@@ -123,8 +123,8 @@ library-metadata-lookup/
   services/
     parser.py                  # Minimal ParsedRequest model (no Groq)
   tests/
-    unit/                      # Mocked tests for orchestrator + helpers
-    integration/               # Tests against real APIs
+    unit/                      # 375 mocked unit tests (97% source coverage)
+    integration/               # 45 integration tests with real SQLite/FTS5
 ```
 
 ## Development
@@ -147,12 +147,18 @@ uvicorn main:app --reload
 ### Running tests
 
 ```bash
-# Unit tests (mocked, fast)
-/Users/jake/Developer/request-parser/venv/bin/python -m pytest tests/unit/ -v
+# Unit tests only (default, fast -- 375 tests)
+uv run pytest tests/unit/ -v
 
-# All tests
-/Users/jake/Developer/request-parser/venv/bin/python -m pytest -v
+# Integration tests only (real SQLite/FTS5 -- 45 tests)
+uv run pytest -m integration -v
+
+# All tests with coverage (420 tests, 97% source coverage)
+uv run pytest -m "" --cov=. --cov-report=term-missing -v
 ```
+
+Integration tests use a real in-memory SQLite database with FTS5 and seed data.
+They are excluded by default (`addopts = "-m 'not integration'"` in `pyproject.toml`).
 
 ## Environment Variables
 
