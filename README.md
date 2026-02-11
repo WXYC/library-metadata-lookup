@@ -1,6 +1,6 @@
 # Library Metadata Lookup
 
-A FastAPI service for WXYC radio that searches the library catalog and cross-references results with Discogs metadata. Extracted from [request-parser](https://github.com/WXYC/request-parser) to separate search/lookup concerns from message parsing and Slack posting.
+A FastAPI service for WXYC radio that searches the library catalog and cross-references results with Discogs metadata. Extracted from [request-o-matic](https://github.com/WXYC/request-o-matic) to separate search/lookup concerns from message parsing and Slack posting.
 
 ## What it does
 
