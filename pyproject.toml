@@ -1,0 +1,68 @@
+[project]
+name = "library-metadata-lookup"
+version = "0.1.0"
+description = "WXYC library catalog lookup service with Discogs integration"
+requires-python = ">=3.12"
+readme = "README.md"
+authors = [
+    {name = "WXYC Engineering"}
+]
+
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.25.0",
+    "aiosqlite>=0.19.0",
+    "asyncpg>=0.29.0",
+    "rapidfuzz>=3.0.0",
+    "cachetools>=5.0.0",
+    "posthog>=3.0.0",
+    "aiolimiter>=1.1.0",
+    "sentry-sdk[fastapi]>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-httpx>=0.22.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["core*", "config*", "library*", "discogs*", "lookup*", "services*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py312']
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "C4"]
+ignore = ["E501", "B008", "C901"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests",
+    "slow: marks tests as slow",
+]
+addopts = "-m 'not integration'"
+console_output_style = "progress"
+testpaths = ["tests"]
+pythonpath = ["."]
