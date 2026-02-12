@@ -298,6 +298,53 @@ class TestFallbackLikeSearch:
         assert result == []
 
 
+class TestFallbackLikeNormalization:
+    """Tests that _fallback_like_search normalizes diacritics before the ASCII regex."""
+
+    @pytest.mark.asyncio
+    async def test_bjork_produces_correct_like_params(self, mock_library_db_real):
+        """'bjork' should normalize to 'bjork', not 'bj rk'."""
+        db = mock_library_db_real
+        db._conn.execute.return_value.__aenter__.return_value = db._conn.execute.return_value
+        db._conn.execute.return_value.fetchall.return_value = []
+
+        await db._fallback_like_search("björk", limit=10)
+
+        # Verify the SQL params contain "%bjork%" not "%bj%" and "%rk%"
+        call_args = db._conn.execute.call_args
+        params = call_args[0][1]
+        assert "%bjork%" in params, f"Expected '%bjork%' in params, got {params}"
+
+    @pytest.mark.asyncio
+    async def test_sigur_ros_produces_correct_like_params(self, mock_library_db_real):
+        """'sigur ros' should normalize to 'sigur' and 'ros', not 'r' and 's'."""
+        db = mock_library_db_real
+        db._conn.execute.return_value.__aenter__.return_value = db._conn.execute.return_value
+        db._conn.execute.return_value.fetchall.return_value = []
+
+        await db._fallback_like_search("sigur rós", limit=10)
+
+        call_args = db._conn.execute.call_args
+        params = call_args[0][1]
+        # "sigur" and "ros" should both be present as LIKE params
+        param_str = str(params)
+        assert "%sigur%" in param_str, f"Expected '%sigur%' in params, got {params}"
+        assert "%ros%" in param_str, f"Expected '%ros%' in params, got {params}"
+
+    @pytest.mark.asyncio
+    async def test_motorhead_produces_correct_like_params(self, mock_library_db_real):
+        """'motorhead' should normalize to 'motorhead', not 'mot rhead'."""
+        db = mock_library_db_real
+        db._conn.execute.return_value.__aenter__.return_value = db._conn.execute.return_value
+        db._conn.execute.return_value.fetchall.return_value = []
+
+        await db._fallback_like_search("motörhead", limit=10)
+
+        call_args = db._conn.execute.call_args
+        params = call_args[0][1]
+        assert "%motorhead%" in params, f"Expected '%motorhead%' in params, got {params}"
+
+
 # ---------------------------------------------------------------------------
 # _fuzzy_search
 # ---------------------------------------------------------------------------
@@ -347,6 +394,24 @@ class TestFuzzySearch:
         # Very different strings should not match at high threshold
         result = await db._fuzzy_search("Radiohead", limit=10, threshold=90)
         assert len(result) == 0
+
+
+class TestFuzzySearchNormalization:
+    """Tests that _fuzzy_search normalizes diacritics before the ASCII regex."""
+
+    @pytest.mark.asyncio
+    async def test_bjork_fuzzy_uses_correct_prefix(self, mock_library_db_real):
+        """'bjork' should use prefix 'bjo' for candidate search, not 'bj'."""
+        db = mock_library_db_real
+        db._conn.execute.return_value.__aenter__.return_value = db._conn.execute.return_value
+        db._conn.execute.return_value.fetchall.return_value = []
+
+        await db._fuzzy_search("björk", limit=10)
+
+        call_args = db._conn.execute.call_args
+        params = call_args[0][1]
+        # The prefix should be "bjo" (from "bjork"), not "bj" (from "bj rk")
+        assert "%bjo%" in params, f"Expected '%bjo%' in params, got {params}"
 
 
 # ---------------------------------------------------------------------------

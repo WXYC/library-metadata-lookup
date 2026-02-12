@@ -5,6 +5,35 @@ Constants were consolidated from multiple locations to ensure consistency.
 """
 
 import re
+import unicodedata
+
+# =============================================================================
+# Unicode Normalization
+# =============================================================================
+
+
+def strip_diacritics(text: str) -> str:
+    """Remove diacritical marks from text, preserving base characters.
+
+    Uses NFKD normalization to decompose characters, then filters out
+    combining marks. For example: "Björk" -> "Bjork", "Zoé" -> "Zoe".
+
+    Punctuation and other non-combining characters are preserved.
+    """
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def normalize_for_comparison(text: str | None) -> str:
+    """Normalize text for case-insensitive, diacritics-insensitive comparison.
+
+    Strips diacritics and lowercases the text. Returns empty string for
+    None or empty input.
+    """
+    if not text:
+        return ""
+    return strip_diacritics(text).lower()
+
 
 # =============================================================================
 # Search Result Limiting

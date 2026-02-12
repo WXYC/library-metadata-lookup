@@ -94,6 +94,30 @@ class TestFilterResultsByArtist:
         assert len(filtered) == 1
         assert filtered[0].artist == "Toy"
 
+    def test_bjork_with_diacritics_matches_ascii(self):
+        """'Bjork' query matches library's 'Bjork' (diacritics in query, ASCII in DB)."""
+        results = [make_library_item(id=1, artist="Bjork", title="Debut")]
+        filtered = filter_results_by_artist(results, "Björk")
+        assert len(filtered) == 1
+
+    def test_ascii_query_matches_diacritics_artist(self):
+        """'Bjork' query matches if DB somehow has 'Björk'."""
+        results = [make_library_item(id=1, artist="Björk", title="Debut")]
+        filtered = filter_results_by_artist(results, "Bjork")
+        assert len(filtered) == 1
+
+    def test_motorhead_diacritics(self):
+        """'Motorhead' query matches library's 'Motorhead'."""
+        results = [make_library_item(id=1, artist="Motorhead", title="Ace of Spades")]
+        filtered = filter_results_by_artist(results, "Motörhead")
+        assert len(filtered) == 1
+
+    def test_sigur_ros_diacritics(self):
+        """'Sigur Ros' query matches library's 'Sigur Ros'."""
+        results = [make_library_item(id=1, artist="Sigur Ros", title="Agaetis Byrjun")]
+        filtered = filter_results_by_artist(results, "Sigur Rós")
+        assert len(filtered) == 1
+
 
 # ---------------------------------------------------------------------------
 # Tests: build_context_message
@@ -204,6 +228,23 @@ class TestResolveAlbumsForTrack:
         )
         albums, not_found = await resolve_albums_for_track(parsed)
         assert albums == []
+        assert not_found is False
+
+    @pytest.mark.asyncio
+    async def test_filters_releases_by_diacritics_artist(self, mock_discogs_service):
+        """Discogs returns 'Björk' but query artist is 'Björk' - should match."""
+        parsed = ParsedRequest(
+            song="Army of Me", artist="Björk", raw_message="Test",
+            is_request=True, message_type=MessageType.REQUEST,
+        )
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[("Bjork", "Post"), ("Bjork", "Debut")],
+        ):
+            albums, not_found = await resolve_albums_for_track(parsed, mock_discogs_service)
+
+        assert "Post" in albums
         assert not_found is False
 
     @pytest.mark.asyncio

@@ -6,7 +6,77 @@ from core.matching import (
     calculate_confidence,
     detect_ambiguous_format,
     is_compilation_artist,
+    normalize_for_comparison,
+    strip_diacritics,
 )
+
+
+# ---------------------------------------------------------------------------
+# strip_diacritics
+# ---------------------------------------------------------------------------
+
+
+class TestStripDiacritics:
+    """Tests for Unicode diacritics removal."""
+
+    @pytest.mark.parametrize(
+        "input_text, expected",
+        [
+            ("Björk", "Bjork"),
+            ("Sigur Rós", "Sigur Ros"),
+            ("Zoé", "Zoe"),
+            ("Motörhead", "Motorhead"),
+            ("Godspeed You! Black Emperor", "Godspeed You! Black Emperor"),
+            ("Bjork", "Bjork"),
+            ("", ""),
+            ("Hüsker Dü", "Husker Du"),
+            ("Café Tacvba", "Cafe Tacvba"),
+        ],
+        ids=[
+            "bjork",
+            "sigur_ros",
+            "zoe",
+            "motorhead",
+            "punctuation_preserved",
+            "ascii_unchanged",
+            "empty_string",
+            "husker_du",
+            "cafe_tacvba",
+        ],
+    )
+    def test_strip_diacritics(self, input_text, expected):
+        assert strip_diacritics(input_text) == expected
+
+
+# ---------------------------------------------------------------------------
+# normalize_for_comparison
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeForComparison:
+    """Tests for combined diacritics + lowercase normalization."""
+
+    @pytest.mark.parametrize(
+        "input_text, expected",
+        [
+            ("Björk", "bjork"),
+            ("SIGUR RÓS", "sigur ros"),
+            ("Motörhead", "motorhead"),
+            (None, ""),
+            ("", ""),
+            ("  Björk  ", "  bjork  "),
+        ],
+        ids=[
+            "bjork_lowercase",
+            "sigur_ros_uppercase",
+            "motorhead",
+            "none_input",
+            "empty_string",
+            "preserves_whitespace",
+        ],
+    )
+    def test_normalize_for_comparison(self, input_text, expected):
+        assert normalize_for_comparison(input_text) == expected
 
 
 # ---------------------------------------------------------------------------

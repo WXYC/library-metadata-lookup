@@ -5,7 +5,7 @@ from pathlib import Path
 import aiosqlite
 from rapidfuzz import fuzz
 
-from core.matching import STOPWORDS
+from core.matching import STOPWORDS, normalize_for_comparison
 from library.models import LibraryItem
 
 logger = logging.getLogger(__name__)
@@ -152,8 +152,8 @@ class LibraryDB:
         Fallback search using LIKE when FTS fails.
         Splits query into words and searches for titles/artists containing all words.
         """
-        # Normalize: remove special chars, keep only alphanumeric and spaces
-        normalized = re.sub(r"[^a-z0-9\s]", " ", query.lower())
+        # Strip diacritics first, then remove remaining special chars
+        normalized = re.sub(r"[^a-z0-9\s]", " ", normalize_for_comparison(query))
         words = normalized.split()
 
         # Remove stopwords that might cause mismatches
@@ -198,8 +198,8 @@ class LibraryDB:
             limit: Max results to return
             threshold: Minimum fuzzy match score (0-100) to include results
         """
-        # Normalize query
-        normalized = re.sub(r"[^a-z0-9\s]", " ", query.lower())
+        # Strip diacritics first, then remove remaining special chars
+        normalized = re.sub(r"[^a-z0-9\s]", " ", normalize_for_comparison(query))
         words = normalized.split()
 
         if not words:

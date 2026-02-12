@@ -33,6 +33,24 @@ def mock_discogs_service():
 
 
 @pytest.fixture
+def mock_library_db_real():
+    """Create a real LibraryDB instance with a mocked connection.
+
+    Unlike mock_library_db which is a fully mocked AsyncMock, this creates
+    a real LibraryDB so we can test internal methods like _fallback_like_search.
+    """
+    from library.db import LibraryDB
+
+    db = LibraryDB(db_path=None)
+    conn = AsyncMock()
+    cursor = AsyncMock()
+    cursor.fetchall = AsyncMock(return_value=[])
+    conn.execute = AsyncMock(return_value=cursor)
+    db._conn = conn
+    return db
+
+
+@pytest.fixture
 def sample_library_item():
     """Create a sample library item for testing."""
     return make_library_item(

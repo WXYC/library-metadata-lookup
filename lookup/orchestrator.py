@@ -14,6 +14,7 @@ from core.matching import (
     MAX_SEARCH_RESULTS,
     STOPWORDS,
     is_compilation_artist,
+    normalize_for_comparison,
 )
 from core.search import (
     build_strategies,
@@ -52,7 +53,8 @@ async def resolve_albums_for_track(
     album_is_artist = (
         parsed.album
         and parsed.artist
-        and parsed.album.lower().strip() == parsed.artist.lower().strip()
+        and normalize_for_comparison(parsed.album).strip()
+        == normalize_for_comparison(parsed.artist).strip()
     )
 
     if parsed.song and parsed.artist and (album_is_missing or album_is_artist):
@@ -64,9 +66,9 @@ async def resolve_albums_for_track(
             )
             if releases:
                 albums = []
-                artist_lower = parsed.artist.lower()
+                artist_normalized = normalize_for_comparison(parsed.artist)
                 for release_artist, album in releases:
-                    if release_artist.lower().startswith(artist_lower):
+                    if normalize_for_comparison(release_artist).startswith(artist_normalized):
                         if album not in albums:
                             albums.append(album)
                 if albums:
@@ -92,11 +94,11 @@ def filter_results_by_artist(
     if not artist:
         return results
 
-    artist_lower = artist.lower()
+    artist_normalized = normalize_for_comparison(artist)
     filtered = []
     for item in results:
-        item_artist = (item.artist or "").lower()
-        if item_artist.startswith(artist_lower):
+        item_artist = normalize_for_comparison(item.artist)
+        if item_artist.startswith(artist_normalized):
             filtered.append(item)
 
     if len(filtered) < len(results):
@@ -176,8 +178,8 @@ async def search_song_as_artist(
             if item.id in seen_ids:
                 continue
 
-            item_artist = (item.artist or "").lower()
-            if item_artist.startswith(song_as_artist.lower()) or is_compilation_artist(
+            item_artist = normalize_for_comparison(item.artist)
+            if item_artist.startswith(normalize_for_comparison(song_as_artist)) or is_compilation_artist(
                 item_artist
             ):
                 results.append(item)
@@ -310,11 +312,12 @@ async def search_compilations_for_track(
 
             if keyword_results:
                 filtered_results = []
+                artist_normalized = normalize_for_comparison(parsed.artist)
                 for item in keyword_results:
-                    item_artist = (item.artist or "").lower()
-                    if item_artist.startswith(parsed.artist.lower()):
+                    item_artist = normalize_for_comparison(item.artist)
+                    if item_artist.startswith(artist_normalized):
                         filtered_results.append(item)
-                    elif is_compilation_artist(item_artist):
+                    elif is_compilation_artist(item.artist or ""):
                         filtered_results.append(item)
 
                 if filtered_results:
@@ -357,14 +360,14 @@ async def search_compilations_for_track(
 
             if matches and parsed.artist:
                 filtered_matches = []
-                artist_lower = parsed.artist.lower()
+                artist_normalized = normalize_for_comparison(parsed.artist)
                 discogs_is_compilation = is_compilation_artist(release_artist)
 
                 for match in matches:
-                    match_artist = (match.artist or "").lower()
-                    if match_artist.startswith(artist_lower):
+                    match_artist = normalize_for_comparison(match.artist)
+                    if match_artist.startswith(artist_normalized):
                         filtered_matches.append(match)
-                    elif discogs_is_compilation and is_compilation_artist(match_artist):
+                    elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
                         filtered_matches.append(match)
                 matches = filtered_matches
 
