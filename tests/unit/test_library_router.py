@@ -6,7 +6,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from library.db import LibraryDB
-from library.models import LibraryItem
+from tests.factories import make_library_item
+from tests.unit.conftest import override_deps
 
 
 @pytest.fixture
@@ -22,22 +23,17 @@ def app_client(mock_db, mock_settings):
     from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
     from config.settings import get_settings
 
-    app.dependency_overrides[get_library_db] = lambda: mock_db
-    app.dependency_overrides[get_discogs_service] = lambda: None
-    app.dependency_overrides[get_posthog_client] = lambda: None
-    app.dependency_overrides[get_settings] = lambda: mock_settings
-    yield app
-    app.dependency_overrides.clear()
+    with override_deps(app, {
+        get_library_db: mock_db, get_discogs_service: None,
+        get_posthog_client: None, get_settings: mock_settings,
+    }):
+        yield app
 
 
 class TestSearchLibrary:
     @pytest.mark.asyncio
     async def test_query_search(self, app_client, mock_db):
-        item = LibraryItem(
-            id=1, title="The Game", artist="Queen",
-            call_letters="Q", artist_call_number=1, release_call_number=1,
-            genre="Rock", format="CD",
-        )
+        item = make_library_item(id=1, artist="Queen", title="The Game", call_letters="Q")
         mock_db.search = AsyncMock(return_value=[item])
 
         async with AsyncClient(
@@ -52,11 +48,7 @@ class TestSearchLibrary:
 
     @pytest.mark.asyncio
     async def test_artist_filter(self, app_client, mock_db):
-        item = LibraryItem(
-            id=2, title="Album", artist="Radiohead",
-            call_letters="R", artist_call_number=1, release_call_number=1,
-            genre="Rock", format="CD",
-        )
+        item = make_library_item(id=2, artist="Radiohead", title="Album", call_letters="R")
         mock_db.search = AsyncMock(return_value=[item])
 
         async with AsyncClient(
@@ -69,11 +61,7 @@ class TestSearchLibrary:
 
     @pytest.mark.asyncio
     async def test_title_filter(self, app_client, mock_db):
-        item = LibraryItem(
-            id=3, title="OK Computer", artist="Radiohead",
-            call_letters="R", artist_call_number=1, release_call_number=1,
-            genre="Rock", format="CD",
-        )
+        item = make_library_item(id=3, artist="Radiohead", title="OK Computer", call_letters="R")
         mock_db.search = AsyncMock(return_value=[item])
 
         async with AsyncClient(

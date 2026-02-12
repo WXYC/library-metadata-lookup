@@ -16,9 +16,10 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from core.telemetry import RequestTelemetry
-from discogs.models import DiscogsSearchResponse, DiscogsSearchResult
+from discogs.models import DiscogsSearchResponse
 from library.models import LibraryItem
 from lookup.models import LookupRequest, LookupResponse
+from tests.factories import make_discogs_result, make_library_item
 from lookup.orchestrator import perform_lookup
 from services.parser import MessageType, ParsedRequest
 
@@ -105,15 +106,10 @@ class TestPerformLookupBasic:
         """Direct match: artist + album finds results immediately."""
         mock_library_db.search.return_value = [queen_item]
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
-            results=[
-                DiscogsSearchResult(
-                    album="A Night at the Opera",
-                    artist="Queen",
-                    release_id=12345,
-                    release_url="https://discogs.com/release/12345",
-                    artwork_url="https://example.com/cover.jpg",
-                )
-            ]
+            results=[make_discogs_result(
+                release_id=12345, album="A Night at the Opera", artist="Queen",
+                artwork_url="https://example.com/cover.jpg",
+            )]
         )
 
         request = LookupRequest(
@@ -185,14 +181,7 @@ class TestPerformLookupArtistCorrection:
         """Misspelled artist gets corrected via fuzzy match."""
         mock_library_db.find_similar_artist.return_value = "Living Colour"
         mock_library_db.search.return_value = [
-            LibraryItem(
-                id=5,
-                artist="Living Colour",
-                title="Vivid",
-                call_letters="L",
-                artist_call_number=1,
-                release_call_number=1,
-            )
+            make_library_item(id=5, artist="Living Colour", title="Vivid", call_letters="L")
         ]
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
 
@@ -298,11 +287,8 @@ class TestPerformLookupFallback:
         ]
 
         # Discogs validates: "Bohemian Rhapsody" is on "A Night at the Opera" but not "The Game"
-        search_result = DiscogsSearchResult(
-            album="A Night at the Opera",
-            artist="Queen",
-            release_id=12345,
-            release_url="https://discogs.com/release/12345",
+        search_result = make_discogs_result(
+            release_id=12345, album="A Night at the Opera", artist="Queen",
         )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
             results=[search_result]
@@ -347,9 +333,8 @@ class TestPerformLookupCompilations:
         mock_library_db.find_similar_artist.return_value = None
 
         # A fallback item that would be returned by artist-only search
-        fallback_item = LibraryItem(
-            id=99, artist="Some Artist", title="Some Album",
-            call_letters="S", artist_call_number=1, release_call_number=1,
+        fallback_item = make_library_item(
+            id=99, artist="Some Artist", title="Some Album", call_letters="S",
         )
 
         # search_library_with_fallback call order:
@@ -405,11 +390,8 @@ class TestPerformLookupArtwork:
         mock_library_db.search.return_value = [queen_item]
         mock_library_db.find_similar_artist.return_value = None
 
-        artwork = DiscogsSearchResult(
-            album="A Night at the Opera",
-            artist="Queen",
-            release_id=12345,
-            release_url="https://discogs.com/release/12345",
+        artwork = make_discogs_result(
+            release_id=12345, album="A Night at the Opera", artist="Queen",
             artwork_url="https://example.com/cover.jpg",
         )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
@@ -440,13 +422,8 @@ class TestPerformLookupAmbiguousFormat:
         self, mock_library_db, mock_discogs_service, telemetry
     ):
         """For 'Artist - Title' format, tries both orderings."""
-        amps_item = LibraryItem(
-            id=61692,
-            artist="Amps for Christ",
-            title="Circuits",
-            call_letters="A",
-            artist_call_number=1,
-            release_call_number=1,
+        amps_item = make_library_item(
+            id=61692, artist="Amps for Christ", title="Circuits",
         )
 
         mock_library_db.find_similar_artist.return_value = None

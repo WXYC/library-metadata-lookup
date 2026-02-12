@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from library.models import LibraryItem
 from services.parser import MessageType, ParsedRequest
+from tests.factories import make_library_item
 
 
 @pytest.fixture
@@ -35,15 +35,8 @@ def mock_discogs_service():
 @pytest.fixture
 def sample_library_item():
     """Create a sample library item for testing."""
-    return LibraryItem(
-        id=1,
-        artist="Queen",
-        title="A Night at the Opera",
-        call_letters="Q",
-        artist_call_number=1,
-        release_call_number=1,
-        genre="Rock",
-        format="CD",
+    return make_library_item(
+        id=1, artist="Queen", title="A Night at the Opera", call_letters="Q",
     )
 
 
@@ -51,25 +44,12 @@ def sample_library_item():
 def sample_library_items():
     """Create multiple sample library items for testing."""
     return [
-        LibraryItem(
-            id=1,
-            artist="Queen",
-            title="A Night at the Opera",
-            call_letters="Q",
-            artist_call_number=1,
-            release_call_number=1,
-            genre="Rock",
-            format="CD",
+        make_library_item(
+            id=1, artist="Queen", title="A Night at the Opera", call_letters="Q",
         ),
-        LibraryItem(
-            id=2,
-            artist="Queen",
-            title="The Game",
-            call_letters="Q",
-            artist_call_number=1,
-            release_call_number=2,
-            genre="Rock",
-            format="CD",
+        make_library_item(
+            id=2, artist="Queen", title="The Game",
+            call_letters="Q", release_call_number=2,
         ),
     ]
 

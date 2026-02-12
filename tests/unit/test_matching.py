@@ -24,16 +24,16 @@ class TestIsCompilationArtist:
     @pytest.mark.parametrize(
         "artist",
         [
-            "Various Artists",
-            "VARIOUS",
-            "various",
-            "Soundtrack Collection",
-            "soundtrack",
-            "A Compilation Album",
-            "V/A",
-            "v/a",
-            "V.A.",
-            "v.a.",
+            pytest.param("Various Artists", id="various-artists"),
+            pytest.param("VARIOUS", id="various-upper"),
+            pytest.param("various", id="various-lower"),
+            pytest.param("Soundtrack Collection", id="soundtrack-collection"),
+            pytest.param("soundtrack", id="soundtrack"),
+            pytest.param("A Compilation Album", id="compilation"),
+            pytest.param("V/A", id="v-slash-a"),
+            pytest.param("v/a", id="v-slash-a-lower"),
+            pytest.param("V.A.", id="v-dot-a"),
+            pytest.param("v.a.", id="v-dot-a-lower"),
         ],
     )
     def test_compilation_keywords_detected(self, artist):
@@ -42,10 +42,10 @@ class TestIsCompilationArtist:
     @pytest.mark.parametrize(
         "artist",
         [
-            "Radiohead",
-            "Queen",
-            "The National",
-            "DJ Shadow",
+            pytest.param("Radiohead", id="radiohead"),
+            pytest.param("Queen", id="queen"),
+            pytest.param("The National", id="the-national"),
+            pytest.param("DJ Shadow", id="dj-shadow"),
         ],
     )
     def test_non_compilation_artists(self, artist):
@@ -61,24 +61,22 @@ class TestCalculateConfidence:
     @pytest.mark.parametrize(
         "req_artist, req_album, res_artist, res_album, expected",
         [
-            # Exact artist + exact album = 0.4+0.4+0.2 bonus = 1.0
-            ("Queen", "The Game", "Queen", "The Game", 1.0),
-            # Exact artist only = 0.4
-            ("Queen", None, "Queen", "The Game", 0.4),
-            # Exact album only = 0.4
-            (None, "The Game", "Radiohead", "The Game", 0.4),
-            # Partial artist match (substring) = 0.3
-            ("Radio", None, "Radiohead", "OK Computer", 0.3),
-            # Partial album match (substring) = 0.3
-            (None, "Game", "Queen", "The Game", 0.3),
-            # Partial artist + partial album = 0.3+0.3+0.2 bonus = 0.8
-            ("Radio", "Computer", "Radiohead", "OK Computer", 0.8),
-            # Exact artist + partial album = 0.4+0.3 = 0.7 (>= 0.6 bonus) = 0.9
-            ("Queen", "Night", "Queen", "A Night at the Opera", pytest.approx(0.9)),
-            # No match at all = base 0.2
-            ("Queen", "The Game", "Radiohead", "OK Computer", 0.2),
-            # Both None = base 0.2
-            (None, None, "Artist", "Album", 0.2),
+            pytest.param("Queen", "The Game", "Queen", "The Game", 1.0, id="exact-both"),
+            pytest.param("Queen", None, "Queen", "The Game", 0.4, id="artist-only"),
+            pytest.param(None, "The Game", "Radiohead", "The Game", 0.4, id="album-only"),
+            pytest.param("Radio", None, "Radiohead", "OK Computer", 0.3, id="partial-artist"),
+            pytest.param(None, "Game", "Queen", "The Game", 0.3, id="partial-album"),
+            pytest.param(
+                "Radio", "Computer", "Radiohead", "OK Computer", 0.8, id="partial-both"
+            ),
+            pytest.param(
+                "Queen", "Night", "Queen", "A Night at the Opera",
+                pytest.approx(0.9), id="exact-artist-partial-album",
+            ),
+            pytest.param(
+                "Queen", "The Game", "Radiohead", "OK Computer", 0.2, id="no-match"
+            ),
+            pytest.param(None, None, "Artist", "Album", 0.2, id="both-none"),
         ],
     )
     def test_scoring(self, req_artist, req_album, res_artist, res_album, expected):
@@ -107,12 +105,16 @@ class TestDetectAmbiguousFormat:
     @pytest.mark.parametrize(
         "message, expected",
         [
-            # Dash patterns
-            ("Amps for Christ - Edward", ("Amps for Christ", "Edward")),
-            ("Artist -Title", ("Artist", "Title")),
-            ("Artist- Title", ("Artist", "Title")),
-            # Period pattern
-            ("Stereolab. Dots and Loops", ("Stereolab", "Dots and Loops")),
+            pytest.param(
+                "Amps for Christ - Edward", ("Amps for Christ", "Edward"),
+                id="dash-spaced",
+            ),
+            pytest.param("Artist -Title", ("Artist", "Title"), id="dash-left"),
+            pytest.param("Artist- Title", ("Artist", "Title"), id="dash-right"),
+            pytest.param(
+                "Stereolab. Dots and Loops", ("Stereolab", "Dots and Loops"),
+                id="period",
+            ),
         ],
     )
     def test_detects_ambiguous_formats(self, message, expected):
@@ -122,10 +124,10 @@ class TestDetectAmbiguousFormat:
     @pytest.mark.parametrize(
         "message",
         [
-            "Radiohead OK Computer",  # no separator
-            "hip-hop beats",  # dash without spaces
-            "Queen",  # single word
-            "",  # empty
+            pytest.param("Radiohead OK Computer", id="no-separator"),
+            pytest.param("hip-hop beats", id="hyphenated-word"),
+            pytest.param("Queen", id="single-word"),
+            pytest.param("", id="empty"),
         ],
     )
     def test_non_matches_return_none(self, message):

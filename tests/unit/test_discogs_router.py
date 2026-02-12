@@ -8,12 +8,13 @@ from httpx import ASGITransport, AsyncClient
 
 from discogs.models import (
     DiscogsSearchResponse,
-    DiscogsSearchResult,
     ReleaseMetadataResponse,
     TrackReleasesResponse,
 )
+from tests.factories import make_discogs_result
 from discogs.router import _require_service
 from discogs.service import DiscogsService
+from tests.unit.conftest import override_deps
 
 
 # ---------------------------------------------------------------------------
@@ -49,12 +50,11 @@ def app_with_discogs(mock_discogs, mock_settings):
     from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
     from config.settings import get_settings
 
-    app.dependency_overrides[get_library_db] = lambda: AsyncMock()
-    app.dependency_overrides[get_discogs_service] = lambda: mock_discogs
-    app.dependency_overrides[get_posthog_client] = lambda: None
-    app.dependency_overrides[get_settings] = lambda: mock_settings
-    yield app
-    app.dependency_overrides.clear()
+    with override_deps(app, {
+        get_library_db: AsyncMock(), get_discogs_service: mock_discogs,
+        get_posthog_client: None, get_settings: mock_settings,
+    }):
+        yield app
 
 
 @pytest.fixture
@@ -63,12 +63,11 @@ def app_without_discogs(mock_settings):
     from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
     from config.settings import get_settings
 
-    app.dependency_overrides[get_library_db] = lambda: AsyncMock()
-    app.dependency_overrides[get_discogs_service] = lambda: None
-    app.dependency_overrides[get_posthog_client] = lambda: None
-    app.dependency_overrides[get_settings] = lambda: mock_settings
-    yield app
-    app.dependency_overrides.clear()
+    with override_deps(app, {
+        get_library_db: AsyncMock(), get_discogs_service: None,
+        get_posthog_client: None, get_settings: mock_settings,
+    }):
+        yield app
 
 
 class TestTrackReleases:
@@ -143,12 +142,9 @@ class TestSearchReleases:
     async def test_success(self, app_with_discogs, mock_discogs):
         mock_discogs.search = AsyncMock(
             return_value=DiscogsSearchResponse(
-                results=[
-                    DiscogsSearchResult(
-                        album="Album", artist="Artist",
-                        release_id=1, release_url="https://discogs.com/release/1",
-                    )
-                ],
+                results=[make_discogs_result(
+                    release_id=1, album="Album", artist="Artist",
+                )],
                 total=1,
             )
         )
