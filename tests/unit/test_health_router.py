@@ -7,6 +7,7 @@ from httpx import ASGITransport, AsyncClient
 
 from discogs.service import DiscogsService
 from library.db import LibraryDB
+from tests.unit.conftest import override_deps
 from routers.health import (
     _check_database,
     _check_discogs_api,
@@ -125,24 +126,20 @@ class TestHealthEndpoint:
         from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
         from config.settings import get_settings
 
-        app.dependency_overrides[get_library_db] = lambda: mock_db
-        app.dependency_overrides[get_discogs_service] = lambda: mock_discogs
-        app.dependency_overrides[get_posthog_client] = lambda: None
-        app.dependency_overrides[get_settings] = lambda: mock_settings
-
-        try:
+        with override_deps(app, {
+            get_library_db: mock_db, get_discogs_service: mock_discogs,
+            get_posthog_client: None, get_settings: mock_settings,
+        }):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as client:
                 resp = await client.get("/health")
 
-            assert resp.status_code == 200
-            body = resp.json()
-            assert body["status"] == "healthy"
-            assert "version" in body
-            assert body["services"]["database"] == "ok"
-        finally:
-            app.dependency_overrides.clear()
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "healthy"
+        assert "version" in body
+        assert body["services"]["database"] == "ok"
 
     @pytest.mark.asyncio
     async def test_degraded(self, mock_db, mock_settings):
@@ -156,22 +153,18 @@ class TestHealthEndpoint:
         svc.cache_service = AsyncMock()
         svc.cache_service.is_available = AsyncMock(return_value=False)
 
-        app.dependency_overrides[get_library_db] = lambda: mock_db
-        app.dependency_overrides[get_discogs_service] = lambda: svc
-        app.dependency_overrides[get_posthog_client] = lambda: None
-        app.dependency_overrides[get_settings] = lambda: mock_settings
-
-        try:
+        with override_deps(app, {
+            get_library_db: mock_db, get_discogs_service: svc,
+            get_posthog_client: None, get_settings: mock_settings,
+        }):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as client:
                 resp = await client.get("/health")
 
-            assert resp.status_code == 200
-            body = resp.json()
-            assert body["status"] == "degraded"
-        finally:
-            app.dependency_overrides.clear()
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "degraded"
 
     @pytest.mark.asyncio
     async def test_unhealthy_returns_503(self, mock_settings):
@@ -183,19 +176,15 @@ class TestHealthEndpoint:
         db = AsyncMock(spec=LibraryDB)
         db.is_available = AsyncMock(return_value=False)
 
-        app.dependency_overrides[get_library_db] = lambda: db
-        app.dependency_overrides[get_discogs_service] = lambda: None
-        app.dependency_overrides[get_posthog_client] = lambda: None
-        app.dependency_overrides[get_settings] = lambda: mock_settings
-
-        try:
+        with override_deps(app, {
+            get_library_db: db, get_discogs_service: None,
+            get_posthog_client: None, get_settings: mock_settings,
+        }):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as client:
                 resp = await client.get("/health")
 
-            assert resp.status_code == 503
-            body = resp.json()
-            assert body["status"] == "unhealthy"
-        finally:
-            app.dependency_overrides.clear()
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["status"] == "unhealthy"

@@ -15,8 +15,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from discogs.models import DiscogsSearchRequest, DiscogsSearchResponse, DiscogsSearchResult
-from library.models import LibraryItem
+from discogs.models import DiscogsSearchRequest, DiscogsSearchResponse
+from tests.factories import make_discogs_result, make_library_item
 from lookup.orchestrator import (
     build_context_message,
     fetch_artwork_for_items,
@@ -39,9 +39,9 @@ class TestFilterResultsByArtist:
 
     def test_filters_out_non_matching_artists(self):
         results = [
-            LibraryItem(id=1, artist="Biz Markie", title="Young Girl Bluez"),
-            LibraryItem(id=2, artist="Young Black Teenagers", title="Proud to be Black"),
-            LibraryItem(id=3, artist="Young Gov", title="Some Album"),
+            make_library_item(id=1, artist="Biz Markie", title="Young Girl Bluez"),
+            make_library_item(id=2, artist="Young Black Teenagers", title="Proud to be Black"),
+            make_library_item(id=3, artist="Young Gov", title="Some Album"),
         ]
 
         filtered = filter_results_by_artist(results, "Young Gov")
@@ -51,8 +51,8 @@ class TestFilterResultsByArtist:
 
     def test_keeps_matching_artists(self):
         results = [
-            LibraryItem(id=1, artist="Radiohead", title="OK Computer"),
-            LibraryItem(id=2, artist="Radiohead", title="The Bends"),
+            make_library_item(id=1, artist="Radiohead", title="OK Computer"),
+            make_library_item(id=2, artist="Radiohead", title="The Bends"),
         ]
 
         filtered = filter_results_by_artist(results, "Radiohead")
@@ -60,8 +60,8 @@ class TestFilterResultsByArtist:
 
     def test_case_insensitive(self):
         results = [
-            LibraryItem(id=1, artist="RADIOHEAD", title="OK Computer"),
-            LibraryItem(id=2, artist="radiohead", title="The Bends"),
+            make_library_item(id=1, artist="RADIOHEAD", title="OK Computer"),
+            make_library_item(id=2, artist="radiohead", title="The Bends"),
         ]
 
         filtered = filter_results_by_artist(results, "radiohead")
@@ -69,7 +69,7 @@ class TestFilterResultsByArtist:
 
     def test_prefix_matching_allows_various_artists(self):
         results = [
-            LibraryItem(id=1, artist="Various Artists - Rock - D", title="Disco Not Disco"),
+            make_library_item(id=1, artist="Various Artists - Rock - D", title="Disco Not Disco"),
         ]
 
         filtered = filter_results_by_artist(results, "Various")
@@ -77,8 +77,8 @@ class TestFilterResultsByArtist:
 
     def test_no_artist_returns_all(self):
         results = [
-            LibraryItem(id=1, artist="Radiohead", title="OK Computer"),
-            LibraryItem(id=2, artist="Queen", title="The Game"),
+            make_library_item(id=1, artist="Radiohead", title="OK Computer"),
+            make_library_item(id=2, artist="Queen", title="The Game"),
         ]
 
         assert len(filter_results_by_artist(results, None)) == 2
@@ -86,8 +86,8 @@ class TestFilterResultsByArtist:
 
     def test_toy_does_not_match_chew_toy(self):
         results = [
-            LibraryItem(id=1, artist="Chew Toy", title="The Touch my Disney ep"),
-            LibraryItem(id=2, artist="Toy", title="Toy"),
+            make_library_item(id=1, artist="Chew Toy", title="The Touch my Disney ep"),
+            make_library_item(id=2, artist="Toy", title="Toy"),
         ]
 
         filtered = filter_results_by_artist(results, "Toy")
@@ -233,9 +233,9 @@ class TestSearchLibraryWithFallback:
 
     @pytest.mark.asyncio
     async def test_finds_by_artist_plus_album(self, mock_library_db):
-        item = LibraryItem(
+        item = make_library_item(
             id=1, artist="Queen", title="A Night at the Opera",
-            call_letters="Q", artist_call_number=1, release_call_number=1,
+            call_letters="Q",
         )
         mock_library_db.search.return_value = [item]
 
@@ -252,9 +252,9 @@ class TestSearchLibraryWithFallback:
 
     @pytest.mark.asyncio
     async def test_falls_back_to_artist_only(self, mock_library_db):
-        item = LibraryItem(
+        item = make_library_item(
             id=2, artist="Queen", title="The Game",
-            call_letters="Q", artist_call_number=1, release_call_number=2,
+            call_letters="Q", release_call_number=2,
         )
         mock_library_db.search.side_effect = [
             [],  # artist + album
@@ -277,13 +277,13 @@ class TestSearchLibraryWithFallback:
     async def test_filters_results_by_album_title(self, mock_library_db):
         """Regression: 'Wireless' album search should not also return 'Stator'."""
         mock_library_db.search.return_value = [
-            LibraryItem(
+            make_library_item(
                 id=1, artist="Biosphere", title="Wireless",
-                call_letters="B", artist_call_number=1, release_call_number=1,
+                call_letters="B",
             ),
-            LibraryItem(
+            make_library_item(
                 id=2, artist="Biosphere", title="Stator",
-                call_letters="B", artist_call_number=1, release_call_number=2,
+                call_letters="B", release_call_number=2,
             ),
         ]
 
@@ -310,8 +310,8 @@ class TestSearchWithAlternativeInterpretation:
     @pytest.mark.asyncio
     async def test_finds_first_interpretation(self, mock_library_db):
         mock_library_db.search.side_effect = [
-            [LibraryItem(id=1, artist="Amps for Christ", title="Circuits")],
-            [LibraryItem(id=2, artist="Someone Else", title="Other Album")],
+            [make_library_item(id=1, artist="Amps for Christ", title="Circuits")],
+            [make_library_item(id=2, artist="Someone Else", title="Other Album")],
         ]
 
         results, _ = await search_with_alternative_interpretation(
@@ -322,7 +322,7 @@ class TestSearchWithAlternativeInterpretation:
 
     @pytest.mark.asyncio
     async def test_deduplicates_results(self, mock_library_db):
-        item = LibraryItem(id=1, artist="Artist A", title="Album 1")
+        item = make_library_item(id=1, artist="Artist A", title="Album 1")
         mock_library_db.search.side_effect = [[item], [item]]
 
         results, _ = await search_with_alternative_interpretation(
@@ -333,8 +333,8 @@ class TestSearchWithAlternativeInterpretation:
     @pytest.mark.asyncio
     async def test_returns_empty_when_no_matches(self, mock_library_db):
         mock_library_db.search.side_effect = [
-            [LibraryItem(id=1, artist="Wrong Artist", title="Album")],
-            [LibraryItem(id=2, artist="Also Wrong", title="Another")],
+            [make_library_item(id=1, artist="Wrong Artist", title="Album")],
+            [make_library_item(id=2, artist="Also Wrong", title="Another")],
         ]
 
         results, _ = await search_with_alternative_interpretation(
@@ -354,13 +354,12 @@ class TestFilterResultsByTrackValidation:
     @pytest.mark.asyncio
     async def test_filters_to_validated_albums(self, mock_discogs_service):
         items = [
-            LibraryItem(id=1, artist="Queen", title="A Night at the Opera"),
-            LibraryItem(id=2, artist="Queen", title="The Game"),
+            make_library_item(id=1, artist="Queen", title="A Night at the Opera"),
+            make_library_item(id=2, artist="Queen", title="The Game"),
         ]
 
-        search_result = DiscogsSearchResult(
-            album="A Night at the Opera", artist="Queen",
-            release_id=12345, release_url="https://discogs.com/release/12345",
+        search_result = make_discogs_result(
+            release_id=12345, album="A Night at the Opera", artist="Queen",
         )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
             results=[search_result]
@@ -377,13 +376,13 @@ class TestFilterResultsByTrackValidation:
 
     @pytest.mark.asyncio
     async def test_returns_none_without_discogs(self):
-        items = [LibraryItem(id=1, artist="Queen", title="A Night at the Opera")]
+        items = [make_library_item(id=1, artist="Queen", title="A Night at the Opera")]
         result = await filter_results_by_track_validation(items, "Song", "Artist", None)
         assert result is None
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_albums_validate(self, mock_discogs_service):
-        items = [LibraryItem(id=1, artist="Queen", title="The Game")]
+        items = [make_library_item(id=1, artist="Queen", title="The Game")]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
 
@@ -404,13 +403,12 @@ class TestFetchArtworkForItems:
     @pytest.mark.asyncio
     async def test_fetches_artwork_for_each_item(self, mock_discogs_service):
         items = [
-            LibraryItem(id=1, artist="Queen", title="A Night at the Opera"),
-            LibraryItem(id=2, artist="Queen", title="The Game"),
+            make_library_item(id=1, artist="Queen", title="A Night at the Opera"),
+            make_library_item(id=2, artist="Queen", title="The Game"),
         ]
 
-        artwork = DiscogsSearchResult(
-            album="A Night at the Opera", artist="Queen",
-            release_id=12345, release_url="https://discogs.com/release/12345",
+        artwork = make_discogs_result(
+            release_id=12345, album="A Night at the Opera", artist="Queen",
             artwork_url="https://example.com/cover.jpg",
         )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
@@ -424,7 +422,7 @@ class TestFetchArtworkForItems:
 
     @pytest.mark.asyncio
     async def test_returns_none_artwork_without_discogs(self):
-        items = [LibraryItem(id=1, artist="Queen", title="A Night at the Opera")]
+        items = [make_library_item(id=1, artist="Queen", title="A Night at the Opera")]
 
         results = await fetch_artwork_for_items(items, None)
 
@@ -435,13 +433,12 @@ class TestFetchArtworkForItems:
     @pytest.mark.asyncio
     async def test_uses_discogs_titles_for_compilation_lookup(self, mock_discogs_service):
         """For compilations, use the Discogs album title (not library title) for artwork."""
-        item = LibraryItem(
+        item = make_library_item(
             id=20, artist="Various Artists - Rock - D", title="Disco Not Disco",
         )
 
-        artwork = DiscogsSearchResult(
-            album="Disco Not Disco", artist="Various",
-            release_id=99999, release_url="https://discogs.com/release/99999",
+        artwork = make_discogs_result(
+            release_id=99999, album="Disco Not Disco", artist="Various",
             artwork_url="https://example.com/disco.jpg",
         )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])

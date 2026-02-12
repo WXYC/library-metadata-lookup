@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from library.models import LibraryItem
+from tests.factories import make_discogs_result, make_library_item as _item
 from lookup.orchestrator import (
     fetch_artwork_for_items,
     filter_results_by_track_validation,
@@ -16,15 +16,6 @@ from lookup.orchestrator import (
     search_with_alternative_interpretation,
 )
 from services.parser import ParsedRequest
-
-
-def _item(id=1, artist="Artist", title="Album", **kwargs):
-    defaults = dict(
-        call_letters="A", artist_call_number=1, release_call_number=1,
-        genre="Rock", format="CD",
-    )
-    defaults.update(kwargs)
-    return LibraryItem(id=id, artist=artist, title=title, **defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -470,17 +461,14 @@ class TestTrackValidationException:
         item2 = _item(id=2, title="Album2")
 
         discogs = AsyncMock()
-        from discogs.models import DiscogsSearchResponse, DiscogsSearchResult
+        from discogs.models import DiscogsSearchResponse
         discogs.search = AsyncMock(
             side_effect=[
                 Exception("timeout"),
                 DiscogsSearchResponse(
-                    results=[
-                        DiscogsSearchResult(
-                            album="Album2", artist="Artist",
-                            release_id=2, release_url="https://discogs.com/release/2",
-                        )
-                    ],
+                    results=[make_discogs_result(
+                        release_id=2, album="Album2", artist="Artist",
+                    )],
                     total=1,
                 ),
             ]
@@ -508,17 +496,14 @@ class TestFetchArtworkException:
         item2 = _item(id=2, title="Album2")
 
         discogs = AsyncMock()
-        from discogs.models import DiscogsSearchResponse, DiscogsSearchResult
+        from discogs.models import DiscogsSearchResponse
         discogs.search = AsyncMock(
             side_effect=[
                 Exception("timeout"),
                 DiscogsSearchResponse(
-                    results=[
-                        DiscogsSearchResult(
-                            album="Album2", artist="Artist",
-                            release_id=2, release_url="https://discogs.com/release/2",
-                        )
-                    ],
+                    results=[make_discogs_result(
+                        release_id=2, album="Album2", artist="Artist",
+                    )],
                     total=1,
                 ),
             ]

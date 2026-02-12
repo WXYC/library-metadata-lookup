@@ -8,9 +8,8 @@ from httpx import ASGITransport, AsyncClient
 from discogs.service import DiscogsService
 from library.db import LibraryDB
 from lookup.models import LookupResponse
-
-
-LOOKUP_BODY = {"artist": "Queen", "album": "The Game", "raw_message": "Queen - The Game"}
+from tests.factories import LOOKUP_BODY
+from tests.unit.conftest import override_deps
 
 
 @pytest.fixture
@@ -29,12 +28,11 @@ def app_client(mock_db, mock_discogs, mock_settings):
     from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
     from config.settings import get_settings
 
-    app.dependency_overrides[get_library_db] = lambda: mock_db
-    app.dependency_overrides[get_discogs_service] = lambda: mock_discogs
-    app.dependency_overrides[get_posthog_client] = lambda: None
-    app.dependency_overrides[get_settings] = lambda: mock_settings
-    yield app
-    app.dependency_overrides.clear()
+    with override_deps(app, {
+        get_library_db: mock_db, get_discogs_service: mock_discogs,
+        get_posthog_client: None, get_settings: mock_settings,
+    }):
+        yield app
 
 
 class TestHandleLookup:
@@ -65,14 +63,12 @@ class TestHandleLookup:
         mock_posthog.capture = Mock()
         mock_posthog.flush = Mock()
 
-        app.dependency_overrides[get_library_db] = lambda: mock_db
-        app.dependency_overrides[get_discogs_service] = lambda: mock_discogs
-        app.dependency_overrides[get_posthog_client] = lambda: mock_posthog
-        app.dependency_overrides[get_settings] = lambda: mock_settings
-
         response = LookupResponse(results=[], search_type="direct")
 
-        try:
+        with override_deps(app, {
+            get_library_db: mock_db, get_discogs_service: mock_discogs,
+            get_posthog_client: mock_posthog, get_settings: mock_settings,
+        }):
             with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
                 mock_lookup.return_value = response
                 async with AsyncClient(
@@ -83,8 +79,6 @@ class TestHandleLookup:
             assert resp.status_code == 200
             # Telemetry sends capture calls via send_to_posthog
             assert mock_posthog.capture.call_count >= 1
-        finally:
-            app.dependency_overrides.clear()
 
     @pytest.mark.asyncio
     async def test_error_returns_500(self, app_client):

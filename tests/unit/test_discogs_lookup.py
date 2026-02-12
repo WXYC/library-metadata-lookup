@@ -8,10 +8,10 @@ from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
 from discogs.models import (
     DiscogsSearchRequest,
     DiscogsSearchResponse,
-    DiscogsSearchResult,
     ReleaseInfo,
     TrackReleasesResponse,
 )
+from tests.factories import make_discogs_result
 
 
 # ---------------------------------------------------------------------------
@@ -123,14 +123,9 @@ class TestLookupReleasesByArtist:
         service = AsyncMock()
         service.search = AsyncMock(
             return_value=DiscogsSearchResponse(
-                results=[
-                    DiscogsSearchResult(
-                        album="OK Computer",
-                        artist="Radiohead",
-                        release_id=1,
-                        release_url="https://discogs.com/release/1",
-                    )
-                ],
+                results=[make_discogs_result(
+                    release_id=1, album="OK Computer", artist="Radiohead",
+                )],
                 total=1,
             )
         )
@@ -150,14 +145,9 @@ class TestLookupReleasesByArtist:
         service = AsyncMock()
         service.search = AsyncMock(
             return_value=DiscogsSearchResponse(
-                results=[
-                    DiscogsSearchResult(
-                        album=None,
-                        artist=None,
-                        release_id=1,
-                        release_url="https://discogs.com/release/1",
-                    )
-                ],
+                results=[make_discogs_result(
+                    release_id=1, album=None, artist=None,
+                )],
                 total=1,
             )
         )

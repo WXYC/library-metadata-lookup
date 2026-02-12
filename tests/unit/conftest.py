@@ -1,5 +1,6 @@
 """Unit test fixtures."""
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
@@ -7,6 +8,25 @@ import pytest
 from config.settings import Settings
 from discogs.memory_cache import clear_all_caches, set_skip_cache
 from discogs.ratelimit import reset_rate_limiting
+
+
+@contextmanager
+def override_deps(app, overrides):
+    """Set FastAPI dependency overrides and clear them on exit.
+
+    Args:
+        app: The FastAPI application.
+        overrides: A dict mapping dependency functions to their replacement values.
+    """
+    def _make_override(val):
+        return lambda: val
+
+    for dep_fn, provider in overrides.items():
+        app.dependency_overrides[dep_fn] = _make_override(provider)
+    try:
+        yield app
+    finally:
+        app.dependency_overrides.clear()
 
 
 @pytest.fixture

@@ -16,17 +16,8 @@ from core.search import (
     no_results_and_song_but_no_artist,
     song_not_found_with_artist_and_song,
 )
-from library.models import LibraryItem
 from services.parser import ParsedRequest
-
-
-def _item(id=1, artist="Artist", title="Album", **kwargs):
-    defaults = dict(
-        call_letters="A", artist_call_number=1, release_call_number=1,
-        genre="Rock", format="CD",
-    )
-    defaults.update(kwargs)
-    return LibraryItem(id=id, artist=artist, title=title, **defaults)
+from tests.factories import make_library_item as _item
 
 
 # ---------------------------------------------------------------------------

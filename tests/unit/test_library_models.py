@@ -9,45 +9,33 @@ class TestLibraryItemCallNumber:
     @pytest.mark.parametrize(
         "kwargs, expected",
         [
-            # All fields present
-            (
+            pytest.param(
                 {
-                    "id": 1,
-                    "genre": "Rock",
-                    "format": "CD",
-                    "call_letters": "Q",
-                    "artist_call_number": 1,
+                    "id": 1, "genre": "Rock", "format": "CD",
+                    "call_letters": "Q", "artist_call_number": 1,
                     "release_call_number": 2,
                 },
                 "Rock CD Q 1/2",
+                id="all-fields",
             ),
-            # No release_call_number
-            (
+            pytest.param(
                 {
-                    "id": 2,
-                    "genre": "Rock",
-                    "format": "CD",
-                    "call_letters": "Q",
-                    "artist_call_number": 1,
+                    "id": 2, "genre": "Rock", "format": "CD",
+                    "call_letters": "Q", "artist_call_number": 1,
                 },
                 "Rock CD Q 1",
+                id="no-release-num",
             ),
-            # Only genre
-            ({"id": 3, "genre": "Jazz"}, "Jazz"),
-            # Only format
-            ({"id": 4, "format": "LP"}, "LP"),
-            # Empty (all None)
-            ({"id": 5}, ""),
-            # release_call_number without artist_call_number shouldn't crash
-            (
+            pytest.param({"id": 3, "genre": "Jazz"}, "Jazz", id="genre-only"),
+            pytest.param({"id": 4, "format": "LP"}, "LP", id="format-only"),
+            pytest.param({"id": 5}, "", id="all-none"),
+            pytest.param(
                 {
-                    "id": 6,
-                    "genre": "Rock",
-                    "call_letters": "Q",
-                    "artist_call_number": 5,
-                    "release_call_number": 3,
+                    "id": 6, "genre": "Rock", "call_letters": "Q",
+                    "artist_call_number": 5, "release_call_number": 3,
                 },
                 "Rock Q 5/3",
+                id="no-format",
             ),
         ],
     )
