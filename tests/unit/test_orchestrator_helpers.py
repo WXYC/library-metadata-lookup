@@ -16,7 +16,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResponse
-from tests.factories import make_discogs_result, make_library_item
 from lookup.orchestrator import (
     build_context_message,
     fetch_artwork_for_items,
@@ -27,7 +26,7 @@ from lookup.orchestrator import (
     search_with_alternative_interpretation,
 )
 from services.parser import MessageType, ParsedRequest
-
+from tests.factories import make_discogs_result, make_library_item
 
 # ---------------------------------------------------------------------------
 # Tests: filter_results_by_artist
@@ -129,16 +128,23 @@ class TestBuildContextMessage:
 
     def test_compilation_context(self):
         parsed = ParsedRequest(
-            song="Test Song", artist="Test Artist", raw_message="Test",
-            is_request=True, message_type=MessageType.REQUEST,
+            song="Test Song",
+            artist="Test Artist",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         context = build_context_message(parsed, found_on_compilation=True, song_not_found=False)
         assert context == 'Found "Test Song" by Test Artist on:'
 
     def test_album_not_found_context(self):
         parsed = ParsedRequest(
-            song="Test Song", artist="Test Artist", album="Test Album",
-            raw_message="Test", is_request=True, message_type=MessageType.REQUEST,
+            song="Test Song",
+            artist="Test Artist",
+            album="Test Album",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         context = build_context_message(parsed, found_on_compilation=False, song_not_found=True)
         assert "not found in the library" in context
@@ -146,23 +152,33 @@ class TestBuildContextMessage:
 
     def test_song_not_found_context(self):
         parsed = ParsedRequest(
-            song="Test Song", artist="Test Artist", raw_message="Test",
-            is_request=True, message_type=MessageType.REQUEST,
+            song="Test Song",
+            artist="Test Artist",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         context = build_context_message(parsed, found_on_compilation=False, song_not_found=True)
         assert "is not on any album" in context
 
     def test_returns_none_when_normal(self):
         parsed = ParsedRequest(
-            song="Test Song", artist="Test Artist", album="Test Album",
-            raw_message="Test", is_request=True, message_type=MessageType.REQUEST,
+            song="Test Song",
+            artist="Test Artist",
+            album="Test Album",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         assert build_context_message(parsed, False, False) is None
 
     def test_no_results_context(self):
         parsed = ParsedRequest(
-            song="Test Song", artist="Test Artist", raw_message="Test",
-            is_request=True, message_type=MessageType.REQUEST,
+            song="Test Song",
+            artist="Test Artist",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         context = build_context_message(parsed, False, True, has_results=False)
         assert "not found in library" in context
@@ -179,8 +195,12 @@ class TestResolveAlbumsForTrack:
     @pytest.mark.asyncio
     async def test_returns_album_when_already_provided(self):
         parsed = ParsedRequest(
-            song="Bohemian Rhapsody", artist="Queen", album="A Night at the Opera",
-            raw_message="Test", is_request=True, message_type=MessageType.REQUEST,
+            song="Bohemian Rhapsody",
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         albums, not_found = await resolve_albums_for_track(parsed)
         assert albums == ["A Night at the Opera"]
@@ -189,8 +209,11 @@ class TestResolveAlbumsForTrack:
     @pytest.mark.asyncio
     async def test_looks_up_album_when_missing(self, mock_discogs_service):
         parsed = ParsedRequest(
-            song="Percolator", artist="Stereolab", raw_message="Test",
-            is_request=True, message_type=MessageType.REQUEST,
+            song="Percolator",
+            artist="Stereolab",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         with patch(
             "lookup.orchestrator.lookup_releases_by_track",
@@ -206,8 +229,11 @@ class TestResolveAlbumsForTrack:
     @pytest.mark.asyncio
     async def test_returns_empty_when_no_discogs_results(self, mock_discogs_service):
         parsed = ParsedRequest(
-            song="Unknown Song", artist="Unknown Artist", raw_message="Test",
-            is_request=True, message_type=MessageType.REQUEST,
+            song="Unknown Song",
+            artist="Unknown Artist",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         with patch(
             "lookup.orchestrator.lookup_releases_by_track",
@@ -223,8 +249,10 @@ class TestResolveAlbumsForTrack:
     async def test_skips_lookup_without_artist(self):
         """Without artist, skip Discogs lookup (results are unreliable)."""
         parsed = ParsedRequest(
-            song="Laid Back", raw_message="Laid Back",
-            is_request=True, message_type=MessageType.REQUEST,
+            song="Laid Back",
+            raw_message="Laid Back",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         albums, not_found = await resolve_albums_for_track(parsed)
         assert albums == []
@@ -234,8 +262,11 @@ class TestResolveAlbumsForTrack:
     async def test_filters_releases_by_diacritics_artist(self, mock_discogs_service):
         """Discogs returns 'Björk' but query artist is 'Björk' - should match."""
         parsed = ParsedRequest(
-            song="Army of Me", artist="Björk", raw_message="Test",
-            is_request=True, message_type=MessageType.REQUEST,
+            song="Army of Me",
+            artist="Björk",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         with patch(
             "lookup.orchestrator.lookup_releases_by_track",
@@ -251,8 +282,12 @@ class TestResolveAlbumsForTrack:
     async def test_treats_album_equals_artist_as_missing(self, mock_discogs_service):
         """When parser sets album = artist name, treat as missing."""
         parsed = ParsedRequest(
-            song="Test Song", artist="Stereolab", album="Stereolab",
-            raw_message="Test", is_request=True, message_type=MessageType.REQUEST,
+            song="Test Song",
+            artist="Stereolab",
+            album="Stereolab",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
         with patch(
             "lookup.orchestrator.lookup_releases_by_track",
@@ -275,14 +310,19 @@ class TestSearchLibraryWithFallback:
     @pytest.mark.asyncio
     async def test_finds_by_artist_plus_album(self, mock_library_db):
         item = make_library_item(
-            id=1, artist="Queen", title="A Night at the Opera",
+            id=1,
+            artist="Queen",
+            title="A Night at the Opera",
             call_letters="Q",
         )
         mock_library_db.search.return_value = [item]
 
         parsed = ParsedRequest(
-            song="Bohemian Rhapsody", artist="Queen", raw_message="Test",
-            is_request=True, message_type=MessageType.REQUEST,
+            song="Bohemian Rhapsody",
+            artist="Queen",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
 
         results, fallback = await search_library_with_fallback(
@@ -294,8 +334,11 @@ class TestSearchLibraryWithFallback:
     @pytest.mark.asyncio
     async def test_falls_back_to_artist_only(self, mock_library_db):
         item = make_library_item(
-            id=2, artist="Queen", title="The Game",
-            call_letters="Q", release_call_number=2,
+            id=2,
+            artist="Queen",
+            title="The Game",
+            call_letters="Q",
+            release_call_number=2,
         )
         mock_library_db.search.side_effect = [
             [],  # artist + album
@@ -304,8 +347,12 @@ class TestSearchLibraryWithFallback:
         ]
 
         parsed = ParsedRequest(
-            song="Test Song", artist="Queen", album="Unknown Album",
-            raw_message="Test", is_request=True, message_type=MessageType.REQUEST,
+            song="Test Song",
+            artist="Queen",
+            album="Unknown Album",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
 
         results, fallback = await search_library_with_fallback(
@@ -319,18 +366,26 @@ class TestSearchLibraryWithFallback:
         """Regression: 'Wireless' album search should not also return 'Stator'."""
         mock_library_db.search.return_value = [
             make_library_item(
-                id=1, artist="Biosphere", title="Wireless",
+                id=1,
+                artist="Biosphere",
+                title="Wireless",
                 call_letters="B",
             ),
             make_library_item(
-                id=2, artist="Biosphere", title="Stator",
-                call_letters="B", release_call_number=2,
+                id=2,
+                artist="Biosphere",
+                title="Stator",
+                call_letters="B",
+                release_call_number=2,
             ),
         ]
 
         parsed = ParsedRequest(
-            song="The Things I Tell You", artist="Biosphere", raw_message="Test",
-            is_request=True, message_type=MessageType.REQUEST,
+            song="The Things I Tell You",
+            artist="Biosphere",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
         )
 
         results, fallback = await search_library_with_fallback(
@@ -400,11 +455,11 @@ class TestFilterResultsByTrackValidation:
         ]
 
         search_result = make_discogs_result(
-            release_id=12345, album="A Night at the Opera", artist="Queen",
+            release_id=12345,
+            album="A Night at the Opera",
+            artist="Queen",
         )
-        mock_discogs_service.search.return_value = DiscogsSearchResponse(
-            results=[search_result]
-        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[search_result])
         mock_discogs_service.validate_track_on_release.side_effect = [True, False]
 
         validated = await filter_results_by_track_validation(
@@ -449,7 +504,9 @@ class TestFetchArtworkForItems:
         ]
 
         artwork = make_discogs_result(
-            release_id=12345, album="A Night at the Opera", artist="Queen",
+            release_id=12345,
+            album="A Night at the Opera",
+            artist="Queen",
             artwork_url="https://example.com/cover.jpg",
         )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
@@ -475,17 +532,23 @@ class TestFetchArtworkForItems:
     async def test_uses_discogs_titles_for_compilation_lookup(self, mock_discogs_service):
         """For compilations, use the Discogs album title (not library title) for artwork."""
         item = make_library_item(
-            id=20, artist="Various Artists - Rock - D", title="Disco Not Disco",
+            id=20,
+            artist="Various Artists - Rock - D",
+            title="Disco Not Disco",
         )
 
         artwork = make_discogs_result(
-            release_id=99999, album="Disco Not Disco", artist="Various",
+            release_id=99999,
+            album="Disco Not Disco",
+            artist="Various",
             artwork_url="https://example.com/disco.jpg",
         )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
 
         discogs_titles = {20: "Disco Not Disco (Post Punk, Electro & Leftfield Disco Classics)"}
-        results = await fetch_artwork_for_items(items=[item], discogs_service=mock_discogs_service, discogs_titles=discogs_titles)
+        results = await fetch_artwork_for_items(
+            items=[item], discogs_service=mock_discogs_service, discogs_titles=discogs_titles
+        )
 
         assert len(results) == 1
         # Should have looked up with the Discogs title, not the library title

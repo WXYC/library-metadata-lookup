@@ -1,6 +1,6 @@
 """Unit tests for main.py."""
 
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -12,10 +12,11 @@ class TestLifespan:
         """Lifespan context manager calls shutdown functions on exit."""
         from main import app, lifespan
 
-        with patch("main.shutdown_posthog") as mock_ph_shutdown, \
-             patch("main.close_library_db", new_callable=AsyncMock) as mock_db_close, \
-             patch("main.close_discogs_service", new_callable=AsyncMock) as mock_discogs_close:
-
+        with (
+            patch("main.shutdown_posthog") as mock_ph_shutdown,
+            patch("main.close_library_db", new_callable=AsyncMock) as mock_db_close,
+            patch("main.close_discogs_service", new_callable=AsyncMock) as mock_discogs_close,
+        ):
             async with lifespan(app):
                 pass  # startup
 
@@ -29,9 +30,9 @@ class TestMiddleware:
     @pytest.mark.asyncio
     async def test_posthog_flush_middleware(self, mock_settings):
         """PostHog flush middleware flushes after each request."""
-        from main import app
-        from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
         from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
 
         mock_db = AsyncMock()
         mock_db.is_available = AsyncMock(return_value=True)

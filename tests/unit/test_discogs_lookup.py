@@ -6,13 +6,11 @@ import pytest
 
 from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
 from discogs.models import (
-    DiscogsSearchRequest,
     DiscogsSearchResponse,
     ReleaseInfo,
     TrackReleasesResponse,
 )
 from tests.factories import make_discogs_result
-
 
 # ---------------------------------------------------------------------------
 # lookup_releases_by_track
@@ -40,9 +38,7 @@ class TestLookupReleasesByTrack:
         )
         service.validate_track_on_release = AsyncMock(return_value=True)
 
-        result = await lookup_releases_by_track(
-            "Bohemian Rhapsody", "Queen", service=service
-        )
+        result = await lookup_releases_by_track("Bohemian Rhapsody", "Queen", service=service)
         assert len(result) == 1
         assert result[0] == ("Queen", "A Night at the Opera")
 
@@ -123,9 +119,13 @@ class TestLookupReleasesByArtist:
         service = AsyncMock()
         service.search = AsyncMock(
             return_value=DiscogsSearchResponse(
-                results=[make_discogs_result(
-                    release_id=1, album="OK Computer", artist="Radiohead",
-                )],
+                results=[
+                    make_discogs_result(
+                        release_id=1,
+                        album="OK Computer",
+                        artist="Radiohead",
+                    )
+                ],
                 total=1,
             )
         )
@@ -145,9 +145,13 @@ class TestLookupReleasesByArtist:
         service = AsyncMock()
         service.search = AsyncMock(
             return_value=DiscogsSearchResponse(
-                results=[make_discogs_result(
-                    release_id=1, album=None, artist=None,
-                )],
+                results=[
+                    make_discogs_result(
+                        release_id=1,
+                        album=None,
+                        artist=None,
+                    )
+                ],
                 total=1,
             )
         )

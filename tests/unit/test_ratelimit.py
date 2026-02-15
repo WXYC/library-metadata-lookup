@@ -1,7 +1,5 @@
 """Unit tests for discogs/ratelimit.py."""
 
-from unittest.mock import patch
-
 import pytest
 
 from discogs.ratelimit import (

@@ -54,7 +54,10 @@ def mock_library_db_real():
 def sample_library_item():
     """Create a sample library item for testing."""
     return make_library_item(
-        id=1, artist="Queen", title="A Night at the Opera", call_letters="Q",
+        id=1,
+        artist="Queen",
+        title="A Night at the Opera",
+        call_letters="Q",
     )
 
 
@@ -63,11 +66,17 @@ def sample_library_items():
     """Create multiple sample library items for testing."""
     return [
         make_library_item(
-            id=1, artist="Queen", title="A Night at the Opera", call_letters="Q",
+            id=1,
+            artist="Queen",
+            title="A Night at the Opera",
+            call_letters="Q",
         ),
         make_library_item(
-            id=2, artist="Queen", title="The Game",
-            call_letters="Q", release_call_number=2,
+            id=2,
+            artist="Queen",
+            title="The Game",
+            call_letters="Q",
+            release_call_number=2,
         ),
     ]
 

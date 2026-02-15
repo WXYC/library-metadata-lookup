@@ -176,9 +176,7 @@ class TestParseTitle:
 class TestProcessSearchResult:
     def test_valid_result(self, service):
         seen = set()
-        result = service._process_search_result(
-            {"title": "Queen - The Game", "id": 123}, seen
-        )
+        result = service._process_search_result({"title": "Queen - The Game", "id": 123}, seen)
         assert result is not None
         assert result.album == "The Game"
         assert result.artist == "Queen"
@@ -190,15 +188,11 @@ class TestProcessSearchResult:
 
     def test_duplicate_skipped(self, service):
         seen = {"the game"}
-        result = service._process_search_result(
-            {"title": "Queen - The Game", "id": 123}, seen
-        )
+        result = service._process_search_result({"title": "Queen - The Game", "id": 123}, seen)
         assert result is None
 
     def test_no_id_returns_none(self, service):
-        result = service._process_search_result(
-            {"title": "Queen - The Game"}, set()
-        )
+        result = service._process_search_result({"title": "Queen - The Game"}, set())
         assert result is None
 
     def test_compilation_detection(self, service):
@@ -221,11 +215,11 @@ class TestSearchReleasesByTrack:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.raise_for_status = MagicMock()
-        mock_resp.json.return_value = {
-            "results": [{"title": "Queen - The Game", "id": 123}]
-        }
+        mock_resp.json.return_value = {"results": [{"title": "Queen - The Game", "id": 123}]}
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.search_releases_by_track("Crazy Little Thing", "Queen")
 
         assert isinstance(result, TrackReleasesResponse)
@@ -260,7 +254,12 @@ class TestSearchReleasesByTrack:
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"results": []}
 
-        with patch.object(service_with_cache, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ):
             result = await service_with_cache.search_releases_by_track("Song", "Queen")
         assert isinstance(result, TrackReleasesResponse)
 
@@ -278,7 +277,8 @@ class TestSearchReleasesByTrack:
         resp2.json.return_value = {"results": [{"title": "Queen - Album2", "id": 2}]}
 
         with patch.object(
-            service, "_request_with_retry",
+            service,
+            "_request_with_retry",
             new_callable=AsyncMock,
             side_effect=[resp1, resp2],
         ):
@@ -289,7 +289,8 @@ class TestSearchReleasesByTrack:
     @pytest.mark.asyncio
     async def test_api_exception_returns_empty(self, service):
         with patch.object(
-            service, "_request_with_retry",
+            service,
+            "_request_with_retry",
             new_callable=AsyncMock,
             side_effect=Exception("API error"),
         ):
@@ -321,7 +322,9 @@ class TestGetRelease:
             "images": [{"uri": "https://img.com/cover.jpg"}],
         }
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.get_release(12345)
 
         assert result is not None
@@ -348,7 +351,9 @@ class TestGetRelease:
 
     @pytest.mark.asyncio
     async def test_404_returns_none(self, service):
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=None):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=None
+        ):
             result = await service.get_release(99999)
         assert result is None
 
@@ -370,15 +375,22 @@ class TestGetRelease:
             "styles": [],
         }
 
-        with patch.object(service_with_cache, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
-            result = await service_with_cache.get_release(456)
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ):
+            await service_with_cache.get_release(456)
 
         service_with_cache.cache_service.write_release.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_cache_write_error_still_returns(self, service_with_cache):
         service_with_cache.cache_service.get_release = AsyncMock(return_value=None)
-        service_with_cache.cache_service.write_release = AsyncMock(side_effect=Exception("write fail"))
+        service_with_cache.cache_service.write_release = AsyncMock(
+            side_effect=Exception("write fail")
+        )
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -393,7 +405,12 @@ class TestGetRelease:
             "styles": [],
         }
 
-        with patch.object(service_with_cache, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ):
             result = await service_with_cache.get_release(789)
 
         assert result is not None
@@ -414,7 +431,9 @@ class TestSearch:
             "results": [{"title": "Queen - The Game", "id": 1, "thumb": "https://img.com/t.jpg"}]
         }
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.search(DiscogsSearchRequest(artist="Queen", album="The Game"))
 
         assert isinstance(result, DiscogsSearchResponse)
@@ -436,7 +455,8 @@ class TestSearch:
         }
 
         with patch.object(
-            service, "_request_with_retry",
+            service,
+            "_request_with_retry",
             new_callable=AsyncMock,
             side_effect=[resp_empty, resp_fuzzy],
         ):
@@ -477,7 +497,8 @@ class TestSearch:
         mock_resp.json.return_value = {"results": []}
 
         with patch.object(
-            service_with_cache, "_request_with_retry",
+            service_with_cache,
+            "_request_with_retry",
             new_callable=AsyncMock,
             return_value=mock_resp,
         ):
@@ -493,7 +514,9 @@ class TestSearch:
             "results": [{"title": "Art - Alb", "id": 1, "thumb": "https://img.com/spacer.gif"}]
         }
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.search(DiscogsSearchRequest(artist="Art"))
         assert result.results[0].artwork_url is None
 
@@ -512,9 +535,7 @@ class TestBuildSearchParams:
         assert params["release_title"] == "The Game"
 
     def test_artist_and_track(self, service):
-        params = service._build_search_params(
-            DiscogsSearchRequest(artist="Queen", track="Song")
-        )
+        params = service._build_search_params(DiscogsSearchRequest(artist="Queen", track="Song"))
         assert params["release_title"] == "Song"
 
     def test_no_fields_returns_empty(self, service):
@@ -597,6 +618,8 @@ class TestValidateTrackOnRelease:
             release_url="https://discogs.com/release/1",
             tracklist=[TrackItem(position="1", title="Song")],
         )
-        with patch.object(service_with_cache, "get_release", new_callable=AsyncMock, return_value=release):
+        with patch.object(
+            service_with_cache, "get_release", new_callable=AsyncMock, return_value=release
+        ):
             result = await service_with_cache.validate_track_on_release(1, "Song", "Queen")
         assert result is True

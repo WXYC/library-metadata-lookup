@@ -18,6 +18,7 @@ def override_deps(app, overrides):
         app: The FastAPI application.
         overrides: A dict mapping dependency functions to their replacement values.
     """
+
     def _make_override(val):
         return lambda: val
 

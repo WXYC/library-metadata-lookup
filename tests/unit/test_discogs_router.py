@@ -11,11 +11,10 @@ from discogs.models import (
     ReleaseMetadataResponse,
     TrackReleasesResponse,
 )
-from tests.factories import make_discogs_result
 from discogs.router import _require_service
 from discogs.service import DiscogsService
+from tests.factories import make_discogs_result
 from tests.unit.conftest import override_deps
-
 
 # ---------------------------------------------------------------------------
 # _require_service
@@ -46,27 +45,37 @@ def mock_discogs():
 
 @pytest.fixture
 def app_with_discogs(mock_discogs, mock_settings):
-    from main import app
-    from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
     from config.settings import get_settings
+    from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+    from main import app
 
-    with override_deps(app, {
-        get_library_db: AsyncMock(), get_discogs_service: mock_discogs,
-        get_posthog_client: None, get_settings: mock_settings,
-    }):
+    with override_deps(
+        app,
+        {
+            get_library_db: AsyncMock(),
+            get_discogs_service: mock_discogs,
+            get_posthog_client: None,
+            get_settings: mock_settings,
+        },
+    ):
         yield app
 
 
 @pytest.fixture
 def app_without_discogs(mock_settings):
-    from main import app
-    from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
     from config.settings import get_settings
+    from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+    from main import app
 
-    with override_deps(app, {
-        get_library_db: AsyncMock(), get_discogs_service: None,
-        get_posthog_client: None, get_settings: mock_settings,
-    }):
+    with override_deps(
+        app,
+        {
+            get_library_db: AsyncMock(),
+            get_discogs_service: None,
+            get_posthog_client: None,
+            get_settings: mock_settings,
+        },
+    ):
         yield app
 
 
@@ -80,9 +89,7 @@ class TestTrackReleases:
         async with AsyncClient(
             transport=ASGITransport(app=app_with_discogs), base_url="http://test"
         ) as client:
-            resp = await client.get(
-                "/api/v1/discogs/track-releases", params={"track": "Song"}
-            )
+            resp = await client.get("/api/v1/discogs/track-releases", params={"track": "Song"})
 
         assert resp.status_code == 200
 
@@ -91,9 +98,7 @@ class TestTrackReleases:
         async with AsyncClient(
             transport=ASGITransport(app=app_without_discogs), base_url="http://test"
         ) as client:
-            resp = await client.get(
-                "/api/v1/discogs/track-releases", params={"track": "Song"}
-            )
+            resp = await client.get("/api/v1/discogs/track-releases", params={"track": "Song"})
 
         assert resp.status_code == 503
 
@@ -103,7 +108,9 @@ class TestGetRelease:
     async def test_found(self, app_with_discogs, mock_discogs):
         mock_discogs.get_release = AsyncMock(
             return_value=ReleaseMetadataResponse(
-                release_id=123, title="Album", artist="Artist",
+                release_id=123,
+                title="Album",
+                artist="Artist",
                 release_url="https://discogs.com/release/123",
             )
         )
@@ -142,9 +149,13 @@ class TestSearchReleases:
     async def test_success(self, app_with_discogs, mock_discogs):
         mock_discogs.search = AsyncMock(
             return_value=DiscogsSearchResponse(
-                results=[make_discogs_result(
-                    release_id=1, album="Album", artist="Artist",
-                )],
+                results=[
+                    make_discogs_result(
+                        release_id=1,
+                        album="Album",
+                        artist="Artist",
+                    )
+                ],
                 total=1,
             )
         )
@@ -174,8 +185,6 @@ class TestSearchReleases:
         async with AsyncClient(
             transport=ASGITransport(app=app_without_discogs), base_url="http://test"
         ) as client:
-            resp = await client.post(
-                "/api/v1/discogs/search", json={"artist": "Artist"}
-            )
+            resp = await client.post("/api/v1/discogs/search", json={"artist": "Artist"})
 
         assert resp.status_code == 503

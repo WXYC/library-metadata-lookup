@@ -58,8 +58,20 @@ class TestSearchReleasesByTrack:
     async def test_deduplicates(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetch = AsyncMock(
             return_value=[
-                {"release_id": 1, "title": "Album", "artist_name": "A", "track_title": "S", "is_compilation": False},
-                {"release_id": 2, "title": "Album", "artist_name": "A", "track_title": "S", "is_compilation": False},
+                {
+                    "release_id": 1,
+                    "title": "Album",
+                    "artist_name": "A",
+                    "track_title": "S",
+                    "is_compilation": False,
+                },
+                {
+                    "release_id": 2,
+                    "title": "Album",
+                    "artist_name": "A",
+                    "track_title": "S",
+                    "is_compilation": False,
+                },
             ]
         )
 
@@ -69,7 +81,13 @@ class TestSearchReleasesByTrack:
     @pytest.mark.asyncio
     async def test_respects_limit(self, cache_service, mock_asyncpg_pool):
         rows = [
-            {"release_id": i, "title": f"Album{i}", "artist_name": "A", "track_title": "S", "is_compilation": False}
+            {
+                "release_id": i,
+                "title": f"Album{i}",
+                "artist_name": "A",
+                "track_title": "S",
+                "is_compilation": False,
+            }
             for i in range(10)
         ]
         mock_asyncpg_pool.fetch = AsyncMock(return_value=rows)
@@ -128,7 +146,12 @@ class TestGetRelease:
     @pytest.mark.asyncio
     async def test_with_track_artists(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetchrow = AsyncMock(
-            return_value={"id": 1, "title": "Compilation", "release_year": 2000, "artwork_url": None}
+            return_value={
+                "id": 1,
+                "title": "Compilation",
+                "release_year": 2000,
+                "artwork_url": None,
+            }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
             side_effect=[
@@ -175,7 +198,9 @@ class TestWriteRelease:
     async def test_error_raises(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.acquire.return_value.__aenter__ = AsyncMock(side_effect=Exception("fail"))
         release = ReleaseMetadataResponse(
-            release_id=1, title="A", artist="B",
+            release_id=1,
+            title="A",
+            artist="B",
             release_url="https://discogs.com/release/1",
         )
         with pytest.raises(CacheUnavailableError):
@@ -197,7 +222,13 @@ class TestSearchReleases:
     async def test_artist_and_album(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetch = AsyncMock(
             return_value=[
-                {"release_id": 1, "title": "Album", "artist_name": "Artist", "artwork_url": None, "score": 0.8}
+                {
+                    "release_id": 1,
+                    "title": "Album",
+                    "artist_name": "Artist",
+                    "artwork_url": None,
+                    "score": 0.8,
+                }
             ]
         )
         result = await cache_service.search_releases(artist="Artist", album="Album")
@@ -207,7 +238,13 @@ class TestSearchReleases:
     async def test_artist_only(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetch = AsyncMock(
             return_value=[
-                {"release_id": 1, "title": "Album", "artist_name": "Artist", "artwork_url": None, "score": 0.8}
+                {
+                    "release_id": 1,
+                    "title": "Album",
+                    "artist_name": "Artist",
+                    "artwork_url": None,
+                    "score": 0.8,
+                }
             ]
         )
         result = await cache_service.search_releases(artist="Artist")
@@ -217,7 +254,13 @@ class TestSearchReleases:
     async def test_album_only(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetch = AsyncMock(
             return_value=[
-                {"release_id": 1, "title": "Album", "artist_name": "Artist", "artwork_url": None, "score": 0.8}
+                {
+                    "release_id": 1,
+                    "title": "Album",
+                    "artist_name": "Artist",
+                    "artwork_url": None,
+                    "score": 0.8,
+                }
             ]
         )
         result = await cache_service.search_releases(album="Album")
@@ -227,8 +270,20 @@ class TestSearchReleases:
     async def test_deduplicates(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetch = AsyncMock(
             return_value=[
-                {"release_id": 1, "title": "Album", "artist_name": "A1", "artwork_url": None, "score": 0.8},
-                {"release_id": 2, "title": "Album", "artist_name": "A2", "artwork_url": None, "score": 0.7},
+                {
+                    "release_id": 1,
+                    "title": "Album",
+                    "artist_name": "A1",
+                    "artwork_url": None,
+                    "score": 0.8,
+                },
+                {
+                    "release_id": 2,
+                    "title": "Album",
+                    "artist_name": "A2",
+                    "artwork_url": None,
+                    "score": 0.7,
+                },
             ]
         )
         result = await cache_service.search_releases(artist="A1")

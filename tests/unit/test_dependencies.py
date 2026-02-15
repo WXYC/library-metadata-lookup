@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-from config.settings import Settings
+import core.dependencies as deps_module
 from core.dependencies import (
     close_discogs_service,
     close_library_db,
@@ -14,7 +14,6 @@ from core.dependencies import (
     get_posthog_client,
     shutdown_posthog,
 )
-import core.dependencies as deps_module
 
 
 @pytest.fixture(autouse=True)
@@ -43,13 +42,13 @@ class TestGetLibraryDB:
         db_file.touch()
         mock_settings.library_db_path = str(db_file)
 
-        with patch("core.dependencies.LibraryDB") as MockDB:
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
             mock_db = AsyncMock()
-            MockDB.return_value = mock_db
+            mock_db_cls.return_value = mock_db
 
             result = await get_library_db(mock_settings)
 
-            MockDB.assert_called_once()
+            mock_db_cls.assert_called_once()
             mock_db.connect.assert_called_once()
             assert result is mock_db
 
@@ -66,8 +65,8 @@ class TestGetLibraryDB:
     async def test_init_error_raises(self, mock_settings):
         from core.exceptions import ServiceInitializationError
 
-        with patch("core.dependencies.LibraryDB") as MockDB:
-            MockDB.return_value.connect = AsyncMock(side_effect=Exception("no db"))
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            mock_db_cls.return_value.connect = AsyncMock(side_effect=Exception("no db"))
 
             with pytest.raises(ServiceInitializationError):
                 await get_library_db(mock_settings)
@@ -112,13 +111,13 @@ class TestGetDiscogsService:
         mock_settings.discogs_token = "test-token"
         mock_settings.database_url_discogs = None
 
-        with patch("core.dependencies.DiscogsService") as MockSvc:
+        with patch("core.dependencies.DiscogsService") as mock_svc_cls:
             mock_svc = AsyncMock()
-            MockSvc.return_value = mock_svc
+            mock_svc_cls.return_value = mock_svc
 
             result = await get_discogs_service(mock_settings)
 
-            MockSvc.assert_called_once_with("test-token", cache_service=None)
+            mock_svc_cls.assert_called_once_with("test-token", cache_service=None)
             assert result is mock_svc
 
     @pytest.mark.asyncio
@@ -128,38 +127,43 @@ class TestGetDiscogsService:
 
         mock_pool = AsyncMock()
 
-        with patch("core.dependencies.asyncpg.create_pool", new_callable=AsyncMock) as mock_create, \
-             patch("core.dependencies.DiscogsCacheService") as MockCache, \
-             patch("core.dependencies.DiscogsService") as MockSvc:
+        with (
+            patch("core.dependencies.asyncpg.create_pool", new_callable=AsyncMock) as mock_create,
+            patch("core.dependencies.DiscogsCacheService") as mock_cache_cls,
+            patch("core.dependencies.DiscogsService") as mock_svc_cls,
+        ):
             mock_create.return_value = mock_pool
             mock_cache = MagicMock()
-            MockCache.return_value = mock_cache
+            mock_cache_cls.return_value = mock_cache
             mock_svc = AsyncMock()
-            MockSvc.return_value = mock_svc
+            mock_svc_cls.return_value = mock_svc
 
-            result = await get_discogs_service(mock_settings)
+            await get_discogs_service(mock_settings)
 
             mock_create.assert_called_once()
-            MockCache.assert_called_once_with(mock_pool)
-            MockSvc.assert_called_once_with("test-token", cache_service=mock_cache)
+            mock_cache_cls.assert_called_once_with(mock_pool)
+            mock_svc_cls.assert_called_once_with("test-token", cache_service=mock_cache)
 
     @pytest.mark.asyncio
     async def test_pool_error_degrades_gracefully(self, mock_settings):
         mock_settings.discogs_token = "test-token"
         mock_settings.database_url_discogs = "postgresql://localhost/test"
 
-        with patch(
-            "core.dependencies.asyncpg.create_pool",
-            new_callable=AsyncMock,
-            side_effect=Exception("connection refused"),
-        ), patch("core.dependencies.DiscogsService") as MockSvc:
+        with (
+            patch(
+                "core.dependencies.asyncpg.create_pool",
+                new_callable=AsyncMock,
+                side_effect=Exception("connection refused"),
+            ),
+            patch("core.dependencies.DiscogsService") as mock_svc_cls,
+        ):
             mock_svc = AsyncMock()
-            MockSvc.return_value = mock_svc
+            mock_svc_cls.return_value = mock_svc
 
-            result = await get_discogs_service(mock_settings)
+            await get_discogs_service(mock_settings)
 
             # Service created without cache
-            MockSvc.assert_called_once_with("test-token", cache_service=None)
+            mock_svc_cls.assert_called_once_with("test-token", cache_service=None)
 
     @pytest.mark.asyncio
     async def test_cached_instance(self, mock_settings):
@@ -216,13 +220,13 @@ class TestGetPosthogClient:
         mock_settings.posthog_api_key = "phc_test"
         mock_settings.posthog_host = "https://app.posthog.com"
 
-        with patch("core.dependencies.Posthog") as MockPH:
+        with patch("core.dependencies.Posthog") as mock_ph_cls:
             mock_client = Mock()
-            MockPH.return_value = mock_client
+            mock_ph_cls.return_value = mock_client
 
             result = get_posthog_client(mock_settings)
 
-            MockPH.assert_called_once_with(
+            mock_ph_cls.assert_called_once_with(
                 project_api_key="phc_test",
                 host="https://app.posthog.com",
             )

@@ -1,6 +1,6 @@
 """Unit tests for core/sentry.py."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from core.sentry import add_discogs_breadcrumb, capture_exception, init_sentry
 

@@ -11,7 +11,7 @@ These tests verify perform_lookup() orchestrates the full pipeline:
 All external dependencies (LibraryDB, DiscogsService) are mocked.
 """
 
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -19,10 +19,8 @@ from core.telemetry import RequestTelemetry
 from discogs.models import DiscogsSearchResponse
 from library.models import LibraryItem
 from lookup.models import LookupRequest, LookupResponse
-from tests.factories import make_discogs_result, make_library_item
 from lookup.orchestrator import perform_lookup
-from services.parser import MessageType, ParsedRequest
-
+from tests.factories import make_discogs_result, make_library_item
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -106,10 +104,14 @@ class TestPerformLookupBasic:
         """Direct match: artist + album finds results immediately."""
         mock_library_db.search.return_value = [queen_item]
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
-            results=[make_discogs_result(
-                release_id=12345, album="A Night at the Opera", artist="Queen",
-                artwork_url="https://example.com/cover.jpg",
-            )]
+            results=[
+                make_discogs_result(
+                    release_id=12345,
+                    album="A Night at the Opera",
+                    artist="Queen",
+                    artwork_url="https://example.com/cover.jpg",
+                )
+            ]
         )
 
         request = LookupRequest(
@@ -128,9 +130,7 @@ class TestPerformLookupBasic:
         assert response.song_not_found is False
 
     @pytest.mark.asyncio
-    async def test_no_results_returns_empty(
-        self, mock_library_db, mock_discogs_service, telemetry
-    ):
+    async def test_no_results_returns_empty(self, mock_library_db, mock_discogs_service, telemetry):
         """When nothing matches, return empty results."""
         mock_library_db.search.return_value = []
         mock_library_db.find_similar_artist.return_value = None
@@ -147,9 +147,7 @@ class TestPerformLookupBasic:
         assert len(response.results) == 0
 
     @pytest.mark.asyncio
-    async def test_no_discogs_service_still_works(
-        self, mock_library_db, telemetry, queen_item
-    ):
+    async def test_no_discogs_service_still_works(self, mock_library_db, telemetry, queen_item):
         """Pipeline works without Discogs (artwork will be None)."""
         mock_library_db.search.return_value = [queen_item]
 
@@ -288,11 +286,11 @@ class TestPerformLookupFallback:
 
         # Discogs validates: "Bohemian Rhapsody" is on "A Night at the Opera" but not "The Game"
         search_result = make_discogs_result(
-            release_id=12345, album="A Night at the Opera", artist="Queen",
+            release_id=12345,
+            album="A Night at the Opera",
+            artist="Queen",
         )
-        mock_discogs_service.search.return_value = DiscogsSearchResponse(
-            results=[search_result]
-        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[search_result])
         # validate_track_on_release: True for queen_item, False for queen_game_item
         mock_discogs_service.validate_track_on_release.side_effect = [True, False]
 
@@ -334,7 +332,10 @@ class TestPerformLookupCompilations:
 
         # A fallback item that would be returned by artist-only search
         fallback_item = make_library_item(
-            id=99, artist="Some Artist", title="Some Album", call_letters="S",
+            id=99,
+            artist="Some Artist",
+            title="Some Album",
+            call_letters="S",
         )
 
         # search_library_with_fallback call order:
@@ -391,7 +392,9 @@ class TestPerformLookupArtwork:
         mock_library_db.find_similar_artist.return_value = None
 
         artwork = make_discogs_result(
-            release_id=12345, album="A Night at the Opera", artist="Queen",
+            release_id=12345,
+            album="A Night at the Opera",
+            artist="Queen",
             artwork_url="https://example.com/cover.jpg",
         )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
@@ -423,7 +426,9 @@ class TestPerformLookupAmbiguousFormat:
     ):
         """For 'Artist - Title' format, tries both orderings."""
         amps_item = make_library_item(
-            id=61692, artist="Amps for Christ", title="Circuits",
+            id=61692,
+            artist="Amps for Christ",
+            title="Circuits",
         )
 
         mock_library_db.find_similar_artist.return_value = None

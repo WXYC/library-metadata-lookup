@@ -1,7 +1,5 @@
 """Unit tests for core/telemetry.py."""
 
-from unittest.mock import Mock
-
 import pytest
 
 from core.telemetry import (
@@ -15,7 +13,6 @@ from core.telemetry import (
     record_pg_cache_miss,
     record_pg_time,
 )
-
 
 # ---------------------------------------------------------------------------
 # RequestTelemetry

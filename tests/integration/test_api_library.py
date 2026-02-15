@@ -35,17 +35,13 @@ class TestLibrarySearchEndpoint:
 
     @pytest.mark.asyncio
     async def test_empty_results(self, app_client):
-        resp = await app_client.get(
-            "/api/v1/library/search", params={"q": "ZZZNONEXISTENT"}
-        )
+        resp = await app_client.get("/api/v1/library/search", params={"q": "ZZZNONEXISTENT"})
         assert resp.status_code == 200
         assert resp.json()["total"] == 0
 
     @pytest.mark.asyncio
     async def test_multiword_fts_query(self, app_client):
-        resp = await app_client.get(
-            "/api/v1/library/search", params={"q": "Queen Night Opera"}
-        )
+        resp = await app_client.get("/api/v1/library/search", params={"q": "Queen Night Opera"})
         assert resp.status_code == 200
         body = resp.json()
         if body["total"] > 0:
