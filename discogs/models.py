@@ -40,6 +40,8 @@ class ReleaseMetadataResponse(BaseModel):
     artist: str
     year: int | None = None
     label: str | None = None
+    artist_id: int | None = None
+    label_id: int | None = None
     genres: list[str] = []
     styles: list[str] = []
     tracklist: list[TrackItem] = []

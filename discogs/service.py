@@ -19,6 +19,8 @@ from core.telemetry import (
     record_pg_time,
 )
 from discogs.memory_cache import (
+    ARTIST_CACHE,
+    LABEL_CACHE,
     RELEASE_CACHE,
     SEARCH_CACHE,
     TRACK_CACHE,
@@ -380,10 +382,12 @@ class DiscogsService:
             # Extract artists
             artists = data.get("artists", [])
             artist_name = artists[0].get("name", "") if artists else ""
+            artist_id = artists[0].get("id") if artists else None
 
             # Extract labels
             labels = data.get("labels", [])
             label_name = labels[0].get("name") if labels else None
+            label_id = labels[0].get("id") if labels else None
 
             # Extract tracklist with per-track artists (for compilations)
             tracklist = [
@@ -406,6 +410,8 @@ class DiscogsService:
                 artist=artist_name,
                 year=data.get("year"),
                 label=label_name,
+                artist_id=artist_id,
+                label_id=label_id,
                 genres=data.get("genres", []),
                 styles=data.get("styles", []),
                 tracklist=tracklist,
@@ -428,6 +434,58 @@ class DiscogsService:
 
         except Exception as e:
             logger.error(f"Failed to fetch release {release_id}: {e}")
+            return None
+
+    @async_cached(ARTIST_CACHE)
+    async def get_artist_image(self, artist_id: int) -> str | None:
+        """Fetch primary image for a Discogs artist.
+
+        Args:
+            artist_id: Discogs artist ID
+
+        Returns:
+            Image URI string, or None if unavailable
+        """
+        try:
+            start = time.perf_counter()
+            response = await self._request_with_retry("GET", f"/artists/{artist_id}")
+            if response is None:
+                return None
+            record_api_time((time.perf_counter() - start) * 1000)
+            record_discogs_api_call()
+            add_discogs_breadcrumb("get_artist_image", {"artist_id": artist_id})
+            response.raise_for_status()
+            data = response.json()
+            images = data.get("images", [])
+            return images[0].get("uri") if images else None
+        except Exception as e:
+            logger.warning(f"Failed to fetch artist image for {artist_id}: {e}")
+            return None
+
+    @async_cached(LABEL_CACHE)
+    async def get_label_image(self, label_id: int) -> str | None:
+        """Fetch primary image for a Discogs label.
+
+        Args:
+            label_id: Discogs label ID
+
+        Returns:
+            Image URI string, or None if unavailable
+        """
+        try:
+            start = time.perf_counter()
+            response = await self._request_with_retry("GET", f"/labels/{label_id}")
+            if response is None:
+                return None
+            record_api_time((time.perf_counter() - start) * 1000)
+            record_discogs_api_call()
+            add_discogs_breadcrumb("get_label_image", {"label_id": label_id})
+            response.raise_for_status()
+            data = response.json()
+            images = data.get("images", [])
+            return images[0].get("uri") if images else None
+        except Exception as e:
+            logger.warning(f"Failed to fetch label image for {label_id}: {e}")
             return None
 
     @async_cached(SEARCH_CACHE)

@@ -22,6 +22,8 @@ _cache_registry: list[TTLCache] = []
 _track_cache: TTLCache | None = None
 _release_cache: TTLCache | None = None
 _search_cache: TTLCache | None = None
+_artist_cache: TTLCache | None = None
+_label_cache: TTLCache | None = None
 
 T = TypeVar("T")
 
@@ -77,13 +79,15 @@ def create_ttl_cache(maxsize: int, ttl: int) -> TTLCache:
 
 def clear_all_caches() -> None:
     """Clear all registered caches and reset lazy caches."""
-    global _track_cache, _release_cache, _search_cache
+    global _track_cache, _release_cache, _search_cache, _artist_cache, _label_cache
     for cache in _cache_registry:
         cache.clear()
     # Reset lazy caches so they get recreated with fresh settings
     _track_cache = None
     _release_cache = None
     _search_cache = None
+    _artist_cache = None
+    _label_cache = None
 
 
 def _set_cached_flag(result: Any, cached: bool) -> Any:
@@ -195,6 +199,34 @@ def get_search_cache() -> TTLCache:
     return _search_cache
 
 
+def get_artist_cache() -> TTLCache:
+    """Get or create the artist image cache using settings."""
+    global _artist_cache
+    if _artist_cache is None:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        _artist_cache = create_ttl_cache(
+            maxsize=settings.discogs_cache_maxsize // 2,
+            ttl=settings.discogs_artist_cache_ttl,
+        )
+    return _artist_cache
+
+
+def get_label_cache() -> TTLCache:
+    """Get or create the label image cache using settings."""
+    global _label_cache
+    if _label_cache is None:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        _label_cache = create_ttl_cache(
+            maxsize=settings.discogs_cache_maxsize // 2,
+            ttl=settings.discogs_label_cache_ttl,
+        )
+    return _label_cache
+
+
 # Convenience constants for backwards compatibility
 def __getattr__(name: str):
     """Lazy initialization of cache constants for backwards compatibility."""
@@ -204,4 +236,8 @@ def __getattr__(name: str):
         return get_release_cache()
     elif name == "SEARCH_CACHE":
         return get_search_cache()
+    elif name == "ARTIST_CACHE":
+        return get_artist_cache()
+    elif name == "LABEL_CACHE":
+        return get_label_cache()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
