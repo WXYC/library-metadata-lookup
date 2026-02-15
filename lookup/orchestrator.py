@@ -497,11 +497,13 @@ async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id:
     if release.artist_id:
         image = await discogs_service.get_artist_image(release.artist_id)
         if image:
+            logger.info(f"Using artist image fallback for release {release_id}")
             return image
 
     if release.label_id:
         image = await discogs_service.get_label_image(release.label_id)
         if image:
+            logger.info(f"Using label image fallback for release {release_id}")
             return image
 
     return None
