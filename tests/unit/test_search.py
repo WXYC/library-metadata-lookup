@@ -6,7 +6,6 @@ import pytest
 
 from core.search import (
     SearchState,
-    SearchStrategy,
     SearchStrategyType,
     build_strategies,
     execute_search_pipeline,
@@ -18,7 +17,6 @@ from core.search import (
 )
 from services.parser import ParsedRequest
 from tests.factories import make_library_item as _item
-
 
 # ---------------------------------------------------------------------------
 # get_search_type_from_state
@@ -152,19 +150,19 @@ class TestExecuteSearchPipeline:
     @pytest.mark.asyncio
     async def test_swapped_interpretation_no_ambiguous_format(self):
         """SWAPPED_INTERPRETATION with non-ambiguous message results in empty."""
-        item = _item(id=1)
         search_lib = AsyncMock(return_value=([], False))
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(return_value=([], {}))
 
         strategies = build_strategies(search_lib, search_alt, search_comp)
 
-        parsed = ParsedRequest(
-            artist="Queen", album="The Game", raw_message="Queen The Game"
-        )
+        parsed = ParsedRequest(artist="Queen", album="The Game", raw_message="Queen The Game")
 
         state = await execute_search_pipeline(
-            parsed, AsyncMock(), "Queen The Game", strategies,
+            parsed,
+            AsyncMock(),
+            "Queen The Game",
+            strategies,
         )
 
         assert state.results == []
@@ -180,13 +178,19 @@ class TestExecuteSearchPipeline:
         search_song = AsyncMock(return_value=([item], None))
 
         strategies = build_strategies(
-            search_lib, search_alt, search_comp, search_song,
+            search_lib,
+            search_alt,
+            search_comp,
+            search_song,
         )
 
         parsed = ParsedRequest(song="Stereolab", raw_message="Stereolab")
 
         state = await execute_search_pipeline(
-            parsed, AsyncMock(), "Stereolab", strategies,
+            parsed,
+            AsyncMock(),
+            "Stereolab",
+            strategies,
         )
 
         assert len(state.results) == 1
@@ -203,12 +207,13 @@ class TestExecuteSearchPipeline:
 
         strategies = build_strategies(search_lib, search_alt, search_comp)
 
-        parsed = ParsedRequest(
-            artist="Foo", album="Bar", raw_message="Foo - Bar"
-        )
+        parsed = ParsedRequest(artist="Foo", album="Bar", raw_message="Foo - Bar")
 
         state = await execute_search_pipeline(
-            parsed, AsyncMock(), "Foo - Bar", strategies,
+            parsed,
+            AsyncMock(),
+            "Foo - Bar",
+            strategies,
         )
 
         assert len(state.results) == 1
@@ -226,12 +231,16 @@ class TestExecuteSearchPipeline:
         strategies = build_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
-            artist="Queen", song="We Will Rock You",
+            artist="Queen",
+            song="We Will Rock You",
             raw_message="Queen - We Will Rock You",
         )
 
         state = await execute_search_pipeline(
-            parsed, AsyncMock(), "Queen - We Will Rock You", strategies,
+            parsed,
+            AsyncMock(),
+            "Queen - We Will Rock You",
+            strategies,
         )
 
         assert state.found_on_compilation is True

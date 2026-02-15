@@ -179,14 +179,12 @@ async def search_song_as_artist(
                 continue
 
             item_artist = normalize_for_comparison(item.artist)
-            if item_artist.startswith(normalize_for_comparison(song_as_artist)) or is_compilation_artist(
-                item_artist
-            ):
+            if item_artist.startswith(
+                normalize_for_comparison(song_as_artist)
+            ) or is_compilation_artist(item_artist):
                 results.append(item)
                 seen_ids.add(item.id)
-                logger.info(
-                    f"Found '{item.artist} - {item.title}' via Discogs cross-reference"
-                )
+                logger.info(f"Found '{item.artist} - {item.title}' via Discogs cross-reference")
 
         if len(results) >= MAX_SEARCH_RESULTS:
             break
@@ -221,9 +219,7 @@ async def search_library_with_fallback(
             album_lower = album.lower()
             album_normalized = re.sub(r"[^\w\s]", " ", album_lower)
             album_normalized = " ".join(album_normalized.split())
-            album_words = {
-                w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS
-            }
+            album_words = {w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS}
             filtered_results = []
             for item in results:
                 item_title_lower = (item.title or "").lower()
@@ -296,9 +292,7 @@ async def search_compilations_for_track(
         artist_words = (
             re.sub(r"[^\w\s]", " ", parsed.artist.lower()).split() if parsed.artist else []
         )
-        song_words = (
-            re.sub(r"[^\w\s]", " ", parsed.song.lower()).split() if parsed.song else []
-        )
+        song_words = re.sub(r"[^\w\s]", " ", parsed.song.lower()).split() if parsed.song else []
 
         sig_artist = [w for w in artist_words if len(w) > 3 and w not in STOPWORDS]
         sig_song = [w for w in song_words if len(w) > 3 and w not in STOPWORDS]
@@ -334,9 +328,7 @@ async def search_compilations_for_track(
         raw_lower = parsed.raw_message.lower()
         song_search = parsed.song
 
-        remix_match = re.search(
-            r"\((.*?(?:remix|mix|version|edit).*?)\)", raw_lower, re.IGNORECASE
-        )
+        remix_match = re.search(r"\((.*?(?:remix|mix|version|edit).*?)\)", raw_lower, re.IGNORECASE)
         if remix_match and parsed.song.lower() in raw_lower:
             song_search = f"{parsed.song} ({remix_match.group(1)})"
             logger.info(f"Using full track name with version info: '{song_search}'")
@@ -348,9 +340,7 @@ async def search_compilations_for_track(
 
         for release_artist, release_album in releases:
             if parsed.artist and release_album.lower().strip() == parsed.artist.lower().strip():
-                logger.debug(
-                    f"Skipping '{release_album}' - appears to be artist name, not album"
-                )
+                logger.debug(f"Skipping '{release_album}' - appears to be artist name, not album")
                 continue
 
             if len(release_album.strip()) < 3:
@@ -416,9 +406,7 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
 
         if significant_words:
             fuzzy_query = " ".join(significant_words[:4])
-            logger.info(
-                f"Exact match failed for '{album_title}', trying fuzzy: '{fuzzy_query}'"
-            )
+            logger.info(f"Exact match failed for '{album_title}', trying fuzzy: '{fuzzy_query}'")
             results = await db.search(query=fuzzy_query, limit=MAX_SEARCH_RESULTS)
 
             if results:
@@ -606,9 +594,7 @@ async def perform_lookup(
     with telemetry.track_step("album_lookup"):
         if parsed.song and not parsed.album:
             telemetry.record_api_call("discogs")
-        albums_for_search, song_not_found = await resolve_albums_for_track(
-            parsed, discogs_service
-        )
+        albums_for_search, song_not_found = await resolve_albums_for_track(parsed, discogs_service)
 
     # Step 3: Execute search strategy pipeline
     with telemetry.track_step("library_search"):

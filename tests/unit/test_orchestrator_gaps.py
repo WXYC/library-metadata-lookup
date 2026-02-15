@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.factories import make_discogs_result, make_library_item as _item
 from lookup.orchestrator import (
     fetch_artwork_for_items,
     filter_results_by_track_validation,
@@ -16,7 +15,8 @@ from lookup.orchestrator import (
     search_with_alternative_interpretation,
 )
 from services.parser import ParsedRequest
-
+from tests.factories import make_discogs_result
+from tests.factories import make_library_item as _item
 
 # ---------------------------------------------------------------------------
 # resolve_albums -- exception path (lines 77-79)
@@ -220,7 +220,8 @@ class TestSearchCompilationsForTrack:
         db.search = AsyncMock(return_value=[comp, match])
 
         parsed = ParsedRequest(
-            artist="Queen", song="Bohemian Rhapsody",
+            artist="Queen",
+            song="Bohemian Rhapsody",
             raw_message="Queen - Bohemian Rhapsody",
         )
 
@@ -245,7 +246,8 @@ class TestSearchCompilationsForTrack:
         db.search = AsyncMock(side_effect=[[], [comp]])
 
         parsed = ParsedRequest(
-            artist="Queen", song="Bohemian Rhapsody",
+            artist="Queen",
+            song="Bohemian Rhapsody",
             raw_message="Queen - Bohemian Rhapsody",
         )
 
@@ -267,7 +269,8 @@ class TestSearchCompilationsForTrack:
         db.search = AsyncMock(return_value=[])
 
         parsed = ParsedRequest(
-            artist="Depeche Mode", song="Enjoy the Silence",
+            artist="Depeche Mode",
+            song="Enjoy the Silence",
             raw_message="Depeche Mode - Enjoy the Silence (Timo Maas Remix)",
         )
 
@@ -289,7 +292,8 @@ class TestSearchCompilationsForTrack:
         db.search = AsyncMock(return_value=[])
 
         parsed = ParsedRequest(
-            artist="Queen", song="Bohemian Rhapsody",
+            artist="Queen",
+            song="Bohemian Rhapsody",
             raw_message="Queen - Bohemian Rhapsody",
         )
 
@@ -309,7 +313,8 @@ class TestSearchCompilationsForTrack:
         db.search = AsyncMock(return_value=[])
 
         parsed = ParsedRequest(
-            artist="Queen", song="Bohemian Rhapsody",
+            artist="Queen",
+            song="Bohemian Rhapsody",
             raw_message="Queen - Bohemian Rhapsody",
         )
 
@@ -332,7 +337,8 @@ class TestSearchCompilationsForTrack:
         db.search = AsyncMock(side_effect=[[], [comp]])
 
         parsed = ParsedRequest(
-            artist="Queen", song="We Will Rock You",
+            artist="Queen",
+            song="We Will Rock You",
             raw_message="Queen - We Will Rock You",
         )
 
@@ -357,7 +363,8 @@ class TestSearchCompilationsForTrack:
         releases = [("Various Artists", f"Comp {i}") for i in range(30)]
 
         parsed = ParsedRequest(
-            artist="Queen", song="Song",
+            artist="Queen",
+            song="Song",
             raw_message="Queen - Song",
         )
 
@@ -381,7 +388,8 @@ class TestSearchCompilationsForTrack:
         db.search = AsyncMock(return_value=[keyword_item])
 
         parsed = ParsedRequest(
-            artist="Queen", song="Bohemian Rhapsody",
+            artist="Queen",
+            song="Bohemian Rhapsody",
             raw_message="Queen - Bohemian Rhapsody",
         )
 
@@ -462,22 +470,25 @@ class TestTrackValidationException:
 
         discogs = AsyncMock()
         from discogs.models import DiscogsSearchResponse
+
         discogs.search = AsyncMock(
             side_effect=[
                 Exception("timeout"),
                 DiscogsSearchResponse(
-                    results=[make_discogs_result(
-                        release_id=2, album="Album2", artist="Artist",
-                    )],
+                    results=[
+                        make_discogs_result(
+                            release_id=2,
+                            album="Album2",
+                            artist="Artist",
+                        )
+                    ],
                     total=1,
                 ),
             ]
         )
         discogs.validate_track_on_release = AsyncMock(return_value=True)
 
-        result = await filter_results_by_track_validation(
-            [item1, item2], "Song", "Artist", discogs
-        )
+        result = await filter_results_by_track_validation([item1, item2], "Song", "Artist", discogs)
         assert result is not None
         assert len(result) == 1
         assert result[0].id == 2
@@ -497,13 +508,18 @@ class TestFetchArtworkException:
 
         discogs = AsyncMock()
         from discogs.models import DiscogsSearchResponse
+
         discogs.search = AsyncMock(
             side_effect=[
                 Exception("timeout"),
                 DiscogsSearchResponse(
-                    results=[make_discogs_result(
-                        release_id=2, album="Album2", artist="Artist",
-                    )],
+                    results=[
+                        make_discogs_result(
+                            release_id=2,
+                            album="Album2",
+                            artist="Artist",
+                        )
+                    ],
                     total=1,
                 ),
             ]

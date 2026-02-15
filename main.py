@@ -8,7 +8,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 
 from config.settings import get_settings
-from core.dependencies import close_discogs_service, close_library_db, flush_posthog, shutdown_posthog
+from core.dependencies import (
+    close_discogs_service,
+    close_library_db,
+    flush_posthog,
+    shutdown_posthog,
+)
 from core.logging import setup_logging
 from core.sentry import init_sentry
 from discogs.router import router as discogs_router

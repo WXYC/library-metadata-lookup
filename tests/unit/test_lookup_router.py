@@ -24,14 +24,19 @@ def mock_discogs():
 
 @pytest.fixture
 def app_client(mock_db, mock_discogs, mock_settings):
-    from main import app
-    from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
     from config.settings import get_settings
+    from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+    from main import app
 
-    with override_deps(app, {
-        get_library_db: mock_db, get_discogs_service: mock_discogs,
-        get_posthog_client: None, get_settings: mock_settings,
-    }):
+    with override_deps(
+        app,
+        {
+            get_library_db: mock_db,
+            get_discogs_service: mock_discogs,
+            get_posthog_client: None,
+            get_settings: mock_settings,
+        },
+    ):
         yield app
 
 
@@ -55,9 +60,9 @@ class TestHandleLookup:
     async def test_telemetry_sent_when_posthog_configured(
         self, mock_db, mock_discogs, mock_settings
     ):
-        from main import app
-        from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
         from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
 
         mock_posthog = Mock()
         mock_posthog.capture = Mock()
@@ -65,10 +70,15 @@ class TestHandleLookup:
 
         response = LookupResponse(results=[], search_type="direct")
 
-        with override_deps(app, {
-            get_library_db: mock_db, get_discogs_service: mock_discogs,
-            get_posthog_client: mock_posthog, get_settings: mock_settings,
-        }):
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: mock_posthog,
+                get_settings: mock_settings,
+            },
+        ):
             with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
                 mock_lookup.return_value = response
                 async with AsyncClient(
@@ -114,15 +124,15 @@ class TestHandleLookup:
     async def test_skip_cache_flag(self, app_client):
         response = LookupResponse(results=[], search_type="direct")
 
-        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup, \
-             patch("lookup.router.set_skip_cache") as mock_set_skip:
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.set_skip_cache") as mock_set_skip,
+        ):
             mock_lookup.return_value = response
             async with AsyncClient(
                 transport=ASGITransport(app=app_client), base_url="http://test"
             ) as client:
-                resp = await client.post(
-                    "/api/v1/lookup?skip_cache=true", json=LOOKUP_BODY
-                )
+                resp = await client.post("/api/v1/lookup?skip_cache=true", json=LOOKUP_BODY)
 
         assert resp.status_code == 200
         mock_set_skip.assert_called_once_with(True)
@@ -131,8 +141,10 @@ class TestHandleLookup:
     async def test_cache_stats_initialized(self, app_client):
         response = LookupResponse(results=[], search_type="direct")
 
-        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup, \
-             patch("lookup.router.init_cache_stats") as mock_init:
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.init_cache_stats") as mock_init,
+        ):
             mock_lookup.return_value = response
             async with AsyncClient(
                 transport=ASGITransport(app=app_client), base_url="http://test"

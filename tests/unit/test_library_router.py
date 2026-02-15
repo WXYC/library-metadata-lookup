@@ -19,14 +19,19 @@ def mock_db():
 
 @pytest.fixture
 def app_client(mock_db, mock_settings):
-    from main import app
-    from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
     from config.settings import get_settings
+    from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+    from main import app
 
-    with override_deps(app, {
-        get_library_db: mock_db, get_discogs_service: None,
-        get_posthog_client: None, get_settings: mock_settings,
-    }):
+    with override_deps(
+        app,
+        {
+            get_library_db: mock_db,
+            get_discogs_service: None,
+            get_posthog_client: None,
+            get_settings: mock_settings,
+        },
+    ):
         yield app
 
 
@@ -67,9 +72,7 @@ class TestSearchLibrary:
         async with AsyncClient(
             transport=ASGITransport(app=app_client), base_url="http://test"
         ) as client:
-            resp = await client.get(
-                "/api/v1/library/search", params={"title": "OK Computer"}
-            )
+            resp = await client.get("/api/v1/library/search", params={"title": "OK Computer"})
 
         assert resp.status_code == 200
 

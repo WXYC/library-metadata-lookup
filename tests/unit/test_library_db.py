@@ -1,13 +1,10 @@
 """Unit tests for library/db.py."""
 
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from library.db import LibraryDB
-from library.models import LibraryItem
-
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -4,15 +4,12 @@ Provides a real LibraryDB backed by in-memory SQLite with FTS5,
 seeded with representative catalog items.
 """
 
-from unittest.mock import AsyncMock
-
 import aiosqlite
 import pytest
 import pytest_asyncio
 
 from config.settings import Settings
 from library.db import LibraryDB
-
 
 # ---------------------------------------------------------------------------
 # Seed data -- representative catalog items
@@ -115,18 +112,17 @@ def test_settings():
 async def app_client(library_db, test_settings):
     """httpx AsyncClient with real LibraryDB but mocked Discogs/PostHog."""
     from httpx import ASGITransport, AsyncClient
-    from main import app
-    from core.dependencies import get_library_db, get_discogs_service, get_posthog_client
+
     from config.settings import get_settings
+    from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+    from main import app
 
     app.dependency_overrides[get_library_db] = lambda: library_db
     app.dependency_overrides[get_discogs_service] = lambda: None
     app.dependency_overrides[get_posthog_client] = lambda: None
     app.dependency_overrides[get_settings] = lambda: test_settings
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         yield client
 
     app.dependency_overrides.clear()

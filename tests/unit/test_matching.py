@@ -10,7 +10,6 @@ from core.matching import (
     strip_diacritics,
 )
 
-
 # ---------------------------------------------------------------------------
 # strip_diacritics
 # ---------------------------------------------------------------------------
@@ -136,16 +135,16 @@ class TestCalculateConfidence:
             pytest.param(None, "The Game", "Radiohead", "The Game", 0.4, id="album-only"),
             pytest.param("Radio", None, "Radiohead", "OK Computer", 0.3, id="partial-artist"),
             pytest.param(None, "Game", "Queen", "The Game", 0.3, id="partial-album"),
+            pytest.param("Radio", "Computer", "Radiohead", "OK Computer", 0.8, id="partial-both"),
             pytest.param(
-                "Radio", "Computer", "Radiohead", "OK Computer", 0.8, id="partial-both"
+                "Queen",
+                "Night",
+                "Queen",
+                "A Night at the Opera",
+                pytest.approx(0.9),
+                id="exact-artist-partial-album",
             ),
-            pytest.param(
-                "Queen", "Night", "Queen", "A Night at the Opera",
-                pytest.approx(0.9), id="exact-artist-partial-album",
-            ),
-            pytest.param(
-                "Queen", "The Game", "Radiohead", "OK Computer", 0.2, id="no-match"
-            ),
+            pytest.param("Queen", "The Game", "Radiohead", "OK Computer", 0.2, id="no-match"),
             pytest.param(None, None, "Artist", "Album", 0.2, id="both-none"),
         ],
     )
@@ -176,13 +175,15 @@ class TestDetectAmbiguousFormat:
         "message, expected",
         [
             pytest.param(
-                "Amps for Christ - Edward", ("Amps for Christ", "Edward"),
+                "Amps for Christ - Edward",
+                ("Amps for Christ", "Edward"),
                 id="dash-spaced",
             ),
             pytest.param("Artist -Title", ("Artist", "Title"), id="dash-left"),
             pytest.param("Artist- Title", ("Artist", "Title"), id="dash-right"),
             pytest.param(
-                "Stereolab. Dots and Loops", ("Stereolab", "Dots and Loops"),
+                "Stereolab. Dots and Loops",
+                ("Stereolab", "Dots and Loops"),
                 id="period",
             ),
         ],

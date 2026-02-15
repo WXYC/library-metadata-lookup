@@ -1,7 +1,5 @@
 """Unit tests for discogs/memory_cache.py."""
 
-from unittest.mock import AsyncMock, patch
-
 import pytest
 from pydantic import BaseModel
 
@@ -18,7 +16,6 @@ from discogs.memory_cache import (
     set_skip_cache,
     should_skip_cache,
 )
-
 
 # ---------------------------------------------------------------------------
 # skip_cache flag
