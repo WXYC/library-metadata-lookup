@@ -103,7 +103,7 @@ library-metadata-lookup/
   config/settings.py           # Environment-based configuration
   core/
     dependencies.py            # DI for LibraryDB + DiscogsService
-    matching.py                # Fuzzy matching utilities
+    matching.py                # Fuzzy matching, diacritics normalization
     search.py                  # Search strategy pattern
     telemetry.py               # PostHog telemetry
     logging.py, sentry.py, exceptions.py
@@ -123,7 +123,8 @@ library-metadata-lookup/
   services/
     parser.py                  # Minimal ParsedRequest model (no Groq)
   tests/
-    unit/                      # 375 mocked unit tests (97% source coverage)
+    factories.py               # Shared test factories (make_library_item, make_discogs_result)
+    unit/                      # 399 mocked unit tests (97% source coverage)
     integration/               # 45 integration tests with real SQLite/FTS5
 ```
 
@@ -147,13 +148,13 @@ uvicorn main:app --reload
 ### Running tests
 
 ```bash
-# Unit tests only (default, fast -- 375 tests)
+# Unit tests only (default, fast -- 399 tests)
 uv run pytest tests/unit/ -v
 
 # Integration tests only (real SQLite/FTS5 -- 45 tests)
 uv run pytest -m integration -v
 
-# All tests with coverage (420 tests, 97% source coverage)
+# All tests with coverage (444 tests, 97% source coverage)
 uv run pytest -m "" --cov=. --cov-report=term-missing -v
 ```
 

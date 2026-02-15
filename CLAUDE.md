@@ -38,7 +38,7 @@ All strategy implementations live in `lookup/orchestrator.py`.
 - `discogs/cache_service.py` -- PostgreSQL cache (asyncpg + pg_trgm)
 - `discogs/memory_cache.py` -- In-memory TTL cache (cachetools)
 - `core/search.py` -- Declarative search strategy pattern
-- `core/matching.py` -- Stopwords, compilation detection, ambiguous format detection
+- `core/matching.py` -- Stopwords, compilation detection, ambiguous format detection, diacritics normalization
 - `core/dependencies.py` -- FastAPI DI for LibraryDB + DiscogsService
 
 ### Discogs Cache (Optional)
@@ -53,14 +53,6 @@ The service supports an optional PostgreSQL cache for Discogs data:
 Set `DATABASE_URL_DISCOGS` to enable. The cache schema is defined in [WXYC/discogs-cache](https://github.com/WXYC/discogs-cache).
 
 ## Development
-
-### Venv
-
-Uses the shared venv from request-parser (no separate venv yet):
-
-```bash
-/Users/jake/Developer/request-parser/venv/bin/python
-```
 
 ### Running locally
 
@@ -80,13 +72,12 @@ uvicorn main:app --reload
 All external services (LibraryDB, DiscogsService) are mocked. Run frequently:
 
 ```bash
-venv/bin/python -m pytest tests/unit/ -v
+uv run pytest tests/unit/ -v
 ```
-
-where `venv/bin/python` is `/Users/jake/Developer/request-parser/venv/bin/python`.
 
 ### Test Patterns
 
+- Use factories from `tests/factories.py`: `make_library_item()`, `make_discogs_result()`, `LOOKUP_BODY`
 - Mock `discogs_service` with `AsyncMock` and construct `DiscogsSearchResponse`/`DiscogsSearchResult` models
 - `DiscogsSearchResult` requires `release_id: int` and `release_url: str` (no defaults)
 - Mock `LibraryDB` with `AsyncMock` including `search`, `find_similar_artist`, `connect`, `close`
