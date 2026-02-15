@@ -607,9 +607,7 @@ class TestFetchArtworkFallback:
             release_url="https://www.discogs.com/release/28138",
         )
         mock_discogs_service.get_artist_image.return_value = None
-        mock_discogs_service.get_label_image.return_value = (
-            "https://i.discogs.com/label-logo.jpg"
-        )
+        mock_discogs_service.get_label_image.return_value = "https://i.discogs.com/label-logo.jpg"
 
         results = await fetch_artwork_for_items(items, mock_discogs_service)
 

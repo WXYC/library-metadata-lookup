@@ -645,7 +645,9 @@ class TestGetArtistImage:
             ],
         }
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.get_artist_image(77)
 
         assert result == "https://i.discogs.com/artist-primary.jpg"
@@ -657,7 +659,9 @@ class TestGetArtistImage:
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"id": 77, "name": "Autechre", "images": []}
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.get_artist_image(77)
 
         assert result is None
@@ -669,14 +673,18 @@ class TestGetArtistImage:
         mock_resp.raise_for_status = MagicMock(side_effect=Exception("Not Found"))
         mock_resp.json.return_value = {}
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.get_artist_image(77)
 
         assert result is None
 
     @pytest.mark.asyncio
     async def test_returns_none_on_rate_limit(self, service):
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=None):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=None
+        ):
             result = await service.get_artist_image(77)
 
         assert result is None
@@ -699,7 +707,9 @@ class TestGetLabelImage:
             "images": [{"uri": "https://i.discogs.com/label-logo.jpg", "type": "primary"}],
         }
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.get_label_image(233)
 
         assert result == "https://i.discogs.com/label-logo.jpg"
@@ -711,7 +721,9 @@ class TestGetLabelImage:
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"id": 233, "name": "Warp Records", "images": []}
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.get_label_image(233)
 
         assert result is None
@@ -723,7 +735,9 @@ class TestGetLabelImage:
         mock_resp.raise_for_status = MagicMock(side_effect=Exception("Not Found"))
         mock_resp.json.return_value = {}
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.get_label_image(233)
 
         assert result is None
@@ -750,7 +764,9 @@ class TestGetReleaseExtractsIds:
             "styles": [],
         }
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.get_release(28138)
 
         assert result is not None
@@ -772,7 +788,9 @@ class TestGetReleaseExtractsIds:
             "styles": [],
         }
 
-        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await service.get_release(28138)
 
         assert result is not None
