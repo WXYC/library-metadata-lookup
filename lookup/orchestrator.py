@@ -488,6 +488,27 @@ async def filter_results_by_track_validation(
     return None
 
 
+async def _resolve_fallback_artwork(
+    discogs_service: DiscogsService, release_id: int
+) -> str | None:
+    """Try artist image, then label image, for a release with no cover art."""
+    release = await discogs_service.get_release(release_id)
+    if not release:
+        return None
+
+    if release.artist_id:
+        image = await discogs_service.get_artist_image(release.artist_id)
+        if image:
+            return image
+
+    if release.label_id:
+        image = await discogs_service.get_label_image(release.label_id)
+        if image:
+            return image
+
+    return None
+
+
 async def fetch_artwork_for_items(
     items: list[LibraryItem],
     discogs_service: DiscogsService | None,
@@ -511,7 +532,14 @@ async def fetch_artwork_for_items(
                 DiscogsSearchRequest(album=album, artist=artist)
             )
             if response.results:
-                return response.results[0]
+                result = response.results[0]
+                if not result.artwork_url:
+                    fallback = await _resolve_fallback_artwork(
+                        discogs_service, result.release_id
+                    )
+                    if fallback:
+                        result = result.model_copy(update={"artwork_url": fallback})
+                return result
             return None
         except Exception as e:
             logger.warning(f"Artwork lookup failed for {item.title}: {e}")

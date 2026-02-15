@@ -623,3 +623,158 @@ class TestValidateTrackOnRelease:
         ):
             result = await service_with_cache.validate_track_on_release(1, "Song", "Queen")
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# get_artist_image
+# ---------------------------------------------------------------------------
+
+
+class TestGetArtistImage:
+    @pytest.mark.asyncio
+    async def test_returns_uri(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "id": 77,
+            "name": "Autechre",
+            "images": [
+                {"uri": "https://i.discogs.com/artist-primary.jpg", "type": "primary"},
+                {"uri": "https://i.discogs.com/artist-secondary.jpg", "type": "secondary"},
+            ],
+        }
+
+        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+            result = await service.get_artist_image(77)
+
+        assert result == "https://i.discogs.com/artist-primary.jpg"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_images(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"id": 77, "name": "Autechre", "images": []}
+
+        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+            result = await service.get_artist_image(77)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_api_failure(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.raise_for_status = MagicMock(side_effect=Exception("Not Found"))
+        mock_resp.json.return_value = {}
+
+        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+            result = await service.get_artist_image(77)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_rate_limit(self, service):
+        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=None):
+            result = await service.get_artist_image(77)
+
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# get_label_image
+# ---------------------------------------------------------------------------
+
+
+class TestGetLabelImage:
+    @pytest.mark.asyncio
+    async def test_returns_uri(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "id": 233,
+            "name": "Warp Records",
+            "images": [{"uri": "https://i.discogs.com/label-logo.jpg", "type": "primary"}],
+        }
+
+        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+            result = await service.get_label_image(233)
+
+        assert result == "https://i.discogs.com/label-logo.jpg"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_images(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"id": 233, "name": "Warp Records", "images": []}
+
+        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+            result = await service.get_label_image(233)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_api_failure(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.raise_for_status = MagicMock(side_effect=Exception("Not Found"))
+        mock_resp.json.return_value = {}
+
+        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+            result = await service.get_label_image(233)
+
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# get_release extracts artist_id / label_id
+# ---------------------------------------------------------------------------
+
+
+class TestGetReleaseExtractsIds:
+    @pytest.mark.asyncio
+    async def test_extracts_artist_and_label_ids(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Confield",
+            "artists": [{"id": 77, "name": "Autechre"}],
+            "labels": [{"id": 233, "name": "Warp Records"}],
+            "tracklist": [],
+            "images": [],
+            "genres": [],
+            "styles": [],
+        }
+
+        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+            result = await service.get_release(28138)
+
+        assert result is not None
+        assert result.artist_id == 77
+        assert result.label_id == 233
+
+    @pytest.mark.asyncio
+    async def test_handles_missing_ids(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Confield",
+            "artists": [{"name": "Autechre"}],  # no id
+            "labels": [],  # no labels
+            "tracklist": [],
+            "images": [],
+            "genres": [],
+            "styles": [],
+        }
+
+        with patch.object(service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp):
+            result = await service.get_release(28138)
+
+        assert result is not None
+        assert result.artist_id is None
+        assert result.label_id is None

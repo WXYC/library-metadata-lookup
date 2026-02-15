@@ -15,7 +15,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from discogs.models import DiscogsSearchRequest, DiscogsSearchResponse
+from discogs.models import (
+    DiscogsSearchRequest,
+    DiscogsSearchResponse,
+    ReleaseMetadataResponse,
+)
 from lookup.orchestrator import (
     build_context_message,
     fetch_artwork_for_items,
@@ -555,3 +559,104 @@ class TestFetchArtworkForItems:
         call_args = mock_discogs_service.search.call_args[0][0]
         assert isinstance(call_args, DiscogsSearchRequest)
         assert "Disco Not Disco" in call_args.album
+
+
+class TestFetchArtworkFallback:
+    """Tests for artwork fallback to artist/label images."""
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_artist_image(self, mock_discogs_service):
+        """When search returns result with no artwork, fall back to artist image."""
+        items = [make_library_item(id=1, artist="Autechre", title="Confield")]
+
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[make_discogs_result(release_id=28138, artwork_url=None)]
+        )
+        mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=28138,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            release_url="https://www.discogs.com/release/28138",
+        )
+        mock_discogs_service.get_artist_image.return_value = (
+            "https://i.discogs.com/artist-photo.jpg"
+        )
+
+        results = await fetch_artwork_for_items(items, mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is not None
+        assert results[0][1].artwork_url == "https://i.discogs.com/artist-photo.jpg"
+        mock_discogs_service.get_artist_image.assert_called_once_with(77)
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_label_image(self, mock_discogs_service):
+        """When artist image also unavailable, fall back to label image."""
+        items = [make_library_item(id=1, artist="Autechre", title="Confield")]
+
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[make_discogs_result(release_id=28138, artwork_url=None)]
+        )
+        mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=28138,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            label_id=233,
+            release_url="https://www.discogs.com/release/28138",
+        )
+        mock_discogs_service.get_artist_image.return_value = None
+        mock_discogs_service.get_label_image.return_value = (
+            "https://i.discogs.com/label-logo.jpg"
+        )
+
+        results = await fetch_artwork_for_items(items, mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is not None
+        assert results[0][1].artwork_url == "https://i.discogs.com/label-logo.jpg"
+        mock_discogs_service.get_label_image.assert_called_once_with(233)
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_artwork_exists(self, mock_discogs_service):
+        """When search returns result with artwork, no fallback calls made."""
+        items = [make_library_item(id=1, artist="Autechre", title="Confield")]
+
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=28138,
+                    artwork_url="https://i.discogs.com/cover.jpg",
+                )
+            ]
+        )
+
+        results = await fetch_artwork_for_items(items, mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1].artwork_url == "https://i.discogs.com/cover.jpg"
+        mock_discogs_service.get_release.assert_not_called()
+        mock_discogs_service.get_artist_image.assert_not_called()
+        mock_discogs_service.get_label_image.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_result_when_all_fallbacks_fail(self, mock_discogs_service):
+        """When all fallbacks fail, result returned with artwork_url=None."""
+        items = [make_library_item(id=1, artist="Autechre", title="Confield")]
+
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[make_discogs_result(release_id=28138, artwork_url=None)]
+        )
+        mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=28138,
+            title="Confield",
+            artist="Autechre",
+            release_url="https://www.discogs.com/release/28138",
+        )
+
+        results = await fetch_artwork_for_items(items, mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is not None
+        assert results[0][1].artwork_url is None

@@ -59,6 +59,12 @@ class Settings(BaseSettings):
     discogs_search_cache_ttl: int = Field(
         default=3600, description="TTL in seconds for Discogs search cache (default: 1 hour)"
     )
+    discogs_artist_cache_ttl: int = Field(
+        default=86400, description="TTL in seconds for Discogs artist cache (default: 24 hours)"
+    )
+    discogs_label_cache_ttl: int = Field(
+        default=86400, description="TTL in seconds for Discogs label cache (default: 24 hours)"
+    )
     discogs_cache_maxsize: int = Field(
         default=1000, description="Maximum entries in Discogs caches"
     )
