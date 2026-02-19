@@ -51,6 +51,7 @@ async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryD
             logger.error(f"Failed to initialize library database: {e}")
             raise ServiceInitializationError(f"Database initialization failed: {e}") from e
 
+    assert _library_db is not None  # Set above; narrows type for mypy
     return _library_db
 
 

@@ -58,6 +58,9 @@ ignore = ["E501", "B008", "C901"]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+
 [tool.pytest.ini_options]
 markers = [
     "integration: marks tests as integration tests",
