@@ -205,7 +205,7 @@ Hosted on Railway with CI-driven deploys (automatic deploys are disabled).
 - **`main`** branch -- CI deploys to **staging** after lint, typecheck, and unit tests pass
 - **`prod`** branch -- CI deploys to **production** after lint, typecheck, and unit tests pass
 - Health check at `/health` with real dependency probes
-- Uses the same `Postgres-Nard` PostgreSQL instance as request-parser for Discogs cache
+- Optional PostgreSQL cache for Discogs data via `DATABASE_URL_DISCOGS` (gracefully degrades to API-only)
 - Railway volume mounted at `/data` stores `library.db` persistently across deploys
 
 ### Library Database
