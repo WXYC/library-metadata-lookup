@@ -12,14 +12,11 @@ RUN pip install --no-cache-dir .
 # Copy application
 COPY . .
 
-# Create logs directory
-RUN mkdir -p /app/logs && chown -R appuser:appuser /app/logs
-
-# Switch to non-root user
-USER appuser
+# Create logs and data directories
+RUN mkdir -p /app/logs /data && chown -R appuser:appuser /app/logs /data
 
 # Expose port
 EXPOSE 8000
 
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Entrypoint fixes volume permissions then drops to non-root user
+ENTRYPOINT ["/app/entrypoint.sh"]
