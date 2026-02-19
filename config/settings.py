@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     # Application Metadata
     app_name: str = Field(default="Library-Metadata-Lookup", description="Application name")
     app_version: str = Field(default="0.1.0", description="Application version")
+    environment: str = Field(
+        default="development", description="Runtime environment (development, staging, production)"
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

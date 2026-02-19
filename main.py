@@ -28,7 +28,7 @@ settings = get_settings()
 
 init_sentry(
     dsn=settings.sentry_dsn,
-    environment="production" if settings.log_level != "DEBUG" else "development",
+    environment=settings.environment,
     release=settings.app_version,
 )
 
