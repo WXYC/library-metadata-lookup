@@ -501,3 +501,57 @@ class TestFindSimilarArtist:
 
         result = await db.find_similar_artist("Radiohed")
         assert result == "Radiohead"
+
+    @pytest.mark.asyncio
+    async def test_short_name_not_corrected_to_similar(self):
+        """Short name 'Plug' should NOT be corrected to 'Plugz'.
+
+        For short names, a single character difference is proportionally large,
+        so the threshold should be raised to prevent false corrections.
+        """
+        db = LibraryDB()
+
+        class FakeRow:
+            def __init__(self, val):
+                self.val = val
+
+            def __getitem__(self, idx):
+                return self.val
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Plugz")])
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(return_value=mock_cursor)
+
+        result = await db.find_similar_artist("Plug")
+        assert result is None, (
+            f"Expected None (no correction), got '{result}'. "
+            "Short names should not be corrected to similar-but-different artists."
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "misspelled, candidate, expected",
+        [
+            ("Living Color", "Living Colour", "Living Colour"),
+            ("Radiohed", "Radiohead", "Radiohead"),
+        ],
+    )
+    async def test_long_name_still_corrected(self, misspelled, candidate, expected):
+        """Regression guard: long names with typos are still corrected."""
+        db = LibraryDB()
+
+        class FakeRow:
+            def __init__(self, val):
+                self.val = val
+
+            def __getitem__(self, idx):
+                return self.val
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow(candidate)])
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(return_value=mock_cursor)
+
+        result = await db.find_similar_artist(misspelled)
+        assert result == expected
