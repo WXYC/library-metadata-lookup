@@ -80,6 +80,11 @@ class Settings(BaseSettings):
         default=2, description="Max retry attempts on 429 rate limit errors"
     )
 
+    # Admin Configuration
+    admin_token: str | None = Field(
+        None, description="Bearer token for admin endpoints (e.g. library.db upload)"
+    )
+
     # Application Metadata
     app_name: str = Field(default="Library-Metadata-Lookup", description="Application name")
     app_version: str = Field(default="0.1.0", description="Application version")

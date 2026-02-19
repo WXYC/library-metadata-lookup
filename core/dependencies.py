@@ -41,6 +41,12 @@ async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryD
             _library_db = LibraryDB(db_path=db_path)
             await _library_db.connect()
             logger.info(f"Library database connected: {db_path}")
+        except FileNotFoundError:
+            logger.warning(
+                f"Library database not found at {settings.resolved_library_db_path}. "
+                "Service will start without database (health check will report unhealthy). "
+                "Upload library.db via POST /admin/upload-library-db to enable."
+            )
         except Exception as e:
             logger.error(f"Failed to initialize library database: {e}")
             raise ServiceInitializationError(f"Database initialization failed: {e}") from e

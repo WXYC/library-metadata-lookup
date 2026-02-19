@@ -117,6 +117,7 @@ Optional:
 - `SENTRY_DSN` -- Sentry error tracking
 - `POSTHOG_API_KEY` -- PostHog telemetry
 - `LIBRARY_DB_PATH` -- Path to SQLite database (default: `library.db`)
+- `ADMIN_TOKEN` -- Bearer token for admin endpoints (upload endpoint)
 
 ## Code Style
 
@@ -127,10 +128,55 @@ Optional:
 
 ## Deployment
 
-- Hosted on Railway
-- `main` auto-deploys to **staging**, `prod` auto-deploys to **production**
-- Health check at `/health` with real dependency probes
-- Uses same `Postgres-Nard` PostgreSQL instance as request-parser for Discogs cache
+### Infrastructure
+
+- Hosted on Railway with CI-driven deploys (automatic deploys disabled)
+- Railway volume mounted at `/data` stores `library.db` persistently across deploys
+- Uses `Postgres-Nard` shared PostgreSQL instance for Discogs cache
+- `LIBRARY_DB_PATH=/data/library.db` on Railway
+
+### Branch Strategy
+
+- **`main`** -- CI deploys to **staging** after lint + typecheck + unit tests pass
+- **`prod`** -- CI deploys to **production** after lint + typecheck + unit tests pass
+- Both environments get smoke tests after deploy
+
+### CI/CD Pipeline (`.github/workflows/ci.yml`)
+
+| Job | Trigger | Depends on |
+|---|---|---|
+| Lint & Format | All pushes + PRs | -- |
+| Type Check | All pushes + PRs | -- |
+| Unit Tests | All pushes + PRs | -- |
+| Deploy to Staging | Push to `main` | lint, typecheck, test |
+| Smoke Test (Staging) | Push to `main` | deploy-staging |
+| Integration Tests | Push to `main` | smoke-test-staging |
+| Deploy to Production | Push to `prod` | lint, typecheck, test |
+| Smoke Test (Production) | Push to `prod` | deploy-production |
+
+### Library Database Upload
+
+The `library.db` file lives on a Railway volume, not in git. It's uploaded via:
+
+```
+POST /admin/upload-library-db
+Authorization: Bearer <ADMIN_TOKEN>
+Content-Type: multipart/form-data
+```
+
+The upload endpoint validates the SQLite file, closes the current DB connection,
+atomically replaces the file, and returns `{"status": "ok", "row_count": <int>}`.
+
+The ETL script in request-o-matic (`scripts/sync-library.sh`) handles daily uploads
+to both staging and production.
+
+### Health Check Behavior
+
+When `library.db` is missing (e.g., on first deploy before first upload):
+- `get_library_db()` returns a LibraryDB instance with `is_available() = False`
+- Health endpoint returns `{"status": "unhealthy", "services": {"database": "error"}}` (503)
+- Service is functional for non-database endpoints
+- After uploading library.db, next request triggers reconnection
 
 ## Relationship to Other Repos
 

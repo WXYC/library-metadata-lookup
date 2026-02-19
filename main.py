@@ -19,6 +19,7 @@ from core.sentry import init_sentry
 from discogs.router import router as discogs_router
 from library.router import router as library_router
 from lookup.router import router as lookup_router
+from routers.admin import router as admin_router
 from routers.health import router as health_router
 
 load_dotenv()
@@ -73,6 +74,7 @@ async def posthog_flush_middleware(request: Request, call_next):
 
 
 app.include_router(health_router, prefix="", tags=["health"])
+app.include_router(admin_router, prefix="/admin", tags=["admin"])
 app.include_router(lookup_router, prefix="/api/v1", tags=["lookup"])
 app.include_router(library_router, prefix="/api/v1", tags=["library"])
 app.include_router(discogs_router, prefix="/api/v1", tags=["discogs"])

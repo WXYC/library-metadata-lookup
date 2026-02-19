@@ -18,6 +18,7 @@ on:
 
 jobs:
   lint:
+    name: Lint & Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +29,21 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
 
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install -e ".[dev]"
+          pip install mypy
+      - run: mypy . --ignore-missing-imports
+
   test:
+    name: Unit Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,4 +51,112 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: pytest tests/unit/ -v
+      - run: pytest tests/unit/ -v --cov=. --cov-report=xml
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, typecheck, test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+      - name: Deploy to Railway
+        run: railway up --service library-metadata-lookup
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_STAGING }}
+
+  smoke-test-staging:
+    name: Smoke Test (Staging)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [deploy-staging]
+    steps:
+      - name: Wait for deploy to stabilize
+        run: sleep 30
+      - name: Smoke test
+        run: |
+          curl -sf https://library-metadata-lookup-staging.up.railway.app/health | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          services = data['services']
+          errors = []
+          if services['database'] != 'ok':
+              errors.append(f\"database: {services['database']}\")
+          if services['discogs_api'] != 'ok':
+              errors.append(f\"discogs_api: {services['discogs_api']}\")
+          cache = services.get('discogs_cache', 'unavailable')
+          if cache not in ('ok', 'unavailable'):
+              print(f'WARNING: discogs_cache: {cache}')
+          if errors:
+              print('Smoke test FAILED:', ', '.join(errors))
+              sys.exit(1)
+          print('Smoke test passed:', json.dumps(services))
+          "
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [smoke-test-staging]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: Run integration tests
+        env:
+          DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
+          TEST_ENV: staging
+        run: pytest tests/integration/ -v -m integration
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/prod'
+    needs: [lint, typecheck, test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+      - name: Deploy to Railway
+        run: railway up --service library-metadata-lookup
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
+
+  smoke-test-production:
+    name: Smoke Test (Production)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/prod'
+    needs: [deploy-production]
+    steps:
+      - name: Wait for deploy to stabilize
+        run: sleep 30
+      - name: Smoke test
+        run: |
+          curl -sf https://library-metadata-lookup-production.up.railway.app/health | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          services = data['services']
+          errors = []
+          if services['database'] != 'ok':
+              errors.append(f\"database: {services['database']}\")
+          if services['discogs_api'] != 'ok':
+              errors.append(f\"discogs_api: {services['discogs_api']}\")
+          cache = services.get('discogs_cache', 'unavailable')
+          if cache not in ('ok', 'unavailable'):
+              print(f'WARNING: discogs_cache: {cache}')
+          if errors:
+              print('Smoke test FAILED:', ', '.join(errors))
+              sys.exit(1)
+          print('Smoke test passed:', json.dumps(services))
+          "
