@@ -71,6 +71,48 @@ class TestGetLibraryDB:
             with pytest.raises(ServiceInitializationError):
                 await get_library_db(mock_settings)
 
+    @pytest.mark.asyncio
+    async def test_missing_db_file_returns_unavailable_instance(self, mock_settings):
+        """When library.db doesn't exist, return a LibraryDB that reports unavailable."""
+        mock_settings.library_db_path = "/nonexistent/library.db"
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            mock_db = AsyncMock()
+            mock_db.is_available = AsyncMock(return_value=False)
+            mock_db.connect = AsyncMock(side_effect=FileNotFoundError("not found"))
+            mock_db_cls.return_value = mock_db
+
+            result = await get_library_db(mock_settings)
+
+            assert result is mock_db
+            assert await result.is_available() is False
+
+    @pytest.mark.asyncio
+    async def test_missing_db_file_allows_reconnect_after_upload(self, mock_settings):
+        """After close_library_db(), next call re-initializes from scratch."""
+        mock_settings.library_db_path = "/nonexistent/library.db"
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            # First call: file missing
+            mock_db_missing = AsyncMock()
+            mock_db_missing.is_available = AsyncMock(return_value=False)
+            mock_db_missing.connect = AsyncMock(side_effect=FileNotFoundError("not found"))
+
+            # Second call: file exists
+            mock_db_ok = AsyncMock()
+            mock_db_ok.is_available = AsyncMock(return_value=True)
+            mock_db_ok.connect = AsyncMock()
+
+            mock_db_cls.side_effect = [mock_db_missing, mock_db_ok]
+
+            result1 = await get_library_db(mock_settings)
+            assert await result1.is_available() is False
+
+            await close_library_db()
+
+            result2 = await get_library_db(mock_settings)
+            assert await result2.is_available() is True
+
 
 # ---------------------------------------------------------------------------
 # close_library_db

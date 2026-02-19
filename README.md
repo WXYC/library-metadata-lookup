@@ -1,5 +1,7 @@
 # Library Metadata Lookup
 
+[![CI](https://github.com/WXYC/library-metadata-lookup/actions/workflows/ci.yml/badge.svg)](https://github.com/WXYC/library-metadata-lookup/actions/workflows/ci.yml)
+
 A FastAPI service for WXYC radio that searches the library catalog and cross-references results with Discogs metadata. Extracted from [request-o-matic](https://github.com/WXYC/request-o-matic) to separate search/lookup concerns from message parsing and Slack posting.
 
 ## What it does
@@ -78,6 +80,12 @@ Find all releases containing a specific track.
 
 Get full release metadata from Discogs.
 
+### `POST /admin/upload-library-db`
+
+Upload a new `library.db` file. Requires `Authorization: Bearer <ADMIN_TOKEN>` header.
+The file is validated (must be a SQLite database with a `library` table), then atomically
+replaces the current database. Returns `{"status": "ok", "row_count": <int>, "timestamp": "<ISO8601>"}`.
+
 ### `GET /health`
 
 Health check with real connectivity probes for the database, Discogs API, and Discogs cache.
@@ -120,6 +128,9 @@ library-metadata-lookup/
     orchestrator.py            # Core search pipeline (extracted from request-parser)
     models.py                  # LookupRequest, LookupResponse
     router.py                  # POST /lookup endpoint
+  routers/
+    admin.py                   # POST /admin/upload-library-db
+    health.py                  # GET /health
   services/
     parser.py                  # Minimal ParsedRequest model (no Groq)
   tests/
@@ -171,6 +182,7 @@ They are excluded by default (`addopts = "-m 'not integration'"` in `pyproject.t
 - `SENTRY_DSN` -- Sentry error tracking
 - `POSTHOG_API_KEY` -- PostHog telemetry
 - `LIBRARY_DB_PATH` -- Path to SQLite library database (default: `library.db`)
+- `ADMIN_TOKEN` -- Bearer token for admin endpoints (library.db upload)
 - `LOG_LEVEL` -- Logging level (default: `INFO`)
 
 ### Discogs cache TTL settings
@@ -188,12 +200,22 @@ They are excluded by default (`addopts = "-m 'not integration'"` in `pyproject.t
 
 ## Deployment
 
-Hosted on Railway.
+Hosted on Railway with CI-driven deploys (automatic deploys are disabled).
 
-- `main` branch auto-deploys to **staging**
-- `prod` branch auto-deploys to **production**
+- **`main`** branch -- CI deploys to **staging** after lint, typecheck, and unit tests pass
+- **`prod`** branch -- CI deploys to **production** after lint, typecheck, and unit tests pass
 - Health check at `/health` with real dependency probes
 - Uses the same `Postgres-Nard` PostgreSQL instance as request-parser for Discogs cache
+- Railway volume mounted at `/data` stores `library.db` persistently across deploys
+
+### Library Database
+
+The `library.db` file is uploaded to the Railway volume via `POST /admin/upload-library-db`,
+not committed to git. The request-o-matic ETL script (`scripts/sync-library.sh`) handles
+daily uploads to both staging and production environments.
+
+On first deploy, the volume is empty. The service starts healthy for non-database endpoints
+but the health check reports `unhealthy` (503) until `library.db` is uploaded.
 
 ## Relationship to request-parser
 
