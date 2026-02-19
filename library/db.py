@@ -261,6 +261,11 @@ class LibraryDB:
 
         # Get candidate artists using prefix of first significant word
         artist_lower = artist.lower()
+
+        # For short names, a single-character difference is proportionally large,
+        # so raise the threshold to prevent false corrections (e.g. "Plug" -> "Plugz")
+        effective_threshold = max(threshold, 100 - len(artist_lower) * 2)
+
         words = artist_lower.split()
 
         # Use first word with 3+ chars for candidate search
@@ -292,12 +297,15 @@ class LibraryDB:
                 continue
 
             score = fuzz.ratio(artist_lower, candidate.lower())
-            if score > best_score and score >= threshold:
+            if score > best_score and score >= effective_threshold:
                 best_score = score
                 best_match = candidate
 
         if best_match and best_match.lower() != artist_lower:
-            logger.info(f"Corrected artist '{artist}' to '{best_match}' (score: {best_score})")
+            logger.info(
+                f"Corrected artist '{artist}' to '{best_match}' "
+                f"(score: {best_score}, threshold: {effective_threshold})"
+            )
             return best_match
 
         return None
