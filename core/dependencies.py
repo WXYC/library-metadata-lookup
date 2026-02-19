@@ -90,7 +90,10 @@ async def get_discogs_service(
         if settings.database_url_discogs and _discogs_pool is None:
             try:
                 _discogs_pool = await asyncpg.create_pool(
-                    settings.database_url_discogs, min_size=1, max_size=5
+                    settings.database_url_discogs,
+                    min_size=1,
+                    max_size=5,
+                    timeout=10,
                 )
                 logger.info("Discogs cache pool connected")
             except Exception as e:
