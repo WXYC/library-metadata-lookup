@@ -132,7 +132,7 @@ Optional:
 
 - Hosted on Railway with CI-driven deploys (automatic deploys disabled)
 - Railway volume mounted at `/data` stores `library.db` persistently across deploys
-- Uses `Postgres-Nard` shared PostgreSQL instance for Discogs cache
+- Optional PostgreSQL cache for Discogs data via `DATABASE_URL_DISCOGS` (gracefully degrades to API-only)
 - `LIBRARY_DB_PATH=/data/library.db` on Railway
 
 ### Branch Strategy
