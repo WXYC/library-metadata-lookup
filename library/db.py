@@ -246,7 +246,7 @@ class LibraryDB:
                 WHERE artist LIKE ? OR title LIKE ? OR alternate_artist_name LIKE ?
                 LIMIT 500
             """
-            fuzzy_params = (f"%{prefix}%", f"%{prefix}%", f"%{prefix}%")
+            fuzzy_params: tuple[str, ...] = (f"%{prefix}%", f"%{prefix}%", f"%{prefix}%")
         else:
             sql = f"""
                 SELECT {self._select_columns()}
