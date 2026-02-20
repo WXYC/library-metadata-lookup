@@ -555,3 +555,163 @@ class TestFindSimilarArtist:
 
         result = await db.find_similar_artist(misspelled)
         assert result == expected
+
+
+# ---------------------------------------------------------------------------
+# alternate_artist_name column
+# ---------------------------------------------------------------------------
+
+
+class TestAlternateArtistColumn:
+    """Tests for alternate_artist_name column detection and queries."""
+
+    @pytest.mark.asyncio
+    async def test_connect_detects_alternate_artist_column(self, tmp_path):
+        """connect() should detect the alternate_artist_name column and set flag."""
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT,
+                alternate_artist_name TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist, alternate_artist_name,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        assert db._has_alternate_artist is True
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_connect_without_alternate_artist_column(self, tmp_path):
+        """connect() should set flag to False when column is absent."""
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        assert db._has_alternate_artist is False
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_filtered_search_matches_alternate_artist(self, tmp_path):
+        """Artist filter search should also match alternate_artist_name."""
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT,
+                alternate_artist_name TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist, alternate_artist_name,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.execute(
+            "INSERT INTO library VALUES (1, 'Drum n Bass for Papa', 'Luke Vibert', 'V', 1, 1, 'Electronic', 'CD', 'Plug')"
+        )
+        conn.execute(
+            "INSERT INTO library_fts(rowid, title, artist, alternate_artist_name) VALUES (1, 'Drum n Bass for Papa', 'Luke Vibert', 'Plug')"
+        )
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+
+        results = await db.search(artist="Plug")
+        assert len(results) == 1
+        assert results[0].alternate_artist_name == "Plug"
+        assert results[0].artist == "Luke Vibert"
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_find_similar_artist_includes_alternates(self, tmp_path):
+        """find_similar_artist should also consider alternate_artist_name."""
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT,
+                alternate_artist_name TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist, alternate_artist_name,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.execute(
+            "INSERT INTO library VALUES (1, 'Album', 'Luke Vibert', 'V', 1, 1, 'Electronic', 'CD', 'Wagon Christ')"
+        )
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+
+        # "Wagon Chrst" is a typo for "Wagon Christ" - should match the alternate name
+        result = await db.find_similar_artist("Wagon Chrst")
+        assert result == "Wagon Christ"
+        await db.close()
