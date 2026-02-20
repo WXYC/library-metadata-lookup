@@ -21,6 +21,7 @@ class LibraryItem(BaseModel):
     release_call_number: int | None = None
     genre: str | None = None
     format: str | None = None
+    alternate_artist_name: str | None = None
 
     @property
     def call_number(self) -> str:
