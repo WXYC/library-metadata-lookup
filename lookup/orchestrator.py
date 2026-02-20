@@ -38,6 +38,20 @@ def limit_results(results: list) -> list:
     return results[:MAX_SEARCH_RESULTS]
 
 
+def artist_matches_item(item: LibraryItem, artist: str) -> bool:
+    """Check if a library item matches the given artist name.
+
+    Checks both the primary artist and alternate_artist_name fields.
+    """
+    artist_normalized = normalize_for_comparison(artist)
+    if normalize_for_comparison(item.artist).startswith(artist_normalized):
+        return True
+    if item.alternate_artist_name:
+        if normalize_for_comparison(item.alternate_artist_name).startswith(artist_normalized):
+            return True
+    return False
+
+
 async def resolve_albums_for_track(
     parsed: ParsedRequest,
     discogs_service: DiscogsService | None = None,
@@ -94,11 +108,9 @@ def filter_results_by_artist(
     if not artist:
         return results
 
-    artist_normalized = normalize_for_comparison(artist)
     filtered = []
     for item in results:
-        item_artist = normalize_for_comparison(item.artist)
-        if item_artist.startswith(artist_normalized):
+        if artist_matches_item(item, artist):
             filtered.append(item)
 
     if len(filtered) < len(results):
@@ -178,10 +190,9 @@ async def search_song_as_artist(
             if item.id in seen_ids:
                 continue
 
-            item_artist = normalize_for_comparison(item.artist)
-            if item_artist.startswith(
-                normalize_for_comparison(song_as_artist)
-            ) or is_compilation_artist(item_artist):
+            if artist_matches_item(item, song_as_artist) or is_compilation_artist(
+                item.artist or ""
+            ):
                 results.append(item)
                 seen_ids.add(item.id)
                 logger.info(f"Found '{item.artist} - {item.title}' via Discogs cross-reference")
@@ -306,10 +317,8 @@ async def search_compilations_for_track(
 
             if keyword_results:
                 filtered_results = []
-                artist_normalized = normalize_for_comparison(parsed.artist)
                 for item in keyword_results:
-                    item_artist = normalize_for_comparison(item.artist)
-                    if item_artist.startswith(artist_normalized):
+                    if artist_matches_item(item, parsed.artist):
                         filtered_results.append(item)
                     elif is_compilation_artist(item.artist or ""):
                         filtered_results.append(item)
@@ -350,12 +359,10 @@ async def search_compilations_for_track(
 
             if matches and parsed.artist:
                 filtered_matches = []
-                artist_normalized = normalize_for_comparison(parsed.artist)
                 discogs_is_compilation = is_compilation_artist(release_artist)
 
                 for match in matches:
-                    match_artist = normalize_for_comparison(match.artist)
-                    if match_artist.startswith(artist_normalized):
+                    if artist_matches_item(match, parsed.artist):
                         filtered_matches.append(match)
                     elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
                         filtered_matches.append(match)
@@ -524,7 +531,7 @@ async def fetch_artwork_for_items(
         try:
             album = discogs_titles.get(item.id, item.title)
 
-            artist = item.artist or ""
+            artist = item.alternate_artist_name or item.artist or ""
             if is_compilation_artist(artist):
                 artist = "Various"
 

@@ -20,6 +20,7 @@ class LibraryDB:
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or DEFAULT_DB_PATH
         self._conn: aiosqlite.Connection | None = None
+        self._has_alternate_artist: bool = False
 
     async def connect(self):
         """Open database connection."""
@@ -31,7 +32,17 @@ class LibraryDB:
 
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
-        logger.info(f"Connected to SQLite database: {self.db_path}")
+
+        # Detect whether library.db has the alternate_artist_name column
+        cursor = await self._conn.execute("PRAGMA table_info(library)")
+        columns = await cursor.fetchall()
+        column_names = {row[1] for row in columns}
+        self._has_alternate_artist = "alternate_artist_name" in column_names
+
+        logger.info(
+            f"Connected to SQLite database: {self.db_path} "
+            f"(alternate_artist_name: {'yes' if self._has_alternate_artist else 'no'})"
+        )
 
     async def is_available(self) -> bool:
         """Check if the database connection is alive."""
@@ -50,6 +61,17 @@ class LibraryDB:
             await self._conn.close()
             self._conn = None
             logger.info("Closed SQLite connection")
+
+    def _select_columns(self, prefix: str = "") -> str:
+        """Build the SELECT column list, conditionally including alternate_artist_name."""
+        p = f"{prefix}." if prefix else ""
+        cols = (
+            f"{p}id, {p}title, {p}artist, {p}call_letters, "
+            f"{p}artist_call_number, {p}release_call_number, {p}genre, {p}format"
+        )
+        if self._has_alternate_artist:
+            cols += f", {p}alternate_artist_name"
+        return cols
 
     async def search(
         self,
@@ -79,8 +101,8 @@ class LibraryDB:
 
         if query:
             # Full-text search using FTS5
-            sql = """
-                SELECT l.id, l.title, l.artist, l.call_letters, l.artist_call_number, l.release_call_number, l.genre, l.format
+            sql = f"""
+                SELECT {self._select_columns("l")}
                 FROM library l
                 JOIN library_fts fts ON l.id = fts.rowid
                 WHERE library_fts MATCH ?
@@ -126,15 +148,19 @@ class LibraryDB:
             conditions: list[str] = []
             params: list[str | int] = []
             if artist:
-                conditions.append("artist LIKE ?")
-                params.append(f"%{artist}%")
+                if self._has_alternate_artist:
+                    conditions.append("(artist LIKE ? OR alternate_artist_name LIKE ?)")
+                    params.extend([f"%{artist}%", f"%{artist}%"])
+                else:
+                    conditions.append("artist LIKE ?")
+                    params.append(f"%{artist}%")
             if title:
                 conditions.append("title LIKE ?")
                 params.append(f"%{title}%")
             params.append(limit)
 
             sql = f"""
-                SELECT id, title, artist, call_letters, artist_call_number, release_call_number, genre, format
+                SELECT {self._select_columns()}
                 FROM library
                 WHERE {" AND ".join(conditions)}
                 LIMIT ?
@@ -170,15 +196,17 @@ class LibraryDB:
         conditions: list[str] = []
         params: list[str | int] = []
         for word in significant_words:
-            # Search in both title and artist fields
-            conditions.append("(title LIKE ? OR artist LIKE ?)")
-            params.append(f"%{word}%")
-            params.append(f"%{word}%")
+            if self._has_alternate_artist:
+                conditions.append("(title LIKE ? OR artist LIKE ? OR alternate_artist_name LIKE ?)")
+                params.extend([f"%{word}%", f"%{word}%", f"%{word}%"])
+            else:
+                conditions.append("(title LIKE ? OR artist LIKE ?)")
+                params.extend([f"%{word}%", f"%{word}%"])
 
         params.append(limit)
 
         sql = f"""
-            SELECT id, title, artist, call_letters, artist_call_number, release_call_number, genre, format
+            SELECT {self._select_columns()}
             FROM library
             WHERE {" AND ".join(conditions)}
             LIMIT ?
@@ -211,15 +239,25 @@ class LibraryDB:
         # Search for candidates using partial match on longest word
         prefix = search_word[:3] if len(search_word) >= 3 else search_word
 
-        sql = """
-            SELECT id, title, artist, call_letters, artist_call_number, release_call_number, genre, format
-            FROM library
-            WHERE artist LIKE ? OR title LIKE ?
-            LIMIT 500
-        """
+        if self._has_alternate_artist:
+            sql = f"""
+                SELECT {self._select_columns()}
+                FROM library
+                WHERE artist LIKE ? OR title LIKE ? OR alternate_artist_name LIKE ?
+                LIMIT 500
+            """
+            fuzzy_params: tuple[str, ...] = (f"%{prefix}%", f"%{prefix}%", f"%{prefix}%")
+        else:
+            sql = f"""
+                SELECT {self._select_columns()}
+                FROM library
+                WHERE artist LIKE ? OR title LIKE ?
+                LIMIT 500
+            """
+            fuzzy_params = (f"%{prefix}%", f"%{prefix}%")
 
         assert self._conn is not None, "Database not connected. Call connect() first."
-        cursor = await self._conn.execute(sql, (f"%{prefix}%", f"%{prefix}%"))
+        cursor = await self._conn.execute(sql, fuzzy_params)
         rows = await cursor.fetchall()
 
         if not rows:
@@ -275,13 +313,24 @@ class LibraryDB:
 
         prefix = search_word[:3]
 
-        sql = """
-            SELECT DISTINCT artist FROM library
-            WHERE artist LIKE ?
-            LIMIT 100
-        """
-
-        cursor = await self._conn.execute(sql, (f"{prefix}%",))
+        if self._has_alternate_artist:
+            sql = """
+                SELECT DISTINCT name FROM (
+                    SELECT artist AS name FROM library WHERE artist LIKE ?
+                    UNION
+                    SELECT alternate_artist_name AS name FROM library
+                    WHERE alternate_artist_name IS NOT NULL AND alternate_artist_name LIKE ?
+                )
+                LIMIT 100
+            """
+            cursor = await self._conn.execute(sql, (f"{prefix}%", f"{prefix}%"))
+        else:
+            sql = """
+                SELECT DISTINCT artist FROM library
+                WHERE artist LIKE ?
+                LIMIT 100
+            """
+            cursor = await self._conn.execute(sql, (f"{prefix}%",))
         rows = await cursor.fetchall()
 
         if not rows:

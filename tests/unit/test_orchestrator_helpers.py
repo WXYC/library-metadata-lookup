@@ -21,6 +21,7 @@ from discogs.models import (
     ReleaseMetadataResponse,
 )
 from lookup.orchestrator import (
+    artist_matches_item,
     build_context_message,
     fetch_artwork_for_items,
     filter_results_by_artist,
@@ -120,6 +121,79 @@ class TestFilterResultsByArtist:
         results = [make_library_item(id=1, artist="Sigur Ros", title="Agaetis Byrjun")]
         filtered = filter_results_by_artist(results, "Sigur Rós")
         assert len(filtered) == 1
+
+    def test_alternate_artist_name_matches(self):
+        """Item with alternate_artist_name should match when filtering by the alternate name."""
+        results = [
+            make_library_item(
+                id=1,
+                artist="Luke Vibert",
+                title="Drum 'n' Bass for Papa (+ Plug EPs 1,2 & 3)",
+                alternate_artist_name="Plug",
+            ),
+        ]
+        filtered = filter_results_by_artist(results, "Plug")
+        assert len(filtered) == 1
+
+    def test_alternate_artist_name_prefix(self):
+        """Prefix of alternate name should also match."""
+        results = [
+            make_library_item(
+                id=1,
+                artist="Luke Vibert",
+                title="Drum 'n' Bass for Papa",
+                alternate_artist_name="Plug",
+            ),
+        ]
+        filtered = filter_results_by_artist(results, "Plu")
+        assert len(filtered) == 1
+
+    def test_no_alternate_filtered_out(self):
+        """Item without alternate_artist_name should not match a different artist."""
+        results = [
+            make_library_item(
+                id=1,
+                artist="Luke Vibert",
+                title="Some Album",
+            ),
+        ]
+        filtered = filter_results_by_artist(results, "Plug")
+        assert len(filtered) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: artist_matches_item
+# ---------------------------------------------------------------------------
+
+
+class TestArtistMatchesItem:
+    """Tests for the artist_matches_item helper."""
+
+    def test_primary_artist_matches(self):
+        item = make_library_item(id=1, artist="Radiohead", title="OK Computer")
+        assert artist_matches_item(item, "Radiohead") is True
+
+    def test_alternate_artist_matches(self):
+        item = make_library_item(
+            id=1, artist="Luke Vibert", title="Album", alternate_artist_name="Plug"
+        )
+        assert artist_matches_item(item, "Plug") is True
+
+    def test_neither_matches(self):
+        item = make_library_item(id=1, artist="Luke Vibert", title="Album")
+        assert artist_matches_item(item, "Plug") is False
+
+    def test_prefix_matches_alternate(self):
+        item = make_library_item(
+            id=1, artist="Luke Vibert", title="Album", alternate_artist_name="Plug"
+        )
+        assert artist_matches_item(item, "Plu") is True
+
+    def test_case_insensitive(self):
+        item = make_library_item(
+            id=1, artist="Luke Vibert", title="Album", alternate_artist_name="Plug"
+        )
+        assert artist_matches_item(item, "plug") is True
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +605,31 @@ class TestFetchArtworkForItems:
         assert len(results) == 1
         assert results[0][0].id == 1
         assert results[0][1] is None
+
+    @pytest.mark.asyncio
+    async def test_artwork_uses_alternate_artist(self, mock_discogs_service):
+        """When item has alternate_artist_name, use it for Discogs search."""
+        item = make_library_item(
+            id=1,
+            artist="Luke Vibert",
+            title="Drum 'n' Bass for Papa",
+            alternate_artist_name="Plug",
+        )
+
+        artwork = make_discogs_result(
+            release_id=12345,
+            album="Drum 'n' Bass for Papa",
+            artist="Plug",
+            artwork_url="https://example.com/cover.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        call_args = mock_discogs_service.search.call_args[0][0]
+        assert isinstance(call_args, DiscogsSearchRequest)
+        assert call_args.artist == "Plug"
 
     @pytest.mark.asyncio
     async def test_uses_discogs_titles_for_compilation_lookup(self, mock_discogs_service):
