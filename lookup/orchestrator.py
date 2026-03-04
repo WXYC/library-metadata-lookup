@@ -334,6 +334,8 @@ async def search_compilations_for_track(
         logger.warning(f"Keyword search failed: {e}")
         keyword_matches = []
 
+    discogs_found_releases = False
+
     try:
         raw_lower = parsed.raw_message.lower()
         song_search = parsed.song
@@ -347,6 +349,7 @@ async def search_compilations_for_track(
             song_search, parsed.artist, service=discogs_service
         )
         logger.info(f"Found {len(releases)} releases with '{song_search}' on Discogs")
+        discogs_found_releases = len(releases) > 0
 
         for release_artist, release_album in releases:
             if parsed.artist and release_album.lower().strip() == parsed.artist.lower().strip():
@@ -387,7 +390,7 @@ async def search_compilations_for_track(
     except Exception as e:
         logger.warning(f"Failed to search for track on other releases: {e}")
 
-    if not results and keyword_matches:
+    if not results and keyword_matches and not discogs_found_releases:
         logger.info("Discogs search found nothing, using keyword matches as fallback")
         for item in keyword_matches[:1]:
             if item.id not in seen_ids:
