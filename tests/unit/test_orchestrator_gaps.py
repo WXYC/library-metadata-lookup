@@ -425,6 +425,41 @@ class TestSearchCompilationsForTrack:
         # Should fall back to keyword matches
         assert len(results) >= 1
 
+    @pytest.mark.asyncio
+    async def test_no_keyword_fallback_when_discogs_found_releases(self):
+        """When Discogs finds releases but none match in library, don't use keyword fallback.
+
+        Bug: "flow coma by 808 state" — keyword search finds "808 State" via
+        fuzzy matching, Discogs finds "The Best Of 808 State: Blueprint", but
+        search_album_fuzzy correctly rejects "808 State" for that album.
+        The keyword fallback then returns "808 State" anyway — a false positive.
+        """
+        db = AsyncMock()
+        false_positive = _item(id=958, artist="808 State", title="808 State")
+
+        # First call (keyword search): returns the false positive
+        # Second call (search_album_fuzzy for "The Best Of 808 State: Blueprint"): empty
+        db.search = AsyncMock(side_effect=[[false_positive], []])
+
+        parsed = ParsedRequest(
+            artist="808 State",
+            song="Flow Coma",
+            raw_message="flow coma by 808 state",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[("808 State", "The Best Of 808 State: Blueprint")],
+        ):
+            results, _ = await search_compilations_for_track(db, parsed)
+
+        # Should NOT fall back to keyword matches — Discogs found releases
+        assert results == [], (
+            "Should not return '808 State' as keyword fallback when Discogs found specific "
+            "releases that didn't match in library"
+        )
+
 
 # ---------------------------------------------------------------------------
 # search_album_fuzzy (lines 411-444)
