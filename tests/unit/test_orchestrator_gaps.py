@@ -186,15 +186,19 @@ class TestSearchLibraryWithFallbackSongPath:
         assert "Bohemian Rhapsody" in results[0].title
 
     @pytest.mark.asyncio
-    async def test_no_fallback_when_discogs_albums_provided(self):
-        """When Discogs found specific albums but none matched, don't fall back."""
+    async def test_falls_through_to_artist_search_when_discogs_albums_not_in_library(self):
+        """When Discogs found specific albums but none matched, fall through to artist search.
+
+        filter_results_by_track_validation() (called downstream by perform_lookup)
+        handles rejecting false positives from the fallback results.
+        """
         db = AsyncMock()
         item = _item(id=1, artist="Queen", title="Greatest Hits")
 
         db.search = AsyncMock(
             side_effect=[
                 [],  # album search: no match
-                [item],  # would be artist+song
+                [item],  # artist+song fallback
             ]
         )
 
@@ -206,7 +210,8 @@ class TestSearchLibraryWithFallbackSongPath:
             db, parsed, albums=["Nonexistent Album"]
         )
 
-        assert results == []
+        assert len(results) == 1
+        assert results[0].title == "Greatest Hits"
         assert song_not_found is True
 
 
