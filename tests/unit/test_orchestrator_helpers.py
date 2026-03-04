@@ -336,7 +336,8 @@ class TestSearchLibraryWithFallback:
         assert fallback is False
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_artist_only(self, mock_library_db):
+    async def test_falls_back_to_artist_only_when_no_discogs_albums(self, mock_library_db):
+        """Falls back to artist-only when Discogs found no albums (empty list)."""
         item = make_library_item(
             id=2,
             artist="Queen",
@@ -345,7 +346,6 @@ class TestSearchLibraryWithFallback:
             release_call_number=2,
         )
         mock_library_db.search.side_effect = [
-            [],  # artist + album
             [],  # artist + song
             [item],  # artist only
         ]
@@ -359,11 +359,47 @@ class TestSearchLibraryWithFallback:
             message_type=MessageType.REQUEST,
         )
 
-        results, fallback = await search_library_with_fallback(
-            mock_library_db, parsed, ["Unknown Album"]
-        )
+        results, fallback = await search_library_with_fallback(mock_library_db, parsed, [])
         assert len(results) == 1
         assert fallback is True
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_discogs_found_albums(self, mock_library_db):
+        """When Discogs found specific albums but none are in the library, don't fall back.
+
+        Bug: searching "flow coma by 808 state" — Discogs finds the track on
+        "The Best Of 808 State: Blueprint" but the library doesn't have that album.
+        The old code fell back to artist+song/artist-only search, returning the
+        unrelated "808 State" (self-titled) album which does NOT contain "Flow Coma".
+        """
+        false_positive = make_library_item(
+            id=958,
+            artist="808 State",
+            title="808 State",
+            call_letters="Ei",
+        )
+        mock_library_db.search.side_effect = [
+            [],  # album search: no match
+            [false_positive],  # artist+song: would match via fuzzy
+            [false_positive],  # artist-only: would match
+        ]
+
+        parsed = ParsedRequest(
+            song="Flow Coma",
+            artist="808 State",
+            raw_message="flow coma by 808 state",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+
+        results, fallback = await search_library_with_fallback(
+            mock_library_db, parsed, ["The Best Of 808 State: Blueprint"]
+        )
+        assert results == [], (
+            "Should not fall back to artist search when Discogs found specific albums"
+        )
+        assert fallback is True
+        assert mock_library_db.search.call_count == 1
 
     @pytest.mark.asyncio
     async def test_filters_results_by_album_title(self, mock_library_db):

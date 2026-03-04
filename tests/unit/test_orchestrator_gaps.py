@@ -165,14 +165,38 @@ class TestSearchSongAsArtist:
 
 class TestSearchLibraryWithFallbackSongPath:
     @pytest.mark.asyncio
-    async def test_artist_plus_song_fallback(self):
-        """When albums produce no results, tries artist+song and sorts by song match."""
+    async def test_artist_plus_song_fallback_when_no_discogs_albums(self):
+        """When Discogs found no albums (empty list), falls back to artist+song."""
         db = AsyncMock()
         item1 = _item(id=1, artist="Queen", title="Greatest Hits")
         item2 = _item(id=2, artist="Queen", title="Bohemian Rhapsody Single")
 
-        # No album results (first call), artist+song results (second call)
-        db.search = AsyncMock(side_effect=[[], [item1, item2]])
+        # artist+song results (first call)
+        db.search = AsyncMock(side_effect=[[item1, item2]])
+
+        parsed = ParsedRequest(
+            artist="Queen", song="Bohemian Rhapsody", raw_message="Queen - Bohemian Rhapsody"
+        )
+
+        results, song_not_found = await search_library_with_fallback(db, parsed, albums=[])
+
+        assert len(results) >= 1
+        assert song_not_found is True
+        # Item with song in title should be sorted first
+        assert "Bohemian Rhapsody" in results[0].title
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_discogs_albums_provided(self):
+        """When Discogs found specific albums but none matched, don't fall back."""
+        db = AsyncMock()
+        item = _item(id=1, artist="Queen", title="Greatest Hits")
+
+        db.search = AsyncMock(
+            side_effect=[
+                [],  # album search: no match
+                [item],  # would be artist+song
+            ]
+        )
 
         parsed = ParsedRequest(
             artist="Queen", song="Bohemian Rhapsody", raw_message="Queen - Bohemian Rhapsody"
@@ -182,10 +206,8 @@ class TestSearchLibraryWithFallbackSongPath:
             db, parsed, albums=["Nonexistent Album"]
         )
 
-        assert len(results) >= 1
+        assert results == []
         assert song_not_found is True
-        # Item with song in title should be sorted first
-        assert "Bohemian Rhapsody" in results[0].title
 
 
 # ---------------------------------------------------------------------------
