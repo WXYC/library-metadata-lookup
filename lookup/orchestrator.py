@@ -249,6 +249,16 @@ async def search_library_with_fallback(
             )
             return all_results, False
 
+        # Discogs found specific albums for this track but none matched in the
+        # library.  Don't fall through to generic artist search — that would
+        # return unrelated albums (e.g., "808 State" self-titled for a track
+        # on "The Best Of 808 State: Blueprint").  The compilation search
+        # strategy runs next and can still find the track.
+        logger.info(
+            f"Discogs found albums {albums} but none matched in library; skipping artist fallback"
+        )
+        return [], True
+
     if parsed.artist and parsed.song:
         query = f"{parsed.artist} {parsed.song}"
         results = await db.search(query=query, limit=MAX_SEARCH_RESULTS)
@@ -394,11 +404,34 @@ async def search_compilations_for_track(
     return limit_results(results), discogs_titles
 
 
+def _album_title_acceptable(query_lower: str, result_lower: str) -> bool:
+    """Check if a library album title is an acceptable match for a Discogs album title.
+
+    Uses prefix matching (handles parenthetical suffixes like edition names) and
+    length-sensitive fuzz.ratio to reject subset matches that token_set_ratio
+    would incorrectly accept.
+    """
+    from rapidfuzz import fuzz
+
+    if query_lower.startswith(result_lower) or result_lower.startswith(query_lower):
+        return True
+    return fuzz.ratio(query_lower, result_lower) >= 50
+
+
 async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryItem]:
     """Search for album with fuzzy keyword matching."""
     from rapidfuzz import fuzz
 
     results = await db.search(query=album_title, limit=MAX_SEARCH_RESULTS)
+
+    # Filter exact FTS5 results by title similarity to reject subset matches
+    # (e.g., FTS5 matches "808 State" for query "The Best Of 808 State: Blueprint"
+    # because it tokenizes and matches on shared terms "808" and "State")
+    if results:
+        album_lower = album_title.lower()
+        results = [
+            r for r in results if _album_title_acceptable(album_lower, (r.title or "").lower())
+        ]
 
     if not results:
         words = re.sub(r"[^\w\s]", " ", album_title.lower()).split()
@@ -419,8 +452,9 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
                         1 for word in significant_words if word in result_title_lower
                     )
                     similarity = fuzz.token_set_ratio(album_lower, result_title_lower)
+                    title_ok = _album_title_acceptable(album_lower, result_title_lower)
 
-                    if keyword_matches >= 2 and similarity >= 60:
+                    if keyword_matches >= 2 and similarity >= 60 and title_ok:
                         logger.debug(
                             f"Album match: '{result.title}' "
                             f"(keywords={keyword_matches}, similarity={similarity})"
