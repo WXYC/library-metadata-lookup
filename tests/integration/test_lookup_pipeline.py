@@ -1,5 +1,7 @@
 """Integration tests for the lookup pipeline with real LibraryDB."""
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 pytestmark = pytest.mark.integration
@@ -114,3 +116,37 @@ class TestLookupPipeline:
         # Should have corrected the artist
         if body.get("corrected_artist"):
             assert body["corrected_artist"] == "Living Colour"
+
+
+class TestTrackValidationFiltering:
+    """Test that track validation filters false positives from album-resolved results."""
+
+    @pytest.mark.asyncio
+    async def test_song_filters_to_correct_album(self, app_client_with_discogs):
+        """'Help Me by Joni Mitchell' should return Court and Spark, not the self-titled album.
+
+        The self-titled "Joni Mitchell" album does not contain "Help Me" — it's a
+        false positive from album resolution matching the artist name as an album title.
+        """
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[
+                ("Joni Mitchell", "Court and Spark"),
+                ("Joni Mitchell", "Joni Mitchell"),
+            ],
+        ):
+            resp = await app_client_with_discogs.post(
+                "/api/v1/lookup",
+                json={
+                    "artist": "Joni Mitchell",
+                    "song": "Help Me",
+                    "raw_message": "Play Help Me by Joni Mitchell",
+                },
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["results"]) == 1
+        assert body["results"][0]["library_item"]["title"] == "Court and Spark"
+        assert body["song_not_found"] is False

@@ -89,6 +89,34 @@ def compilation_item():
     )
 
 
+@pytest.fixture
+def joni_self_titled():
+    return LibraryItem(
+        id=19,
+        artist="Joni Mitchell",
+        title="Joni Mitchell",
+        call_letters="MI",
+        artist_call_number=8,
+        release_call_number=1,
+        genre="Rock",
+        format="Vinyl",
+    )
+
+
+@pytest.fixture
+def joni_court_and_spark():
+    return LibraryItem(
+        id=20,
+        artist="Joni Mitchell",
+        title="Court and Spark",
+        call_letters="MI",
+        artist_call_number=8,
+        release_call_number=6,
+        genre="Rock",
+        format="Vinyl",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - basic cases
 # ---------------------------------------------------------------------------
@@ -229,6 +257,77 @@ class TestPerformLookupAlbumResolution:
 
         assert len(response.results) >= 1
         assert response.song_not_found is False
+
+    @pytest.mark.asyncio
+    async def test_track_validation_filters_album_resolved_results(
+        self,
+        mock_library_db,
+        mock_discogs_service,
+        telemetry,
+        joni_self_titled,
+        joni_court_and_spark,
+    ):
+        """Album resolution may return false positives; track validation should filter them.
+
+        Scenario: "Help Me by Joni Mitchell"
+        - Discogs resolves albums: ["Court and Spark", "Joni Mitchell"]
+        - Library matches both (self-titled + Court and Spark)
+        - Track validation confirms "Help Me" is on Court and Spark but NOT self-titled
+        - Only Court and Spark should remain in results
+        """
+        mock_library_db.find_similar_artist.return_value = None
+        # search_library_with_fallback searches each album:
+        # 1. "Joni Mitchell Court and Spark" -> Court and Spark
+        # 2. "Joni Mitchell Joni Mitchell" -> self-titled
+        mock_library_db.search.side_effect = [
+            [joni_court_and_spark],
+            [joni_self_titled],
+        ]
+
+        # Discogs search for artwork (called per result in filter_results_by_track_validation)
+        court_and_spark_discogs = make_discogs_result(
+            release_id=1001,
+            album="Court and Spark",
+            artist="Joni Mitchell",
+        )
+        self_titled_discogs = make_discogs_result(
+            release_id=1002,
+            album="Joni Mitchell",
+            artist="Joni Mitchell",
+        )
+        # search() is called by filter_results_by_track_validation for each item,
+        # then again by fetch_artwork_for_items
+        mock_discogs_service.search.side_effect = [
+            # track validation: search for Court and Spark
+            DiscogsSearchResponse(results=[court_and_spark_discogs]),
+            # track validation: search for Joni Mitchell (self-titled)
+            DiscogsSearchResponse(results=[self_titled_discogs]),
+            # artwork fetch for the one remaining result
+            DiscogsSearchResponse(results=[court_and_spark_discogs]),
+        ]
+
+        # validate_track_on_release: "Help Me" IS on Court and Spark, NOT on self-titled
+        mock_discogs_service.validate_track_on_release.side_effect = [True, False]
+
+        request = LookupRequest(
+            artist="Joni Mitchell",
+            song="Help Me",
+            raw_message="Play Help Me by Joni Mitchell",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[("Joni Mitchell", "Court and Spark"), ("Joni Mitchell", "Joni Mitchell")],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert len(response.results) == 1
+        assert response.results[0].library_item.title == "Court and Spark"
+        assert response.song_not_found is False
+        assert response.search_type == "direct"
 
 
 # ---------------------------------------------------------------------------
