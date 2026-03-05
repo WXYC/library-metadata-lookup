@@ -4,12 +4,16 @@ Provides a real LibraryDB backed by in-memory SQLite with FTS5,
 seeded with representative catalog items.
 """
 
+from unittest.mock import AsyncMock
+
 import aiosqlite
 import pytest
 import pytest_asyncio
 
 from config.settings import Settings
+from discogs.models import DiscogsSearchResponse
 from library.db import LibraryDB
+from tests.factories import make_discogs_result
 
 # ---------------------------------------------------------------------------
 # Seed data -- representative catalog items
@@ -34,6 +38,8 @@ SEED_ITEMS = [
     (16, "Abbey Road", "The Beatles", "B", 1, 1, "Rock", "Vinyl"),
     (17, "Let It Be", "The Beatles", "B", 1, 2, "Rock", "Vinyl"),
     (18, "Laid Back", "Laid Back", "L", 2, 1, "Electronic", "CD"),
+    (19, "Joni Mitchell", "Joni Mitchell", "MI", 8, 1, "Rock", "Vinyl"),
+    (20, "Court and Spark", "Joni Mitchell", "MI", 8, 6, "Rock", "Vinyl"),
 ]
 
 
@@ -119,6 +125,59 @@ async def app_client(library_db, test_settings):
 
     app.dependency_overrides[get_library_db] = lambda: library_db
     app.dependency_overrides[get_discogs_service] = lambda: None
+    app.dependency_overrides[get_posthog_client] = lambda: None
+    app.dependency_overrides[get_settings] = lambda: test_settings
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        yield client
+
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def app_client_with_discogs(library_db, test_settings):
+    """httpx AsyncClient with real LibraryDB and a mock DiscogsService.
+
+    The mock DiscogsService provides realistic track validation behavior:
+    - validate_track_on_release returns True/False based on album title
+    - search returns Discogs results for known albums
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from config.settings import get_settings
+    from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+    from main import app
+
+    mock_discogs = AsyncMock()
+    mock_discogs.cache_service = None
+
+    # Track validation: "Help Me" is on "Court and Spark" but NOT "Joni Mitchell" (self-titled)
+    async def validate_track(release_id, song, artist):
+        # release_id 1001 = Court and Spark, 1002 = self-titled
+        return release_id == 1001
+
+    mock_discogs.validate_track_on_release = AsyncMock(side_effect=validate_track)
+
+    # Search returns matching Discogs results for known albums
+    court_and_spark = make_discogs_result(
+        release_id=1001, album="Court and Spark", artist="Joni Mitchell"
+    )
+    joni_self_titled = make_discogs_result(
+        release_id=1002, album="Joni Mitchell", artist="Joni Mitchell"
+    )
+
+    async def search_discogs(request):
+        album = request.album if hasattr(request, "album") else ""
+        if album and "court" in album.lower():
+            return DiscogsSearchResponse(results=[court_and_spark])
+        if album and "joni" in album.lower():
+            return DiscogsSearchResponse(results=[joni_self_titled])
+        return DiscogsSearchResponse(results=[])
+
+    mock_discogs.search = AsyncMock(side_effect=search_discogs)
+
+    app.dependency_overrides[get_library_db] = lambda: library_db
+    app.dependency_overrides[get_discogs_service] = lambda: mock_discogs
     app.dependency_overrides[get_posthog_client] = lambda: None
     app.dependency_overrides[get_settings] = lambda: test_settings
 
