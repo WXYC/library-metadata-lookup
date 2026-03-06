@@ -413,17 +413,45 @@ async def search_compilations_for_track(
     return limit_results(results), discogs_titles
 
 
-def _album_title_acceptable(query_lower: str, result_lower: str) -> bool:
+def album_title_acceptable(query_lower: str, result_lower: str) -> bool:
     """Check if a library album title is an acceptable match for a Discogs album title.
 
     Uses prefix matching (handles parenthetical suffixes like edition names) and
     length-sensitive fuzz.ratio to reject subset matches that token_set_ratio
     would incorrectly accept.
+
+    Also rejects numbered series albums (e.g., "Chicago V" vs "Chicago 16",
+    "Led Zeppelin II" vs "Led Zeppelin IV") by checking that when titles share
+    a long common prefix, the short distinguishing suffixes are also similar.
     """
     from rapidfuzz import fuzz
 
     if query_lower.startswith(result_lower) or result_lower.startswith(query_lower):
         return True
+
+    # Find common prefix length
+    common = 0
+    for a, b in zip(query_lower, result_lower, strict=False):
+        if a != b:
+            break
+        common += 1
+
+    # Reject numbered series: titles that share a dominant prefix but differ
+    # in a short identifier suffix (e.g., "V" vs "16", "II" vs "IV").
+    if common > 0:
+        remainder_q = query_lower[common:].strip()
+        remainder_r = result_lower[common:].strip()
+        min_len = min(len(query_lower), len(result_lower))
+        if (
+            remainder_q
+            and remainder_r
+            and len(remainder_q) <= 5
+            and len(remainder_r) <= 5
+            and common >= min_len * 0.5
+        ):
+            if fuzz.ratio(remainder_q, remainder_r) < 50:
+                return False
+
     return fuzz.ratio(query_lower, result_lower) >= 50
 
 
@@ -439,7 +467,7 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
     if results:
         album_lower = album_title.lower()
         results = [
-            r for r in results if _album_title_acceptable(album_lower, (r.title or "").lower())
+            r for r in results if album_title_acceptable(album_lower, (r.title or "").lower())
         ]
 
     if not results:
@@ -461,7 +489,7 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
                         1 for word in significant_words if word in result_title_lower
                     )
                     similarity = fuzz.token_set_ratio(album_lower, result_title_lower)
-                    title_ok = _album_title_acceptable(album_lower, result_title_lower)
+                    title_ok = album_title_acceptable(album_lower, result_title_lower)
 
                     if keyword_matches >= 2 and similarity >= 60 and title_ok:
                         logger.debug(
