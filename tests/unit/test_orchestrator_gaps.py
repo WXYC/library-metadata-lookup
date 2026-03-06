@@ -499,6 +499,43 @@ class TestSearchCompilationsForTrack:
             "these are different albums in a numbered series"
         )
 
+    @pytest.mark.asyncio
+    async def test_quoted_artist_prevents_keyword_fallback(self):
+        """Quoted Discogs artist names should not cause keyword fallback.
+
+        Bug: 'Bob by Weird Al Yankovic' returned the self-titled album because
+        Discogs formats the artist as '"Weird Al" Yankovic' (with quotes), which
+        broke validation, causing all validated releases to be rejected. With no
+        Discogs results, the keyword fallback fired and returned the self-titled
+        album without track validation.
+
+        Fix: validate_track_on_release now strips quotes. Validation passes for
+        legitimate releases, discogs_found_releases is True, and the keyword
+        fallback does not fire.
+        """
+        db = AsyncMock()
+        self_titled = _item(id=1, artist="Weird Al Yankovic", title="Weird Al Yankovic")
+        db.search = AsyncMock(return_value=[self_titled])
+
+        parsed = ParsedRequest(
+            artist="Weird Al Yankovic",
+            song="Bob",
+            raw_message='Bob by Weird "Al" Yankovich',
+        )
+
+        # Discogs found Poodle Hat (which contains "Bob"), but it's not in the library
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[('"Weird Al" Yankovic', "Poodle Hat")],
+        ):
+            results, _ = await search_compilations_for_track(db, parsed)
+
+        assert results == [], (
+            "Should not return self-titled album via keyword fallback when Discogs "
+            "found valid releases (Poodle Hat) that simply aren't in the library"
+        )
+
 
 # ---------------------------------------------------------------------------
 # search_album_fuzzy (lines 411-444)

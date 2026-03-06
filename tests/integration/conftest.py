@@ -42,6 +42,9 @@ SEED_ITEMS = [
     (20, "Court and Spark", "Joni Mitchell", "MI", 8, 6, "Rock", "Vinyl"),
     (21, "S/t", "The Bird and the Bee", "BI", 125, 1, "Rock", "CD"),
     (22, "Please Clap Your Hands", "The Bird and the Bee", "BI", 125, 2, "Rock", "CD"),
+    (23, "Weird Al Yankovic", "Weird Al Yankovic", "YA", 1, 1, "Rock", "Vinyl"),
+    (24, "Dare to Be Stupid", "Weird Al Yankovic", "YA", 1, 2, "Rock", "Vinyl"),
+    (25, "Even Worse", "Weird Al Yankovic", "YA", 1, 3, "Rock", "Vinyl"),
 ]
 
 

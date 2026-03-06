@@ -703,7 +703,10 @@ class DiscogsService:
             return False
 
         track_lower = track.lower()
-        artist_lower = artist.lower()
+        # Strip quotes from artist name — Discogs uses quotes for nicknames
+        # (e.g. '"Weird Al" Yankovic') which breaks substring matching against
+        # the user-supplied form ('Weird Al Yankovic').
+        artist_lower = artist.lower().replace('"', "").replace("'", "")
 
         for item in release.tracklist:
             item_title = item.title.lower()
@@ -714,7 +717,8 @@ class DiscogsService:
             # Check per-track artists first (for compilations)
             if item.artists:
                 for track_artist in item.artists:
-                    track_artist_lower = track_artist.lower().split("(")[0].strip()
+                    track_artist_lower = track_artist.lower().replace('"', "").replace("'", "")
+                    track_artist_lower = track_artist_lower.split("(")[0].strip()
                     if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
                         logger.info(
                             f"Validated: '{track}' by '{artist}' found on release {release_id}"
@@ -722,7 +726,7 @@ class DiscogsService:
                         return True
             else:
                 # For single-artist releases, check release artist
-                release_artist = release.artist.lower()
+                release_artist = release.artist.lower().replace('"', "").replace("'", "")
                 # Remove Discogs numbering like "(2)"
                 release_artist = release_artist.split("(")[0].strip()
 
