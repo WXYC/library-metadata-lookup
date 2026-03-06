@@ -6,6 +6,7 @@ from core.matching import (
     calculate_confidence,
     detect_ambiguous_format,
     is_compilation_artist,
+    is_self_titled,
     normalize_for_comparison,
     strip_diacritics,
 )
@@ -119,6 +120,41 @@ class TestIsCompilationArtist:
     )
     def test_non_compilation_artists(self, artist):
         assert is_compilation_artist(artist) is False
+
+
+# ---------------------------------------------------------------------------
+# is_self_titled
+# ---------------------------------------------------------------------------
+
+
+class TestIsSelfTitled:
+    @pytest.mark.parametrize(
+        "title",
+        [
+            pytest.param("S/t", id="s-slash-t"),
+            pytest.param("s/t", id="s-slash-t-lower"),
+            pytest.param("S/T", id="s-slash-t-upper"),
+            pytest.param("S.T.", id="s-dot-t"),
+            pytest.param("s.t.", id="s-dot-t-lower"),
+            pytest.param("Self-Titled", id="self-titled"),
+            pytest.param("self titled", id="self-titled-no-hyphen"),
+            pytest.param(" S/t ", id="with-whitespace"),
+        ],
+    )
+    def test_self_titled_detected(self, title):
+        assert is_self_titled(title) is True
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            pytest.param("The Game", id="normal-title"),
+            pytest.param("", id="empty"),
+            pytest.param("St. Elsewhere", id="saint"),
+            pytest.param("Satisfaction", id="starts-with-s"),
+        ],
+    )
+    def test_non_self_titled(self, title):
+        assert is_self_titled(title) is False
 
 
 # ---------------------------------------------------------------------------
