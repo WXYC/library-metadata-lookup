@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from lookup.orchestrator import (
+    album_title_acceptable,
     fetch_artwork_for_items,
     filter_results_by_track_validation,
     resolve_albums_for_track,
@@ -465,10 +466,75 @@ class TestSearchCompilationsForTrack:
             "releases that didn't match in library"
         )
 
+    @pytest.mark.asyncio
+    async def test_rejects_wrong_album_in_numbered_series(self):
+        """search_compilations_for_track should not match Chicago V for Chicago 16.
+
+        Bug: "Hard to Say I'm Sorry - Chicago" — Discogs correctly identifies
+        the track on "Chicago 16", but the library doesn't have Chicago 16.
+        FTS5 returns "Chicago V" (shares the word "Chicago"), and fuzzy matching
+        incorrectly accepts it because the fuzz.ratio is high (~84%).
+        """
+        db = AsyncMock()
+        chicago_v = _item(id=100, artist="Chicago", title="Chicago V")
+
+        # Keyword search returns Chicago V; search_album_fuzzy also returns it
+        db.search = AsyncMock(return_value=[chicago_v])
+
+        parsed = ParsedRequest(
+            artist="Chicago",
+            song="Hard to Say I'm Sorry",
+            raw_message="Hard to Say Im Sorry - Chicago",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[("Chicago", "Chicago 16")],
+        ):
+            results, _ = await search_compilations_for_track(db, parsed)
+
+        assert results == [], (
+            "Should not match 'Chicago V' when Discogs album is 'Chicago 16' — "
+            "these are different albums in a numbered series"
+        )
+
 
 # ---------------------------------------------------------------------------
 # search_album_fuzzy (lines 411-444)
 # ---------------------------------------------------------------------------
+
+
+class TestAlbumTitleAcceptable:
+    """Tests for album_title_acceptable: rejects numbered series albums that share only a prefix."""
+
+    def test_rejects_chicago_v_for_chicago_16(self):
+        """Chicago V and Chicago 16 are different albums in a numbered series."""
+        assert album_title_acceptable("chicago 16", "chicago v") is False
+
+    def test_rejects_chicago_ix_for_chicago_16(self):
+        """Chicago IX and Chicago 16 are different albums in a numbered series."""
+        assert album_title_acceptable("chicago 16", "chicago ix") is False
+
+    def test_rejects_led_zeppelin_ii_for_led_zeppelin_iv(self):
+        """Led Zeppelin II and Led Zeppelin IV are different albums."""
+        assert album_title_acceptable("led zeppelin iv", "led zeppelin ii") is False
+
+    def test_accepts_exact_match(self):
+        assert album_title_acceptable("chicago 16", "chicago 16") is True
+
+    def test_accepts_prefix_match(self):
+        assert album_title_acceptable("abbey road", "abbey road remastered") is True
+
+    def test_accepts_spelling_variation(self):
+        """Rumours vs Rumors should match (spelling variation, not series)."""
+        assert album_title_acceptable("rumours", "rumors") is True
+
+    def test_accepts_high_similarity(self):
+        """Dark Side of the Moon with/without 'The' should match."""
+        assert (
+            album_title_acceptable("dark side of the moon", "the dark side of the moon") is True
+        )
 
 
 class TestSearchAlbumFuzzy:
