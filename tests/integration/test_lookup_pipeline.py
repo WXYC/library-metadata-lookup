@@ -1,6 +1,6 @@
 """Integration tests for the lookup pipeline with real LibraryDB."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -9,7 +9,6 @@ from discogs.models import (
     ReleaseMetadataResponse,
     TrackItem,
 )
-from tests.factories import make_discogs_result
 
 pytestmark = pytest.mark.integration
 
