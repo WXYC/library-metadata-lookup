@@ -532,9 +532,7 @@ class TestAlbumTitleAcceptable:
 
     def test_accepts_high_similarity(self):
         """Dark Side of the Moon with/without 'The' should match."""
-        assert (
-            album_title_acceptable("dark side of the moon", "the dark side of the moon") is True
-        )
+        assert album_title_acceptable("dark side of the moon", "the dark side of the moon") is True
 
 
 class TestSearchAlbumFuzzy:
