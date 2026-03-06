@@ -551,7 +551,6 @@ class TestSearchLibraryWithFallback:
         assert len(results) == 1
         assert results[0].title == "Wireless"
 
-
     @pytest.mark.asyncio
     async def test_self_titled_album_matches_artist_name(self, mock_library_db):
         """Self-titled albums stored as 'S/t' should match when Discogs resolves the artist name.
