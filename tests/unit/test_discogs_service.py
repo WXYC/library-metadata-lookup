@@ -601,6 +601,59 @@ class TestValidateTrackOnRelease:
         assert result is False
 
     @pytest.mark.asyncio
+    async def test_quoted_artist_name_matches(self, service):
+        """Discogs formats some artist names with quotes, e.g. '"Weird Al" Yankovic'.
+
+        validate_track_on_release must strip quotes before comparing so that
+        the user-supplied 'Weird Al Yankovic' matches the Discogs-formatted
+        '"Weird Al" Yankovic'.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Poodle Hat",
+            artist='"Weird Al" Yankovic',
+            release_url="https://discogs.com/release/1",
+            tracklist=[
+                TrackItem(position="1", title="Couch Potato"),
+                TrackItem(position="2", title="Hardware Store"),
+                TrackItem(position="3", title="Trash Day"),
+                TrackItem(position="4", title="Party At The Leper Colony"),
+                TrackItem(position="5", title="Angry White Boy Polka"),
+                TrackItem(position="6", title="Wanna B Ur Lovr"),
+                TrackItem(position="7", title="A Complicated Song"),
+                TrackItem(position="8", title="Why Does This Always Happen To Me?"),
+                TrackItem(position="9", title="Ode To A Superhero"),
+                TrackItem(position="10", title="Bob"),
+                TrackItem(position="11", title="Genius In France"),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(1, "Bob", "Weird Al Yankovic")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_quoted_per_track_artist_matches(self, service):
+        """Per-track artists on compilations may also have Discogs quote formatting."""
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Compilation",
+            artist="Various Artists",
+            release_url="https://discogs.com/release/1",
+            tracklist=[
+                TrackItem(
+                    position="1",
+                    title="Bob",
+                    artists=['"Weird Al" Yankovic'],
+                ),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(
+                1, "Bob", "Weird Al Yankovic"
+            )
+        assert result is True
+
+    @pytest.mark.asyncio
     async def test_cache_validated(self, service_with_cache):
         service_with_cache.cache_service.validate_track_on_release = AsyncMock(return_value=True)
 

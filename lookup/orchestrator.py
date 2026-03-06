@@ -372,7 +372,9 @@ async def search_compilations_for_track(
         discogs_found_releases = len(releases) > 0
 
         for release_artist, release_album in releases:
-            if parsed.artist and release_album.lower().strip() == parsed.artist.lower().strip():
+            album_clean = release_album.lower().replace('"', "").replace("'", "").strip()
+            artist_clean = parsed.artist.lower().replace('"', "").replace("'", "").strip()
+            if parsed.artist and album_clean == artist_clean:
                 logger.debug(f"Skipping '{release_album}' - appears to be artist name, not album")
                 continue
 

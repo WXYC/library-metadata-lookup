@@ -411,7 +411,7 @@ class DiscogsCacheService:
             return None  # Cache miss - caller should try API
 
         track_lower = track.lower()
-        artist_lower = artist.lower()
+        artist_lower = artist.lower().replace('"', "").replace("'", "")
 
         for item in release.tracklist:
             item_title = item.title.lower()
@@ -421,11 +421,12 @@ class DiscogsCacheService:
 
             if item.artists:
                 for track_artist in item.artists:
-                    track_artist_lower = track_artist.lower().split("(")[0].strip()
+                    track_artist_lower = track_artist.lower().replace('"', "").replace("'", "")
+                    track_artist_lower = track_artist_lower.split("(")[0].strip()
                     if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
                         return True
             else:
-                release_artist = release.artist.lower()
+                release_artist = release.artist.lower().replace('"', "").replace("'", "")
                 release_artist = release_artist.split("(")[0].strip()
                 if artist_lower in release_artist or release_artist in artist_lower:
                     return True
