@@ -167,8 +167,7 @@ Content-Type: multipart/form-data
 The upload endpoint validates the SQLite file, closes the current DB connection,
 atomically replaces the file, and returns `{"status": "ok", "row_count": <int>}`.
 
-The ETL script in request-o-matic (`scripts/sync-library.sh`) handles daily uploads
-to both staging and production.
+The ETL script `scripts/sync-library.sh` handles daily uploads to both staging and production.
 
 ### Health Check Behavior
 
@@ -177,6 +176,53 @@ When `library.db` is missing (e.g., on first deploy before first upload):
 - Health endpoint returns `{"status": "unhealthy", "services": {"database": "error"}}` (503)
 - Service is functional for non-database endpoints
 - After uploading library.db, next request triggers reconnection
+
+## Scripts
+
+### Library ETL (`scripts/sync-library.sh`)
+
+Syncs the WXYC library catalog from the MySQL database (on Kattare) to `library.db` and uploads it to staging and production.
+
+**How it works:**
+1. Connects to Kattare via SSH, runs a MySQL query to export the library catalog
+2. Builds a SQLite database with FTS5 full-text search (`scripts/export_to_sqlite.py`)
+3. Uploads the resulting `library.db` to staging and production via `POST /admin/upload-library-db`
+
+**Usage:**
+```bash
+# Manual run
+./scripts/sync-library.sh
+
+# With Slack error notifications
+./scripts/sync-library.sh --notify
+```
+
+**Logs:** `~/Library/Logs/library-metadata-lookup-etl.log`
+
+**Required environment variables** (in `.env`, not on Railway):
+- `LIBRARY_SSH_HOST` -- SSH host for the MySQL server
+- `LIBRARY_SSH_USER` -- SSH username
+- `LIBRARY_DB_HOST` -- MySQL host (as seen from SSH host)
+- `LIBRARY_DB_USER` -- MySQL username
+- `LIBRARY_DB_PASSWORD` -- MySQL password
+- `LIBRARY_DB_NAME` -- MySQL database name
+- `ADMIN_TOKEN` -- Bearer token for the admin upload endpoint
+- `STAGING_URL` -- e.g. `https://library-metadata-lookup-staging.up.railway.app`
+- `PRODUCTION_URL` -- e.g. `https://library-metadata-lookup-production.up.railway.app`
+
+Optional:
+- `SLACK_MONITORING_WEBHOOK` -- Webhook URL for error notifications (used with `--notify`)
+
+### Discogs Cache Benchmark (`scripts/benchmark_cache.py`)
+
+Benchmarks PG cache vs Discogs API response times for `search()`. Useful for evaluating cache effectiveness after discogs-cache ETL runs.
+
+**Usage:**
+```bash
+.venv/bin/python scripts/benchmark_cache.py --iterations 3
+```
+
+Loads `DISCOGS_TOKEN` and `DATABASE_URL_DISCOGS` from `.env` or the Railway CLI linked project.
 
 ## Relationship to Other Repos
 
