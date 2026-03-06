@@ -14,6 +14,7 @@ from core.matching import (
     MAX_SEARCH_RESULTS,
     STOPWORDS,
     is_compilation_artist,
+    is_self_titled,
     normalize_for_comparison,
 )
 from core.search import (
@@ -231,8 +232,20 @@ async def search_library_with_fallback(
             album_normalized = re.sub(r"[^\w\s]", " ", album_lower)
             album_normalized = " ".join(album_normalized.split())
             album_words = {w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS}
+            # Check if Discogs album name matches the artist (self-titled album)
+            album_is_artist = (
+                parsed.artist
+                and normalize_for_comparison(album) == normalize_for_comparison(parsed.artist)
+            )
+
             filtered_results = []
             for item in results:
+                # Self-titled albums stored as "S/t" match when Discogs resolves
+                # the album name as the artist name
+                if album_is_artist and is_self_titled(item.title or ""):
+                    filtered_results.append(item)
+                    continue
+
                 item_title_lower = (item.title or "").lower()
                 item_normalized = re.sub(r"[^\w\s]", " ", item_title_lower)
                 item_normalized = " ".join(item_normalized.split())
@@ -524,8 +537,10 @@ async def filter_results_by_track_validation(
 
     async def validate_one(item: LibraryItem) -> LibraryItem | None:
         try:
+            # Self-titled albums stored as "S/t" should use the artist name
+            album_for_search = item.artist if is_self_titled(item.title or "") else item.title
             response = await discogs_service.search(
-                DiscogsSearchRequest(album=item.title, artist=artist)
+                DiscogsSearchRequest(album=album_for_search, artist=artist)
             )
             if not response.results:
                 return None
@@ -594,6 +609,11 @@ async def fetch_artwork_for_items(
     async def fetch_one(item: LibraryItem) -> DiscogsSearchResult | None:
         try:
             album = discogs_titles.get(item.id, item.title)
+
+            # Self-titled albums stored as "S/t" should use the artist name
+            # for Discogs search instead of the abbreviation
+            if is_self_titled(album or ""):
+                album = item.artist
 
             artist = item.alternate_artist_name or item.artist or ""
             if is_compilation_artist(artist):

@@ -40,6 +40,8 @@ SEED_ITEMS = [
     (18, "Laid Back", "Laid Back", "L", 2, 1, "Electronic", "CD"),
     (19, "Joni Mitchell", "Joni Mitchell", "MI", 8, 1, "Rock", "Vinyl"),
     (20, "Court and Spark", "Joni Mitchell", "MI", 8, 6, "Rock", "Vinyl"),
+    (21, "S/t", "The Bird and the Bee", "BI", 125, 1, "Rock", "CD"),
+    (22, "Please Clap Your Hands", "The Bird and the Bee", "BI", 125, 2, "Rock", "CD"),
 ]
 
 

@@ -118,6 +118,42 @@ class TestLookupPipeline:
             assert body["corrected_artist"] == "Living Colour"
 
 
+class TestSelfTitledAlbumMatching:
+    """Test that self-titled albums stored as 'S/t' match correctly."""
+
+    @pytest.mark.asyncio
+    async def test_self_titled_album_returned_for_track_search(self, app_client_with_discogs):
+        """'Again and Again by The Bird and the Bee' should find the 'S/t' album.
+
+        The library stores the self-titled album as 'S/t'. When Discogs resolves
+        the album as 'The Bird and the Bee' (matching the artist name), the album
+        title filter should recognize 'S/t' as self-titled and include it.
+        """
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[
+                ("The Bird and the Bee", "The Bird and the Bee"),
+            ],
+        ):
+            resp = await app_client_with_discogs.post(
+                "/api/v1/lookup",
+                json={
+                    "artist": "The Bird and the Bee",
+                    "song": "Again and Again",
+                    "raw_message": "Again and Again by The Bird and the Bee",
+                },
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        titles = [r["library_item"]["title"] for r in body["results"]]
+        assert "S/t" in titles, (
+            f"Self-titled album 'S/t' should be in results, got: {titles}"
+        )
+        assert body["search_type"] == "direct"
+
+
 class TestTrackValidationFiltering:
     """Test that track validation filters false positives from album-resolved results."""
 

@@ -552,6 +552,52 @@ class TestSearchLibraryWithFallback:
         assert results[0].title == "Wireless"
 
 
+    @pytest.mark.asyncio
+    async def test_self_titled_album_matches_artist_name(self, mock_library_db):
+        """Self-titled albums stored as 'S/t' should match when Discogs resolves the artist name.
+
+        Bug: "Again and Again by The Bird and the Bee" — Discogs resolves the album
+        as "The Bird and the Bee" (self-titled). The library stores it as "S/t" at
+        BI 125/1. The album title word filter rejects "S/t" because it has no
+        significant words, so the self-titled album is never returned.
+        """
+        self_titled = make_library_item(
+            id=50086,
+            artist="The Bird and the Bee",
+            title="S/t",
+            call_letters="BI",
+            artist_call_number=125,
+            release_call_number=1,
+        )
+        other_album = make_library_item(
+            id=54095,
+            artist="The Bird and the Bee",
+            title="Please Clap Your Hands",
+            call_letters="BI",
+            artist_call_number=125,
+            release_call_number=2,
+        )
+        mock_library_db.search.return_value = [self_titled, other_album]
+
+        parsed = ParsedRequest(
+            song="Again and Again",
+            artist="The Bird and the Bee",
+            raw_message="Again and Again by The Bird and the Bee",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+
+        results, fallback = await search_library_with_fallback(
+            mock_library_db, parsed, ["The Bird and the Bee"]
+        )
+        # The self-titled album should be included because "S/t" means the
+        # album name is the same as the artist name.
+        assert any(r.title == "S/t" for r in results), (
+            "Self-titled album 'S/t' should match when Discogs album is the artist name"
+        )
+        assert fallback is False
+
+
 # ---------------------------------------------------------------------------
 # Tests: search_with_alternative_interpretation
 # ---------------------------------------------------------------------------

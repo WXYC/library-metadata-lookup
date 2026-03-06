@@ -88,6 +88,22 @@ COMPILATION_KEYWORDS = frozenset(
 """Keywords indicating a compilation/soundtrack album (case-insensitive substring match)."""
 
 
+SELF_TITLED_PATTERNS = frozenset({"s/t", "s.t.", "self-titled", "self titled"})
+"""Common abbreviations for self-titled albums (case-insensitive exact match)."""
+
+
+def is_self_titled(title: str) -> bool:
+    """Check if an album title indicates a self-titled release.
+
+    Args:
+        title: Album title to check
+
+    Returns:
+        True if title is a common self-titled abbreviation (e.g. "S/t", "S.T.")
+    """
+    return title.strip().lower() in SELF_TITLED_PATTERNS
+
+
 def is_compilation_artist(artist: str) -> bool:
     """Check if an artist name indicates a compilation/soundtrack album.
 
