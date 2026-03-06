@@ -648,9 +648,7 @@ class TestValidateTrackOnRelease:
             ],
         )
         with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
-            result = await service.validate_track_on_release(
-                1, "Bob", "Weird Al Yankovic"
-            )
+            result = await service.validate_track_on_release(1, "Bob", "Weird Al Yankovic")
         assert result is True
 
     @pytest.mark.asyncio
