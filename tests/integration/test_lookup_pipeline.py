@@ -148,9 +148,7 @@ class TestSelfTitledAlbumMatching:
         assert resp.status_code == 200
         body = resp.json()
         titles = [r["library_item"]["title"] for r in body["results"]]
-        assert "S/t" in titles, (
-            f"Self-titled album 'S/t' should be in results, got: {titles}"
-        )
+        assert "S/t" in titles, f"Self-titled album 'S/t' should be in results, got: {titles}"
         assert body["search_type"] == "direct"
 
 

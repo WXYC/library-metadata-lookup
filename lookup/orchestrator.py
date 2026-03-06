@@ -233,10 +233,9 @@ async def search_library_with_fallback(
             album_normalized = " ".join(album_normalized.split())
             album_words = {w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS}
             # Check if Discogs album name matches the artist (self-titled album)
-            album_is_artist = (
-                parsed.artist
-                and normalize_for_comparison(album) == normalize_for_comparison(parsed.artist)
-            )
+            album_is_artist = parsed.artist and normalize_for_comparison(
+                album
+            ) == normalize_for_comparison(parsed.artist)
 
             filtered_results = []
             for item in results:
