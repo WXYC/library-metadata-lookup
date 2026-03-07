@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Library Metadata Lookup is a FastAPI service for WXYC radio that searches the library catalog and cross-references results with Discogs metadata. It was extracted from [request-parser](https://github.com/WXYC/request-parser) to separate search/lookup concerns from message parsing and Slack posting.
+Library Metadata Lookup is a FastAPI service for WXYC radio that searches the library catalog and cross-references results with Discogs metadata. It was extracted from [request-o-matic](https://github.com/WXYC/request-o-matic) to separate search/lookup concerns from message parsing and Slack posting.
 
 ## Architecture
 

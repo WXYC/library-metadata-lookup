@@ -1,4 +1,4 @@
-"""Lookup orchestrator: the core search logic extracted from request-parser.
+"""Lookup orchestrator: the core search logic extracted from request-o-matic.
 
 This module contains the perform_lookup() function that orchestrates the full
 search pipeline: artist correction -> album resolution -> search strategies ->

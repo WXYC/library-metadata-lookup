@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/WXYC/library-metadata-lookup/actions/workflows/ci.yml/badge.svg)](https://github.com/WXYC/library-metadata-lookup/actions/workflows/ci.yml)
 
-A FastAPI service for WXYC radio that searches the library catalog and cross-references results with Discogs metadata. Extracted from [request-o-matic](https://github.com/WXYC/request-o-matic) to separate search/lookup concerns from message parsing and Slack posting.
+A FastAPI service for WXYC radio that searches the library catalog and cross-references results with Discogs metadata.
 
 ## What it does
 
@@ -125,7 +125,7 @@ library-metadata-lookup/
     db.py                      # SQLite FTS5 + fuzzy fallback search
     models.py, router.py
   lookup/
-    orchestrator.py            # Core search pipeline (extracted from request-parser)
+    orchestrator.py            # Core search pipeline
     models.py                  # LookupRequest, LookupResponse
     router.py                  # POST /lookup endpoint
   routers/
@@ -214,12 +214,5 @@ daily uploads to both staging and production environments.
 
 On first deploy, the volume is empty. The service starts healthy for non-database endpoints
 but the health check reports `unhealthy` (503) until `library.db` is uploaded.
-
-## Relationship to request-parser
-
-This service extracts all search/lookup logic from `request-parser/routers/request.py`. After migration:
-
-- **request-parser**: parse message (Groq) -> call this service -> post to Slack
-- **library-metadata-lookup**: search library + Discogs -> return enriched results
 
 The API contract is defined in [`wxyc-shared/api.yaml`](https://github.com/WXYC/wxyc-shared) with generated models for Python, TypeScript, Swift, and Kotlin.
