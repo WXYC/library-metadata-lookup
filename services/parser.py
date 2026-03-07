@@ -1,6 +1,6 @@
 """Minimal parser models for the lookup service.
 
-The lookup service receives pre-parsed requests from request-parser,
+The lookup service receives pre-parsed requests from request-o-matic,
 so it only needs the ParsedRequest model shape, not the Groq parsing logic.
 """
 

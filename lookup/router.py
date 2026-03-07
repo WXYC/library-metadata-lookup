@@ -33,7 +33,7 @@ router = APIRouter(tags=["lookup"])
     5. Fetches album artwork from Discogs
     6. Returns enriched results with metadata
 
-    The caller (request-parser) handles parsing and Slack posting.
+    The caller (request-o-matic) handles parsing and Slack posting.
     """,
     responses={
         200: {"description": "Lookup completed successfully"},
