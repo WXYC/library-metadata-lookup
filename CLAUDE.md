@@ -229,3 +229,12 @@ Loads `DISCOGS_TOKEN` and `DATABASE_URL_DISCOGS` from `.env` or the Railway CLI 
 - **[request-parser](https://github.com/WXYC/request-parser)** -- The caller. Parses messages, calls this service, posts to Slack.
 - **[wxyc-shared](https://github.com/WXYC/wxyc-shared)** -- Shared API contract (`api.yaml`). Defines `LookupRequest`, `LookupResponse`, and related schemas with code generation for Python, TypeScript, Swift, Kotlin.
 - **[discogs-cache](https://github.com/WXYC/discogs-cache)** -- ETL pipeline that populates the PostgreSQL Discogs cache consumed by `discogs/cache_service.py`.
+
+## Example Music Data for Tests
+
+WXYC is a freeform station. When creating test fixtures or mock data, use representative artists instead of mainstream acts like Queen, Radiohead, or The Beatles. The canonical data source is `wxyc-shared/src/test-utils/wxyc-example-data.json`.
+
+Preferred defaults for fixtures:
+- `LibraryItem`: `artist="Stereolab", title="Aluminum Tunes", genre="Rock"`
+- `LOOKUP_BODY`: `{"artist": "Jessica Pratt", "album": "On Your Own Love Again", "raw_message": "Jessica Pratt - On Your Own Love Again"}`
+- Other good choices: Juana Molina / "DOGA" (Sonamos), Cat Power / "Moon Pix" (Matador), Chuquimamani-Condori / "Edits" (self-released), Duke Ellington & John Coltrane / "Duke Ellington & John Coltrane" (Impulse Records), Sessa / "Pequena Vertigem de Amor" (Mexican Summer), Large Professor / "1st Class" (Matador Records)

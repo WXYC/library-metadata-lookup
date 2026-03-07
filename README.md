@@ -131,12 +131,16 @@ library-metadata-lookup/
   routers/
     admin.py                   # POST /admin/upload-library-db
     health.py                  # GET /health
+  scripts/
+    sync-library.sh            # ETL: MySQL -> SQLite -> upload to Railway
+    export_to_sqlite.py        # CSV -> SQLite FTS5 conversion
+    benchmark_cache.py         # Discogs PG cache vs API benchmarks
   services/
     parser.py                  # Minimal ParsedRequest model (no Groq)
   tests/
     factories.py               # Shared test factories (make_library_item, make_discogs_result)
-    unit/                      # 399 mocked unit tests (97% source coverage)
-    integration/               # 45 integration tests with real SQLite/FTS5
+    unit/                      # 472 mocked unit tests (97% source coverage)
+    integration/               # 48 integration tests with real SQLite/FTS5
 ```
 
 ## Development
@@ -144,11 +148,7 @@ library-metadata-lookup/
 ### Prerequisites
 
 - Python 3.12+
-- Uses the shared venv from request-parser for now:
-
-```bash
-/Users/jake/Developer/request-parser/venv/bin/python
-```
+- [uv](https://docs.astral.sh/uv/) for dependency management
 
 ### Running locally
 
@@ -159,13 +159,13 @@ uvicorn main:app --reload
 ### Running tests
 
 ```bash
-# Unit tests only (default, fast -- 399 tests)
+# Unit tests only (default, fast -- 472 tests)
 uv run pytest tests/unit/ -v
 
-# Integration tests only (real SQLite/FTS5 -- 45 tests)
+# Integration tests only (real SQLite/FTS5 -- 48 tests)
 uv run pytest -m integration -v
 
-# All tests with coverage (444 tests, 97% source coverage)
+# All tests with coverage (520 tests, 97% source coverage)
 uv run pytest -m "" --cov=. --cov-report=term-missing -v
 ```
 
@@ -211,8 +211,8 @@ Hosted on Railway with CI-driven deploys (automatic deploys are disabled).
 ### Library Database
 
 The `library.db` file is uploaded to the Railway volume via `POST /admin/upload-library-db`,
-not committed to git. The request-o-matic ETL script (`scripts/sync-library.sh`) handles
-daily uploads to both staging and production environments.
+not committed to git. The ETL script (`scripts/sync-library.sh`) handles daily uploads to
+both staging and production environments.
 
 On first deploy, the volume is empty. The service starts healthy for non-database endpoints
 but the health check reports `unhealthy` (503) until `library.db` is uploaded.
