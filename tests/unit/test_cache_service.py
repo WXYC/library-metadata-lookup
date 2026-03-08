@@ -290,6 +290,22 @@ class TestSearchReleases:
         assert len(result) == 1
 
     @pytest.mark.asyncio
+    async def test_artist_and_album_query_uses_and_logic(self, cache_service, mock_asyncpg_pool):
+        """When both artist and album are provided, the SQL must require BOTH to match (AND)."""
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        await cache_service.search_releases(artist="High Rise", album="Disallow")
+
+        query_sql = mock_asyncpg_pool.fetch.call_args[0][0]
+        # Normalize whitespace for reliable matching
+        normalized = " ".join(query_sql.split())
+        assert "AND lower(ra.artist_name)" in normalized, (
+            f"Expected AND between title and artist_name conditions, got: {normalized}"
+        )
+        assert "OR lower(ra.artist_name)" not in normalized, (
+            f"Expected no OR between title and artist_name conditions, got: {normalized}"
+        )
+
+    @pytest.mark.asyncio
     async def test_error_raises(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetch = AsyncMock(side_effect=Exception("db error"))
         with pytest.raises(CacheUnavailableError):

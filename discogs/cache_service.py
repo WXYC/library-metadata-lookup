@@ -315,14 +315,12 @@ class DiscogsCacheService:
                 query = """
                     SELECT DISTINCT ON (r.id)
                         r.id as release_id, r.title, ra.artist_name, r.artwork_url,
-                        GREATEST(
-                            similarity(lower(r.title), lower($1)),
-                            similarity(lower(ra.artist_name), lower($2))
-                        ) as score
+                        (similarity(lower(r.title), lower($1))
+                         + similarity(lower(ra.artist_name), lower($2))) / 2.0 as score
                     FROM release r
                     JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
                     WHERE lower(r.title) % lower($1)
-                       OR lower(ra.artist_name) % lower($2)
+                      AND lower(ra.artist_name) % lower($2)
                     ORDER BY r.id, score DESC
                 """
                 query = f"""
