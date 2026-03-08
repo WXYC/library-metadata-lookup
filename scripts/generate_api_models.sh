@@ -60,7 +60,10 @@ echo "Generating Python models..."
     --output-model-type pydantic_v2.BaseModel \
     --target-python-version 3.12 \
     --use-standard-collections \
-    --use-union-operator
+    --use-union-operator \
+    --disable-timestamp \
+    --custom-file-header "# Generated from wxyc-shared/api.yaml -- do not edit manually.
+# Regenerate with: bash scripts/generate_api_models.sh"
 
 # Format with ruff
 echo "Formatting generated code..."
