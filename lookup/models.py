@@ -1,34 +1,24 @@
-"""Models for the lookup API contract."""
+"""API contract models for the lookup endpoint.
 
-from pydantic import BaseModel
+These are re-exports from the generated api.yaml models (wxyc-shared).
+Internal models (LibraryItem, DiscogsSearchResult) remain in their
+respective modules for domain logic.
+"""
 
-from discogs.models import DiscogsSearchResult
-from library.models import LibraryItem
+from generated.api_models import (
+    DiscogsMatchResult,
+    LibraryCatalogItem,
+    LookupRequest,
+    LookupResponse,
+    LookupResultItem,
+    SearchType,
+)
 
-
-class LookupRequest(BaseModel):
-    """Request body for the POST /lookup endpoint."""
-
-    artist: str | None = None
-    song: str | None = None
-    album: str | None = None
-    raw_message: str
-
-
-class LookupResultItem(BaseModel):
-    """A single lookup result: library item paired with optional artwork."""
-
-    library_item: LibraryItem
-    artwork: DiscogsSearchResult | None = None
-
-
-class LookupResponse(BaseModel):
-    """Response from the lookup service."""
-
-    results: list[LookupResultItem] = []
-    search_type: str = "none"
-    song_not_found: bool = False
-    found_on_compilation: bool = False
-    context_message: str | None = None
-    corrected_artist: str | None = None
-    cache_stats: dict | None = None
+__all__ = [
+    "DiscogsMatchResult",
+    "LibraryCatalogItem",
+    "LookupRequest",
+    "LookupResponse",
+    "LookupResultItem",
+    "SearchType",
+]

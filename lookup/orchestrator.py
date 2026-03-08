@@ -768,14 +768,19 @@ async def perform_lookup(
         parsed, found_on_compilation, song_not_found, has_results=bool(library_results)
     )
 
-    # Build response
+    # Build response (convert internal models to API contract models)
     result_items = []
     if items_with_artwork:
         for item, artwork in items_with_artwork:
-            result_items.append(LookupResultItem(library_item=item, artwork=artwork))
+            result_items.append(
+                LookupResultItem(
+                    library_item=item.to_catalog_item(),
+                    artwork=artwork.to_match_result() if artwork else None,
+                )
+            )
     elif library_results:
         for item in library_results:
-            result_items.append(LookupResultItem(library_item=item))
+            result_items.append(LookupResultItem(library_item=item.to_catalog_item()))
 
     return LookupResponse(
         results=result_items,

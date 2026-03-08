@@ -34,6 +34,7 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
+    "datamodel-code-generator[http]>=0.26.0",
 ]
 
 [build-system]
@@ -41,7 +42,7 @@ requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["core*", "config*", "library*", "discogs*", "lookup*", "routers*", "services*"]
+include = ["core*", "config*", "library*", "discogs*", "lookup*", "routers*", "services*", "generated*"]
 
 [tool.black]
 line-length = 100
@@ -57,9 +58,14 @@ ignore = ["E501", "B008", "C901"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+"generated/*" = ["N815"]
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "generated.*"
+ignore_errors = true
 
 [tool.pytest.ini_options]
 markers = [

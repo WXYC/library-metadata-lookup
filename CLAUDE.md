@@ -31,7 +31,8 @@ All strategy implementations live in `lookup/orchestrator.py`.
 ### Key Files
 
 - `lookup/orchestrator.py` -- Core search logic: `perform_lookup()` and all helper functions
-- `lookup/models.py` -- `LookupRequest`, `LookupResponse`, `LookupResultItem`
+- `lookup/models.py` -- Re-exports generated API contract models (`LookupRequest`, `LookupResponse`, `LookupResultItem`)
+- `generated/api_models.py` -- Pydantic v2 models generated from `wxyc-shared/api.yaml`
 - `lookup/router.py` -- `POST /lookup` endpoint
 - `library/db.py` -- SQLite FTS5 search with LIKE + fuzzy fallback chain
 - `discogs/service.py` -- Discogs API client with optional PostgreSQL cache
@@ -190,10 +191,21 @@ Benchmarks PG cache vs Discogs API response times for `search()`. Useful for eva
 
 Loads `DISCOGS_TOKEN` and `DATABASE_URL_DISCOGS` from `.env` or the Railway CLI linked project.
 
+### API Model Generation (`scripts/generate_api_models.sh`)
+
+Generates Pydantic v2 models from `wxyc-shared/api.yaml`. Uses a local sibling `wxyc-shared` directory if available, otherwise downloads from GitHub. The generated file (`generated/api_models.py`) is committed to git. Re-run after api.yaml changes.
+
+**Usage:**
+```bash
+bash scripts/generate_api_models.sh
+```
+
+Requires `datamodel-code-generator` (included in dev dependencies).
+
 ## Relationship to Other Repos
 
 - **[request-o-matic](https://github.com/WXYC/request-o-matic)** -- The caller. Parses messages, calls this service, posts to Slack.
-- **[wxyc-shared](https://github.com/WXYC/wxyc-shared)** -- Shared API contract (`api.yaml`). Defines `LookupRequest`, `LookupResponse`, and related schemas with code generation for Python, TypeScript, Swift, Kotlin.
+- **[wxyc-shared](https://github.com/WXYC/wxyc-shared)** -- Shared API contract (`api.yaml`). Defines `LookupRequest`, `LookupResponse`, and related schemas. Python models are generated via `scripts/generate_api_models.sh` and committed to `generated/api_models.py`. The generated models are used as API boundary types; internal domain models (`LibraryItem`, `DiscogsSearchResult`) are converted via `to_catalog_item()` / `to_match_result()` methods.
 - **[discogs-cache](https://github.com/WXYC/discogs-cache)** -- ETL pipeline that populates the PostgreSQL Discogs cache consumed by `discogs/cache_service.py`. The pipeline is filtered by `library.db`, which discogs-cache generates from the WXYC MySQL catalog via `scripts/export_to_sqlite.py`. The `library.db` file serves dual purpose: runtime search for this service and primary input to the discogs-cache pipeline. The library ETL scripts (`export_to_sqlite.py`, `sync-library.sh`) live in discogs-cache.
 
 ## Example Music Data for Tests

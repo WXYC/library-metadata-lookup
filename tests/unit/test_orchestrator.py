@@ -289,11 +289,13 @@ class TestPerformLookupAlbumResolution:
             release_id=1001,
             album="Court and Spark",
             artist="Joni Mitchell",
+            artwork_url="https://example.com/court-and-spark.jpg",
         )
         self_titled_discogs = make_discogs_result(
             release_id=1002,
             album="Joni Mitchell",
             artist="Joni Mitchell",
+            artwork_url="https://example.com/joni-mitchell.jpg",
         )
         # search() is called by filter_results_by_track_validation for each item,
         # then again by fetch_artwork_for_items
@@ -388,6 +390,7 @@ class TestPerformLookupFallback:
             release_id=12345,
             album="A Night at the Opera",
             artist="Queen",
+            artwork_url="https://example.com/opera.jpg",
         )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[search_result])
         # validate_track_on_release: True for queen_item, False for queen_game_item
