@@ -1,4 +1,11 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from pydantic import BaseModel, computed_field
+
+if TYPE_CHECKING:
+    from generated.api_models import LibraryCatalogItem
 
 
 class LibrarySearchRequest(BaseModel):
@@ -44,6 +51,23 @@ class LibraryItem(BaseModel):
     def library_url(self) -> str:
         """URL to view this release in the WXYC library."""
         return f"http://www.wxyc.info/wxycdb/libraryRelease?id={self.id}"
+
+    def to_catalog_item(self) -> LibraryCatalogItem:
+        """Convert to the API contract model (generated from wxyc-shared/api.yaml)."""
+        from generated.api_models import LibraryCatalogItem
+
+        return LibraryCatalogItem(
+            id=self.id,
+            title=self.title,
+            artist=self.artist,
+            call_letters=self.call_letters,
+            artist_call_number=self.artist_call_number,
+            release_call_number=self.release_call_number,
+            genre=self.genre,
+            format=self.format,
+            call_number=self.call_number,
+            library_url=self.library_url,
+        )
 
 
 class LibrarySearchResponse(BaseModel):

@@ -124,15 +124,18 @@ library-metadata-lookup/
   library/
     db.py                      # SQLite FTS5 + fuzzy fallback search
     models.py, router.py
+  generated/
+    api_models.py              # Pydantic v2 models from wxyc-shared/api.yaml
   lookup/
     orchestrator.py            # Core search pipeline
-    models.py                  # LookupRequest, LookupResponse
+    models.py                  # Re-exports generated API contract models
     router.py                  # POST /lookup endpoint
   routers/
     admin.py                   # POST /admin/upload-library-db
     health.py                  # GET /health
   scripts/
     benchmark_cache.py         # Discogs PG cache vs API benchmarks
+    generate_api_models.sh     # Generate Python models from api.yaml
   services/
     parser.py                  # Minimal ParsedRequest model (no Groq)
   tests/

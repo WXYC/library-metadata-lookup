@@ -2,6 +2,7 @@
 
 import pytest
 
+from generated.api_models import LibraryCatalogItem
 from library.models import LibraryItem, LibrarySearchResponse
 
 
@@ -63,6 +64,60 @@ class TestLibraryItemLibraryUrl:
         data = item.model_dump()
         assert "library_url" in data
         assert data["library_url"] == "http://www.wxyc.info/wxycdb/libraryRelease?id=99"
+
+
+class TestToCatalogItem:
+    def test_maps_all_fields(self):
+        item = LibraryItem(
+            id=1,
+            artist="Stereolab",
+            title="Aluminum Tunes",
+            call_letters="S",
+            artist_call_number=1,
+            release_call_number=2,
+            genre="Rock",
+            format="CD",
+        )
+        catalog = item.to_catalog_item()
+        assert isinstance(catalog, LibraryCatalogItem)
+        assert catalog.id == 1
+        assert catalog.artist == "Stereolab"
+        assert catalog.title == "Aluminum Tunes"
+        assert catalog.call_letters == "S"
+        assert catalog.artist_call_number == 1
+        assert catalog.release_call_number == 2
+        assert catalog.genre == "Rock"
+        assert catalog.format == "CD"
+
+    def test_includes_computed_call_number(self):
+        item = LibraryItem(
+            id=1,
+            genre="Rock",
+            format="CD",
+            call_letters="S",
+            artist_call_number=1,
+            release_call_number=2,
+        )
+        catalog = item.to_catalog_item()
+        assert catalog.call_number == "Rock CD S 1/2"
+
+    def test_includes_library_url(self):
+        item = LibraryItem(id=42)
+        catalog = item.to_catalog_item()
+        assert catalog.library_url == "http://www.wxyc.info/wxycdb/libraryRelease?id=42"
+
+    def test_minimal_item(self):
+        item = LibraryItem(id=5)
+        catalog = item.to_catalog_item()
+        assert catalog.id == 5
+        assert catalog.call_number == ""
+        assert catalog.library_url == "http://www.wxyc.info/wxycdb/libraryRelease?id=5"
+
+    def test_excludes_alternate_artist_name(self):
+        item = LibraryItem(id=1, alternate_artist_name="Alt Name")
+        catalog = item.to_catalog_item()
+        data = catalog.model_dump()
+        assert "alternate_artist_name" not in data
 
 
 class TestLibrarySearchResponse:

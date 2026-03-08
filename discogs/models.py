@@ -1,6 +1,13 @@
 """Pydantic models for Discogs API responses."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from generated.api_models import DiscogsMatchResult
 
 
 class TrackItem(BaseModel):
@@ -67,6 +74,19 @@ class DiscogsSearchResult(BaseModel):
     release_url: str
     artwork_url: str | None = None
     confidence: float = 0.0
+
+    def to_match_result(self) -> DiscogsMatchResult:
+        """Convert to the API contract model (generated from wxyc-shared/api.yaml)."""
+        from generated.api_models import DiscogsMatchResult
+
+        return DiscogsMatchResult(
+            album=self.album,
+            artist=self.artist,
+            release_id=self.release_id,
+            release_url=self.release_url,
+            artwork_url=self.artwork_url,
+            confidence=self.confidence,
+        )
 
 
 class DiscogsSearchResponse(BaseModel):

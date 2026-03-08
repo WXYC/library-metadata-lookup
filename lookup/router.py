@@ -71,7 +71,7 @@ async def handle_lookup(
             telemetry.send_to_posthog(
                 posthog_client,
                 {
-                    "results_count": len(response.results),
+                    "results_count": len(response.results or []),
                     "search_type": response.search_type,
                     "had_artist": bool(request.artist),
                     "had_album": bool(request.album),

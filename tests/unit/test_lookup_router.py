@@ -7,8 +7,8 @@ from httpx import ASGITransport, AsyncClient
 
 from discogs.service import DiscogsService
 from library.db import LibraryDB
-from lookup.models import LookupResponse
-from tests.factories import LOOKUP_BODY
+from lookup.models import LookupResponse, LookupResultItem
+from tests.factories import LOOKUP_BODY, make_catalog_item, make_match_result
 from tests.unit.conftest import override_deps
 
 
@@ -153,3 +153,32 @@ class TestHandleLookup:
 
         assert resp.status_code == 200
         mock_init.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_response_includes_call_number(self, app_client):
+        """Regression: call_number must appear in the JSON response."""
+        result_item = LookupResultItem(
+            library_item=make_catalog_item(
+                id=10,
+                artist="Stereolab",
+                title="Aluminum Tunes",
+                call_number="Rock CD S 1/1",
+            ),
+            artwork=make_match_result(
+                release_id=12345,
+                artwork_url="https://example.com/cover.jpg",
+            ),
+        )
+        response = LookupResponse(results=[result_item], search_type="direct")
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        library_item = resp.json()["results"][0]["library_item"]
+        assert library_item["call_number"] == "Rock CD S 1/1"
+        assert library_item["library_url"] == "http://www.wxyc.info/wxycdb/libraryRelease?id=10"
