@@ -301,7 +301,7 @@ async def search_library_with_fallback(
         if results:
             return results, True
 
-    return all_results, False
+    return all_results, bool(parsed.song)
 
 
 async def search_compilations_for_track(
