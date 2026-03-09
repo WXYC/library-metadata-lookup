@@ -419,7 +419,7 @@ async def search_compilations_for_track(
                         # Verify title similarity to reject false positives
                         # (e.g., "Chicago Trax" matching "House Sound of London")
                         title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
-                        if title_score >= 70:
+                        if title_score >= 80:
                             filtered_matches.append(match)
                         else:
                             logger.debug(

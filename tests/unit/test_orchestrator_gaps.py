@@ -380,6 +380,39 @@ class TestSearchCompilationsForTrack:
         assert len(results) == 1
 
     @pytest.mark.asyncio
+    async def test_rejects_similar_but_different_compilation(self):
+        """Discogs compilation with similar name but different series is rejected.
+
+        "Get On The Dance Floor Volume 5" (Discogs, contains the track) should
+        NOT match library item "Explorations on the Dancefloor vol. 3" (different
+        compilation series). fuzz.ratio = 73.5, below the 80 threshold.
+        """
+        db = AsyncMock()
+        wrong_item = _item(
+            id=3288,
+            artist="Various Artists - Hiphop",
+            title="Explorations on the Dancefloor vol. 3",
+        )
+
+        # keyword: no results; album search: returns wrong item
+        db.search = AsyncMock(side_effect=[[], [wrong_item]])
+
+        parsed = ParsedRequest(
+            artist="Adonis",
+            song="No Way Back",
+            raw_message="No Way Back by Adonis",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[("Various Artists", "Get On The Dance Floor Volume 5")],
+        ):
+            results, _ = await search_compilations_for_track(db, parsed)
+
+        assert len(results) == 0
+
+    @pytest.mark.asyncio
     async def test_max_results_break(self):
         """Stops collecting once MAX_SEARCH_RESULTS reached."""
         db = AsyncMock()
