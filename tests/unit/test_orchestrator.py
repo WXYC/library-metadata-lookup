@@ -616,6 +616,8 @@ class TestPerformLookupCompilations:
         excludes VA compilations. Using `artist_as_keyword=True` puts the artist
         in the `q` param instead, matching track-level credits on compilations.
         """
+        from discogs.models import ReleaseInfo, TrackReleasesResponse
+
         compilation_item = make_library_item(
             id=46602,
             artist="Various Artists - Hiphop",
@@ -631,19 +633,49 @@ class TestPerformLookupCompilations:
         # 3. search_library_with_fallback: "Adonis" (artist only) -> []
         # 4. search_compilations_for_track: keyword "adonis back" -> []
         # 5. search_album_fuzzy("No Way Back"): exact -> []
-        # 6. search_album_fuzzy("No Way Back"): fuzzy "back" -> []
-        # 7. search_album_fuzzy("Trax Records..."): exact -> [compilation_item]
+        # 6. search_album_fuzzy("Trax Records..."): exact -> [compilation_item]
         mock_library_db.search.side_effect = [
             [],  # 1: artist + album
             [],  # 2: artist + song
             [],  # 3: artist only
             [],  # 4: keyword search
             [],  # 5: search_album_fuzzy("No Way Back") exact
-            [],  # 6: search_album_fuzzy("No Way Back") fuzzy "back"
-            [compilation_item],  # 7: search_album_fuzzy("Trax Records...") exact
+            [compilation_item],  # 6: search_album_fuzzy("Trax Records...") exact
         ]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        # search_compilations_for_track calls discogs_service.search_releases_by_track
+        # directly (library-first approach), not lookup_releases_by_track.
+        adonis_release = ReleaseInfo(
+            album="No Way Back",
+            artist="Adonis",
+            release_id=1001,
+            release_url="https://www.discogs.com/release/1001",
+            is_compilation=False,
+        )
+        trax_release = ReleaseInfo(
+            album="Trax Records 20th Anniversary Collection",
+            artist="Various Artists",
+            release_id=1002,
+            release_url="https://www.discogs.com/release/1002",
+            is_compilation=True,
+        )
+
+        async def mock_discogs_search(track, artist=None, artist_as_keyword=False, **kwargs):
+            if not artist_as_keyword:
+                return TrackReleasesResponse(
+                    track=track, artist=artist, releases=[adonis_release], total=1
+                )
+            return TrackReleasesResponse(
+                track=track,
+                artist=artist,
+                releases=[adonis_release, trax_release],
+                total=2,
+            )
+
+        mock_discogs_service.search_releases_by_track = AsyncMock(side_effect=mock_discogs_search)
+        mock_discogs_service.validate_track_on_release = AsyncMock(return_value=True)
 
         request = LookupRequest(
             artist="Adonis",
@@ -651,21 +683,11 @@ class TestPerformLookupCompilations:
             raw_message="No Way Back by Adonis",
         )
 
-        async def mock_track_lookup(track, artist=None, artist_as_keyword=False, **kwargs):
-            if artist and not artist_as_keyword:
-                # Standard artist-field search: only finds Adonis releases
-                return [("Adonis", "No Way Back")]
-            if artist and artist_as_keyword:
-                # Keyword search: finds VA compilations with Adonis track credits
-                return [
-                    ("Adonis", "No Way Back"),
-                    ("Various Artists", "Trax Records 20th Anniversary Collection"),
-                ]
-            return []
-
+        # resolve_albums_for_track still uses lookup_releases_by_track
         with patch(
             "lookup.orchestrator.lookup_releases_by_track",
-            side_effect=mock_track_lookup,
+            new_callable=AsyncMock,
+            return_value=[("Adonis", "No Way Back")],
         ):
             response = await perform_lookup(
                 request, mock_library_db, mock_discogs_service, telemetry

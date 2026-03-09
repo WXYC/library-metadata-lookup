@@ -569,6 +569,84 @@ class TestSearchCompilationsForTrack:
             "found valid releases (Poodle Hat) that simply aren't in the library"
         )
 
+    @pytest.mark.asyncio
+    async def test_validates_only_library_matching_releases(self):
+        """Only calls validate_track_on_release for releases found in the library.
+
+        When Discogs returns 10 releases but only 1 matches the library, we should
+        make 1 validation API call (not 10). This tests the library-first approach
+        where we search the library before validating each Discogs release.
+        """
+        db = AsyncMock()
+        comp = _item(
+            id=46602,
+            artist="Various Artists",
+            title="Trax Records 20th Anniversary Collection",
+        )
+
+        # First call: keyword search (no results)
+        # Then album searches: only "Trax Records 20th Anniversary Collection" matches
+        db.search = AsyncMock(
+            side_effect=[
+                [],  # keyword search
+                [comp],  # "Trax Records..." matches library
+                [],  # "Album 2" not in library
+                [],  # "Album 3" not in library
+                [],  # "Album 4" not in library
+                [],  # "Album 5" not in library
+            ]
+        )
+
+        mock_discogs = AsyncMock()
+        from discogs.models import ReleaseInfo, TrackReleasesResponse
+
+        releases = [
+            ReleaseInfo(
+                album="Trax Records: The 20th Anniversary Edition",
+                artist="Various Artists",
+                release_id=1001,
+                release_url="https://www.discogs.com/release/1001",
+                is_compilation=True,
+            ),
+        ] + [
+            ReleaseInfo(
+                album=f"Album {i}",
+                artist="Various Artists",
+                release_id=1000 + i,
+                release_url=f"https://www.discogs.com/release/{1000 + i}",
+                is_compilation=True,
+            )
+            for i in range(2, 6)
+        ]
+
+        mock_discogs.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="No Way Back",
+                artist="Adonis",
+                releases=releases,
+                total=len(releases),
+            )
+        )
+        mock_discogs.validate_track_on_release = AsyncMock(return_value=True)
+
+        parsed = ParsedRequest(
+            artist="Adonis",
+            song="No Way Back",
+            raw_message="No Way Back by Adonis",
+        )
+
+        results, discogs_titles = await search_compilations_for_track(db, parsed, mock_discogs)
+
+        assert len(results) == 1
+        assert results[0].id == 46602
+        # Key assertion: validate was called only for the library-matching release
+        assert mock_discogs.validate_track_on_release.call_count == 1
+        assert mock_discogs.validate_track_on_release.call_args[0] == (
+            1001,
+            "No Way Back",
+            "Adonis",
+        )
+
 
 # ---------------------------------------------------------------------------
 # search_album_fuzzy (lines 411-444)

@@ -24,7 +24,7 @@ from core.search import (
 )
 from core.telemetry import RequestTelemetry
 from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
-from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
+from discogs.models import DiscogsSearchRequest, DiscogsSearchResult, ReleaseInfo
 from discogs.service import DiscogsService
 from library.db import LibraryDB
 from library.models import LibraryItem
@@ -365,30 +365,47 @@ async def search_compilations_for_track(
             song_search = f"{parsed.song} ({remix_match.group(1)})"
             logger.info(f"Using full track name with version info: '{song_search}'")
 
-        releases = await lookup_releases_by_track(
-            song_search, parsed.artist, service=discogs_service
-        )
-        # If artist-scoped search only found non-compilation releases,
-        # retry with artist as keyword (q param) to find VA compilations
-        # where the artist is credited on individual tracks
-        has_compilation = any(is_compilation_artist(a) for a, _ in releases)
-        if not has_compilation:
-            va_releases = await lookup_releases_by_track(
-                song_search,
-                parsed.artist,
-                service=discogs_service,
-                artist_as_keyword=True,
-            )
-            for release_artist, release_album in va_releases:
-                if (
-                    is_compilation_artist(release_artist)
-                    and (release_artist, release_album) not in releases
-                ):
-                    releases.append((release_artist, release_album))
-        logger.info(f"Found {len(releases)} releases with '{song_search}' on Discogs")
-        discogs_found_releases = len(releases) > 0
+        # Get raw releases from Discogs without per-release validation.
+        # We search the library first and only validate releases that match,
+        # avoiding expensive API calls for releases not in our catalog.
+        raw_releases: list[ReleaseInfo] = []
+        if discogs_service:
+            response = await discogs_service.search_releases_by_track(song_search, parsed.artist)
+            raw_releases = list(response.releases)
 
-        for release_artist, release_album in releases:
+            # If artist-scoped search only found non-compilation releases,
+            # retry with artist as keyword (q param) to find VA compilations
+            # where the artist is credited on individual tracks
+            has_compilation = any(r.is_compilation for r in raw_releases)
+            if not has_compilation:
+                va_response = await discogs_service.search_releases_by_track(
+                    song_search, parsed.artist, artist_as_keyword=True
+                )
+                seen_album_keys = {r.album.lower() for r in raw_releases}
+                for r in va_response.releases:
+                    if r.is_compilation and r.album.lower() not in seen_album_keys:
+                        raw_releases.append(r)
+                        seen_album_keys.add(r.album.lower())
+        else:
+            # No injected service — fall back to lookup helper (validates all)
+            tuples = await lookup_releases_by_track(song_search, parsed.artist, service=None)
+            raw_releases = [
+                ReleaseInfo(
+                    album=album,
+                    artist=artist,
+                    release_id=0,
+                    release_url="",
+                    is_compilation=is_compilation_artist(artist),
+                )
+                for artist, album in tuples
+            ]
+
+        logger.info(f"Found {len(raw_releases)} releases with '{song_search}' on Discogs")
+        discogs_found_releases = len(raw_releases) > 0
+
+        for release_info in raw_releases:
+            release_album = release_info.album
+
             album_clean = release_album.lower().replace('"', "").replace("'", "").strip()
             artist_clean = parsed.artist.lower().replace('"', "").replace("'", "").strip()
             if parsed.artist and album_clean == artist_clean:
@@ -402,14 +419,14 @@ async def search_compilations_for_track(
 
             # If album-only search failed for a compilation, retry with "Various"
             # to help FTS5 match entries stored as "Various Artists - ..."
-            if not matches and is_compilation_artist(release_artist):
+            if not matches and release_info.is_compilation:
                 matches = await search_album_fuzzy(db, f"Various {release_album}")
 
             if matches and parsed.artist:
                 from rapidfuzz import fuzz as _fuzz
 
                 filtered_matches = []
-                discogs_is_compilation = is_compilation_artist(release_artist)
+                discogs_is_compilation = release_info.is_compilation
                 release_album_lower = release_album.lower()
 
                 for match in matches:
@@ -428,16 +445,31 @@ async def search_compilations_for_track(
                             )
                 matches = filtered_matches
 
-            if matches:
-                logger.info(
-                    f"Found '{parsed.song}' in library on '{matches[0].title}' "
-                    f"(matched from Discogs: '{release_album}')"
+            if not matches:
+                continue
+
+            # Validate that the track actually exists on this release.
+            # Deferred until after library matching so we only validate
+            # releases we might actually return — saving API calls.
+            if discogs_service and release_info.release_id and parsed.artist:
+                is_valid = await discogs_service.validate_track_on_release(
+                    release_info.release_id, song_search, parsed.artist
                 )
-                for match in matches:
-                    if match.id not in seen_ids:
-                        results.append(match)
-                        seen_ids.add(match.id)
-                        discogs_titles[match.id] = release_album
+                if not is_valid:
+                    logger.info(
+                        f"Skipping '{release_album}' - track/artist not validated on release"
+                    )
+                    continue
+
+            logger.info(
+                f"Found '{parsed.song}' in library on '{matches[0].title}' "
+                f"(matched from Discogs: '{release_album}')"
+            )
+            for match in matches:
+                if match.id not in seen_ids:
+                    results.append(match)
+                    seen_ids.add(match.id)
+                    discogs_titles[match.id] = release_album
 
                 if len(results) >= MAX_SEARCH_RESULTS:
                     break
