@@ -193,8 +193,12 @@ class DiscogsService:
         Returns:
             TrackReleasesResponse with list of releases
         """
-        # Try local cache first
-        if self.cache_service and not should_skip_cache():
+        # Try local cache first.
+        # Skip cache when artist_as_keyword=True: the PG cache filters by
+        # release-level artist which excludes VA compilations where the
+        # artist is credited on individual tracks.  The API keyword search
+        # handles this correctly with format=Compilation.
+        if self.cache_service and not should_skip_cache() and not artist_as_keyword:
             try:
                 add_discogs_breadcrumb(
                     "cache_search_releases_by_track",

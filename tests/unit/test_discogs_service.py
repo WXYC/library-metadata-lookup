@@ -297,6 +297,60 @@ class TestSearchReleasesByTrack:
             result = await service.search_releases_by_track("Song")
         assert result.releases == []
 
+    @pytest.mark.asyncio
+    async def test_artist_as_keyword_skips_cache(self, service_with_cache):
+        """When artist_as_keyword=True, the PG cache must be bypassed.
+
+        The PG cache filters by release-level artist (release_artist table),
+        which excludes VA compilations where the artist is credited on
+        individual tracks. The artist_as_keyword flag tells the Discogs API
+        to use keyword search + format=Compilation instead, so the cache
+        must be skipped to let the API handle it.
+        """
+        from discogs.models import ReleaseInfo
+
+        # Set up cache to return non-VA results (simulating the bug)
+        service_with_cache.cache_service.search_releases_by_track = AsyncMock(
+            return_value=[
+                ReleaseInfo(
+                    album="No Way Back",
+                    artist="Adonis",
+                    release_id=100,
+                    release_url="https://discogs.com/release/100",
+                )
+            ]
+        )
+
+        # Set up API to return the VA compilation we actually want
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "results": [
+                {
+                    "title": "Various - Trax Records 20th Anniversary Collection",
+                    "id": 456,
+                }
+            ]
+        }
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ):
+            result = await service_with_cache.search_releases_by_track(
+                "No Way Back", "Adonis", artist_as_keyword=True
+            )
+
+        # Cache should NOT have been consulted
+        service_with_cache.cache_service.search_releases_by_track.assert_not_called()
+        # API result should come through
+        assert len(result.releases) >= 1
+        assert result.releases[0].is_compilation is True
+        assert result.cached is False
+
 
 # ---------------------------------------------------------------------------
 # get_release
