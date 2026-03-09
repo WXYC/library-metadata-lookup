@@ -532,6 +532,72 @@ class TestPerformLookupCompilations:
         assert response.context_message is not None
         assert "Found" in response.context_message
 
+    @pytest.mark.asyncio
+    async def test_finds_song_on_compilation_when_discogs_resolves_single(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Compilation search runs when Discogs resolves an artist single not in library.
+
+        Scenario: "No Way Back by Adonis"
+        - resolve_albums_for_track finds Adonis single -> (["No Way Back"], False)
+        - search_library_with_fallback finds nothing for "Adonis" at all -> ([], True)
+        - ARTIST_PLUS_ALBUM sets song_not_found=True from the fallback flag
+        - TRACK_ON_COMPILATION triggers and finds the VA compilation
+        """
+        compilation_item = make_library_item(
+            id=46602,
+            artist="Various Artists - Electronic - T",
+            title="Trax Records 20th Anniversary Collection",
+            call_letters="V",
+        )
+
+        mock_library_db.find_similar_artist.return_value = None
+
+        # search_library_with_fallback call order:
+        # 1. artist + album "Adonis No Way Back" -> empty
+        # 2. artist + song "Adonis No Way Back" -> empty
+        # 3. artist only "Adonis" -> empty
+        # Then search_compilations_for_track:
+        # 4. keyword search "adonis back" -> compilation
+        # 5. search_album_fuzzy("No Way Back") exact -> rejected by album_title_acceptable
+        # 6. search_album_fuzzy("No Way Back") fuzzy "back" -> rejected by similarity
+        # 7. search_album_fuzzy("Trax Records...") exact -> compilation (VA match)
+        mock_library_db.search.side_effect = [
+            [],  # search_library_with_fallback: artist + album
+            [],  # search_library_with_fallback: artist + song
+            [],  # search_library_with_fallback: artist only
+            [compilation_item],  # search_compilations_for_track: keyword search
+            [compilation_item],  # search_album_fuzzy: exact "No Way Back" (filtered)
+            [compilation_item],  # search_album_fuzzy: fuzzy "back" (rejected)
+            [compilation_item],  # search_album_fuzzy: exact "Trax Records..." (match)
+        ]
+
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Adonis",
+            song="No Way Back",
+            raw_message="No Way Back by Adonis",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[
+                ("Adonis", "No Way Back"),
+                ("Various Artists", "Trax Records 20th Anniversary Collection"),
+            ],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.found_on_compilation is True
+        assert len(response.results) >= 1
+        assert response.results[0].library_item.title == "Trax Records 20th Anniversary Collection"
+        assert response.context_message is not None
+        assert "Found" in response.context_message
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - artwork
