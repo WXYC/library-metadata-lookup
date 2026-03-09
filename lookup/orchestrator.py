@@ -406,14 +406,26 @@ async def search_compilations_for_track(
                 matches = await search_album_fuzzy(db, f"Various {release_album}")
 
             if matches and parsed.artist:
+                from rapidfuzz import fuzz as _fuzz
+
                 filtered_matches = []
                 discogs_is_compilation = is_compilation_artist(release_artist)
+                release_album_lower = release_album.lower()
 
                 for match in matches:
                     if artist_matches_item(match, parsed.artist):
                         filtered_matches.append(match)
                     elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
-                        filtered_matches.append(match)
+                        # Verify title similarity to reject false positives
+                        # (e.g., "Chicago Trax" matching "House Sound of London")
+                        title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
+                        if title_score >= 60:
+                            filtered_matches.append(match)
+                        else:
+                            logger.debug(
+                                f"Rejected '{match.title}' for '{release_album}' "
+                                f"(title_score={title_score:.0f})"
+                            )
                 matches = filtered_matches
 
             if matches:
