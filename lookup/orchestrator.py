@@ -827,8 +827,10 @@ async def perform_lookup(
         if found_on_compilation:
             telemetry.record_api_call("discogs")
 
-    # Step 3b: Validate results against Discogs track data
-    if library_results and parsed.song and parsed.artist:
+    # Step 3b: Validate results against Discogs track data.
+    # Skip when results come from compilation search — those were already
+    # validated by search_compilations_for_track (deferred validation).
+    if library_results and parsed.song and parsed.artist and not found_on_compilation:
         with telemetry.track_step("track_validation"):
             validated = await filter_results_by_track_validation(
                 library_results, parsed.song, parsed.artist, discogs_service

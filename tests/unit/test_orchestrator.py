@@ -697,6 +697,56 @@ class TestPerformLookupCompilations:
         assert len(response.results) >= 1
         assert response.results[0].library_item.title == "Trax Records 20th Anniversary Collection"
 
+    @pytest.mark.asyncio
+    async def test_compilation_results_skip_track_validation(
+        self, mock_library_db, mock_discogs_service, telemetry, compilation_item
+    ):
+        """When results come from compilation search, step 3b (filter_results_by_track_validation)
+        should be skipped because the track was already validated in search_compilations_for_track.
+
+        Re-running validation would make unnecessary Discogs API calls.
+        """
+        mock_library_db.find_similar_artist.return_value = None
+
+        fallback_item = make_library_item(
+            id=99,
+            artist="Some Artist",
+            title="Some Album",
+            call_letters="S",
+        )
+
+        mock_library_db.search.side_effect = [
+            [],  # search_library_with_fallback: artist + song
+            [fallback_item],  # search_library_with_fallback: artist only
+            [compilation_item],  # search_compilations_for_track: keyword search
+            [compilation_item],  # search_album_fuzzy: exact search
+        ]
+
+        # If filter_results_by_track_validation runs, it calls discogs_service.search
+        # for each result. We track whether this happens.
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Some Artist",
+            song="Disco Song",
+            raw_message="Play Disco Song by Some Artist",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[("Various Artists", "Disco Not Disco")],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.found_on_compilation is True
+        # discogs_service.search should only be called for artwork fetch,
+        # NOT for track validation. With 1 result, artwork fetch calls search once.
+        # If track validation also ran, search would be called 2+ times.
+        assert mock_discogs_service.search.call_count <= 1
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - artwork
