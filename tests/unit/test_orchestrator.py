@@ -580,13 +580,19 @@ class TestPerformLookupCompilations:
             raw_message="No Way Back by Adonis",
         )
 
-        with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
-            new_callable=AsyncMock,
-            return_value=[
+        # Discogs API with artist="Adonis" returns only the single;
+        # without artist filter, it also returns VA compilations
+        async def mock_track_lookup(track, artist=None, **kwargs):
+            if artist:
+                return [("Adonis", "No Way Back")]
+            return [
                 ("Adonis", "No Way Back"),
                 ("Various Artists", "Trax Records 20th Anniversary Collection"),
-            ],
+            ]
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            side_effect=mock_track_lookup,
         ):
             response = await perform_lookup(
                 request, mock_library_db, mock_discogs_service, telemetry
