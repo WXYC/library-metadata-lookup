@@ -523,22 +523,26 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
         significant_words = [w for w in words if len(w) > 3 and w not in STOPWORDS]
 
         if significant_words:
+            album_lower = album_title.lower()
+            # Require most keywords to match — prevents "20th Anniversary Concert"
+            # from matching when searching for "Trax Records 20th Anniversary Edition"
+            min_keywords = max(2, len(significant_words) - 1)
+
             # Try progressively shorter queries to handle word mismatches between
-            # Discogs and library titles (e.g., "Edition" vs "Collection")
+            # Discogs and library titles (e.g., "Edition" vs "Collection").
+            # Filter inside the loop so false positives don't block shorter queries.
             max_words = min(4, len(significant_words))
             for n_words in range(max_words, 1, -1):
                 fuzzy_query = " ".join(significant_words[:n_words])
                 logger.info(
                     f"Exact match failed for '{album_title}', trying fuzzy: '{fuzzy_query}'"
                 )
-                results = await db.search(query=fuzzy_query, limit=MAX_SEARCH_RESULTS)
-                if results:
-                    break
+                raw_results = await db.search(query=fuzzy_query, limit=MAX_SEARCH_RESULTS)
+                if not raw_results:
+                    continue
 
-            if results:
-                album_lower = album_title.lower()
                 filtered_results = []
-                for result in results:
+                for result in raw_results:
                     result_title_lower = (result.title or "").lower()
 
                     keyword_matches = sum(
@@ -547,19 +551,23 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
                     similarity = fuzz.token_set_ratio(album_lower, result_title_lower)
                     title_ok = album_title_acceptable(album_lower, result_title_lower)
 
-                    if keyword_matches >= 2 and similarity >= 60 and title_ok:
+                    if keyword_matches >= min_keywords and similarity >= 60 and title_ok:
                         logger.debug(
                             f"Album match: '{result.title}' "
-                            f"(keywords={keyword_matches}, similarity={similarity})"
+                            f"(keywords={keyword_matches}/{len(significant_words)}, "
+                            f"similarity={similarity})"
                         )
                         filtered_results.append(result)
                     else:
                         logger.debug(
                             f"Album rejected: '{result.title}' "
-                            f"(keywords={keyword_matches}, similarity={similarity})"
+                            f"(keywords={keyword_matches}/{len(significant_words)}, "
+                            f"similarity={similarity})"
                         )
 
-                results = filtered_results
+                if filtered_results:
+                    results = filtered_results
+                    break
 
     return results
 

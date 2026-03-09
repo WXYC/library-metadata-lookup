@@ -635,11 +635,11 @@ class TestSearchAlbumFuzzy:
         db = AsyncMock()
         item = _item(id=1, title="Completely Different Title")
 
-        # Exact: empty, fuzzy: returns unrelated item
-        db.search = AsyncMock(side_effect=[[], [item]])
+        # Exact: empty; all fuzzy attempts return unrelated item (filtered each time)
+        db.search = AsyncMock(side_effect=[[], [item], [item], [item]])
 
         results = await search_album_fuzzy(db, "Greatest Hits Collection Volume")
-        # Should be filtered out due to low similarity
+        # Should be filtered out due to low keyword match count
         assert len(results) == 0
 
     @pytest.mark.asyncio
