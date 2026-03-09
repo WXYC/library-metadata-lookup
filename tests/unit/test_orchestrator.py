@@ -604,6 +604,76 @@ class TestPerformLookupCompilations:
         assert response.context_message is not None
         assert "Found" in response.context_message
 
+    @pytest.mark.asyncio
+    async def test_compilation_search_retries_with_various_prefix(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """When album-only FTS5 fails for a VA compilation, retry with 'Various' prefix.
+
+        On staging, db.search("Trax Records 20th Anniversary Collection") returns
+        nothing via FTS5, but db.search("Various Trax Records 20th Anniversary
+        Collection") succeeds because FTS5 matches "Various" against the artist
+        column "Various Artists - Electronic - T".
+        """
+        compilation_item = make_library_item(
+            id=46602,
+            artist="Various Artists - Electronic - T",
+            title="Trax Records 20th Anniversary Collection",
+            call_letters="V",
+        )
+
+        mock_library_db.find_similar_artist.return_value = None
+
+        # db.search call order:
+        # 1. search_library_with_fallback: "Adonis No Way Back" (artist+album) -> []
+        # 2. search_library_with_fallback: "Adonis No Way Back" (artist+song) -> []
+        # 3. search_library_with_fallback: "Adonis" (artist only) -> []
+        # 4. search_compilations_for_track: keyword "adonis back" -> []
+        # 5. search_album_fuzzy("No Way Back"): exact -> []
+        # 6. search_album_fuzzy("No Way Back"): fuzzy "back" -> []
+        # 7. search_album_fuzzy("Trax Records..."): exact -> [] (FTS5 FAILS!)
+        # 8. search_album_fuzzy("Trax Records..."): fuzzy -> [] (also fails)
+        # 9. search_album_fuzzy("Various Trax Records..."): exact -> found! (retry)
+        mock_library_db.search.side_effect = [
+            [],  # 1: artist + album
+            [],  # 2: artist + song
+            [],  # 3: artist only
+            [],  # 4: keyword search
+            [],  # 5: search_album_fuzzy("No Way Back") exact
+            [],  # 6: search_album_fuzzy("No Way Back") fuzzy "back"
+            [],  # 7: search_album_fuzzy("Trax Records...") exact (FTS5 failure)
+            [],  # 8: search_album_fuzzy("Trax Records...") fuzzy
+            [compilation_item],  # 9: search_album_fuzzy("Various Trax Records...") (retry!)
+        ]
+
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Adonis",
+            song="No Way Back",
+            raw_message="No Way Back by Adonis",
+        )
+
+        async def mock_track_lookup(track, artist=None, **kwargs):
+            if artist:
+                return [("Adonis", "No Way Back")]
+            return [
+                ("Adonis", "No Way Back"),
+                ("Various Artists", "Trax Records 20th Anniversary Collection"),
+            ]
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            side_effect=mock_track_lookup,
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.found_on_compilation is True
+        assert len(response.results) >= 1
+        assert response.results[0].library_item.title == "Trax Records 20th Anniversary Collection"
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - artwork

@@ -402,6 +402,11 @@ async def search_compilations_for_track(
 
             matches = await search_album_fuzzy(db, release_album)
 
+            # If album-only search failed for a compilation, retry with "Various"
+            # to help FTS5 match entries stored as "Various Artists - ..."
+            if not matches and is_compilation_artist(release_artist):
+                matches = await search_album_fuzzy(db, f"Various {release_album}")
+
             if matches and parsed.artist:
                 filtered_matches = []
                 discogs_is_compilation = is_compilation_artist(release_artist)
