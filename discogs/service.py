@@ -172,7 +172,11 @@ class DiscogsService:
 
     @async_cached(TRACK_CACHE)
     async def search_releases_by_track(
-        self, track: str, artist: str | None = None, limit: int = 20
+        self,
+        track: str,
+        artist: str | None = None,
+        limit: int = 20,
+        artist_as_keyword: bool = False,
     ) -> TrackReleasesResponse:
         """Search for ALL releases containing a track.
 
@@ -231,7 +235,12 @@ class DiscogsService:
             "per_page": limit,
         }
         if artist:
-            params["artist"] = artist
+            if artist_as_keyword:
+                # Use q (keyword) instead of artist (field filter) to find
+                # VA compilations where the artist is credited on tracks
+                params["q"] = artist
+            else:
+                params["artist"] = artist
 
         logger.info(f"Searching Discogs for releases with track: '{track}', artist: {artist}")
 

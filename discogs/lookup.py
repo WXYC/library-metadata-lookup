@@ -32,6 +32,7 @@ async def lookup_releases_by_track(
     artist: str | None = None,
     limit: int = 20,
     service: DiscogsService | None = None,
+    artist_as_keyword: bool = False,
 ) -> list[tuple[str, str]]:
     """Look up all releases containing a track using Discogs.
 
@@ -53,7 +54,9 @@ async def lookup_releases_by_track(
     if not service:
         return []
 
-    response = await service.search_releases_by_track(track, artist, limit)
+    response = await service.search_releases_by_track(
+        track, artist, limit, artist_as_keyword=artist_as_keyword
+    )
 
     # Validate that the track actually exists on each release
     releases = []

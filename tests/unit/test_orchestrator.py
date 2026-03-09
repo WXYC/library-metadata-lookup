@@ -580,15 +580,17 @@ class TestPerformLookupCompilations:
             raw_message="No Way Back by Adonis",
         )
 
-        # Discogs API with artist="Adonis" returns only the single;
-        # without artist filter, it also returns VA compilations
-        async def mock_track_lookup(track, artist=None, **kwargs):
-            if artist:
+        # Discogs API with artist field filter returns only the single;
+        # with artist as keyword, also returns VA compilations
+        async def mock_track_lookup(track, artist=None, artist_as_keyword=False, **kwargs):
+            if artist and not artist_as_keyword:
                 return [("Adonis", "No Way Back")]
-            return [
-                ("Adonis", "No Way Back"),
-                ("Various Artists", "Trax Records 20th Anniversary Collection"),
-            ]
+            if artist and artist_as_keyword:
+                return [
+                    ("Adonis", "No Way Back"),
+                    ("Various Artists", "Trax Records 20th Anniversary Collection"),
+                ]
+            return []
 
         with patch(
             "lookup.orchestrator.lookup_releases_by_track",
@@ -605,19 +607,18 @@ class TestPerformLookupCompilations:
         assert "Found" in response.context_message
 
     @pytest.mark.asyncio
-    async def test_compilation_search_retries_with_various_prefix(
+    async def test_compilation_search_uses_artist_as_keyword(
         self, mock_library_db, mock_discogs_service, telemetry
     ):
-        """When album-only FTS5 fails for a VA compilation, retry with 'Various' prefix.
+        """Compilation search uses artist as keyword (q param) to find VA compilations.
 
-        On staging, db.search("Trax Records 20th Anniversary Collection") returns
-        nothing via FTS5, but db.search("Various Trax Records 20th Anniversary
-        Collection") succeeds because FTS5 matches "Various" against the artist
-        column "Various Artists - Electronic - T".
+        The Discogs API `artist` param filters by release-level artist, which
+        excludes VA compilations. Using `artist_as_keyword=True` puts the artist
+        in the `q` param instead, matching track-level credits on compilations.
         """
         compilation_item = make_library_item(
             id=46602,
-            artist="Various Artists - Electronic - T",
+            artist="Various Artists - Hiphop",
             title="Trax Records 20th Anniversary Collection",
             call_letters="V",
         )
@@ -631,9 +632,7 @@ class TestPerformLookupCompilations:
         # 4. search_compilations_for_track: keyword "adonis back" -> []
         # 5. search_album_fuzzy("No Way Back"): exact -> []
         # 6. search_album_fuzzy("No Way Back"): fuzzy "back" -> []
-        # 7. search_album_fuzzy("Trax Records..."): exact -> [] (FTS5 FAILS!)
-        # 8. search_album_fuzzy("Trax Records..."): fuzzy -> [] (also fails)
-        # 9. search_album_fuzzy("Various Trax Records..."): exact -> found! (retry)
+        # 7. search_album_fuzzy("Trax Records..."): exact -> [compilation_item]
         mock_library_db.search.side_effect = [
             [],  # 1: artist + album
             [],  # 2: artist + song
@@ -641,9 +640,7 @@ class TestPerformLookupCompilations:
             [],  # 4: keyword search
             [],  # 5: search_album_fuzzy("No Way Back") exact
             [],  # 6: search_album_fuzzy("No Way Back") fuzzy "back"
-            [],  # 7: search_album_fuzzy("Trax Records...") exact (FTS5 failure)
-            [],  # 8: search_album_fuzzy("Trax Records...") fuzzy
-            [compilation_item],  # 9: search_album_fuzzy("Various Trax Records...") (retry!)
+            [compilation_item],  # 7: search_album_fuzzy("Trax Records...") exact
         ]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
@@ -654,13 +651,17 @@ class TestPerformLookupCompilations:
             raw_message="No Way Back by Adonis",
         )
 
-        async def mock_track_lookup(track, artist=None, **kwargs):
-            if artist:
+        async def mock_track_lookup(track, artist=None, artist_as_keyword=False, **kwargs):
+            if artist and not artist_as_keyword:
+                # Standard artist-field search: only finds Adonis releases
                 return [("Adonis", "No Way Back")]
-            return [
-                ("Adonis", "No Way Back"),
-                ("Various Artists", "Trax Records 20th Anniversary Collection"),
-            ]
+            if artist and artist_as_keyword:
+                # Keyword search: finds VA compilations with Adonis track credits
+                return [
+                    ("Adonis", "No Way Back"),
+                    ("Various Artists", "Trax Records 20th Anniversary Collection"),
+                ]
+            return []
 
         with patch(
             "lookup.orchestrator.lookup_releases_by_track",

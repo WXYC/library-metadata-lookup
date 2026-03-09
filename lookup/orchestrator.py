@@ -369,24 +369,22 @@ async def search_compilations_for_track(
             song_search, parsed.artist, service=discogs_service
         )
         # If artist-scoped search only found non-compilation releases,
-        # retry without artist to find VA compilations containing the track
+        # retry with artist as keyword (q param) to find VA compilations
+        # where the artist is credited on individual tracks
         has_compilation = any(is_compilation_artist(a) for a, _ in releases)
         if not has_compilation:
             va_releases = await lookup_releases_by_track(
-                song_search, artist=None, service=discogs_service
+                song_search,
+                parsed.artist,
+                service=discogs_service,
+                artist_as_keyword=True,
             )
             for release_artist, release_album in va_releases:
                 if (
                     is_compilation_artist(release_artist)
-                    and (
-                        release_artist,
-                        release_album,
-                    )
-                    not in releases
+                    and (release_artist, release_album) not in releases
                 ):
                     releases.append((release_artist, release_album))
-            if va_releases and not releases:
-                releases = va_releases
         logger.info(f"Found {len(releases)} releases with '{song_search}' on Discogs")
         discogs_found_releases = len(releases) > 0
 
