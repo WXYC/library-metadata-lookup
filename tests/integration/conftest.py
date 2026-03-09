@@ -180,6 +180,7 @@ async def app_client_with_discogs(library_db, test_settings):
         return DiscogsSearchResponse(results=[])
 
     mock_discogs.search = AsyncMock(side_effect=search_discogs)
+    mock_discogs.get_release = AsyncMock(return_value=None)
 
     app.dependency_overrides[get_library_db] = lambda: library_db
     app.dependency_overrides[get_discogs_service] = lambda: mock_discogs
