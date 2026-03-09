@@ -237,8 +237,11 @@ class DiscogsService:
         if artist:
             if artist_as_keyword:
                 # Use q (keyword) instead of artist (field filter) to find
-                # VA compilations where the artist is credited on tracks
+                # VA compilations where the artist is credited on tracks.
+                # Also filter by format=Compilation to exclude single/album
+                # releases that dominate results for common track names.
                 params["q"] = artist
+                params["format"] = "Compilation"
             else:
                 params["artist"] = artist
 
