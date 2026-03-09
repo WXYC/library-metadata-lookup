@@ -618,6 +618,27 @@ class TestSearchAlbumFuzzy:
         results = await search_album_fuzzy(db, "The")
         assert results == []
 
+    @pytest.mark.asyncio
+    async def test_drops_mismatched_word_and_retries(self):
+        """When all significant words fail, progressively shorter queries are tried.
+
+        Discogs may list an album as "Trax Records: The 20th Anniversary Edition"
+        while the library has "Trax Records 20th Anniversary Collection". The word
+        "edition" doesn't appear in the library title, so the 4-word query fails.
+        Dropping to 3 words ("trax 20th anniversary") should find it.
+        """
+        db = AsyncMock()
+        item = _item(id=46602, title="Trax Records 20th Anniversary Collection")
+
+        # First call: exact match (full title) -> empty
+        # Second call: 4-word fuzzy "trax 20th anniversary edition" -> empty
+        # Third call: 3-word fuzzy "trax 20th anniversary" -> finds item
+        db.search = AsyncMock(side_effect=[[], [], [item]])
+
+        results = await search_album_fuzzy(db, "Trax Records: The 20th Anniversary Edition")
+        assert len(results) == 1
+        assert results[0].id == 46602
+
 
 # ---------------------------------------------------------------------------
 # filter_results_by_track_validation -- exception (lines 482-483)

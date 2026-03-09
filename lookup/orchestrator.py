@@ -523,9 +523,17 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
         significant_words = [w for w in words if len(w) > 3 and w not in STOPWORDS]
 
         if significant_words:
-            fuzzy_query = " ".join(significant_words[:4])
-            logger.info(f"Exact match failed for '{album_title}', trying fuzzy: '{fuzzy_query}'")
-            results = await db.search(query=fuzzy_query, limit=MAX_SEARCH_RESULTS)
+            # Try progressively shorter queries to handle word mismatches between
+            # Discogs and library titles (e.g., "Edition" vs "Collection")
+            max_words = min(4, len(significant_words))
+            for n_words in range(max_words, 1, -1):
+                fuzzy_query = " ".join(significant_words[:n_words])
+                logger.info(
+                    f"Exact match failed for '{album_title}', trying fuzzy: '{fuzzy_query}'"
+                )
+                results = await db.search(query=fuzzy_query, limit=MAX_SEARCH_RESULTS)
+                if results:
+                    break
 
             if results:
                 album_lower = album_title.lower()
