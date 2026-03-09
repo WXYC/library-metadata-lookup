@@ -733,6 +733,7 @@ async def perform_lookup(
             raw_message=request.raw_message,
             strategies=strategies,
             albums_for_search=albums_for_search,
+            song_not_found=song_not_found,
         )
 
         library_results = limit_results(search_state.results)

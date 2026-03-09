@@ -245,3 +245,45 @@ class TestExecuteSearchPipeline:
 
         assert state.found_on_compilation is True
         assert state.discogs_titles == {1: "Rock Comp"}
+
+    @pytest.mark.asyncio
+    async def test_compilation_search_when_song_not_found_from_album_resolution(self):
+        """song_not_found from album resolution triggers compilation search.
+
+        When resolve_albums_for_track() sets song_not_found=True (Discogs found
+        only VA releases) but the artist has zero library entries so
+        ARTIST_PLUS_ALBUM returns ([], False), the song_not_found flag must
+        propagate into the pipeline so TRACK_ON_COMPILATION still runs.
+        """
+        compilation = _item(
+            id=46602,
+            artist="Various Artists - Electronic - T",
+            title="Trax Records 20th Anniversary Collection",
+        )
+
+        # ARTIST_PLUS_ALBUM: artist not in library at all -> ([], False)
+        search_lib = AsyncMock(return_value=([], False))
+        search_alt = AsyncMock(return_value=([], None))
+        search_comp = AsyncMock(
+            return_value=([compilation], {46602: "Trax Records 20th Anniversary Collection"})
+        )
+
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Adonis",
+            song="No Way Back",
+            raw_message="No Way Back by Adonis",
+        )
+
+        state = await execute_search_pipeline(
+            parsed,
+            AsyncMock(),
+            "No Way Back by Adonis",
+            strategies,
+            song_not_found=True,
+        )
+
+        assert state.found_on_compilation is True
+        assert state.results == [compilation]
+        assert state.discogs_titles == {46602: "Trax Records 20th Anniversary Collection"}

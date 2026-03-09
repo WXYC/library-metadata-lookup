@@ -217,6 +217,7 @@ async def execute_search_pipeline(
     raw_message: str,
     strategies: list[SearchStrategy],
     albums_for_search: list[str] | None = None,
+    song_not_found: bool = False,
 ) -> SearchState:
     """Execute strategies in array order until results found.
 
@@ -226,6 +227,7 @@ async def execute_search_pipeline(
         raw_message: Original request message (for ambiguous format detection)
         strategies: List of search strategies to try
         albums_for_search: Optional list of album names from Discogs lookup
+        song_not_found: Whether album resolution already determined the song wasn't found
 
     Returns:
         SearchState with results and metadata about the search
@@ -234,6 +236,7 @@ async def execute_search_pipeline(
         results=[],
         strategies_tried=[],
         albums_for_search=albums_for_search or [],
+        song_not_found=song_not_found,
     )
 
     for strategy in strategies:
