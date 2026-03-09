@@ -476,6 +476,62 @@ class TestPerformLookupCompilations:
         assert response.context_message is not None
         assert "Found" in response.context_message
 
+    @pytest.mark.asyncio
+    async def test_finds_song_on_compilation_when_artist_not_in_library(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Compilation search runs when the track artist has zero library entries.
+
+        Scenario: "No Way Back by Adonis"
+        - resolve_albums_for_track finds only VA releases -> song_not_found=True
+        - search_library_with_fallback finds nothing for "Adonis" -> ([], False)
+        - song_not_found from album resolution must propagate so
+          TRACK_ON_COMPILATION still triggers
+        """
+        compilation_item = make_library_item(
+            id=46602,
+            artist="Various Artists - Electronic - T",
+            title="Trax Records 20th Anniversary Collection",
+            call_letters="V",
+        )
+
+        mock_library_db.find_similar_artist.return_value = None
+
+        # search_library_with_fallback: artist+song -> empty, artist-only -> empty
+        # search_compilations_for_track: keyword search -> compilation,
+        #   search_album_fuzzy -> compilation
+        mock_library_db.search.side_effect = [
+            [],  # search_library_with_fallback: artist + song
+            [],  # search_library_with_fallback: artist only (Adonis not in library)
+            [compilation_item],  # search_compilations_for_track: keyword search
+            [compilation_item],  # search_album_fuzzy: exact search for Discogs album
+        ]
+
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Adonis",
+            song="No Way Back",
+            raw_message="No Way Back by Adonis",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[
+                ("Various Artists", "Trax Records 20th Anniversary Collection"),
+            ],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.found_on_compilation is True
+        assert len(response.results) >= 1
+        assert response.results[0].library_item.title == "Trax Records 20th Anniversary Collection"
+        assert response.context_message is not None
+        assert "Found" in response.context_message
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - artwork
