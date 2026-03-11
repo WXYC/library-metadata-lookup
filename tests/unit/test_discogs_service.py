@@ -1142,12 +1142,8 @@ class TestGetArtistDetails:
     async def test_cache_hit(self, service_with_cache):
         from discogs.models import ArtistDetails
 
-        cached_details = ArtistDetails(
-            artist_id=77, name="Autechre", cached=True
-        )
-        service_with_cache.cache_service.get_artist_details = AsyncMock(
-            return_value=cached_details
-        )
+        cached_details = ArtistDetails(artist_id=77, name="Autechre", cached=True)
+        service_with_cache.cache_service.get_artist_details = AsyncMock(return_value=cached_details)
 
         result = await service_with_cache.get_artist_details(77)
         assert result is not None
@@ -1203,9 +1199,7 @@ class TestGetArtistImageDelegation:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_details(self, service):
-        with patch.object(
-            service, "get_artist_details", new_callable=AsyncMock, return_value=None
-        ):
+        with patch.object(service, "get_artist_details", new_callable=AsyncMock, return_value=None):
             result = await service.get_artist_image(77)
 
         assert result is None
