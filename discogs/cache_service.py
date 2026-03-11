@@ -11,7 +11,16 @@ The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 
 import logging
 
-from discogs.models import ReleaseInfo, ReleaseMetadataResponse, TrackItem
+from discogs.models import (
+    ArtistCredit,
+    ArtistDetails,
+    ArtistRef,
+    LabelCredit,
+    MemberRef,
+    ReleaseInfo,
+    ReleaseMetadataResponse,
+    TrackItem,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,23 +139,57 @@ class DiscogsCacheService:
         """
         try:
             release_row = await self.pool.fetchrow(
-                "SELECT id, title, release_year, artwork_url FROM release WHERE id = $1",
+                "SELECT id, title, release_year, artwork_url, released FROM release WHERE id = $1",
                 release_id,
             )
 
             if release_row is None:
                 return None
 
+            # Read all artists (main + extra) with enriched columns
             artist_rows = await self.pool.fetch(
-                "SELECT artist_name, extra FROM release_artist WHERE release_id = $1 ORDER BY extra",
+                """
+                SELECT artist_id, artist_name, extra, role
+                FROM release_artist
+                WHERE release_id = $1
+                ORDER BY extra, artist_name
+                """,
                 release_id,
             )
 
             primary_artist = ""
+            primary_artist_id = None
+            artist_credits: list[ArtistCredit] = []
+            extra_artist_credits: list[ArtistCredit] = []
             for row in artist_rows:
+                credit = ArtistCredit(
+                    artist_id=row["artist_id"],
+                    name=row["artist_name"],
+                    role=row["role"],
+                )
                 if row["extra"] == 0:
-                    primary_artist = row["artist_name"]
-                    break
+                    artist_credits.append(credit)
+                    if not primary_artist:
+                        primary_artist = row["artist_name"]
+                        primary_artist_id = row["artist_id"]
+                else:
+                    extra_artist_credits.append(credit)
+
+            # Read labels
+            label_rows = await self.pool.fetch(
+                "SELECT label_id, label_name, catno FROM release_label WHERE release_id = $1",
+                release_id,
+            )
+            label_credits = [
+                LabelCredit(
+                    label_id=row["label_id"],
+                    name=row["label_name"],
+                    catno=row["catno"],
+                )
+                for row in label_rows
+            ]
+            primary_label = label_credits[0].name if label_credits else None
+            primary_label_id = label_credits[0].label_id if label_credits else None
 
             track_rows = await self.pool.fetch(
                 """
@@ -191,11 +234,18 @@ class DiscogsCacheService:
                 release_id=release_id,
                 title=release_row["title"],
                 artist=primary_artist,
+                artist_id=primary_artist_id,
                 year=release_row["release_year"],
+                label=primary_label,
+                label_id=primary_label_id,
                 artwork_url=release_row["artwork_url"],
                 tracklist=tracklist,
                 release_url=f"https://www.discogs.com/release/{release_id}",
                 cached=True,
+                artists=artist_credits,
+                extra_artists=extra_artist_credits,
+                labels=label_credits,
+                released=release_row["released"],
             )
 
         except Exception as e:
@@ -213,32 +263,78 @@ class DiscogsCacheService:
         """
         try:
             async with self.pool.acquire() as conn:
+                # Upsert release row (including released date)
                 await conn.execute(
                     """
-                    INSERT INTO release (id, title, release_year, artwork_url)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO release (id, title, release_year, artwork_url, released)
+                    VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (id) DO UPDATE SET
                         title = EXCLUDED.title,
                         release_year = EXCLUDED.release_year,
-                        artwork_url = EXCLUDED.artwork_url
+                        artwork_url = EXCLUDED.artwork_url,
+                        released = EXCLUDED.released
                     """,
                     release.release_id,
                     release.title,
                     release.year,
                     release.artwork_url,
+                    release.released,
                 )
 
-                if release.artist:
-                    await conn.execute(
-                        """
-                        INSERT INTO release_artist (release_id, artist_name, extra)
-                        VALUES ($1, $2, 0)
-                        ON CONFLICT (release_id, artist_name) DO NOTHING
-                        """,
-                        release.release_id,
-                        release.artist,
+                # Delete + re-insert all artists (clean replacement)
+                await conn.execute(
+                    "DELETE FROM release_artist WHERE release_id = $1",
+                    release.release_id,
+                )
+
+                artist_data = []
+                # Main artists (extra=0)
+                if release.artists:
+                    for a in release.artists:
+                        artist_data.append(
+                            (release.release_id, a.artist_id, a.name, 0, a.role)
+                        )
+                elif release.artist:
+                    # Backward compat: fall back to scalar artist
+                    artist_data.append(
+                        (release.release_id, release.artist_id, release.artist, 0, None)
+                    )
+                # Extra artists (extra=1)
+                for a in release.extra_artists:
+                    artist_data.append(
+                        (release.release_id, a.artist_id, a.name, 1, a.role)
                     )
 
+                if artist_data:
+                    await conn.executemany(
+                        """
+                        INSERT INTO release_artist
+                            (release_id, artist_id, artist_name, extra, role)
+                        VALUES ($1, $2, $3, $4, $5)
+                        """,
+                        artist_data,
+                    )
+
+                # Delete + re-insert labels
+                await conn.execute(
+                    "DELETE FROM release_label WHERE release_id = $1",
+                    release.release_id,
+                )
+
+                if release.labels:
+                    label_data = [
+                        (release.release_id, lbl.label_id, lbl.name, lbl.catno)
+                        for lbl in release.labels
+                    ]
+                    await conn.executemany(
+                        """
+                        INSERT INTO release_label (release_id, label_id, label_name, catno)
+                        VALUES ($1, $2, $3, $4)
+                        """,
+                        label_data,
+                    )
+
+                # Delete + re-insert tracks
                 await conn.execute(
                     "DELETE FROM release_track WHERE release_id = $1",
                     release.release_id,
@@ -265,7 +361,8 @@ class DiscogsCacheService:
                     if track_artist_data:
                         await conn.executemany(
                             """
-                            INSERT INTO release_track_artist (release_id, track_sequence, artist_name)
+                            INSERT INTO release_track_artist
+                                (release_id, track_sequence, artist_name)
                             VALUES ($1, $2, $3)
                             ON CONFLICT DO NOTHING
                             """,
@@ -387,6 +484,157 @@ class DiscogsCacheService:
         except Exception as e:
             logger.error(f"Cache search_releases failed: {e}")
             raise CacheUnavailableError(f"Cache search_releases failed: {e}") from e
+
+    async def get_artist_details(self, artist_id: int) -> ArtistDetails | None:
+        """Get full artist details by ID.
+
+        Args:
+            artist_id: Discogs artist ID
+
+        Returns:
+            ArtistDetails if found, None if not in cache
+
+        Raises:
+            CacheUnavailableError: If database is unreachable
+        """
+        try:
+            artist_row = await self.pool.fetchrow(
+                "SELECT id, name, profile, image_url FROM artist WHERE id = $1",
+                artist_id,
+            )
+
+            if artist_row is None:
+                return None
+
+            alias_rows = await self.pool.fetch(
+                "SELECT alias_id, alias_name FROM artist_alias WHERE artist_id = $1",
+                artist_id,
+            )
+            nv_rows = await self.pool.fetch(
+                "SELECT name FROM artist_name_variation WHERE artist_id = $1",
+                artist_id,
+            )
+            member_rows = await self.pool.fetch(
+                "SELECT member_id, member_name, active FROM artist_member WHERE artist_id = $1",
+                artist_id,
+            )
+            url_rows = await self.pool.fetch(
+                "SELECT url FROM artist_url WHERE artist_id = $1",
+                artist_id,
+            )
+
+            return ArtistDetails(
+                artist_id=artist_row["id"],
+                name=artist_row["name"],
+                profile=artist_row["profile"],
+                image_url=artist_row["image_url"],
+                aliases=[
+                    ArtistRef(id=r["alias_id"], name=r["alias_name"])
+                    for r in alias_rows
+                    if r["alias_id"] is not None
+                ],
+                name_variations=[r["name"] for r in nv_rows],
+                members=[
+                    MemberRef(id=r["member_id"], name=r["member_name"], active=r["active"])
+                    for r in member_rows
+                ],
+                urls=[r["url"] for r in url_rows],
+                cached=True,
+            )
+
+        except Exception as e:
+            logger.error(f"Cache get_artist_details failed: {e}")
+            raise CacheUnavailableError(f"Cache get_artist_details failed: {e}") from e
+
+    async def write_artist_details(self, details: ArtistDetails) -> None:
+        """Write or update artist details in the cache.
+
+        Args:
+            details: Artist details to cache
+
+        Raises:
+            CacheUnavailableError: If database is unreachable
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                # Upsert artist row
+                await conn.execute(
+                    """
+                    INSERT INTO artist (id, name, profile, image_url, fetched_at)
+                    VALUES ($1, $2, $3, $4, now())
+                    ON CONFLICT (id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        profile = EXCLUDED.profile,
+                        image_url = EXCLUDED.image_url,
+                        fetched_at = now()
+                    """,
+                    details.artist_id,
+                    details.name,
+                    details.profile,
+                    details.image_url,
+                )
+
+                # Delete + re-insert child tables
+                await conn.execute(
+                    "DELETE FROM artist_alias WHERE artist_id = $1",
+                    details.artist_id,
+                )
+                if details.aliases:
+                    await conn.executemany(
+                        """
+                        INSERT INTO artist_alias (artist_id, alias_id, alias_name)
+                        VALUES ($1, $2, $3)
+                        """,
+                        [(details.artist_id, a.id, a.name) for a in details.aliases],
+                    )
+
+                await conn.execute(
+                    "DELETE FROM artist_name_variation WHERE artist_id = $1",
+                    details.artist_id,
+                )
+                if details.name_variations:
+                    await conn.executemany(
+                        """
+                        INSERT INTO artist_name_variation (artist_id, name)
+                        VALUES ($1, $2)
+                        """,
+                        [(details.artist_id, nv) for nv in details.name_variations],
+                    )
+
+                await conn.execute(
+                    "DELETE FROM artist_member WHERE artist_id = $1",
+                    details.artist_id,
+                )
+                if details.members:
+                    await conn.executemany(
+                        """
+                        INSERT INTO artist_member (artist_id, member_id, member_name, active)
+                        VALUES ($1, $2, $3, $4)
+                        """,
+                        [
+                            (details.artist_id, m.id, m.name, m.active)
+                            for m in details.members
+                        ],
+                    )
+
+                await conn.execute(
+                    "DELETE FROM artist_url WHERE artist_id = $1",
+                    details.artist_id,
+                )
+                if details.urls:
+                    await conn.executemany(
+                        """
+                        INSERT INTO artist_url (artist_id, url)
+                        VALUES ($1, $2)
+                        """,
+                        [(details.artist_id, url) for url in details.urls],
+                    )
+
+                logger.debug(f"Cached artist {details.artist_id}: {details.name}")
+
+        except Exception as e:
+            logger.error(f"Cache write_artist_details failed: {e}")
+            raise CacheUnavailableError(f"Cache write_artist_details failed: {e}") from e
 
     async def validate_track_on_release(
         self, release_id: int, track: str, artist: str

@@ -5,7 +5,15 @@ from unittest.mock import AsyncMock
 import pytest
 
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
-from discogs.models import ReleaseMetadataResponse, TrackItem
+from discogs.models import (
+    ArtistCredit,
+    ArtistDetails,
+    ArtistRef,
+    LabelCredit,
+    MemberRef,
+    ReleaseMetadataResponse,
+    TrackItem,
+)
 
 
 @pytest.fixture
@@ -123,12 +131,15 @@ class TestGetRelease:
                 "title": "The Game",
                 "release_year": 1980,
                 "artwork_url": "https://img.com/a.jpg",
+                "released": None,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
             side_effect=[
                 # artist_rows
-                [{"artist_name": "Queen", "extra": 0}],
+                [{"artist_id": None, "artist_name": "Queen", "extra": 0, "role": None}],
+                # label_rows
+                [],
                 # track_rows
                 [{"position": "1", "title": "Play the Game", "duration": "3:30", "sequence": 1}],
                 # track_artist_rows
@@ -151,11 +162,13 @@ class TestGetRelease:
                 "title": "Compilation",
                 "release_year": 2000,
                 "artwork_url": None,
+                "released": None,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
             side_effect=[
-                [{"artist_name": "Various Artists", "extra": 0}],
+                [{"artist_id": None, "artist_name": "Various Artists", "extra": 0, "role": None}],
+                [],  # label_rows
                 [{"position": "1", "title": "Track1", "duration": None, "sequence": 1}],
                 [{"track_sequence": 1, "artist_name": "Some Artist"}],
             ]
@@ -205,6 +218,129 @@ class TestWriteRelease:
         )
         with pytest.raises(CacheUnavailableError):
             await cache_service.write_release(release)
+
+    @pytest.mark.asyncio
+    async def test_writes_enriched_release(self, cache_service, mock_asyncpg_pool):
+        """write_release persists all artists, extra artists, labels, and released."""
+        release = ReleaseMetadataResponse(
+            release_id=28138,
+            title="Confield",
+            artist="Autechre",
+            year=2001,
+            artwork_url="https://img.com/confield.jpg",
+            release_url="https://discogs.com/release/28138",
+            artists=[
+                ArtistCredit(artist_id=77, name="Autechre"),
+            ],
+            extra_artists=[
+                ArtistCredit(artist_id=200, name="Rob Brown", role="Producer"),
+                ArtistCredit(artist_id=201, name="Sean Booth", role="Producer"),
+            ],
+            labels=[
+                LabelCredit(label_id=233, name="Warp Records", catno="WAP 159 CD"),
+            ],
+            released="2001-04-30",
+            tracklist=[TrackItem(position="1", title="VI Scose Poise")],
+        )
+
+        await cache_service.write_release(release)
+        conn = mock_asyncpg_pool._mock_conn
+
+        # Check the release row includes 'released'
+        release_call = conn.execute.call_args_list[0]
+        release_sql = release_call[0][0]
+        assert "released" in release_sql
+
+        # Check release_artist rows were deleted then re-inserted (not just a single ON CONFLICT)
+        all_sql = [call[0][0] for call in conn.execute.call_args_list]
+        assert any("DELETE FROM release_artist" in sql for sql in all_sql)
+
+        # Check release_label rows were written
+        assert any("release_label" in sql for sql in all_sql)
+
+    @pytest.mark.asyncio
+    async def test_writes_multiple_artists_as_rows(self, cache_service, mock_asyncpg_pool):
+        """write_release writes ALL artists (main + extra) as separate rows."""
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Duke Ellington & John Coltrane",
+            artist="Duke Ellington",
+            release_url="https://discogs.com/release/1",
+            artists=[
+                ArtistCredit(artist_id=100, name="Duke Ellington", join=" & "),
+                ArtistCredit(artist_id=101, name="John Coltrane"),
+            ],
+            extra_artists=[
+                ArtistCredit(artist_id=300, name="Engineer Bob", role="Engineer"),
+            ],
+        )
+
+        await cache_service.write_release(release)
+        conn = mock_asyncpg_pool._mock_conn
+
+        # Should use executemany for artist inserts (3 total: 2 main + 1 extra)
+        executemany_calls = conn.executemany.call_args_list
+        artist_inserts = [
+            c for c in executemany_calls if "release_artist" in c[0][0]
+        ]
+        assert len(artist_inserts) >= 1
+        # The data should contain all 3 artists
+        artist_data = artist_inserts[0][0][1]
+        assert len(artist_data) == 3
+
+
+# ---------------------------------------------------------------------------
+# get_release (enriched)
+# ---------------------------------------------------------------------------
+
+
+class TestGetReleaseEnriched:
+    @pytest.mark.asyncio
+    async def test_reads_enriched_metadata(self, cache_service, mock_asyncpg_pool):
+        """get_release returns enriched artist, label, and released data."""
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 28138,
+                "title": "Confield",
+                "release_year": 2001,
+                "artwork_url": "https://img.com/a.jpg",
+                "released": "2001-04-30",
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=[
+                # artist_rows (main + extra)
+                [
+                    {"artist_id": 77, "artist_name": "Autechre", "extra": 0, "role": None},
+                    {"artist_id": 200, "artist_name": "Rob Brown", "extra": 1, "role": "Producer"},
+                ],
+                # label_rows
+                [
+                    {"label_id": 233, "label_name": "Warp Records", "catno": "WAP 159 CD"},
+                ],
+                # track_rows
+                [{"position": "1", "title": "VI Scose Poise", "duration": "5:30", "sequence": 1}],
+                # track_artist_rows
+                [],
+            ]
+        )
+
+        result = await cache_service.get_release(28138)
+        assert result is not None
+        assert result.released == "2001-04-30"
+        assert len(result.artists) == 1
+        assert result.artists[0].artist_id == 77
+        assert result.artists[0].name == "Autechre"
+        assert len(result.extra_artists) == 1
+        assert result.extra_artists[0].name == "Rob Brown"
+        assert result.extra_artists[0].role == "Producer"
+        assert len(result.labels) == 1
+        assert result.labels[0].label_id == 233
+        assert result.labels[0].name == "Warp Records"
+        assert result.labels[0].catno == "WAP 159 CD"
+        # Backward compat scalars
+        assert result.artist == "Autechre"
+        assert result.label == "Warp Records"
 
 
 # ---------------------------------------------------------------------------
@@ -327,11 +463,15 @@ class TestValidateTrackOnRelease:
     @pytest.mark.asyncio
     async def test_found(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetchrow = AsyncMock(
-            return_value={"id": 1, "title": "Album", "release_year": 2020, "artwork_url": None}
+            return_value={
+                "id": 1, "title": "Album", "release_year": 2020,
+                "artwork_url": None, "released": None,
+            }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
             side_effect=[
-                [{"artist_name": "Artist", "extra": 0}],
+                [{"artist_id": None, "artist_name": "Artist", "extra": 0, "role": None}],
+                [],  # label_rows
                 [{"position": "1", "title": "Song", "duration": None, "sequence": 1}],
                 [],
             ]
@@ -342,14 +482,97 @@ class TestValidateTrackOnRelease:
     @pytest.mark.asyncio
     async def test_not_found(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetchrow = AsyncMock(
-            return_value={"id": 1, "title": "Album", "release_year": 2020, "artwork_url": None}
+            return_value={
+                "id": 1, "title": "Album", "release_year": 2020,
+                "artwork_url": None, "released": None,
+            }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
             side_effect=[
-                [{"artist_name": "Artist", "extra": 0}],
+                [{"artist_id": None, "artist_name": "Artist", "extra": 0, "role": None}],
+                [],  # label_rows
                 [{"position": "1", "title": "Other Song", "duration": None, "sequence": 1}],
                 [],
             ]
         )
         result = await cache_service.validate_track_on_release(1, "Missing Song", "Artist")
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Artist detail caching
+# ---------------------------------------------------------------------------
+
+
+class TestGetArtistDetails:
+    @pytest.mark.asyncio
+    async def test_not_found(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=None)
+        result = await cache_service.get_artist_details(999)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_full_details(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 77,
+                "name": "Autechre",
+                "profile": "Electronic duo from Rochdale.",
+                "image_url": "https://i.discogs.com/autechre.jpg",
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=[
+                # aliases
+                [{"alias_id": 500, "alias_name": "Gescom"}],
+                # name_variations
+                [{"name": "Ae"}, {"name": "Autechre."}],
+                # members
+                [{"member_id": 200, "member_name": "Rob Brown", "active": True}],
+                # urls
+                [{"url": "https://autechre.ws"}],
+            ]
+        )
+
+        result = await cache_service.get_artist_details(77)
+        assert result is not None
+        assert result.artist_id == 77
+        assert result.name == "Autechre"
+        assert result.profile == "Electronic duo from Rochdale."
+        assert result.image_url == "https://i.discogs.com/autechre.jpg"
+        assert len(result.aliases) == 1
+        assert result.aliases[0].name == "Gescom"
+        assert result.name_variations == ["Ae", "Autechre."]
+        assert len(result.members) == 1
+        assert result.members[0].name == "Rob Brown"
+        assert result.urls == ["https://autechre.ws"]
+        assert result.cached is True
+
+
+class TestWriteArtistDetails:
+    @pytest.mark.asyncio
+    async def test_writes_artist_details(self, cache_service, mock_asyncpg_pool):
+        details = ArtistDetails(
+            artist_id=77,
+            name="Autechre",
+            profile="Electronic duo.",
+            image_url="https://i.discogs.com/autechre.jpg",
+            aliases=[ArtistRef(id=500, name="Gescom")],
+            name_variations=["Ae"],
+            members=[MemberRef(id=200, name="Rob Brown", active=True)],
+            urls=["https://autechre.ws"],
+        )
+
+        await cache_service.write_artist_details(details)
+        conn = mock_asyncpg_pool._mock_conn
+
+        # Should upsert artist row
+        artist_call = conn.execute.call_args_list[0]
+        assert "artist" in artist_call[0][0].lower()
+
+        # Should write child tables
+        all_sql = [call[0][0] for call in conn.execute.call_args_list]
+        assert any("artist_alias" in sql for sql in all_sql)
+        assert any("artist_name_variation" in sql for sql in all_sql)
+        assert any("artist_member" in sql for sql in all_sql)
+        assert any("artist_url" in sql for sql in all_sql)

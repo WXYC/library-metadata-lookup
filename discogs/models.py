@@ -10,6 +10,23 @@ if TYPE_CHECKING:
     from generated.api_models import DiscogsMatchResult
 
 
+class ArtistCredit(BaseModel):
+    """An artist credit on a release."""
+
+    artist_id: int | None = None
+    name: str
+    join: str = ""  # join phrase: " & ", ", ", etc.
+    role: str | None = None  # for extra artists: "Producer", "Mixed By"
+
+
+class LabelCredit(BaseModel):
+    """A label credit on a release."""
+
+    label_id: int | None = None
+    name: str
+    catno: str | None = None
+
+
 class TrackItem(BaseModel):
     """A single track on a release."""
 
@@ -54,6 +71,40 @@ class ReleaseMetadataResponse(BaseModel):
     tracklist: list[TrackItem] = []
     artwork_url: str | None = None
     release_url: str
+    cached: bool = False
+    # Enriched fields (additive, backward-compatible)
+    artists: list[ArtistCredit] = []
+    extra_artists: list[ArtistCredit] = []
+    labels: list[LabelCredit] = []
+    released: str | None = None  # full date string, e.g. "2024-03-15"
+
+
+class ArtistRef(BaseModel):
+    """Reference to a related artist (alias or similar)."""
+
+    id: int
+    name: str
+
+
+class MemberRef(BaseModel):
+    """Reference to a group member."""
+
+    id: int
+    name: str
+    active: bool = True
+
+
+class ArtistDetails(BaseModel):
+    """Full artist details from Discogs."""
+
+    artist_id: int
+    name: str
+    profile: str | None = None
+    image_url: str | None = None
+    name_variations: list[str] = []
+    aliases: list[ArtistRef] = []
+    members: list[MemberRef] = []
+    urls: list[str] = []
     cached: bool = False
 
 

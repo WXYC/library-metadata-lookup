@@ -28,9 +28,14 @@ from discogs.memory_cache import (
     should_skip_cache,
 )
 from discogs.models import (
+    ArtistCredit,
+    ArtistDetails,
+    ArtistRef,
     DiscogsSearchRequest,
     DiscogsSearchResponse,
     DiscogsSearchResult,
+    LabelCredit,
+    MemberRef,
     ReleaseInfo,
     ReleaseMetadataResponse,
     TrackItem,
@@ -395,15 +400,45 @@ class DiscogsService:
             response.raise_for_status()
             data = response.json()
 
-            # Extract artists
-            artists = data.get("artists", [])
-            artist_name = artists[0].get("name", "") if artists else ""
-            artist_id = artists[0].get("id") if artists else None
+            # Extract all artists
+            raw_artists = data.get("artists", [])
+            artist_credits = [
+                ArtistCredit(
+                    artist_id=a.get("id"),
+                    name=a.get("name", ""),
+                    join=a.get("join", ""),
+                )
+                for a in raw_artists
+            ]
+            artist_name = artist_credits[0].name if artist_credits else ""
+            artist_id = artist_credits[0].artist_id if artist_credits else None
 
-            # Extract labels
-            labels = data.get("labels", [])
-            label_name = labels[0].get("name") if labels else None
-            label_id = labels[0].get("id") if labels else None
+            # Extract extra artists (credits)
+            raw_extras = data.get("extraartists", [])
+            extra_artist_credits = [
+                ArtistCredit(
+                    artist_id=a.get("id"),
+                    name=a.get("name", ""),
+                    role=a.get("role"),
+                )
+                for a in raw_extras
+            ]
+
+            # Extract all labels
+            raw_labels = data.get("labels", [])
+            label_credits = [
+                LabelCredit(
+                    label_id=lbl.get("id"),
+                    name=lbl.get("name", ""),
+                    catno=lbl.get("catno"),
+                )
+                for lbl in raw_labels
+            ]
+            label_name = label_credits[0].name if label_credits else None
+            label_id = label_credits[0].label_id if label_credits else None
+
+            # Extract full release date
+            released = data.get("released")
 
             # Extract tracklist with per-track artists (for compilations)
             tracklist = [
@@ -434,6 +469,10 @@ class DiscogsService:
                 artwork_url=artwork_url,
                 release_url=f"https://www.discogs.com/release/{release_id}",
                 cached=False,
+                artists=artist_credits,
+                extra_artists=extra_artist_credits,
+                labels=label_credits,
+                released=released,
             )
 
             # Write back to cache for future queries
@@ -453,15 +492,36 @@ class DiscogsService:
             return None
 
     @async_cached(ARTIST_CACHE)
-    async def get_artist_image(self, artist_id: int) -> str | None:
-        """Fetch primary image for a Discogs artist.
+    async def get_artist_details(self, artist_id: int) -> ArtistDetails | None:
+        """Fetch full artist details from Discogs.
+
+        Uses optional PostgreSQL cache with write-back strategy:
+        1. Try local cache first (if available)
+        2. On cache miss, fetch from Discogs API
+        3. Write API result back to cache for future queries
 
         Args:
             artist_id: Discogs artist ID
 
         Returns:
-            Image URI string, or None if unavailable
+            ArtistDetails with full metadata, or None on error
         """
+        # Try local cache first
+        if self.cache_service and not should_skip_cache():
+            try:
+                add_discogs_breadcrumb("cache_get_artist_details", {"artist_id": artist_id})
+                start = time.perf_counter()
+                cached_details = await self.cache_service.get_artist_details(artist_id)
+                record_pg_time((time.perf_counter() - start) * 1000)
+                if cached_details:
+                    logger.info(f"Cache hit: artist {artist_id}")
+                    record_pg_cache_hit()
+                    return cached_details
+                logger.debug(f"Cache miss for artist {artist_id}")
+                record_pg_cache_miss()
+            except Exception as e:
+                logger.warning(f"Cache lookup failed, falling back to API: {e}")
+
         try:
             start = time.perf_counter()
             response = await self._request_with_retry("GET", f"/artists/{artist_id}")
@@ -469,14 +529,64 @@ class DiscogsService:
                 return None
             record_api_time((time.perf_counter() - start) * 1000)
             record_discogs_api_call()
-            add_discogs_breadcrumb("get_artist_image", {"artist_id": artist_id})
+            add_discogs_breadcrumb("get_artist_details", {"artist_id": artist_id})
             response.raise_for_status()
             data = response.json()
+
             images = data.get("images", [])
-            return images[0].get("uri") if images else None
+            image_url = images[0].get("uri") if images else None
+
+            details = ArtistDetails(
+                artist_id=artist_id,
+                name=data.get("name", ""),
+                profile=data.get("profile") or None,
+                image_url=image_url,
+                name_variations=data.get("namevariations", []),
+                aliases=[
+                    ArtistRef(id=a["id"], name=a["name"])
+                    for a in data.get("aliases", [])
+                    if "id" in a and "name" in a
+                ],
+                members=[
+                    MemberRef(
+                        id=m["id"],
+                        name=m["name"],
+                        active=m.get("active", True),
+                    )
+                    for m in data.get("members", [])
+                    if "id" in m and "name" in m
+                ],
+                urls=data.get("urls", []),
+                cached=False,
+            )
+
+            # Write back to cache
+            if self.cache_service and not should_skip_cache():
+                try:
+                    await self.cache_service.write_artist_details(details)
+                    logger.debug(f"Cached artist {artist_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to cache artist {artist_id}: {e}")
+
+            return details
+
         except Exception as e:
-            logger.warning(f"Failed to fetch artist image for {artist_id}: {e}")
+            logger.warning(f"Failed to fetch artist details for {artist_id}: {e}")
             return None
+
+    async def get_artist_image(self, artist_id: int) -> str | None:
+        """Fetch primary image for a Discogs artist.
+
+        Delegates to get_artist_details which handles caching.
+
+        Args:
+            artist_id: Discogs artist ID
+
+        Returns:
+            Image URI string, or None if unavailable
+        """
+        details = await self.get_artist_details(artist_id)
+        return details.image_url if details else None
 
     @async_cached(LABEL_CACHE)
     async def get_label_image(self, label_id: int) -> str | None:

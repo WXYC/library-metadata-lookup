@@ -901,3 +901,311 @@ class TestGetReleaseExtractsIds:
         assert result is not None
         assert result.artist_id is None
         assert result.label_id is None
+
+
+# ---------------------------------------------------------------------------
+# get_release parses enriched data (multi-artist, labels, extra artists)
+# ---------------------------------------------------------------------------
+
+
+class TestGetReleaseEnrichedParsing:
+    @pytest.mark.asyncio
+    async def test_parses_multiple_artists(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Duke Ellington & John Coltrane",
+            "artists": [
+                {"id": 100, "name": "Duke Ellington", "join": " & "},
+                {"id": 101, "name": "John Coltrane", "join": ""},
+            ],
+            "labels": [{"id": 500, "name": "Impulse Records"}],
+            "tracklist": [],
+            "images": [],
+            "genres": ["Jazz"],
+            "styles": [],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(12345)
+
+        assert result is not None
+        assert len(result.artists) == 2
+        assert result.artists[0].artist_id == 100
+        assert result.artists[0].name == "Duke Ellington"
+        assert result.artists[0].join == " & "
+        assert result.artists[1].artist_id == 101
+        assert result.artists[1].name == "John Coltrane"
+        # Backward compat: scalar artist is first artist
+        assert result.artist == "Duke Ellington"
+        assert result.artist_id == 100
+
+    @pytest.mark.asyncio
+    async def test_parses_extra_artists(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Confield",
+            "artists": [{"id": 77, "name": "Autechre"}],
+            "extraartists": [
+                {"id": 200, "name": "Rob Brown", "role": "Producer"},
+                {"id": 201, "name": "Sean Booth", "role": "Producer"},
+            ],
+            "labels": [],
+            "tracklist": [],
+            "images": [],
+            "genres": [],
+            "styles": [],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(28138)
+
+        assert result is not None
+        assert len(result.extra_artists) == 2
+        assert result.extra_artists[0].artist_id == 200
+        assert result.extra_artists[0].name == "Rob Brown"
+        assert result.extra_artists[0].role == "Producer"
+
+    @pytest.mark.asyncio
+    async def test_parses_multiple_labels(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Aluminum Tunes",
+            "artists": [{"id": 1, "name": "Stereolab"}],
+            "labels": [
+                {"id": 233, "name": "Duophonic", "catno": "D-UHF-CD 19"},
+                {"id": 400, "name": "Elektra", "catno": "62302-2"},
+            ],
+            "tracklist": [],
+            "images": [],
+            "genres": [],
+            "styles": [],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(55555)
+
+        assert result is not None
+        assert len(result.labels) == 2
+        assert result.labels[0].label_id == 233
+        assert result.labels[0].name == "Duophonic"
+        assert result.labels[0].catno == "D-UHF-CD 19"
+        assert result.labels[1].label_id == 400
+        # Backward compat: scalar label is first label
+        assert result.label == "Duophonic"
+        assert result.label_id == 233
+
+    @pytest.mark.asyncio
+    async def test_parses_released_date(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Confield",
+            "artists": [{"id": 77, "name": "Autechre"}],
+            "labels": [],
+            "tracklist": [],
+            "images": [],
+            "genres": [],
+            "styles": [],
+            "released": "2001-04-30",
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(28138)
+
+        assert result is not None
+        assert result.released == "2001-04-30"
+
+    @pytest.mark.asyncio
+    async def test_empty_artists_and_labels(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Untitled",
+            "artists": [],
+            "labels": [],
+            "tracklist": [],
+            "images": [],
+            "genres": [],
+            "styles": [],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(99999)
+
+        assert result is not None
+        assert result.artists == []
+        assert result.extra_artists == []
+        assert result.labels == []
+        assert result.artist == ""
+        assert result.artist_id is None
+
+
+# ---------------------------------------------------------------------------
+# get_artist_details
+# ---------------------------------------------------------------------------
+
+
+class TestGetArtistDetails:
+    @pytest.mark.asyncio
+    async def test_parses_full_artist_data(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "id": 77,
+            "name": "Autechre",
+            "profile": "Electronic duo from Rochdale, England.",
+            "namevariations": ["Ae", "Autechre."],
+            "aliases": [{"id": 500, "name": "Gescom"}],
+            "members": [
+                {"id": 200, "name": "Rob Brown", "active": True},
+                {"id": 201, "name": "Sean Booth", "active": True},
+            ],
+            "urls": ["https://autechre.ws", "https://warp.net/artists/autechre"],
+            "images": [
+                {"uri": "https://i.discogs.com/autechre.jpg", "type": "primary"},
+            ],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_artist_details(77)
+
+        assert result is not None
+        assert result.artist_id == 77
+        assert result.name == "Autechre"
+        assert result.profile == "Electronic duo from Rochdale, England."
+        assert result.image_url == "https://i.discogs.com/autechre.jpg"
+        assert result.name_variations == ["Ae", "Autechre."]
+        assert len(result.aliases) == 1
+        assert result.aliases[0].id == 500
+        assert result.aliases[0].name == "Gescom"
+        assert len(result.members) == 2
+        assert result.members[0].name == "Rob Brown"
+        assert result.urls == ["https://autechre.ws", "https://warp.net/artists/autechre"]
+
+    @pytest.mark.asyncio
+    async def test_handles_minimal_response(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "id": 1,
+            "name": "Unknown Artist",
+            "images": [],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_artist_details(1)
+
+        assert result is not None
+        assert result.artist_id == 1
+        assert result.name == "Unknown Artist"
+        assert result.profile is None
+        assert result.image_url is None
+        assert result.name_variations == []
+        assert result.aliases == []
+        assert result.members == []
+        assert result.urls == []
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_failure(self, service):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=None
+        ):
+            result = await service.get_artist_details(77)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cache_hit(self, service_with_cache):
+        from discogs.models import ArtistDetails
+
+        cached_details = ArtistDetails(
+            artist_id=77, name="Autechre", cached=True
+        )
+        service_with_cache.cache_service.get_artist_details = AsyncMock(
+            return_value=cached_details
+        )
+
+        result = await service_with_cache.get_artist_details(77)
+        assert result is not None
+        assert result.artist_id == 77
+        assert result.cached is True
+
+    @pytest.mark.asyncio
+    async def test_writes_back_to_cache(self, service_with_cache):
+        service_with_cache.cache_service.get_artist_details = AsyncMock(return_value=None)
+        service_with_cache.cache_service.write_artist_details = AsyncMock()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "id": 77,
+            "name": "Autechre",
+            "images": [],
+        }
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ):
+            await service_with_cache.get_artist_details(77)
+
+        service_with_cache.cache_service.write_artist_details.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# get_artist_image delegates to get_artist_details
+# ---------------------------------------------------------------------------
+
+
+class TestGetArtistImageDelegation:
+    @pytest.mark.asyncio
+    async def test_delegates_to_get_artist_details(self, service):
+        from discogs.models import ArtistDetails
+
+        details = ArtistDetails(
+            artist_id=77,
+            name="Autechre",
+            image_url="https://i.discogs.com/autechre.jpg",
+        )
+        with patch.object(
+            service, "get_artist_details", new_callable=AsyncMock, return_value=details
+        ):
+            result = await service.get_artist_image(77)
+
+        assert result == "https://i.discogs.com/autechre.jpg"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_details(self, service):
+        with patch.object(
+            service, "get_artist_details", new_callable=AsyncMock, return_value=None
+        ):
+            result = await service.get_artist_image(77)
+
+        assert result is None
