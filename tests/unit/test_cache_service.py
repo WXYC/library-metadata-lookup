@@ -280,9 +280,7 @@ class TestWriteRelease:
 
         # Should use executemany for artist inserts (3 total: 2 main + 1 extra)
         executemany_calls = conn.executemany.call_args_list
-        artist_inserts = [
-            c for c in executemany_calls if "release_artist" in c[0][0]
-        ]
+        artist_inserts = [c for c in executemany_calls if "release_artist" in c[0][0]]
         assert len(artist_inserts) >= 1
         # The data should contain all 3 artists
         artist_data = artist_inserts[0][0][1]
@@ -464,8 +462,11 @@ class TestValidateTrackOnRelease:
     async def test_found(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetchrow = AsyncMock(
             return_value={
-                "id": 1, "title": "Album", "release_year": 2020,
-                "artwork_url": None, "released": None,
+                "id": 1,
+                "title": "Album",
+                "release_year": 2020,
+                "artwork_url": None,
+                "released": None,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -483,8 +484,11 @@ class TestValidateTrackOnRelease:
     async def test_not_found(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetchrow = AsyncMock(
             return_value={
-                "id": 1, "title": "Album", "release_year": 2020,
-                "artwork_url": None, "released": None,
+                "id": 1,
+                "title": "Album",
+                "release_year": 2020,
+                "artwork_url": None,
+                "released": None,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(

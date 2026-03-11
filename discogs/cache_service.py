@@ -291,9 +291,7 @@ class DiscogsCacheService:
                 # Main artists (extra=0)
                 if release.artists:
                     for a in release.artists:
-                        artist_data.append(
-                            (release.release_id, a.artist_id, a.name, 0, a.role)
-                        )
+                        artist_data.append((release.release_id, a.artist_id, a.name, 0, a.role))
                 elif release.artist:
                     # Backward compat: fall back to scalar artist
                     artist_data.append(
@@ -301,9 +299,7 @@ class DiscogsCacheService:
                     )
                 # Extra artists (extra=1)
                 for a in release.extra_artists:
-                    artist_data.append(
-                        (release.release_id, a.artist_id, a.name, 1, a.role)
-                    )
+                    artist_data.append((release.release_id, a.artist_id, a.name, 1, a.role))
 
                 if artist_data:
                     await conn.executemany(
@@ -611,10 +607,7 @@ class DiscogsCacheService:
                         INSERT INTO artist_member (artist_id, member_id, member_name, active)
                         VALUES ($1, $2, $3, $4)
                         """,
-                        [
-                            (details.artist_id, m.id, m.name, m.active)
-                            for m in details.members
-                        ],
+                        [(details.artist_id, m.id, m.name, m.active) for m in details.members],
                     )
 
                 await conn.execute(
