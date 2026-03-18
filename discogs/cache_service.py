@@ -9,6 +9,7 @@ It implements a hybrid cache strategy:
 The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 """
 
+import asyncio
 import logging
 
 from discogs.models import (
@@ -146,15 +147,39 @@ class DiscogsCacheService:
             if release_row is None:
                 return None
 
-            # Read all artists (main + extra) with enriched columns
-            artist_rows = await self.pool.fetch(
-                """
-                SELECT artist_id, artist_name, extra, role
-                FROM release_artist
-                WHERE release_id = $1
-                ORDER BY extra, artist_name
-                """,
-                release_id,
+            # Fetch all child tables in parallel (independent queries)
+            artist_rows, label_rows, track_rows, track_artist_rows = await asyncio.gather(
+                self.pool.fetch(
+                    """
+                    SELECT artist_id, artist_name, extra, role
+                    FROM release_artist
+                    WHERE release_id = $1
+                    ORDER BY extra, artist_name
+                    """,
+                    release_id,
+                ),
+                self.pool.fetch(
+                    "SELECT label_id, label_name, catno FROM release_label WHERE release_id = $1",
+                    release_id,
+                ),
+                self.pool.fetch(
+                    """
+                    SELECT position, title, duration, sequence
+                    FROM release_track
+                    WHERE release_id = $1
+                    ORDER BY sequence
+                    """,
+                    release_id,
+                ),
+                self.pool.fetch(
+                    """
+                    SELECT track_sequence, artist_name
+                    FROM release_track_artist
+                    WHERE release_id = $1
+                    ORDER BY track_sequence
+                    """,
+                    release_id,
+                ),
             )
 
             primary_artist = ""
@@ -175,11 +200,6 @@ class DiscogsCacheService:
                 else:
                     extra_artist_credits.append(credit)
 
-            # Read labels
-            label_rows = await self.pool.fetch(
-                "SELECT label_id, label_name, catno FROM release_label WHERE release_id = $1",
-                release_id,
-            )
             label_credits = [
                 LabelCredit(
                     label_id=row["label_id"],
@@ -190,26 +210,6 @@ class DiscogsCacheService:
             ]
             primary_label = label_credits[0].name if label_credits else None
             primary_label_id = label_credits[0].label_id if label_credits else None
-
-            track_rows = await self.pool.fetch(
-                """
-                SELECT position, title, duration, sequence
-                FROM release_track
-                WHERE release_id = $1
-                ORDER BY sequence
-                """,
-                release_id,
-            )
-
-            track_artist_rows = await self.pool.fetch(
-                """
-                SELECT track_sequence, artist_name
-                FROM release_track_artist
-                WHERE release_id = $1
-                ORDER BY track_sequence
-                """,
-                release_id,
-            )
 
             track_artists: dict[int, list[str]] = {}
             for row in track_artist_rows:
@@ -502,21 +502,24 @@ class DiscogsCacheService:
             if artist_row is None:
                 return None
 
-            alias_rows = await self.pool.fetch(
-                "SELECT alias_id, alias_name FROM artist_alias WHERE artist_id = $1",
-                artist_id,
-            )
-            nv_rows = await self.pool.fetch(
-                "SELECT name FROM artist_name_variation WHERE artist_id = $1",
-                artist_id,
-            )
-            member_rows = await self.pool.fetch(
-                "SELECT member_id, member_name, active FROM artist_member WHERE artist_id = $1",
-                artist_id,
-            )
-            url_rows = await self.pool.fetch(
-                "SELECT url FROM artist_url WHERE artist_id = $1",
-                artist_id,
+            # Fetch all child tables in parallel (independent queries)
+            alias_rows, nv_rows, member_rows, url_rows = await asyncio.gather(
+                self.pool.fetch(
+                    "SELECT alias_id, alias_name FROM artist_alias WHERE artist_id = $1",
+                    artist_id,
+                ),
+                self.pool.fetch(
+                    "SELECT name FROM artist_name_variation WHERE artist_id = $1",
+                    artist_id,
+                ),
+                self.pool.fetch(
+                    "SELECT member_id, member_name, active FROM artist_member WHERE artist_id = $1",
+                    artist_id,
+                ),
+                self.pool.fetch(
+                    "SELECT url FROM artist_url WHERE artist_id = $1",
+                    artist_id,
+                ),
             )
 
             return ArtistDetails(
