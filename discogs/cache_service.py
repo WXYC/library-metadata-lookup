@@ -699,30 +699,18 @@ class DiscogsCacheService:
                 artists_for_track = track_artists.get(seq, [])
                 if artists_for_track:
                     for track_artist in artists_for_track:
-                        track_artist_lower = (
-                            track_artist.lower().replace('"', "").replace("'", "")
-                        )
+                        track_artist_lower = track_artist.lower().replace('"', "").replace("'", "")
                         track_artist_lower = track_artist_lower.split("(")[0].strip()
-                        if (
-                            artist_lower in track_artist_lower
-                            or track_artist_lower in artist_lower
-                        ):
+                        if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
                             return True
                 else:
-                    release_artist_clean = (
-                        primary_artist.lower().replace('"', "").replace("'", "")
-                    )
+                    release_artist_clean = primary_artist.lower().replace('"', "").replace("'", "")
                     release_artist_clean = release_artist_clean.split("(")[0].strip()
-                    if (
-                        artist_lower in release_artist_clean
-                        or release_artist_clean in artist_lower
-                    ):
+                    if artist_lower in release_artist_clean or release_artist_clean in artist_lower:
                         return True
 
             return False
 
         except Exception as e:
             logger.error(f"Cache validate_track_on_release failed: {e}")
-            raise CacheUnavailableError(
-                f"Cache validate_track_on_release failed: {e}"
-            ) from e
+            raise CacheUnavailableError(f"Cache validate_track_on_release failed: {e}") from e

@@ -417,8 +417,7 @@ class TestSearchCompilationsForTrack:
         """Stops collecting once MAX_SEARCH_RESULTS reached."""
         db = AsyncMock()
         items_by_title = {
-            f"Comp {i}": _item(id=i, artist="Various Artists", title=f"Comp {i}")
-            for i in range(30)
+            f"Comp {i}": _item(id=i, artist="Various Artists", title=f"Comp {i}") for i in range(30)
         }
 
         # Route by query content: return the matching item for each "Comp N" query.

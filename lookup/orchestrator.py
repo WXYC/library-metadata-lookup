@@ -410,8 +410,10 @@ async def search_compilations_for_track(
             release_album = release_info.album
 
             album_clean = release_album.lower().replace('"', "").replace("'", "").strip()
-            artist_clean = parsed.artist.lower().replace('"', "").replace("'", "").strip()
-            if parsed.artist and album_clean == artist_clean:
+            if (
+                parsed.artist
+                and album_clean == parsed.artist.lower().replace('"', "").replace("'", "").strip()
+            ):
                 logger.debug(f"Skipping '{release_album}' - appears to be artist name, not album")
                 return []
 
@@ -468,9 +470,7 @@ async def search_compilations_for_track(
             )
             return [(match, release_album) for match in matches]
 
-        all_release_results = await asyncio.gather(
-            *[process_release(ri) for ri in raw_releases]
-        )
+        all_release_results = await asyncio.gather(*[process_release(ri) for ri in raw_releases])
 
         for release_matches in all_release_results:
             for match, discogs_album in release_matches:
