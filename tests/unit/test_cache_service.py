@@ -489,9 +489,7 @@ class TestValidateTrackOnRelease:
                 release_track=[{"sequence": 1, "title": "Song"}],
             )
         )
-        mock_asyncpg_pool.fetchrow = AsyncMock(
-            return_value={"artist_name": "Artist"}
-        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "Artist"})
         result = await cache_service.validate_track_on_release(1, "Song", "Artist")
         assert result is True
 
@@ -504,9 +502,7 @@ class TestValidateTrackOnRelease:
                 release_track=[{"sequence": 1, "title": "Other Song"}],
             )
         )
-        mock_asyncpg_pool.fetchrow = AsyncMock(
-            return_value={"artist_name": "Artist"}
-        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "Artist"})
         result = await cache_service.validate_track_on_release(1, "Missing Song", "Artist")
         assert result is False
 
