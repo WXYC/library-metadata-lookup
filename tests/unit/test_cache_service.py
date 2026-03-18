@@ -432,10 +432,10 @@ class TestSearchReleases:
         query_sql = mock_asyncpg_pool.fetch.call_args[0][0]
         # Normalize whitespace for reliable matching
         normalized = " ".join(query_sql.split())
-        assert "AND lower(ra.artist_name)" in normalized, (
+        assert "AND lower(f_unaccent(ra.artist_name))" in normalized, (
             f"Expected AND between title and artist_name conditions, got: {normalized}"
         )
-        assert "OR lower(ra.artist_name)" not in normalized, (
+        assert "OR lower(f_unaccent(ra.artist_name))" not in normalized, (
             f"Expected no OR between title and artist_name conditions, got: {normalized}"
         )
 
