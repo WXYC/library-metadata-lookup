@@ -16,6 +16,26 @@ from discogs.models import (
 )
 
 
+def make_fetch_router(**table_results):
+    """Create a mock side_effect that routes by table name in query.
+
+    With asyncio.gather, the consumption order of side_effect entries is
+    non-deterministic. This routes by matching table names in the SQL query.
+    More specific table names (e.g., release_track_artist) must be checked
+    before less specific ones (e.g., release_track).
+    """
+    # Sort keys longest-first so "release_track_artist" matches before "release_track"
+    sorted_tables = sorted(table_results.keys(), key=len, reverse=True)
+
+    async def route(query, *args):
+        for table_name in sorted_tables:
+            if table_name in query:
+                return table_results[table_name]
+        return []
+
+    return route
+
+
 @pytest.fixture
 def cache_service(mock_asyncpg_pool):
     return DiscogsCacheService(mock_asyncpg_pool)
@@ -135,16 +155,16 @@ class TestGetRelease:
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
-            side_effect=[
-                # artist_rows
-                [{"artist_id": None, "artist_name": "Queen", "extra": 0, "role": None}],
-                # label_rows
-                [],
-                # track_rows
-                [{"position": "1", "title": "Play the Game", "duration": "3:30", "sequence": 1}],
-                # track_artist_rows
-                [],
-            ]
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[
+                    {"position": "1", "title": "Play the Game", "duration": "3:30", "sequence": 1}
+                ],
+                release_artist=[
+                    {"artist_id": None, "artist_name": "Queen", "extra": 0, "role": None}
+                ],
+                release_label=[],
+            )
         )
 
         result = await cache_service.get_release(123)
@@ -166,12 +186,16 @@ class TestGetRelease:
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
-            side_effect=[
-                [{"artist_id": None, "artist_name": "Various Artists", "extra": 0, "role": None}],
-                [],  # label_rows
-                [{"position": "1", "title": "Track1", "duration": None, "sequence": 1}],
-                [{"track_sequence": 1, "artist_name": "Some Artist"}],
-            ]
+            side_effect=make_fetch_router(
+                release_track_artist=[{"track_sequence": 1, "artist_name": "Some Artist"}],
+                release_track=[
+                    {"position": "1", "title": "Track1", "duration": None, "sequence": 1}
+                ],
+                release_artist=[
+                    {"artist_id": None, "artist_name": "Various Artists", "extra": 0, "role": None}
+                ],
+                release_label=[],
+            )
         )
 
         result = await cache_service.get_release(1)
@@ -306,21 +330,19 @@ class TestGetReleaseEnriched:
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
-            side_effect=[
-                # artist_rows (main + extra)
-                [
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[
+                    {"position": "1", "title": "VI Scose Poise", "duration": "5:30", "sequence": 1}
+                ],
+                release_artist=[
                     {"artist_id": 77, "artist_name": "Autechre", "extra": 0, "role": None},
                     {"artist_id": 200, "artist_name": "Rob Brown", "extra": 1, "role": "Producer"},
                 ],
-                # label_rows
-                [
+                release_label=[
                     {"label_id": 233, "label_name": "Warp Records", "catno": "WAP 159 CD"},
                 ],
-                # track_rows
-                [{"position": "1", "title": "VI Scose Poise", "duration": "5:30", "sequence": 1}],
-                # track_artist_rows
-                [],
-            ]
+            )
         )
 
         result = await cache_service.get_release(28138)
@@ -470,12 +492,16 @@ class TestValidateTrackOnRelease:
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
-            side_effect=[
-                [{"artist_id": None, "artist_name": "Artist", "extra": 0, "role": None}],
-                [],  # label_rows
-                [{"position": "1", "title": "Song", "duration": None, "sequence": 1}],
-                [],
-            ]
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[
+                    {"position": "1", "title": "Song", "duration": None, "sequence": 1}
+                ],
+                release_artist=[
+                    {"artist_id": None, "artist_name": "Artist", "extra": 0, "role": None}
+                ],
+                release_label=[],
+            )
         )
         result = await cache_service.validate_track_on_release(1, "Song", "Artist")
         assert result is True
@@ -492,12 +518,16 @@ class TestValidateTrackOnRelease:
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
-            side_effect=[
-                [{"artist_id": None, "artist_name": "Artist", "extra": 0, "role": None}],
-                [],  # label_rows
-                [{"position": "1", "title": "Other Song", "duration": None, "sequence": 1}],
-                [],
-            ]
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[
+                    {"position": "1", "title": "Other Song", "duration": None, "sequence": 1}
+                ],
+                release_artist=[
+                    {"artist_id": None, "artist_name": "Artist", "extra": 0, "role": None}
+                ],
+                release_label=[],
+            )
         )
         result = await cache_service.validate_track_on_release(1, "Missing Song", "Artist")
         assert result is False
@@ -526,16 +556,12 @@ class TestGetArtistDetails:
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
-            side_effect=[
-                # aliases
-                [{"alias_id": 500, "alias_name": "Gescom"}],
-                # name_variations
-                [{"name": "Ae"}, {"name": "Autechre."}],
-                # members
-                [{"member_id": 200, "member_name": "Rob Brown", "active": True}],
-                # urls
-                [{"url": "https://autechre.ws"}],
-            ]
+            side_effect=make_fetch_router(
+                artist_alias=[{"alias_id": 500, "alias_name": "Gescom"}],
+                artist_name_variation=[{"name": "Ae"}, {"name": "Autechre."}],
+                artist_member=[{"member_id": 200, "member_name": "Rob Brown", "active": True}],
+                artist_url=[{"url": "https://autechre.ws"}],
+            )
         )
 
         result = await cache_service.get_artist_details(77)
