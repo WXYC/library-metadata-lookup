@@ -77,9 +77,9 @@ class DiscogsCacheService:
             query = """
                 WITH matching_tracks AS (
                     SELECT DISTINCT rt.release_id, rt.title as track_title,
-                           similarity(lower(rt.title), lower($1)) as sim
+                           similarity(lower(f_unaccent(rt.title)), lower(f_unaccent($1))) as sim
                     FROM release_track rt
-                    WHERE lower(rt.title) % lower($1)
+                    WHERE lower(f_unaccent(rt.title)) % lower(f_unaccent($1))
                     ORDER BY sim DESC
                     LIMIT $2
                 )
@@ -89,7 +89,7 @@ class DiscogsCacheService:
                 FROM matching_tracks mt
                 JOIN release r ON r.id = mt.release_id
                 JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
-                WHERE ($3::text IS NULL OR lower(ra.artist_name) % lower($3))
+                WHERE ($3::text IS NULL OR lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3)))
                 ORDER BY mt.sim DESC
             """
 
@@ -408,12 +408,12 @@ class DiscogsCacheService:
                 query = """
                     SELECT DISTINCT ON (r.id)
                         r.id as release_id, r.title, ra.artist_name, r.artwork_url,
-                        (similarity(lower(r.title), lower($1))
-                         + similarity(lower(ra.artist_name), lower($2))) / 2.0 as score
+                        (similarity(lower(f_unaccent(r.title)), lower(f_unaccent($1)))
+                         + similarity(lower(f_unaccent(ra.artist_name)), lower(f_unaccent($2)))) / 2.0 as score
                     FROM release r
                     JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
-                    WHERE lower(r.title) % lower($1)
-                      AND lower(ra.artist_name) % lower($2)
+                    WHERE lower(f_unaccent(r.title)) % lower(f_unaccent($1))
+                      AND lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($2))
                     ORDER BY r.id, score DESC
                 """
                 query = f"""
@@ -426,10 +426,10 @@ class DiscogsCacheService:
                 query = """
                     SELECT DISTINCT ON (r.id)
                         r.id as release_id, r.title, ra.artist_name, r.artwork_url,
-                        similarity(lower(ra.artist_name), lower($1)) as score
+                        similarity(lower(f_unaccent(ra.artist_name)), lower(f_unaccent($1))) as score
                     FROM release r
                     JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
-                    WHERE lower(ra.artist_name) % lower($1)
+                    WHERE lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($1))
                     ORDER BY r.id, score DESC
                 """
                 query = f"""
@@ -442,10 +442,10 @@ class DiscogsCacheService:
                 query = """
                     SELECT DISTINCT ON (r.id)
                         r.id as release_id, r.title, ra.artist_name, r.artwork_url,
-                        similarity(lower(r.title), lower($1)) as score
+                        similarity(lower(f_unaccent(r.title)), lower(f_unaccent($1))) as score
                     FROM release r
                     JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
-                    WHERE lower(r.title) % lower($1)
+                    WHERE lower(f_unaccent(r.title)) % lower(f_unaccent($1))
                     ORDER BY r.id, score DESC
                 """
                 query = f"""
