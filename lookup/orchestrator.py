@@ -403,17 +403,20 @@ async def search_compilations_for_track(
         logger.info(f"Found {len(raw_releases)} releases with '{song_search}' on Discogs")
         discogs_found_releases = len(raw_releases) > 0
 
-        for release_info in raw_releases:
+        async def process_release(
+            release_info: ReleaseInfo,
+        ) -> list[tuple[LibraryItem, str]]:
+            """Process one Discogs release: library search, filter, validate."""
             release_album = release_info.album
 
             album_clean = release_album.lower().replace('"', "").replace("'", "").strip()
             artist_clean = parsed.artist.lower().replace('"', "").replace("'", "").strip()
             if parsed.artist and album_clean == artist_clean:
                 logger.debug(f"Skipping '{release_album}' - appears to be artist name, not album")
-                continue
+                return []
 
             if len(release_album.strip()) < 3:
-                continue
+                return []
 
             matches = await search_album_fuzzy(db, release_album)
 
@@ -433,8 +436,6 @@ async def search_compilations_for_track(
                     if artist_matches_item(match, parsed.artist):
                         filtered_matches.append(match)
                     elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
-                        # Verify title similarity to reject false positives
-                        # (e.g., "Chicago Trax" matching "House Sound of London")
                         title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
                         if title_score >= 80:
                             filtered_matches.append(match)
@@ -446,7 +447,7 @@ async def search_compilations_for_track(
                 matches = filtered_matches
 
             if not matches:
-                continue
+                return []
 
             # Validate that the track actually exists on this release.
             # Deferred until after library matching so we only validate
@@ -459,20 +460,26 @@ async def search_compilations_for_track(
                     logger.info(
                         f"Skipping '{release_album}' - track/artist not validated on release"
                     )
-                    continue
+                    return []
 
             logger.info(
                 f"Found '{parsed.song}' in library on '{matches[0].title}' "
                 f"(matched from Discogs: '{release_album}')"
             )
-            for match in matches:
+            return [(match, release_album) for match in matches]
+
+        all_release_results = await asyncio.gather(
+            *[process_release(ri) for ri in raw_releases]
+        )
+
+        for release_matches in all_release_results:
+            for match, discogs_album in release_matches:
                 if match.id not in seen_ids:
                     results.append(match)
                     seen_ids.add(match.id)
-                    discogs_titles[match.id] = release_album
-
-                if len(results) >= MAX_SEARCH_RESULTS:
-                    break
+                    discogs_titles[match.id] = discogs_album
+            if len(results) >= MAX_SEARCH_RESULTS:
+                break
     except Exception as e:
         logger.warning(f"Failed to search for track on other releases: {e}")
 
