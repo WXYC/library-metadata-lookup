@@ -637,6 +637,11 @@ class DiscogsCacheService:
     ) -> bool | None:
         """Validate that a track by an artist exists on a release.
 
+        Uses lightweight queries instead of fetching the full release metadata.
+        Only retrieves tracks, track artists, and the primary release artist —
+        skipping labels, extra artists, and release metadata that validation
+        doesn't need.
+
         Args:
             release_id: Discogs release ID
             track: Track title to find
@@ -648,29 +653,76 @@ class DiscogsCacheService:
         Raises:
             CacheUnavailableError: If database is unreachable
         """
-        release = await self.get_release(release_id)
-        if release is None:
-            return None  # Cache miss - caller should try API
+        try:
+            exists = await self.pool.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM release WHERE id = $1)", release_id
+            )
+            if not exists:
+                return None  # Cache miss - caller should try API
 
-        track_lower = track.lower()
-        artist_lower = artist.lower().replace('"', "").replace("'", "")
+            # Fetch only what validation needs (tracks + track artists + primary artist)
+            track_rows, track_artist_rows, release_artist_row = await asyncio.gather(
+                self.pool.fetch(
+                    "SELECT sequence, title FROM release_track WHERE release_id = $1",
+                    release_id,
+                ),
+                self.pool.fetch(
+                    "SELECT track_sequence, artist_name FROM release_track_artist WHERE release_id = $1",
+                    release_id,
+                ),
+                self.pool.fetchrow(
+                    "SELECT artist_name FROM release_artist WHERE release_id = $1 AND extra = 0 LIMIT 1",
+                    release_id,
+                ),
+            )
 
-        for item in release.tracklist:
-            item_title = item.title.lower()
+            # Build track_artists lookup
+            track_artists: dict[int, list[str]] = {}
+            for row in track_artist_rows:
+                seq = row["track_sequence"]
+                if seq not in track_artists:
+                    track_artists[seq] = []
+                track_artists[seq].append(row["artist_name"])
 
-            if track_lower not in item_title and item_title not in track_lower:
-                continue
+            primary_artist = release_artist_row["artist_name"] if release_artist_row else ""
 
-            if item.artists:
-                for track_artist in item.artists:
-                    track_artist_lower = track_artist.lower().replace('"', "").replace("'", "")
-                    track_artist_lower = track_artist_lower.split("(")[0].strip()
-                    if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
+            track_lower = track.lower()
+            artist_lower = artist.lower().replace('"', "").replace("'", "")
+
+            for row in track_rows:
+                item_title = row["title"].lower()
+
+                if track_lower not in item_title and item_title not in track_lower:
+                    continue
+
+                seq = row["sequence"]
+                artists_for_track = track_artists.get(seq, [])
+                if artists_for_track:
+                    for track_artist in artists_for_track:
+                        track_artist_lower = (
+                            track_artist.lower().replace('"', "").replace("'", "")
+                        )
+                        track_artist_lower = track_artist_lower.split("(")[0].strip()
+                        if (
+                            artist_lower in track_artist_lower
+                            or track_artist_lower in artist_lower
+                        ):
+                            return True
+                else:
+                    release_artist_clean = (
+                        primary_artist.lower().replace('"', "").replace("'", "")
+                    )
+                    release_artist_clean = release_artist_clean.split("(")[0].strip()
+                    if (
+                        artist_lower in release_artist_clean
+                        or release_artist_clean in artist_lower
+                    ):
                         return True
-            else:
-                release_artist = release.artist.lower().replace('"', "").replace("'", "")
-                release_artist = release_artist.split("(")[0].strip()
-                if artist_lower in release_artist or release_artist in artist_lower:
-                    return True
 
-        return False
+            return False
+
+        except Exception as e:
+            logger.error(f"Cache validate_track_on_release failed: {e}")
+            raise CacheUnavailableError(
+                f"Cache validate_track_on_release failed: {e}"
+            ) from e
