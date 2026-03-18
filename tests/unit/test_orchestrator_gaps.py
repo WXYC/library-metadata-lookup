@@ -416,10 +416,27 @@ class TestSearchCompilationsForTrack:
     async def test_max_results_break(self):
         """Stops collecting once MAX_SEARCH_RESULTS reached."""
         db = AsyncMock()
-        items = [_item(id=i, artist="Various Artists", title=f"Comp {i}") for i in range(30)]
+        items_by_title = {
+            f"Comp {i}": _item(id=i, artist="Various Artists", title=f"Comp {i}")
+            for i in range(30)
+        }
 
-        # keyword: no results; each album search returns items
-        db.search = AsyncMock(side_effect=[[]] + [[item] for item in items])
+        # Route by query content: return the matching item for each "Comp N" query.
+        # With asyncio.gather, album searches run concurrently so we can't
+        # rely on sequential side_effect ordering.
+        _keyword_search_done = False
+
+        async def route_search(query, **kwargs):
+            nonlocal _keyword_search_done
+            if not _keyword_search_done:
+                _keyword_search_done = True
+                return []
+            for title, item in items_by_title.items():
+                if title.lower() in query.lower():
+                    return [item]
+            return []
+
+        db.search = AsyncMock(side_effect=route_search)
 
         releases = [("Various Artists", f"Comp {i}") for i in range(30)]
 
@@ -584,18 +601,21 @@ class TestSearchCompilationsForTrack:
             title="Trax Records 20th Anniversary Collection",
         )
 
-        # First call: keyword search (no results)
-        # Then album searches: only "Trax Records 20th Anniversary Collection" matches
-        db.search = AsyncMock(
-            side_effect=[
-                [],  # keyword search
-                [comp],  # "Trax Records..." matches library
-                [],  # "Album 2" not in library
-                [],  # "Album 3" not in library
-                [],  # "Album 4" not in library
-                [],  # "Album 5" not in library
-            ]
-        )
+        # Route by query content: only "Trax Records" matches the library.
+        # With asyncio.gather, album searches run concurrently so we can't
+        # rely on sequential side_effect ordering.
+        _keyword_search_done = False
+
+        async def route_search(query, **kwargs):
+            nonlocal _keyword_search_done
+            if not _keyword_search_done:
+                _keyword_search_done = True
+                return []
+            if "trax" in query.lower():
+                return [comp]
+            return []
+
+        db.search = AsyncMock(side_effect=route_search)
 
         mock_discogs = AsyncMock()
         from discogs.models import ReleaseInfo, TrackReleasesResponse
