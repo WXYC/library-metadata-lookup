@@ -141,8 +141,18 @@ class FlowsheetCreateSongFreeform(BaseModel):
     label_id: int | None = None
 
 
+class EntryType(StrEnum):
+    talkset = "talkset"
+    breakpoint = "breakpoint"
+    message = "message"
+
+
 class FlowsheetCreateMessage(BaseModel):
     message: str
+    entry_type: EntryType | None = Field(
+        None,
+        description="Explicit entry type. If omitted, the backend infers from message content.",
+    )
 
 
 class FlowsheetUpdateRequest(BaseModel):
@@ -218,7 +228,7 @@ class FlowsheetV2Base(BaseModel):
     add_time: AwareDatetime
 
 
-class EntryType(StrEnum):
+class EntryType1(StrEnum):
     track = "track"
 
 
@@ -244,7 +254,7 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
     artist_wikipedia_url: str | None = None
 
 
-class EntryType1(StrEnum):
+class EntryType2(StrEnum):
     show_start = "show_start"
 
 
@@ -254,7 +264,7 @@ class FlowsheetV2ShowStartEntry(FlowsheetV2Base):
     timestamp: AwareDatetime
 
 
-class EntryType2(StrEnum):
+class EntryType3(StrEnum):
     show_end = "show_end"
 
 
@@ -264,7 +274,7 @@ class FlowsheetV2ShowEndEntry(FlowsheetV2Base):
     timestamp: AwareDatetime
 
 
-class EntryType3(StrEnum):
+class EntryType4(StrEnum):
     dj_join = "dj_join"
 
 
@@ -273,7 +283,7 @@ class FlowsheetV2DJJoinEntry(FlowsheetV2Base):
     dj_name: str
 
 
-class EntryType4(StrEnum):
+class EntryType5(StrEnum):
     dj_leave = "dj_leave"
 
 
@@ -282,7 +292,7 @@ class FlowsheetV2DJLeaveEntry(FlowsheetV2Base):
     dj_name: str
 
 
-class EntryType5(StrEnum):
+class EntryType6(StrEnum):
     talkset = "talkset"
 
 
@@ -291,7 +301,7 @@ class FlowsheetV2TalksetEntry(FlowsheetV2Base):
     message: str
 
 
-class EntryType6(StrEnum):
+class EntryType7(StrEnum):
     breakpoint = "breakpoint"
 
 
@@ -300,7 +310,7 @@ class FlowsheetV2BreakpointEntry(FlowsheetV2Base):
     message: str | None = None
 
 
-class EntryType7(StrEnum):
+class EntryType8(StrEnum):
     message = "message"
 
 
@@ -470,7 +480,7 @@ class OrderDirection(StrEnum):
 
 class CatalogSearchParams(BaseModel):
     artist_name: str | None = None
-    album_name: str | None = None
+    album_title: str | None = None
     n: int | None = Field(None, description="Maximum number of results")
     orderBy: str | None = None
     orderDirection: OrderDirection | None = None
