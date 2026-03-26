@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from config.settings import get_settings
-from core.matching import calculate_confidence, is_compilation_artist
+from core.matching import calculate_confidence, is_compilation_artist, normalize_for_comparison
 from core.telemetry import (
     record_api_time,
     record_discogs_api_call,
@@ -828,14 +828,14 @@ class DiscogsService:
         if release is None:
             return False
 
-        track_lower = track.lower()
+        track_lower = normalize_for_comparison(track)
         # Strip quotes from artist name — Discogs uses quotes for nicknames
         # (e.g. '"Weird Al" Yankovic') which breaks substring matching against
         # the user-supplied form ('Weird Al Yankovic').
         artist_lower = artist.lower().replace('"', "").replace("'", "")
 
         for item in release.tracklist:
-            item_title = item.title.lower()
+            item_title = normalize_for_comparison(item.title)
             # Check if track title matches
             if track_lower not in item_title and item_title not in track_lower:
                 continue
