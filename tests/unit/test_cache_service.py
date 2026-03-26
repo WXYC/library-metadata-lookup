@@ -124,6 +124,62 @@ class TestSearchReleasesByTrack:
         assert len(results) == 3
 
     @pytest.mark.asyncio
+    async def test_returns_va_compilation_via_track_artist(self, cache_service, mock_asyncpg_pool):
+        """VA compilation is returned when the track-level artist matches."""
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[
+                {
+                    "release_id": 99,
+                    "title": "Nao Wave- Brazilian Punk 82-88",
+                    "artist_name": "Various Artists",
+                    "track_title": "Ciencias Sensuais",
+                    "is_compilation": True,
+                }
+            ]
+        )
+
+        results = await cache_service.search_releases_by_track("Ciencias Sensuais", "Azul 29")
+        assert len(results) == 1
+        assert results[0].album == "Nao Wave- Brazilian Punk 82-88"
+        assert results[0].is_compilation is True
+
+    @pytest.mark.asyncio
+    async def test_query_includes_track_artist_join(self, cache_service, mock_asyncpg_pool):
+        """SQL query joins release_track_artist for track-level artist matching."""
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+
+        await cache_service.search_releases_by_track("Song", "Artist")
+
+        sql = mock_asyncpg_pool.fetch.call_args[0][0]
+        assert "release_track_artist" in sql
+        assert "rta.artist_name" in sql
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_multiple_track_artists(self, cache_service, mock_asyncpg_pool):
+        """Multiple rows from LEFT JOIN (different track artists) are deduplicated."""
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[
+                {
+                    "release_id": 99,
+                    "title": "Compilation",
+                    "artist_name": "Various Artists",
+                    "track_title": "Track",
+                    "is_compilation": True,
+                },
+                {
+                    "release_id": 99,
+                    "title": "Compilation",
+                    "artist_name": "Various Artists",
+                    "track_title": "Track",
+                    "is_compilation": True,
+                },
+            ]
+        )
+
+        results = await cache_service.search_releases_by_track("Track", "Artist A")
+        assert len(results) == 1
+
+    @pytest.mark.asyncio
     async def test_error_raises_cache_unavailable(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetch = AsyncMock(side_effect=Exception("db error"))
 
