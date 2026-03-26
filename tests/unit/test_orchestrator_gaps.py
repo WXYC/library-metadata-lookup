@@ -788,9 +788,7 @@ class TestSearchAlbumFuzzy:
         # Call 4: 2-word fuzzy "wave brazilian" -> finds item
         db.search = AsyncMock(side_effect=[[], [], [], [item]])
 
-        results = await search_album_fuzzy(
-            db, "Não Wave - Brazilian Post Punk 1982 - 1988"
-        )
+        results = await search_album_fuzzy(db, "Não Wave - Brazilian Post Punk 1982 - 1988")
         assert len(results) == 1
         assert results[0].id == 57500
 
