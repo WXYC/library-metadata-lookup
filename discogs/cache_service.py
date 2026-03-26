@@ -12,6 +12,7 @@ The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 import asyncio
 import logging
 
+from core.matching import normalize_for_comparison
 from discogs.models import (
     ArtistCredit,
     ArtistDetails,
@@ -694,11 +695,11 @@ class DiscogsCacheService:
 
             primary_artist = release_artist_row["artist_name"] if release_artist_row else ""
 
-            track_lower = track.lower()
+            track_lower = normalize_for_comparison(track)
             artist_lower = artist.lower().replace('"', "").replace("'", "")
 
             for row in track_rows:
-                item_title = row["title"].lower()
+                item_title = normalize_for_comparison(row["title"])
 
                 if track_lower not in item_title and item_title not in track_lower:
                     continue

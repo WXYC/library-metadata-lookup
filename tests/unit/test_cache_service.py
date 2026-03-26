@@ -563,6 +563,20 @@ class TestValidateTrackOnRelease:
         assert result is False
 
     @pytest.mark.asyncio
+    async def test_diacritics_in_track_title(self, cache_service, mock_asyncpg_pool):
+        """Track title with diacritics should match the unaccented search query."""
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=True)
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[{"track_sequence": 1, "artist_name": "Azul 29"}],
+                release_track=[{"sequence": 1, "title": "Ciências Sensuais"}],
+            )
+        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "Various Artists"})
+        result = await cache_service.validate_track_on_release(1, "Ciencias Sensuais", "Azul 29")
+        assert result is True
+
+    @pytest.mark.asyncio
     async def test_error_raises(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetchval = AsyncMock(side_effect=Exception("db error"))
         with pytest.raises(CacheUnavailableError):

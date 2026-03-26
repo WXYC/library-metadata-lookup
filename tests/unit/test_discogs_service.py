@@ -706,6 +706,29 @@ class TestValidateTrackOnRelease:
         assert result is True
 
     @pytest.mark.asyncio
+    async def test_diacritics_in_track_title(self, service):
+        """Track title with diacritics should match the unaccented search query.
+
+        Discogs stores "Ciências Sensuais" but the user searches for "Ciencias Sensuais".
+        """
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Compilation",
+            artist="Various Artists",
+            release_url="https://discogs.com/release/1",
+            tracklist=[
+                TrackItem(
+                    position="5",
+                    title="Ciências Sensuais",
+                    artists=["Azul 29"],
+                ),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(1, "Ciencias Sensuais", "Azul 29")
+        assert result is True
+
+    @pytest.mark.asyncio
     async def test_cache_validated(self, service_with_cache):
         service_with_cache.cache_service.validate_track_on_release = AsyncMock(return_value=True)
 
