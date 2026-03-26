@@ -838,16 +838,32 @@ async def perform_lookup(
             telemetry.record_api_call("discogs")
 
     # Step 3b: Validate results against Discogs track data.
-    # Skip when results come from compilation search — those were already
-    # validated by search_compilations_for_track (deferred validation).
-    if library_results and parsed.song and parsed.artist and not found_on_compilation:
-        with telemetry.track_step("track_validation"):
-            validated = await filter_results_by_track_validation(
-                library_results, parsed.song, parsed.artist, discogs_service
-            )
-            if validated:
-                library_results = validated
-                song_not_found = False
+    if library_results and parsed.song and parsed.artist:
+        if not found_on_compilation:
+            # Normal case: validate all results against Discogs tracklists
+            with telemetry.track_step("track_validation"):
+                validated = await filter_results_by_track_validation(
+                    library_results, parsed.song, parsed.artist, discogs_service
+                )
+                if validated:
+                    library_results = validated
+                    song_not_found = False
+        elif search_state.artist_fallback_results:
+            # Compilation found, but the artist's own album may also contain the track.
+            # Validate the artist fallback results (saved before compilation search
+            # replaced them) and prepend any confirmed matches.
+            with telemetry.track_step("track_validation"):
+                validated = await filter_results_by_track_validation(
+                    search_state.artist_fallback_results,
+                    parsed.song,
+                    parsed.artist,
+                    discogs_service,
+                )
+                if validated:
+                    compilation_ids = {r.id for r in library_results}
+                    merged = [r for r in validated if r.id not in compilation_ids]
+                    merged.extend(library_results)
+                    library_results = merged
 
     # Step 4: Fetch artwork
     with telemetry.track_step("artwork_fetch"):

@@ -742,10 +742,13 @@ class TestPerformLookupCompilations:
             )
 
         assert response.found_on_compilation is True
-        # discogs_service.search should only be called for artwork fetch,
-        # NOT for track validation. With 1 result, artwork fetch calls search once.
-        # If track validation also ran, search would be called 2+ times.
-        assert mock_discogs_service.search.call_count <= 1
+        # Compilation results should NOT be re-validated (already validated in
+        # search_compilations_for_track). search calls come from:
+        # 1. Artist fallback validation: 1 call (for fallback_item → no Discogs match)
+        # 2. Artwork fetch: 1 call (for compilation_item)
+        # Without the artist fallback validation this would be 1 call.
+        # If compilation results were ALSO re-validated, count would be 3+.
+        assert mock_discogs_service.search.call_count <= 2
 
 
 # ---------------------------------------------------------------------------
@@ -825,3 +828,138 @@ class TestPerformLookupAmbiguousFormat:
 
         assert len(response.results) >= 1
         assert response.search_type == "alternative"
+
+
+# ---------------------------------------------------------------------------
+# Tests: perform_lookup - track on artist album + compilation
+# ---------------------------------------------------------------------------
+
+
+class TestArtistAlbumPlusCompilation:
+    """Test that tracks found on both an artist album and a compilation return both results.
+
+    Bug: "Poison Dart" by "The Bug" is on London Zoo (artist album, library ID 54324)
+    AND The Sound of Dub (VA compilation, library ID 47808). The pipeline should
+    return both, but currently only returns the compilation because TRACK_ON_COMPILATION
+    replaces artist fallback results and track validation is skipped.
+    """
+
+    @pytest.mark.asyncio
+    async def test_artist_album_included_when_compilation_also_found(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Both London Zoo (artist album) and The Sound of Dub (compilation) should be returned.
+
+        Scenario:
+        1. resolve_albums_for_track returns nothing (Discogs track lookup fails/empty)
+        2. ARTIST_PLUS_ALBUM: artist+song empty, falls back to artist-only → Bug albums
+        3. TRACK_ON_COMPILATION: finds The Sound of Dub (compilation)
+        4. Track validation should confirm London Zoo contains "Poison Dart"
+        5. Both London Zoo and The Sound of Dub should appear in results
+        """
+        from discogs.models import ReleaseInfo, TrackReleasesResponse
+
+        london_zoo = make_library_item(
+            id=54324,
+            artist="The Bug",
+            title="London Zoo",
+            call_letters="B",
+            genre="Electronic",
+        )
+        pressure = make_library_item(
+            id=54325,
+            artist="The Bug",
+            title="Pressure",
+            call_letters="B",
+            genre="Electronic",
+            release_call_number=2,
+        )
+        sound_of_dub = make_library_item(
+            id=47808,
+            artist="various",
+            title="The Sound of Dub",
+            call_letters="V",
+            genre="Reggae",
+        )
+
+        mock_library_db.find_similar_artist.return_value = None
+
+        # db.search call order:
+        # 1. search_library_with_fallback: artist+song "The Bug Poison Dart" → []
+        # 2. search_library_with_fallback: artist only "The Bug" → [london_zoo, pressure]
+        # 3. search_compilations_for_track: keyword "poison dart" → []
+        # 4. search_album_fuzzy: "The Sound of Dub" → [sound_of_dub]
+        mock_library_db.search.side_effect = [
+            [],  # artist + song
+            [london_zoo, pressure],  # artist only fallback
+            [],  # keyword search (no library match for "poison dart")
+            [sound_of_dub],  # search_album_fuzzy for Discogs album title
+        ]
+
+        # Discogs: search_releases_by_track finds The Sound of Dub (compilation)
+        mock_discogs_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Poison Dart",
+                artist="The Bug",
+                releases=[
+                    ReleaseInfo(
+                        album="The Sound of Dub",
+                        artist="Various Artists",
+                        release_id=2308471,
+                        release_url="https://www.discogs.com/release/2308471",
+                        is_compilation=True,
+                    ),
+                ],
+                total=1,
+                cached=False,
+            )
+        )
+
+        # Track validation: "Poison Dart" IS on London Zoo, NOT on Pressure
+        london_zoo_discogs = make_discogs_result(
+            release_id=1395903, album="London Zoo", artist="The Bug"
+        )
+        pressure_discogs = make_discogs_result(release_id=9999, album="Pressure", artist="The Bug")
+
+        async def mock_discogs_search(request):
+            album = request.album if hasattr(request, "album") else ""
+            if album and "london" in album.lower():
+                return DiscogsSearchResponse(results=[london_zoo_discogs])
+            if album and "pressure" in album.lower():
+                return DiscogsSearchResponse(results=[pressure_discogs])
+            return DiscogsSearchResponse(results=[])
+
+        mock_discogs_service.search = AsyncMock(side_effect=mock_discogs_search)
+
+        async def mock_validate(release_id, track, artist):
+            # Poison Dart is on London Zoo (1395903) and The Sound of Dub (2308471)
+            return release_id in (1395903, 2308471)
+
+        mock_discogs_service.validate_track_on_release = AsyncMock(side_effect=mock_validate)
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="The Bug",
+            song="Poison Dart",
+            raw_message="poison dart, the bug",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],  # Discogs track lookup returns nothing
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        titles = [r.library_item.title for r in response.results]
+        assert "London Zoo" in titles, (
+            f"Artist album 'London Zoo' should be in results, got: {titles}"
+        )
+        assert "The Sound of Dub" in titles, (
+            f"Compilation 'The Sound of Dub' should be in results, got: {titles}"
+        )
+        assert response.found_on_compilation is True
+        # Artist's own album should come first
+        assert titles.index("London Zoo") < titles.index("The Sound of Dub")
