@@ -68,6 +68,15 @@ class SearchState:
     albums_for_search: list[str] = field(default_factory=list)
     """Album names resolved from Discogs track lookup (may contain multiple)."""
 
+    artist_fallback_results: list[LibraryItem] = field(default_factory=list)
+    """Artist-only fallback results saved before TRACK_ON_COMPILATION replaces them.
+
+    When compilation search replaces the previous artist-only results, the originals
+    are preserved here so perform_lookup can validate them against Discogs tracklists
+    and merge any confirmed matches (e.g., the artist's own album containing the track)
+    back into the final results.
+    """
+
 
 # Type aliases for strategy functions
 ConditionFunc = Callable[[ParsedRequest, SearchState, str], bool]
@@ -269,6 +278,11 @@ async def execute_search_pipeline(
         elif strategy.name == SearchStrategyType.TRACK_ON_COMPILATION:
             results, discogs_titles = await strategy.execute(db, parsed)
             if results:
+                # Save artist fallback results before replacing — perform_lookup
+                # will validate them against Discogs tracklists and merge any
+                # confirmed matches back into the final results.
+                if state.results and state.song_not_found:
+                    state.artist_fallback_results = list(state.results)
                 state.results = results
                 state.found_on_compilation = True
                 state.song_not_found = False

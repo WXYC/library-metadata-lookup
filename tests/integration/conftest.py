@@ -45,6 +45,9 @@ SEED_ITEMS = [
     (23, "Weird Al Yankovic", "Weird Al Yankovic", "YA", 1, 1, "Rock", "Vinyl"),
     (24, "Dare to Be Stupid", "Weird Al Yankovic", "YA", 1, 2, "Rock", "Vinyl"),
     (25, "Even Worse", "Weird Al Yankovic", "YA", 1, 3, "Rock", "Vinyl"),
+    (26, "London Zoo", "The Bug", "B", 2, 1, "Electronic", "CD"),
+    (27, "Pressure", "The Bug", "B", 2, 2, "Electronic", "CD"),
+    (28, "The Sound of Dub", "Various Artists - Reggae", "V", 2, 1, "Reggae", "CD"),
 ]
 
 

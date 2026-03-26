@@ -367,3 +367,112 @@ class TestVACompilationTrackSearch:
         assert len(response.results) >= 1
         titles = [r.library_item.title for r in response.results]
         assert "Now That's What I Call Music 47" in titles
+
+
+class TestTrackOnArtistAlbumAndCompilation:
+    """Test that tracks on both an artist album and a compilation return both results.
+
+    Bug: "Poison Dart" by "The Bug" is on London Zoo (artist album) AND
+    The Sound of Dub (VA compilation). When ARTIST_PLUS_ALBUM falls back to
+    artist-only and then TRACK_ON_COMPILATION finds the compilation, the artist
+    fallback results should be validated and the artist's own album included.
+    """
+
+    @pytest.mark.asyncio
+    async def test_artist_album_and_compilation_both_returned(self, library_db):
+        """Both London Zoo and The Sound of Dub should appear in results.
+
+        Seed data includes:
+        - (26, "London Zoo", "The Bug") - artist's own album
+        - (27, "Pressure", "The Bug") - another Bug album (should be excluded)
+        - (28, "The Sound of Dub", "Various Artists - Reggae") - compilation
+        """
+        from core.telemetry import RequestTelemetry, init_cache_stats
+        from lookup.models import LookupRequest
+        from lookup.orchestrator import perform_lookup
+
+        init_cache_stats()
+
+        mock_service = AsyncMock(
+            spec_set=[
+                "search_releases_by_track",
+                "validate_track_on_release",
+                "search",
+                "get_release",
+                "cache_service",
+            ]
+        )
+        mock_service.cache_service = None
+
+        # Discogs search_releases_by_track returns The Sound of Dub (compilation)
+        mock_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Poison Dart",
+                artist="The Bug",
+                releases=[
+                    ReleaseInfo(
+                        album="The Sound of Dub",
+                        artist="Various Artists",
+                        release_id=2308471,
+                        release_url="https://www.discogs.com/release/2308471",
+                        is_compilation=True,
+                    ),
+                ],
+                total=1,
+                cached=False,
+            )
+        )
+
+        # Track validation:
+        # - "Poison Dart" IS on London Zoo (release 1395903)
+        # - "Poison Dart" IS on The Sound of Dub (release 2308471)
+        # - "Poison Dart" is NOT on Pressure (release 9999)
+        from tests.factories import make_discogs_result
+
+        london_zoo_discogs = make_discogs_result(
+            release_id=1395903, album="London Zoo", artist="The Bug"
+        )
+        pressure_discogs = make_discogs_result(release_id=9999, album="Pressure", artist="The Bug")
+
+        async def mock_search(request):
+            album = request.album if hasattr(request, "album") else ""
+            if album and "london" in album.lower():
+                return DiscogsSearchResponse(results=[london_zoo_discogs])
+            if album and "pressure" in album.lower():
+                return DiscogsSearchResponse(results=[pressure_discogs])
+            return DiscogsSearchResponse(results=[])
+
+        mock_service.search = AsyncMock(side_effect=mock_search)
+
+        async def mock_validate(release_id, track, artist):
+            return release_id in (1395903, 2308471)
+
+        mock_service.validate_track_on_release = AsyncMock(side_effect=mock_validate)
+        mock_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="The Bug",
+            song="Poison Dart",
+            raw_message="poison dart, the bug",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(request, library_db, mock_service, RequestTelemetry())
+
+        titles = [r.library_item.title for r in response.results]
+        assert "London Zoo" in titles, (
+            f"Artist album 'London Zoo' should be in results, got: {titles}"
+        )
+        assert "The Sound of Dub" in titles, (
+            f"Compilation 'The Sound of Dub' should be in results, got: {titles}"
+        )
+        assert "Pressure" not in titles, (
+            f"'Pressure' (doesn't contain 'Poison Dart') should NOT be in results, got: {titles}"
+        )
+        assert response.found_on_compilation is True
+        # Artist's own album should come before the compilation
+        assert titles.index("London Zoo") < titles.index("The Sound of Dub")
