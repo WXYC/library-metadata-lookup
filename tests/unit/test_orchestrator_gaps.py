@@ -769,6 +769,31 @@ class TestSearchAlbumFuzzy:
         assert len(results) == 1
         assert results[0].id == 46602
 
+    @pytest.mark.asyncio
+    async def test_matches_abbreviated_compilation_title(self):
+        """Library may abbreviate titles differently from Discogs.
+
+        Discogs: "Não Wave - Brazilian Post Punk 1982 - 1988"
+        Library: "Nao Wave- Brazilian Punk 82-88"
+        Only 3/6 significant words match ("wave", "brazilian", "punk") but
+        token_set_ratio is 77% — the keyword threshold should be lenient
+        enough to accept this.
+        """
+        db = AsyncMock()
+        item = _item(id=57500, title="Nao Wave- Brazilian Punk 82-88")
+
+        # Call 1: exact FTS5 search -> empty (diacritics mismatch)
+        # Call 2: 4-word fuzzy "wave brazilian post punk" -> empty ("post" not in title)
+        # Call 3: 3-word fuzzy "wave brazilian post" -> empty
+        # Call 4: 2-word fuzzy "wave brazilian" -> finds item
+        db.search = AsyncMock(side_effect=[[], [], [], [item]])
+
+        results = await search_album_fuzzy(
+            db, "Não Wave - Brazilian Post Punk 1982 - 1988"
+        )
+        assert len(results) == 1
+        assert results[0].id == 57500
+
 
 # ---------------------------------------------------------------------------
 # filter_results_by_track_validation -- exception (lines 482-483)

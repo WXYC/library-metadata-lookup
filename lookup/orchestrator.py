@@ -563,9 +563,12 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
 
         if significant_words:
             album_lower = album_title.lower()
-            # Require most keywords to match — prevents "20th Anniversary Concert"
-            # from matching when searching for "Trax Records 20th Anniversary Edition"
-            min_keywords = max(2, len(significant_words) - 1)
+            # Require roughly half the keywords to match — lenient enough for
+            # abbreviated titles (e.g., "Punk 82-88" vs "Post Punk 1982 - 1988")
+            # but strict enough to reject unrelated albums that share a few words
+            # (e.g., "20th Anniversary Concert" vs "Trax Records 20th Anniversary Edition").
+            # The similarity and album_title_acceptable checks provide additional gating.
+            min_keywords = max(2, (len(significant_words) + 1) // 2)
 
             # Try progressively shorter queries to handle word mismatches between
             # Discogs and library titles (e.g., "Edition" vs "Collection").
