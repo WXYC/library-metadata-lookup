@@ -77,7 +77,8 @@ class DiscogsCacheService:
         try:
             query = """
                 WITH matching_tracks AS (
-                    SELECT DISTINCT rt.release_id, rt.title as track_title,
+                    SELECT DISTINCT rt.release_id, rt.sequence,
+                           rt.title as track_title,
                            similarity(lower(f_unaccent(rt.title)), lower(f_unaccent($1))) as sim
                     FROM release_track rt
                     WHERE lower(f_unaccent(rt.title)) % lower(f_unaccent($1))
@@ -90,7 +91,14 @@ class DiscogsCacheService:
                 FROM matching_tracks mt
                 JOIN release r ON r.id = mt.release_id
                 JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
-                WHERE ($3::text IS NULL OR lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3)))
+                LEFT JOIN release_track_artist rta
+                    ON rta.release_id = mt.release_id
+                    AND rta.track_sequence = mt.sequence
+                WHERE (
+                    $3::text IS NULL
+                    OR lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3))
+                    OR lower(f_unaccent(rta.artist_name)) % lower(f_unaccent($3))
+                )
                 ORDER BY mt.sim DESC
             """
 

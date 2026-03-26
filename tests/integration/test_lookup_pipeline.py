@@ -6,8 +6,10 @@ import pytest
 
 from discogs.models import (
     DiscogsSearchResponse,
+    ReleaseInfo,
     ReleaseMetadataResponse,
     TrackItem,
+    TrackReleasesResponse,
 )
 
 pytestmark = pytest.mark.integration
@@ -302,3 +304,66 @@ class TestQuotedArtistNameValidation:
         assert response.context_message and "not" in response.context_message.lower(), (
             f"Context should indicate song not found; got: {response.context_message}"
         )
+
+
+class TestVACompilationTrackSearch:
+    """Test that tracks on VA compilations are found via Discogs cross-reference."""
+
+    @pytest.mark.asyncio
+    async def test_finds_track_on_va_compilation(self, library_db):
+        """Track on a VA compilation should be found when Discogs identifies the release.
+
+        Seed data includes (10, "Now That's What I Call Music 47", "Various Artists").
+        When Discogs reports a track is on this compilation, the pipeline should find
+        the library entry and return found_on_compilation=True.
+        """
+        from core.telemetry import RequestTelemetry, init_cache_stats
+        from discogs.service import DiscogsService
+        from lookup.models import LookupRequest
+        from lookup.orchestrator import perform_lookup
+
+        init_cache_stats()
+
+        mock_service = AsyncMock(spec=DiscogsService)
+        mock_service.cache_service = None
+
+        # Discogs finds the track on a VA compilation matching the library entry
+        mock_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Dancing Queen",
+                artist="Chuquimamani-Condori",
+                releases=[
+                    ReleaseInfo(
+                        album="Now That's What I Call Music 47",
+                        artist="Various Artists",
+                        release_id=9001,
+                        release_url="https://discogs.com/release/9001",
+                        is_compilation=True,
+                    ),
+                ],
+                total=1,
+                cached=False,
+            )
+        )
+
+        # Validate that the track is on the release
+        mock_service.validate_track_on_release = AsyncMock(return_value=True)
+
+        # No artwork
+        mock_service.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
+        mock_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Chuquimamani-Condori",
+            song="Dancing Queen",
+            raw_message="Dancing Queen by Chuquimamani-Condori",
+        )
+
+        response = await perform_lookup(request, library_db, mock_service, RequestTelemetry())
+
+        assert response.found_on_compilation is True, (
+            "Track on VA compilation should set found_on_compilation=True"
+        )
+        assert len(response.results) >= 1
+        titles = [r.library_item.title for r in response.results]
+        assert "Now That's What I Call Music 47" in titles
