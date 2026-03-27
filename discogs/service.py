@@ -13,7 +13,6 @@ from config.settings import get_settings
 from core.matching import (
     calculate_confidence,
     is_compilation_artist,
-    normalize_for_comparison,
     normalize_for_track_comparison,
 )
 from core.telemetry import (
