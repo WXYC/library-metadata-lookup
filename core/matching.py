@@ -35,6 +35,26 @@ def normalize_for_comparison(text: str | None) -> str:
     return strip_diacritics(text).lower()
 
 
+def normalize_for_track_comparison(text: str | None) -> str:
+    """Normalize a track title for fuzzy comparison during validation.
+
+    Extends normalize_for_comparison with additional steps:
+    - Replaces ``&`` with ``and``
+    - Strips punctuation (periods, apostrophes, quotes, etc.)
+    - Collapses runs of whitespace
+
+    This handles common Discogs/user mismatches like
+    "Me & Mr. Jones" vs "Me And Mr Jones".
+    """
+    if not text:
+        return ""
+    result = normalize_for_comparison(text)
+    result = result.replace("&", " and ")
+    result = re.sub(r"[^\w\s]", "", result)
+    result = re.sub(r"\s+", " ", result).strip()
+    return result
+
+
 # =============================================================================
 # Search Result Limiting
 # =============================================================================
