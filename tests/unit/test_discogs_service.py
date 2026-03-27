@@ -729,6 +729,28 @@ class TestValidateTrackOnRelease:
         assert result is True
 
     @pytest.mark.asyncio
+    async def test_ampersand_vs_and_in_track_title(self, service):
+        """Track 'Me & Mr. Jones' on Discogs should match search for 'Me And Mr Jones'.
+
+        Bug: 'Me And Mr Jones' by Plug failed validation because Discogs stores the
+        track as 'Me & Mr. Jones' and the substring check didn't normalize & to 'and'
+        or strip periods.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=82602,
+            title="Drum 'n' Bass For Papa",
+            artist="Plug",
+            release_url="https://discogs.com/release/82602",
+            tracklist=[
+                TrackItem(position="1", title="Me & Mr. Jones"),
+                TrackItem(position="2", title="Drum 'n' Bass For Papa"),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(82602, "Me And Mr Jones", "Plug")
+        assert result is True
+
+    @pytest.mark.asyncio
     async def test_cache_validated(self, service_with_cache):
         service_with_cache.cache_service.validate_track_on_release = AsyncMock(return_value=True)
 

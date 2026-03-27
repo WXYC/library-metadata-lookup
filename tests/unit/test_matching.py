@@ -8,6 +8,7 @@ from core.matching import (
     is_compilation_artist,
     is_self_titled,
     normalize_for_comparison,
+    normalize_for_track_comparison,
     strip_diacritics,
 )
 
@@ -77,6 +78,47 @@ class TestNormalizeForComparison:
     )
     def test_normalize_for_comparison(self, input_text, expected):
         assert normalize_for_comparison(input_text) == expected
+
+
+# ---------------------------------------------------------------------------
+# normalize_for_track_comparison
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeForTrackComparison:
+    """Tests for track title normalization used in validation."""
+
+    @pytest.mark.parametrize(
+        "input_text, expected",
+        [
+            ("Me & Mr. Jones", "me and mr jones"),
+            ("Me And Mr Jones", "me and mr jones"),
+            ("Me and Mr. Jones", "me and mr jones"),
+            ("Rock & Roll", "rock and roll"),
+            ("Rock 'n' Roll", "rock n roll"),
+            ("Drum 'n' Bass For Papa", "drum n bass for papa"),
+            ("Björk", "bjork"),
+            (None, ""),
+            ("", ""),
+            ("Don't Stop", "dont stop"),
+            ("6 Underground", "6 underground"),
+        ],
+        ids=[
+            "ampersand_to_and",
+            "and_preserved",
+            "mixed_ampersand_period",
+            "rock_and_roll",
+            "quoted_n",
+            "drum_n_bass",
+            "diacritics_stripped",
+            "none_input",
+            "empty_string",
+            "apostrophe_stripped",
+            "number_preserved",
+        ],
+    )
+    def test_normalize_for_track_comparison(self, input_text, expected):
+        assert normalize_for_track_comparison(input_text) == expected
 
 
 # ---------------------------------------------------------------------------
