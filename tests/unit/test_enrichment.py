@@ -21,9 +21,7 @@ class TestBuildStreamingSearchUrl:
         assert url == "https://open.spotify.com/search/Autechre%20VI%20Scose%20Poise"
 
     def test_artist_only(self):
-        url = _build_streaming_search_url(
-            "https://bandcamp.com/search?q=", "Juana Molina", ""
-        )
+        url = _build_streaming_search_url("https://bandcamp.com/search?q=", "Juana Molina", "")
         assert "Juana%20Molina" in url
 
     def test_encodes_special_characters(self):
@@ -47,7 +45,9 @@ class TestFetchAppleMusicUrl:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.get = AsyncMock(return_value=mock_response)
 
-        result = await _fetch_apple_music_url("Kate Bush", "The Saxophone Song", http_client=mock_client)
+        result = await _fetch_apple_music_url(
+            "Kate Bush", "The Saxophone Song", http_client=mock_client
+        )
         assert result == "https://music.apple.com/us/album/test/123"
 
     @pytest.mark.asyncio
@@ -62,7 +62,9 @@ class TestFetchAppleMusicUrl:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.get = AsyncMock(return_value=mock_response)
 
-        result = await _fetch_apple_music_url("Obscure Artist", "Obscure Song", http_client=mock_client)
+        result = await _fetch_apple_music_url(
+            "Obscure Artist", "Obscure Song", http_client=mock_client
+        )
         assert result is None
 
     @pytest.mark.asyncio
@@ -78,7 +80,9 @@ class TestEnrichArtworkResults:
     @pytest.mark.asyncio
     async def test_enriches_with_year_and_artist_details(self):
         item = make_library_item(artist="Kate Bush", title="The Kick Inside")
-        artwork = make_discogs_result(release_id=10154369, artist="Kate Bush", album="The Kick Inside")
+        artwork = make_discogs_result(
+            release_id=10154369, artist="Kate Bush", album="The Kick Inside"
+        )
 
         discogs_service = AsyncMock()
         discogs_service.get_release.return_value = ReleaseMetadataResponse(
@@ -127,9 +131,7 @@ class TestEnrichArtworkResults:
         )
 
         with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(
-                [(item, artwork)], discogs_service
-            )
+            results = await enrich_artwork_results([(item, artwork)], discogs_service)
 
         _, enriched = results[0]
         assert enriched.release_year == 2020
@@ -140,9 +142,7 @@ class TestEnrichArtworkResults:
     async def test_handles_none_artwork(self):
         item = make_library_item()
 
-        results = await enrich_artwork_results(
-            [(item, None)], AsyncMock()
-        )
+        results = await enrich_artwork_results([(item, None)], AsyncMock())
 
         _, enriched = results[0]
         assert enriched is None
@@ -152,9 +152,7 @@ class TestEnrichArtworkResults:
         item = make_library_item()
         artwork = make_discogs_result()
 
-        results = await enrich_artwork_results(
-            [(item, artwork)], None
-        )
+        results = await enrich_artwork_results([(item, artwork)], None)
 
         _, enriched = results[0]
         assert enriched is artwork  # unchanged
@@ -168,9 +166,7 @@ class TestEnrichArtworkResults:
         discogs_service.get_release.side_effect = Exception("API error")
 
         with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(
-                [(item, artwork)], discogs_service
-            )
+            results = await enrich_artwork_results([(item, artwork)], discogs_service)
 
         _, enriched = results[0]
         # Enriched fields should be None but streaming URLs still generated

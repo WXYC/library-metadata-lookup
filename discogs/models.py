@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from pydantic import BaseModel
 
-if TYPE_CHECKING:
-    from generated.api_models import DiscogsMatchResult
+from generated.api_models import DiscogsMatchResult as _GeneratedDiscogsMatchResult
 
 
 class ArtistCredit(BaseModel):
@@ -135,11 +132,9 @@ class DiscogsSearchResult(BaseModel):
     bandcamp_url: str | None = None
     soundcloud_url: str | None = None
 
-    def to_match_result(self) -> DiscogsMatchResult:
-        """Convert to the API contract model (generated from wxyc-shared/api.yaml)."""
-        from generated.api_models import DiscogsMatchResult
-
-        return DiscogsMatchResult(
+    def to_match_result(self) -> EnrichedDiscogsMatchResult:
+        """Convert to the enriched API contract model."""
+        return EnrichedDiscogsMatchResult(
             album=self.album,
             artist=self.artist,
             release_id=self.release_id,
@@ -163,3 +158,20 @@ class DiscogsSearchResponse(BaseModel):
     results: list[DiscogsSearchResult] = []
     total: int = 0
     cached: bool = False
+
+
+class EnrichedDiscogsMatchResult(_GeneratedDiscogsMatchResult):
+    """Extends the generated DiscogsMatchResult with enriched metadata fields.
+
+    Subclasses the generated model so it passes Pydantic validation wherever
+    DiscogsMatchResult is expected (e.g., LookupResultItem.artwork).
+    """
+
+    release_year: int | None = None
+    artist_bio: str | None = None
+    wikipedia_url: str | None = None
+    spotify_url: str | None = None
+    apple_music_url: str | None = None
+    youtube_music_url: str | None = None
+    bandcamp_url: str | None = None
+    soundcloud_url: str | None = None
