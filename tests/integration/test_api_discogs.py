@@ -61,9 +61,9 @@ class TestDiscogsApiSearch:
 
         assert response.results, "Expected at least one result from Discogs API"
         top_result = response.results[0]
-        assert (
-            "disallow" in top_result.album.lower()
-        ), f"Top result should be 'Disallow', got '{top_result.album}'"
+        assert "disallow" in top_result.album.lower(), (
+            f"Top result should be 'Disallow', got '{top_result.album}'"
+        )
 
 
 class TestEntityResolution:
