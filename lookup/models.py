@@ -34,7 +34,7 @@ class LookupResultItem(_GeneratedLookupResultItem):
 class LookupResponse(_GeneratedLookupResponse):
     """Override so results use our LookupResultItem with SerializeAsAny."""
 
-    results: list[LookupResultItem] | None = None
+    results: list[LookupResultItem] | None = None  # type: ignore[assignment]
 
 
 __all__ = [
