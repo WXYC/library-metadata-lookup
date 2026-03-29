@@ -808,7 +808,11 @@ async def enrich_artwork_results(
 
                 bio = details.profile if isinstance(details.profile, str) else None
                 wiki = next(
-                    (url for url in details.urls if isinstance(url, str) and "wikipedia.org" in url),
+                    (
+                        url
+                        for url in details.urls
+                        if isinstance(url, str) and "wikipedia.org" in url
+                    ),
                     None,
                 )
                 return year, bio, wiki
@@ -816,7 +820,8 @@ async def enrich_artwork_results(
                 return None, None, None
 
         async def fetch_apple_music(
-            _artist: str = artist, _search_term: str = search_term,
+            _artist: str = artist,
+            _search_term: str = search_term,
         ) -> str | None:
             if not _artist or not _search_term:
                 return None
