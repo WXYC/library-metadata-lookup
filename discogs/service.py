@@ -25,6 +25,7 @@ from core.telemetry import (
 from discogs.memory_cache import (
     ARTIST_CACHE,
     LABEL_CACHE,
+    MASTER_CACHE,
     RELEASE_CACHE,
     SEARCH_CACHE,
     TRACK_CACHE,
@@ -39,6 +40,7 @@ from discogs.models import (
     DiscogsSearchResponse,
     DiscogsSearchResult,
     LabelCredit,
+    MasterRelease,
     MemberRef,
     ReleaseInfo,
     ReleaseMetadataResponse,
@@ -616,6 +618,37 @@ class DiscogsService:
             return images[0].get("uri") if images else None
         except Exception as e:
             logger.warning(f"Failed to fetch label image for {label_id}: {e}")
+            return None
+
+    @async_cached(MASTER_CACHE)
+    async def get_master(self, master_id: int) -> MasterRelease | None:
+        """Fetch master release metadata from Discogs.
+
+        Args:
+            master_id: Discogs master release ID
+
+        Returns:
+            MasterRelease with title and year, or None on error
+        """
+        try:
+            start = time.perf_counter()
+            response = await self._request_with_retry("GET", f"/masters/{master_id}")
+            if response is None:
+                return None
+            record_api_time((time.perf_counter() - start) * 1000)
+            record_discogs_api_call()
+            add_discogs_breadcrumb("get_master", {"master_id": master_id})
+            response.raise_for_status()
+            data = response.json()
+
+            return MasterRelease(
+                master_id=master_id,
+                title=data.get("title", ""),
+                year=data.get("year"),
+                cached=False,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch master release {master_id}: {e}")
             return None
 
     @async_cached(SEARCH_CACHE)

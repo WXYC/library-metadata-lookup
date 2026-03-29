@@ -6,8 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from core.dependencies import get_discogs_service
 from discogs.models import (
+    ArtistDetails,
     DiscogsSearchRequest,
     DiscogsSearchResponse,
+    EntityResolveResponse,
+    EntityType,
     ReleaseMetadataResponse,
     TrackReleasesResponse,
 )
@@ -101,3 +104,68 @@ async def search_releases(
         )
 
     return await svc.search(request, limit=limit)
+
+
+@router.get(
+    "/artist/{artist_id}",
+    response_model=ArtistDetails,
+    summary="Get full artist details",
+    responses={
+        200: {"description": "Artist details returned"},
+        404: {"description": "Artist not found"},
+        503: {"description": "Discogs service not configured"},
+    },
+)
+async def get_artist(
+    artist_id: int,
+    service: DiscogsService | None = Depends(get_discogs_service),
+) -> ArtistDetails:
+    """Get full details for an artist by Discogs ID."""
+    svc = _require_service(service)
+    result = await svc.get_artist_details(artist_id)
+
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Artist {artist_id} not found",
+        )
+
+    return result
+
+
+@router.get(
+    "/entity/{entity_type}/{entity_id}",
+    response_model=EntityResolveResponse,
+    summary="Resolve a Discogs entity to its name",
+    responses={
+        200: {"description": "Entity resolved"},
+        404: {"description": "Entity not found"},
+        422: {"description": "Invalid entity type"},
+        503: {"description": "Discogs service not configured"},
+    },
+)
+async def resolve_entity(
+    entity_type: EntityType,
+    entity_id: int,
+    service: DiscogsService | None = Depends(get_discogs_service),
+) -> EntityResolveResponse:
+    """Resolve a Discogs entity (artist, release, or master) to its name."""
+    svc = _require_service(service)
+
+    if entity_type == EntityType.artist:
+        artist = await svc.get_artist_details(entity_id)
+        if artist is None:
+            raise HTTPException(status_code=404, detail=f"Artist {entity_id} not found")
+        return EntityResolveResponse(name=artist.name, type=entity_type, id=entity_id)
+
+    elif entity_type == EntityType.release:
+        release = await svc.get_release(entity_id)
+        if release is None:
+            raise HTTPException(status_code=404, detail=f"Release {entity_id} not found")
+        return EntityResolveResponse(name=release.title, type=entity_type, id=entity_id)
+
+    else:  # master
+        master = await svc.get_master(entity_id)
+        if master is None:
+            raise HTTPException(status_code=404, detail=f"Master {entity_id} not found")
+        return EntityResolveResponse(name=master.title, type=entity_type, id=entity_id)

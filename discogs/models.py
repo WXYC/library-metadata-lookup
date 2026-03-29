@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel
 
 from generated.api_models import DiscogsMatchResult as _GeneratedDiscogsMatchResult
@@ -103,6 +105,31 @@ class ArtistDetails(BaseModel):
     members: list[MemberRef] = []
     urls: list[str] = []
     cached: bool = False
+
+
+class MasterRelease(BaseModel):
+    """Minimal master release metadata from Discogs."""
+
+    master_id: int
+    title: str
+    year: int | None = None
+    cached: bool = False
+
+
+class EntityType(StrEnum):
+    """Supported Discogs entity types for resolution."""
+
+    artist = "artist"
+    release = "release"
+    master = "master"
+
+
+class EntityResolveResponse(BaseModel):
+    """Response for entity resolution: name, type, and ID."""
+
+    name: str
+    type: EntityType
+    id: int
 
 
 class DiscogsSearchRequest(BaseModel):
