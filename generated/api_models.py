@@ -895,14 +895,6 @@ class DiscogsMatchResult(BaseModel):
     release_url: str = Field(..., description="URL to the release on Discogs")
     artwork_url: str | None = Field(None, description="Artwork image URL")
     confidence: confloat(ge=0.0, le=1.0) | None = Field(0, description="Match confidence score")
-    release_year: int | None = Field(None, description="Release year from Discogs")
-    artist_bio: str | None = Field(None, description="Artist biography from Discogs")
-    wikipedia_url: str | None = Field(None, description="Wikipedia URL for the artist")
-    spotify_url: str | None = Field(None, description="Spotify search URL")
-    apple_music_url: str | None = Field(None, description="Apple Music URL")
-    youtube_music_url: str | None = Field(None, description="YouTube Music search URL")
-    bandcamp_url: str | None = Field(None, description="Bandcamp search URL")
-    soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
 
 
 class LookupResultItem(BaseModel):
