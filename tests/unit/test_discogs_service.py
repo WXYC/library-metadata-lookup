@@ -1248,3 +1248,52 @@ class TestGetArtistImageDelegation:
             result = await service.get_artist_image(77)
 
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# get_master
+# ---------------------------------------------------------------------------
+
+
+class TestGetMaster:
+    @pytest.mark.asyncio
+    async def test_api_success(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "id": 456,
+            "title": "Dots and Loops",
+            "year": 1997,
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_master(456)
+
+        assert result is not None
+        assert result.master_id == 456
+        assert result.title == "Dots and Loops"
+        assert result.year == 1997
+        assert result.cached is False
+
+    @pytest.mark.asyncio
+    async def test_not_found_returns_none(self, service):
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=None
+        ):
+            result = await service.get_master(999999)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_api_error_returns_none(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.raise_for_status = MagicMock(side_effect=Exception("Server error"))
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_master(456)
+        assert result is None

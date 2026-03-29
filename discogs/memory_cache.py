@@ -24,6 +24,7 @@ _release_cache: TTLCache | None = None
 _search_cache: TTLCache | None = None
 _artist_cache: TTLCache | None = None
 _label_cache: TTLCache | None = None
+_master_cache: TTLCache | None = None
 
 T = TypeVar("T")
 
@@ -79,7 +80,7 @@ def create_ttl_cache(maxsize: int, ttl: int) -> TTLCache:
 
 def clear_all_caches() -> None:
     """Clear all registered caches and reset lazy caches."""
-    global _track_cache, _release_cache, _search_cache, _artist_cache, _label_cache
+    global _track_cache, _release_cache, _search_cache, _artist_cache, _label_cache, _master_cache
     for cache in _cache_registry:
         cache.clear()
     # Reset lazy caches so they get recreated with fresh settings
@@ -88,6 +89,7 @@ def clear_all_caches() -> None:
     _search_cache = None
     _artist_cache = None
     _label_cache = None
+    _master_cache = None
 
 
 def _set_cached_flag(result: Any, cached: bool) -> Any:
@@ -227,6 +229,20 @@ def get_label_cache() -> TTLCache:
     return _label_cache
 
 
+def get_master_cache() -> TTLCache:
+    """Get or create the master release cache using settings."""
+    global _master_cache
+    if _master_cache is None:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        _master_cache = create_ttl_cache(
+            maxsize=settings.discogs_cache_maxsize // 2,
+            ttl=settings.discogs_release_cache_ttl,
+        )
+    return _master_cache
+
+
 # Convenience constants for backwards compatibility
 def __getattr__(name: str):
     """Lazy initialization of cache constants for backwards compatibility."""
@@ -240,4 +256,6 @@ def __getattr__(name: str):
         return get_artist_cache()
     elif name == "LABEL_CACHE":
         return get_label_cache()
+    elif name == "MASTER_CACHE":
+        return get_master_cache()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
