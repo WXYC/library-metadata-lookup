@@ -8,8 +8,8 @@ track validation -> artwork fetch -> metadata enrichment -> context message.
 import asyncio
 import logging
 import re
-from urllib.parse import quote
 from functools import partial
+from urllib.parse import quote
 
 import httpx
 
@@ -786,10 +786,12 @@ async def enrich_artwork_results(
         # Parallel fetches: release details (year), artist details (bio/wiki), Apple Music
         release_id = artwork.release_id
 
-        async def fetch_release_details() -> tuple[int | None, str | None, str | None]:
+        async def fetch_release_details(
+            _release_id: int = release_id,
+        ) -> tuple[int | None, str | None, str | None]:
             """Returns (year, artist_bio, wikipedia_url) from Discogs release + artist."""
             try:
-                release = await discogs_service.get_release(release_id)
+                release = await discogs_service.get_release(_release_id)
                 if not release:
                     return None, None, None
 
@@ -813,10 +815,12 @@ async def enrich_artwork_results(
             except Exception:
                 return None, None, None
 
-        async def fetch_apple_music() -> str | None:
-            if not artist or not search_term:
+        async def fetch_apple_music(
+            _artist: str = artist, _search_term: str = search_term,
+        ) -> str | None:
+            if not _artist or not _search_term:
                 return None
-            return await _fetch_apple_music_url(artist, search_term)
+            return await _fetch_apple_music_url(_artist, _search_term)
 
         release_details_result, apple_music_result = await asyncio.gather(
             fetch_release_details(),
