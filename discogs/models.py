@@ -125,6 +125,15 @@ class DiscogsSearchResult(BaseModel):
     release_url: str
     artwork_url: str | None = None
     confidence: float = 0.0
+    # Enriched fields (populated after initial search by orchestrator)
+    release_year: int | None = None
+    artist_bio: str | None = None
+    wikipedia_url: str | None = None
+    spotify_url: str | None = None
+    apple_music_url: str | None = None
+    youtube_music_url: str | None = None
+    bandcamp_url: str | None = None
+    soundcloud_url: str | None = None
 
     def to_match_result(self) -> DiscogsMatchResult:
         """Convert to the API contract model (generated from wxyc-shared/api.yaml)."""
@@ -137,6 +146,14 @@ class DiscogsSearchResult(BaseModel):
             release_url=self.release_url,
             artwork_url=self.artwork_url,
             confidence=self.confidence,
+            release_year=self.release_year,
+            artist_bio=self.artist_bio,
+            wikipedia_url=self.wikipedia_url,
+            spotify_url=self.spotify_url,
+            apple_music_url=self.apple_music_url,
+            youtube_music_url=self.youtube_music_url,
+            bandcamp_url=self.bandcamp_url,
+            soundcloud_url=self.soundcloud_url,
         )
 
 

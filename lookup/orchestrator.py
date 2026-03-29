@@ -2,13 +2,16 @@
 
 This module contains the perform_lookup() function that orchestrates the full
 search pipeline: artist correction -> album resolution -> search strategies ->
-track validation -> artwork fetch -> context message.
+track validation -> artwork fetch -> metadata enrichment -> context message.
 """
 
 import asyncio
 import logging
 import re
+from urllib.parse import quote
 from functools import partial
+
+import httpx
 
 from core.matching import (
     MAX_SEARCH_RESULTS,
@@ -731,6 +734,133 @@ async def fetch_artwork_for_items(
     return list(zip(items, artwork_results, strict=True))
 
 
+def _build_streaming_search_url(base: str, artist: str, term: str) -> str:
+    """Build a streaming service search URL from artist + song/album."""
+    query = f"{artist} {term}" if term else artist
+    return f"{base}{quote(query)}"
+
+
+async def _fetch_apple_music_url(
+    artist: str, song: str, http_client: httpx.AsyncClient | None = None
+) -> str | None:
+    """Search the iTunes API for an Apple Music link. Free, no auth required."""
+    try:
+        query = quote(f"{artist} {song}")
+        url = f"https://itunes.apple.com/search?term={query}&entity=song&media=music&limit=1"
+        if http_client:
+            resp = await http_client.get(url)
+        else:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        results = data.get("results", [])
+        return results[0].get("trackViewUrl") if results else None
+    except Exception:
+        return None
+
+
+async def enrich_artwork_results(
+    items_with_artwork: list[tuple[LibraryItem, DiscogsSearchResult | None]],
+    discogs_service: DiscogsService | None,
+    song: str | None = None,
+) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
+    """Enrich artwork results with release year, artist details, and streaming links.
+
+    Fetches supplementary data in parallel (best-effort). Failures are silently
+    ignored — enriched fields remain None.
+    """
+    if not discogs_service:
+        return items_with_artwork
+
+    enriched = []
+    for item, artwork in items_with_artwork:
+        if not artwork:
+            enriched.append((item, artwork))
+            continue
+
+        artist = item.alternate_artist_name or item.artist or ""
+        search_term = song or item.title or ""
+
+        # Parallel fetches: release details (year), artist details (bio/wiki), Apple Music
+        release_id = artwork.release_id
+
+        async def fetch_release_details() -> tuple[int | None, str | None, str | None]:
+            """Returns (year, artist_bio, wikipedia_url) from Discogs release + artist."""
+            try:
+                release = await discogs_service.get_release(release_id)
+                if not release:
+                    return None, None, None
+
+                year = release.year if isinstance(release.year, int) else None
+
+                # Fetch artist details if we have an artist_id
+                artist_id = release.artist_id
+                if not isinstance(artist_id, int) or artist_id <= 0:
+                    return year, None, None
+
+                details = await discogs_service.get_artist_details(artist_id)
+                if not details:
+                    return year, None, None
+
+                bio = details.profile if isinstance(details.profile, str) else None
+                wiki = next(
+                    (url for url in details.urls if isinstance(url, str) and "wikipedia.org" in url),
+                    None,
+                )
+                return year, bio, wiki
+            except Exception:
+                return None, None, None
+
+        async def fetch_apple_music() -> str | None:
+            if not artist or not search_term:
+                return None
+            return await _fetch_apple_music_url(artist, search_term)
+
+        release_details_result, apple_music_result = await asyncio.gather(
+            fetch_release_details(),
+            fetch_apple_music(),
+        )
+
+        year_result, artist_bio, wikipedia_url = release_details_result
+
+        # Build streaming search URLs
+        spotify_url = None
+        youtube_music_url = None
+        bandcamp_url = None
+        soundcloud_url = None
+        if artist and search_term:
+            spotify_url = _build_streaming_search_url(
+                "https://open.spotify.com/search/", artist, search_term
+            )
+            youtube_music_url = _build_streaming_search_url(
+                "https://music.youtube.com/search?q=", artist, search_term
+            )
+            bandcamp_url = _build_streaming_search_url(
+                "https://bandcamp.com/search?q=", artist, search_term
+            )
+            soundcloud_url = _build_streaming_search_url(
+                "https://soundcloud.com/search?q=", artist, search_term
+            )
+
+        updated = artwork.model_copy(
+            update={
+                "release_year": year_result,
+                "artist_bio": artist_bio,
+                "wikipedia_url": wikipedia_url,
+                "spotify_url": spotify_url,
+                "apple_music_url": apple_music_result or None,
+                "youtube_music_url": youtube_music_url,
+                "bandcamp_url": bandcamp_url,
+                "soundcloud_url": soundcloud_url,
+            }
+        )
+        enriched.append((item, updated))
+
+    return enriched
+
+
 def build_context_message(
     parsed: ParsedRequest,
     found_on_compilation: bool,
@@ -872,6 +1002,13 @@ async def perform_lookup(
                 telemetry.record_api_call("discogs")
             items_with_artwork = await fetch_artwork_for_items(
                 library_results, discogs_service, discogs_titles
+            )
+
+    # Step 4b: Enrich with release year, artist details, streaming links
+    with telemetry.track_step("metadata_enrichment"):
+        if items_with_artwork:
+            items_with_artwork = await enrich_artwork_results(
+                items_with_artwork, discogs_service, song=parsed.song
             )
 
     # Step 5: Build context message
