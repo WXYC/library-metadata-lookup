@@ -596,6 +596,30 @@ class TestBuildSearchParams:
         params = service._build_search_params(DiscogsSearchRequest())
         assert params == {}
 
+    def test_includes_label_when_provided(self, service):
+        params = service._build_search_params(
+            DiscogsSearchRequest(artist="Cat Power", album="Moon Pix", label="Matador")
+        )
+        assert params["label"] == "Matador"
+
+    def test_omits_label_when_none(self, service):
+        params = service._build_search_params(
+            DiscogsSearchRequest(artist="Cat Power", album="Moon Pix")
+        )
+        assert "label" not in params
+
+    def test_includes_format_when_provided(self, service):
+        params = service._build_search_params(
+            DiscogsSearchRequest(artist="Cat Power", album="Moon Pix", format="CD")
+        )
+        assert params["format"] == "CD"
+
+    def test_omits_format_when_none(self, service):
+        params = service._build_search_params(
+            DiscogsSearchRequest(artist="Cat Power", album="Moon Pix")
+        )
+        assert "format" not in params
+
 
 # ---------------------------------------------------------------------------
 # validate_track_on_release

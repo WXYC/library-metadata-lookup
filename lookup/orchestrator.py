@@ -18,6 +18,7 @@ from core.matching import (
     STOPWORDS,
     is_compilation_artist,
     is_self_titled,
+    map_library_format_to_discogs,
     normalize_for_comparison,
 )
 from core.search import (
@@ -716,7 +717,12 @@ async def fetch_artwork_for_items(
                 artist = "Various"
 
             response = await discogs_service.search(
-                DiscogsSearchRequest(album=album, artist=artist)
+                DiscogsSearchRequest(
+                    album=album,
+                    artist=artist,
+                    label=item.label,
+                    format=map_library_format_to_discogs(item.format),
+                )
             )
             if response.results:
                 result = response.results[0]

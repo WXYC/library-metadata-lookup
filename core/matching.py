@@ -149,6 +149,10 @@ def calculate_confidence(
     request_album: str | None,
     result_artist: str,
     result_album: str,
+    request_label: str | None = None,
+    result_label: str | None = None,
+    request_format: str | None = None,
+    result_format: str | None = None,
 ) -> float:
     """Calculate confidence score for how well a search result matches a request.
 
@@ -158,6 +162,9 @@ def calculate_confidence(
     - Exact album match: +0.4
     - Partial album match (substring): +0.3
     - Both fields match well (score >= 0.6): +0.2 bonus
+    - Exact label match: +0.1
+    - Partial label match (substring): +0.05
+    - Format match: +0.05
     - Minimum score for any result: 0.2
 
     Args:
@@ -165,6 +172,10 @@ def calculate_confidence(
         request_album: Album from the search request
         result_artist: Artist from the search result
         result_album: Album from the search result
+        request_label: Label from the library item (optional)
+        result_label: Label from the Discogs result (optional)
+        request_format: Discogs format term from library item (optional)
+        result_format: Discogs format term from the result (optional)
 
     Returns:
         Confidence score between 0.2 and 1.0
@@ -201,7 +212,53 @@ def calculate_confidence(
     if score == 0:
         score = 0.2
 
+    # Label match (bonus signal, no penalty for mismatch)
+    req_label = normalize(request_label)
+    res_label = normalize(result_label)
+    if req_label and res_label:
+        if req_label == res_label:
+            score += 0.1
+        elif req_label in res_label or res_label in req_label:
+            score += 0.05
+
+    # Format match (bonus signal, no penalty for mismatch)
+    req_fmt = normalize(request_format)
+    res_fmt = normalize(result_format)
+    if req_fmt and res_fmt and req_fmt == res_fmt:
+        score += 0.05
+
     return min(score, 1.0)
+
+
+# =============================================================================
+# Library-to-Discogs Format Mapping
+# =============================================================================
+
+
+def map_library_format_to_discogs(fmt: str | None) -> str | None:
+    """Map a WXYC library format value to a Discogs API format parameter.
+
+    Library format values like "cd", "vinyl - 12\"", "cd x 2" are mapped to
+    the corresponding Discogs search API format terms ("CD", "12\"", etc.).
+
+    Returns None if the format is not recognized or is empty.
+    """
+    if not fmt:
+        return None
+    normalized = fmt.strip().lower()
+    if normalized.startswith("cdr"):
+        return "CDr"
+    if normalized.startswith("cd"):
+        return "CD"
+    if 'vinyl - 12"' in normalized or "vinyl - 12" in normalized:
+        return '12"'
+    if 'vinyl - 7"' in normalized or "vinyl - 7" in normalized:
+        return '7"'
+    if 'vinyl - 10"' in normalized or "vinyl - 10" in normalized:
+        return '10"'
+    if normalized.startswith("vinyl"):
+        return "Vinyl"
+    return None
 
 
 # =============================================================================

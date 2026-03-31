@@ -692,6 +692,10 @@ class DiscogsService:
                             request.album,
                             row["artist_name"],
                             row["title"],
+                            request_label=request.label,
+                            result_label=row.get("label_name"),
+                            request_format=request.format,
+                            result_format=None,  # cache doesn't include format yet
                         )
                         results.append(
                             DiscogsSearchResult(
@@ -759,8 +763,21 @@ class DiscogsService:
                 title = item.get("title", "")
                 result_artist, album = self._parse_title(title)
 
+                # Extract label and format from Discogs search result
+                result_labels = item.get("label", [])
+                result_label = result_labels[0] if result_labels else None
+                result_formats = item.get("format", [])
+                result_format = result_formats[0] if result_formats else None
+
                 confidence = calculate_confidence(
-                    request.artist, request.album, result_artist, album
+                    request.artist,
+                    request.album,
+                    result_artist,
+                    album,
+                    request_label=request.label,
+                    result_label=result_label,
+                    request_format=request.format,
+                    result_format=result_format,
                 )
 
                 release_id = item.get("id")
@@ -810,6 +827,11 @@ class DiscogsService:
             params["release_title"] = request.album
         elif request.track:
             params["release_title"] = request.track
+
+        if request.label:
+            params["label"] = request.label
+        if request.format:
+            params["format"] = request.format
 
         if "artist" not in params and "release_title" not in params:
             return {}

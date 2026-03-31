@@ -120,6 +120,16 @@ class TestToCatalogItem:
         assert "alternate_artist_name" not in data
 
 
+class TestLibraryItemLabel:
+    def test_label_defaults_to_none(self):
+        item = LibraryItem(id=1)
+        assert item.label is None
+
+    def test_label_round_trips(self):
+        item = LibraryItem(id=1, label="Matador Records")
+        assert item.label == "Matador Records"
+
+
 class TestLibrarySearchResponse:
     def test_empty_results(self):
         resp = LibrarySearchResponse(results=[], total=0)

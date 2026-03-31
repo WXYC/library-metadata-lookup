@@ -783,6 +783,46 @@ class TestFetchArtworkForItems:
         assert isinstance(call_args, DiscogsSearchRequest)
         assert "Disco Not Disco" in call_args.album
 
+    @pytest.mark.asyncio
+    async def test_artwork_search_passes_label_and_format(self, mock_discogs_service):
+        """When item has label and format, pass them to DiscogsSearchRequest."""
+        item = make_library_item(
+            id=1,
+            artist="Cat Power",
+            title="Moon Pix",
+            format="cd",
+            label="Matador Records",
+        )
+
+        artwork = make_discogs_result(
+            release_id=12345,
+            album="Moon Pix",
+            artist="Cat Power",
+            artwork_url="https://example.com/cover.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        call_args = mock_discogs_service.search.call_args[0][0]
+        assert isinstance(call_args, DiscogsSearchRequest)
+        assert call_args.label == "Matador Records"
+        assert call_args.format == "CD"
+
+    @pytest.mark.asyncio
+    async def test_artwork_search_omits_label_and_format_when_absent(self, mock_discogs_service):
+        """When item has no label, label should be None in search request."""
+        item = make_library_item(id=1, artist="Cat Power", title="Moon Pix")
+
+        artwork = make_discogs_result(release_id=12345)
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
+
+        await fetch_artwork_for_items([item], mock_discogs_service)
+
+        call_args = mock_discogs_service.search.call_args[0][0]
+        assert call_args.label is None
+
 
 class TestFetchArtworkFallback:
     """Tests for artwork fallback to artist/label images."""
