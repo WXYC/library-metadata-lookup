@@ -123,6 +123,28 @@ async def close_discogs_service() -> None:
         _discogs_pool = None
 
 
+async def get_discogs_cache_service(
+    settings: Settings = Depends(get_settings),
+) -> DiscogsCacheService | None:
+    """Get Discogs cache service instance for direct cache queries.
+
+    Returns the cache layer only (no Discogs API client). Used by endpoints
+    that query the PostgreSQL cache directly, like track autocomplete.
+
+    Returns:
+        DiscogsCacheService if the cache pool is available, None otherwise.
+    """
+    global _discogs_pool
+
+    if _discogs_pool is None:
+        await get_discogs_service(settings)
+
+    if _discogs_pool is None:
+        return None
+
+    return DiscogsCacheService(_discogs_pool)
+
+
 def get_posthog_client(settings: Settings = Depends(get_settings)) -> Posthog | None:
     """Get PostHog client instance.
 
