@@ -881,6 +881,7 @@ class LibraryCatalogItem(BaseModel):
     )
     genre: str | None = Field(None, description="Genre classification")
     format: str | None = Field(None, description="Physical format (vinyl, CD, etc.)")
+    label: str | None = Field(None, description="Record label name from the library catalog")
     call_number: str = Field(
         ...,
         description='Full call number for shelf lookup, e.g. "Rock CD ABC 123/45". Computed from genre, format, call_letters, artist_call_number, and release_call_number.\n',
@@ -942,11 +943,29 @@ class AppConfig(BaseModel):
     apiBaseUrl: str = Field(..., description="Backend API base URL")
 
 
+class TrackListItem(BaseModel):
+    position: str = Field(..., description='Track position (e.g. "1", "A1")')
+    title: str = Field(..., description="Track title")
+    duration: str | None = Field(None, description='Track duration (e.g. "5:23")')
+
+
 class AlbumMetadataResponse(BaseModel):
     discogsReleaseId: int | None = Field(None, description="Discogs release ID")
     discogsUrl: str | None = Field(None, description="Discogs release page URL")
     releaseYear: int | None = Field(None, description="Release year from Discogs")
     artworkUrl: str | None = Field(None, description="Album artwork image URL")
+    genres: list[str] | None = Field(None, description="Discogs genre classifications")
+    styles: list[str] | None = Field(
+        None, description="Discogs style classifications (more specific than genres)"
+    )
+    label: str | None = Field(None, description="Primary record label name")
+    discogsArtistId: int | None = Field(
+        None, description="Discogs artist ID, for linking to artist metadata"
+    )
+    fullReleaseDate: str | None = Field(
+        None, description='Full release date when available (e.g. "2024-03-15")'
+    )
+    tracklist: list[TrackListItem] | None = Field(None, description="Release tracklist")
     spotifyUrl: str | None = Field(None, description="Spotify URL for the album or track")
     appleMusicUrl: str | None = Field(None, description="Apple Music URL for the album or track")
     youtubeMusicUrl: str | None = Field(None, description="YouTube Music search URL")
@@ -956,8 +975,9 @@ class AlbumMetadataResponse(BaseModel):
 
 class ArtistMetadataResponse(BaseModel):
     discogsArtistId: int | None = Field(None, description="Discogs artist ID")
-    bio: str | None = Field(None, description="Artist biography from Discogs (markup cleaned)")
+    bio: str | None = Field(None, description="Artist biography from Discogs")
     wikipediaUrl: str | None = Field(None, description="Wikipedia URL for the artist")
+    imageUrl: str | None = Field(None, description="Artist image URL from Discogs")
 
 
 class ArtworkSearchResponse(BaseModel):

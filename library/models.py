@@ -66,6 +66,7 @@ class LibraryItem(BaseModel):
             release_call_number=self.release_call_number,
             genre=self.genre,
             format=self.format,
+            label=self.label,
             call_number=self.call_number,
             library_url=self.library_url,
         )
