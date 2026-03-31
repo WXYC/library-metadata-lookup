@@ -8,7 +8,6 @@ from httpx import ASGITransport, AsyncClient
 from discogs.cache_service import DiscogsCacheService
 from tests.unit.conftest import override_deps
 
-
 # ---------------------------------------------------------------------------
 # Cache service: autocomplete_tracks
 # ---------------------------------------------------------------------------
