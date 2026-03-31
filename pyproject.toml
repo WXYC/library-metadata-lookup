@@ -70,9 +70,10 @@ ignore_errors = true
 [tool.pytest.ini_options]
 markers = [
     "integration: marks tests as integration tests",
+    "e2e: marks tests as end-to-end tests (real external APIs)",
     "slow: marks tests as slow",
 ]
-addopts = "-m 'not integration'"
+addopts = "-m 'not integration and not e2e'"
 console_output_style = "progress"
 testpaths = ["tests"]
 pythonpath = ["."]
