@@ -25,7 +25,9 @@ def _get_service() -> DiscogsService | None:
     if settings.discogs_token:
         return DiscogsService(token=settings.discogs_token)
     if settings.discogs_api_key and settings.discogs_api_secret:
-        return DiscogsService(api_key=settings.discogs_api_key, api_secret=settings.discogs_api_secret)
+        return DiscogsService(
+            api_key=settings.discogs_api_key, api_secret=settings.discogs_api_secret
+        )
     return None
 
 

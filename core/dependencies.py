@@ -107,7 +107,9 @@ async def get_discogs_service(
             logger.info("Discogs cache service enabled")
 
         if has_token:
-            _discogs_service = DiscogsService(token=settings.discogs_token, cache_service=cache_service)
+            _discogs_service = DiscogsService(
+                token=settings.discogs_token, cache_service=cache_service
+            )
         else:
             _discogs_service = DiscogsService(
                 api_key=settings.discogs_api_key,
