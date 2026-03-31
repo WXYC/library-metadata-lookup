@@ -138,6 +138,8 @@ class DiscogsSearchRequest(BaseModel):
     artist: str | None = None
     album: str | None = None
     track: str | None = None
+    label: str | None = None
+    format: str | None = None
 
 
 class DiscogsSearchResult(BaseModel):

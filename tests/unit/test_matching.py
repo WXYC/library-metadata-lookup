@@ -7,6 +7,7 @@ from core.matching import (
     detect_ambiguous_format,
     is_compilation_artist,
     is_self_titled,
+    map_library_format_to_discogs,
     normalize_for_comparison,
     normalize_for_track_comparison,
     strip_diacritics,
@@ -241,6 +242,83 @@ class TestCalculateConfidence:
         # Even with bonuses, score caps at 1.0
         score = calculate_confidence("Queen", "The Game", "Queen", "The Game")
         assert score <= 1.0
+
+    @pytest.mark.parametrize(
+        "req_label, res_label, expected_bonus",
+        [
+            pytest.param(None, None, 0.0, id="both-none"),
+            pytest.param("Matador", "Matador", 0.1, id="exact-match"),
+            pytest.param("Matador", "Matador Records", 0.05, id="partial-match"),
+            pytest.param("Matador", "4AD", 0.0, id="mismatch"),
+            pytest.param(None, "Matador", 0.0, id="request-none"),
+            pytest.param("Matador", None, 0.0, id="result-none"),
+        ],
+    )
+    def test_label_bonus(self, req_label, res_label, expected_bonus):
+        base = calculate_confidence(None, None, "Artist", "Album")
+        with_label = calculate_confidence(
+            None,
+            None,
+            "Artist",
+            "Album",
+            request_label=req_label,
+            result_label=res_label,
+        )
+        assert with_label == pytest.approx(base + expected_bonus)
+
+    @pytest.mark.parametrize(
+        "req_format, res_format, expected_bonus",
+        [
+            pytest.param(None, None, 0.0, id="both-none"),
+            pytest.param("CD", "CD", 0.05, id="exact-match"),
+            pytest.param("CD", "Vinyl", 0.0, id="mismatch"),
+            pytest.param(None, "CD", 0.0, id="request-none"),
+            pytest.param("CD", None, 0.0, id="result-none"),
+        ],
+    )
+    def test_format_bonus(self, req_format, res_format, expected_bonus):
+        base = calculate_confidence(None, None, "Artist", "Album")
+        with_format = calculate_confidence(
+            None,
+            None,
+            "Artist",
+            "Album",
+            request_format=req_format,
+            result_format=res_format,
+        )
+        assert with_format == pytest.approx(base + expected_bonus)
+
+
+# ---------------------------------------------------------------------------
+# map_library_format_to_discogs
+# ---------------------------------------------------------------------------
+
+
+class TestMapLibraryFormatToDiscogs:
+    @pytest.mark.parametrize(
+        "library_format, expected",
+        [
+            pytest.param("cd", "CD", id="cd"),
+            pytest.param("CD", "CD", id="cd-upper"),
+            pytest.param("vinyl", "Vinyl", id="vinyl"),
+            pytest.param('vinyl - 12"', '12"', id="vinyl-12"),
+            pytest.param('vinyl - 7"', '7"', id="vinyl-7"),
+            pytest.param('vinyl - 10"', '10"', id="vinyl-10"),
+            pytest.param("vinyl - LP", "Vinyl", id="vinyl-lp"),
+            pytest.param("cdr", "CDr", id="cdr"),
+            pytest.param("cd x 2", "CD", id="cd-x-2"),
+            pytest.param("cd x 3", "CD", id="cd-x-3"),
+            pytest.param("vinyl - LP x 2", "Vinyl", id="vinyl-lp-x-2"),
+            pytest.param("vinyl - LP x 3", "Vinyl", id="vinyl-lp-x-3"),
+            pytest.param('vinyl - 12" x 2', '12"', id="vinyl-12-x-2"),
+            pytest.param('vinyl - 7" x 2', '7"', id="vinyl-7-x-2"),
+            pytest.param("cd x 2 box", "CD", id="cd-x-2-box"),
+            pytest.param(None, None, id="none"),
+            pytest.param("", None, id="empty"),
+        ],
+    )
+    def test_format_mapping(self, library_format, expected):
+        assert map_library_format_to_discogs(library_format) == expected
 
 
 # ---------------------------------------------------------------------------

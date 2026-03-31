@@ -21,6 +21,7 @@ class LibraryDB:
         self.db_path = db_path or DEFAULT_DB_PATH
         self._conn: aiosqlite.Connection | None = None
         self._has_alternate_artist: bool = False
+        self._has_label: bool = False
 
     async def connect(self):
         """Open database connection."""
@@ -38,10 +39,12 @@ class LibraryDB:
         columns = await cursor.fetchall()
         column_names = {row[1] for row in columns}
         self._has_alternate_artist = "alternate_artist_name" in column_names
+        self._has_label = "label" in column_names
 
         logger.info(
             f"Connected to SQLite database: {self.db_path} "
-            f"(alternate_artist_name: {'yes' if self._has_alternate_artist else 'no'})"
+            f"(alternate_artist_name: {'yes' if self._has_alternate_artist else 'no'}, "
+            f"label: {'yes' if self._has_label else 'no'})"
         )
 
     async def is_available(self) -> bool:
@@ -71,6 +74,8 @@ class LibraryDB:
         )
         if self._has_alternate_artist:
             cols += f", {p}alternate_artist_name"
+        if self._has_label:
+            cols += f", {p}label"
         return cols
 
     async def search(

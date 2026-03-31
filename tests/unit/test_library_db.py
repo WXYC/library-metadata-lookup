@@ -715,3 +715,139 @@ class TestAlternateArtistColumn:
         result = await db.find_similar_artist("Wagon Chrst")
         assert result == "Wagon Christ"
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# label column
+# ---------------------------------------------------------------------------
+
+
+class TestLabelColumn:
+    """Tests for label column detection and queries."""
+
+    @pytest.mark.asyncio
+    async def test_connect_detects_label_column(self, tmp_path):
+        """connect() should detect the label column and set flag."""
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT,
+                alternate_artist_name TEXT,
+                label TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist, alternate_artist_name,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        assert db._has_label is True
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_connect_without_label_column(self, tmp_path):
+        """connect() should set flag to False when label column is absent."""
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        assert db._has_label is False
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_search_returns_label_when_present(self, tmp_path):
+        """Search results should include label data when column exists."""
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT,
+                alternate_artist_name TEXT,
+                label TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist, alternate_artist_name,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.execute(
+            "INSERT INTO library VALUES "
+            "(1, 'Moon Pix', 'Cat Power', 'C', 1, 1, 'Rock', 'CD', NULL, 'Matador Records')"
+        )
+        conn.execute(
+            "INSERT INTO library_fts(rowid, title, artist, alternate_artist_name) "
+            "VALUES (1, 'Moon Pix', 'Cat Power', NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        results = await db.search(artist="Cat Power")
+        assert len(results) == 1
+        assert results[0].label == "Matador Records"
+        await db.close()
+
+    def test_select_columns_includes_label(self):
+        db = LibraryDB()
+        db._has_alternate_artist = True
+        db._has_label = True
+        cols = db._select_columns()
+        assert "label" in cols
+
+    def test_select_columns_excludes_label(self):
+        db = LibraryDB()
+        db._has_alternate_artist = True
+        db._has_label = False
+        cols = db._select_columns()
+        assert "label" not in cols
