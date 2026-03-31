@@ -58,6 +58,7 @@ class KeySecretDiscogsService(DiscogsService):
 def _create_discogs_service() -> DiscogsService:
     if _discogs_token:
         return DiscogsService(token=_discogs_token, cache_service=None)
+    assert _discogs_key is not None and _discogs_secret is not None
     return KeySecretDiscogsService(key=_discogs_key, secret=_discogs_secret, cache_service=None)
 
 
