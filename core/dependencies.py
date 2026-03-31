@@ -80,8 +80,11 @@ async def get_discogs_service(
     global _discogs_service
     global _discogs_pool
 
-    if not settings.discogs_token:
-        logger.debug("DISCOGS_TOKEN not set - Discogs service disabled")
+    has_token = bool(settings.discogs_token)
+    has_key_secret = bool(settings.discogs_api_key and settings.discogs_api_secret)
+
+    if not has_token and not has_key_secret:
+        logger.debug("No Discogs credentials set - Discogs service disabled")
         return None
 
     if _discogs_service is None:
@@ -103,7 +106,14 @@ async def get_discogs_service(
             cache_service = DiscogsCacheService(_discogs_pool)
             logger.info("Discogs cache service enabled")
 
-        _discogs_service = DiscogsService(settings.discogs_token, cache_service=cache_service)
+        if has_token:
+            _discogs_service = DiscogsService(token=settings.discogs_token, cache_service=cache_service)
+        else:
+            _discogs_service = DiscogsService(
+                api_key=settings.discogs_api_key,
+                api_secret=settings.discogs_api_secret,
+                cache_service=cache_service,
+            )
         logger.info(
             f"Discogs service initialized (cache: {'enabled' if cache_service else 'disabled'})"
         )
@@ -121,29 +131,6 @@ async def close_discogs_service() -> None:
     if _discogs_pool:
         await _discogs_pool.close()
         _discogs_pool = None
-
-
-async def get_discogs_cache_service(
-    settings: Settings = Depends(get_settings),
-) -> DiscogsCacheService | None:
-    """Get Discogs cache service instance for direct cache queries.
-
-    Returns the cache layer only (no Discogs API client). Used by endpoints
-    that query the PostgreSQL cache directly, like track autocomplete.
-
-    Returns:
-        DiscogsCacheService if the cache pool is available, None otherwise.
-    """
-    global _discogs_pool
-
-    if _discogs_pool is None:
-        # Trigger pool creation via get_discogs_service (which manages the pool lifecycle)
-        await get_discogs_service(settings)
-
-    if _discogs_pool is None:
-        return None
-
-    return DiscogsCacheService(_discogs_pool)
 
 
 def get_posthog_client(settings: Settings = Depends(get_settings)) -> Posthog | None:
