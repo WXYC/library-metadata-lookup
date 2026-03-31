@@ -4,7 +4,8 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from core.dependencies import get_discogs_service
+from core.dependencies import get_discogs_cache_service, get_discogs_service
+from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.models import (
     ArtistDetails,
     DiscogsSearchRequest,
@@ -13,6 +14,7 @@ from discogs.models import (
     EntityType,
     ReleaseMetadataResponse,
     TrackReleasesResponse,
+    TracksAutocompleteResponse,
 )
 from discogs.service import DiscogsService
 
@@ -169,3 +171,45 @@ async def resolve_entity(
         if master is None:
             raise HTTPException(status_code=404, detail=f"Master {entity_id} not found")
         return EntityResolveResponse(name=master.title, type=entity_type, id=entity_id)
+
+
+@router.get(
+    "/tracks/autocomplete",
+    response_model=TracksAutocompleteResponse,
+    summary="Autocomplete track titles for an artist",
+    responses={
+        200: {"description": "Track titles returned (may be empty on cache error)"},
+        422: {"description": "Missing required artist or q parameter"},
+        503: {"description": "Discogs cache not available"},
+    },
+)
+async def autocomplete_tracks(
+    artist: str = Query(..., description="Artist name (required)"),
+    q: str = Query(..., description="Track title prefix to search for"),
+    release: str | None = Query(None, description="Optional release title filter"),
+    limit: int = Query(20, ge=1, le=100, description="Maximum number of results"),
+    cache: DiscogsCacheService | None = Depends(get_discogs_cache_service),
+) -> TracksAutocompleteResponse:
+    """Autocomplete track titles from the Discogs cache for a given artist."""
+    if cache is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Discogs cache is not available. Set DATABASE_URL_DISCOGS.",
+        )
+
+    try:
+        results = await cache.autocomplete_tracks(artist, q, release=release, limit=limit)
+        return TracksAutocompleteResponse(
+            results=results,
+            total=len(results),
+            artist=artist,
+            cached=True,
+        )
+    except CacheUnavailableError:
+        logger.warning("Cache error during track autocomplete, returning empty results")
+        return TracksAutocompleteResponse(
+            results=[],
+            total=0,
+            artist=artist,
+            cached=True,
+        )

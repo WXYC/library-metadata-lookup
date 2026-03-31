@@ -22,9 +22,11 @@ def _get_service() -> DiscogsService | None:
     from config.settings import get_settings
 
     settings = get_settings()
-    if not settings.discogs_token:
-        return None
-    return DiscogsService(settings.discogs_token)
+    if settings.discogs_token:
+        return DiscogsService(token=settings.discogs_token)
+    if settings.discogs_api_key and settings.discogs_api_secret:
+        return DiscogsService(api_key=settings.discogs_api_key, api_secret=settings.discogs_api_secret)
+    return None
 
 
 async def lookup_releases_by_track(

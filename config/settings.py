@@ -10,8 +10,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
-    # API Keys - Optional
-    discogs_token: str | None = Field(None, description="Discogs API token for artwork lookup")
+    # API Keys - Optional (token OR key+secret, token takes precedence)
+    discogs_token: str | None = Field(None, description="Discogs personal access token")
+    discogs_api_key: str | None = Field(None, description="Discogs OAuth consumer key")
+    discogs_api_secret: str | None = Field(None, description="Discogs OAuth consumer secret")
 
     # Database Configuration
     library_db_path: Path = Field(

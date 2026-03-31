@@ -159,7 +159,7 @@ class TestGetDiscogsService:
 
             result = await get_discogs_service(mock_settings)
 
-            mock_svc_cls.assert_called_once_with("test-token", cache_service=None)
+            mock_svc_cls.assert_called_once_with(token="test-token", cache_service=None)
             assert result is mock_svc
 
     @pytest.mark.asyncio
@@ -184,7 +184,7 @@ class TestGetDiscogsService:
 
             mock_create.assert_called_once()
             mock_cache_cls.assert_called_once_with(mock_pool)
-            mock_svc_cls.assert_called_once_with("test-token", cache_service=mock_cache)
+            mock_svc_cls.assert_called_once_with(token="test-token", cache_service=mock_cache)
 
     @pytest.mark.asyncio
     async def test_pool_error_degrades_gracefully(self, mock_settings):
@@ -205,7 +205,7 @@ class TestGetDiscogsService:
             await get_discogs_service(mock_settings)
 
             # Service created without cache
-            mock_svc_cls.assert_called_once_with("test-token", cache_service=None)
+            mock_svc_cls.assert_called_once_with(token="test-token", cache_service=None)
 
     @pytest.mark.asyncio
     async def test_cached_instance(self, mock_settings):
