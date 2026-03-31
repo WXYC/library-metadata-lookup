@@ -9,6 +9,15 @@ from pydantic import BaseModel
 from generated.api_models import DiscogsMatchResult as _GeneratedDiscogsMatchResult
 
 
+class TracksAutocompleteResponse(BaseModel):
+    """Response for track title autocomplete from cache."""
+
+    results: list[str] = []
+    total: int = 0
+    artist: str
+    cached: bool = True
+
+
 class ArtistCredit(BaseModel):
     """An artist credit on a release."""
 

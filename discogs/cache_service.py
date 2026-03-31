@@ -135,6 +135,58 @@ class DiscogsCacheService:
             logger.error(f"Cache search failed: {e}")
             raise CacheUnavailableError(f"Cache search failed: {e}") from e
 
+    async def autocomplete_tracks(
+        self, artist: str, q: str, *, release: str | None = None, limit: int = 20
+    ) -> list[str]:
+        """Autocomplete track titles for an artist from the cache.
+
+        Searches the release_track table for track titles matching the prefix,
+        filtered by artist. Returns distinct, sorted titles.
+
+        Args:
+            artist: Artist name to filter by (required).
+            q: Track title prefix to search for.
+            release: Optional release title to filter by.
+            limit: Maximum number of results after deduplication.
+
+        Returns:
+            Sorted list of distinct track titles.
+
+        Raises:
+            CacheUnavailableError: If the database is unreachable.
+        """
+        try:
+            query = """
+                SELECT rt.title
+                FROM release_track rt
+                JOIN release_artist ra ON ra.release_id = rt.release_id AND ra.extra = 0
+                LEFT JOIN release r ON r.id = rt.release_id
+                WHERE lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($1))
+                  AND lower(f_unaccent(rt.title)) ILIKE f_unaccent($2) || '%'
+                  AND ($3::text IS NULL OR lower(f_unaccent(r.title)) % lower(f_unaccent($3)))
+                LIMIT $4
+            """
+
+            # Overfetch to allow for dedup
+            rows = await self.pool.fetch(query, artist, q, release, limit * 5)
+
+            # Case-insensitive dedup (first occurrence wins), then sort
+            seen: set[str] = set()
+            titles: list[str] = []
+            for row in rows:
+                title = row["title"]
+                key = title.lower()
+                if key not in seen:
+                    seen.add(key)
+                    titles.append(title)
+
+            titles.sort(key=str.lower)
+            return titles[:limit]
+
+        except Exception as e:
+            logger.error(f"Cache autocomplete_tracks failed: {e}")
+            raise CacheUnavailableError(f"Cache autocomplete_tracks failed: {e}") from e
+
     async def get_release(self, release_id: int) -> ReleaseMetadataResponse | None:
         """Get full release metadata by ID.
 
