@@ -4,6 +4,19 @@
 
 A FastAPI service for WXYC radio that searches the library catalog and cross-references results with Discogs metadata.
 
+## Dependents
+
+These projects depend on library-metadata-lookup:
+
+| Project | Relationship |
+|---|---|
+| [request-o-matic](https://github.com/WXYC/request-o-matic) | Primary consumer. Calls `POST /api/v1/lookup` to resolve song requests before posting to Slack. |
+| [Backend-Service](https://github.com/WXYC/Backend-Service) | Calls this service for library search and Discogs metadata. |
+| [dj-site](https://github.com/WXYC/dj-site) | Indirect via Backend-Service. DJ flowsheet and card catalog frontend. |
+| [wxyc-ios-64](https://github.com/WXYC/wxyc-ios-64) | Indirect via Backend-Service. iOS/macOS/tvOS/watchOS app. |
+| [WXYC-Android](https://github.com/WXYC/WXYC-Android) | Indirect via Backend-Service. Android app. |
+| [discogs-cache](https://github.com/WXYC/discogs-cache) | Shared data. Its ETL pipeline produces `library.db` (consumed at runtime by this service) and populates the PostgreSQL Discogs cache (queried by `discogs/cache_service.py`). |
+
 ## What it does
 
 Given an artist, song, and/or album, the service:
