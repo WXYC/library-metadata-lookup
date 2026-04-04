@@ -881,6 +881,7 @@ class LibraryCatalogItem(BaseModel):
     )
     genre: str | None = Field(None, description="Genre classification")
     format: str | None = Field(None, description="Physical format (vinyl, CD, etc.)")
+    label: str | None = Field(None, description="Record label name from the library catalog")
     call_number: str = Field(
         ...,
         description='Full call number for shelf lookup, e.g. "Rock CD ABC 123/45". Computed from genre, format, call_letters, artist_call_number, and release_call_number.\n',
