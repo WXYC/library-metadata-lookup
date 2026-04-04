@@ -18,20 +18,28 @@ async def db():
     await results_db.close()
 
 
-def _make_album(**kwargs) -> DeduplicatedAlbum:
-    defaults = {
-        "normalized_artist": "stereolab",
-        "normalized_title": "aluminum tunes",
-        "display_artist": "Stereolab",
-        "display_title": "Aluminum Tunes",
-        "library_ids": [1, 2],
-        "formats": ["cd", "vinyl - LP"],
-        "genre": "Rock",
-        "label": "Duophonic",
-        "is_compilation": False,
-    }
-    defaults.update(kwargs)
-    return DeduplicatedAlbum(**defaults)
+def _make_album(
+    normalized_artist: str = "stereolab",
+    normalized_title: str = "aluminum tunes",
+    display_artist: str = "Stereolab",
+    display_title: str = "Aluminum Tunes",
+    library_ids: list[int] | None = None,
+    formats: list[str] | None = None,
+    genre: str | None = "Rock",
+    label: str | None = "Duophonic",
+    is_compilation: bool = False,
+) -> DeduplicatedAlbum:
+    return DeduplicatedAlbum(
+        normalized_artist=normalized_artist,
+        normalized_title=normalized_title,
+        display_artist=display_artist,
+        display_title=display_title,
+        library_ids=library_ids if library_ids is not None else [1, 2],
+        formats=formats if formats is not None else ["cd", "vinyl - LP"],
+        genre=genre,
+        label=label,
+        is_compilation=is_compilation,
+    )
 
 
 class TestInsertAlbums:

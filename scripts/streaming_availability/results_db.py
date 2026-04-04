@@ -96,7 +96,7 @@ class ResultsDB:
             f"SELECT * FROM albums WHERE {col} = 'pending' LIMIT ?",  # noqa: S608
             (limit,),
         )
-        return await cursor.fetchall()
+        return list(await cursor.fetchall())
 
     async def get_spotify_misses_pending_apple(self, limit: int = 100) -> list[aiosqlite.Row]:
         """Get albums not found on Spotify that haven't been checked on Apple Music."""
@@ -105,7 +105,7 @@ class ResultsDB:
             "SELECT * FROM albums WHERE spotify_status = 'not_found' AND apple_status = 'pending' LIMIT ?",
             (limit,),
         )
-        return await cursor.fetchall()
+        return list(await cursor.fetchall())
 
     async def update_result(
         self,
@@ -149,7 +149,7 @@ class ResultsDB:
 
         cursor = await self._db.execute("SELECT COUNT(*) FROM albums")
         row = await cursor.fetchone()
-        stats["total"] = row[0]
+        stats["total"] = row[0] if row else 0
 
         for service in ("spotify", "apple"):
             col = f"{service}_status"
@@ -167,7 +167,7 @@ class ResultsDB:
         cursor = await self._db.execute("""SELECT * FROM albums
                WHERE spotify_status = 'not_found' AND apple_status = 'not_found'
                ORDER BY display_artist, display_title""")
-        return await cursor.fetchall()
+        return list(await cursor.fetchall())
 
     async def get_all_results(self) -> list[aiosqlite.Row]:
         """Get all albums ordered by artist and title."""
@@ -175,4 +175,4 @@ class ResultsDB:
         cursor = await self._db.execute(
             "SELECT * FROM albums ORDER BY display_artist, display_title"
         )
-        return await cursor.fetchall()
+        return list(await cursor.fetchall())
