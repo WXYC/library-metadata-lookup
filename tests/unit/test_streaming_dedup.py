@@ -170,3 +170,42 @@ class TestDeduplicateLibrary:
         result = await deduplicate_library(db_path)
         assert len(result) == 1
         assert sorted(result[0].library_ids) == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_vinyl_12_inch_flagged_as_single(self, tmp_path):
+        db_path = _create_test_db(
+            tmp_path,
+            [(1, 'Feel It 12"', "The Afros", "A", 1, 1, "Hiphop", 'vinyl - 12"', None, None)],
+        )
+        result = await deduplicate_library(db_path)
+        assert result[0].is_single is True
+
+    @pytest.mark.asyncio
+    async def test_vinyl_7_inch_flagged_as_single(self, tmp_path):
+        db_path = _create_test_db(
+            tmp_path,
+            [(1, "Blue Monday", "New Order", "N", 1, 1, "Rock", 'vinyl - 7"', None, None)],
+        )
+        result = await deduplicate_library(db_path)
+        assert result[0].is_single is True
+
+    @pytest.mark.asyncio
+    async def test_cd_not_flagged_as_single(self, tmp_path):
+        db_path = _create_test_db(
+            tmp_path,
+            [(1, "Aluminum Tunes", "Stereolab", "S", 1, 1, "Rock", "cd", None, None)],
+        )
+        result = await deduplicate_library(db_path)
+        assert result[0].is_single is False
+
+    @pytest.mark.asyncio
+    async def test_album_with_cd_and_single_not_flagged(self, tmp_path):
+        db_path = _create_test_db(
+            tmp_path,
+            [
+                (1, "Moon Pix", "Cat Power", "C", 1, 1, "Rock", "cd", None, None),
+                (2, "Moon Pix", "Cat Power", "C", 1, 2, "Rock", 'vinyl - 12"', None, None),
+            ],
+        )
+        result = await deduplicate_library(db_path)
+        assert result[0].is_single is False

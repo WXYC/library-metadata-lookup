@@ -1,23 +1,18 @@
 """Unit tests for scripts/streaming_availability/matching.py."""
 
 import pytest
-
 from scripts.streaming_availability.matching import (
     is_acceptable_match,
     normalize_album_title,
     normalize_artist_name,
     score_match,
+    strip_discogs_suffix,
     strip_format_suffix,
+    strip_the_prefix,
 )
-
-# ---------------------------------------------------------------------------
-# strip_format_suffix
-# ---------------------------------------------------------------------------
 
 
 class TestStripFormatSuffix:
-    """Tests for removing trailing format indicators from library titles."""
-
     @pytest.mark.parametrize(
         "title, expected",
         [
@@ -38,14 +33,10 @@ class TestStripFormatSuffix:
             pytest.param("", "", id="empty-string"),
             pytest.param("S/t", "S/t", id="self-titled-unchanged"),
             pytest.param(
-                "Hotel Insomnia (Limited Edition)",
-                "Hotel Insomnia",
-                id="parenthetical-limited-edition",
+                "Hotel Insomnia (Limited Edition)", "Hotel Insomnia", id="parenthetical-limited"
             ),
             pytest.param(
-                "Gasoline (Anniversary Edition)",
-                "Gasoline",
-                id="parenthetical-anniversary",
+                "Gasoline (Anniversary Edition)", "Gasoline", id="parenthetical-anniversary"
             ),
         ],
     )
@@ -53,14 +44,7 @@ class TestStripFormatSuffix:
         assert strip_format_suffix(title) == expected
 
 
-# ---------------------------------------------------------------------------
-# normalize_album_title
-# ---------------------------------------------------------------------------
-
-
 class TestNormalizeAlbumTitle:
-    """Tests for full album title normalization pipeline."""
-
     @pytest.mark.parametrize(
         "title, expected",
         [
@@ -74,14 +58,7 @@ class TestNormalizeAlbumTitle:
         assert normalize_album_title(title) == expected
 
 
-# ---------------------------------------------------------------------------
-# normalize_artist_name
-# ---------------------------------------------------------------------------
-
-
 class TestNormalizeArtistName:
-    """Tests for artist name normalization."""
-
     @pytest.mark.parametrize(
         "artist, expected",
         [
@@ -95,51 +72,34 @@ class TestNormalizeArtistName:
         assert normalize_artist_name(artist) == expected
 
 
-# ---------------------------------------------------------------------------
-# score_match
-# ---------------------------------------------------------------------------
-
-
 class TestScoreMatch:
-    """Tests for fuzzy match scoring."""
-
     def test_exact_match(self):
-        score = score_match("Stereolab", "Stereolab")
-        assert score == 100.0
+        assert score_match("Stereolab", "Stereolab") == 100.0
 
     def test_case_insensitive_match(self):
-        score = score_match("stereolab", "Stereolab")
-        assert score == 100.0
+        assert score_match("stereolab", "Stereolab") == 100.0
 
     def test_diacritics_match(self):
-        score = score_match("Bjork", "Björk")
-        assert score == 100.0
+        assert score_match("Bjork", "Björk") == 100.0
 
     def test_remastered_suffix_high_score(self):
-        score = score_match("Confield", "Confield (Remastered)")
-        assert score >= 80.0
+        assert score_match("Confield", "Confield (Remastered)") >= 80.0
 
     def test_completely_different_low_score(self):
-        score = score_match("Stereolab", "Stereo MC's")
-        assert score < 80.0
+        assert score_match("Stereolab", "Stereo MC's") < 80.0
 
     def test_empty_strings(self):
-        score = score_match("", "")
-        assert score == 100.0
+        assert score_match("", "") == 100.0
 
     def test_one_empty_string(self):
-        score = score_match("Stereolab", "")
-        assert score == 0.0
+        assert score_match("Stereolab", "") == 0.0
 
-
-# ---------------------------------------------------------------------------
-# is_acceptable_match
-# ---------------------------------------------------------------------------
+    def test_the_prefix_mismatch(self):
+        """'Afros' should score well against 'The Afros'."""
+        assert score_match("Afros", "The Afros") >= 80.0
 
 
 class TestIsAcceptableMatch:
-    """Tests for match acceptance threshold logic."""
-
     def test_both_high_accepted(self):
         assert is_acceptable_match(95.0, 90.0) is True
 
@@ -154,3 +114,38 @@ class TestIsAcceptableMatch:
 
     def test_both_below_threshold_rejected(self):
         assert is_acceptable_match(50.0, 50.0) is False
+
+
+class TestStripDiscogsSuffix:
+    @pytest.mark.parametrize(
+        "name, expected",
+        [
+            pytest.param("DNA (22)", "DNA", id="numbered-suffix"),
+            pytest.param("Asia (2)", "Asia", id="single-digit"),
+            pytest.param("Björk", "Björk", id="no-suffix"),
+            pytest.param("The Afros", "The Afros", id="no-suffix-the"),
+            pytest.param("", "", id="empty"),
+            pytest.param(
+                "Moon Pix (Deluxe Edition)",
+                "Moon Pix (Deluxe Edition)",
+                id="non-numeric-parens-preserved",
+            ),
+        ],
+    )
+    def test_strip_discogs_suffix(self, name, expected):
+        assert strip_discogs_suffix(name) == expected
+
+
+class TestStripThePrefix:
+    @pytest.mark.parametrize(
+        "name, expected",
+        [
+            pytest.param("The Afros", "Afros", id="strips-the"),
+            pytest.param("Stereolab", "Stereolab", id="no-the"),
+            pytest.param("The The", "The", id="the-the"),
+            pytest.param("Theodore", "Theodore", id="the-substring-preserved"),
+            pytest.param("", "", id="empty"),
+        ],
+    )
+    def test_strip_the_prefix(self, name, expected):
+        assert strip_the_prefix(name) == expected

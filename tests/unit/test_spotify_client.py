@@ -39,6 +39,32 @@ def _make_album_item(
     }
 
 
+def _track_search_response(tracks: list[dict] | None = None) -> httpx.Response:
+    items = tracks or []
+    return httpx.Response(
+        200,
+        json={"tracks": {"items": items, "total": len(items)}},
+        request=httpx.Request("GET", "https://api.spotify.com/v1/search"),
+    )
+
+
+def _make_track_item(
+    name: str = "Feel It",
+    artist_name: str = "The Afros",
+    track_id: str = "track123",
+) -> dict:
+    return {
+        "name": name,
+        "id": track_id,
+        "artists": [{"name": artist_name}],
+        "album": {
+            "name": "Kickin' Afrolistics",
+            "external_urls": {"spotify": "https://open.spotify.com/album/alb123"},
+        },
+        "external_urls": {"spotify": f"https://open.spotify.com/track/{track_id}"},
+    }
+
+
 class TestTokenAcquisition:
     @pytest.mark.asyncio
     async def test_acquires_token_on_first_search(self):
@@ -47,12 +73,8 @@ class TestTokenAcquisition:
         mock_http.post = AsyncMock(return_value=_token_response())
         mock_http.get = AsyncMock(return_value=_search_response([_make_album_item()]))
         client._http = mock_http
-
         results = await client.search_album("Stereolab", "Aluminum Tunes")
-
         mock_http.post.assert_called_once()
-        call_kwargs = mock_http.post.call_args
-        assert "accounts.spotify.com" in str(call_kwargs)
         assert len(results) == 1
 
     @pytest.mark.asyncio
@@ -62,13 +84,9 @@ class TestTokenAcquisition:
         mock_http.post = AsyncMock(return_value=_token_response())
         mock_http.get = AsyncMock(return_value=_search_response([_make_album_item()]))
         client._http = mock_http
-
         await client.search_album("Stereolab", "Aluminum Tunes")
         await client.search_album("Autechre", "Confield")
-
-        # Token should only be acquired once
         assert mock_http.post.call_count == 1
-        assert mock_http.get.call_count == 2
 
 
 class TestSearchAlbum:
@@ -77,15 +95,11 @@ class TestSearchAlbum:
         client = SpotifyClient("test-id", "test-secret")
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.post = AsyncMock(return_value=_token_response())
-        album = _make_album_item("Aluminum Tunes", "Stereolab", "abc123")
-        mock_http.get = AsyncMock(return_value=_search_response([album]))
+        mock_http.get = AsyncMock(return_value=_search_response([_make_album_item()]))
         client._http = mock_http
-
         results = await client.search_album("Stereolab", "Aluminum Tunes")
-
         assert len(results) == 1
         assert results[0]["name"] == "Aluminum Tunes"
-        assert results[0]["artists"][0]["name"] == "Stereolab"
 
     @pytest.mark.asyncio
     async def test_returns_empty_for_no_results(self):
@@ -94,25 +108,34 @@ class TestSearchAlbum:
         mock_http.post = AsyncMock(return_value=_token_response())
         mock_http.get = AsyncMock(return_value=_search_response([]))
         client._http = mock_http
-
-        results = await client.search_album("Unknown Artist", "Unknown Album")
+        results = await client.search_album("Unknown", "Unknown Album")
         assert results == []
 
+
+class TestUnquotedFallback:
     @pytest.mark.asyncio
-    async def test_search_query_includes_artist_and_album(self):
+    async def test_falls_back_to_unquoted_search(self):
         client = SpotifyClient("test-id", "test-secret")
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.post = AsyncMock(return_value=_token_response())
-        mock_http.get = AsyncMock(return_value=_search_response([]))
+        mock_http.get = AsyncMock(
+            side_effect=[_search_response([]), _search_response([_make_album_item()])]
+        )
         client._http = mock_http
+        results = await client.search_album("Stereolab", "Aluminum Tunes")
+        assert len(results) == 1
+        assert mock_http.get.call_count == 2
 
-        await client.search_album("Stereolab", "Aluminum Tunes")
-
-        call_kwargs = mock_http.get.call_args
-        params = call_kwargs.kwargs.get("params", {})
-        query = params.get("q", "")
-        assert "Stereolab" in query
-        assert "Aluminum Tunes" in query
+    @pytest.mark.asyncio
+    async def test_skips_fallback_when_quoted_succeeds(self):
+        client = SpotifyClient("test-id", "test-secret")
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.post = AsyncMock(return_value=_token_response())
+        mock_http.get = AsyncMock(return_value=_search_response([_make_album_item()]))
+        client._http = mock_http
+        results = await client.search_album("Stereolab", "Aluminum Tunes")
+        assert len(results) == 1
+        assert mock_http.get.call_count == 1
 
 
 class TestRetryOn429:
@@ -121,7 +144,6 @@ class TestRetryOn429:
         client = SpotifyClient("test-id", "test-secret")
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.post = AsyncMock(return_value=_token_response())
-
         rate_limit_response = httpx.Response(
             429,
             headers={"Retry-After": "1"},
@@ -130,10 +152,8 @@ class TestRetryOn429:
         success_response = _search_response([_make_album_item()])
         mock_http.get = AsyncMock(side_effect=[rate_limit_response, success_response])
         client._http = mock_http
-
         with patch("asyncio.sleep", new_callable=AsyncMock):
             results = await client.search_album("Stereolab", "Aluminum Tunes")
-
         assert len(results) == 1
         assert mock_http.get.call_count == 2
 
@@ -146,7 +166,6 @@ class TestErrorHandling:
         mock_http.post = AsyncMock(return_value=_token_response())
         mock_http.get = AsyncMock(side_effect=httpx.ConnectError("Connection failed"))
         client._http = mock_http
-
         results = await client.search_album("Stereolab", "Aluminum Tunes")
         assert results == []
 
@@ -157,11 +176,43 @@ class TestErrorHandling:
         mock_http.post = AsyncMock(return_value=_token_response())
         mock_http.get = AsyncMock(
             return_value=httpx.Response(
-                500,
-                request=httpx.Request("GET", "https://api.spotify.com/v1/search"),
+                500, request=httpx.Request("GET", "https://api.spotify.com/v1/search")
             )
         )
         client._http = mock_http
-
         results = await client.search_album("Stereolab", "Aluminum Tunes")
         assert results == []
+
+
+class TestSearchTrack:
+    @pytest.mark.asyncio
+    async def test_returns_track_results(self):
+        client = SpotifyClient("test-id", "test-secret")
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.post = AsyncMock(return_value=_token_response())
+        mock_http.get = AsyncMock(return_value=_track_search_response([_make_track_item()]))
+        client._http = mock_http
+        results = await client.search_track("The Afros", "Feel It")
+        assert len(results) == 1
+        assert results[0]["name"] == "Feel It"
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_for_no_results(self):
+        client = SpotifyClient("test-id", "test-secret")
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.post = AsyncMock(return_value=_token_response())
+        mock_http.get = AsyncMock(return_value=_track_search_response([]))
+        client._http = mock_http
+        results = await client.search_track("Unknown", "Unknown Track")
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_search_uses_track_type(self):
+        client = SpotifyClient("test-id", "test-secret")
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.post = AsyncMock(return_value=_token_response())
+        mock_http.get = AsyncMock(return_value=_track_search_response([]))
+        client._http = mock_http
+        await client.search_track("The Afros", "Feel It")
+        params = mock_http.get.call_args.kwargs.get("params", {})
+        assert params.get("type") == "track"

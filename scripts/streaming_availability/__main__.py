@@ -1,19 +1,10 @@
 """Analyze streaming availability for the WXYC library catalog.
 
-Searches Spotify and Apple Music to identify albums NOT on streaming platforms.
+Searches Deezer (pre-filter), Spotify, and Apple Music to identify albums
+NOT on streaming platforms.
 
 Usage:
     uv run python -m scripts.streaming_availability [OPTIONS]
-
-Options:
-    --library-db PATH     Path to library.db (default: library.db)
-    --results-db PATH     Path to results database (default: streaming_availability.db)
-    --output PATH         CSV output path (default: streaming_report.csv)
-    --spotify-only        Skip Apple Music phase
-    --batch-size INT      Albums per progress log (default: 100)
-    --dry-run             Populate albums table only, no API calls
-    --stats               Show current stats and exit
-    --retry-errors        Re-check albums with status 'error'
 """
 
 from __future__ import annotations
@@ -27,21 +18,26 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-
 from scripts.streaming_availability.apple_music_client import AppleMusicClient
-from scripts.streaming_availability.dedup import deduplicate_library
 from scripts.streaming_availability.matching import (
     is_acceptable_match,
     score_match,
     strip_format_suffix,
 )
 from scripts.streaming_availability.report import generate_csv_report, generate_summary
+
+from scripts.streaming_availability.dedup import deduplicate_library
+from scripts.streaming_availability.deezer_client import DeezerClient
+from scripts.streaming_availability.discogs_enricher import (
+    build_artist_mapping,
+    check_wxyc_schema,
+    enrich_album,
+)
 from scripts.streaming_availability.results_db import ResultsDB
 from scripts.streaming_availability.spotify_client import SpotifyClient
 
 logger = logging.getLogger("streaming_availability")
 
-# Graceful shutdown flag
 _shutdown_requested = False
 
 
@@ -54,13 +50,18 @@ def _handle_signal(signum, frame):
     _shutdown_requested = True
 
 
+# ---------------------------------------------------------------------------
+# Processing functions
+# ---------------------------------------------------------------------------
+
+
 async def _process_spotify(
     results_db: ResultsDB,
     spotify: SpotifyClient,
     batch_size: int,
     retry_errors: bool = False,
 ) -> None:
-    """Process all pending albums against Spotify."""
+    """Process pending albums against Spotify."""
     stats = await results_db.get_stats()
     spotify_stats = stats.get("spotify", {})
     total_pending = spotify_stats.get("pending", 0)
@@ -86,31 +87,39 @@ async def _process_spotify(
                 break
 
             album_id = row["id"]
-            artist = row["display_artist"]
-            title = strip_format_suffix(row["display_title"])
+            artist = row["discogs_artist"] or row["display_artist"]
+            title = strip_format_suffix(row["discogs_title"] or row["display_title"])
+            is_single = bool(row["is_single"])
 
             try:
+                # Album search first
                 results = await spotify.search_album(artist, title)
-                if not results:
+                best = _find_best_spotify_match(artist, title, results) if results else None
+
+                # For singles: fall back to track search if album search missed
+                if not best and is_single:
+                    track_results = await spotify.search_track(artist, title)
+                    best = (
+                        _find_best_track_match(artist, title, track_results)
+                        if track_results
+                        else None
+                    )
+
+                if best:
+                    await results_db.update_result(
+                        album_id,
+                        "spotify",
+                        "found",
+                        url=best["url"],
+                        spotify_id=best["id"],
+                        confidence=best["confidence"],
+                        matched_artist=best["matched_artist"],
+                        matched_title=best["matched_title"],
+                    )
+                    found += 1
+                else:
                     await results_db.update_result(album_id, "spotify", "not_found")
                     not_found += 1
-                else:
-                    best = _find_best_spotify_match(artist, title, results)
-                    if best:
-                        await results_db.update_result(
-                            album_id,
-                            "spotify",
-                            "found",
-                            url=best["url"],
-                            spotify_id=best["id"],
-                            confidence=best["confidence"],
-                            matched_artist=best["matched_artist"],
-                            matched_title=best["matched_title"],
-                        )
-                        found += 1
-                    else:
-                        await results_db.update_result(album_id, "spotify", "not_found")
-                        not_found += 1
             except Exception:
                 logger.exception("Error processing %s - %s", artist, title)
                 await results_db.update_result(album_id, "spotify", "error")
@@ -119,20 +128,24 @@ async def _process_spotify(
             processed += 1
             if processed % batch_size == 0:
                 pct = processed / total_pending * 100
+                hit_rate = found / processed * 100 if processed else 0
                 logger.info(
-                    "  Spotify: %d / %d (%.1f%%) | found: %d | not found: %d | errors: %d",
+                    "  Spotify: %d / %d (%.1f%%) | found: %d (%.0f%%) | not found: %d | errors: %d",
                     processed,
                     total_pending,
                     pct,
                     found,
+                    hit_rate,
                     not_found,
                     errors,
                 )
 
+    hit_rate = found / processed * 100 if processed else 0
     logger.info(
-        "Spotify complete: %d processed | found: %d | not found: %d | errors: %d",
+        "Spotify complete: %d processed | found: %d (%.0f%%) | not found: %d | errors: %d",
         processed,
         found,
+        hit_rate,
         not_found,
         errors,
     )
@@ -142,17 +155,24 @@ async def _process_apple_music(
     results_db: ResultsDB,
     apple: AppleMusicClient,
     batch_size: int,
+    check_all: bool = False,
 ) -> None:
-    """Process Spotify misses against Apple Music."""
-    rows = await results_db.get_spotify_misses_pending_apple(limit=1)
+    """Process albums against Apple Music."""
+
+    async def _get_rows(limit: int) -> list:
+        if check_all:
+            return await results_db.get_pending("apple", limit=limit)
+        return await results_db.get_spotify_misses_pending_apple(limit=limit)
+
+    rows = await _get_rows(limit=1)
     if not rows:
         logger.info("No albums to check on Apple Music")
         return
 
-    # Get total count for progress reporting
-    all_pending = await results_db.get_spotify_misses_pending_apple(limit=100_000)
+    all_pending = await _get_rows(limit=100_000)
     total_pending = len(all_pending)
-    logger.info("Apple Music: %d albums to check (Spotify misses)", total_pending)
+    label = "all pending" if check_all else "Spotify misses"
+    logger.info("Apple Music: %d albums to check (%s)", total_pending, label)
 
     processed = 0
     found = 0
@@ -160,7 +180,183 @@ async def _process_apple_music(
     errors = 0
 
     while not _shutdown_requested:
-        rows = await results_db.get_spotify_misses_pending_apple(limit=batch_size)
+        rows = await _get_rows(limit=batch_size)
+        if not rows:
+            break
+
+        for row in rows:
+            if _shutdown_requested:
+                break
+
+            album_id = row["id"]
+            artist = row["discogs_artist"] or row["display_artist"]
+            title = strip_format_suffix(row["discogs_title"] or row["display_title"])
+
+            try:
+                results = await apple.search_album(artist, title)
+                best = _find_best_apple_match(artist, title, results) if results else None
+                if best:
+                    await results_db.update_result(
+                        album_id,
+                        "apple",
+                        "found",
+                        url=best["url"],
+                        confidence=best["confidence"],
+                        matched_artist=best["matched_artist"],
+                        matched_title=best["matched_title"],
+                    )
+                    found += 1
+                else:
+                    await results_db.update_result(album_id, "apple", "not_found")
+                    not_found += 1
+            except Exception:
+                logger.exception("Error processing %s - %s", artist, title)
+                await results_db.update_result(album_id, "apple", "error")
+                errors += 1
+
+            processed += 1
+            if processed % batch_size == 0:
+                pct = processed / total_pending * 100
+                hit_rate = found / processed * 100 if processed else 0
+                logger.info(
+                    "  Apple Music: %d / %d (%.1f%%) | found: %d (%.0f%%) | not found: %d | errors: %d",
+                    processed,
+                    total_pending,
+                    pct,
+                    found,
+                    hit_rate,
+                    not_found,
+                    errors,
+                )
+
+    hit_rate = found / processed * 100 if processed else 0
+    logger.info(
+        "Apple Music complete: %d processed | found: %d (%.0f%%) | not found: %d | errors: %d",
+        processed,
+        found,
+        hit_rate,
+        not_found,
+        errors,
+    )
+
+
+async def _process_deezer(
+    results_db: ResultsDB,
+    deezer: DeezerClient,
+    batch_size: int,
+) -> None:
+    """Pre-filter albums through Deezer to identify digitally distributed releases."""
+    rows = await results_db.get_pending("deezer", limit=1)
+    if not rows:
+        logger.info("No albums to check on Deezer")
+        return
+
+    all_pending = await results_db.get_pending("deezer", limit=100_000)
+    total_pending = len(all_pending)
+    logger.info("Deezer pre-filter: %d albums to check", total_pending)
+
+    processed = 0
+    found = 0
+    not_found = 0
+    errors = 0
+
+    while not _shutdown_requested:
+        rows = await results_db.get_pending("deezer", limit=batch_size)
+        if not rows:
+            break
+
+        for row in rows:
+            if _shutdown_requested:
+                break
+
+            album_id = row["id"]
+            artist = row["discogs_artist"] or row["display_artist"]
+            title = strip_format_suffix(row["discogs_title"] or row["display_title"])
+            is_single = bool(row["is_single"])
+
+            try:
+                results = await deezer.search_album(artist, title)
+                best = _find_best_deezer_match(artist, title, results) if results else None
+
+                if not best and is_single:
+                    track_results = await deezer.search_track(artist, title)
+                    best = (
+                        _find_best_deezer_track_match(artist, title, track_results)
+                        if track_results
+                        else None
+                    )
+
+                if best:
+                    await results_db.update_result(
+                        album_id,
+                        "deezer",
+                        "found",
+                        url=best["url"],
+                        confidence=best["confidence"],
+                        matched_artist=best["matched_artist"],
+                        matched_title=best["matched_title"],
+                    )
+                    found += 1
+                else:
+                    await results_db.update_result(album_id, "deezer", "not_found")
+                    not_found += 1
+            except Exception:
+                logger.exception("Error processing %s - %s", artist, title)
+                await results_db.update_result(album_id, "deezer", "error")
+                errors += 1
+
+            processed += 1
+            if processed % batch_size == 0:
+                pct = processed / total_pending * 100
+                hit_rate = found / processed * 100 if processed else 0
+                logger.info(
+                    "  Deezer: %d / %d (%.1f%%) | found: %d (%.0f%%) | not found: %d | errors: %d",
+                    processed,
+                    total_pending,
+                    pct,
+                    found,
+                    hit_rate,
+                    not_found,
+                    errors,
+                )
+
+    hit_rate = found / processed * 100 if processed else 0
+    logger.info(
+        "Deezer complete: %d processed | found: %d (%.0f%%) | not found: %d | errors: %d",
+        processed,
+        found,
+        hit_rate,
+        not_found,
+        errors,
+    )
+
+
+async def _process_discogs_enrichment(
+    results_db: ResultsDB,
+    pool: object,
+    batch_size: int,
+    artist_mapping: dict[str, str] | None = None,
+) -> None:
+    """Enrich all pending albums with Discogs canonical names."""
+    rows = await results_db.get_pending_discogs(limit=1)
+    if not rows:
+        logger.info("No albums to enrich from Discogs")
+        return
+
+    all_pending = await results_db.get_pending_discogs(limit=100_000)
+    total_pending = len(all_pending)
+    mapped = len(artist_mapping) if artist_mapping else 0
+    logger.info(
+        "Discogs enrichment: %d albums to process (%d artist mappings)", total_pending, mapped
+    )
+
+    processed = 0
+    found = 0
+    not_found = 0
+    errors = 0
+
+    while not _shutdown_requested:
+        rows = await results_db.get_pending_discogs(limit=batch_size)
         if not rows:
             break
 
@@ -173,67 +369,65 @@ async def _process_apple_music(
             title = strip_format_suffix(row["display_title"])
 
             try:
-                results = await apple.search_album(artist, title)
-                if not results:
-                    await results_db.update_result(album_id, "apple", "not_found")
-                    not_found += 1
+                match = await enrich_album(pool, artist, title, artist_mapping=artist_mapping)
+                if match:
+                    await results_db.update_discogs_result(
+                        album_id,
+                        "found",
+                        artist=match["artist_name"],
+                        title=match["title"],
+                        release_id=match["release_id"],
+                    )
+                    found += 1
                 else:
-                    best = _find_best_apple_match(artist, title, results)
-                    if best:
-                        await results_db.update_result(
-                            album_id,
-                            "apple",
-                            "found",
-                            url=best["url"],
-                            confidence=best["confidence"],
-                            matched_artist=best["matched_artist"],
-                            matched_title=best["matched_title"],
-                        )
-                        found += 1
-                    else:
-                        await results_db.update_result(album_id, "apple", "not_found")
-                        not_found += 1
+                    await results_db.update_discogs_result(album_id, "not_found")
+                    not_found += 1
             except Exception:
-                logger.exception("Error processing %s - %s", artist, title)
-                await results_db.update_result(album_id, "apple", "error")
+                logger.exception("Discogs enrichment error: %s - %s", artist, title)
+                await results_db.update_discogs_result(album_id, "error")
                 errors += 1
 
             processed += 1
             if processed % batch_size == 0:
                 pct = processed / total_pending * 100
+                hit_rate = found / processed * 100 if processed else 0
                 logger.info(
-                    "  Apple Music: %d / %d (%.1f%%) | found: %d | not found: %d | errors: %d",
+                    "  Discogs: %d / %d (%.1f%%) | found: %d (%.0f%%) | not found: %d | errors: %d",
                     processed,
                     total_pending,
                     pct,
                     found,
+                    hit_rate,
                     not_found,
                     errors,
                 )
 
+    hit_rate = found / processed * 100 if processed else 0
     logger.info(
-        "Apple Music complete: %d processed | found: %d | not found: %d | errors: %d",
+        "Discogs enrichment complete: %d processed | found: %d (%.0f%%) | not found: %d | errors: %d",
         processed,
         found,
+        hit_rate,
         not_found,
         errors,
     )
 
 
+# ---------------------------------------------------------------------------
+# Match scoring helpers
+# ---------------------------------------------------------------------------
+
+
 def _find_best_spotify_match(artist: str, title: str, results: list[dict]) -> dict | None:
-    """Find the best matching album from Spotify search results."""
     best: dict | None = None
     best_score = 0.0
-
     for album in results:
         spotify_artist = album.get("artists", [{}])[0].get("name", "")
         spotify_title = album.get("name", "")
         artist_score = score_match(artist, spotify_artist)
         title_score = score_match(title, spotify_title)
-
         if not is_acceptable_match(artist_score, title_score):
             continue
-
         combined = (artist_score + title_score) / 2
         if combined > best_score:
             best_score = combined
@@ -244,24 +438,42 @@ def _find_best_spotify_match(artist: str, title: str, results: list[dict]) -> di
                 "matched_artist": spotify_artist,
                 "matched_title": spotify_title,
             }
+    return best
 
+
+def _find_best_track_match(artist: str, title: str, results: list[dict]) -> dict | None:
+    best: dict | None = None
+    best_score = 0.0
+    for track in results:
+        spotify_artist = track.get("artists", [{}])[0].get("name", "")
+        spotify_title = track.get("name", "")
+        artist_score = score_match(artist, spotify_artist)
+        title_score = score_match(title, spotify_title)
+        if not is_acceptable_match(artist_score, title_score):
+            continue
+        combined = (artist_score + title_score) / 2
+        if combined > best_score:
+            best_score = combined
+            best = {
+                "url": track.get("external_urls", {}).get("spotify", ""),
+                "id": track.get("id", ""),
+                "confidence": combined,
+                "matched_artist": spotify_artist,
+                "matched_title": spotify_title,
+            }
     return best
 
 
 def _find_best_apple_match(artist: str, title: str, results: list[dict]) -> dict | None:
-    """Find the best matching album from iTunes search results."""
     best: dict | None = None
     best_score = 0.0
-
     for album in results:
         apple_artist = album.get("artistName", "")
         apple_title = album.get("collectionName", "")
         artist_score = score_match(artist, apple_artist)
         title_score = score_match(title, apple_title)
-
         if not is_acceptable_match(artist_score, title_score):
             continue
-
         combined = (artist_score + title_score) / 2
         if combined > best_score:
             best_score = combined
@@ -271,35 +483,81 @@ def _find_best_apple_match(artist: str, title: str, results: list[dict]) -> dict
                 "matched_artist": apple_artist,
                 "matched_title": apple_title,
             }
+    return best
 
+
+def _find_best_deezer_match(artist: str, title: str, results: list[dict]) -> dict | None:
+    best: dict | None = None
+    best_score = 0.0
+    for album in results:
+        deezer_artist = album.get("artist", {}).get("name", "")
+        deezer_title = album.get("title", "")
+        artist_score = score_match(artist, deezer_artist)
+        title_score = score_match(title, deezer_title)
+        if not is_acceptable_match(artist_score, title_score):
+            continue
+        combined = (artist_score + title_score) / 2
+        if combined > best_score:
+            best_score = combined
+            best = {
+                "url": album.get("link", ""),
+                "confidence": combined,
+                "matched_artist": deezer_artist,
+                "matched_title": deezer_title,
+            }
+    return best
+
+
+def _find_best_deezer_track_match(artist: str, title: str, results: list[dict]) -> dict | None:
+    best: dict | None = None
+    best_score = 0.0
+    for track in results:
+        deezer_artist = track.get("artist", {}).get("name", "")
+        deezer_title = track.get("title", "")
+        artist_score = score_match(artist, deezer_artist)
+        title_score = score_match(title, deezer_title)
+        if not is_acceptable_match(artist_score, title_score):
+            continue
+        combined = (artist_score + title_score) / 2
+        if combined > best_score:
+            best_score = combined
+            best = {
+                "url": track.get("link", ""),
+                "confidence": combined,
+                "matched_artist": deezer_artist,
+                "matched_title": deezer_title,
+            }
     return best
 
 
 async def _skip_compilations(results_db: ResultsDB) -> int:
-    """Mark all compilations as skipped on both services."""
     db = results_db._db
     assert db is not None
-    cursor = await db.execute(
-        """UPDATE albums SET spotify_status = 'skipped', apple_status = 'skipped'
-           WHERE is_compilation = 1 AND (spotify_status = 'pending' OR apple_status = 'pending')"""
-    )
+    cursor = await db.execute("""UPDATE albums SET
+           spotify_status = 'skipped', apple_status = 'skipped',
+           discogs_status = 'skipped', deezer_status = 'skipped'
+           WHERE is_compilation = 1
+           AND (spotify_status = 'pending' OR apple_status = 'pending'
+                OR discogs_status = 'pending' OR deezer_status = 'pending')""")
     await db.commit()
     return cursor.rowcount
 
 
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+
 async def run(args: argparse.Namespace) -> None:
-    """Main orchestration."""
     results_db = ResultsDB(args.results_db)
     await results_db.connect()
 
     try:
-        # Show stats and exit if requested
         if args.stats:
             summary = await generate_summary(results_db)
             print(summary)
             return
 
-        # Step 1: Deduplicate library
         library_path = args.library_db
         if not Path(library_path).is_file():
             logger.error("library.db not found at %s", library_path)
@@ -307,19 +565,18 @@ async def run(args: argparse.Namespace) -> None:
 
         logger.info("Reading library from %s...", library_path)
         albums = await deduplicate_library(library_path)
+        singles = sum(1 for a in albums if a.is_single)
+        compilations = sum(1 for a in albums if a.is_compilation)
         logger.info(
-            "Deduplicated: %d unique albums from library",
+            "Deduplicated: %d unique albums (%d singles, %d compilations)",
             len(albums),
+            singles,
+            compilations,
         )
 
-        compilations = sum(1 for a in albums if a.is_compilation)
-        logger.info("Compilations: %d (will be skipped)", compilations)
-
-        # Step 2: Insert into results DB
         inserted = await results_db.insert_albums(albums)
         logger.info("Inserted %d new albums into results DB (duplicates ignored)", inserted)
 
-        # Skip compilations
         skipped = await _skip_compilations(results_db)
         if skipped:
             logger.info("Marked %d compilations as skipped", skipped)
@@ -328,34 +585,91 @@ async def run(args: argparse.Namespace) -> None:
             logger.info("Dry run complete. Use --stats to see current state.")
             return
 
-        # Step 3: Spotify
-        client_id = os.environ.get("SPOTIFY_CLIENT_ID")
-        client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
-        if not client_id or not client_secret:
-            logger.error("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET required in .env")
-            sys.exit(1)
+        # Step 1: Discogs enrichment
+        discogs_url = os.environ.get("DATABASE_URL_DISCOGS")
+        if discogs_url and not _shutdown_requested:
+            import asyncpg
 
-        spotify = SpotifyClient(client_id, client_secret)
-        try:
-            await _process_spotify(
-                results_db, spotify, args.batch_size, retry_errors=args.retry_errors
+            async def _init_conn(conn: asyncpg.Connection) -> None:
+                await conn.execute("SET pg_trgm.similarity_threshold = 0.4")
+
+            pool = await asyncpg.create_pool(discogs_url, min_size=2, max_size=10, init=_init_conn)
+            try:
+                use_wxyc = await check_wxyc_schema(pool)
+                artist_mapping: dict[str, str] = {}
+                if use_wxyc:
+                    unique_artists = sorted(
+                        {a.display_artist for a in albums if not a.is_compilation}
+                    )
+                    logger.info("Building artist mapping for %d artists...", len(unique_artists))
+                    artist_mapping = await build_artist_mapping(pool, unique_artists)
+                    logger.info(
+                        "Artist mapping: %d of %d artists have Discogs name variants",
+                        len(artist_mapping),
+                        len(unique_artists),
+                    )
+                else:
+                    logger.info("wxyc schema not found, using exact match only")
+                await _process_discogs_enrichment(
+                    results_db, pool, args.batch_size, artist_mapping=artist_mapping
+                )
+            finally:
+                await pool.close()
+        elif not discogs_url:
+            logger.warning(
+                "DATABASE_URL_DISCOGS not set, skipping Discogs enrichment "
+                "(searches will use library names)"
             )
-        finally:
-            await spotify.close()
 
-        # Step 4: Apple Music (only for Spotify misses)
+        # Step 2: Deezer pre-filter
+        if not _shutdown_requested:
+            deezer = DeezerClient()
+            try:
+                await _process_deezer(results_db, deezer, args.batch_size)
+            finally:
+                await deezer.close()
+
+            # Mark Deezer misses as not_found on Spotify too
+            db = results_db._db
+            assert db is not None
+            cursor = await db.execute("""UPDATE albums SET spotify_status = 'not_found'
+                   WHERE deezer_status = 'not_found' AND spotify_status = 'pending'""")
+            await db.commit()
+            if cursor.rowcount:
+                logger.info(
+                    "Skipped %d Deezer misses for Spotify (not digitally distributed)",
+                    cursor.rowcount,
+                )
+
+        # Step 3: Spotify (only Deezer hits)
+        if not args.apple_only and not _shutdown_requested:
+            client_id = os.environ.get("SPOTIFY_CLIENT_ID")
+            client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
+            if not client_id or not client_secret:
+                logger.error("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET required in .env")
+                sys.exit(1)
+
+            spotify = SpotifyClient(client_id, client_secret)
+            try:
+                await _process_spotify(
+                    results_db, spotify, args.batch_size, retry_errors=args.retry_errors
+                )
+            finally:
+                await spotify.close()
+
+        # Step 4: Apple Music
         if not args.spotify_only and not _shutdown_requested:
             apple = AppleMusicClient()
             try:
-                await _process_apple_music(results_db, apple, args.batch_size)
+                await _process_apple_music(
+                    results_db, apple, args.batch_size, check_all=args.apple_only
+                )
             finally:
                 await apple.close()
 
-        # Step 5: Generate report
+        # Step 5: Report
         logger.info("Generating CSV report: %s", args.output)
         await generate_csv_report(results_db, args.output)
-
-        # Step 6: Summary
         summary = await generate_summary(results_db)
         print(summary)
 
@@ -367,58 +681,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analyze streaming availability for the WXYC library catalog.",
     )
-    parser.add_argument(
-        "--library-db",
-        default="library.db",
-        help="Path to library.db (default: library.db)",
-    )
-    parser.add_argument(
-        "--results-db",
-        default="streaming_availability.db",
-        help="Path to results database (default: streaming_availability.db)",
-    )
-    parser.add_argument(
-        "--output",
-        default="streaming_report.csv",
-        help="CSV output path (default: streaming_report.csv)",
-    )
-    parser.add_argument(
-        "--spotify-only",
-        action="store_true",
-        help="Only check Spotify, skip Apple Music",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=100,
-        help="Albums per progress log (default: 100)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Populate albums table only, no API calls",
-    )
-    parser.add_argument(
-        "--stats",
-        action="store_true",
-        help="Show current stats and exit",
-    )
-    parser.add_argument(
-        "--retry-errors",
-        action="store_true",
-        help="Re-check albums with status 'error'",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable debug logging",
-    )
+    parser.add_argument("--library-db", default="library.db")
+    parser.add_argument("--results-db", default="streaming_availability.db")
+    parser.add_argument("--output", default="streaming_report.csv")
+    parser.add_argument("--spotify-only", action="store_true")
+    parser.add_argument("--apple-only", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--stats", action="store_true")
+    parser.add_argument("--retry-errors", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 
 
 def main():
     load_dotenv()
-
     args = parse_args()
 
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -427,6 +704,7 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
