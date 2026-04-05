@@ -18,14 +18,8 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from scripts.streaming_availability.apple_music_client import AppleMusicClient
-from scripts.streaming_availability.matching import (
-    is_acceptable_match,
-    score_match,
-    strip_format_suffix,
-)
-from scripts.streaming_availability.report import generate_csv_report, generate_summary
 
+from scripts.streaming_availability.apple_music_client import AppleMusicClient
 from scripts.streaming_availability.dedup import deduplicate_library
 from scripts.streaming_availability.deezer_client import DeezerClient
 from scripts.streaming_availability.discogs_enricher import (
@@ -33,6 +27,12 @@ from scripts.streaming_availability.discogs_enricher import (
     check_wxyc_schema,
     enrich_album,
 )
+from scripts.streaming_availability.matching import (
+    is_acceptable_match,
+    score_match,
+    strip_format_suffix,
+)
+from scripts.streaming_availability.report import generate_csv_report, generate_summary
 from scripts.streaming_availability.results_db import ResultsDB
 from scripts.streaming_availability.spotify_client import SpotifyClient
 
@@ -585,79 +585,234 @@ async def run(args: argparse.Namespace) -> None:
             logger.info("Dry run complete. Use --stats to see current state.")
             return
 
-        # Step 1: Discogs enrichment
+        # Build pipeline: Discogs → Deezer → Spotify
+        # Each stage takes an album_id, reads row from DB, processes, writes result,
+        # and returns the album_id for the next stage (or None to filter).
+
+        from scripts.streaming_availability.pipeline import Pipeline, Stage
+
+        discogs_pool = None
+        artist_mapping: dict[str, str] = {}
         discogs_url = os.environ.get("DATABASE_URL_DISCOGS")
-        if discogs_url and not _shutdown_requested:
+        if discogs_url:
             import asyncpg
 
             async def _init_conn(conn: asyncpg.Connection) -> None:
                 await conn.execute("SET pg_trgm.similarity_threshold = 0.4")
 
-            pool = await asyncpg.create_pool(discogs_url, min_size=2, max_size=10, init=_init_conn)
-            try:
-                use_wxyc = await check_wxyc_schema(pool)
-                artist_mapping: dict[str, str] = {}
-                if use_wxyc:
-                    unique_artists = sorted(
-                        {a.display_artist for a in albums if not a.is_compilation}
-                    )
-                    logger.info("Building artist mapping for %d artists...", len(unique_artists))
-                    artist_mapping = await build_artist_mapping(pool, unique_artists)
-                    logger.info(
-                        "Artist mapping: %d of %d artists have Discogs name variants",
-                        len(artist_mapping),
-                        len(unique_artists),
-                    )
-                else:
-                    logger.info("wxyc schema not found, using exact match only")
-                await _process_discogs_enrichment(
-                    results_db, pool, args.batch_size, artist_mapping=artist_mapping
-                )
-            finally:
-                await pool.close()
-        elif not discogs_url:
-            logger.warning(
-                "DATABASE_URL_DISCOGS not set, skipping Discogs enrichment "
-                "(searches will use library names)"
+            discogs_pool = await asyncpg.create_pool(
+                discogs_url, min_size=2, max_size=10, init=_init_conn
             )
-
-        # Step 2: Deezer pre-filter
-        if not _shutdown_requested:
-            deezer = DeezerClient()
-            try:
-                await _process_deezer(results_db, deezer, args.batch_size)
-            finally:
-                await deezer.close()
-
-            # Mark Deezer misses as not_found on Spotify too
-            db = results_db._db
-            assert db is not None
-            cursor = await db.execute("""UPDATE albums SET spotify_status = 'not_found'
-                   WHERE deezer_status = 'not_found' AND spotify_status = 'pending'""")
-            await db.commit()
-            if cursor.rowcount:
+            use_wxyc = await check_wxyc_schema(discogs_pool)
+            if use_wxyc:
+                unique_artists = sorted({a.display_artist for a in albums if not a.is_compilation})
+                logger.info("Building artist mapping for %d artists...", len(unique_artists))
+                artist_mapping = await build_artist_mapping(discogs_pool, unique_artists)
                 logger.info(
-                    "Skipped %d Deezer misses for Spotify (not digitally distributed)",
-                    cursor.rowcount,
+                    "Artist mapping: %d of %d artists have Discogs name variants",
+                    len(artist_mapping),
+                    len(unique_artists),
                 )
+            else:
+                logger.info("wxyc schema not found, using exact match only")
+        else:
+            logger.warning("DATABASE_URL_DISCOGS not set, skipping Discogs enrichment")
 
-        # Step 3: Spotify (only Deezer hits)
-        if not args.apple_only and not _shutdown_requested:
+        deezer = DeezerClient()
+        spotify: SpotifyClient | None = None
+        if not args.apple_only:
             client_id = os.environ.get("SPOTIFY_CLIENT_ID")
             client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
-            if not client_id or not client_secret:
+            if client_id and client_secret:
+                spotify = SpotifyClient(client_id, client_secret)
+            else:
                 logger.error("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET required in .env")
-                sys.exit(1)
 
-            spotify = SpotifyClient(client_id, client_secret)
-            try:
-                await _process_spotify(
-                    results_db, spotify, args.batch_size, retry_errors=args.retry_errors
+        # Counters for progress
+        discogs_found = 0
+        discogs_total = 0
+        deezer_found = 0
+        deezer_total = 0
+        spotify_found = 0
+        spotify_total = 0
+
+        async def discogs_stage_fn(album_id: int) -> int | None:
+            nonlocal discogs_found, discogs_total
+            row = await results_db._db.execute("SELECT * FROM albums WHERE id = ?", (album_id,))
+            row = await row.fetchone()
+            if not row or row["discogs_status"] != "pending":
+                return album_id  # already done, pass through
+
+            artist = row["display_artist"]
+            title = strip_format_suffix(row["display_title"])
+            if discogs_pool:
+                match = await enrich_album(
+                    discogs_pool, artist, title, artist_mapping=artist_mapping
                 )
-            finally:
-                await spotify.close()
+                if match:
+                    await results_db.update_discogs_result(
+                        album_id,
+                        "found",
+                        artist=match["artist_name"],
+                        title=match["title"],
+                        release_id=match["release_id"],
+                    )
+                    discogs_found += 1
+                else:
+                    await results_db.update_discogs_result(album_id, "not_found")
+            else:
+                await results_db.update_discogs_result(album_id, "not_found")
 
-        # Step 4: Apple Music
+            discogs_total += 1
+            if discogs_total % 500 == 0:
+                rate = discogs_found / discogs_total * 100
+                logger.info("  Discogs: %d done (%.0f%% found)", discogs_total, rate)
+            return album_id
+
+        async def deezer_stage_fn(album_id: int) -> int | None:
+            nonlocal deezer_found, deezer_total
+            row = await results_db._db.execute("SELECT * FROM albums WHERE id = ?", (album_id,))
+            row = await row.fetchone()
+            if not row or row["deezer_status"] != "pending":
+                # Already checked — pass through if it was found, filter if not
+                if row and row["deezer_status"] == "found":
+                    return album_id
+                return None
+
+            artist = row["discogs_artist"] or row["display_artist"]
+            title = strip_format_suffix(row["discogs_title"] or row["display_title"])
+            is_single = bool(row["is_single"])
+
+            results = await deezer.search_album(artist, title)
+            best = _find_best_deezer_match(artist, title, results) if results else None
+            if not best and is_single:
+                track_results = await deezer.search_track(artist, title)
+                best = (
+                    _find_best_deezer_track_match(artist, title, track_results)
+                    if track_results
+                    else None
+                )
+
+            deezer_total += 1
+            if best:
+                await results_db.update_result(
+                    album_id,
+                    "deezer",
+                    "found",
+                    url=best["url"],
+                    confidence=best["confidence"],
+                    matched_artist=best["matched_artist"],
+                    matched_title=best["matched_title"],
+                )
+                deezer_found += 1
+                if deezer_total % 500 == 0:
+                    rate = deezer_found / deezer_total * 100
+                    logger.info("  Deezer: %d done (%.0f%% found)", deezer_total, rate)
+                return album_id  # pass to Spotify
+            else:
+                await results_db.update_result(album_id, "deezer", "not_found")
+                # Also mark as not_found on Spotify (not digitally distributed)
+                await results_db.update_result(album_id, "spotify", "not_found")
+                if deezer_total % 500 == 0:
+                    rate = deezer_found / deezer_total * 100
+                    logger.info("  Deezer: %d done (%.0f%% found)", deezer_total, rate)
+                return None  # filter from Spotify
+
+        async def spotify_stage_fn(album_id: int) -> int | None:
+            nonlocal spotify_found, spotify_total
+            if not spotify:
+                return None
+
+            row = await results_db._db.execute("SELECT * FROM albums WHERE id = ?", (album_id,))
+            row = await row.fetchone()
+            if not row or row["spotify_status"] != "pending":
+                return album_id
+
+            artist = row["discogs_artist"] or row["display_artist"]
+            title = strip_format_suffix(row["discogs_title"] or row["display_title"])
+            is_single = bool(row["is_single"])
+
+            results = await spotify.search_album(artist, title)
+            best = _find_best_spotify_match(artist, title, results) if results else None
+            if not best and is_single:
+                track_results = await spotify.search_track(artist, title)
+                best = (
+                    _find_best_track_match(artist, title, track_results) if track_results else None
+                )
+
+            spotify_total += 1
+            if best:
+                await results_db.update_result(
+                    album_id,
+                    "spotify",
+                    "found",
+                    url=best["url"],
+                    spotify_id=best["id"],
+                    confidence=best["confidence"],
+                    matched_artist=best["matched_artist"],
+                    matched_title=best["matched_title"],
+                )
+                spotify_found += 1
+            else:
+                await results_db.update_result(album_id, "spotify", "not_found")
+
+            if spotify_total % 100 == 0:
+                rate = spotify_found / spotify_total * 100
+                logger.info("  Spotify: %d done (%.0f%% found)", spotify_total, rate)
+            return album_id
+
+        # Get all non-compilation, non-skipped album IDs
+        all_rows = await results_db.get_pending("discogs", limit=100_000)
+        # Also include already-enriched albums that still need Deezer/Spotify
+        deezer_pending = await results_db.get_pending("deezer", limit=100_000)
+        spotify_pending = await results_db.get_pending("spotify", limit=100_000)
+
+        # Combine all unique album IDs that need any processing
+        album_ids = sorted(
+            {row["id"] for row in all_rows}
+            | {row["id"] for row in deezer_pending}
+            | {row["id"] for row in spotify_pending}
+        )
+        logger.info("Starting pipeline: %d albums (Discogs → Deezer → Spotify)", len(album_ids))
+
+        try:
+            pipeline = Pipeline(batch_size=args.batch_size)
+            pipeline.add_stage(Stage("discogs", discogs_stage_fn))
+            pipeline.add_stage(Stage("deezer", deezer_stage_fn))
+            if spotify:
+                pipeline.add_stage(Stage("spotify", spotify_stage_fn))
+            await pipeline.run(album_ids)
+        finally:
+            await deezer.close()
+            if spotify:
+                await spotify.close()
+            if discogs_pool:
+                await discogs_pool.close()
+
+        # Log final stats
+        if discogs_total:
+            logger.info(
+                "Discogs: %d found / %d total (%.0f%%)",
+                discogs_found,
+                discogs_total,
+                discogs_found / discogs_total * 100,
+            )
+        if deezer_total:
+            logger.info(
+                "Deezer: %d found / %d total (%.0f%%)",
+                deezer_found,
+                deezer_total,
+                deezer_found / deezer_total * 100,
+            )
+        if spotify_total:
+            logger.info(
+                "Spotify: %d found / %d total (%.0f%%)",
+                spotify_found,
+                spotify_total,
+                spotify_found / spotify_total * 100,
+            )
+
+        # Apple Music (still sequential, runs after pipeline)
         if not args.spotify_only and not _shutdown_requested:
             apple = AppleMusicClient()
             try:
@@ -667,7 +822,7 @@ async def run(args: argparse.Namespace) -> None:
             finally:
                 await apple.close()
 
-        # Step 5: Report
+        # Report
         logger.info("Generating CSV report: %s", args.output)
         await generate_csv_report(results_db, args.output)
         summary = await generate_summary(results_db)

@@ -27,7 +27,7 @@ class SpotifyClient:
         self._http: httpx.AsyncClient | None = None
         self._rate_limiter = AsyncLimiter(30, 30)
         self._semaphore = asyncio.Semaphore(5)
-        self._max_retries = 3
+        self._max_retries = 5
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http is None:
@@ -115,9 +115,11 @@ class SpotifyClient:
             )
 
             if resp.status_code == 429:
-                retry_after = min(int(resp.headers.get("Retry-After", "5")), 120)
+                raw_retry = int(resp.headers.get("Retry-After", "5"))
+                retry_after = min(raw_retry, 600)  # wait up to 10 min
                 logger.warning(
-                    "Spotify 429, retrying in %ds (attempt %d/%d)",
+                    "Spotify 429 (retry-after: %ds), waiting %ds (attempt %d/%d)",
+                    raw_retry,
                     retry_after,
                     attempt + 1,
                     self._max_retries,
