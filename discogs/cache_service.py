@@ -255,8 +255,16 @@ class DiscogsCacheService:
                 ),
                 return_exceptions=True,
             )
-            genre_rows = genre_style_results[0] if not isinstance(genre_style_results[0], BaseException) else []
-            style_rows = genre_style_results[1] if not isinstance(genre_style_results[1], BaseException) else []
+            genre_rows = (
+                genre_style_results[0]
+                if not isinstance(genre_style_results[0], BaseException)
+                else []
+            )
+            style_rows = (
+                genre_style_results[1]
+                if not isinstance(genre_style_results[1], BaseException)
+                else []
+            )
 
             primary_artist = ""
             primary_artist_id = None
