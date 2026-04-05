@@ -38,6 +38,16 @@ from services.parser import MessageType, ParsedRequest
 logger = logging.getLogger(__name__)
 
 
+_FETCH_LIMIT = MAX_SEARCH_RESULTS * 10
+"""Internal fetch limit for FTS queries that are post-filtered by artist.
+
+FTS5 ranks results by term frequency, not by artist-prefix relevance, so the
+target artist's entries may fall outside a tight SQL LIMIT.  Fetching more rows
+ensures enough candidates survive ``filter_results_by_artist`` before we trim
+back to ``MAX_SEARCH_RESULTS``.
+"""
+
+
 def limit_results(results: list) -> list:
     """Limit results to MAX_SEARCH_RESULTS."""
     return results[:MAX_SEARCH_RESULTS]
@@ -133,11 +143,11 @@ async def search_with_alternative_interpretation(
 ) -> tuple[list[LibraryItem], None]:
     """Try searching with both artist/title interpretations for 'X - Y' format."""
     query1 = f"{part1} {part2}"
-    results1 = await db.search(query=query1, limit=MAX_SEARCH_RESULTS)
+    results1 = await db.search(query=query1, limit=_FETCH_LIMIT)
     results1 = filter_results_by_artist(results1, part1)
 
     query2 = f"{part2} {part1}"
-    results2 = await db.search(query=query2, limit=MAX_SEARCH_RESULTS)
+    results2 = await db.search(query=query2, limit=_FETCH_LIMIT)
     results2 = filter_results_by_artist(results2, part2)
 
     if results1 and not results2:
@@ -167,7 +177,7 @@ async def search_song_as_artist(
     """Try searching using the parsed song title as an artist name."""
     logger.info(f"Trying song '{song_as_artist}' as artist name")
 
-    results = await db.search(query=song_as_artist, limit=MAX_SEARCH_RESULTS)
+    results = await db.search(query=song_as_artist, limit=_FETCH_LIMIT)
     results = filter_results_by_artist(results, song_as_artist)
     if results:
         logger.info(f"Found {len(results)} results treating '{song_as_artist}' as artist")
@@ -189,7 +199,7 @@ async def search_song_as_artist(
         if not album_title:
             continue
 
-        album_results = await db.search(query=album_title, limit=MAX_SEARCH_RESULTS)
+        album_results = await db.search(query=album_title, limit=_FETCH_LIMIT)
 
         for item in album_results:
             if item.id in seen_ids:
@@ -229,7 +239,7 @@ async def search_library_with_fallback(
     if parsed.artist and albums:
         for album in albums:
             query = f"{parsed.artist} {album}"
-            results = await db.search(query=query, limit=MAX_SEARCH_RESULTS)
+            results = await db.search(query=query, limit=_FETCH_LIMIT)
             results = filter_results_by_artist(results, parsed.artist)
 
             album_lower = album.lower()
@@ -287,7 +297,7 @@ async def search_library_with_fallback(
 
     if parsed.artist and parsed.song:
         query = f"{parsed.artist} {parsed.song}"
-        results = await db.search(query=query, limit=MAX_SEARCH_RESULTS)
+        results = await db.search(query=query, limit=_FETCH_LIMIT)
         results = filter_results_by_artist(results, parsed.artist)
 
         if results:
@@ -300,7 +310,7 @@ async def search_library_with_fallback(
 
     if not all_results and parsed.artist:
         logger.info(f"No results for albums {albums}, trying artist only: '{parsed.artist}'")
-        results = await db.search(query=parsed.artist, limit=MAX_SEARCH_RESULTS)
+        results = await db.search(query=parsed.artist, limit=_FETCH_LIMIT)
         results = filter_results_by_artist(results, parsed.artist)
         if results:
             return results, True
@@ -338,7 +348,7 @@ async def search_compilations_for_track(
         if query_words:
             keyword_query = " ".join(query_words)
             logger.info(f"Trying direct keyword search: '{keyword_query}'")
-            keyword_results = await db.search(query=keyword_query, limit=MAX_SEARCH_RESULTS)
+            keyword_results = await db.search(query=keyword_query, limit=_FETCH_LIMIT)
 
             if keyword_results:
                 filtered_results = []
