@@ -220,6 +220,8 @@ class TestGetRelease:
                     {"artist_id": None, "artist_name": "Queen", "extra": 0, "role": None}
                 ],
                 release_label=[],
+                release_genre=[{"genre": "Rock"}],
+                release_style=[{"style": "Arena Rock"}, {"style": "Pop Rock"}],
             )
         )
 
@@ -227,6 +229,8 @@ class TestGetRelease:
         assert result is not None
         assert result.title == "The Game"
         assert result.artist == "Queen"
+        assert result.genres == ["Rock"]
+        assert result.styles == ["Arena Rock", "Pop Rock"]
         assert len(result.tracklist) == 1
         assert result.cached is True
 
@@ -251,6 +255,8 @@ class TestGetRelease:
                     {"artist_id": None, "artist_name": "Various Artists", "extra": 0, "role": None}
                 ],
                 release_label=[],
+                release_genre=[],
+                release_style=[],
             )
         )
 
@@ -309,6 +315,8 @@ class TestWriteRelease:
             year=2001,
             artwork_url="https://img.com/confield.jpg",
             release_url="https://discogs.com/release/28138",
+            genres=["Electronic"],
+            styles=["IDM", "Abstract"],
             artists=[
                 ArtistCredit(artist_id=77, name="Autechre"),
             ],
@@ -337,6 +345,13 @@ class TestWriteRelease:
 
         # Check release_label rows were written
         assert any("release_label" in sql for sql in all_sql)
+
+        # Check genre/style rows were written
+        assert any("DELETE FROM release_genre" in sql for sql in all_sql)
+        assert any("DELETE FROM release_style" in sql for sql in all_sql)
+        all_executemany_sql = [call[0][0] for call in conn.executemany.call_args_list]
+        assert any("release_genre" in sql for sql in all_executemany_sql)
+        assert any("release_style" in sql for sql in all_executemany_sql)
 
     @pytest.mark.asyncio
     async def test_writes_multiple_artists_as_rows(self, cache_service, mock_asyncpg_pool):
