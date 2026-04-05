@@ -47,6 +47,30 @@ class TestLookupPipeline:
         assert len(body["results"]) >= 1
 
     @pytest.mark.asyncio
+    async def test_artist_only_with_name_substring_collisions(self, app_client):
+        """Artist-only search finds results even when other artists/titles share the name.
+
+        Regression test: "Grimes" was returning no results because FTS5 ranked
+        entries like "Tiny Grimes", "Henry Grimes", and albums containing "Grimes"
+        above the actual "Grimes" artist. With limit=5 applied in SQL before the
+        Python artist-prefix filter, all 5 FTS hits were non-matching and got
+        filtered out, leaving zero results.
+        """
+        resp = await app_client.post(
+            "/api/v1/lookup",
+            json={
+                "artist": "Grimes",
+                "raw_message": "Grimes",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["results"]) >= 1
+        assert all(
+            r["library_item"]["artist"] == "Grimes" for r in body["results"]
+        ), f"Expected only Grimes results, got: {[r['library_item']['artist'] for r in body['results']]}"
+
+    @pytest.mark.asyncio
     async def test_no_results(self, app_client):
         """Nonexistent artist returns empty results."""
         resp = await app_client.post(

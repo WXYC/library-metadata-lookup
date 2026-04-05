@@ -48,6 +48,16 @@ SEED_ITEMS = [
     (26, "London Zoo", "The Bug", "B", 2, 1, "Electronic", "CD"),
     (27, "Pressure", "The Bug", "B", 2, 2, "Electronic", "CD"),
     (28, "The Sound of Dub", "Various Artists - Reggae", "V", 2, 1, "Reggae", "CD"),
+    # Grimes cluster: multiple artists/albums with "Grimes" in them
+    (29, "Tiny Grimes", "Tiny Grimes", "G", 1, 1, "Jazz", "CD"),
+    (30, "Report from Grimes Creek", "Rosalie Sorrels", "S", 3, 1, "Folk", "CD"),
+    (31, "Grimes Golden", "Further", "F", 1, 1, "Rock", "CD"),
+    (32, "Live at the Kerava Jazz Festival", "Henry Grimes", "G", 2, 1, "Jazz", "CD"),
+    (33, "Spirits Aloft", "Henry Grimes", "G", 2, 2, "Jazz", "CD"),
+    (34, "Visions", "Grimes", "G", 3, 1, "Rock", "CD"),
+    (35, "Halfaxa", "Grimes", "G", 3, 2, "Rock", "Vinyl"),
+    (36, "Art Angels", "Grimes", "G", 3, 3, "Rock", "Vinyl"),
+    (37, "Miss Anthropocene", "Grimes", "G", 3, 4, "Rock", "CD"),
 ]
 
 
