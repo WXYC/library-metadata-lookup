@@ -243,6 +243,21 @@ class DiscogsCacheService:
                 ),
             )
 
+            # Genre/style tables may not exist if the pipeline hasn't been re-run
+            genre_style_results = await asyncio.gather(
+                self.pool.fetch(
+                    "SELECT genre FROM release_genre WHERE release_id = $1",
+                    release_id,
+                ),
+                self.pool.fetch(
+                    "SELECT style FROM release_style WHERE release_id = $1",
+                    release_id,
+                ),
+                return_exceptions=True,
+            )
+            genre_rows = genre_style_results[0] if not isinstance(genre_style_results[0], BaseException) else []
+            style_rows = genre_style_results[1] if not isinstance(genre_style_results[1], BaseException) else []
+
             primary_artist = ""
             primary_artist_id = None
             artist_credits: list[ArtistCredit] = []
@@ -299,6 +314,8 @@ class DiscogsCacheService:
                 year=release_row["release_year"],
                 label=primary_label,
                 label_id=primary_label_id,
+                genres=[row["genre"] for row in genre_rows],
+                styles=[row["style"] for row in style_rows],
                 artwork_url=release_row["artwork_url"],
                 tracklist=tracklist,
                 release_url=f"https://www.discogs.com/release/{release_id}",
@@ -390,6 +407,34 @@ class DiscogsCacheService:
                         """,
                         label_data,
                     )
+
+                # Delete + re-insert genres (table may not exist yet)
+                try:
+                    await conn.execute(
+                        "DELETE FROM release_genre WHERE release_id = $1",
+                        release.release_id,
+                    )
+                    if release.genres:
+                        await conn.executemany(
+                            "INSERT INTO release_genre (release_id, genre) VALUES ($1, $2)",
+                            [(release.release_id, g) for g in release.genres],
+                        )
+                except Exception:
+                    pass
+
+                # Delete + re-insert styles (table may not exist yet)
+                try:
+                    await conn.execute(
+                        "DELETE FROM release_style WHERE release_id = $1",
+                        release.release_id,
+                    )
+                    if release.styles:
+                        await conn.executemany(
+                            "INSERT INTO release_style (release_id, style) VALUES ($1, $2)",
+                            [(release.release_id, s) for s in release.styles],
+                        )
+                except Exception:
+                    pass
 
                 # Delete + re-insert tracks
                 await conn.execute(
