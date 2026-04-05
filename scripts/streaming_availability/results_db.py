@@ -21,6 +21,17 @@ CREATE TABLE IF NOT EXISTS albums (
     genre TEXT,
     label TEXT,
     is_compilation INTEGER NOT NULL DEFAULT 0,
+    is_single INTEGER NOT NULL DEFAULT 0,
+    discogs_artist TEXT,
+    discogs_title TEXT,
+    discogs_release_id INTEGER,
+    discogs_status TEXT NOT NULL DEFAULT 'pending',
+    deezer_status TEXT NOT NULL DEFAULT 'pending',
+    deezer_url TEXT,
+    deezer_confidence REAL,
+    deezer_matched_artist TEXT,
+    deezer_matched_title TEXT,
+    deezer_checked_at TEXT,
     spotify_status TEXT NOT NULL DEFAULT 'pending',
     spotify_url TEXT,
     spotify_id TEXT,
@@ -54,7 +65,30 @@ class ResultsDB:
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
+        await self._migrate()
         await self._db.commit()
+
+    async def _migrate(self) -> None:
+        """Add columns that may not exist in older databases."""
+        assert self._db is not None
+        cursor = await self._db.execute("PRAGMA table_info(albums)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        migrations = [
+            ("is_single", "INTEGER NOT NULL DEFAULT 0"),
+            ("discogs_artist", "TEXT"),
+            ("discogs_title", "TEXT"),
+            ("discogs_release_id", "INTEGER"),
+            ("discogs_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("deezer_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("deezer_url", "TEXT"),
+            ("deezer_confidence", "REAL"),
+            ("deezer_matched_artist", "TEXT"),
+            ("deezer_matched_title", "TEXT"),
+            ("deezer_checked_at", "TEXT"),
+        ]
+        for col_name, col_type in migrations:
+            if col_name not in columns:
+                await self._db.execute(f"ALTER TABLE albums ADD COLUMN {col_name} {col_type}")
 
     async def close(self) -> None:
         if self._db:
@@ -69,8 +103,8 @@ class ResultsDB:
             cursor = await self._db.execute(
                 """INSERT OR IGNORE INTO albums
                    (normalized_artist, normalized_title, display_artist, display_title,
-                    library_ids, formats, genre, label, is_compilation)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    library_ids, formats, genre, label, is_compilation, is_single)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     album.normalized_artist,
                     album.normalized_title,
@@ -81,6 +115,7 @@ class ResultsDB:
                     album.genre,
                     album.label,
                     1 if album.is_compilation else 0,
+                    1 if album.is_single else 0,
                 ),
             )
             if cursor.rowcount > 0:
@@ -94,6 +129,43 @@ class ResultsDB:
         col = f"{service}_status"
         cursor = await self._db.execute(
             f"SELECT * FROM albums WHERE {col} = 'pending' LIMIT ?",  # noqa: S608
+            (limit,),
+        )
+        return list(await cursor.fetchall())
+
+    async def get_pending_discogs(self, limit: int = 100) -> list[aiosqlite.Row]:
+        """Get albums not yet enriched with Discogs names."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "SELECT * FROM albums WHERE discogs_status = 'pending' AND is_compilation = 0 LIMIT ?",
+            (limit,),
+        )
+        return list(await cursor.fetchall())
+
+    async def update_discogs_result(
+        self,
+        album_id: int,
+        status: str,
+        *,
+        artist: str | None = None,
+        title: str | None = None,
+        release_id: int | None = None,
+    ) -> None:
+        """Update the Discogs enrichment result for an album."""
+        assert self._db is not None
+        await self._db.execute(
+            """UPDATE albums SET
+               discogs_status = ?, discogs_artist = ?, discogs_title = ?, discogs_release_id = ?
+               WHERE id = ?""",
+            (status, artist, title, release_id, album_id),
+        )
+        await self._db.commit()
+
+    async def get_deezer_hits_pending_spotify(self, limit: int = 100) -> list[aiosqlite.Row]:
+        """Get albums found on Deezer that haven't been checked on Spotify."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "SELECT * FROM albums WHERE deezer_status = 'found' AND spotify_status = 'pending' LIMIT ?",
             (limit,),
         )
         return list(await cursor.fetchall())
@@ -119,7 +191,7 @@ class ResultsDB:
         matched_artist: str | None = None,
         matched_title: str | None = None,
     ) -> None:
-        """Update the result for a service (spotify or apple)."""
+        """Update the result for a service (spotify, apple, or deezer)."""
         assert self._db is not None
         now = datetime.now(UTC).isoformat()
         if service == "spotify":
@@ -140,18 +212,27 @@ class ResultsDB:
                    WHERE id = ?""",
                 (status, url, confidence, matched_artist, matched_title, now, album_id),
             )
+        elif service == "deezer":
+            await self._db.execute(
+                """UPDATE albums SET
+                   deezer_status = ?, deezer_url = ?,
+                   deezer_confidence = ?, deezer_matched_artist = ?,
+                   deezer_matched_title = ?, deezer_checked_at = ?
+                   WHERE id = ?""",
+                (status, url, confidence, matched_artist, matched_title, now, album_id),
+            )
         await self._db.commit()
 
     async def get_stats(self) -> dict:
         """Return counts by status for each service."""
         assert self._db is not None
-        stats: dict = {"spotify": {}, "apple": {}, "total": 0}
+        stats: dict = {"spotify": {}, "apple": {}, "discogs": {}, "deezer": {}, "total": 0}
 
         cursor = await self._db.execute("SELECT COUNT(*) FROM albums")
         row = await cursor.fetchone()
         stats["total"] = row[0] if row else 0
 
-        for service in ("spotify", "apple"):
+        for service in ("spotify", "apple", "discogs", "deezer"):
             col = f"{service}_status"
             cursor = await self._db.execute(
                 f"SELECT {col}, COUNT(*) FROM albums GROUP BY {col}"  # noqa: S608

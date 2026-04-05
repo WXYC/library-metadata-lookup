@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import aiosqlite
+from scripts.streaming_availability.matching import normalize_album_title, normalize_artist_name
 
 from core.matching import is_compilation_artist
-from scripts.streaming_availability.matching import normalize_album_title, normalize_artist_name
 
 
 @dataclass
@@ -23,6 +23,7 @@ class DeduplicatedAlbum:
     genre: str | None = None
     label: str | None = None
     is_compilation: bool = False
+    is_single: bool = False
 
 
 async def deduplicate_library(db_path: str) -> list[DeduplicatedAlbum]:
@@ -64,5 +65,17 @@ async def deduplicate_library(db_path: str) -> list[DeduplicatedAlbum]:
                 fmt = row["format"]
                 if fmt and fmt not in album.formats:
                     album.formats.append(fmt)
+
+    # Determine is_single from formats: only non-LP vinyl = single
+    single_formats = frozenset(['vinyl - 12"', 'vinyl - 7"', 'vinyl - 10"'])
+    album_formats = frozenset(["cd", "vinyl - LP", "vinyl", "cdr"])
+    for album in groups.values():
+        if album.formats:
+            has_album_format = any(
+                f in album_formats or f.startswith("cd ") or f.startswith("vinyl - LP")
+                for f in album.formats
+            )
+            has_only_singles = all(f in single_formats for f in album.formats)
+            album.is_single = has_only_singles and not has_album_format
 
     return list(groups.values())

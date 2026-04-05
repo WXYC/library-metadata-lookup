@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-
 from scripts.streaming_availability.apple_music_client import AppleMusicClient
 
 

@@ -25,8 +25,8 @@ class SpotifyClient:
         self._access_token: str | None = None
         self._token_expires_at: float = 0
         self._http: httpx.AsyncClient | None = None
-        self._rate_limiter = AsyncLimiter(80, 30)
-        self._semaphore = asyncio.Semaphore(10)
+        self._rate_limiter = AsyncLimiter(30, 30)
+        self._semaphore = asyncio.Semaphore(5)
         self._max_retries = 3
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -54,38 +54,68 @@ class SpotifyClient:
         data = resp.json()
 
         self._access_token = data["access_token"]
-        self._token_expires_at = time.time() + data["expires_in"] - 60  # refresh 60s early
+        self._token_expires_at = time.time() + data["expires_in"] - 60
         logger.debug("Acquired Spotify access token (expires in %ds)", data["expires_in"])
         return self._access_token
 
     async def search_album(self, artist: str, title: str, market: str = "US") -> list[dict]:
         """Search Spotify for albums matching artist + title.
 
+        Tries quoted field search first, falls back to unquoted if no results.
         Returns a list of album dicts from the Spotify API, or an empty list on error.
         """
         try:
             async with self._semaphore:
-                return await self._search_with_retry(artist, title, market)
+                # Quoted field search (strict)
+                results = await self._search_with_retry(artist, title, market)
+                if results:
+                    return results
+
+                # Unquoted fallback (fuzzier)
+                return await self._search_with_retry_type(
+                    artist, title, "album", market, quoted=False
+                )
         except Exception:
             logger.exception("Spotify search failed for %s - %s", artist, title)
             return []
 
+    async def search_track(self, artist: str, track: str, market: str = "US") -> list[dict]:
+        """Search Spotify for tracks matching artist + track name.
+
+        Returns a list of track dicts from the Spotify API, or an empty list on error.
+        """
+        try:
+            async with self._semaphore:
+                return await self._search_with_retry_type(artist, track, "track", market)
+        except Exception:
+            logger.exception("Spotify track search failed for %s - %s", artist, track)
+            return []
+
     async def _search_with_retry(self, artist: str, title: str, market: str) -> list[dict]:
+        return await self._search_with_retry_type(artist, title, "album", market)
+
+    async def _search_with_retry_type(
+        self, artist: str, term: str, search_type: str, market: str, quoted: bool = True
+    ) -> list[dict]:
         http = await self._get_client()
+        result_key = search_type + "s"  # "albums" or "tracks"
 
         for attempt in range(self._max_retries):
             token = await self._ensure_token()
             await self._rate_limiter.acquire()
 
-            query = f'artist:"{artist}" album:"{title}"'
+            if quoted:
+                query = f'artist:"{artist}" {search_type}:"{term}"'
+            else:
+                query = f"{artist} {term}"
             resp = await http.get(
                 f"{self.API_BASE}/search",
-                params={"q": query, "type": "album", "market": market, "limit": 5},
+                params={"q": query, "type": search_type, "market": market, "limit": 5},
                 headers={"Authorization": f"Bearer {token}"},
             )
 
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", "5"))
+                retry_after = min(int(resp.headers.get("Retry-After", "5")), 120)
                 logger.warning(
                     "Spotify 429, retrying in %ds (attempt %d/%d)",
                     retry_after,
@@ -97,14 +127,17 @@ class SpotifyClient:
 
             if resp.status_code != 200:
                 logger.warning(
-                    "Spotify search returned %d for %s - %s", resp.status_code, artist, title
+                    "Spotify search returned %d for %s - %s",
+                    resp.status_code,
+                    artist,
+                    term,
                 )
                 return []
 
             data = resp.json()
-            return data.get("albums", {}).get("items", [])
+            return data.get(result_key, {}).get("items", [])
 
-        logger.error("Spotify max retries exhausted for %s - %s", artist, title)
+        logger.error("Spotify max retries exhausted for %s - %s", artist, term)
         return []
 
     async def close(self) -> None:

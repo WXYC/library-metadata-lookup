@@ -4,9 +4,9 @@ import csv
 
 import pytest
 import pytest_asyncio
+from scripts.streaming_availability.report import generate_csv_report, generate_summary
 
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
-from scripts.streaming_availability.report import generate_csv_report, generate_summary
 from scripts.streaming_availability.results_db import ResultsDB
 
 
