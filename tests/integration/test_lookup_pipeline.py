@@ -66,9 +66,9 @@ class TestLookupPipeline:
         assert resp.status_code == 200
         body = resp.json()
         assert len(body["results"]) >= 1
-        assert all(
-            r["library_item"]["artist"] == "Grimes" for r in body["results"]
-        ), f"Expected only Grimes results, got: {[r['library_item']['artist'] for r in body['results']]}"
+        assert all(r["library_item"]["artist"] == "Grimes" for r in body["results"]), (
+            f"Expected only Grimes results, got: {[r['library_item']['artist'] for r in body['results']]}"
+        )
 
     @pytest.mark.asyncio
     async def test_no_results(self, app_client):
