@@ -44,3 +44,5 @@ va_disambiguate.db
 va_flowsheet_updates.sql
 va_catalog_inserts.sql
 va_disambiguate_unresolved.csv
+streaming_availability.db
+streaming_report.csv
