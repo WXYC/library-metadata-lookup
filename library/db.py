@@ -22,6 +22,7 @@ class LibraryDB:
         self._conn: aiosqlite.Connection | None = None
         self._has_alternate_artist: bool = False
         self._has_label: bool = False
+        self._has_compilation_track_artist: bool = False
 
     async def connect(self):
         """Open database connection."""
@@ -41,10 +42,17 @@ class LibraryDB:
         self._has_alternate_artist = "alternate_artist_name" in column_names
         self._has_label = "label" in column_names
 
+        # Detect compilation_track_artist table
+        tables_cursor = await self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='compilation_track_artist'"
+        )
+        self._has_compilation_track_artist = await tables_cursor.fetchone() is not None
+
         logger.info(
             f"Connected to SQLite database: {self.db_path} "
             f"(alternate_artist_name: {'yes' if self._has_alternate_artist else 'no'}, "
-            f"label: {'yes' if self._has_label else 'no'})"
+            f"label: {'yes' if self._has_label else 'no'}, "
+            f"compilation_track_artist: {'yes' if self._has_compilation_track_artist else 'no'})"
         )
 
     async def is_available(self) -> bool:
@@ -164,12 +172,34 @@ class LibraryDB:
                 params.append(f"%{title}%")
             params.append(limit)
 
+            cols = self._select_columns()
             sql = f"""
-                SELECT {self._select_columns()}
+                SELECT {cols}
                 FROM library
                 WHERE {" AND ".join(conditions)}
                 LIMIT ?
             """
+
+            # Include compilations featuring the artist
+            if artist and self._has_compilation_track_artist:
+                cta_conditions = ["cta.artist_name LIKE ?"]
+                cta_params: list[str | int] = [f"%{artist}%"]
+                if title:
+                    cta_conditions.append("library.title LIKE ?")
+                    cta_params.append(f"%{title}%")
+                cta_params.append(limit)
+
+                sql = f"""
+                    SELECT {cols} FROM library
+                    WHERE {" AND ".join(conditions)}
+                    UNION
+                    SELECT {cols} FROM library
+                    JOIN compilation_track_artist cta ON cta.library_release_id = library.id
+                    WHERE {" AND ".join(cta_conditions)}
+                    LIMIT ?
+                """
+                params = params[:-1] + cta_params  # remove first LIMIT, add cta params + final LIMIT
+
             cursor = await self._conn.execute(sql, params)
             rows = await cursor.fetchall()
 
@@ -318,24 +348,23 @@ class LibraryDB:
 
         prefix = search_word[:3]
 
+        unions = ["SELECT artist AS name FROM library WHERE artist LIKE ?"]
+        params_list = [f"{prefix}%"]
         if self._has_alternate_artist:
-            sql = """
-                SELECT DISTINCT name FROM (
-                    SELECT artist AS name FROM library WHERE artist LIKE ?
-                    UNION
-                    SELECT alternate_artist_name AS name FROM library
-                    WHERE alternate_artist_name IS NOT NULL AND alternate_artist_name LIKE ?
-                )
-                LIMIT 100
-            """
-            cursor = await self._conn.execute(sql, (f"{prefix}%", f"{prefix}%"))
-        else:
-            sql = """
-                SELECT DISTINCT artist FROM library
-                WHERE artist LIKE ?
-                LIMIT 100
-            """
-            cursor = await self._conn.execute(sql, (f"{prefix}%",))
+            unions.append(
+                "SELECT alternate_artist_name AS name FROM library "
+                "WHERE alternate_artist_name IS NOT NULL AND alternate_artist_name LIKE ?"
+            )
+            params_list.append(f"{prefix}%")
+        if self._has_compilation_track_artist:
+            unions.append(
+                "SELECT artist_name AS name FROM compilation_track_artist "
+                "WHERE artist_name LIKE ?"
+            )
+            params_list.append(f"{prefix}%")
+
+        sql = f"SELECT DISTINCT name FROM ({' UNION '.join(unions)}) LIMIT 100"
+        cursor = await self._conn.execute(sql, params_list)
         rows = await cursor.fetchall()
 
         if not rows:
