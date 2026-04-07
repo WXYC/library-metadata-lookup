@@ -73,6 +73,7 @@ async def run(args: argparse.Namespace) -> None:
     load_dotenv()
 
     import os
+
     database_url = os.environ.get("DATABASE_URL_DISCOGS")
     if not database_url and not args.stats and not args.apply:
         logger.error("DATABASE_URL_DISCOGS not set")
@@ -86,14 +87,18 @@ async def run(args: argparse.Namespace) -> None:
         if args.stats:
             stats = await db.get_stats()
             print("=== VA Disambiguation Stats ===")
-            print(f"Flowsheet: {stats['flowsheet_total']} total, "
-                  f"{stats['flowsheet_resolved']} resolved, "
-                  f"{stats['flowsheet_unresolved']} unresolved, "
-                  f"{stats['flowsheet_pending']} pending")
-            print(f"Catalog:   {stats['catalog_total']} total, "
-                  f"{stats['catalog_enriched']} enriched, "
-                  f"{stats['catalog_unresolved']} unresolved, "
-                  f"{stats['catalog_pending']} pending")
+            print(
+                f"Flowsheet: {stats['flowsheet_total']} total, "
+                f"{stats['flowsheet_resolved']} resolved, "
+                f"{stats['flowsheet_unresolved']} unresolved, "
+                f"{stats['flowsheet_pending']} pending"
+            )
+            print(
+                f"Catalog:   {stats['catalog_total']} total, "
+                f"{stats['catalog_enriched']} enriched, "
+                f"{stats['catalog_unresolved']} unresolved, "
+                f"{stats['catalog_pending']} pending"
+            )
             return
 
         # --apply: execute generated SQL files
@@ -129,8 +134,10 @@ async def run(args: argparse.Namespace) -> None:
 
         if args.dry_run:
             stats = await db.get_stats()
-            print(f"Extracted {stats['flowsheet_total']} flowsheet entries "
-                  f"and {stats['catalog_total']} compilation releases")
+            print(
+                f"Extracted {stats['flowsheet_total']} flowsheet entries "
+                f"and {stats['catalog_total']} compilation releases"
+            )
             return
 
         # Build library code index
@@ -151,7 +158,9 @@ async def run(args: argparse.Namespace) -> None:
 
                 for i, entry in enumerate(pending):
                     result = await resolve_flowsheet_entry(
-                        entry, pool, library_index,
+                        entry,
+                        pool,
+                        library_index,
                         confidence_threshold=args.confidence_threshold,
                     )
                     if result:
@@ -168,14 +177,14 @@ async def run(args: argparse.Namespace) -> None:
                             f"({resolved_count} resolved, {unresolved_count} unresolved)"
                         )
 
-                logger.info(
-                    f"  Done: {resolved_count} resolved, {unresolved_count} unresolved"
-                )
+                logger.info(f"  Done: {resolved_count} resolved, {unresolved_count} unresolved")
 
             # Phase 1b: Collect compilation track artists
             pending_releases = await db.get_pending_catalog_releases()
             if pending_releases:
-                logger.info(f"Phase 1b: Collecting track artists for {len(pending_releases)} compilations...")
+                logger.info(
+                    f"Phase 1b: Collecting track artists for {len(pending_releases)} compilations..."
+                )
                 enriched_count = 0
                 unenriched_count = 0
 
@@ -185,7 +194,8 @@ async def run(args: argparse.Namespace) -> None:
                         track_artists = [
                             CompilationTrackArtist(
                                 library_release_id=release.id,
-                                artist_name=select_primary_artist([a["artist_name"]]) or a["artist_name"],
+                                artist_name=select_primary_artist([a["artist_name"]])
+                                or a["artist_name"],
                                 track_title=a.get("track_title"),
                             )
                             for a in artists_data
@@ -202,9 +212,7 @@ async def run(args: argparse.Namespace) -> None:
                             f"({enriched_count} enriched, {unenriched_count} unresolved)"
                         )
 
-                logger.info(
-                    f"  Done: {enriched_count} enriched, {unenriched_count} unresolved"
-                )
+                logger.info(f"  Done: {enriched_count} enriched, {unenriched_count} unresolved")
 
         finally:
             await pool.close()
@@ -241,10 +249,14 @@ async def run(args: argparse.Namespace) -> None:
         # Summary
         stats = await db.get_stats()
         print("\n=== Summary ===")
-        print(f"Flowsheet: {stats['flowsheet_resolved']} resolved, "
-              f"{stats['flowsheet_unresolved']} unresolved of {stats['flowsheet_total']} total")
-        print(f"Catalog:   {stats['catalog_enriched']} enriched, "
-              f"{stats['catalog_unresolved']} unresolved of {stats['catalog_total']} total")
+        print(
+            f"Flowsheet: {stats['flowsheet_resolved']} resolved, "
+            f"{stats['flowsheet_unresolved']} unresolved of {stats['flowsheet_total']} total"
+        )
+        print(
+            f"Catalog:   {stats['catalog_enriched']} enriched, "
+            f"{stats['catalog_unresolved']} unresolved of {stats['catalog_total']} total"
+        )
         if resolved:
             print(f"\nReview: {args.flowsheet_output}")
         if catalog_rows:

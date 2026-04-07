@@ -198,7 +198,9 @@ class LibraryDB:
                     WHERE {" AND ".join(cta_conditions)}
                     LIMIT ?
                 """
-                params = params[:-1] + cta_params  # remove first LIMIT, add cta params + final LIMIT
+                params = (
+                    params[:-1] + cta_params
+                )  # remove first LIMIT, add cta params + final LIMIT
 
             cursor = await self._conn.execute(sql, params)
             rows = await cursor.fetchall()
@@ -358,8 +360,7 @@ class LibraryDB:
             params_list.append(f"{prefix}%")
         if self._has_compilation_track_artist:
             unions.append(
-                "SELECT artist_name AS name FROM compilation_track_artist "
-                "WHERE artist_name LIKE ?"
+                "SELECT artist_name AS name FROM compilation_track_artist WHERE artist_name LIKE ?"
             )
             params_list.append(f"{prefix}%")
 

@@ -107,4 +107,7 @@ class TestSelectPrimaryArtist:
         assert select_primary_artist(["Koo Nimo (2)"]) == "Koo Nimo"
 
     def test_preserves_non_numeric_parens(self):
-        assert select_primary_artist(["Duke Ellington & John Coltrane"]) == "Duke Ellington & John Coltrane"
+        assert (
+            select_primary_artist(["Duke Ellington & John Coltrane"])
+            == "Duke Ellington & John Coltrane"
+        )

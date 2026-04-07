@@ -10,14 +10,16 @@ from __future__ import annotations
 import re
 
 # Canonical VA names (exact match, case-insensitive)
-_VA_EXACT = frozenset({
-    "v/a",
-    "v.a.",
-    "v.a",
-    "various",
-    "various artists",
-    "various artist",
-})
+_VA_EXACT = frozenset(
+    {
+        "v/a",
+        "v.a.",
+        "v.a",
+        "various",
+        "various artists",
+        "various artist",
+    }
+)
 
 # Words that commonly appear in misspelled or variant VA names
 _VA_STEMS = ("various", "v/a", "v.a")
@@ -55,7 +57,7 @@ def is_va_artist(name: str) -> bool:
         return False
 
     # Strip surrounding quotes, brackets, parens
-    cleaned = name.strip().strip('"\'[]()').strip()
+    cleaned = name.strip().strip("\"'[]()").strip()
     lower = cleaned.lower()
 
     if lower in _VA_EXACT:

@@ -53,9 +53,7 @@ AND (lr.ALTERNATE_ARTIST_NAME IS NULL OR lr.ALTERNATE_ARTIST_NAME = '')
 def _run_query(query: str, columns: list[str]) -> list[dict]:
     """Run a MySQL query on the remote host via SSH and parse tab-separated results."""
     if not MYSQL_PASSWORD:
-        raise RuntimeError(
-            "TUBAFRENZY_DB_PASSWORD not set. Export it or add to .env."
-        )
+        raise RuntimeError("TUBAFRENZY_DB_PASSWORD not set. Export it or add to .env.")
 
     ssh_target = f"{SSH_USER}@{SSH_HOST}"
     mysql_cmd = (
@@ -97,18 +95,29 @@ def _run_query(query: str, columns: list[str]) -> list[dict]:
 
 def fetch_va_entries() -> list[FlowsheetEntry]:
     """Fetch all Various Artists flowsheet entries from MySQL."""
-    columns = ["id", "artist_name", "song_title", "release_title", "library_release_id", "artist_id"]
+    columns = [
+        "id",
+        "artist_name",
+        "song_title",
+        "release_title",
+        "library_release_id",
+        "artist_id",
+    ]
     rows = _run_query(_VA_FLOWSHEET_QUERY, columns)
     entries = []
     for row in rows:
-        entries.append(FlowsheetEntry(
-            id=int(row["id"]),
-            artist_name=row["artist_name"] or "",
-            song_title=row["song_title"],
-            release_title=row["release_title"],
-            library_release_id=int(row["library_release_id"]) if row["library_release_id"] else None,
-            artist_id=int(row["artist_id"]) if row["artist_id"] else None,
-        ))
+        entries.append(
+            FlowsheetEntry(
+                id=int(row["id"]),
+                artist_name=row["artist_name"] or "",
+                song_title=row["song_title"],
+                release_title=row["release_title"],
+                library_release_id=int(row["library_release_id"])
+                if row["library_release_id"]
+                else None,
+                artist_id=int(row["artist_id"]) if row["artist_id"] else None,
+            )
+        )
     return entries
 
 
@@ -148,10 +157,7 @@ def apply_sql_file(sql_path: str) -> None:
         raise RuntimeError("TUBAFRENZY_DB_PASSWORD not set.")
 
     ssh_target = f"{SSH_USER}@{SSH_HOST}"
-    mysql_cmd = (
-        f"mysql -h {MYSQL_HOST} -u {MYSQL_USER} -p'{MYSQL_PASSWORD}' "
-        f"{MYSQL_DATABASE}"
-    )
+    mysql_cmd = f"mysql -h {MYSQL_HOST} -u {MYSQL_USER} -p'{MYSQL_PASSWORD}' {MYSQL_DATABASE}"
 
     logger.info(f"Applying {sql_path} via {ssh_target}...")
     start = time.time()
