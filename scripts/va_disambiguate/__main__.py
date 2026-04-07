@@ -217,9 +217,9 @@ async def run(args: argparse.Namespace) -> None:
             lines = generate_flowsheet_updates(resolved)
             write_sql_file(lines, Path(args.flowsheet_output))
 
-        track_artists = await db.get_all_track_artists()
-        if track_artists:
-            lines = generate_catalog_inserts(track_artists)
+        catalog_rows = await db.get_all_track_artists()
+        if catalog_rows:
+            lines = generate_catalog_inserts(catalog_rows)
             write_sql_file(lines, Path(args.catalog_output))
 
         # Generate unresolved CSV
@@ -229,7 +229,7 @@ async def run(args: argparse.Namespace) -> None:
             "SELECT id, artist_name, song_title, release_title, unresolved_reason "
             "FROM flowsheet_entries WHERE status = 'unresolved'"
         )
-        unresolved_rows = await cursor.fetchall()
+        unresolved_rows = list(await cursor.fetchall())
         if unresolved_rows:
             with open(unresolved_path, "w", newline="") as f:
                 writer = csv.writer(f)
@@ -247,9 +247,9 @@ async def run(args: argparse.Namespace) -> None:
               f"{stats['catalog_unresolved']} unresolved of {stats['catalog_total']} total")
         if resolved:
             print(f"\nReview: {args.flowsheet_output}")
-        if enriched:
+        if catalog_rows:
             print(f"Review: {args.catalog_output}")
-        print(f"\nTo apply: uv run python -m scripts.va_disambiguate --apply")
+        print("\nTo apply: uv run python -m scripts.va_disambiguate --apply")
 
     finally:
         await db.close()

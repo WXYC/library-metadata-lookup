@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from scripts.va_disambiguate.models import FlowsheetEntry, ResolutionResult
+from scripts.va_disambiguate.models import FlowsheetEntry
 from scripts.va_disambiguate.resolve import resolve_flowsheet_entry
 
 # Confidence thresholds from the plan

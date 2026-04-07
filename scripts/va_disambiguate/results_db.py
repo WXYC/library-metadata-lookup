@@ -98,8 +98,8 @@ class ResultsDB:
 
     async def count_flowsheet_entries(self) -> int:
         assert self._db is not None
-        row = await self._db.execute_fetchall("SELECT COUNT(*) FROM flowsheet_entries")
-        return row[0][0]
+        rows = list(await self._db.execute_fetchall("SELECT COUNT(*) FROM flowsheet_entries"))
+        return rows[0][0]
 
     async def get_pending_flowsheet_entries(self) -> list[FlowsheetEntry]:
         assert self._db is not None
@@ -228,23 +228,23 @@ class ResultsDB:
         stats = {}
 
         for table, prefix in [("flowsheet_entries", "flowsheet"), ("compilation_releases", "catalog")]:
-            row = await self._db.execute_fetchall(f"SELECT COUNT(*) FROM {table}")
-            stats[f"{prefix}_total"] = row[0][0]
+            rows = list(await self._db.execute_fetchall(f"SELECT COUNT(*) FROM {table}"))
+            stats[f"{prefix}_total"] = rows[0][0]
 
-            row = await self._db.execute_fetchall(
+            rows = list(await self._db.execute_fetchall(
                 f"SELECT COUNT(*) FROM {table} WHERE status = 'resolved'" if prefix == "flowsheet"
                 else f"SELECT COUNT(*) FROM {table} WHERE status = 'enriched'"
-            )
-            stats[f"{prefix}_{'resolved' if prefix == 'flowsheet' else 'enriched'}"] = row[0][0]
+            ))
+            stats[f"{prefix}_{'resolved' if prefix == 'flowsheet' else 'enriched'}"] = rows[0][0]
 
-            row = await self._db.execute_fetchall(
+            rows = list(await self._db.execute_fetchall(
                 f"SELECT COUNT(*) FROM {table} WHERE status = 'unresolved'"
-            )
-            stats[f"{prefix}_unresolved"] = row[0][0]
+            ))
+            stats[f"{prefix}_unresolved"] = rows[0][0]
 
-            row = await self._db.execute_fetchall(
+            rows = list(await self._db.execute_fetchall(
                 f"SELECT COUNT(*) FROM {table} WHERE status = 'pending'"
-            )
-            stats[f"{prefix}_pending"] = row[0][0]
+            ))
+            stats[f"{prefix}_pending"] = rows[0][0]
 
         return stats
