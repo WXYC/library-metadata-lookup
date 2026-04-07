@@ -68,7 +68,7 @@ def find_library_code_id(index: dict[str, int], artist: str) -> int | None:
         return index[stripped]
 
     # Fuzzy match
-    best_score = 0
+    best_score: float = 0
     best_id: int | None = None
     for name, code_id in index.items():
         score = fuzz.ratio(stripped, name)

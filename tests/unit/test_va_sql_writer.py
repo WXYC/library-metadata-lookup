@@ -1,7 +1,5 @@
 """Tests for SQL generation."""
 
-import pytest
-
 from scripts.va_disambiguate.sql_writer import (
     generate_catalog_inserts,
     generate_flowsheet_updates,
