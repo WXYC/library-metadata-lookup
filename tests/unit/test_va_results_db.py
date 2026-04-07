@@ -26,8 +26,15 @@ async def db(tmp_path):
 class TestFlowsheetEntries:
     async def test_insert_and_count(self, db: ResultsDB):
         entries = [
-            FlowsheetEntry(id=1, artist_name="V/A", song_title="odo akosomo", release_title="Vintage Palmwine"),
-            FlowsheetEntry(id=2, artist_name="Various Artists", song_title="Pineapple", release_title="Indian Soundscapes"),
+            FlowsheetEntry(
+                id=1, artist_name="V/A", song_title="odo akosomo", release_title="Vintage Palmwine"
+            ),
+            FlowsheetEntry(
+                id=2,
+                artist_name="Various Artists",
+                song_title="Pineapple",
+                release_title="Indian Soundscapes",
+            ),
         ]
         count = await db.insert_flowsheet_entries(entries)
         assert count == 2
@@ -55,7 +62,10 @@ class TestFlowsheetEntries:
         ]
         await db.insert_flowsheet_entries(entries)
         result = ResolutionResult(
-            entry_id=1, resolved_artist="Koo Nimo", confidence=0.90, strategy="exact",
+            entry_id=1,
+            resolved_artist="Koo Nimo",
+            confidence=0.90,
+            strategy="exact",
         )
         await db.save_flowsheet_resolution(result)
         pending = await db.get_pending_flowsheet_entries()
@@ -70,11 +80,16 @@ class TestFlowsheetEntries:
         assert len(pending) == 0
 
     async def test_get_resolved_entries(self, db: ResultsDB):
-        entry = FlowsheetEntry(id=1, artist_name="V/A", song_title="odo akosomo", release_title="Vintage Palmwine")
+        entry = FlowsheetEntry(
+            id=1, artist_name="V/A", song_title="odo akosomo", release_title="Vintage Palmwine"
+        )
         await db.insert_flowsheet_entries([entry])
         result = ResolutionResult(
-            entry_id=1, resolved_artist="Koo Nimo", confidence=0.90,
-            strategy="exact", library_code_id=42,
+            entry_id=1,
+            resolved_artist="Koo Nimo",
+            confidence=0.90,
+            strategy="exact",
+            library_code_id=42,
         )
         await db.save_flowsheet_resolution(result)
         resolved = await db.get_resolved_flowsheet_entries()
@@ -107,8 +122,12 @@ class TestCompilationReleases:
         ]
         await db.insert_compilation_releases(releases)
         track_artists = [
-            CompilationTrackArtist(library_release_id=100, artist_name="Koo Nimo", track_title="Odo Akosomo"),
-            CompilationTrackArtist(library_release_id=100, artist_name="T.O. Jazz", track_title="Waytime Ama"),
+            CompilationTrackArtist(
+                library_release_id=100, artist_name="Koo Nimo", track_title="Odo Akosomo"
+            ),
+            CompilationTrackArtist(
+                library_release_id=100, artist_name="T.O. Jazz", track_title="Waytime Ama"
+            ),
         ]
         await db.save_catalog_track_artists(100, track_artists)
         pending = await db.get_pending_catalog_releases()
@@ -118,8 +137,12 @@ class TestCompilationReleases:
         releases = [CompilationRelease(id=100, title="Vintage Palmwine", library_code_id=50)]
         await db.insert_compilation_releases(releases)
         track_artists = [
-            CompilationTrackArtist(library_release_id=100, artist_name="Koo Nimo", track_title="Odo Akosomo"),
-            CompilationTrackArtist(library_release_id=100, artist_name="T.O. Jazz", track_title="Waytime Ama"),
+            CompilationTrackArtist(
+                library_release_id=100, artist_name="Koo Nimo", track_title="Odo Akosomo"
+            ),
+            CompilationTrackArtist(
+                library_release_id=100, artist_name="T.O. Jazz", track_title="Waytime Ama"
+            ),
         ]
         await db.save_catalog_track_artists(100, track_artists)
         all_ta = await db.get_all_track_artists()

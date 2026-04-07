@@ -18,9 +18,7 @@ def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def generate_flowsheet_updates(
-    rows: list[dict], *, batch_size: int = 500
-) -> list[str]:
+def generate_flowsheet_updates(rows: list[dict], *, batch_size: int = 500) -> list[str]:
     """Generate UPDATE statements for FLOWSHEET_ENTRY_PROD.
 
     Args:
@@ -66,9 +64,7 @@ def generate_flowsheet_updates(
     return lines
 
 
-def generate_catalog_inserts(
-    rows: list[dict], *, batch_size: int = 500
-) -> list[str]:
+def generate_catalog_inserts(rows: list[dict], *, batch_size: int = 500) -> list[str]:
     """Generate INSERT statements for COMPILATION_TRACK_ARTIST.
 
     Args:

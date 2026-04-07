@@ -905,15 +905,9 @@ def _create_db_with_compilation_track_artists(db_file, *, include_cta_table: boo
             )
         """)
         conn.execute("CREATE INDEX idx_cta_artist ON compilation_track_artist(artist_name)")
-        conn.execute(
-            "INSERT INTO compilation_track_artist VALUES (2, 'Koo Nimo', 'Odo Akosomo')"
-        )
-        conn.execute(
-            "INSERT INTO compilation_track_artist VALUES (2, 'T.O. Jazz', 'Waytime Ama')"
-        )
-        conn.execute(
-            "INSERT INTO compilation_track_artist VALUES (2, 'Kwaa Mensah', 'Obra Ye Ku')"
-        )
+        conn.execute("INSERT INTO compilation_track_artist VALUES (2, 'Koo Nimo', 'Odo Akosomo')")
+        conn.execute("INSERT INTO compilation_track_artist VALUES (2, 'T.O. Jazz', 'Waytime Ama')")
+        conn.execute("INSERT INTO compilation_track_artist VALUES (2, 'Kwaa Mensah', 'Obra Ye Ku')")
 
     conn.commit()
     conn.close()

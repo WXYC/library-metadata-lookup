@@ -28,8 +28,19 @@ def _make_pool(rows: list[dict]) -> AsyncMock:
 class TestResolveTrackArtistExact:
     @pytest.mark.asyncio
     async def test_returns_artist_on_match(self):
-        pool = _make_pool([{"artist_name": "Sessa", "track_title": "Pequena Vertigem", "release_title": "Pequena Vertigem de Amor", "sim": 1.0}])
-        results = await resolve_track_artist_exact(pool, "Pequena Vertigem", "Pequena Vertigem de Amor")
+        pool = _make_pool(
+            [
+                {
+                    "artist_name": "Sessa",
+                    "track_title": "Pequena Vertigem",
+                    "release_title": "Pequena Vertigem de Amor",
+                    "sim": 1.0,
+                }
+            ]
+        )
+        results = await resolve_track_artist_exact(
+            pool, "Pequena Vertigem", "Pequena Vertigem de Amor"
+        )
         assert len(results) == 1
         assert results[0]["artist_name"] == "Sessa"
         # Verify the query was called with the right parameters
@@ -48,7 +59,17 @@ class TestResolveTrackArtistExact:
 class TestResolveTrackArtistFuzzy:
     @pytest.mark.asyncio
     async def test_returns_results_with_similarity(self):
-        pool = _make_pool([{"artist_name": "Juana Molina", "track_title": "la paradoja", "release_title": "DOGA", "song_sim": 0.8, "release_sim": 0.9}])
+        pool = _make_pool(
+            [
+                {
+                    "artist_name": "Juana Molina",
+                    "track_title": "la paradoja",
+                    "release_title": "DOGA",
+                    "song_sim": 0.8,
+                    "release_sim": 0.9,
+                }
+            ]
+        )
         results = await resolve_track_artist_fuzzy(pool, "la paradoja", "DOGA")
         assert len(results) == 1
         assert results[0]["artist_name"] == "Juana Molina"
@@ -63,7 +84,15 @@ class TestResolveTrackArtistFuzzy:
 class TestResolveTrackArtistSongOnly:
     @pytest.mark.asyncio
     async def test_returns_compilation_track_artists(self):
-        pool = _make_pool([{"artist_name": "Cat Power", "track_title": "Cross Bones Style", "release_title": "Some Compilation"}])
+        pool = _make_pool(
+            [
+                {
+                    "artist_name": "Cat Power",
+                    "track_title": "Cross Bones Style",
+                    "release_title": "Some Compilation",
+                }
+            ]
+        )
         results = await resolve_track_artist_song_only(pool, "Cross Bones Style")
         assert len(results) == 1
         assert results[0]["artist_name"] == "Cat Power"
@@ -72,11 +101,13 @@ class TestResolveTrackArtistSongOnly:
 class TestCollectTrackArtistsForRelease:
     @pytest.mark.asyncio
     async def test_returns_track_artist_dicts(self):
-        pool = _make_pool([
-            {"artist_name": "Koo Nimo", "track_title": "Odo Akosomo", "sequence": 1},
-            {"artist_name": "T.O. Jazz", "track_title": "Waytime Ama", "sequence": 2},
-            {"artist_name": "Kwaa Mensah", "track_title": "Obra Ye Ku", "sequence": 3},
-        ])
+        pool = _make_pool(
+            [
+                {"artist_name": "Koo Nimo", "track_title": "Odo Akosomo", "sequence": 1},
+                {"artist_name": "T.O. Jazz", "track_title": "Waytime Ama", "sequence": 2},
+                {"artist_name": "Kwaa Mensah", "track_title": "Obra Ye Ku", "sequence": 3},
+            ]
+        )
         results = await collect_track_artists_for_release(pool, "Vintage Palmwine")
         assert len(results) == 3
         assert results[0]["artist_name"] == "Koo Nimo"

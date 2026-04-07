@@ -89,8 +89,14 @@ class ResultsDB:
                 """INSERT OR IGNORE INTO flowsheet_entries
                    (id, artist_name, song_title, release_title, library_release_id, artist_id)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (entry.id, entry.artist_name, entry.song_title, entry.release_title,
-                 entry.library_release_id, entry.artist_id),
+                (
+                    entry.id,
+                    entry.artist_name,
+                    entry.song_title,
+                    entry.release_title,
+                    entry.library_release_id,
+                    entry.artist_id,
+                ),
             )
             inserted += cursor.rowcount
         await self._db.commit()
@@ -117,8 +123,13 @@ class ResultsDB:
                SET status = 'resolved', resolved_artist = ?, confidence = ?,
                    strategy = ?, library_code_id = ?
                WHERE id = ?""",
-            (result.resolved_artist, result.confidence, result.strategy,
-             result.library_code_id, result.entry_id),
+            (
+                result.resolved_artist,
+                result.confidence,
+                result.strategy,
+                result.library_code_id,
+                result.entry_id,
+            ),
         )
         await self._db.commit()
 
@@ -159,8 +170,7 @@ class ResultsDB:
     async def get_pending_catalog_releases(self) -> list[CompilationRelease]:
         assert self._db is not None
         cursor = await self._db.execute(
-            "SELECT id, title, library_code_id "
-            "FROM compilation_releases WHERE status = 'pending'"
+            "SELECT id, title, library_code_id FROM compilation_releases WHERE status = 'pending'"
         )
         rows = await cursor.fetchall()
         return [CompilationRelease(**dict(row)) for row in rows]
@@ -227,24 +237,34 @@ class ResultsDB:
         assert self._db is not None
         stats = {}
 
-        for table, prefix in [("flowsheet_entries", "flowsheet"), ("compilation_releases", "catalog")]:
+        for table, prefix in [
+            ("flowsheet_entries", "flowsheet"),
+            ("compilation_releases", "catalog"),
+        ]:
             rows = list(await self._db.execute_fetchall(f"SELECT COUNT(*) FROM {table}"))
             stats[f"{prefix}_total"] = rows[0][0]
 
-            rows = list(await self._db.execute_fetchall(
-                f"SELECT COUNT(*) FROM {table} WHERE status = 'resolved'" if prefix == "flowsheet"
-                else f"SELECT COUNT(*) FROM {table} WHERE status = 'enriched'"
-            ))
+            rows = list(
+                await self._db.execute_fetchall(
+                    f"SELECT COUNT(*) FROM {table} WHERE status = 'resolved'"
+                    if prefix == "flowsheet"
+                    else f"SELECT COUNT(*) FROM {table} WHERE status = 'enriched'"
+                )
+            )
             stats[f"{prefix}_{'resolved' if prefix == 'flowsheet' else 'enriched'}"] = rows[0][0]
 
-            rows = list(await self._db.execute_fetchall(
-                f"SELECT COUNT(*) FROM {table} WHERE status = 'unresolved'"
-            ))
+            rows = list(
+                await self._db.execute_fetchall(
+                    f"SELECT COUNT(*) FROM {table} WHERE status = 'unresolved'"
+                )
+            )
             stats[f"{prefix}_unresolved"] = rows[0][0]
 
-            rows = list(await self._db.execute_fetchall(
-                f"SELECT COUNT(*) FROM {table} WHERE status = 'pending'"
-            ))
+            rows = list(
+                await self._db.execute_fetchall(
+                    f"SELECT COUNT(*) FROM {table} WHERE status = 'pending'"
+                )
+            )
             stats[f"{prefix}_pending"] = rows[0][0]
 
         return stats

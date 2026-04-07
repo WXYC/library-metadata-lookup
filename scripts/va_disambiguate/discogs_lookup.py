@@ -11,9 +11,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-async def resolve_track_artist_exact(
-    pool, song_title: str, release_title: str
-) -> list[dict]:
+async def resolve_track_artist_exact(pool, song_title: str, release_title: str) -> list[dict]:
     """Find track artists by exact match on song + release title.
 
     Uses case-insensitive, diacritics-insensitive matching via f_unaccent().
@@ -41,9 +39,7 @@ async def resolve_track_artist_exact(
     return [dict(row) for row in rows]
 
 
-async def resolve_track_artist_fuzzy(
-    pool, song_title: str, release_title: str
-) -> list[dict]:
+async def resolve_track_artist_fuzzy(pool, song_title: str, release_title: str) -> list[dict]:
     """Find track artists by fuzzy match on song + release title.
 
     Uses pg_trgm similarity for typo-tolerant matching.
@@ -77,9 +73,7 @@ async def resolve_track_artist_fuzzy(
     return [dict(row) for row in rows]
 
 
-async def resolve_track_artist_song_only(
-    pool, song_title: str
-) -> list[dict]:
+async def resolve_track_artist_song_only(pool, song_title: str) -> list[dict]:
     """Find track artists by song title only, filtered to compilation releases.
 
     Used when the flowsheet entry has no release title. Restricts to releases
@@ -108,9 +102,7 @@ async def resolve_track_artist_song_only(
     return [dict(row) for row in rows]
 
 
-async def collect_track_artists_for_release(
-    pool, release_title: str
-) -> list[dict]:
+async def collect_track_artists_for_release(pool, release_title: str) -> list[dict]:
     """Collect all track artist credits for a compilation release.
 
     Matches the release by title (exact, case-insensitive) and returns
