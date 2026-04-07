@@ -851,3 +851,143 @@ class TestLabelColumn:
         db._has_label = False
         cols = db._select_columns()
         assert "label" not in cols
+
+
+# ---------------------------------------------------------------------------
+# compilation_track_artist table
+# ---------------------------------------------------------------------------
+
+
+def _create_db_with_compilation_track_artists(db_file, *, include_cta_table: bool = True):
+    """Create a test library.db with optional compilation_track_artist table."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_file)
+    conn.execute("""
+        CREATE TABLE library (
+            id INTEGER PRIMARY KEY, title TEXT, artist TEXT,
+            call_letters TEXT, artist_call_number INTEGER,
+            release_call_number INTEGER, genre TEXT, format TEXT,
+            alternate_artist_name TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE VIRTUAL TABLE library_fts USING fts5(
+            title, artist, alternate_artist_name,
+            content='library', content_rowid='id'
+        )
+    """)
+    # A regular artist release
+    conn.execute(
+        "INSERT INTO library VALUES "
+        "(1, 'Aluminum Tunes', 'Stereolab', 'S', 1, 1, 'Rock', 'CD', NULL)"
+    )
+    conn.execute(
+        "INSERT INTO library_fts(rowid, title, artist, alternate_artist_name) "
+        "VALUES (1, 'Aluminum Tunes', 'Stereolab', NULL)"
+    )
+    # A compilation release
+    conn.execute(
+        "INSERT INTO library VALUES "
+        "(2, 'Vintage Palmwine', 'various', 'Z-', 0, 1, 'World', 'CD', NULL)"
+    )
+    conn.execute(
+        "INSERT INTO library_fts(rowid, title, artist, alternate_artist_name) "
+        "VALUES (2, 'Vintage Palmwine', 'various', NULL)"
+    )
+
+    if include_cta_table:
+        conn.execute("""
+            CREATE TABLE compilation_track_artist (
+                library_release_id INTEGER NOT NULL,
+                artist_name TEXT NOT NULL,
+                track_title TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX idx_cta_artist ON compilation_track_artist(artist_name)")
+        conn.execute(
+            "INSERT INTO compilation_track_artist VALUES (2, 'Koo Nimo', 'Odo Akosomo')"
+        )
+        conn.execute(
+            "INSERT INTO compilation_track_artist VALUES (2, 'T.O. Jazz', 'Waytime Ama')"
+        )
+        conn.execute(
+            "INSERT INTO compilation_track_artist VALUES (2, 'Kwaa Mensah', 'Obra Ye Ku')"
+        )
+
+    conn.commit()
+    conn.close()
+
+
+class TestCompilationTrackArtistSearch:
+    @pytest.mark.asyncio
+    async def test_connect_detects_table(self, tmp_path):
+        db_file = tmp_path / "test.db"
+        _create_db_with_compilation_track_artists(db_file, include_cta_table=True)
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        assert db._has_compilation_track_artist is True
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_connect_without_table(self, tmp_path):
+        db_file = tmp_path / "test.db"
+        _create_db_with_compilation_track_artists(db_file, include_cta_table=False)
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        assert db._has_compilation_track_artist is False
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_artist_search_surfaces_compilation(self, tmp_path):
+        """Searching for 'Koo Nimo' should return 'Vintage Palmwine' compilation."""
+        db_file = tmp_path / "test.db"
+        _create_db_with_compilation_track_artists(db_file)
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        results = await db.search(artist="Koo Nimo")
+        assert len(results) >= 1
+        titles = [r.title for r in results]
+        assert "Vintage Palmwine" in titles
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_artist_search_still_finds_regular_releases(self, tmp_path):
+        """Searching for 'Stereolab' should still find their own releases."""
+        db_file = tmp_path / "test.db"
+        _create_db_with_compilation_track_artists(db_file)
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        results = await db.search(artist="Stereolab")
+        assert len(results) >= 1
+        titles = [r.title for r in results]
+        assert "Aluminum Tunes" in titles
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_graceful_degradation_without_table(self, tmp_path):
+        """Without compilation_track_artist table, search still works normally."""
+        db_file = tmp_path / "test.db"
+        _create_db_with_compilation_track_artists(db_file, include_cta_table=False)
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        # Should NOT find Vintage Palmwine for Koo Nimo without the table
+        results = await db.search(artist="Koo Nimo")
+        titles = [r.title for r in results]
+        assert "Vintage Palmwine" not in titles
+        # Should still find regular releases
+        results = await db.search(artist="Stereolab")
+        assert len(results) >= 1
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_find_similar_artist_includes_compilation_artists(self, tmp_path):
+        """find_similar_artist should check compilation_track_artist for candidates."""
+        db_file = tmp_path / "test.db"
+        _create_db_with_compilation_track_artists(db_file)
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        # "Koo Nimo" is only in compilation_track_artist, not in library.artist
+        result = await db.find_similar_artist("Koo Nmo")  # typo
+        assert result == "Koo Nimo"
+        await db.close()

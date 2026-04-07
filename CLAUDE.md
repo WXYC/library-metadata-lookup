@@ -34,7 +34,7 @@ All strategy implementations live in `lookup/orchestrator.py`.
 - `lookup/models.py` -- Re-exports generated API contract models (`LookupRequest`, `LookupResponse`, `LookupResultItem`)
 - `generated/api_models.py` -- Pydantic v2 models generated from `wxyc-shared/api.yaml`
 - `lookup/router.py` -- `POST /lookup` endpoint
-- `library/db.py` -- SQLite FTS5 search with LIKE + fuzzy fallback chain
+- `library/db.py` -- SQLite FTS5 search with LIKE + fuzzy fallback chain. Detects `compilation_track_artist` table at connect time; when present, artist searches include compilations featuring that artist via JOIN/UNION.
 - `discogs/service.py` -- Discogs API client with optional PostgreSQL cache
 - `discogs/cache_service.py` -- PostgreSQL cache (asyncpg + pg_trgm)
 - `discogs/memory_cache.py` -- In-memory TTL cache (cachetools)
@@ -201,6 +201,19 @@ bash scripts/generate_api_models.sh
 ```
 
 Requires `datamodel-code-generator` (included in dev dependencies).
+
+### VA Disambiguation (`scripts/va_disambiguate/`)
+
+Disambiguates "Various Artists" entries in the WXYC flowsheet and populates the `COMPILATION_TRACK_ARTIST` table with per-track artist credits from the Discogs cache.
+
+**Usage:**
+```bash
+uv run python -m scripts.va_disambiguate [OPTIONS]
+```
+
+Options: `--dry-run` (extract only), `--stats` (show progress), `--apply` (execute SQL), `--confidence-threshold FLOAT` (default 0.70), `--verbose`.
+
+Generates two SQL files for review before application: `va_flowsheet_updates.sql` (updates `ARTIST_NAME`/`ARTIST_ID` on flowsheet entries) and `va_catalog_inserts.sql` (inserts into `COMPILATION_TRACK_ARTIST`). Requires `DATABASE_URL_DISCOGS` and `TUBAFRENZY_DB_PASSWORD` environment variables.
 
 ## Relationship to Other Repos
 
