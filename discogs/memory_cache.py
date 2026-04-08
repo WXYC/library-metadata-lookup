@@ -81,7 +81,14 @@ def create_ttl_cache(maxsize: int, ttl: int) -> TTLCache:
 
 def clear_all_caches() -> None:
     """Clear all registered caches and reset lazy caches."""
-    global _track_cache, _release_cache, _search_cache, _artist_cache, _label_cache, _master_cache, _validation_cache
+    global \
+        _track_cache, \
+        _release_cache, \
+        _search_cache, \
+        _artist_cache, \
+        _label_cache, \
+        _master_cache, \
+        _validation_cache
     for cache in _cache_registry:
         cache.clear()
     # Reset lazy caches so they get recreated with fresh settings

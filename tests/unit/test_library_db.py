@@ -1035,8 +1035,12 @@ class TestLibraryDBSearchCache:
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
 
-        result1 = await db.search(query="Nonexistent", fallback_to_like=False, fallback_to_fuzzy=False)
-        result2 = await db.search(query="Nonexistent", fallback_to_like=False, fallback_to_fuzzy=False)
+        result1 = await db.search(
+            query="Nonexistent", fallback_to_like=False, fallback_to_fuzzy=False
+        )
+        result2 = await db.search(
+            query="Nonexistent", fallback_to_like=False, fallback_to_fuzzy=False
+        )
 
         assert result1 == []
         assert result2 == []

@@ -71,11 +71,10 @@ class Settings(BaseSettings):
 
     # Library Cache Configuration
     library_cache_ttl: int = Field(
-        default=3600, description="TTL in seconds for library search/artist caches (default: 1 hour)"
+        default=3600,
+        description="TTL in seconds for library search/artist caches (default: 1 hour)",
     )
-    library_cache_maxsize: int = Field(
-        default=500, description="Maximum entries in library caches"
-    )
+    library_cache_maxsize: int = Field(default=500, description="Maximum entries in library caches")
 
     # Discogs Rate Limiting Configuration
     discogs_rate_limit: int = Field(

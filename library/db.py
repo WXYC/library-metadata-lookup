@@ -396,9 +396,7 @@ class LibraryDB:
         artist_cache[cache_key] = result
         return result
 
-    async def _find_similar_artist_uncached(
-        self, artist: str, threshold: int = 85
-    ) -> str | None:
+    async def _find_similar_artist_uncached(self, artist: str, threshold: int = 85) -> str | None:
         assert self._conn is not None  # Caller validates
         # Get candidate artists using prefix of first significant word
         artist_lower = artist.lower()
