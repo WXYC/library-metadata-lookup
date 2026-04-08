@@ -985,3 +985,121 @@ class TestCompilationTrackArtistSearch:
         result = await db.find_similar_artist("Koo Nmo")  # typo
         assert result == "Koo Nimo"
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# In-memory caching
+# ---------------------------------------------------------------------------
+
+
+class TestLibraryDBSearchCache:
+    @pytest.mark.asyncio
+    async def test_search_cache_hit_skips_db(self):
+        """Second identical search should return cached result without DB call."""
+        db = LibraryDB()
+        row = _make_row(id=1, artist="Stereolab", title="Aluminum Tunes")
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[row])
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(return_value=mock_cursor)
+
+        result1 = await db.search(query="Stereolab Aluminum")
+        result2 = await db.search(query="Stereolab Aluminum")
+
+        assert len(result1) == 1
+        assert result1 == result2
+        # DB should only have been called once (second call uses cache)
+        assert db._conn.execute.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_search_cache_different_queries_both_hit_db(self):
+        """Different queries should both hit the DB."""
+        db = LibraryDB()
+        row = _make_row(id=1, artist="Stereolab", title="Aluminum Tunes")
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[row])
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(return_value=mock_cursor)
+
+        await db.search(query="Stereolab")
+        await db.search(query="Cat Power")
+
+        assert db._conn.execute.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_search_cache_empty_results_cached(self):
+        """Empty results should also be cached."""
+        db = LibraryDB()
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[])
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(return_value=mock_cursor)
+
+        result1 = await db.search(query="Nonexistent", fallback_to_like=False, fallback_to_fuzzy=False)
+        result2 = await db.search(query="Nonexistent", fallback_to_like=False, fallback_to_fuzzy=False)
+
+        assert result1 == []
+        assert result2 == []
+        assert db._conn.execute.call_count == 1
+
+
+class TestLibraryDBFindSimilarArtistCache:
+    @pytest.mark.asyncio
+    async def test_find_similar_artist_cache_hit(self):
+        """Second identical lookup should return cached result."""
+        db = LibraryDB()
+
+        class FakeRow:
+            def __init__(self, val):
+                self.val = val
+
+            def __getitem__(self, idx):
+                return self.val
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Living Colour")])
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(return_value=mock_cursor)
+
+        result1 = await db.find_similar_artist("Living Color")
+        result2 = await db.find_similar_artist("Living Color")
+
+        assert result1 == "Living Colour"
+        assert result1 == result2
+        assert db._conn.execute.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_find_similar_artist_caches_none(self):
+        """None results (no correction) should also be cached."""
+        db = LibraryDB()
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[])
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(return_value=mock_cursor)
+
+        result1 = await db.find_similar_artist("Nonexistent")
+        result2 = await db.find_similar_artist("Nonexistent")
+
+        assert result1 is None
+        assert result2 is None
+        assert db._conn.execute.call_count == 1
+
+
+class TestLibraryDBCacheInvalidation:
+    @pytest.mark.asyncio
+    async def test_close_clears_caches(self):
+        """Closing the DB should clear all library caches."""
+        from library.db import _get_library_caches
+
+        artist_cache, search_cache = _get_library_caches()
+        artist_cache["test_key"] = "test_value"
+        search_cache["test_key"] = "test_value"
+
+        db = LibraryDB()
+        db._conn = AsyncMock()
+        await db.close()
+
+        # Caches should be cleared after close
+        artist_cache, search_cache = _get_library_caches()
+        assert len(artist_cache) == 0
+        assert len(search_cache) == 0

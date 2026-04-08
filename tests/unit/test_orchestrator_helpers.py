@@ -597,6 +597,36 @@ class TestSearchLibraryWithFallback:
         assert fallback is False
 
 
+    @pytest.mark.asyncio
+    async def test_multiple_albums_all_searched_and_deduplicated(self, mock_library_db):
+        """All albums should be searched and results deduplicated by ID."""
+        item1 = make_library_item(id=1, artist="Stereolab", title="Emperor Tomato Ketchup")
+        item2 = make_library_item(
+            id=2, artist="Stereolab", title="Dots and Loops", release_call_number=2
+        )
+        mock_library_db.search.side_effect = [
+            [item1],  # first album search
+            [item2],  # second album search
+        ]
+
+        parsed = ParsedRequest(
+            song="Percolator",
+            artist="Stereolab",
+            raw_message="Test",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        results, fallback = await search_library_with_fallback(
+            mock_library_db, parsed, ["Emperor Tomato Ketchup", "Dots and Loops"]
+        )
+
+        assert len(results) == 2
+        assert fallback is False
+        # Primary album should be sorted first
+        assert results[0].title == "Emperor Tomato Ketchup"
+        assert mock_library_db.search.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # Tests: search_with_alternative_interpretation
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 import aiosqlite
+from cachetools import TTLCache  # type: ignore[import-untyped]
 from rapidfuzz import fuzz
 
 from core.matching import STOPWORDS, normalize_for_comparison
@@ -12,6 +13,36 @@ logger = logging.getLogger(__name__)
 
 # Default path to SQLite database (relative to project root)
 DEFAULT_DB_PATH = Path(__file__).parent.parent / "library.db"
+
+# Module-level caches for library search results.
+# Lazy-initialized from settings. Cleared when the database is closed/replaced.
+_artist_cache: TTLCache | None = None
+_search_cache: TTLCache | None = None
+
+
+def _get_library_caches() -> tuple[TTLCache, TTLCache]:
+    """Get or create library caches from settings."""
+    global _artist_cache, _search_cache
+    if _artist_cache is None or _search_cache is None:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        _artist_cache = TTLCache(
+            maxsize=settings.library_cache_maxsize // 2, ttl=settings.library_cache_ttl
+        )
+        _search_cache = TTLCache(
+            maxsize=settings.library_cache_maxsize, ttl=settings.library_cache_ttl
+        )
+    return _artist_cache, _search_cache
+
+
+def clear_library_caches() -> None:
+    """Reset library search and artist caches (called on DB upload)."""
+    global _artist_cache, _search_cache
+    if _artist_cache is not None:
+        _artist_cache.clear()
+    if _search_cache is not None:
+        _search_cache.clear()
 
 
 class LibraryDB:
@@ -67,10 +98,11 @@ class LibraryDB:
             return False
 
     async def close(self):
-        """Close database connection."""
+        """Close database connection and clear caches."""
         if self._conn:
             await self._conn.close()
             self._conn = None
+            clear_library_caches()
             logger.info("Closed SQLite connection")
 
     def _select_columns(self, prefix: str = "") -> str:
@@ -112,6 +144,27 @@ class LibraryDB:
         if not self._conn:
             raise RuntimeError("Database not connected")
 
+        _, search_cache = _get_library_caches()
+        cache_key = (query, artist, title, limit, fallback_to_like, fallback_to_fuzzy)
+        if cache_key in search_cache:
+            return search_cache[cache_key]
+
+        result = await self._search_uncached(
+            query, artist, title, limit, fallback_to_like, fallback_to_fuzzy
+        )
+        search_cache[cache_key] = result
+        return result
+
+    async def _search_uncached(
+        self,
+        query: str | None,
+        artist: str | None,
+        title: str | None,
+        limit: int,
+        fallback_to_like: bool,
+        fallback_to_fuzzy: bool,
+    ) -> list[LibraryItem]:
+        assert self._conn is not None  # Caller validates
         if query:
             # Full-text search using FTS5
             sql = f"""
@@ -334,6 +387,19 @@ class LibraryDB:
         if not self._conn:
             raise RuntimeError("Database not connected")
 
+        artist_cache, _ = _get_library_caches()
+        cache_key = artist.lower()
+        if cache_key in artist_cache:
+            return artist_cache[cache_key]
+
+        result = await self._find_similar_artist_uncached(artist, threshold)
+        artist_cache[cache_key] = result
+        return result
+
+    async def _find_similar_artist_uncached(
+        self, artist: str, threshold: int = 85
+    ) -> str | None:
+        assert self._conn is not None  # Caller validates
         # Get candidate artists using prefix of first significant word
         artist_lower = artist.lower()
 

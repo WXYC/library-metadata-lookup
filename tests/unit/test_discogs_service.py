@@ -782,6 +782,29 @@ class TestValidateTrackOnRelease:
         assert result is True
 
     @pytest.mark.asyncio
+    async def test_memory_cache_hit_skips_api(self, service):
+        """Second identical validation should use in-memory cache, not API."""
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Album",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/1",
+            tracklist=[TrackItem(position="1", title="Percolator")],
+        )
+        mock_get_release = AsyncMock(return_value=release)
+        with patch.object(service, "get_release", mock_get_release):
+            result1 = await service.validate_track_on_release(1, "Percolator", "Stereolab")
+        assert result1 is True
+        assert mock_get_release.call_count == 1
+
+        # Second call should use memory cache, not call get_release again
+        mock_get_release2 = AsyncMock(return_value=release)
+        with patch.object(service, "get_release", mock_get_release2):
+            result2 = await service.validate_track_on_release(1, "Percolator", "Stereolab")
+        assert result2 is True
+        assert mock_get_release2.call_count == 0
+
+    @pytest.mark.asyncio
     async def test_cache_miss_falls_back_to_api(self, service_with_cache):
         service_with_cache.cache_service.validate_track_on_release = AsyncMock(return_value=None)
 

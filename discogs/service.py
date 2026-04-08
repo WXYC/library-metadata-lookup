@@ -29,6 +29,7 @@ from discogs.memory_cache import (
     RELEASE_CACHE,
     SEARCH_CACHE,
     TRACK_CACHE,
+    VALIDATION_CACHE,
     async_cached,
     should_skip_cache,
 )
@@ -838,6 +839,7 @@ class DiscogsService:
 
         return params
 
+    @async_cached(VALIDATION_CACHE)
     async def validate_track_on_release(self, release_id: int, track: str, artist: str) -> bool:
         """Validate that a track by an artist exists on a release.
 
