@@ -4,6 +4,7 @@ import pytest
 
 from scripts.va_disambiguate.matching import (
     extract_embedded_artist,
+    is_placeholder_artist,
     is_va_artist,
     select_primary_artist,
 )
@@ -89,6 +90,29 @@ class TestExtractEmbeddedArtist:
     )
     def test_returns_none_for_plain_va(self, artist_name: str):
         assert extract_embedded_artist(artist_name) is None
+
+    def test_rejects_single_char_result(self):
+        """'Various Artists- H' should return None (H is a genre tag)."""
+        assert extract_embedded_artist("Various Artists- H") is None
+
+    def test_rejects_two_char_result(self):
+        assert extract_embedded_artist("Various Artists- DJ") is None
+
+
+class TestIsPlaceholderArtist:
+    @pytest.mark.parametrize(
+        "name",
+        ["Unknown Artist", "No Artist", "unknown", "Anonymous", "", "H", "DJ"],
+    )
+    def test_detects_placeholders(self, name: str):
+        assert is_placeholder_artist(name) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        ["Koo Nimo", "Cat Power", "Stereolab", "T.O. Jazz"],
+    )
+    def test_accepts_real_artists(self, name: str):
+        assert is_placeholder_artist(name) is False
 
 
 class TestSelectPrimaryArtist:

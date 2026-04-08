@@ -40,6 +40,20 @@ _EMBEDDED_PARENS_RE = re.compile(
 # Discogs numeric disambiguation suffix: "Artist Name (2)"
 _DISCOGS_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")
 
+# Discogs placeholder artist names that shouldn't be used as resolutions
+_PLACEHOLDER_ARTISTS = frozenset(
+    {
+        "unknown artist",
+        "no artist",
+        "unknown",
+        "various artists",
+        "various",
+        "no name",
+        "anonymous",
+        "untitled",
+    }
+)
+
 
 def is_va_artist(name: str) -> bool:
     """Check if an artist name is a Various Artists variant.
@@ -96,17 +110,37 @@ def extract_embedded_artist(artist_name: str) -> str | None:
     match = _EMBEDDED_DASH_RE.match(stripped)
     if match:
         artist = match.group(1).strip()
-        if artist:
+        if artist and len(artist) > 2 and not is_placeholder_artist(artist):
             return artist
 
     # Try "VA (Artist)" pattern
     match = _EMBEDDED_PARENS_RE.match(stripped)
     if match:
         artist = match.group(1).strip()
-        if artist:
+        if artist and len(artist) > 2 and not is_placeholder_artist(artist):
             return artist
 
     return None
+
+
+def is_placeholder_artist(name: str) -> bool:
+    """Check if an artist name is a Discogs placeholder that shouldn't be used.
+
+    Rejects names like "Unknown Artist", "No Artist", "Anonymous", and
+    single-character names that are likely genre tags (e.g., "(H)" for Hiphop).
+
+    Args:
+        name: Artist name to check.
+
+    Returns:
+        True if the name is a placeholder and should not be used as a resolution.
+    """
+    if not name:
+        return True
+    stripped = name.strip()
+    if len(stripped) <= 2:
+        return True
+    return stripped.lower() in _PLACEHOLDER_ARTISTS
 
 
 def select_primary_artist(artists: list[str]) -> str | None:

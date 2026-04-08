@@ -31,7 +31,12 @@ from pathlib import Path
 import asyncpg
 from dotenv import load_dotenv
 
-from scripts.va_disambiguate.discogs_lookup import collect_track_artists_for_release
+from scripts.va_disambiguate.discogs_lookup import (
+    api_get_release_tracks,
+    api_search_release,
+    collect_track_artists_for_release,
+    create_discogs_api_client,
+)
 from scripts.va_disambiguate.extract import (
     apply_sql_file,
     fetch_compilation_releases,
@@ -41,7 +46,7 @@ from scripts.va_disambiguate.extract import (
 from scripts.va_disambiguate.library_lookup import build_library_code_index
 from scripts.va_disambiguate.matching import select_primary_artist
 from scripts.va_disambiguate.models import CompilationTrackArtist
-from scripts.va_disambiguate.resolve import resolve_flowsheet_entry
+from scripts.va_disambiguate.resolve import resolve_flowsheet_entry, resolve_from_tracklist
 from scripts.va_disambiguate.results_db import ResultsDB
 from scripts.va_disambiguate.sql_writer import (
     generate_catalog_inserts,
@@ -65,6 +70,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stats", action="store_true")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument(
+        "--exact-only", action="store_true", help="Skip fuzzy and song-only strategies"
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -145,8 +153,13 @@ async def run(args: argparse.Namespace) -> None:
         library_index = build_library_code_index(all_codes)
         logger.info(f"Built library index with {len(library_index)} entries")
 
-        # Connect to Discogs cache
-        pool = await asyncpg.create_pool(database_url, min_size=1, max_size=5)
+        # Connect to Discogs cache (5s statement timeout to prevent runaway fuzzy queries)
+        pool = await asyncpg.create_pool(
+            database_url,
+            min_size=1,
+            max_size=5,
+            command_timeout=5,
+        )
 
         try:
             # Phase 1a: Resolve flowsheet artists
@@ -162,6 +175,7 @@ async def run(args: argparse.Namespace) -> None:
                         pool,
                         library_index,
                         confidence_threshold=args.confidence_threshold,
+                        exact_only=getattr(args, "exact_only", False),
                     )
                     if result:
                         await db.save_flowsheet_resolution(result)
@@ -179,6 +193,75 @@ async def run(args: argparse.Namespace) -> None:
 
                 logger.info(f"  Done: {resolved_count} resolved, {unresolved_count} unresolved")
 
+            # Phase 1a-api: API fallback for unresolved entries
+            if os.environ.get("DISCOGS_TOKEN"):
+                # Reset unresolved entries back to pending for API retry
+                assert db._db is not None
+                await db._db.execute(
+                    "UPDATE flowsheet_entries SET status = 'pending', unresolved_reason = NULL "
+                    "WHERE status = 'unresolved' AND unresolved_reason = 'no_match'"
+                )
+                await db._db.commit()
+
+                pending_api = await db.get_pending_flowsheet_entries()
+                if pending_api:
+                    # Group by album
+                    by_album: dict[str, list] = {}
+                    for entry in pending_api:
+                        key = (entry.release_title or "").strip()
+                        if key:
+                            by_album.setdefault(key, []).append(entry)
+
+                    logger.info(
+                        f"Phase 1a-api: API fallback for {len(pending_api)} entries "
+                        f"across {len(by_album)} albums..."
+                    )
+                    api_resolved = 0
+                    api_unresolved = 0
+                    albums_checked = 0
+
+                    async with create_discogs_api_client() as client:
+                        for album_title, entries in by_album.items():
+                            try:
+                                release_id = await api_search_release(client, album_title)
+                            except Exception as e:
+                                logger.warning(f"  API search failed for '{album_title}': {e}")
+                                release_id = None
+
+                            tracklist: list[dict] = []
+                            if release_id:
+                                try:
+                                    tracklist = await api_get_release_tracks(client, release_id)
+                                except Exception as e:
+                                    logger.warning(
+                                        f"  API get_release failed for {release_id}: {e}"
+                                    )
+
+                            for entry in entries:
+                                if tracklist:
+                                    result = resolve_from_tracklist(entry, tracklist, library_index)
+                                else:
+                                    result = None
+
+                                if result:
+                                    await db.save_flowsheet_resolution(result)
+                                    api_resolved += 1
+                                else:
+                                    await db.mark_flowsheet_unresolved(entry.id, "no_api_match")
+                                    api_unresolved += 1
+
+                            albums_checked += 1
+                            if albums_checked % 50 == 0:
+                                logger.info(
+                                    f"  API progress: {albums_checked}/{len(by_album)} albums "
+                                    f"({api_resolved} resolved, {api_unresolved} unresolved)"
+                                )
+
+                    logger.info(
+                        f"  API done: {api_resolved} resolved, {api_unresolved} unresolved "
+                        f"from {albums_checked} albums"
+                    )
+
             # Phase 1b: Collect compilation track artists
             pending_releases = await db.get_pending_catalog_releases()
             if pending_releases:
@@ -189,7 +272,11 @@ async def run(args: argparse.Namespace) -> None:
                 unenriched_count = 0
 
                 for i, release in enumerate(pending_releases):
-                    artists_data = await collect_track_artists_for_release(pool, release.title)
+                    try:
+                        artists_data = await collect_track_artists_for_release(pool, release.title)
+                    except Exception as e:
+                        logger.warning(f"  Failed to collect artists for '{release.title}': {e}")
+                        artists_data = []
                     if artists_data:
                         track_artists = [
                             CompilationTrackArtist(
