@@ -175,6 +175,42 @@ class TestEnrichArtworkResults:
         assert enriched.spotify_url is not None  # search URL still works
 
     @pytest.mark.asyncio
+    async def test_enriches_multiple_items_preserving_order(self):
+        """Multiple items should all be enriched and returned in input order."""
+        items_with_artwork = [
+            (
+                make_library_item(id=i, artist=f"Artist {i}", title=f"Album {i}"),
+                make_discogs_result(release_id=i, artist=f"Artist {i}", album=f"Album {i}"),
+            )
+            for i in range(1, 4)
+        ]
+
+        discogs_service = AsyncMock()
+
+        def make_release(release_id, **_kwargs):
+            return ReleaseMetadataResponse(
+                release_id=release_id,
+                title=f"Album {release_id}",
+                artist=f"Artist {release_id}",
+                year=2000 + release_id,
+                artist_id=None,
+                release_url=f"https://discogs.com/release/{release_id}",
+            )
+
+        discogs_service.get_release.side_effect = lambda rid: make_release(rid)
+
+        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
+            results = await enrich_artwork_results(
+                items_with_artwork, discogs_service, song="Song"
+            )
+
+        assert len(results) == 3
+        for i, (item, enriched) in enumerate(results, start=1):
+            assert item.id == i, f"Item order not preserved at position {i}"
+            assert enriched is not None
+            assert enriched.release_year == 2000 + i
+
+    @pytest.mark.asyncio
     async def test_to_match_result_includes_enriched_fields(self):
         result = DiscogsSearchResult(
             release_id=123,

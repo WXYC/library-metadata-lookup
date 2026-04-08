@@ -142,13 +142,12 @@ async def search_with_alternative_interpretation(
     part2: str,
 ) -> tuple[list[LibraryItem], None]:
     """Try searching with both artist/title interpretations for 'X - Y' format."""
-    query1 = f"{part1} {part2}"
-    results1 = await db.search(query=query1, limit=_FETCH_LIMIT)
-    results1 = filter_results_by_artist(results1, part1)
-
-    query2 = f"{part2} {part1}"
-    results2 = await db.search(query=query2, limit=_FETCH_LIMIT)
-    results2 = filter_results_by_artist(results2, part2)
+    raw1, raw2 = await asyncio.gather(
+        db.search(query=f"{part1} {part2}", limit=_FETCH_LIMIT),
+        db.search(query=f"{part2} {part1}", limit=_FETCH_LIMIT),
+    )
+    results1 = filter_results_by_artist(raw1, part1)
+    results2 = filter_results_by_artist(raw2, part2)
 
     if results1 and not results2:
         logger.info(f"Alternative search matched with '{part1}' as artist")
@@ -194,24 +193,30 @@ async def search_song_as_artist(
 
     logger.info(f"Found {len(discogs_releases)} Discogs releases for '{song_as_artist}'")
 
-    seen_ids = set()
-    for _discogs_artist, album_title in discogs_releases:
+    async def search_album(album_title: str) -> list[LibraryItem]:
         if not album_title:
-            continue
-
+            return []
         album_results = await db.search(query=album_title, limit=_FETCH_LIMIT)
+        return [
+            item
+            for item in album_results
+            if artist_matches_item(item, song_as_artist)
+            or is_compilation_artist(item.artist or "")
+        ]
 
-        for item in album_results:
-            if item.id in seen_ids:
-                continue
+    all_matches = await asyncio.gather(
+        *[search_album(album_title) for _, album_title in discogs_releases]
+    )
 
-            if artist_matches_item(item, song_as_artist) or is_compilation_artist(
-                item.artist or ""
-            ):
+    seen_ids: set[int] = set()
+    for matches in all_matches:
+        for item in matches:
+            if item.id not in seen_ids:
                 results.append(item)
                 seen_ids.add(item.id)
                 logger.info(f"Found '{item.artist} - {item.title}' via Discogs cross-reference")
-
+            if len(results) >= MAX_SEARCH_RESULTS:
+                break
         if len(results) >= MAX_SEARCH_RESULTS:
             break
 
@@ -237,7 +242,8 @@ async def search_library_with_fallback(
     seen_ids: set[int] = set()
 
     if parsed.artist and albums:
-        for album in albums:
+
+        async def search_one_album(album: str) -> list[LibraryItem]:
             query = f"{parsed.artist} {album}"
             results = await db.search(query=query, limit=_FETCH_LIMIT)
             results = filter_results_by_artist(results, parsed.artist)
@@ -245,16 +251,15 @@ async def search_library_with_fallback(
             album_lower = album.lower()
             album_normalized = re.sub(r"[^\w\s]", " ", album_lower)
             album_normalized = " ".join(album_normalized.split())
-            album_words = {w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS}
-            # Check if Discogs album name matches the artist (self-titled album)
+            album_words = {
+                w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS
+            }
             album_is_artist = parsed.artist and normalize_for_comparison(
                 album
             ) == normalize_for_comparison(parsed.artist)
 
             filtered_results = []
             for item in results:
-                # Self-titled albums stored as "S/t" match when Discogs resolves
-                # the album name as the artist name
                 if album_is_artist and is_self_titled(item.title or ""):
                     filtered_results.append(item)
                     continue
@@ -271,8 +276,11 @@ async def search_library_with_fallback(
                         filtered_results.append(item)
                 elif len(common_words) >= 2:
                     filtered_results.append(item)
-            results = filtered_results
+            return filtered_results
 
+        album_results = await asyncio.gather(*[search_one_album(a) for a in albums])
+
+        for results in album_results:
             for item in results:
                 if item.id not in seen_ids:
                     seen_ids.add(item.id)
@@ -384,17 +392,18 @@ async def search_compilations_for_track(
         # avoiding expensive API calls for releases not in our catalog.
         raw_releases: list[ReleaseInfo] = []
         if discogs_service:
-            response = await discogs_service.search_releases_by_track(song_search, parsed.artist)
+            # Fire both searches in parallel (speculative: VA search may not be needed)
+            response, va_response = await asyncio.gather(
+                discogs_service.search_releases_by_track(song_search, parsed.artist),
+                discogs_service.search_releases_by_track(
+                    song_search, parsed.artist, artist_as_keyword=True
+                ),
+            )
             raw_releases = list(response.releases)
 
-            # If artist-scoped search only found non-compilation releases,
-            # retry with artist as keyword (q param) to find VA compilations
-            # where the artist is credited on individual tracks
+            # Only merge VA results if the artist-scoped search found no compilations
             has_compilation = any(r.is_compilation for r in raw_releases)
             if not has_compilation:
-                va_response = await discogs_service.search_releases_by_track(
-                    song_search, parsed.artist, artist_as_keyword=True
-                )
                 seen_album_keys = {r.album.lower() for r in raw_releases}
                 for r in va_response.releases:
                     if r.is_compilation and r.album.lower() not in seen_album_keys:
@@ -790,24 +799,20 @@ async def enrich_artwork_results(
     if not discogs_service:
         return items_with_artwork
 
-    enriched = []
-    for item, artwork in items_with_artwork:
+    async def enrich_one(
+        item: LibraryItem, artwork: DiscogsSearchResult | None
+    ) -> tuple[LibraryItem, DiscogsSearchResult | None]:
         if not artwork:
-            enriched.append((item, artwork))
-            continue
+            return (item, artwork)
 
         artist = item.alternate_artist_name or item.artist or ""
         search_term = song or item.title or ""
-
-        # Parallel fetches: release details (year), artist details (bio/wiki), Apple Music
         release_id = artwork.release_id
 
-        async def fetch_release_details(
-            _release_id: int = release_id,
-        ) -> tuple[int | None, str | None, str | None]:
+        async def fetch_release_details() -> tuple[int | None, str | None, str | None]:
             """Returns (year, artist_bio, wikipedia_url) from Discogs release + artist."""
             try:
-                release = await discogs_service.get_release(_release_id)
+                release = await discogs_service.get_release(release_id)
                 if not release:
                     return None, None, None
 
@@ -835,13 +840,10 @@ async def enrich_artwork_results(
             except Exception:
                 return None, None, None
 
-        async def fetch_apple_music(
-            _artist: str = artist,
-            _search_term: str = search_term,
-        ) -> str | None:
-            if not _artist or not _search_term:
+        async def fetch_apple_music() -> str | None:
+            if not artist or not search_term:
                 return None
-            return await _fetch_apple_music_url(_artist, _search_term)
+            return await _fetch_apple_music_url(artist, search_term)
 
         release_details_result, apple_music_result = await asyncio.gather(
             fetch_release_details(),
@@ -881,9 +883,12 @@ async def enrich_artwork_results(
                 "soundcloud_url": soundcloud_url,
             }
         )
-        enriched.append((item, updated))
+        return (item, updated)
 
-    return enriched
+    enriched = await asyncio.gather(
+        *[enrich_one(item, artwork) for item, artwork in items_with_artwork]
+    )
+    return list(enriched)
 
 
 def build_context_message(
@@ -948,18 +953,24 @@ async def perform_lookup(
     discogs_titles: dict[int, str] = {}
     corrected_artist: str | None = None
 
-    # Step 1: Correct artist spelling
+    # Steps 1+2: Correct artist spelling and resolve albums (parallel)
     if parsed.artist:
-        corrected = await db.find_similar_artist(parsed.artist)
+        correction_task = db.find_similar_artist(parsed.artist)
+        with telemetry.track_step("album_lookup"):
+            if parsed.song and not parsed.album:
+                telemetry.record_api_call("discogs")
+            corrected, (albums_for_search, song_not_found) = await asyncio.gather(
+                correction_task,
+                resolve_albums_for_track(parsed, discogs_service),
+            )
         if corrected:
             corrected_artist = corrected
             parsed.artist = corrected
-
-    # Step 2: Resolve albums from Discogs
-    with telemetry.track_step("album_lookup"):
-        if parsed.song and not parsed.album:
-            telemetry.record_api_call("discogs")
-        albums_for_search, song_not_found = await resolve_albums_for_track(parsed, discogs_service)
+    else:
+        with telemetry.track_step("album_lookup"):
+            albums_for_search, song_not_found = await resolve_albums_for_track(
+                parsed, discogs_service
+            )
 
     # Step 3: Execute search strategy pipeline
     with telemetry.track_step("library_search"):

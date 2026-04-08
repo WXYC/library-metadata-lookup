@@ -25,6 +25,7 @@ _search_cache: TTLCache | None = None
 _artist_cache: TTLCache | None = None
 _label_cache: TTLCache | None = None
 _master_cache: TTLCache | None = None
+_validation_cache: TTLCache | None = None
 
 T = TypeVar("T")
 
@@ -80,7 +81,7 @@ def create_ttl_cache(maxsize: int, ttl: int) -> TTLCache:
 
 def clear_all_caches() -> None:
     """Clear all registered caches and reset lazy caches."""
-    global _track_cache, _release_cache, _search_cache, _artist_cache, _label_cache, _master_cache
+    global _track_cache, _release_cache, _search_cache, _artist_cache, _label_cache, _master_cache, _validation_cache
     for cache in _cache_registry:
         cache.clear()
     # Reset lazy caches so they get recreated with fresh settings
@@ -90,6 +91,7 @@ def clear_all_caches() -> None:
     _artist_cache = None
     _label_cache = None
     _master_cache = None
+    _validation_cache = None
 
 
 def _set_cached_flag(result: Any, cached: bool) -> Any:
@@ -243,6 +245,20 @@ def get_master_cache() -> TTLCache:
     return _master_cache
 
 
+def get_validation_cache() -> TTLCache:
+    """Get or create the track validation cache using settings."""
+    global _validation_cache
+    if _validation_cache is None:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        _validation_cache = create_ttl_cache(
+            maxsize=settings.discogs_cache_maxsize,
+            ttl=settings.discogs_track_cache_ttl,
+        )
+    return _validation_cache
+
+
 # Convenience constants for backwards compatibility
 def __getattr__(name: str):
     """Lazy initialization of cache constants for backwards compatibility."""
@@ -258,4 +274,6 @@ def __getattr__(name: str):
         return get_label_cache()
     elif name == "MASTER_CACHE":
         return get_master_cache()
+    elif name == "VALIDATION_CACHE":
+        return get_validation_cache()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

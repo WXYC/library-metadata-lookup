@@ -94,5 +94,9 @@ def reset_caches():
     yield
     clear_all_caches()
     reset_rate_limiting()
+    # Clear library caches (separate from Discogs caches)
+    from library.db import clear_library_caches
+
+    clear_library_caches()
     # Restore the ContextVar to its state before the test
     _cache_stats_var.reset(cache_stats_token)
