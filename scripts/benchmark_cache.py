@@ -23,7 +23,7 @@ import sys
 import time
 from typing import Any
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 from dotenv import load_dotenv
 
 # Add project root to path
