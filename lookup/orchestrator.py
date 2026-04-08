@@ -200,8 +200,7 @@ async def search_song_as_artist(
         return [
             item
             for item in album_results
-            if artist_matches_item(item, song_as_artist)
-            or is_compilation_artist(item.artist or "")
+            if artist_matches_item(item, song_as_artist) or is_compilation_artist(item.artist or "")
         ]
 
     all_matches = await asyncio.gather(
@@ -251,9 +250,7 @@ async def search_library_with_fallback(
             album_lower = album.lower()
             album_normalized = re.sub(r"[^\w\s]", " ", album_lower)
             album_normalized = " ".join(album_normalized.split())
-            album_words = {
-                w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS
-            }
+            album_words = {w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS}
             album_is_artist = parsed.artist and normalize_for_comparison(
                 album
             ) == normalize_for_comparison(parsed.artist)

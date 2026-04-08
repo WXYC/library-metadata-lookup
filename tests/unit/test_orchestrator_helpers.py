@@ -596,7 +596,6 @@ class TestSearchLibraryWithFallback:
         )
         assert fallback is False
 
-
     @pytest.mark.asyncio
     async def test_multiple_albums_all_searched_and_deduplicated(self, mock_library_db):
         """All albums should be searched and results deduplicated by ID."""

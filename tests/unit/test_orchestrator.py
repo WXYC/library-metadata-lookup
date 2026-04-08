@@ -240,14 +240,17 @@ class TestPerformLookupArtistCorrection:
             raw_message="Stereolba - Percolator",
         )
 
-        with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
-            new_callable=AsyncMock,
-            return_value=[("Stereolab", "Emperor Tomato Ketchup")],
-        ), patch(
-            "lookup.orchestrator.fetch_artwork_for_items",
-            new_callable=AsyncMock,
-            return_value=[],
+        with (
+            patch(
+                "lookup.orchestrator.lookup_releases_by_track",
+                new_callable=AsyncMock,
+                return_value=[("Stereolab", "Emperor Tomato Ketchup")],
+            ),
+            patch(
+                "lookup.orchestrator.fetch_artwork_for_items",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
         ):
             response = await perform_lookup(
                 request, mock_library_db, mock_discogs_service, telemetry

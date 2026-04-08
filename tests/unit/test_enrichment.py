@@ -200,9 +200,7 @@ class TestEnrichArtworkResults:
         discogs_service.get_release.side_effect = lambda rid: make_release(rid)
 
         with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(
-                items_with_artwork, discogs_service, song="Song"
-            )
+            results = await enrich_artwork_results(items_with_artwork, discogs_service, song="Song")
 
         assert len(results) == 3
         for i, (item, enriched) in enumerate(results, start=1):
