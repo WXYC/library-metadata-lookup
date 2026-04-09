@@ -11,6 +11,7 @@ from core.matching import (
     normalize_for_comparison,
     normalize_for_track_comparison,
     strip_diacritics,
+    strip_discogs_suffix,
 )
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,33 @@ class TestStripDiacritics:
     )
     def test_strip_diacritics(self, input_text, expected):
         assert strip_diacritics(input_text) == expected
+
+
+# ---------------------------------------------------------------------------
+# strip_discogs_suffix
+# ---------------------------------------------------------------------------
+
+
+class TestStripDiscogsSuffix:
+    """Tests for Discogs numeric disambiguation suffix removal."""
+
+    @pytest.mark.parametrize(
+        "input_text, expected",
+        [
+            pytest.param("DNA (22)", "DNA", id="numeric-suffix-22"),
+            pytest.param("Asia (2)", "Asia", id="numeric-suffix-2"),
+            pytest.param("Bjork", "Bjork", id="no-suffix-unchanged"),
+            pytest.param("", "", id="empty-string"),
+            pytest.param(
+                "Moon Pix (Deluxe Edition)",
+                "Moon Pix (Deluxe Edition)",
+                id="non-numeric-parens-preserved",
+            ),
+            pytest.param("Artist(2)", "Artist", id="no-space-before-parens"),
+        ],
+    )
+    def test_strip_discogs_suffix(self, input_text, expected):
+        assert strip_discogs_suffix(input_text) == expected
 
 
 # ---------------------------------------------------------------------------

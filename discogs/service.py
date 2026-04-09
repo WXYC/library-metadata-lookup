@@ -14,6 +14,7 @@ from core.matching import (
     calculate_confidence,
     is_compilation_artist,
     normalize_for_track_comparison,
+    strip_discogs_suffix,
 )
 from core.telemetry import (
     record_api_time,
@@ -905,7 +906,7 @@ class DiscogsService:
             if item.artists:
                 for track_artist in item.artists:
                     track_artist_lower = track_artist.lower().replace('"', "").replace("'", "")
-                    track_artist_lower = track_artist_lower.split("(")[0].strip()
+                    track_artist_lower = strip_discogs_suffix(track_artist_lower)
                     if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
                         logger.info(
                             f"Validated: '{track}' by '{artist}' found on release {release_id}"
@@ -915,7 +916,7 @@ class DiscogsService:
                 # For single-artist releases, check release artist
                 release_artist = release.artist.lower().replace('"', "").replace("'", "")
                 # Remove Discogs numbering like "(2)"
-                release_artist = release_artist.split("(")[0].strip()
+                release_artist = strip_discogs_suffix(release_artist)
 
                 if artist_lower in release_artist or release_artist in artist_lower:
                     logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")

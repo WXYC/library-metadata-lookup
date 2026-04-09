@@ -56,6 +56,25 @@ def normalize_for_track_comparison(text: str | None) -> str:
 
 
 # =============================================================================
+# Discogs Disambiguation Suffix
+# =============================================================================
+
+# Discogs disambiguation suffix: (2), (22), etc.
+_DISCOGS_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")
+
+
+def strip_discogs_suffix(name: str) -> str:
+    """Remove Discogs numeric disambiguation suffixes like '(2)' or '(22)'.
+
+    Discogs appends these to artist and label names when multiple entities
+    share the same name. Safe to apply to names that have no suffix (no-op).
+    """
+    if not name:
+        return name
+    return _DISCOGS_SUFFIX_RE.sub("", name)
+
+
+# =============================================================================
 # Search Result Limiting
 # =============================================================================
 
