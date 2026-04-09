@@ -10,26 +10,18 @@ from __future__ import annotations
 import asyncio
 import logging
 
-import httpx
-from aiolimiter import AsyncLimiter
+from scripts.streaming_availability.http_client import BaseStreamingClient
 
 logger = logging.getLogger(__name__)
 
 
-class DeezerClient:
+class DeezerClient(BaseStreamingClient):
     """Deezer API client with rate limiting for album and track searches."""
 
     BASE_URL = "https://api.deezer.com"
 
     def __init__(self):
-        self._http: httpx.AsyncClient | None = None
-        self._rate_limiter = AsyncLimiter(25, 5)
-        self._semaphore = asyncio.Semaphore(5)
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._http is None:
-            self._http = httpx.AsyncClient(timeout=10.0)
-        return self._http
+        super().__init__(rate_limit=(25, 5), semaphore_limit=5)
 
     async def search_album(self, artist: str, title: str) -> list[dict]:
         """Search Deezer for albums matching artist + title.
@@ -93,8 +85,3 @@ class DeezerClient:
 
         logger.warning("Deezer quota retries exhausted for query: %s", query[:50])
         return []
-
-    async def close(self) -> None:
-        if self._http:
-            await self._http.aclose()
-            self._http = None
