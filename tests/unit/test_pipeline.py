@@ -113,6 +113,31 @@ class TestPipeline:
         assert max_concurrent > 1  # at least some concurrency
 
     @pytest.mark.asyncio
+    async def test_dict_data_flows_between_stages(self):
+        """Stages can enrich a dict and pass it downstream."""
+        final = []
+
+        async def enrich(item: dict) -> dict:
+            item["enriched_name"] = item["name"].upper()
+            return item
+
+        async def check(item: dict) -> dict | None:
+            # Only pass items that were enriched
+            if item.get("enriched_name"):
+                final.append(item)
+                return item
+            return None
+
+        pipeline = Pipeline()
+        pipeline.add_stage(Stage("enrich", enrich))
+        pipeline.add_stage(Stage("check", check))
+        await pipeline.run([{"name": "stereolab"}, {"name": "autechre"}])
+
+        assert len(final) == 2
+        assert final[0]["enriched_name"] == "STEREOLAB"
+        assert final[1]["enriched_name"] == "AUTECHRE"
+
+    @pytest.mark.asyncio
     async def test_empty_input(self):
         """Pipeline handles empty input gracefully."""
         called = False
