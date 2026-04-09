@@ -13,8 +13,8 @@ from config.settings import get_settings
 from core.matching import (
     calculate_confidence,
     is_compilation_artist,
+    normalize_artist_for_validation,
     normalize_for_track_comparison,
-    strip_discogs_suffix,
 )
 from core.telemetry import (
     record_api_time,
@@ -891,10 +891,7 @@ class DiscogsService:
             return False
 
         track_lower = normalize_for_track_comparison(track)
-        # Strip quotes from artist name — Discogs uses quotes for nicknames
-        # (e.g. '"Weird Al" Yankovic') which breaks substring matching against
-        # the user-supplied form ('Weird Al Yankovic').
-        artist_lower = artist.lower().replace('"', "").replace("'", "")
+        artist_lower = normalize_artist_for_validation(artist)
 
         for item in release.tracklist:
             item_title = normalize_for_track_comparison(item.title)
@@ -905,8 +902,7 @@ class DiscogsService:
             # Check per-track artists first (for compilations)
             if item.artists:
                 for track_artist in item.artists:
-                    track_artist_lower = track_artist.lower().replace('"', "").replace("'", "")
-                    track_artist_lower = strip_discogs_suffix(track_artist_lower)
+                    track_artist_lower = normalize_artist_for_validation(track_artist)
                     if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
                         logger.info(
                             f"Validated: '{track}' by '{artist}' found on release {release_id}"
@@ -914,9 +910,7 @@ class DiscogsService:
                         return True
             else:
                 # For single-artist releases, check release artist
-                release_artist = release.artist.lower().replace('"', "").replace("'", "")
-                # Remove Discogs numbering like "(2)"
-                release_artist = strip_discogs_suffix(release_artist)
+                release_artist = normalize_artist_for_validation(release.artist)
 
                 if artist_lower in release_artist or release_artist in artist_lower:
                     logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")
