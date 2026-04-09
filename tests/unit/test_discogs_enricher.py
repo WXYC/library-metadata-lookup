@@ -5,10 +5,23 @@ from unittest.mock import AsyncMock
 import pytest
 
 from scripts.streaming_availability.discogs_enricher import (
+    _PUBLIC_RELEASE_QUERY,
+    _WXYC_RELEASE_QUERY,
     build_artist_mapping,
     enrich_album,
     pick_best_match,
 )
+
+
+class TestReleaseQueries:
+    def test_wxyc_query_strips_disambiguation_suffix(self):
+        """The wxyc release query must strip Discogs disambiguation suffixes
+        so that searching for 'Los Naturales' also matches 'Los Naturales (2)'."""
+        assert "regexp_replace" in _WXYC_RELEASE_QUERY
+
+    def test_public_query_strips_disambiguation_suffix(self):
+        """The public release query must strip Discogs disambiguation suffixes."""
+        assert "regexp_replace" in _PUBLIC_RELEASE_QUERY
 
 
 class TestPickBestMatch:
@@ -40,6 +53,26 @@ class TestPickBestMatch:
     def test_empty_results(self):
         match = pick_best_match("Stereolab", "Aluminum Tunes", [])
         assert match is None
+
+    def test_disambiguates_by_album_title(self):
+        """When results contain releases from multiple disambiguations of the same
+        artist name, pick_best_match should select the one whose album title matches."""
+        results = [
+            {
+                "title": "Cumbia Salvaje",
+                "artist_name": "Los Naturales",
+                "release_id": 100,
+            },
+            {
+                "title": "Los Naturales",
+                "artist_name": "Los Naturales (2)",
+                "release_id": 200,
+            },
+        ]
+        match = pick_best_match("Los Naturales", "Los Naturales", results)
+        assert match is not None
+        assert match["artist_name"] == "Los Naturales (2)"
+        assert match["release_id"] == 200
 
     def test_diacritics_match(self):
         results = [
@@ -139,6 +172,28 @@ class TestEnrichAlbum:
         result = await enrich_album(pool, "Stereolab", "Aluminum Tunes")
         assert result is not None
         assert pool.fetch.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_enriches_with_disambiguation_suffix(self):
+        """When the PG cache stores the artist as 'Los Naturales (2)', searching
+        for 'Los Naturales' should still find the release because the SQL query
+        strips disambiguation suffixes before comparing."""
+        pool = AsyncMock()
+        album_data = {
+            "release_id": 2685158,
+            "title": "Los Naturales",
+            "artist_name": "Los Naturales (2)",
+            "artwork_url": None,
+        }
+        pool.fetch = AsyncMock(return_value=[album_data])
+        result = await enrich_album(pool, "Los Naturales", "Los Naturales")
+        assert result is not None
+        assert result["artist_name"] == "Los Naturales (2)"
+        assert result["release_id"] == 2685158
+        # Verify the query was called with the original artist name
+        # (the SQL itself handles suffix stripping via regexp_replace)
+        query_artist = pool.fetch.call_args_list[0][0][1]
+        assert query_artist == "Los Naturales"
 
     @pytest.mark.asyncio
     async def test_returns_none_on_no_results(self):
