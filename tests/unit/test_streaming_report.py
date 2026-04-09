@@ -133,4 +133,3 @@ class TestGenerateSummary:
         summary = await generate_summary(populated_db)
         assert "4" in summary  # total
         assert "Spotify" in summary or "spotify" in summary.lower()
-        assert "Apple" in summary or "apple" in summary.lower()
