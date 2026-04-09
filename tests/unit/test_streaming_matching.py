@@ -142,6 +142,119 @@ class TestStripDiscogsSuffix:
         assert strip_discogs_suffix(name) == expected
 
 
+class TestFindBestMatch:
+    """Tests for the generic find_best_match function."""
+
+    def test_finds_best_by_combined_score(self):
+        from scripts.streaming_availability.matching import find_best_match
+
+        results = [
+            {"artist": "Stereolab", "album": "Dots and Loops", "url": "http://a"},
+            {"artist": "Stereolab", "album": "Aluminum Tunes", "url": "http://b"},
+        ]
+        best = find_best_match(
+            results,
+            "Stereolab",
+            "Aluminum Tunes",
+            artist_fn=lambda r: r["artist"],
+            title_fn=lambda r: r["album"],
+            url_fn=lambda r: r["url"],
+        )
+        assert best is not None
+        assert best["url"] == "http://b"
+        assert best["matched_title"] == "Aluminum Tunes"
+
+    def test_returns_none_when_no_acceptable_match(self):
+        from scripts.streaming_availability.matching import find_best_match
+
+        results = [
+            {"artist": "Cat Power", "album": "Moon Pix", "url": "http://x"},
+        ]
+        best = find_best_match(
+            results,
+            "Autechre",
+            "Confield",
+            artist_fn=lambda r: r["artist"],
+            title_fn=lambda r: r["album"],
+            url_fn=lambda r: r["url"],
+        )
+        assert best is None
+
+    def test_returns_none_for_empty_results(self):
+        from scripts.streaming_availability.matching import find_best_match
+
+        best = find_best_match(
+            [],
+            "Stereolab",
+            "Aluminum Tunes",
+            artist_fn=lambda r: r["artist"],
+            title_fn=lambda r: r["album"],
+            url_fn=lambda r: r["url"],
+        )
+        assert best is None
+
+    def test_includes_id_when_id_fn_provided(self):
+        from scripts.streaming_availability.matching import find_best_match
+
+        results = [
+            {"artist": "Stereolab", "album": "Aluminum Tunes", "url": "http://b", "id": "abc123"},
+        ]
+        best = find_best_match(
+            results,
+            "Stereolab",
+            "Aluminum Tunes",
+            artist_fn=lambda r: r["artist"],
+            title_fn=lambda r: r["album"],
+            url_fn=lambda r: r["url"],
+            id_fn=lambda r: r["id"],
+        )
+        assert best is not None
+        assert best["id"] == "abc123"
+
+    def test_no_id_key_when_id_fn_omitted(self):
+        from scripts.streaming_availability.matching import find_best_match
+
+        results = [
+            {"artist": "Stereolab", "album": "Aluminum Tunes", "url": "http://b"},
+        ]
+        best = find_best_match(
+            results,
+            "Stereolab",
+            "Aluminum Tunes",
+            artist_fn=lambda r: r["artist"],
+            title_fn=lambda r: r["album"],
+            url_fn=lambda r: r["url"],
+        )
+        assert best is not None
+        assert "id" not in best
+
+    def test_spotify_field_extraction(self):
+        """Verifies find_best_match works with Spotify's nested response format."""
+        from scripts.streaming_availability.matching import find_best_match
+
+        results = [
+            {
+                "name": "Aluminum Tunes",
+                "artists": [{"name": "Stereolab"}],
+                "external_urls": {"spotify": "https://open.spotify.com/album/xyz"},
+                "id": "xyz",
+            },
+        ]
+        best = find_best_match(
+            results,
+            "Stereolab",
+            "Aluminum Tunes",
+            artist_fn=lambda r: r.get("artists", [{}])[0].get("name", ""),
+            title_fn=lambda r: r.get("name", ""),
+            url_fn=lambda r: r.get("external_urls", {}).get("spotify", ""),
+            id_fn=lambda r: r.get("id", ""),
+        )
+        assert best is not None
+        assert best["url"] == "https://open.spotify.com/album/xyz"
+        assert best["id"] == "xyz"
+        assert best["confidence"] > 0
+
+
 class TestStripThePrefix:
     @pytest.mark.parametrize(
         "name, expected",
