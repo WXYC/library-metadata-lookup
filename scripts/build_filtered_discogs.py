@@ -57,8 +57,7 @@ def extract_library_artists(library_db_path: str) -> list[str]:
 
     # Alternate artist names
     cur.execute(
-        "SELECT DISTINCT alternate_artist_name FROM library "
-        "WHERE alternate_artist_name IS NOT NULL"
+        "SELECT DISTINCT alternate_artist_name FROM library WHERE alternate_artist_name IS NOT NULL"
     )
     for (alt,) in cur.fetchall():
         if alt and not is_compilation_artist(alt):
