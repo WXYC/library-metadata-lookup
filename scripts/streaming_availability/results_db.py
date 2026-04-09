@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 
@@ -55,11 +56,16 @@ CREATE INDEX IF NOT EXISTS idx_albums_apple_status ON albums(apple_status);
 
 
 class ResultsDB:
-    """Async SQLite client for the streaming availability results database."""
+    """Async SQLite client for the streaming availability results database.
+
+    Uses an asyncio.Lock to serialize writes, since SQLite doesn't support
+    concurrent writers from multiple coroutines.
+    """
 
     def __init__(self, db_path: str = "streaming_availability.db"):
         self._db_path = db_path
         self._db: aiosqlite.Connection | None = None
+        self._write_lock: asyncio.Lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._db = await aiosqlite.connect(self._db_path)
@@ -97,6 +103,11 @@ class ResultsDB:
 
     async def insert_albums(self, albums: list[DeduplicatedAlbum]) -> int:
         """Bulk insert albums. Uses INSERT OR IGNORE for idempotent resume. Returns count inserted."""
+        assert self._db is not None
+        async with self._write_lock:
+            return await self._insert_albums_locked(albums)
+
+    async def _insert_albums_locked(self, albums: list[DeduplicatedAlbum]) -> int:
         assert self._db is not None
         inserted = 0
         for album in albums:
@@ -153,13 +164,14 @@ class ResultsDB:
     ) -> None:
         """Update the Discogs enrichment result for an album."""
         assert self._db is not None
-        await self._db.execute(
-            """UPDATE albums SET
-               discogs_status = ?, discogs_artist = ?, discogs_title = ?, discogs_release_id = ?
-               WHERE id = ?""",
-            (status, artist, title, release_id, album_id),
-        )
-        await self._db.commit()
+        async with self._write_lock:
+            await self._db.execute(
+                """UPDATE albums SET
+                   discogs_status = ?, discogs_artist = ?, discogs_title = ?, discogs_release_id = ?
+                   WHERE id = ?""",
+                (status, artist, title, release_id, album_id),
+            )
+            await self._db.commit()
 
     async def get_deezer_hits_pending_spotify(self, limit: int = 100) -> list[aiosqlite.Row]:
         """Get albums found on Deezer that haven't been checked on Spotify."""
@@ -193,35 +205,45 @@ class ResultsDB:
     ) -> None:
         """Update the result for a service (spotify, apple, or deezer)."""
         assert self._db is not None
-        now = datetime.now(UTC).isoformat()
-        if service == "spotify":
-            await self._db.execute(
-                """UPDATE albums SET
-                   spotify_status = ?, spotify_url = ?, spotify_id = ?,
-                   spotify_confidence = ?, spotify_matched_artist = ?,
-                   spotify_matched_title = ?, spotify_checked_at = ?
-                   WHERE id = ?""",
-                (status, url, spotify_id, confidence, matched_artist, matched_title, now, album_id),
-            )
-        elif service == "apple":
-            await self._db.execute(
-                """UPDATE albums SET
-                   apple_status = ?, apple_url = ?,
-                   apple_confidence = ?, apple_matched_artist = ?,
-                   apple_matched_title = ?, apple_checked_at = ?
-                   WHERE id = ?""",
-                (status, url, confidence, matched_artist, matched_title, now, album_id),
-            )
-        elif service == "deezer":
-            await self._db.execute(
-                """UPDATE albums SET
-                   deezer_status = ?, deezer_url = ?,
-                   deezer_confidence = ?, deezer_matched_artist = ?,
-                   deezer_matched_title = ?, deezer_checked_at = ?
-                   WHERE id = ?""",
-                (status, url, confidence, matched_artist, matched_title, now, album_id),
-            )
-        await self._db.commit()
+        async with self._write_lock:
+            now = datetime.now(UTC).isoformat()
+            if service == "spotify":
+                await self._db.execute(
+                    """UPDATE albums SET
+                       spotify_status = ?, spotify_url = ?, spotify_id = ?,
+                       spotify_confidence = ?, spotify_matched_artist = ?,
+                       spotify_matched_title = ?, spotify_checked_at = ?
+                       WHERE id = ?""",
+                    (
+                        status,
+                        url,
+                        spotify_id,
+                        confidence,
+                        matched_artist,
+                        matched_title,
+                        now,
+                        album_id,
+                    ),
+                )
+            elif service == "apple":
+                await self._db.execute(
+                    """UPDATE albums SET
+                       apple_status = ?, apple_url = ?,
+                       apple_confidence = ?, apple_matched_artist = ?,
+                       apple_matched_title = ?, apple_checked_at = ?
+                       WHERE id = ?""",
+                    (status, url, confidence, matched_artist, matched_title, now, album_id),
+                )
+            elif service == "deezer":
+                await self._db.execute(
+                    """UPDATE albums SET
+                       deezer_status = ?, deezer_url = ?,
+                       deezer_confidence = ?, deezer_matched_artist = ?,
+                       deezer_matched_title = ?, deezer_checked_at = ?
+                       WHERE id = ?""",
+                    (status, url, confidence, matched_artist, matched_title, now, album_id),
+                )
+            await self._db.commit()
 
     async def get_stats(self) -> dict:
         """Return counts by status for each service."""
@@ -243,10 +265,10 @@ class ResultsDB:
         return stats
 
     async def get_not_on_streaming(self) -> list[aiosqlite.Row]:
-        """Get albums not found on either Spotify or Apple Music."""
+        """Get albums not found on any checked streaming platform."""
         assert self._db is not None
         cursor = await self._db.execute("""SELECT * FROM albums
-               WHERE spotify_status = 'not_found' AND apple_status = 'not_found'
+               WHERE spotify_status = 'not_found' AND is_compilation = 0
                ORDER BY display_artist, display_title""")
         return list(await cursor.fetchall())
 

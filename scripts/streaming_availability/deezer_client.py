@@ -23,7 +23,7 @@ class DeezerClient:
 
     def __init__(self):
         self._http: httpx.AsyncClient | None = None
-        self._rate_limiter = AsyncLimiter(40, 5)
+        self._rate_limiter = AsyncLimiter(25, 5)
         self._semaphore = asyncio.Semaphore(5)
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -34,14 +34,18 @@ class DeezerClient:
     async def search_album(self, artist: str, title: str) -> list[dict]:
         """Search Deezer for albums matching artist + title.
 
+        Tries quoted field search first, falls back to unquoted if no results.
         Returns a list of album result dicts, or an empty list on error.
         """
         try:
             async with self._semaphore:
-                return await self._search(
-                    f"{self.BASE_URL}/search/album",
-                    f'artist:"{artist}" album:"{title}"',
-                )
+                url = f"{self.BASE_URL}/search/album"
+                # Quoted field search (strict)
+                results = await self._search(url, f'artist:"{artist}" album:"{title}"')
+                if results:
+                    return results
+                # Unquoted fallback (fuzzier)
+                return await self._search(url, f"{artist} {title}")
         except Exception:
             logger.exception("Deezer album search failed for %s - %s", artist, title)
             return []
@@ -49,34 +53,46 @@ class DeezerClient:
     async def search_track(self, artist: str, track: str) -> list[dict]:
         """Search Deezer for tracks matching artist + track name.
 
+        Tries quoted field search first, falls back to unquoted if no results.
         Returns a list of track result dicts, or an empty list on error.
         """
         try:
             async with self._semaphore:
-                return await self._search(
-                    f"{self.BASE_URL}/search",
-                    f'artist:"{artist}" track:"{track}"',
-                )
+                url = f"{self.BASE_URL}/search"
+                results = await self._search(url, f'artist:"{artist}" track:"{track}"')
+                if results:
+                    return results
+                return await self._search(url, f"{artist} {track}")
         except Exception:
             logger.exception("Deezer track search failed for %s - %s", artist, track)
             return []
 
     async def _search(self, url: str, query: str) -> list[dict]:
         http = await self._get_client()
-        await self._rate_limiter.acquire()
 
-        resp = await http.get(url, params={"q": query, "limit": 5})
+        for attempt in range(3):
+            await self._rate_limiter.acquire()
+            resp = await http.get(url, params={"q": query, "limit": 5})
 
-        if resp.status_code != 200:
-            logger.warning("Deezer search returned %d", resp.status_code)
-            return []
+            if resp.status_code != 200:
+                logger.warning("Deezer search returned %d", resp.status_code)
+                return []
 
-        data = resp.json()
-        if "error" in data:
-            logger.warning("Deezer error: %s", data["error"])
-            return []
+            data = resp.json()
+            if "error" in data:
+                code = data["error"].get("code")
+                if code == 4:  # Quota limit exceeded
+                    wait = 5 * (attempt + 1)
+                    logger.debug("Deezer quota exceeded, waiting %ds", wait)
+                    await asyncio.sleep(wait)
+                    continue
+                logger.warning("Deezer error: %s", data["error"])
+                return []
 
-        return data.get("data", [])
+            return data.get("data", [])
+
+        logger.warning("Deezer quota retries exhausted for query: %s", query[:50])
+        return []
 
     async def close(self) -> None:
         if self._http:

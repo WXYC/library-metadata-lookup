@@ -115,12 +115,12 @@ class SpotifyClient:
             )
 
             if resp.status_code == 429:
-                raw_retry = int(resp.headers.get("Retry-After", "5"))
-                retry_after = min(raw_retry, 600)  # wait up to 10 min
+                retry_after = int(resp.headers.get("Retry-After", "5"))
+                hours = retry_after / 3600
                 logger.warning(
-                    "Spotify 429 (retry-after: %ds), waiting %ds (attempt %d/%d)",
-                    raw_retry,
+                    "Spotify 429, waiting %ds (%.1fh) (attempt %d/%d)",
                     retry_after,
+                    hours,
                     attempt + 1,
                     self._max_retries,
                 )

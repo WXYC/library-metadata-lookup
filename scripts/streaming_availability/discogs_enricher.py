@@ -6,13 +6,13 @@ import logging
 from typing import TYPE_CHECKING
 
 from rapidfuzz import fuzz
+
+from core.matching import strip_diacritics
 from scripts.streaming_availability.matching import (
     is_acceptable_match,
     score_match,
     strip_discogs_suffix,
 )
-
-from core.matching import strip_diacritics
 
 if TYPE_CHECKING:
     import asyncpg
@@ -26,24 +26,29 @@ _ARTIST_FUZZY_QUERY = """
     LIMIT 10
 """
 
-# Release lookup by exact artist name on wxyc schema (~10ms)
+# Release lookup by artist name on wxyc schema (~10ms)
+# Uses regexp_replace to strip Discogs disambiguation suffixes like (2), (22)
+# so that searching for "Los Naturales" also matches "Los Naturales (2)".
 _WXYC_RELEASE_QUERY = """
     SELECT DISTINCT ON (r.id)
         r.id as release_id, r.title, ra.artist_name, r.artwork_url
     FROM wxyc.release r
     JOIN wxyc.release_artist ra ON ra.release_id = r.id AND ra.extra = 0
-    WHERE lower(left(ra.artist_name, 200)) = lower($1)
+    WHERE lower(regexp_replace(left(ra.artist_name, 200), '\\s+\\(\\d+\\)$', ''))
+        = lower(regexp_replace($1, '\\s+\\(\\d+\\)$', ''))
     ORDER BY r.id
     LIMIT 200
 """
 
 # Fallback: release lookup on full public schema (~13ms with btree index)
+# Same disambiguation-suffix stripping as the wxyc query above.
 _PUBLIC_RELEASE_QUERY = """
     SELECT DISTINCT ON (r.id)
         r.id as release_id, r.title, ra.artist_name, r.artwork_url
     FROM release r
     JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
-    WHERE lower(left(ra.artist_name, 200)) = lower($1)
+    WHERE lower(regexp_replace(left(ra.artist_name, 200), '\\s+\\(\\d+\\)$', ''))
+        = lower(regexp_replace($1, '\\s+\\(\\d+\\)$', ''))
     ORDER BY r.id
     LIMIT 200
 """
