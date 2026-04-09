@@ -1,6 +1,9 @@
 """Title normalization, format stripping, and match scoring for streaming availability."""
 
+from __future__ import annotations
+
 import re
+from collections.abc import Callable
 
 from rapidfuzz import fuzz
 
@@ -86,3 +89,56 @@ def score_match(query: str, result: str) -> float:
 def is_acceptable_match(artist_score: float, title_score: float) -> bool:
     """Returns True if both artist and title scores meet the acceptance threshold (>= 80)."""
     return artist_score >= 80.0 and title_score >= 80.0
+
+
+def find_best_match(
+    results: list[dict],
+    query_artist: str,
+    query_title: str,
+    *,
+    artist_fn: Callable[[dict], str],
+    title_fn: Callable[[dict], str],
+    url_fn: Callable[[dict], str],
+    id_fn: Callable[[dict], str] | None = None,
+) -> dict | None:
+    """Find the best-scoring match from a list of service results.
+
+    Iterates results, extracts artist/title using the provided callables,
+    scores each with score_match/is_acceptable_match, and returns the
+    highest-scoring result as a dict with url, confidence, matched_artist,
+    matched_title, and optionally id.
+
+    Args:
+        results: Raw result dicts from a streaming service API.
+        query_artist: Artist name to match against.
+        query_title: Title to match against.
+        artist_fn: Extracts artist name from a result dict.
+        title_fn: Extracts title from a result dict.
+        url_fn: Extracts URL from a result dict.
+        id_fn: Extracts ID from a result dict (optional).
+
+    Returns:
+        Best match dict, or None if no acceptable match found.
+    """
+    best: dict | None = None
+    best_score = 0.0
+    for item in results:
+        result_artist = artist_fn(item)
+        result_title = title_fn(item)
+        artist_score = score_match(query_artist, result_artist)
+        title_score = score_match(query_title, result_title)
+        if not is_acceptable_match(artist_score, title_score):
+            continue
+        combined = (artist_score + title_score) / 2
+        if combined > best_score:
+            best_score = combined
+            match: dict = {
+                "url": url_fn(item),
+                "confidence": combined,
+                "matched_artist": result_artist,
+                "matched_title": result_title,
+            }
+            if id_fn is not None:
+                match["id"] = id_fn(item)
+            best = match
+    return best

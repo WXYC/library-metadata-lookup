@@ -28,8 +28,7 @@ from scripts.streaming_availability.discogs_enricher import (
     enrich_album,
 )
 from scripts.streaming_availability.matching import (
-    is_acceptable_match,
-    score_match,
+    find_best_match,
     strip_discogs_suffix,
     strip_format_suffix,
 )
@@ -419,116 +418,79 @@ async def _process_discogs_enrichment(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Service-specific field extractors for find_best_match
+# ---------------------------------------------------------------------------
+
+_SPOTIFY_ARTIST = lambda r: r.get("artists", [{}])[0].get("name", "")  # noqa: E731
+_SPOTIFY_TITLE = lambda r: r.get("name", "")  # noqa: E731
+_SPOTIFY_URL = lambda r: r.get("external_urls", {}).get("spotify", "")  # noqa: E731
+_SPOTIFY_ID = lambda r: r.get("id", "")  # noqa: E731
+
+_APPLE_ARTIST = lambda r: r.get("artistName", "")  # noqa: E731
+_APPLE_TITLE = lambda r: r.get("collectionName", "")  # noqa: E731
+_APPLE_URL = lambda r: r.get("collectionViewUrl", "")  # noqa: E731
+
+_DEEZER_ARTIST = lambda r: r.get("artist", {}).get("name", "")  # noqa: E731
+_DEEZER_TITLE = lambda r: r.get("title", "")  # noqa: E731
+_DEEZER_URL = lambda r: r.get("link", "")  # noqa: E731
+
+
 def _find_best_spotify_match(artist: str, title: str, results: list[dict]) -> dict | None:
-    best: dict | None = None
-    best_score = 0.0
-    for album in results:
-        spotify_artist = album.get("artists", [{}])[0].get("name", "")
-        spotify_title = album.get("name", "")
-        artist_score = score_match(artist, spotify_artist)
-        title_score = score_match(title, spotify_title)
-        if not is_acceptable_match(artist_score, title_score):
-            continue
-        combined = (artist_score + title_score) / 2
-        if combined > best_score:
-            best_score = combined
-            best = {
-                "url": album.get("external_urls", {}).get("spotify", ""),
-                "id": album.get("id", ""),
-                "confidence": combined,
-                "matched_artist": spotify_artist,
-                "matched_title": spotify_title,
-            }
-    return best
+    return find_best_match(
+        results,
+        artist,
+        title,
+        artist_fn=_SPOTIFY_ARTIST,
+        title_fn=_SPOTIFY_TITLE,
+        url_fn=_SPOTIFY_URL,
+        id_fn=_SPOTIFY_ID,
+    )
 
 
 def _find_best_track_match(artist: str, title: str, results: list[dict]) -> dict | None:
-    best: dict | None = None
-    best_score = 0.0
-    for track in results:
-        spotify_artist = track.get("artists", [{}])[0].get("name", "")
-        spotify_title = track.get("name", "")
-        artist_score = score_match(artist, spotify_artist)
-        title_score = score_match(title, spotify_title)
-        if not is_acceptable_match(artist_score, title_score):
-            continue
-        combined = (artist_score + title_score) / 2
-        if combined > best_score:
-            best_score = combined
-            best = {
-                "url": track.get("external_urls", {}).get("spotify", ""),
-                "id": track.get("id", ""),
-                "confidence": combined,
-                "matched_artist": spotify_artist,
-                "matched_title": spotify_title,
-            }
-    return best
+    return find_best_match(
+        results,
+        artist,
+        title,
+        artist_fn=_SPOTIFY_ARTIST,
+        title_fn=_SPOTIFY_TITLE,
+        url_fn=_SPOTIFY_URL,
+        id_fn=_SPOTIFY_ID,
+    )
 
 
 def _find_best_apple_match(artist: str, title: str, results: list[dict]) -> dict | None:
-    best: dict | None = None
-    best_score = 0.0
-    for album in results:
-        apple_artist = album.get("artistName", "")
-        apple_title = album.get("collectionName", "")
-        artist_score = score_match(artist, apple_artist)
-        title_score = score_match(title, apple_title)
-        if not is_acceptable_match(artist_score, title_score):
-            continue
-        combined = (artist_score + title_score) / 2
-        if combined > best_score:
-            best_score = combined
-            best = {
-                "url": album.get("collectionViewUrl", ""),
-                "confidence": combined,
-                "matched_artist": apple_artist,
-                "matched_title": apple_title,
-            }
-    return best
+    return find_best_match(
+        results,
+        artist,
+        title,
+        artist_fn=_APPLE_ARTIST,
+        title_fn=_APPLE_TITLE,
+        url_fn=_APPLE_URL,
+    )
 
 
 def _find_best_deezer_match(artist: str, title: str, results: list[dict]) -> dict | None:
-    best: dict | None = None
-    best_score = 0.0
-    for album in results:
-        deezer_artist = album.get("artist", {}).get("name", "")
-        deezer_title = album.get("title", "")
-        artist_score = score_match(artist, deezer_artist)
-        title_score = score_match(title, deezer_title)
-        if not is_acceptable_match(artist_score, title_score):
-            continue
-        combined = (artist_score + title_score) / 2
-        if combined > best_score:
-            best_score = combined
-            best = {
-                "url": album.get("link", ""),
-                "confidence": combined,
-                "matched_artist": deezer_artist,
-                "matched_title": deezer_title,
-            }
-    return best
+    return find_best_match(
+        results,
+        artist,
+        title,
+        artist_fn=_DEEZER_ARTIST,
+        title_fn=_DEEZER_TITLE,
+        url_fn=_DEEZER_URL,
+    )
 
 
 def _find_best_deezer_track_match(artist: str, title: str, results: list[dict]) -> dict | None:
-    best: dict | None = None
-    best_score = 0.0
-    for track in results:
-        deezer_artist = track.get("artist", {}).get("name", "")
-        deezer_title = track.get("title", "")
-        artist_score = score_match(artist, deezer_artist)
-        title_score = score_match(title, deezer_title)
-        if not is_acceptable_match(artist_score, title_score):
-            continue
-        combined = (artist_score + title_score) / 2
-        if combined > best_score:
-            best_score = combined
-            best = {
-                "url": track.get("link", ""),
-                "confidence": combined,
-                "matched_artist": deezer_artist,
-                "matched_title": deezer_title,
-            }
-    return best
+    return find_best_match(
+        results,
+        artist,
+        title,
+        artist_fn=_DEEZER_ARTIST,
+        title_fn=_DEEZER_TITLE,
+        url_fn=_DEEZER_URL,
+    )
 
 
 async def _skip_compilations(results_db: ResultsDB) -> int:
