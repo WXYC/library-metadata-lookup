@@ -1,3 +1,0 @@
-SPOTIFY_CLIENT_ID=0e0e44ab0f9f488d852a168ca73b2fa6
-SPOTIFY_CLIENT_SECRET=bebbb61e2bb14ef49e73aa0141de1f88
-DATABASE_URL_DISCOGS=postgresql://discogs:discogs@localhost:5433/discogs
