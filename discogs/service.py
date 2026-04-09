@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -16,11 +15,11 @@ from core.matching import (
     normalize_for_track_comparison,
 )
 from core.telemetry import (
-    record_api_time,
     record_discogs_api_call,
     record_pg_cache_hit,
     record_pg_cache_miss,
-    record_pg_time,
+    timed_api,
+    timed_pg,
 )
 from discogs.memory_cache import (
     ARTIST_CACHE,
@@ -216,11 +215,10 @@ class DiscogsService:
                     "cache_search_releases_by_track",
                     {"track": track, "artist": artist},
                 )
-                start = time.perf_counter()
-                cached_releases = await self.cache_service.search_releases_by_track(
-                    track=track, artist=artist, limit=limit
-                )
-                record_pg_time((time.perf_counter() - start) * 1000)
+                async with timed_pg():
+                    cached_releases = await self.cache_service.search_releases_by_track(
+                        track=track, artist=artist, limit=limit
+                    )
                 if cached_releases:
                     logger.info(f"Cache hit: found {len(cached_releases)} releases for '{track}'")
                     record_pg_cache_hit()
@@ -264,11 +262,10 @@ class DiscogsService:
         logger.info(f"Searching Discogs for releases with track: '{track}', artist: {artist}")
 
         try:
-            start = time.perf_counter()
-            response = await self._request_with_retry("GET", "/database/search", params=params)
+            async with timed_api():
+                response = await self._request_with_retry("GET", "/database/search", params=params)
 
             if response is not None:
-                record_api_time((time.perf_counter() - start) * 1000)
                 record_discogs_api_call()
                 response.raise_for_status()
                 data = response.json()
@@ -293,13 +290,12 @@ class DiscogsService:
                 }
 
                 logger.info(f"Supplementing with keyword search: '{query_params['q']}'")
-                start = time.perf_counter()
-                response = await self._request_with_retry(
-                    "GET", "/database/search", params=query_params
-                )
+                async with timed_api():
+                    response = await self._request_with_retry(
+                        "GET", "/database/search", params=query_params
+                    )
 
                 if response is not None:
-                    record_api_time((time.perf_counter() - start) * 1000)
                     record_discogs_api_call()
                     response.raise_for_status()
                     data = response.json()
@@ -378,9 +374,8 @@ class DiscogsService:
         if self.cache_service and not should_skip_cache():
             try:
                 add_discogs_breadcrumb("cache_get_release", {"release_id": release_id})
-                start = time.perf_counter()
-                cached_release = await self.cache_service.get_release(release_id)
-                record_pg_time((time.perf_counter() - start) * 1000)
+                async with timed_pg():
+                    cached_release = await self.cache_service.get_release(release_id)
                 if cached_release:
                     logger.info(f"Cache hit: release {release_id}")
                     record_pg_cache_hit()
@@ -395,14 +390,13 @@ class DiscogsService:
 
         # Fall back to Discogs API
         try:
-            start = time.perf_counter()
-            response = await self._request_with_retry("GET", f"/releases/{release_id}")
+            async with timed_api():
+                response = await self._request_with_retry("GET", f"/releases/{release_id}")
 
             if response is None:
                 logger.warning(f"Failed to fetch release {release_id} (rate limited or error)")
                 return None
 
-            record_api_time((time.perf_counter() - start) * 1000)
             record_discogs_api_call()
             response.raise_for_status()
             data = response.json()
@@ -517,9 +511,8 @@ class DiscogsService:
         if self.cache_service and not should_skip_cache():
             try:
                 add_discogs_breadcrumb("cache_get_artist_details", {"artist_id": artist_id})
-                start = time.perf_counter()
-                cached_details = await self.cache_service.get_artist_details(artist_id)
-                record_pg_time((time.perf_counter() - start) * 1000)
+                async with timed_pg():
+                    cached_details = await self.cache_service.get_artist_details(artist_id)
                 if cached_details:
                     logger.info(f"Cache hit: artist {artist_id}")
                     record_pg_cache_hit()
@@ -530,11 +523,10 @@ class DiscogsService:
                 logger.warning(f"Cache lookup failed, falling back to API: {e}")
 
         try:
-            start = time.perf_counter()
-            response = await self._request_with_retry("GET", f"/artists/{artist_id}")
+            async with timed_api():
+                response = await self._request_with_retry("GET", f"/artists/{artist_id}")
             if response is None:
                 return None
-            record_api_time((time.perf_counter() - start) * 1000)
             record_discogs_api_call()
             add_discogs_breadcrumb("get_artist_details", {"artist_id": artist_id})
             response.raise_for_status()
@@ -606,11 +598,10 @@ class DiscogsService:
             Image URI string, or None if unavailable
         """
         try:
-            start = time.perf_counter()
-            response = await self._request_with_retry("GET", f"/labels/{label_id}")
+            async with timed_api():
+                response = await self._request_with_retry("GET", f"/labels/{label_id}")
             if response is None:
                 return None
-            record_api_time((time.perf_counter() - start) * 1000)
             record_discogs_api_call()
             add_discogs_breadcrumb("get_label_image", {"label_id": label_id})
             response.raise_for_status()
@@ -632,11 +623,10 @@ class DiscogsService:
             MasterRelease with title and year, or None on error
         """
         try:
-            start = time.perf_counter()
-            response = await self._request_with_retry("GET", f"/masters/{master_id}")
+            async with timed_api():
+                response = await self._request_with_retry("GET", f"/masters/{master_id}")
             if response is None:
                 return None
-            record_api_time((time.perf_counter() - start) * 1000)
             record_discogs_api_call()
             add_discogs_breadcrumb("get_master", {"master_id": master_id})
             response.raise_for_status()
@@ -675,13 +665,12 @@ class DiscogsService:
                     "cache_search_releases",
                     {"artist": request.artist, "album": request.album},
                 )
-                start = time.perf_counter()
-                cached = await self.cache_service.search_releases(
-                    artist=request.artist,
-                    album=request.album or request.track,
-                    limit=limit,
-                )
-                record_pg_time((time.perf_counter() - start) * 1000)
+                async with timed_pg():
+                    cached = await self.cache_service.search_releases(
+                        artist=request.artist,
+                        album=request.album or request.track,
+                        limit=limit,
+                    )
                 if cached:
                     logger.info(f"Cache hit: found {len(cached)} releases for search")
                     record_pg_cache_hit()
@@ -720,14 +709,13 @@ class DiscogsService:
         logger.info(f"Searching Discogs with params: {params}")
 
         try:
-            start = time.perf_counter()
-            response = await self._request_with_retry("GET", "/database/search", params=params)
+            async with timed_api():
+                response = await self._request_with_retry("GET", "/database/search", params=params)
 
             if response is None:
                 logger.warning("Discogs search failed (rate limited or error)")
                 return DiscogsSearchResponse(cached=False)
 
-            record_api_time((time.perf_counter() - start) * 1000)
             record_discogs_api_call()
             response.raise_for_status()
             data = response.json()
@@ -745,12 +733,11 @@ class DiscogsService:
                     "q": " ".join(query_parts),
                 }
                 logger.info(f"Strict search empty, trying fuzzy query: {fallback_params}")
-                start = time.perf_counter()
-                response = await self._request_with_retry(
-                    "GET", "/database/search", params=fallback_params
-                )
+                async with timed_api():
+                    response = await self._request_with_retry(
+                        "GET", "/database/search", params=fallback_params
+                    )
                 if response is not None:
-                    record_api_time((time.perf_counter() - start) * 1000)
                     record_discogs_api_call()
                     response.raise_for_status()
                     data = response.json()
@@ -862,11 +849,10 @@ class DiscogsService:
                     "cache_validate_track",
                     {"release_id": release_id, "track": track, "artist": artist},
                 )
-                start = time.perf_counter()
-                cached_result = await self.cache_service.validate_track_on_release(
-                    release_id, track, artist
-                )
-                record_pg_time((time.perf_counter() - start) * 1000)
+                async with timed_pg():
+                    cached_result = await self.cache_service.validate_track_on_release(
+                        release_id, track, artist
+                    )
                 if cached_result is not None:
                     logger.info(
                         f"Cache {'validated' if cached_result else 'rejected'}: "
