@@ -2,7 +2,7 @@
 
 import logging
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
@@ -204,3 +204,23 @@ def record_api_time(ms: float) -> None:
 def get_cache_stats() -> dict | None:
     """Get cache stats for the current request context, or None if not initialized."""
     return _cache_stats_var.get(None)
+
+
+@asynccontextmanager
+async def timed_pg():
+    """Async context manager that records PostgreSQL cache query time."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        record_pg_time((time.perf_counter() - start) * 1000)
+
+
+@asynccontextmanager
+async def timed_api():
+    """Async context manager that records Discogs API call time."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        record_api_time((time.perf_counter() - start) * 1000)

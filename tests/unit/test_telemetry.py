@@ -12,6 +12,8 @@ from core.telemetry import (
     record_pg_cache_hit,
     record_pg_cache_miss,
     record_pg_time,
+    timed_api,
+    timed_pg,
 )
 
 # ---------------------------------------------------------------------------
@@ -169,3 +171,64 @@ class TestCacheStats:
         record_discogs_api_call()
         record_pg_time(1.0)
         record_api_time(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Async context managers: timed_pg / timed_api
+# ---------------------------------------------------------------------------
+
+
+class TestTimedPg:
+    @pytest.mark.asyncio
+    async def test_records_pg_time_when_stats_initialized(self):
+        """timed_pg() should accumulate pg_time_ms in cache stats."""
+        init_cache_stats()
+        async with timed_pg():
+            pass
+        stats = get_cache_stats()
+        assert stats["pg_time_ms"] > 0
+
+    @pytest.mark.asyncio
+    async def test_noop_when_stats_not_initialized(self):
+        """timed_pg() should not crash when cache stats are not initialized."""
+        async with timed_pg():
+            pass
+        # No stats initialized, so nothing to check -- just ensure no exception
+
+    @pytest.mark.asyncio
+    async def test_records_time_even_on_exception(self):
+        """timed_pg() should record time even when the body raises."""
+        init_cache_stats()
+        with pytest.raises(RuntimeError):
+            async with timed_pg():
+                raise RuntimeError("db error")
+        stats = get_cache_stats()
+        assert stats["pg_time_ms"] > 0
+
+
+class TestTimedApi:
+    @pytest.mark.asyncio
+    async def test_records_api_time_when_stats_initialized(self):
+        """timed_api() should accumulate api_time_ms in cache stats."""
+        init_cache_stats()
+        async with timed_api():
+            pass
+        stats = get_cache_stats()
+        assert stats["api_time_ms"] > 0
+
+    @pytest.mark.asyncio
+    async def test_noop_when_stats_not_initialized(self):
+        """timed_api() should not crash when cache stats are not initialized."""
+        async with timed_api():
+            pass
+        # No stats initialized, so nothing to check -- just ensure no exception
+
+    @pytest.mark.asyncio
+    async def test_records_time_even_on_exception(self):
+        """timed_api() should record time even when the body raises."""
+        init_cache_stats()
+        with pytest.raises(ValueError):
+            async with timed_api():
+                raise ValueError("api error")
+        stats = get_cache_stats()
+        assert stats["api_time_ms"] > 0
