@@ -7,32 +7,24 @@ import base64
 import logging
 import time
 
-import httpx
-from aiolimiter import AsyncLimiter
+from scripts.streaming_availability.http_client import BaseStreamingClient
 
 logger = logging.getLogger(__name__)
 
 
-class SpotifyClient:
+class SpotifyClient(BaseStreamingClient):
     """Spotify Web API client using client credentials flow for album searches."""
 
     ACCOUNTS_URL = "https://accounts.spotify.com/api/token"
     API_BASE = "https://api.spotify.com/v1"
 
     def __init__(self, client_id: str, client_secret: str):
+        super().__init__(rate_limit=(30, 30), semaphore_limit=5)
         self._client_id = client_id
         self._client_secret = client_secret
         self._access_token: str | None = None
         self._token_expires_at: float = 0
-        self._http: httpx.AsyncClient | None = None
-        self._rate_limiter = AsyncLimiter(30, 30)
-        self._semaphore = asyncio.Semaphore(5)
         self._max_retries = 5
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._http is None:
-            self._http = httpx.AsyncClient(timeout=10.0)
-        return self._http
 
     async def _ensure_token(self) -> str:
         """Get or refresh the access token via client credentials flow."""
@@ -141,8 +133,3 @@ class SpotifyClient:
 
         logger.error("Spotify max retries exhausted for %s - %s", artist, term)
         return []
-
-    async def close(self) -> None:
-        if self._http:
-            await self._http.aclose()
-            self._http = None

@@ -5,13 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 
-import httpx
-from aiolimiter import AsyncLimiter
+from scripts.streaming_availability.http_client import BaseStreamingClient
 
 logger = logging.getLogger(__name__)
 
 
-class AppleMusicClient:
+class AppleMusicClient(BaseStreamingClient):
     """iTunes Search API client with rate limiting for album searches.
 
     Unlike the existing _fetch_apple_music_url() in the service which searches
@@ -22,15 +21,8 @@ class AppleMusicClient:
     BASE_URL = "https://itunes.apple.com/search"
 
     def __init__(self):
-        self._http: httpx.AsyncClient | None = None
-        self._rate_limiter = AsyncLimiter(15, 60)
-        self._semaphore = asyncio.Semaphore(3)
+        super().__init__(rate_limit=(15, 60), semaphore_limit=3)
         self._max_retries = 2
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._http is None:
-            self._http = httpx.AsyncClient(timeout=10.0)
-        return self._http
 
     async def search_album(self, artist: str, title: str) -> list[dict]:
         """Search iTunes for albums matching artist + title.
@@ -83,8 +75,3 @@ class AppleMusicClient:
 
         logger.error("iTunes max retries exhausted for %s - %s", artist, title)
         return []
-
-    async def close(self) -> None:
-        if self._http:
-            await self._http.aclose()
-            self._http = None
