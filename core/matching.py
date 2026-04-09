@@ -74,6 +74,19 @@ def strip_discogs_suffix(name: str) -> str:
     return _DISCOGS_SUFFIX_RE.sub("", name)
 
 
+def normalize_artist_for_validation(name: str) -> str:
+    """Normalize an artist name for substring comparison during track validation.
+
+    Lowercases, strips quotes (Discogs uses quotes for nicknames, e.g.
+    '"Weird Al" Yankovic'), and removes disambiguation suffixes like '(2)'.
+    Safe for both user-provided and Discogs-sourced names.
+    """
+    if not name:
+        return ""
+    result = name.lower().replace('"', "").replace("'", "")
+    return strip_discogs_suffix(result).strip()
+
+
 # =============================================================================
 # Search Result Limiting
 # =============================================================================

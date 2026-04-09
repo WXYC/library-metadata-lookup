@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from core.matching import strip_discogs_suffix
+from core.matching import normalize_artist_for_validation
 from discogs.models import (
     DiscogsSearchResponse,
     ReleaseInfo,
@@ -296,11 +296,10 @@ class TestQuotedArtistNameValidation:
             if release is None:
                 return False
             track_lower = track.lower()
-            artist_lower = artist.lower().replace('"', "").replace("'", "")
+            artist_lower = normalize_artist_for_validation(artist)
             for item in release.tracklist:
                 if track_lower in item.title.lower() or item.title.lower() in track_lower:
-                    release_artist = release.artist.lower().replace('"', "").replace("'", "")
-                    release_artist = strip_discogs_suffix(release_artist)
+                    release_artist = normalize_artist_for_validation(release.artist)
                     if artist_lower in release_artist or release_artist in artist_lower:
                         return True
             return False

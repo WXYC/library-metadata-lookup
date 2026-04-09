@@ -8,6 +8,7 @@ from core.matching import (
     is_compilation_artist,
     is_self_titled,
     map_library_format_to_discogs,
+    normalize_artist_for_validation,
     normalize_for_comparison,
     normalize_for_track_comparison,
     strip_diacritics,
@@ -76,6 +77,28 @@ class TestStripDiscogsSuffix:
     )
     def test_strip_discogs_suffix(self, input_text, expected):
         assert strip_discogs_suffix(input_text) == expected
+
+
+# ---------------------------------------------------------------------------
+# normalize_artist_for_validation
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeArtistForValidation:
+    """Tests for artist name normalization used in track validation."""
+
+    @pytest.mark.parametrize(
+        "input_name, expected",
+        [
+            pytest.param('"Weird Al" Yankovic', "weird al yankovic", id="quoted-nickname"),
+            pytest.param("Koo Nimo (2)", "koo nimo", id="discogs-suffix"),
+            pytest.param('"MF Doom" (3)', "mf doom", id="quotes-and-suffix"),
+            pytest.param("Stereolab", "stereolab", id="plain-name"),
+            pytest.param("", "", id="empty-string"),
+        ],
+    )
+    def test_normalize_artist_for_validation(self, input_name, expected):
+        assert normalize_artist_for_validation(input_name) == expected
 
 
 # ---------------------------------------------------------------------------
