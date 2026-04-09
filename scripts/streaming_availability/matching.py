@@ -4,7 +4,7 @@ import re
 
 from rapidfuzz import fuzz
 
-from core.matching import normalize_for_comparison
+from core.matching import normalize_for_comparison, strip_discogs_suffix  # noqa: F401
 
 # Trailing format indicators: 12", 7", 10", LP, EP, CD, and multi-disc (x 2, x 3, ...)
 _FORMAT_SUFFIX_RE = re.compile(
@@ -29,9 +29,6 @@ _BRACKET_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Discogs disambiguation suffix: (2), (22), etc.
-_DISCOGS_SUFFIX_RE = re.compile(r"\s+\(\d+\)$")
-
 # Leading "The " prefix
 _THE_PREFIX_RE = re.compile(r"^The\s+", re.IGNORECASE)
 
@@ -44,13 +41,6 @@ def strip_format_suffix(title: str) -> str:
     result = _BRACKET_SUFFIX_RE.sub("", result)
     result = _FORMAT_SUFFIX_RE.sub("", result)
     return result.strip()
-
-
-def strip_discogs_suffix(name: str) -> str:
-    """Remove Discogs disambiguation suffixes like (2), (22) from artist names."""
-    if not name:
-        return name
-    return _DISCOGS_SUFFIX_RE.sub("", name)
 
 
 def strip_the_prefix(name: str) -> str:

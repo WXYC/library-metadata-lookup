@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 
+from core.matching import strip_discogs_suffix
+
 # Canonical VA names (exact match, case-insensitive)
 _VA_EXACT = frozenset(
     {
@@ -36,9 +38,6 @@ _EMBEDDED_PARENS_RE = re.compile(
     r"^(?:various\s+(?:artists?|performers?)|v/?a\.?)\s*\((.+)\)$",
     re.IGNORECASE,
 )
-
-# Discogs numeric disambiguation suffix: "Artist Name (2)"
-_DISCOGS_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")
 
 # Discogs placeholder artist names that shouldn't be used as resolutions
 _PLACEHOLDER_ARTISTS = frozenset(
@@ -161,5 +160,5 @@ def select_primary_artist(artists: list[str]) -> str | None:
 
     primary = artists[0].strip()
     # Strip Discogs numeric disambiguation suffix
-    primary = _DISCOGS_SUFFIX_RE.sub("", primary).strip()
+    primary = strip_discogs_suffix(primary).strip()
     return primary

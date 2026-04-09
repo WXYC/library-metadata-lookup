@@ -6,12 +6,9 @@ resolved artist names to find the corresponding LIBRARY_CODE.ID.
 
 from __future__ import annotations
 
-import re
-
 from rapidfuzz import fuzz
 
-# Discogs numeric disambiguation suffix: "Artist Name (2)"
-_DISCOGS_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")
+from core.matching import strip_discogs_suffix
 
 # Minimum fuzzy match score to accept
 _FUZZY_THRESHOLD = 85
@@ -63,7 +60,7 @@ def find_library_code_id(index: dict[str, int], artist: str) -> int | None:
         return index[lower]
 
     # Strip Discogs numeric suffix and try again
-    stripped = _DISCOGS_SUFFIX_RE.sub("", lower).strip()
+    stripped = strip_discogs_suffix(lower).strip()
     if stripped != lower and stripped in index:
         return index[stripped]
 
