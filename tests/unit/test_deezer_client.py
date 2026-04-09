@@ -56,6 +56,32 @@ class TestSearchAlbum:
         assert results == []
 
     @pytest.mark.asyncio
+    async def test_falls_back_to_unquoted_search(self):
+        client = DeezerClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            side_effect=[_search_response([]), _search_response([_make_album_result()])]
+        )
+        client._http = mock_http
+
+        results = await client.search_album("Björk", "Homogenic")
+
+        assert len(results) == 1
+        assert mock_http.get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_skips_fallback_when_quoted_succeeds(self):
+        client = DeezerClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_search_response([_make_album_result()]))
+        client._http = mock_http
+
+        results = await client.search_album("Stereolab", "Aluminum Tunes")
+
+        assert len(results) == 1
+        assert mock_http.get.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_returns_empty_on_error(self):
         client = DeezerClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)

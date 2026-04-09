@@ -23,6 +23,12 @@ _PARENTHETICAL_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Bracket format tags: [single], [EP], [sampler EP], etc.
+_BRACKET_SUFFIX_RE = re.compile(
+    r"\s*\[[^\]]*(?:single|EP|sampler|promo|import)\]?\s*$",
+    re.IGNORECASE,
+)
+
 # Discogs disambiguation suffix: (2), (22), etc.
 _DISCOGS_SUFFIX_RE = re.compile(r"\s+\(\d+\)$")
 
@@ -35,6 +41,7 @@ def strip_format_suffix(title: str) -> str:
     if not title:
         return title
     result = _PARENTHETICAL_SUFFIX_RE.sub("", title)
+    result = _BRACKET_SUFFIX_RE.sub("", result)
     result = _FORMAT_SUFFIX_RE.sub("", result)
     return result.strip()
 

@@ -38,6 +38,13 @@ class TestStripFormatSuffix:
             pytest.param(
                 "Gasoline (Anniversary Edition)", "Gasoline", id="parenthetical-anniversary"
             ),
+            pytest.param("Me Myself and I [single]", "Me Myself and I", id="bracket-single"),
+            pytest.param("Coma [single]", "Coma", id="bracket-single-short"),
+            pytest.param("Noises [EP]", "Noises", id="bracket-ep"),
+            pytest.param("Laminations [sampler EP]", "Laminations", id="bracket-sampler-ep"),
+            pytest.param(
+                "College Karma [EP]", "College Karma", id="bracket-ep-two-words"
+            ),
         ],
     )
     def test_strip_format_suffix(self, title, expected):
