@@ -838,6 +838,8 @@ async def run(args: argparse.Namespace) -> None:
                     "deezer_found": True,
                     "search_artist": row["discogs_artist"],
                     "search_title": row["discogs_title"],
+                    "deezer_artist": row["deezer_matched_artist"],
+                    "deezer_title": row["deezer_matched_title"],
                 }
 
         pipeline_items = [seen[k] for k in sorted(seen)]
