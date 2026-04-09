@@ -1,6 +1,7 @@
 """Unit tests for scripts/streaming_availability/matching.py."""
 
 import pytest
+
 from scripts.streaming_availability.matching import (
     is_acceptable_match,
     normalize_album_title,
