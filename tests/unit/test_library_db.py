@@ -69,6 +69,102 @@ class TestLibraryDBConnect:
         mock_aiosqlite.connect.assert_called_once_with(db_file)
 
 
+class TestLibraryDBSchemaValidation:
+    """Tests for schema validation against wxyc_etl.schema constants."""
+
+    @pytest.mark.asyncio
+    @patch("library.db.aiosqlite")
+    async def test_connect_validates_expected_columns(self, mock_aiosqlite, tmp_path):
+        """connect() should warn if expected schema columns are missing."""
+        db_file = tmp_path / "test.db"
+        db_file.touch()
+
+        mock_conn = AsyncMock()
+        mock_aiosqlite.connect = AsyncMock(return_value=mock_conn)
+        mock_aiosqlite.Row = "RowClass"
+
+        # Simulate PRAGMA returning only a subset of expected columns (missing 'genre')
+        pragma_cursor = AsyncMock()
+        pragma_cursor.fetchall = AsyncMock(
+            return_value=[
+                (0, "id", "INTEGER", 0, None, 1),
+                (1, "title", "TEXT", 0, None, 0),
+                (2, "artist", "TEXT", 0, None, 0),
+                (3, "call_letters", "TEXT", 0, None, 0),
+                (4, "artist_call_number", "INTEGER", 0, None, 0),
+                (5, "release_call_number", "INTEGER", 0, None, 0),
+                (6, "format", "TEXT", 0, None, 0),
+                # 'genre' is missing
+            ]
+        )
+        tables_cursor = AsyncMock()
+        tables_cursor.fetchone = AsyncMock(return_value=None)
+
+        async def _execute_side_effect(sql, *args):
+            if "PRAGMA" in sql:
+                return pragma_cursor
+            return tables_cursor
+
+        mock_conn.execute = AsyncMock(side_effect=_execute_side_effect)
+
+        db = LibraryDB(db_path=db_file)
+
+        with patch("library.db.logger") as mock_logger:
+            await db.connect()
+            # Should log a warning about the missing column
+            warning_calls = [
+                call for call in mock_logger.warning.call_args_list if "genre" in str(call)
+            ]
+            assert len(warning_calls) > 0, "Expected warning about missing 'genre' column"
+
+    @pytest.mark.asyncio
+    @patch("library.db.aiosqlite")
+    async def test_connect_no_warning_when_all_columns_present(self, mock_aiosqlite, tmp_path):
+        """connect() should not warn when all expected columns are present."""
+        db_file = tmp_path / "test.db"
+        db_file.touch()
+
+        mock_conn = AsyncMock()
+        mock_aiosqlite.connect = AsyncMock(return_value=mock_conn)
+        mock_aiosqlite.Row = "RowClass"
+
+        # Return all expected columns
+        pragma_cursor = AsyncMock()
+        pragma_cursor.fetchall = AsyncMock(
+            return_value=[
+                (0, "id", "INTEGER", 0, None, 1),
+                (1, "title", "TEXT", 0, None, 0),
+                (2, "artist", "TEXT", 0, None, 0),
+                (3, "call_letters", "TEXT", 0, None, 0),
+                (4, "artist_call_number", "INTEGER", 0, None, 0),
+                (5, "release_call_number", "INTEGER", 0, None, 0),
+                (6, "genre", "TEXT", 0, None, 0),
+                (7, "format", "TEXT", 0, None, 0),
+                (8, "alternate_artist_name", "TEXT", 0, None, 0),
+            ]
+        )
+        tables_cursor = AsyncMock()
+        tables_cursor.fetchone = AsyncMock(return_value=None)
+
+        async def _execute_side_effect(sql, *args):
+            if "PRAGMA" in sql:
+                return pragma_cursor
+            return tables_cursor
+
+        mock_conn.execute = AsyncMock(side_effect=_execute_side_effect)
+
+        db = LibraryDB(db_path=db_file)
+
+        with patch("library.db.logger") as mock_logger:
+            await db.connect()
+            warning_calls = [
+                call
+                for call in mock_logger.warning.call_args_list
+                if "missing" in str(call).lower() and "column" in str(call).lower()
+            ]
+            assert len(warning_calls) == 0, f"Unexpected schema warnings: {warning_calls}"
+
+
 class TestLibraryDBIsAvailable:
     @pytest.mark.asyncio
     async def test_no_connection(self):
