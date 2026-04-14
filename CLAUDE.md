@@ -41,6 +41,19 @@ All strategy implementations live in `lookup/orchestrator.py`.
 - `core/search.py` -- Declarative search strategy pattern + ambiguous format detection
 - `discogs/matching.py` -- Discogs-specific normalization (strip_discogs_suffix, normalize_for_track_comparison, normalize_artist_for_validation)
 - `core/dependencies.py` -- FastAPI DI for LibraryDB + DiscogsService
+- `identity/router.py` -- `GET /identity/resolve` and `POST /identity/bulk` endpoints for identity resolution
+- `identity/models.py` -- Pydantic models for identity resolution responses
+- `identity/dependencies.py` -- FastAPI DI for EntityStore (reuses `DATABASE_URL_DISCOGS` pool)
+- `scripts/entity_resolution/store.py` -- Entity store CRUD against `entity.identity` PG table
+
+### Identity Resolution Endpoints
+
+The service exposes REST endpoints for querying the `entity.identity` table in the discogs-cache PostgreSQL database. These endpoints are consumed by semantic-index (via `--entity-source=lml`) and other pipeline tools.
+
+- `GET /identity/resolve?name=Stereolab` -- Look up a single artist name. Returns 200 with external IDs or 404.
+- `POST /identity/bulk` with `{"names": ["Stereolab", "Autechre", ...]}` -- Resolve a batch of names. Returns `identities` (found) and `unresolved` (not found).
+
+Both endpoints return 503 when `DATABASE_URL_DISCOGS` is not set or the entity schema is not applied.
 
 ### Discogs Cache (Optional)
 
