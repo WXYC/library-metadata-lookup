@@ -6,7 +6,6 @@ import re
 from collections.abc import Callable
 
 from rapidfuzz import fuzz
-
 from wxyc_etl.text import normalize_artist_name as normalize_for_comparison  # noqa: F401
 
 from discogs.matching import strip_discogs_suffix  # noqa: F401

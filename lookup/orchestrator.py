@@ -12,7 +12,6 @@ from functools import partial
 from urllib.parse import quote
 
 import httpx
-
 from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import normalize_artist_name as normalize_for_comparison
 

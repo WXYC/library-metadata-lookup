@@ -7,10 +7,9 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 import httpx
+from wxyc_etl.text import is_compilation_artist
 
 from config.settings import get_settings
-from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
-from wxyc_etl.text import is_compilation_artist
 from core.telemetry import (
     record_discogs_api_call,
     record_pg_cache_hit,
@@ -18,6 +17,7 @@ from core.telemetry import (
     timed_api,
     timed_pg,
 )
+from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import (
     ARTIST_CACHE,
     LABEL_CACHE,

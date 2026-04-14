@@ -6,8 +6,8 @@ import logging
 from typing import TYPE_CHECKING
 
 from rapidfuzz import fuzz
-
 from wxyc_etl.text import strip_diacritics
+
 from scripts.streaming_availability.matching import (
     is_acceptable_match,
     score_match,
