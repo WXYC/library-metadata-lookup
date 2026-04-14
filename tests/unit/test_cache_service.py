@@ -12,6 +12,7 @@ from discogs.models import (
     LabelCredit,
     MemberRef,
     ReleaseMetadataResponse,
+    ReleaseVideo,
     TrackItem,
 )
 
@@ -264,6 +265,98 @@ class TestGetRelease:
         assert result.tracklist[0].artists == ["Some Artist"]
 
     @pytest.mark.asyncio
+    async def test_reads_videos(self, cache_service, mock_asyncpg_pool):
+        """get_release returns videos fetched from release_video table."""
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "Emperor Tomato Ketchup",
+                "release_year": 1996,
+                "artwork_url": None,
+                "released": None,
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[],
+                release_artist=[
+                    {"artist_id": None, "artist_name": "Stereolab", "extra": 0, "role": None}
+                ],
+                release_label=[],
+                release_genre=[],
+                release_style=[],
+                release_video=[
+                    {"sequence": 1, "src": "https://www.youtube.com/watch?v=abc", "title": "Metronomic Underground", "duration": 456, "embed": True},
+                    {"sequence": 2, "src": "https://www.youtube.com/watch?v=def", "title": "French Disko", "duration": 204, "embed": False},
+                ],
+            )
+        )
+
+        result = await cache_service.get_release(1)
+        assert result is not None
+        assert len(result.videos) == 2
+        assert result.videos[0].src == "https://www.youtube.com/watch?v=abc"
+        assert result.videos[0].title == "Metronomic Underground"
+        assert result.videos[0].duration == 456
+        assert result.videos[0].embed is True
+        assert result.videos[1].embed is False
+
+    @pytest.mark.asyncio
+    async def test_reads_videos_empty_when_none_exist(self, cache_service, mock_asyncpg_pool):
+        """get_release returns empty videos list when release has no videos."""
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "Aluminum Tunes",
+                "release_year": 1998,
+                "artwork_url": None,
+                "released": None,
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[],
+                release_artist=[
+                    {"artist_id": None, "artist_name": "Stereolab", "extra": 0, "role": None}
+                ],
+                release_label=[],
+                release_genre=[],
+                release_style=[],
+                release_video=[],
+            )
+        )
+
+        result = await cache_service.get_release(1)
+        assert result is not None
+        assert result.videos == []
+
+    @pytest.mark.asyncio
+    async def test_videos_gracefully_absent(self, cache_service, mock_asyncpg_pool):
+        """get_release returns empty videos list when release_video table does not exist."""
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "Emperor Tomato Ketchup",
+                "release_year": 1996,
+                "artwork_url": None,
+                "released": None,
+            }
+        )
+
+        def raise_on_video(query, *args):
+            if "release_video" in query:
+                raise Exception("relation does not exist")
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=raise_on_video)
+
+        result = await cache_service.get_release(1)
+        assert result is not None
+        assert result.videos == []
+
+    @pytest.mark.asyncio
     async def test_error_raises(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetchrow = AsyncMock(side_effect=Exception("db error"))
         with pytest.raises(CacheUnavailableError):
@@ -380,6 +473,84 @@ class TestWriteRelease:
         # The data should contain all 3 artists
         artist_data = artist_inserts[0][0][1]
         assert len(artist_data) == 3
+
+    @pytest.mark.asyncio
+    async def test_writes_videos(self, cache_service, mock_asyncpg_pool):
+        """write_release persists videos to release_video table."""
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Emperor Tomato Ketchup",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/1",
+            videos=[
+                ReleaseVideo(src="https://www.youtube.com/watch?v=abc", title="Metronomic Underground", duration=456),
+                ReleaseVideo(src="https://www.youtube.com/watch?v=def", title="French Disko", duration=204, embed=False),
+            ],
+        )
+
+        await cache_service.write_release(release)
+        conn = mock_asyncpg_pool._mock_conn
+
+        all_sql = [call[0][0] for call in conn.execute.call_args_list]
+        assert any("DELETE FROM release_video" in sql for sql in all_sql)
+
+        all_executemany_sql = [call[0][0] for call in conn.executemany.call_args_list]
+        assert any("release_video" in sql for sql in all_executemany_sql)
+
+        video_insert = next(c for c in conn.executemany.call_args_list if "release_video" in c[0][0])
+        rows = video_insert[0][1]
+        assert len(rows) == 2
+        assert rows[0][1] == 1  # sequence 1
+        assert rows[0][2] == "https://www.youtube.com/watch?v=abc"
+        assert rows[0][3] == "Metronomic Underground"
+        assert rows[0][4] == 456
+        assert rows[0][5] is True
+        assert rows[1][1] == 2  # sequence 2
+        assert rows[1][5] is False
+
+    @pytest.mark.asyncio
+    async def test_write_release_without_videos_skips_insert(self, cache_service, mock_asyncpg_pool):
+        """write_release with no videos deletes old rows but skips executemany INSERT."""
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/1",
+        )
+
+        await cache_service.write_release(release)
+        conn = mock_asyncpg_pool._mock_conn
+
+        # DELETE FROM release_video should still be called (to clear stale data)
+        all_sql = [call[0][0] for call in conn.execute.call_args_list]
+        assert any("DELETE FROM release_video" in sql for sql in all_sql)
+
+        # No executemany INSERT for release_video (no videos to write)
+        all_executemany_sql = [call[0][0] for call in conn.executemany.call_args_list]
+        assert not any("release_video" in sql for sql in all_executemany_sql)
+
+    @pytest.mark.asyncio
+    async def test_videos_table_absent_is_nonfatal(self, cache_service, mock_asyncpg_pool):
+        """write_release does not raise if release_video table does not exist."""
+        conn = mock_asyncpg_pool._mock_conn
+
+        def raise_on_video(sql, *args):
+            if "release_video" in sql:
+                raise Exception("relation does not exist")
+
+        conn.execute = AsyncMock(side_effect=raise_on_video)
+
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Emperor Tomato Ketchup",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/1",
+            videos=[
+                ReleaseVideo(src="https://www.youtube.com/watch?v=abc"),
+            ],
+        )
+        # Must not raise
+        await cache_service.write_release(release)
 
 
 # ---------------------------------------------------------------------------
