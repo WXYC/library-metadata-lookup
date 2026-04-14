@@ -70,11 +70,14 @@ ignore_errors = true
 
 [tool.pytest.ini_options]
 markers = [
-    "integration: marks tests as integration tests",
+    "unit: pure logic tests, no external dependencies",
+    "postgres: needs PostgreSQL (gated by DATABASE_URL_TEST)",
+    "integration: needs external service or fixture data",
+    "e2e: full pipeline end-to-end test",
+    "parity: old vs new implementation comparison",
     "slow: marks tests as slow",
-    "postgres: marks tests requiring PostgreSQL (docker-compose on port 5433)",
 ]
-addopts = "-m 'not integration and not postgres'"
+addopts = "-m 'not integration and not postgres and not e2e and not parity and not slow'"
 console_output_style = "progress"
 testpaths = ["tests"]
 pythonpath = ["."]

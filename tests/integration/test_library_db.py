@@ -8,22 +8,22 @@ pytestmark = pytest.mark.integration
 class TestFTS5Search:
     @pytest.mark.asyncio
     async def test_search_by_artist(self, library_db):
-        results = await library_db.search(query="Queen")
+        results = await library_db.search(query="Stereolab")
         assert len(results) >= 1
-        assert all("Queen" in r.artist for r in results)
+        assert all("Stereolab" in r.artist for r in results)
 
     @pytest.mark.asyncio
     async def test_search_by_album(self, library_db):
-        results = await library_db.search(query="OK Computer")
+        results = await library_db.search(query="On Your Own Love Again")
         assert len(results) >= 1
-        assert results[0].title == "OK Computer"
+        assert results[0].title == "On Your Own Love Again"
 
     @pytest.mark.asyncio
     async def test_combined_artist_album(self, library_db):
-        results = await library_db.search(query="Queen Game")
+        results = await library_db.search(query="Stereolab Dots Loops")
         assert len(results) >= 1
-        # Should find "The Game" by Queen
-        assert any(r.title == "The Game" for r in results)
+        # Should find "Dots and Loops" by Stereolab
+        assert any(r.title == "Dots and Loops" for r in results)
 
     @pytest.mark.asyncio
     async def test_limit(self, library_db):
@@ -33,7 +33,7 @@ class TestFTS5Search:
     @pytest.mark.asyncio
     async def test_special_characters_fallback(self, library_db):
         """FTS5 should handle special characters via LIKE fallback."""
-        results = await library_db.search(query="Time (Clock of the Heart)")
+        results = await library_db.search(query="Duke Ellington & John Coltrane")
         assert isinstance(results, list)
 
     @pytest.mark.asyncio
@@ -45,19 +45,19 @@ class TestFTS5Search:
 class TestFilteredSearch:
     @pytest.mark.asyncio
     async def test_artist_filter(self, library_db):
-        results = await library_db.search(artist="Queen")
+        results = await library_db.search(artist="Stereolab")
         assert len(results) >= 1
-        assert all("Queen" in r.artist for r in results)
+        assert all("Stereolab" in r.artist for r in results)
 
     @pytest.mark.asyncio
     async def test_title_filter(self, library_db):
-        results = await library_db.search(title="The Game")
+        results = await library_db.search(title="Dots and Loops")
         assert len(results) >= 1
-        assert results[0].title == "The Game"
+        assert results[0].title == "Dots and Loops"
 
     @pytest.mark.asyncio
     async def test_combined_filter(self, library_db):
-        results = await library_db.search(artist="Queen", title="Game")
+        results = await library_db.search(artist="Stereolab", title="Dots")
         assert len(results) >= 1
 
     @pytest.mark.asyncio
@@ -70,13 +70,13 @@ class TestLIKEFallback:
     @pytest.mark.asyncio
     async def test_partial_match(self, library_db):
         """LIKE fallback picks up partial matches."""
-        results = await library_db.search(query="Beatles Abbey")
+        results = await library_db.search(query="Juana Molina DOGA")
         assert len(results) >= 1
 
     @pytest.mark.asyncio
     async def test_stopword_removal(self, library_db):
         """Stopwords ('the') are removed in LIKE search."""
-        results = await library_db.search(query="the Beatles")
+        results = await library_db.search(query="the Bird Bee")
         assert isinstance(results, list)
 
 
@@ -84,8 +84,8 @@ class TestFuzzySearch:
     @pytest.mark.asyncio
     async def test_misspelled_artist(self, library_db):
         """Fuzzy search should find close matches."""
-        # "Radioheed" is close to "Radiohead"
-        results = await library_db.search(query="Radioheed Computer")
+        # "Stereolob" is close to "Stereolab"
+        results = await library_db.search(query="Stereolob Aluminum")
         # Might or might not match depending on threshold, but shouldn't crash
         assert isinstance(results, list)
 
@@ -100,7 +100,7 @@ class TestFindSimilarArtist:
     @pytest.mark.asyncio
     async def test_exact_match_returns_none(self, library_db):
         """Exact match returns None (no correction needed)."""
-        result = await library_db.find_similar_artist("Queen")
+        result = await library_db.find_similar_artist("Stereolab")
         assert result is None
 
     @pytest.mark.asyncio

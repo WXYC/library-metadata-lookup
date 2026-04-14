@@ -23,9 +23,9 @@ class TestLookupPipeline:
         resp = await app_client.post(
             "/api/v1/lookup",
             json={
-                "artist": "Queen",
-                "album": "The Game",
-                "raw_message": "Queen - The Game",
+                "artist": "Stereolab",
+                "album": "Dots and Loops",
+                "raw_message": "Stereolab - Dots and Loops",
             },
         )
         assert resp.status_code == 200
@@ -39,8 +39,8 @@ class TestLookupPipeline:
         resp = await app_client.post(
             "/api/v1/lookup",
             json={
-                "artist": "Radiohead",
-                "raw_message": "Radiohead",
+                "artist": "Juana Molina",
+                "raw_message": "Juana Molina",
             },
         )
         assert resp.status_code == 200
@@ -122,9 +122,9 @@ class TestLookupPipeline:
         resp = await app_client.post(
             "/api/v1/lookup",
             json={
-                "artist": "Queen",
-                "album": "The Game",
-                "raw_message": "Queen - The Game",
+                "artist": "Stereolab",
+                "album": "Dots and Loops",
+                "raw_message": "Stereolab - Dots and Loops",
             },
         )
         body = resp.json()
