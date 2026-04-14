@@ -11,7 +11,7 @@ Uses WXYC example artists for fixture data.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -116,9 +116,7 @@ class TestBulkIdentityEndpoint:
         app.dependency_overrides[get_posthog_client] = lambda: None
         app.dependency_overrides[get_settings] = lambda: test_settings
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             yield client
 
         app.dependency_overrides.clear()
@@ -127,9 +125,7 @@ class TestBulkIdentityEndpoint:
     async def test_bulk_1000_names_completes(self, app_client_with_entity_store):
         """Bulk endpoint with 1000+ names completes without timeout or OOM."""
         names = _generate_artist_names(1200)
-        resp = await app_client_with_entity_store.post(
-            "/identity/bulk", json={"names": names}
-        )
+        resp = await app_client_with_entity_store.post("/identity/bulk", json={"names": names})
         assert resp.status_code == 200
         body = resp.json()
         assert "identities" in body
@@ -140,9 +136,7 @@ class TestBulkIdentityEndpoint:
     @pytest.mark.asyncio
     async def test_bulk_empty_names_list(self, app_client_with_entity_store):
         """Bulk endpoint with empty list returns empty results."""
-        resp = await app_client_with_entity_store.post(
-            "/identity/bulk", json={"names": []}
-        )
+        resp = await app_client_with_entity_store.post("/identity/bulk", json={"names": []})
         assert resp.status_code == 200
         body = resp.json()
         assert body["identities"] == []
@@ -152,9 +146,7 @@ class TestBulkIdentityEndpoint:
     async def test_bulk_duplicate_names_handled(self, app_client_with_entity_store):
         """Bulk endpoint handles duplicate names (returns one result per input)."""
         names = ["Stereolab", "Stereolab", "Stereolab"]
-        resp = await app_client_with_entity_store.post(
-            "/identity/bulk", json={"names": names}
-        )
+        resp = await app_client_with_entity_store.post("/identity/bulk", json={"names": names})
         assert resp.status_code == 200
         body = resp.json()
         total = len(body["identities"]) + len(body["unresolved"])
@@ -181,9 +173,9 @@ class TestSourceTransportFailures:
         with pytest.raises(Exception) as exc_info:
             await pg.fetchall("SELECT 1")
         err_msg = str(exc_info.value).lower()
-        assert (
-            "connect" in err_msg or "refused" in err_msg or "timeout" in err_msg
-        ), f"Expected connection error, got: {exc_info.value}"
+        assert "connect" in err_msg or "refused" in err_msg or "timeout" in err_msg, (
+            f"Expected connection error, got: {exc_info.value}"
+        )
 
     @pytest.mark.asyncio
     async def test_pg_source_bad_credentials(self):
@@ -193,8 +185,10 @@ class TestSourceTransportFailures:
         except ImportError:
             pytest.skip("Entity resolution sources not available on this branch")
 
+        import asyncpg
+
         pg = PgSource("postgresql://bogus_user:bad_pass@localhost:5433/postgres")
-        with pytest.raises(Exception):
+        with pytest.raises(asyncpg.InvalidPasswordError):
             await pg.fetchall("SELECT 1")
 
     @pytest.mark.asyncio
@@ -221,14 +215,10 @@ class TestSourceTransportFailures:
         # Mock the httpx client to simulate a connection error.
         # DiscogsService catches exceptions internally and returns empty results.
         mock_client = AsyncMock()
-        mock_client.get = AsyncMock(
-            side_effect=Exception("simulated HTTP connection failure")
-        )
+        mock_client.get = AsyncMock(side_effect=Exception("simulated HTTP connection failure"))
         service._client = mock_client
 
-        request = DiscogsSearchRequest(
-            artist="Stereolab", album="Aluminum Tunes"
-        )
+        request = DiscogsSearchRequest(artist="Stereolab", album="Aluminum Tunes")
 
         result = await service.search(request)
 
@@ -273,9 +263,7 @@ class TestEntityStoreGracefulDegradation:
         app.dependency_overrides[get_posthog_client] = lambda: None
         app.dependency_overrides[get_settings] = lambda: test_settings
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             yield client
 
         app.dependency_overrides.clear()
@@ -292,9 +280,7 @@ class TestEntityStoreGracefulDegradation:
         assert "not available" in resp.json()["detail"].lower()
 
     @pytest.mark.asyncio
-    async def test_bulk_returns_503_when_entity_store_unavailable(
-        self, app_client_no_entity_store
-    ):
+    async def test_bulk_returns_503_when_entity_store_unavailable(self, app_client_no_entity_store):
         """POST /identity/bulk returns 503 when entity store is unavailable."""
         resp = await app_client_no_entity_store.post(
             "/identity/bulk", json={"names": ["Stereolab", "Autechre"]}
@@ -345,9 +331,7 @@ class TestLibraryDbUnavailability:
         app.dependency_overrides[get_posthog_client] = lambda: None
         app.dependency_overrides[get_settings] = lambda: test_settings
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             yield client
 
         app.dependency_overrides.clear()
@@ -364,9 +348,7 @@ class TestLibraryDbUnavailability:
     @pytest.mark.asyncio
     async def test_library_search_returns_error_when_db_unavailable(self, app_client_no_db):
         """Library search returns an error (not a hang) when DB is unavailable."""
-        resp = await app_client_no_db.get(
-            "/api/v1/library/search", params={"q": "Stereolab"}
-        )
+        resp = await app_client_no_db.get("/api/v1/library/search", params={"q": "Stereolab"})
         # Should return an error status, not hang or crash
         assert resp.status_code >= 400
 
@@ -383,9 +365,7 @@ class TestLargePayloads:
     async def test_library_search_very_long_query(self, app_client):
         """Library search with a very long query string doesn't crash."""
         long_query = "Stereolab " * 500  # ~5000 chars
-        resp = await app_client.get(
-            "/api/v1/library/search", params={"q": long_query}
-        )
+        resp = await app_client.get("/api/v1/library/search", params={"q": long_query})
         # Should return a valid response (possibly empty results), not crash
         assert resp.status_code in (200, 400, 422)
 
@@ -404,12 +384,10 @@ class TestLargePayloads:
         for query in [
             "'; DROP TABLE library; --",
             "Stereolab' OR '1'='1",
-            "Cat Power\"); DELETE FROM library;",
+            'Cat Power"); DELETE FROM library;',
             "<script>alert('xss')</script>",
         ]:
-            resp = await app_client.get(
-                "/api/v1/library/search", params={"q": query}
-            )
+            resp = await app_client.get("/api/v1/library/search", params={"q": query})
             # Should not crash or return 500
             assert resp.status_code in (200, 400, 422), (
                 f"Query '{query}' returned unexpected status {resp.status_code}"
@@ -418,8 +396,6 @@ class TestLargePayloads:
     @pytest.mark.asyncio
     async def test_library_search_empty_query_rejected(self, app_client):
         """Library search with empty string query is rejected."""
-        resp = await app_client.get(
-            "/api/v1/library/search", params={"q": ""}
-        )
+        resp = await app_client.get("/api/v1/library/search", params={"q": ""})
         # Empty query should be rejected (400) or return empty results (200)
         assert resp.status_code in (200, 400)
