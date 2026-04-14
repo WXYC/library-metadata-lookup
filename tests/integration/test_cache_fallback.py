@@ -30,9 +30,7 @@ class TestCacheFallbackOnCorruptedData:
         return DiscogsCacheService(corrupt_pool)
 
     @pytest.mark.asyncio
-    async def test_search_releases_db_error_raises_unavailable(
-        self, cache_service, corrupt_pool
-    ):
+    async def test_search_releases_db_error_raises_unavailable(self, cache_service, corrupt_pool):
         """When the DB raises an exception during search, CacheUnavailableError is raised."""
         corrupt_pool.fetch = AsyncMock(
             side_effect=Exception("could not read block 42 in file: Input/output error")
@@ -51,9 +49,7 @@ class TestCacheFallbackOnCorruptedData:
         )
 
         with pytest.raises(CacheUnavailableError, match="Cache search failed"):
-            await cache_service.search_releases_by_track(
-                "VI Scose Poise", "Autechre"
-            )
+            await cache_service.search_releases_by_track("VI Scose Poise", "Autechre")
 
     @pytest.mark.asyncio
     async def test_get_release_corrupted_fetchrow_raises_unavailable(
@@ -90,37 +86,25 @@ class TestCacheFallbackOnCorruptedData:
             await cache_service.get_release(28138)
 
     @pytest.mark.asyncio
-    async def test_validate_track_db_error_raises_unavailable(
-        self, cache_service, corrupt_pool
-    ):
+    async def test_validate_track_db_error_raises_unavailable(self, cache_service, corrupt_pool):
         """validate_track_on_release raises CacheUnavailableError on DB corruption."""
-        corrupt_pool.fetchval = AsyncMock(
-            side_effect=Exception("data file corruption detected")
-        )
+        corrupt_pool.fetchval = AsyncMock(side_effect=Exception("data file corruption detected"))
 
         with pytest.raises(CacheUnavailableError):
-            await cache_service.validate_track_on_release(
-                28138, "VI Scose Poise", "Autechre"
-            )
+            await cache_service.validate_track_on_release(28138, "VI Scose Poise", "Autechre")
 
     @pytest.mark.asyncio
     async def test_autocomplete_tracks_db_error_raises_unavailable(
         self, cache_service, corrupt_pool
     ):
         """autocomplete_tracks raises CacheUnavailableError on DB corruption."""
-        corrupt_pool.fetch = AsyncMock(
-            side_effect=Exception("corrupted page pointer")
-        )
+        corrupt_pool.fetch = AsyncMock(side_effect=Exception("corrupted page pointer"))
 
         with pytest.raises(CacheUnavailableError, match="Cache autocomplete_tracks failed"):
-            await cache_service.autocomplete_tracks(
-                artist="Stereolab", q="Fus"
-            )
+            await cache_service.autocomplete_tracks(artist="Stereolab", q="Fus")
 
     @pytest.mark.asyncio
-    async def test_is_available_returns_false_on_corruption(
-        self, cache_service, corrupt_pool
-    ):
+    async def test_is_available_returns_false_on_corruption(self, cache_service, corrupt_pool):
         """is_available returns False (not raises) when DB is corrupted."""
         corrupt_pool.fetchval = AsyncMock(
             side_effect=Exception("the database system is in recovery mode")
@@ -130,9 +114,7 @@ class TestCacheFallbackOnCorruptedData:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_write_release_db_error_raises_unavailable(
-        self, cache_service, corrupt_pool
-    ):
+    async def test_write_release_db_error_raises_unavailable(self, cache_service, corrupt_pool):
         """write_release raises CacheUnavailableError when DB write fails."""
         from unittest.mock import MagicMock
 
@@ -165,15 +147,16 @@ class TestCacheDegradationLogging:
     async def test_search_error_is_logged(self, caplog):
         """DB errors during search are logged as errors."""
         pool = AsyncMock()
-        pool.fetch = AsyncMock(
-            side_effect=Exception("connection reset by peer")
-        )
+        pool.fetch = AsyncMock(side_effect=Exception("connection reset by peer"))
         service = DiscogsCacheService(pool)
 
         with pytest.raises(CacheUnavailableError):
             await service.search_releases(artist="Juana Molina", album="DOGA")
 
-        assert any("Cache search" in record.message and "failed" in record.message for record in caplog.records)
+        assert any(
+            "Cache search" in record.message and "failed" in record.message
+            for record in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_health_check_failure_logged_as_warning(self, caplog):
@@ -184,10 +167,7 @@ class TestCacheDegradationLogging:
 
         result = await service.is_available()
         assert result is False
-        assert any(
-            "Cache health check failed" in record.message
-            for record in caplog.records
-        )
+        assert any("Cache health check failed" in record.message for record in caplog.records)
 
     @pytest.mark.asyncio
     async def test_get_release_error_is_logged(self, caplog):

@@ -53,9 +53,7 @@ class TestConcurrentSemaphore:
 
         # The semaphore should have limited concurrent access
         # Default max concurrent is 5 (from settings)
-        assert max_concurrent <= 5, (
-            f"Expected at most 5 concurrent, but observed {max_concurrent}"
-        )
+        assert max_concurrent <= 5, f"Expected at most 5 concurrent, but observed {max_concurrent}"
         # At least 2 should have run concurrently (unless extremely slow system)
         assert max_concurrent >= 2, (
             f"Expected at least 2 concurrent executions, got {max_concurrent}"
