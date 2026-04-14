@@ -8,22 +8,22 @@ pytestmark = pytest.mark.integration
 class TestLibrarySearchEndpoint:
     @pytest.mark.asyncio
     async def test_query_search(self, app_client):
-        resp = await app_client.get("/api/v1/library/search", params={"q": "Queen"})
+        resp = await app_client.get("/api/v1/library/search", params={"q": "Stereolab"})
         assert resp.status_code == 200
         body = resp.json()
         assert body["total"] >= 1
-        assert any("Queen" in r["artist"] for r in body["results"])
+        assert any("Stereolab" in r["artist"] for r in body["results"])
 
     @pytest.mark.asyncio
     async def test_artist_filter(self, app_client):
-        resp = await app_client.get("/api/v1/library/search", params={"artist": "Radiohead"})
+        resp = await app_client.get("/api/v1/library/search", params={"artist": "Jessica Pratt"})
         assert resp.status_code == 200
         body = resp.json()
         assert body["total"] >= 1
 
     @pytest.mark.asyncio
     async def test_title_filter(self, app_client):
-        resp = await app_client.get("/api/v1/library/search", params={"title": "OK Computer"})
+        resp = await app_client.get("/api/v1/library/search", params={"title": "On Your Own Love Again"})
         assert resp.status_code == 200
         body = resp.json()
         assert body["total"] >= 1
@@ -41,17 +41,17 @@ class TestLibrarySearchEndpoint:
 
     @pytest.mark.asyncio
     async def test_multiword_fts_query(self, app_client):
-        resp = await app_client.get("/api/v1/library/search", params={"q": "Queen Night Opera"})
+        resp = await app_client.get("/api/v1/library/search", params={"q": "Stereolab Aluminum Tunes"})
         assert resp.status_code == 200
         body = resp.json()
         if body["total"] > 0:
-            assert any("Opera" in r["title"] for r in body["results"])
+            assert any("Aluminum" in r["title"] for r in body["results"])
 
     @pytest.mark.asyncio
     async def test_combined_artist_and_title(self, app_client):
         resp = await app_client.get(
             "/api/v1/library/search",
-            params={"artist": "Queen", "title": "Game"},
+            params={"artist": "Stereolab", "title": "Dots"},
         )
         assert resp.status_code == 200
         body = resp.json()

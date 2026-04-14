@@ -55,9 +55,9 @@ def sample_library_item():
     """Create a sample library item for testing."""
     return make_library_item(
         id=1,
-        artist="Queen",
-        title="A Night at the Opera",
-        call_letters="Q",
+        artist="Stereolab",
+        title="Aluminum Tunes",
+        call_letters="RO",
     )
 
 
@@ -67,15 +67,15 @@ def sample_library_items():
     return [
         make_library_item(
             id=1,
-            artist="Queen",
-            title="A Night at the Opera",
-            call_letters="Q",
+            artist="Stereolab",
+            title="Aluminum Tunes",
+            call_letters="RO",
         ),
         make_library_item(
             id=2,
-            artist="Queen",
-            title="The Game",
-            call_letters="Q",
+            artist="Stereolab",
+            title="Dots and Loops",
+            call_letters="RO",
             release_call_number=2,
         ),
     ]
@@ -85,10 +85,10 @@ def sample_library_items():
 def sample_parsed_request():
     """Create a sample parsed request for testing."""
     return ParsedRequest(
-        song="Bohemian Rhapsody",
-        album="A Night at the Opera",
-        artist="Queen",
+        song="la paradoja",
+        album="DOGA",
+        artist="Juana Molina",
         is_request=True,
         message_type=MessageType.REQUEST,
-        raw_message="Play Bohemian Rhapsody by Queen",
+        raw_message="Play la paradoja by Juana Molina",
     )

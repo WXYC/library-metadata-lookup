@@ -20,35 +20,41 @@ from tests.factories import make_discogs_result
 # ---------------------------------------------------------------------------
 
 SEED_ITEMS = [
-    (1, "A Night at the Opera", "Queen", "Q", 1, 1, "Rock", "CD"),
-    (2, "The Game", "Queen", "Q", 1, 2, "Rock", "CD"),
-    (3, "News of the World", "Queen", "Q", 1, 3, "Rock", "CD"),
-    (4, "OK Computer", "Radiohead", "R", 1, 1, "Rock", "CD"),
-    (5, "Kid A", "Radiohead", "R", 1, 2, "Electronic", "CD"),
-    (6, "Dots and Loops", "Stereolab", "S", 1, 1, "Electronic", "CD"),
-    (7, "Emperor Tomato Ketchup", "Stereolab", "S", 1, 2, "Electronic", "CD"),
-    (8, "Vivadixiesubmarinetransmissionplot", "Sparklehorse", "S", 2, 1, "Rock", "CD"),
-    (9, "Stankonia", "OutKast", "O", 1, 1, "Hip Hop", "CD"),
+    # Stereolab: multi-album artist (3 albums)
+    (1, "Aluminum Tunes", "Stereolab", "RO", 87, 1, "Rock", "CD"),
+    (2, "Dots and Loops", "Stereolab", "RO", 87, 2, "Electronic", "CD"),
+    (3, "Emperor Tomato Ketchup", "Stereolab", "RO", 87, 3, "Electronic", "CD"),
+    # Jessica Pratt + Cat Power: multiple genres
+    (4, "On Your Own Love Again", "Jessica Pratt", "RO", 112, 1, "Rock", "Vinyl"),
+    (5, "Moon Pix", "Cat Power", "RO", 23, 1, "Rock", "CD"),
+    # Duke Ellington & John Coltrane: artist name with "&" (2 albums)
+    (6, "Duke Ellington & John Coltrane", "Duke Ellington & John Coltrane", "JA", 7, 1, "Jazz", "CD"),
+    (7, "In a Sentimental Mood (Single)", "Duke Ellington & John Coltrane", "JA", 7, 2, "Jazz", "Vinyl"),
+    # Various Artists: compilation handling
     (10, "Now That's What I Call Music 47", "Various Artists", "V", 1, 1, "Compilation", "CD"),
     (11, "Rock Classics", "Various Artists", "V", 1, 2, "Compilation", "CD"),
-    (12, "Time (Clock of the Heart)", "Culture Club", "C", 1, 1, "Pop", "Vinyl"),
-    (13, "Colour by Numbers", "Culture Club", "C", 1, 2, "Pop", "CD"),
-    (14, "Living Colour", "Vivid", "L", 1, 1, "Rock", "CD"),  # note: intentionally swapped
+    # Juana Molina: non-English artist name
+    (12, "DOGA", "Juana Molina", "RO", 42, 1, "Rock", "CD"),
+    (13, "Wed 21", "Juana Molina", "RO", 42, 2, "Rock", "CD"),
+    # Preserved from original: intentionally swapped artist/title for regression tests
+    (14, "Living Colour", "Vivid", "L", 1, 1, "Rock", "CD"),
     (15, "Vivid", "Living Colour", "L", 1, 1, "Rock", "CD"),
-    (16, "Abbey Road", "The Beatles", "B", 1, 1, "Rock", "Vinyl"),
-    (17, "Let It Be", "The Beatles", "B", 1, 2, "Rock", "Vinyl"),
+    # Preserved: self-titled artist/album edge case
     (18, "Laid Back", "Laid Back", "L", 2, 1, "Electronic", "CD"),
     (19, "Joni Mitchell", "Joni Mitchell", "MI", 8, 1, "Rock", "Vinyl"),
     (20, "Court and Spark", "Joni Mitchell", "MI", 8, 6, "Rock", "Vinyl"),
+    # Preserved: "S/t" self-titled abbreviation
     (21, "S/t", "The Bird and the Bee", "BI", 125, 1, "Rock", "CD"),
     (22, "Please Clap Your Hands", "The Bird and the Bee", "BI", 125, 2, "Rock", "CD"),
+    # Preserved: quoted Discogs artist name regression
     (23, "Weird Al Yankovic", "Weird Al Yankovic", "YA", 1, 1, "Rock", "Vinyl"),
     (24, "Dare to Be Stupid", "Weird Al Yankovic", "YA", 1, 2, "Rock", "Vinyl"),
     (25, "Even Worse", "Weird Al Yankovic", "YA", 1, 3, "Rock", "Vinyl"),
+    # Preserved: track on both artist album and VA compilation
     (26, "London Zoo", "The Bug", "B", 2, 1, "Electronic", "CD"),
     (27, "Pressure", "The Bug", "B", 2, 2, "Electronic", "CD"),
     (28, "The Sound of Dub", "Various Artists - Reggae", "V", 2, 1, "Reggae", "CD"),
-    # Grimes cluster: multiple artists/albums with "Grimes" in them
+    # Preserved: Grimes cluster (multiple artists/albums with "Grimes" in them)
     (29, "Tiny Grimes", "Tiny Grimes", "G", 1, 1, "Jazz", "CD"),
     (30, "Report from Grimes Creek", "Rosalie Sorrels", "S", 3, 1, "Folk", "CD"),
     (31, "Grimes Golden", "Further", "F", 1, 1, "Rock", "CD"),
@@ -58,6 +64,11 @@ SEED_ITEMS = [
     (35, "Halfaxa", "Grimes", "G", 3, 2, "Rock", "Vinyl"),
     (36, "Art Angels", "Grimes", "G", 3, 3, "Rock", "Vinyl"),
     (37, "Miss Anthropocene", "Grimes", "G", 3, 4, "Rock", "CD"),
+    # Additional WXYC example artists
+    (38, "Edits", "Chuquimamani-Condori", "EL", 15, 1, "Electronic", "Vinyl"),
+    (39, "Confield", "Autechre", "EL", 16, 1, "Electronic", "CD"),
+    (40, "1st Class", "Large Professor", "HH", 1, 1, "Hiphop", "CD"),
+    (41, "...Destroys The Space Invaders", "Prince Jammy", "RE", 1, 1, "Reggae", "Vinyl"),
 ]
 
 
