@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from wxyc_catalog.sources import PgSource
+from scripts.entity_resolution.sources import PgSource
 
 logger = logging.getLogger(__name__)
 
@@ -149,9 +149,7 @@ class DiscogsReconciler:
         if not rows:
             return {}
         return {
-            row["artist_name"]: row["artist_id"]
-            for row in rows
-            if row["artist_id"] is not None
+            row["artist_name"]: row["artist_id"] for row in rows if row["artist_id"] is not None
         }
 
     async def _member_match(self, lower_names: list[str]) -> dict[str, int]:
@@ -160,9 +158,7 @@ class DiscogsReconciler:
         if not rows:
             return {}
         return {
-            row["member_name"]: row["member_id"]
-            for row in rows
-            if row["member_id"] is not None
+            row["member_name"]: row["member_id"] for row in rows if row["member_id"] is not None
         }
 
     async def _alias_match(self, lower_names: list[str]) -> dict[str, int]:
@@ -170,26 +166,15 @@ class DiscogsReconciler:
         rows = await self._pg.fetchall(_ALIAS_MATCH_SQL, lower_names)
         if not rows:
             return {}
-        return {
-            row["alias_name"]: row["artist_id"]
-            for row in rows
-            if row["artist_id"] is not None
-        }
+        return {row["alias_name"]: row["artist_id"] for row in rows if row["artist_id"] is not None}
 
     async def _name_variation_match(self, lower_names: list[str]) -> dict[str, int]:
         """Stage 4: Name variation lookup via artist_name_variation."""
         rows = await self._pg.fetchall(_NAME_VARIATION_MATCH_SQL, lower_names)
         if not rows:
             return {}
-        return {
-            row["name"]: row["artist_id"]
-            for row in rows
-            if row["artist_id"] is not None
-        }
+        return {row["name"]: row["artist_id"] for row in rows if row["artist_id"] is not None}
 
     def _batches(self, items: list[str]) -> list[list[str]]:
         """Split items into batches of self._batch_size."""
-        return [
-            items[i : i + self._batch_size]
-            for i in range(0, len(items), self._batch_size)
-        ]
+        return [items[i : i + self._batch_size] for i in range(0, len(items), self._batch_size)]

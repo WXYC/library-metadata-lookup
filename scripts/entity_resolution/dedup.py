@@ -10,8 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from wxyc_catalog.sources import PgSource
-
+from scripts.entity_resolution.sources import PgSource
 from scripts.entity_resolution.store import Identity, _record_to_identity
 
 logger = logging.getLogger(__name__)

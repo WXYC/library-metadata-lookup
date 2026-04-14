@@ -1,12 +1,11 @@
 """Unit tests for entity store CRUD operations."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
 from scripts.entity_resolution.store import (
     EntityStore,
-    Identity,
 )
 
 
@@ -68,9 +67,7 @@ class TestUpsertIdentity:
                 "reconciliation_status": "unreconciled",
             }
         )
-        identity = await store.upsert_identity(
-            library_name="Autechre", discogs_artist_id=42
-        )
+        identity = await store.upsert_identity(library_name="Autechre", discogs_artist_id=42)
         assert identity is not None
         assert identity.discogs_artist_id == 42
         # Verify COALESCE is used in the UPDATE clause

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from wxyc_catalog.sources import PgSource
+from scripts.entity_resolution.sources import PgSource
 
 logger = logging.getLogger(__name__)
 
@@ -88,9 +88,7 @@ class MusicBrainzReconciler:
             return {}
 
         confirmed = {row["gid"] for row in confirm_rows}
-        return {
-            qid: mbid for qid, mbid in qid_to_mbid.items() if mbid in confirmed
-        }
+        return {qid: mbid for qid, mbid in qid_to_mbid.items() if mbid in confirmed}
 
     async def resolve_from_names(self, names: list[str]) -> dict[str, str]:
         """Resolve artist names to MusicBrainz artist IDs via direct matching.

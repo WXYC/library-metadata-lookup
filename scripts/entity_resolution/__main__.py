@@ -29,17 +29,18 @@ import sys
 import aiosqlite
 from dotenv import load_dotenv
 
-from wxyc_catalog.sources import PgSource, SparqlSource
-
 from scripts.entity_resolution.dedup import EntityDeduplicator
 from scripts.entity_resolution.discogs import DiscogsReconciler
 from scripts.entity_resolution.musicbrainz import MusicBrainzReconciler
+from scripts.entity_resolution.sources import PgSource, SparqlSource
 from scripts.entity_resolution.store import EntityStore
 from scripts.entity_resolution.wikidata import WikidataReconciler
 
 logger = logging.getLogger(__name__)
 
-_LIBRARY_ARTISTS_SQL = "SELECT DISTINCT artist FROM library WHERE artist IS NOT NULL ORDER BY artist"
+_LIBRARY_ARTISTS_SQL = (
+    "SELECT DISTINCT artist FROM library WHERE artist IS NOT NULL ORDER BY artist"
+)
 
 
 async def get_library_artists(db_path: str) -> list[str]:
@@ -158,7 +159,8 @@ async def run_wikidata_stage(
     # Stage 3: Streaming IDs for all identities with QIDs
     all_identities = await store.get_identities_by_status("reconciled")
     need_streaming = [
-        i for i in all_identities
+        i
+        for i in all_identities
         if i.wikidata_qid and not (i.spotify_artist_id or i.apple_music_artist_id or i.bandcamp_id)
     ]
     streaming_fetched = 0
@@ -180,7 +182,9 @@ async def run_wikidata_stage(
 
     logger.info(
         "Wikidata: %d QID bridged, %d name searched, %d streaming fetched",
-        qid_bridged, name_searched, streaming_fetched,
+        qid_bridged,
+        name_searched,
+        streaming_fetched,
     )
     return qid_bridged, name_searched, streaming_fetched
 
@@ -321,7 +325,10 @@ async def main(args: argparse.Namespace) -> None:
         rate = len(reconciled) / total * 100 if total > 0 else 0
         logger.info(
             "Done. %d/%d reconciled (%.1f%%), %d no_match",
-            len(reconciled), total, rate, len(no_match),
+            len(reconciled),
+            total,
+            rate,
+            len(no_match),
         )
 
     finally:
@@ -357,7 +364,8 @@ def parse_args() -> argparse.Namespace:
         help="Skip MusicBrainz reconciliation stage",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Enable verbose logging",
     )

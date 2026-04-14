@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from wxyc_catalog.sources import PgSource, SparqlSource
+from scripts.entity_resolution.sources import PgSource, SparqlSource
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +81,7 @@ class WikidataReconciler:
         self._sparql = sparql
         self._wikidata_pg = wikidata_pg
 
-    async def resolve_qids_from_discogs_ids(
-        self, discogs_ids: set[int]
-    ) -> dict[int, str]:
+    async def resolve_qids_from_discogs_ids(self, discogs_ids: set[int]) -> dict[int, str]:
         """Resolve Discogs artist IDs to Wikidata QIDs.
 
         Tries wikidata-cache first (if available), then falls back to SPARQL P1953.
@@ -102,9 +100,7 @@ class WikidataReconciler:
 
         # Stage 1: Try wikidata-cache PG
         if self._wikidata_pg is not None:
-            rows = await self._wikidata_pg.fetchall(
-                _CACHE_DISCOGS_TO_QID_SQL, list(remaining)
-            )
+            rows = await self._wikidata_pg.fetchall(_CACHE_DISCOGS_TO_QID_SQL, list(remaining))
             if rows:
                 for row in rows:
                     result[row["discogs_artist_id"]] = row["qid"]
@@ -121,9 +117,7 @@ class WikidataReconciler:
         """Resolve Discogs IDs to QIDs via SPARQL P1953 property."""
         values_str = " ".join(f'"{did}"' for did in discogs_ids)
         sparql = _SPARQL_DISCOGS_TO_QID.format(values=values_str)
-        bindings = await self._sparql.query_batched(
-            sparql, [f"Q{did}" for did in discogs_ids]
-        )
+        bindings = await self._sparql.query_batched(sparql, [f"Q{did}" for did in discogs_ids])
 
         result: dict[int, str] = {}
         for binding in bindings:
@@ -179,9 +173,7 @@ class WikidataReconciler:
         if not qids:
             return {}
 
-        bindings = await self._sparql.query_batched(
-            _SPARQL_STREAMING_IDS, qids
-        )
+        bindings = await self._sparql.query_batched(_SPARQL_STREAMING_IDS, qids)
 
         result: dict[str, StreamingIds] = {}
         for binding in bindings:

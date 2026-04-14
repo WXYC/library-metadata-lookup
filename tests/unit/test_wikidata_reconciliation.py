@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from scripts.entity_resolution.wikidata import WikidataReconciler, StreamingIds
+from scripts.entity_resolution.wikidata import WikidataReconciler
 
 
 @pytest.fixture
@@ -133,9 +133,7 @@ class TestStreamingIdFetch:
 
 class TestGracefulDegradation:
     @pytest.mark.asyncio
-    async def test_no_wikidata_cache_uses_sparql_only(
-        self, reconciler_no_cache, mock_sparql
-    ):
+    async def test_no_wikidata_cache_uses_sparql_only(self, reconciler_no_cache, mock_sparql):
         """When wikidata_pg is None, resolve_qids_from_discogs_ids uses SPARQL only."""
         mock_sparql.query_batched = AsyncMock(
             return_value=[
