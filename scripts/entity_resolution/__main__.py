@@ -118,7 +118,7 @@ async def run_wikidata_stage(
 
     qid_bridged = 0
     if need_qid:
-        discogs_ids = {i.discogs_artist_id for i in need_qid}
+        discogs_ids: set[int] = {i.discogs_artist_id for i in need_qid if i.discogs_artist_id}
         id_to_identity = {i.discogs_artist_id: i for i in need_qid}
         qid_map = await reconciler.resolve_qids_from_discogs_ids(discogs_ids)
 
@@ -141,17 +141,17 @@ async def run_wikidata_stage(
     no_match = await store.get_identities_by_status("no_match")
     name_searched = 0
     for identity in no_match:
-        qid = await reconciler.search_musician_by_name(identity.library_name)
-        if qid:
+        found_qid = await reconciler.search_musician_by_name(identity.library_name)
+        if found_qid:
             await store.upsert_identity(
                 library_name=identity.library_name,
-                wikidata_qid=qid,
+                wikidata_qid=found_qid,
             )
             await store.update_status(identity.id, "reconciled")
             await store.log_reconciliation(
                 identity_id=identity.id,
                 source="wikidata",
-                external_id=qid,
+                external_id=found_qid,
                 method="name_search",
             )
             name_searched += 1
@@ -165,7 +165,7 @@ async def run_wikidata_stage(
     ]
     streaming_fetched = 0
     if need_streaming:
-        qids = [i.wikidata_qid for i in need_streaming]
+        qids: list[str] = [i.wikidata_qid for i in need_streaming if i.wikidata_qid]
         qid_to_identity = {i.wikidata_qid: i for i in need_streaming}
         streaming_map = await reconciler.fetch_streaming_ids(qids)
 
@@ -202,9 +202,9 @@ async def run_musicbrainz_stage(
     # Stage 1: QID -> MBID bridge
     with_qid = [i for i in need_mb if i.wikidata_qid]
     if with_qid:
-        qids = {i.wikidata_qid for i in with_qid}
+        mb_qids: set[str] = {i.wikidata_qid for i in with_qid if i.wikidata_qid}
         qid_to_identity = {i.wikidata_qid: i for i in with_qid}
-        qid_results = await reconciler.resolve_from_qids(qids)
+        qid_results = await reconciler.resolve_from_qids(mb_qids)
 
         for qid, mbid in qid_results.items():
             identity = qid_to_identity.get(qid)
