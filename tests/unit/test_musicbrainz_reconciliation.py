@@ -39,9 +39,7 @@ class TestQidToMbidViaP434:
             ]
         )
         mock_mb_pg.fetchall = AsyncMock(
-            return_value=[
-                {"gid": "410c9baf-5469-44f6-9852-826524b80c61", "name": "Autechre"}
-            ]
+            return_value=[{"gid": "410c9baf-5469-44f6-9852-826524b80c61", "name": "Autechre"}]
         )
         result = await reconciler.resolve_from_qids({"Q378288"})
         assert "Q378288" in result

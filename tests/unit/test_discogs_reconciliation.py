@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from scripts.entity_resolution.discogs import DiscogsReconciler, ReconciliationMatch
+from scripts.entity_resolution.discogs import DiscogsReconciler
 
 
 @pytest.fixture
@@ -25,9 +25,7 @@ class TestExactMatch:
     @pytest.mark.asyncio
     async def test_found(self, reconciler, mock_pg):
         """Exact match returns discogs_artist_id when release_artist has a match."""
-        mock_pg.fetchall = AsyncMock(
-            return_value=[{"artist_name": "autechre", "artist_id": 12}]
-        )
+        mock_pg.fetchall = AsyncMock(return_value=[{"artist_name": "autechre", "artist_id": 12}])
         results = await reconciler.reconcile_batch(["Autechre"])
         assert "Autechre" in results
         match = results["Autechre"]
@@ -44,9 +42,7 @@ class TestExactMatch:
     @pytest.mark.asyncio
     async def test_case_insensitive(self, reconciler, mock_pg):
         """Matching is case-insensitive; result uses original canonical name."""
-        mock_pg.fetchall = AsyncMock(
-            return_value=[{"artist_name": "stereolab", "artist_id": 99}]
-        )
+        mock_pg.fetchall = AsyncMock(return_value=[{"artist_name": "stereolab", "artist_id": 99}])
         results = await reconciler.reconcile_batch(["Stereolab"])
         assert "Stereolab" in results
         assert results["Stereolab"].discogs_artist_id == 99
