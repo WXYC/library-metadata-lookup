@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
-
-from rapidfuzz import fuzz
-from wxyc_etl.text import strip_diacritics
 
 from scripts.streaming_availability.matching import (
     is_acceptable_match,
@@ -19,11 +17,35 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Artist name fuzzy lookup on the small wxyc.artist_names table (~130K rows, ~1ms)
-_ARTIST_FUZZY_QUERY = """
-    SELECT artist_name FROM wxyc.artist_names
-    WHERE lower(f_unaccent(artist_name)) % lower(f_unaccent($1))
-    LIMIT 10
+# SQL to load the artist mapping from the entity store.
+# Returns all reconciled artists with a known Discogs artist ID.
+_ENTITY_STORE_QUERY = """
+    SELECT library_name, discogs_artist_id
+    FROM entity.identity
+    WHERE reconciliation_status = 'reconciled'
+      AND discogs_artist_id IS NOT NULL
+"""
+
+# Release lookup by artist ID on wxyc schema (direct, no fuzzy matching needed)
+_WXYC_RELEASE_BY_ARTIST_ID_QUERY = """
+    SELECT DISTINCT ON (r.id)
+        r.id as release_id, r.title, ra.artist_name, r.artwork_url
+    FROM wxyc.release r
+    JOIN wxyc.release_artist ra ON ra.release_id = r.id AND ra.extra = 0
+    WHERE ra.artist_id = $1
+    ORDER BY r.id
+    LIMIT 200
+"""
+
+# Fallback: release lookup by artist ID on full public schema
+_PUBLIC_RELEASE_BY_ARTIST_ID_QUERY = """
+    SELECT DISTINCT ON (r.id)
+        r.id as release_id, r.title, ra.artist_name, r.artwork_url
+    FROM release r
+    JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
+    WHERE ra.artist_id = $1
+    ORDER BY r.id
+    LIMIT 200
 """
 
 # Release lookup by artist name on wxyc schema (~10ms)
@@ -80,82 +102,75 @@ def pick_best_match(query_artist: str, query_title: str, results: list[dict]) ->
     return best
 
 
-def _best_artist_match(query: str, candidates: list[str]) -> str | None:
-    """Pick the best fuzzy match from candidate artist names.
+async def load_entity_store_mapping(pool: asyncpg.Pool) -> dict[str, int]:
+    """Load artist mapping from the entity store.
 
-    Strips Discogs disambiguation suffixes before comparison.
+    Queries ``entity.identity`` for all reconciled artists with a known
+    Discogs artist ID. Returns a dict mapping library_name to discogs_artist_id.
+
+    If the entity schema does not exist or the query fails, returns an empty dict
+    so the pipeline can fall back to name-based lookups.
     """
-    query_normalized = strip_diacritics(query).lower()
-    best_name = None
-    best_score = 0.0
-
-    for name in candidates:
-        clean = strip_discogs_suffix(name)
-        score = fuzz.token_sort_ratio(query_normalized, strip_diacritics(clean).lower())
-        if score > best_score and score >= 80:
-            best_score = score
-            best_name = name
-
-    return best_name
-
-
-async def build_artist_mapping(pool: asyncpg.Pool, artists: list[str]) -> dict[str, str]:
-    """Build a mapping from library artist names to Discogs canonical names.
-
-    Uses trigram fuzzy search on the small wxyc.artist_names table (~130K rows).
-    Only includes entries where the names actually differ.
-
-    Returns dict mapping library_name -> discogs_canonical_name.
-    """
-    mapping: dict[str, str] = {}
-
-    for artist in artists:
-        try:
-            rows = await pool.fetch(_ARTIST_FUZZY_QUERY, artist)
-            candidates = [row["artist_name"] for row in rows]
-            if not candidates:
-                continue
-
-            best = _best_artist_match(artist, candidates)
-            if best and best.lower() != artist.lower():
-                mapping[artist] = best
-        except Exception:
-            logger.debug("Artist mapping failed for %s", artist)
-
-    return mapping
+    t0 = time.monotonic()
+    try:
+        rows = await pool.fetch(_ENTITY_STORE_QUERY)
+        mapping = {
+            row["library_name"]: row["discogs_artist_id"]
+            for row in rows
+            if row["discogs_artist_id"] is not None
+        }
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "Entity store: loaded %d artist mappings in %.2fs",
+            len(mapping),
+            elapsed,
+        )
+        return mapping
+    except Exception:
+        logger.warning("Entity store query failed, falling back to name-based lookups")
+        return {}
 
 
 async def enrich_album(
     pool: asyncpg.Pool,
     artist: str,
     title: str,
-    artist_mapping: dict[str, str] | None = None,
+    *,
+    discogs_artist_id: int | None = None,
 ) -> dict | None:
     """Search the Discogs PG cache for canonical artist/title.
 
-    Uses the artist_mapping to resolve the canonical Discogs artist name,
-    then does exact match release lookups. Tries wxyc schema first, falls
-    back to public schema if no match found.
+    When ``discogs_artist_id`` is provided (from the entity store), uses direct
+    ID-based release lookups which are faster and more accurate than name matching.
+    When absent, falls back to name-based release lookups.
+
+    Tries wxyc schema first, falls back to public schema if no match found.
 
     Returns a dict with 'artist_name', 'title', 'release_id' if found, else None.
     """
     try:
-        # Use mapped name if available, otherwise use original
-        search_artist = artist
-        if artist_mapping and artist in artist_mapping:
-            search_artist = artist_mapping[artist]
+        if discogs_artist_id is not None:
+            # Direct lookup by artist ID (fast, precise)
+            rows = await pool.fetch(_WXYC_RELEASE_BY_ARTIST_ID_QUERY, discogs_artist_id)
+            results = [dict(row) for row in rows]
+            match = pick_best_match(artist, title, results)
+            if match:
+                return match
 
-        # Try wxyc schema first
-        rows = await pool.fetch(_WXYC_RELEASE_QUERY, search_artist)
-        results = [dict(row) for row in rows]
-        match = pick_best_match(artist, title, results)
-        if match:
-            return match
+            rows = await pool.fetch(_PUBLIC_RELEASE_BY_ARTIST_ID_QUERY, discogs_artist_id)
+            results = [dict(row) for row in rows]
+            return pick_best_match(artist, title, results)
+        else:
+            # Name-based lookup (fallback for unreconciled artists)
+            rows = await pool.fetch(_WXYC_RELEASE_QUERY, artist)
+            results = [dict(row) for row in rows]
+            match = pick_best_match(artist, title, results)
+            if match:
+                return match
 
-        # Fall back to public schema
-        rows = await pool.fetch(_PUBLIC_RELEASE_QUERY, search_artist)
-        results = [dict(row) for row in rows]
-        return pick_best_match(artist, title, results)
+            rows = await pool.fetch(_PUBLIC_RELEASE_QUERY, artist)
+            results = [dict(row) for row in rows]
+            return pick_best_match(artist, title, results)
     except Exception:
         logger.exception("Discogs enrichment failed for %s - %s", artist, title)
         return None
