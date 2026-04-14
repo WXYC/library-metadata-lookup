@@ -32,7 +32,16 @@ E2E_SEED_ITEMS = [
     (3, "DOGA", "Juana Molina", "RO", 42, 1, "Rock", "CD"),
     (4, "On Your Own Love Again", "Jessica Pratt", "RO", 112, 1, "Rock", "Vinyl"),
     (5, "Moon Pix", "Cat Power", "RO", 23, 1, "Rock", "CD"),
-    (6, "Duke Ellington & John Coltrane", "Duke Ellington & John Coltrane", "JA", 7, 1, "Jazz", "CD"),
+    (
+        6,
+        "Duke Ellington & John Coltrane",
+        "Duke Ellington & John Coltrane",
+        "JA",
+        7,
+        1,
+        "Jazz",
+        "CD",
+    ),
     (7, "Edits", "Chuquimamani-Condori", "EL", 15, 1, "Electronic", "Vinyl"),
     (8, "Confield", "Autechre", "EL", 16, 1, "Electronic", "CD"),
     (9, "1st Class", "Large Professor", "HH", 1, 1, "Hiphop", "CD"),
@@ -132,7 +141,10 @@ def _make_mock_discogs_service():
         if release is None:
             return False
         track_lower = track.lower()
-        return any(track_lower in t.title.lower() or t.title.lower() in track_lower for t in release.tracklist)
+        return any(
+            track_lower in t.title.lower() or t.title.lower() in track_lower
+            for t in release.tracklist
+        )
 
     mock.validate_track_on_release = AsyncMock(side_effect=mock_validate)
 

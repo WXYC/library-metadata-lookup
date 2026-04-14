@@ -199,14 +199,13 @@ class TestCompilationTrackSearch:
             new_callable=AsyncMock,
             return_value=[],
         ):
+            # Override the mock for this specific test
+            from core.dependencies import get_discogs_service
             from discogs.models import (
                 DiscogsSearchResponse,
                 ReleaseInfo,
                 TrackReleasesResponse,
             )
-
-            # Override the mock for this specific test
-            from core.dependencies import get_discogs_service
             from main import app
 
             mock_discogs = AsyncMock()
