@@ -23,9 +23,9 @@ from scripts.streaming_availability.apple_music_client import AppleMusicClient
 from scripts.streaming_availability.dedup import deduplicate_library
 from scripts.streaming_availability.deezer_client import DeezerClient
 from scripts.streaming_availability.discogs_enricher import (
-    build_artist_mapping,
     check_wxyc_schema,
     enrich_album,
+    load_entity_store_mapping,
 )
 from scripts.streaming_availability.matching import (
     find_best_match,
@@ -335,7 +335,7 @@ async def _process_discogs_enrichment(
     results_db: ResultsDB,
     pool: object,
     batch_size: int,
-    artist_mapping: dict[str, str] | None = None,
+    entity_mapping: dict[str, int] | None = None,
 ) -> None:
     """Enrich all pending albums with Discogs canonical names."""
     rows = await results_db.get_pending_discogs(limit=1)
@@ -345,9 +345,11 @@ async def _process_discogs_enrichment(
 
     all_pending = await results_db.get_pending_discogs(limit=100_000)
     total_pending = len(all_pending)
-    mapped = len(artist_mapping) if artist_mapping else 0
+    mapped = len(entity_mapping) if entity_mapping else 0
     logger.info(
-        "Discogs enrichment: %d albums to process (%d artist mappings)", total_pending, mapped
+        "Discogs enrichment: %d albums to process (%d entity store mappings)",
+        total_pending,
+        mapped,
     )
 
     processed = 0
@@ -369,7 +371,8 @@ async def _process_discogs_enrichment(
             title = strip_format_suffix(row["display_title"])
 
             try:
-                match = await enrich_album(pool, artist, title, artist_mapping=artist_mapping)
+                artist_id = entity_mapping.get(artist) if entity_mapping else None
+                match = await enrich_album(pool, artist, title, discogs_artist_id=artist_id)
                 if match:
                     await results_db.update_discogs_result(
                         album_id,
@@ -579,25 +582,20 @@ async def run(args: argparse.Namespace) -> None:
         from scripts.streaming_availability.pipeline import Pipeline, Stage
 
         discogs_pool = None
-        artist_mapping: dict[str, str] = {}
+        entity_mapping: dict[str, int] = {}
         discogs_url = os.environ.get("DATABASE_URL_DISCOGS")
         if discogs_url:
             import asyncpg
 
-            async def _init_conn(conn: asyncpg.Connection) -> None:
-                await conn.execute("SET pg_trgm.similarity_threshold = 0.4")
-
-            discogs_pool = await asyncpg.create_pool(
-                discogs_url, min_size=2, max_size=10, init=_init_conn
-            )
+            discogs_pool = await asyncpg.create_pool(discogs_url, min_size=2, max_size=10)
             use_wxyc = await check_wxyc_schema(discogs_pool)
             if use_wxyc:
+                entity_mapping = await load_entity_store_mapping(discogs_pool)
                 unique_artists = sorted({a.display_artist for a in albums if not a.is_compilation})
-                logger.info("Building artist mapping for %d artists...", len(unique_artists))
-                artist_mapping = await build_artist_mapping(discogs_pool, unique_artists)
+                mapped = sum(1 for a in unique_artists if a in entity_mapping)
                 logger.info(
-                    "Artist mapping: %d of %d artists have Discogs name variants",
-                    len(artist_mapping),
+                    "Entity store: %d of %d artists have Discogs artist IDs",
+                    mapped,
                     len(unique_artists),
                 )
             else:
@@ -633,9 +631,8 @@ async def run(args: argparse.Namespace) -> None:
             artist = item["display_artist"]
             title = strip_format_suffix(item["display_title"])
             if discogs_pool:
-                match = await enrich_album(
-                    discogs_pool, artist, title, artist_mapping=artist_mapping
-                )
+                artist_id = entity_mapping.get(artist)
+                match = await enrich_album(discogs_pool, artist, title, discogs_artist_id=artist_id)
                 if match:
                     await results_db.update_discogs_result(
                         album_id,
