@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl git gcc &&
     git clone --depth 1 https://github.com/WXYC/wxyc-etl.git /tmp/wxyc-etl && \
     cd /tmp/wxyc-etl/wxyc-etl-python && \
     maturin build --release && \
-    cp /tmp/wxyc-etl/wxyc-etl-python/target/wheels/*.whl /tmp/
+    cp /tmp/wxyc-etl/target/wheels/*.whl /tmp/
 
 FROM python:3.12-slim
 
