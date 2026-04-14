@@ -13,14 +13,9 @@ from urllib.parse import quote
 
 import httpx
 
-from core.matching import (
-    MAX_SEARCH_RESULTS,
-    STOPWORDS,
-    is_compilation_artist,
-    is_self_titled,
-    map_library_format_to_discogs,
-    normalize_for_comparison,
-)
+from wxyc_etl.text import is_compilation_artist
+from wxyc_etl.text import normalize_artist_name as normalize_for_comparison
+
 from core.search import (
     build_strategies,
     execute_search_pipeline,
@@ -30,12 +25,56 @@ from core.telemetry import RequestTelemetry
 from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult, ReleaseInfo
 from discogs.service import DiscogsService
-from library.db import LibraryDB
+from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from services.parser import MessageType, ParsedRequest
 
 logger = logging.getLogger(__name__)
+
+MAX_SEARCH_RESULTS = 5
+"""Maximum number of results to return from search operations."""
+
+SELF_TITLED_PATTERNS = frozenset({"s/t", "s.t.", "self-titled", "self titled"})
+"""Common abbreviations for self-titled albums (case-insensitive exact match)."""
+
+
+def is_self_titled(title: str) -> bool:
+    """Check if an album title indicates a self-titled release.
+
+    Args:
+        title: Album title to check
+
+    Returns:
+        True if title is a common self-titled abbreviation (e.g. "S/t", "S.T.")
+    """
+    return title.strip().lower() in SELF_TITLED_PATTERNS
+
+
+def map_library_format_to_discogs(fmt: str | None) -> str | None:
+    """Map a WXYC library format value to a Discogs API format parameter.
+
+    Library format values like "cd", "vinyl - 12\\"", "cd x 2" are mapped to
+    the corresponding Discogs search API format terms ("CD", "12\\"", etc.).
+
+    Returns None if the format is not recognized or is empty.
+    """
+    if not fmt:
+        return None
+    normalized = fmt.strip().lower()
+    if normalized.startswith("cdr"):
+        return "CDr"
+    if normalized.startswith("cd"):
+        return "CD"
+    if 'vinyl - 12"' in normalized or "vinyl - 12" in normalized:
+        return '12"'
+    if 'vinyl - 7"' in normalized or "vinyl - 7" in normalized:
+        return '7"'
+    if 'vinyl - 10"' in normalized or "vinyl - 10" in normalized:
+        return '10"'
+    if normalized.startswith("vinyl"):
+        return "Vinyl"
+    return None
 
 
 _FETCH_LIMIT = MAX_SEARCH_RESULTS * 10

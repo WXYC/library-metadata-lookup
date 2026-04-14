@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from core.matching import normalize_artist_for_validation
+from discogs.matching import normalize_artist_for_validation
 from discogs.models import (
     DiscogsSearchResponse,
     ReleaseInfo,

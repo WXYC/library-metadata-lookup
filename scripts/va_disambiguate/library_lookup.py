@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from rapidfuzz import fuzz
 
-from core.matching import strip_discogs_suffix
+from discogs.matching import strip_discogs_suffix
 
 # Minimum fuzzy match score to accept
 _FUZZY_THRESHOLD = 85

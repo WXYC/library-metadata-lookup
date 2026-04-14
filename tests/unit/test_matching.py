@@ -1,19 +1,17 @@
-"""Unit tests for core/matching.py."""
+"""Unit tests for matching functions (relocated from core/matching.py)."""
 
 import pytest
+from wxyc_etl.text import is_compilation_artist, strip_diacritics
+from wxyc_etl.text import normalize_artist_name as normalize_for_comparison
 
-from core.matching import (
-    calculate_confidence,
-    detect_ambiguous_format,
-    is_compilation_artist,
-    is_self_titled,
-    map_library_format_to_discogs,
+from core.search import detect_ambiguous_format
+from discogs.matching import (
     normalize_artist_for_validation,
-    normalize_for_comparison,
     normalize_for_track_comparison,
-    strip_diacritics,
     strip_discogs_suffix,
 )
+from discogs.service import calculate_confidence
+from lookup.orchestrator import is_self_titled, map_library_format_to_discogs
 
 # ---------------------------------------------------------------------------
 # strip_diacritics
@@ -117,7 +115,7 @@ class TestNormalizeForComparison:
             ("Motörhead", "motorhead"),
             (None, ""),
             ("", ""),
-            ("  Björk  ", "  bjork  "),
+            ("  Björk  ", "bjork"),
         ],
         ids=[
             "bjork_lowercase",
@@ -125,7 +123,7 @@ class TestNormalizeForComparison:
             "motorhead",
             "none_input",
             "empty_string",
-            "preserves_whitespace",
+            "trims_whitespace",
         ],
     )
     def test_normalize_for_comparison(self, input_text, expected):
@@ -182,8 +180,10 @@ class TestIsCompilationArtist:
     def test_empty_string(self):
         assert is_compilation_artist("") is False
 
-    def test_none(self):
-        assert is_compilation_artist(None) is False
+    def test_none_raises(self):
+        """wxyc_etl.is_compilation_artist requires str; callers guard with 'or ""'."""
+        with pytest.raises(TypeError):
+            is_compilation_artist(None)
 
     @pytest.mark.parametrize(
         "artist",

@@ -12,7 +12,7 @@ The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 import asyncio
 import logging
 
-from core.matching import normalize_artist_for_validation, normalize_for_track_comparison
+from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.models import (
     ArtistCredit,
     ArtistDetails,

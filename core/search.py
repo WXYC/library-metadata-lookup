@@ -6,15 +6,49 @@ Each strategy has explicit trigger conditions and can be easily tested in isolat
 Strategies are executed in array order until results are found.
 """
 
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from core.matching import detect_ambiguous_format
 from library.db import LibraryDB
 from library.models import LibraryItem
 from services.parser import ParsedRequest
+
+
+def detect_ambiguous_format(raw_message: str) -> tuple[str, str] | None:
+    """Detect if message has ambiguous 'X - Y' or 'X. Y' format.
+
+    These formats are ambiguous because they could be interpreted as either:
+    - Artist: X, Title: Y
+    - Title: X, Artist: Y
+
+    Args:
+        raw_message: The original request message
+
+    Returns:
+        Tuple of (part1, part2) if ambiguous format detected, None otherwise.
+    """
+    # Check for "X - Y" pattern with various spacing around dash
+    # Matches: "X - Y", "X- Y", "X -Y" (requires at least one space to avoid "hip-hop")
+    dash_match = re.search(r"(.+?)\s*-\s+(.+)|(.+?)\s+-\s*(.+)", raw_message)
+    if dash_match:
+        # Groups 1,2 for "X- Y" pattern, groups 3,4 for "X -Y" pattern
+        if dash_match.group(1) and dash_match.group(2):
+            part1, part2 = dash_match.group(1).strip(), dash_match.group(2).strip()
+        else:
+            part1, part2 = dash_match.group(3).strip(), dash_match.group(4).strip()
+        if part1 and part2:
+            return (part1, part2)
+
+    # Check for "X. Y" pattern (period followed by space)
+    if ". " in raw_message:
+        parts = raw_message.split(". ", 1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            return (parts[0].strip(), parts[1].strip())
+
+    return None
 
 
 class SearchStrategyType(StrEnum):

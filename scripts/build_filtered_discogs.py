@@ -32,7 +32,7 @@ from pathlib import Path
 import asyncpg
 from dotenv import load_dotenv
 
-from core.matching import is_compilation_artist
+from wxyc_etl.text import is_compilation_artist
 
 logger = logging.getLogger("build_filtered_discogs")
 

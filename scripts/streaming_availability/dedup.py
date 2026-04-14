@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import aiosqlite
 
-from core.matching import is_compilation_artist
+from wxyc_etl.text import is_compilation_artist
 from scripts.streaming_availability.matching import normalize_album_title, normalize_artist_name
 
 

@@ -9,12 +9,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from config.settings import get_settings
-from core.matching import (
-    calculate_confidence,
-    is_compilation_artist,
-    normalize_artist_for_validation,
-    normalize_for_track_comparison,
-)
+from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
+from wxyc_etl.text import is_compilation_artist
 from core.telemetry import (
     record_discogs_api_call,
     record_pg_cache_hit,
@@ -67,6 +63,92 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 DISCOGS_API_BASE = "https://api.discogs.com"
+
+
+def calculate_confidence(
+    request_artist: str | None,
+    request_album: str | None,
+    result_artist: str,
+    result_album: str,
+    request_label: str | None = None,
+    result_label: str | None = None,
+    request_format: str | None = None,
+    result_format: str | None = None,
+) -> float:
+    """Calculate confidence score for how well a search result matches a request.
+
+    Scoring rules:
+    - Exact artist match: +0.4
+    - Partial artist match (substring): +0.3
+    - Exact album match: +0.4
+    - Partial album match (substring): +0.3
+    - Both fields match well (score >= 0.6): +0.2 bonus
+    - Exact label match: +0.1
+    - Partial label match (substring): +0.05
+    - Format match: +0.05
+    - Minimum score for any result: 0.2
+
+    Args:
+        request_artist: Artist from the search request
+        request_album: Album from the search request
+        result_artist: Artist from the search result
+        result_album: Album from the search result
+        request_label: Label from the library item (optional)
+        result_label: Label from the Discogs result (optional)
+        request_format: Discogs format term from library item (optional)
+        result_format: Discogs format term from the result (optional)
+
+    Returns:
+        Confidence score between 0.2 and 1.0
+    """
+    score = 0.0
+
+    def normalize(s: str | None) -> str:
+        return s.lower().strip() if s else ""
+
+    req_artist = normalize(request_artist)
+    req_album = normalize(request_album)
+    res_artist = normalize(result_artist)
+    res_album = normalize(result_album)
+
+    # Artist match
+    if req_artist and res_artist:
+        if req_artist == res_artist:
+            score += 0.4
+        elif req_artist in res_artist or res_artist in req_artist:
+            score += 0.3
+
+    # Album match
+    if req_album and res_album:
+        if req_album == res_album:
+            score += 0.4
+        elif req_album in res_album or res_album in req_album:
+            score += 0.3
+
+    # Bonus for both matches
+    if score >= 0.6:
+        score += 0.2
+
+    # Base score if we got any result
+    if score == 0:
+        score = 0.2
+
+    # Label match (bonus signal, no penalty for mismatch)
+    req_label = normalize(request_label)
+    res_label = normalize(result_label)
+    if req_label and res_label:
+        if req_label == res_label:
+            score += 0.1
+        elif req_label in res_label or res_label in req_label:
+            score += 0.05
+
+    # Format match (bonus signal, no penalty for mismatch)
+    req_fmt = normalize(request_format)
+    res_fmt = normalize(result_format)
+    if req_fmt and res_fmt and req_fmt == res_fmt:
+        score += 0.05
+
+    return min(score, 1.0)
 
 
 class DiscogsService:
