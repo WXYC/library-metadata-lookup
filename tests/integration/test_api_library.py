@@ -23,7 +23,9 @@ class TestLibrarySearchEndpoint:
 
     @pytest.mark.asyncio
     async def test_title_filter(self, app_client):
-        resp = await app_client.get("/api/v1/library/search", params={"title": "On Your Own Love Again"})
+        resp = await app_client.get(
+            "/api/v1/library/search", params={"title": "On Your Own Love Again"}
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["total"] >= 1
@@ -41,7 +43,9 @@ class TestLibrarySearchEndpoint:
 
     @pytest.mark.asyncio
     async def test_multiword_fts_query(self, app_client):
-        resp = await app_client.get("/api/v1/library/search", params={"q": "Stereolab Aluminum Tunes"})
+        resp = await app_client.get(
+            "/api/v1/library/search", params={"q": "Stereolab Aluminum Tunes"}
+        )
         assert resp.status_code == 200
         body = resp.json()
         if body["total"] > 0:

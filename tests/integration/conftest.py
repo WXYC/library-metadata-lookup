@@ -28,8 +28,26 @@ SEED_ITEMS = [
     (4, "On Your Own Love Again", "Jessica Pratt", "RO", 112, 1, "Rock", "Vinyl"),
     (5, "Moon Pix", "Cat Power", "RO", 23, 1, "Rock", "CD"),
     # Duke Ellington & John Coltrane: artist name with "&" (2 albums)
-    (6, "Duke Ellington & John Coltrane", "Duke Ellington & John Coltrane", "JA", 7, 1, "Jazz", "CD"),
-    (7, "In a Sentimental Mood (Single)", "Duke Ellington & John Coltrane", "JA", 7, 2, "Jazz", "Vinyl"),
+    (
+        6,
+        "Duke Ellington & John Coltrane",
+        "Duke Ellington & John Coltrane",
+        "JA",
+        7,
+        1,
+        "Jazz",
+        "CD",
+    ),
+    (
+        7,
+        "In a Sentimental Mood (Single)",
+        "Duke Ellington & John Coltrane",
+        "JA",
+        7,
+        2,
+        "Jazz",
+        "Vinyl",
+    ),
     # Various Artists: compilation handling
     (10, "Now That's What I Call Music 47", "Various Artists", "V", 1, 1, "Compilation", "CD"),
     (11, "Rock Classics", "Various Artists", "V", 1, 2, "Compilation", "CD"),
