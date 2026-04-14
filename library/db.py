@@ -5,7 +5,6 @@ from pathlib import Path
 import aiosqlite
 from cachetools import TTLCache  # type: ignore[import-untyped]
 from rapidfuzz import fuzz
-
 from wxyc_etl.schema import library_columns
 from wxyc_etl.text import normalize_artist_name as normalize_for_comparison
 

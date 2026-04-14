@@ -17,6 +17,12 @@ These projects depend on library-metadata-lookup:
 | [WXYC-Android](https://github.com/WXYC/WXYC-Android) | Indirect via Backend-Service. Android app. |
 | [discogs-cache](https://github.com/WXYC/discogs-cache) | Shared data. Its ETL pipeline produces `library.db` (consumed at runtime by this service) and populates the PostgreSQL Discogs cache (queried by `discogs/cache_service.py`). |
 
+## Dependencies
+
+| Package | Purpose |
+|---|---|
+| [wxyc-etl](https://github.com/WXYC/wxyc-etl) | Shared Rust library (PyO3 bindings) for artist name normalization, diacritics stripping, compilation artist detection, and library.db schema validation. |
+
 ## What it does
 
 Given an artist, song, and/or album, the service:
@@ -124,13 +130,13 @@ library-metadata-lookup/
   config/settings.py           # Environment-based configuration
   core/
     dependencies.py            # DI for LibraryDB + DiscogsService
-    matching.py                # Fuzzy matching, diacritics normalization
-    search.py                  # Search strategy pattern
+    search.py                  # Search strategy pattern + ambiguous format detection
     telemetry.py               # PostHog telemetry
     logging.py, sentry.py, exceptions.py
   discogs/
-    service.py                 # Discogs API client with caching
+    service.py                 # Discogs API client with caching + confidence scoring
     cache_service.py           # PostgreSQL cache (asyncpg + pg_trgm)
+    matching.py                # Discogs-specific normalization (suffix stripping, track comparison)
     memory_cache.py            # In-memory TTL cache
     lookup.py                  # Track/artist lookup helpers
     models.py, ratelimit.py, router.py

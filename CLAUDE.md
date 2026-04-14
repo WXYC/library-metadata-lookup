@@ -38,8 +38,8 @@ All strategy implementations live in `lookup/orchestrator.py`.
 - `discogs/service.py` -- Discogs API client with optional PostgreSQL cache
 - `discogs/cache_service.py` -- PostgreSQL cache (asyncpg + pg_trgm)
 - `discogs/memory_cache.py` -- In-memory TTL cache (cachetools)
-- `core/search.py` -- Declarative search strategy pattern
-- `core/matching.py` -- Stopwords, compilation detection, ambiguous format detection, diacritics normalization
+- `core/search.py` -- Declarative search strategy pattern + ambiguous format detection
+- `discogs/matching.py` -- Discogs-specific normalization (strip_discogs_suffix, normalize_for_track_comparison, normalize_artist_for_validation)
 - `core/dependencies.py` -- FastAPI DI for LibraryDB + DiscogsService
 
 ### Discogs Cache (Optional)
@@ -219,6 +219,7 @@ Generates two SQL files for review before application: `va_flowsheet_updates.sql
 
 - **[request-o-matic](https://github.com/WXYC/request-o-matic)** -- The caller. Parses messages, calls this service, posts to Slack.
 - **[wxyc-shared](https://github.com/WXYC/wxyc-shared)** -- Shared API contract (`api.yaml`). Defines `LookupRequest`, `LookupResponse`, and related schemas. Python models are generated via `scripts/generate_api_models.sh` and committed to `generated/api_models.py`. The generated models are used as API boundary types; internal domain models (`LibraryItem`, `DiscogsSearchResult`) are converted via `to_catalog_item()` / `to_match_result()` methods.
+- **[wxyc-etl](https://github.com/WXYC/wxyc-etl)** -- Shared Rust library with Python bindings (PyO3/maturin). Provides `wxyc_etl.text` (artist name normalization, diacritics stripping, compilation detection) and `wxyc_etl.schema` (library.db column definitions). These were previously duplicated locally in `core/matching.py`.
 - **[discogs-cache](https://github.com/WXYC/discogs-cache)** -- ETL pipeline that populates the PostgreSQL Discogs cache consumed by `discogs/cache_service.py`. The pipeline is filtered by `library.db`, which discogs-cache generates from the WXYC MySQL catalog via `scripts/export_to_sqlite.py`. The `library.db` file serves dual purpose: runtime search for this service and primary input to the discogs-cache pipeline. The library ETL scripts (`export_to_sqlite.py`, `sync-library.sh`) live in discogs-cache.
 
 ## Example Music Data for Tests

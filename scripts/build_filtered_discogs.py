@@ -31,12 +31,9 @@ from pathlib import Path
 
 import asyncpg
 from dotenv import load_dotenv
-
 from wxyc_etl.text import is_compilation_artist
 
 logger = logging.getLogger("build_filtered_discogs")
-
-COMPILATION_KEYWORDS = frozenset({"various", "soundtrack", "compilation", "v/a", "v.a."})
 
 
 def extract_library_artists(library_db_path: str) -> list[str]:
