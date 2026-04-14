@@ -17,16 +17,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from scripts.streaming_availability.discogs_enricher import (
-    _ARTIST_FUZZY_QUERY,
-    _PUBLIC_RELEASE_QUERY,
-    _WXYC_RELEASE_QUERY,
     build_artist_mapping,
     check_wxyc_schema,
     enrich_album,
     pick_best_match,
 )
 from scripts.streaming_availability.matching import score_match
-
 
 # ---------------------------------------------------------------------------
 # Fixture data: representative WXYC artists and their Discogs counterparts
@@ -50,15 +46,29 @@ ARTIST_NAMES_RESPONSES = {
     "Cat Power": [{"artist_name": "Cat Power"}],
     "Jessica Pratt": [{"artist_name": "Jessica Pratt"}],
     "Autechre": [{"artist_name": "Autechre"}],
-    "Bjork": [{"artist_name": "Bjork"}, {"artist_name": "Bjork (2)"}, {"artist_name": "Bjork Gudmundsdottir"}],
+    "Bjork": [
+        {"artist_name": "Bjork"},
+        {"artist_name": "Bjork (2)"},
+        {"artist_name": "Bjork Gudmundsdottir"},
+    ],
     "Stetasonic": [{"artist_name": "Stetsasonic"}],
 }
 
 # WXYC schema release results
 WXYC_RELEASE_RESULTS = {
     "Stereolab": [
-        {"release_id": 5002, "title": "Aluminum Tunes", "artist_name": "Stereolab", "artwork_url": None},
-        {"release_id": 5010, "title": "Dots and Loops", "artist_name": "Stereolab", "artwork_url": None},
+        {
+            "release_id": 5002,
+            "title": "Aluminum Tunes",
+            "artist_name": "Stereolab",
+            "artwork_url": None,
+        },
+        {
+            "release_id": 5010,
+            "title": "Dots and Loops",
+            "artist_name": "Stereolab",
+            "artwork_url": None,
+        },
     ],
     "Juana Molina": [
         {"release_id": 5001, "title": "DOGA", "artist_name": "Juana Molina", "artwork_url": None},
@@ -71,8 +81,18 @@ WXYC_RELEASE_RESULTS = {
 # Public schema release results (fallback -- same data, slightly different IDs)
 PUBLIC_RELEASE_RESULTS = {
     "Stereolab": [
-        {"release_id": 9002, "title": "Aluminum Tunes", "artist_name": "Stereolab", "artwork_url": None},
-        {"release_id": 9010, "title": "Dots and Loops", "artist_name": "Stereolab", "artwork_url": None},
+        {
+            "release_id": 9002,
+            "title": "Aluminum Tunes",
+            "artist_name": "Stereolab",
+            "artwork_url": None,
+        },
+        {
+            "release_id": 9010,
+            "title": "Dots and Loops",
+            "artist_name": "Stereolab",
+            "artwork_url": None,
+        },
     ],
     "Juana Molina": [
         {"release_id": 9001, "title": "DOGA", "artist_name": "Juana Molina", "artwork_url": None},
@@ -118,9 +138,16 @@ class TestEnrichAlbumFallbackPath:
     async def test_wxyc_schema_hit_returns_without_fallback(self) -> None:
         """When wxyc schema returns results, public schema is not queried."""
         pool = AsyncMock()
-        pool.fetch = AsyncMock(return_value=[
-            {"release_id": 5002, "title": "Aluminum Tunes", "artist_name": "Stereolab", "artwork_url": None},
-        ])
+        pool.fetch = AsyncMock(
+            return_value=[
+                {
+                    "release_id": 5002,
+                    "title": "Aluminum Tunes",
+                    "artist_name": "Stereolab",
+                    "artwork_url": None,
+                },
+            ]
+        )
         result = await enrich_album(pool, "Stereolab", "Aluminum Tunes")
         assert result is not None
         assert result["artist_name"] == "Stereolab"
@@ -132,7 +159,12 @@ class TestEnrichAlbumFallbackPath:
     async def test_fallback_to_public_schema_on_wxyc_miss(self) -> None:
         """When wxyc schema returns nothing, public schema is tried."""
         pool = AsyncMock()
-        public_result = {"release_id": 9002, "title": "Aluminum Tunes", "artist_name": "Stereolab", "artwork_url": None}
+        public_result = {
+            "release_id": 9002,
+            "title": "Aluminum Tunes",
+            "artist_name": "Stereolab",
+            "artwork_url": None,
+        }
         pool.fetch = AsyncMock(side_effect=[[], [public_result]])
         result = await enrich_album(pool, "Stereolab", "Aluminum Tunes")
         assert result is not None
@@ -152,8 +184,18 @@ class TestEnrichAlbumFallbackPath:
     async def test_wxyc_and_public_agree_on_best_match(self) -> None:
         """Both schema paths should select the same artist/title when given identical results."""
         results = [
-            {"release_id": 1, "title": "Aluminum Tunes", "artist_name": "Stereolab", "artwork_url": None},
-            {"release_id": 2, "title": "Aluminium Tunes", "artist_name": "Stereolab", "artwork_url": None},
+            {
+                "release_id": 1,
+                "title": "Aluminum Tunes",
+                "artist_name": "Stereolab",
+                "artwork_url": None,
+            },
+            {
+                "release_id": 2,
+                "title": "Aluminium Tunes",
+                "artist_name": "Stereolab",
+                "artwork_url": None,
+            },
         ]
         match = pick_best_match("Stereolab", "Aluminum Tunes", results)
         assert match is not None
@@ -185,10 +227,12 @@ class TestArtistMappingFallbackPath:
         """When some artist lookups fail, the mapping includes successful ones only."""
         pool = AsyncMock()
         # First call succeeds (Bjork -> Bjork with diacritics), second fails
-        pool.fetch = AsyncMock(side_effect=[
-            [{"artist_name": "Bjork"}],
-            Exception("timeout"),
-        ])
+        pool.fetch = AsyncMock(
+            side_effect=[
+                [{"artist_name": "Bjork"}],
+                Exception("timeout"),
+            ]
+        )
         mapping = await build_artist_mapping(pool, ["Bjork", "Stereolab"])
         # Bjork matches exactly (case-insensitive), so it's excluded from mapping
         # Stereolab errored out, so no mapping entry
