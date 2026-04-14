@@ -15,9 +15,11 @@ from core.dependencies import (
     flush_posthog,
     shutdown_posthog,
 )
+from identity.dependencies import close_entity_store
 from core.logging import setup_logging
 from core.sentry import init_sentry
 from discogs.router import router as discogs_router
+from identity.router import router as identity_router
 from library.router import router as library_router
 from lookup.router import router as lookup_router
 from routers.admin import router as admin_router
@@ -55,6 +57,7 @@ async def lifespan(app: FastAPI):
     shutdown_posthog()
     await close_library_db()
     await close_discogs_service()
+    await close_entity_store()
     logger.info("All services shut down")
 
 
@@ -89,6 +92,7 @@ app.include_router(admin_router, prefix="/admin", tags=["admin"])
 app.include_router(lookup_router, prefix="/api/v1", tags=["lookup"])
 app.include_router(library_router, prefix="/api/v1", tags=["library"])
 app.include_router(discogs_router, prefix="/api/v1", tags=["discogs"])
+app.include_router(identity_router, prefix="/identity", tags=["identity"])
 
 if __name__ == "__main__":
     import uvicorn
