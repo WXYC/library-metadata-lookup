@@ -51,6 +51,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install wxyc-etl from source
+        run: |
+          pip install maturin
+          git clone --depth 1 https://github.com/WXYC/wxyc-etl.git /tmp/wxyc-etl
+          cd /tmp/wxyc-etl/wxyc-etl-python
+          maturin build --release
+          pip install /tmp/wxyc-etl/wxyc-etl-python/target/wheels/*.whl
       - run: |
           pip install -e ".[dev]"
           pip install mypy
@@ -64,6 +72,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install wxyc-etl from source
+        run: |
+          pip install maturin
+          git clone --depth 1 https://github.com/WXYC/wxyc-etl.git /tmp/wxyc-etl
+          cd /tmp/wxyc-etl/wxyc-etl-python
+          maturin build --release
+          pip install /tmp/wxyc-etl/wxyc-etl-python/target/wheels/*.whl
       - run: pip install -e ".[dev]"
       - run: pytest tests/unit/ -v --cov=. --cov-report=xml
       - name: Upload coverage reports
@@ -126,6 +142,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install wxyc-etl from source
+        run: |
+          pip install maturin
+          git clone --depth 1 https://github.com/WXYC/wxyc-etl.git /tmp/wxyc-etl
+          cd /tmp/wxyc-etl/wxyc-etl-python
+          maturin build --release
+          pip install /tmp/wxyc-etl/wxyc-etl-python/target/wheels/*.whl
       - run: pip install -e ".[dev]"
       - name: Run integration tests
         env:
