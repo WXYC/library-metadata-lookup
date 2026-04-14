@@ -157,7 +157,7 @@ def resolve_from_tracklist(
     Returns:
         ResolutionResult if matched, None otherwise.
     """
-    from core.matching import normalize_for_track_comparison
+    from discogs.matching import normalize_for_track_comparison
 
     if not entry.song_title:
         return None

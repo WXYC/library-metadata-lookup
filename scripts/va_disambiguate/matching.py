@@ -1,6 +1,6 @@
 """VA-specific matching and parsing helpers.
 
-Extends core/matching.py with functions specific to Various Artists disambiguation:
+Functions specific to Various Artists disambiguation:
 identifying VA artist names, extracting embedded artist names from compound VA fields,
 and selecting the primary artist from Discogs track credits.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from core.matching import strip_discogs_suffix
+from discogs.matching import strip_discogs_suffix
 
 # Canonical VA names (exact match, case-insensitive)
 _VA_EXACT = frozenset(

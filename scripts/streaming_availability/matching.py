@@ -7,7 +7,9 @@ from collections.abc import Callable
 
 from rapidfuzz import fuzz
 
-from core.matching import normalize_for_comparison, strip_discogs_suffix  # noqa: F401
+from wxyc_etl.text import normalize_artist_name as normalize_for_comparison  # noqa: F401
+
+from discogs.matching import strip_discogs_suffix  # noqa: F401
 
 # Trailing format indicators: 12", 7", 10", LP, EP, CD, and multi-disc (x 2, x 3, ...)
 _FORMAT_SUFFIX_RE = re.compile(
