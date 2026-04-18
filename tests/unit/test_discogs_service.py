@@ -469,6 +469,95 @@ class TestGetRelease:
 
         assert result is not None
 
+    @pytest.mark.asyncio
+    async def test_api_maps_videos(self, service):
+        """Videos in API response are mapped to ReleaseVideo objects."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Emperor Tomato Ketchup",
+            "artists": [{"name": "Stereolab"}],
+            "year": 1996,
+            "labels": [],
+            "genres": ["Electronic"],
+            "styles": ["Krautrock"],
+            "tracklist": [],
+            "images": [],
+            "videos": [
+                {"uri": "https://www.youtube.com/watch?v=abc", "title": "Metronomic Underground", "duration": 456, "embed": True},
+                {"uri": "https://www.youtube.com/watch?v=def", "title": "French Disko", "duration": 204, "embed": False},
+            ],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(12345)
+
+        assert result is not None
+        assert len(result.videos) == 2
+        assert result.videos[0].src == "https://www.youtube.com/watch?v=abc"
+        assert result.videos[0].title == "Metronomic Underground"
+        assert result.videos[0].duration == 456
+        assert result.videos[0].embed is True
+        assert result.videos[1].embed is False
+
+    @pytest.mark.asyncio
+    async def test_empty_uri_videos_are_skipped(self, service):
+        """Videos without a URI are not included in the result."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "On Your Own Love Again",
+            "artists": [{"name": "Jessica Pratt"}],
+            "year": 2015,
+            "labels": [],
+            "genres": [],
+            "styles": [],
+            "tracklist": [],
+            "images": [],
+            "videos": [
+                {"uri": "https://www.youtube.com/watch?v=abc", "title": "Moon Dust", "duration": 180, "embed": True},
+                {"uri": "", "title": "No URI video", "duration": 100, "embed": True},
+                {"title": "Missing URI key entirely", "duration": 100, "embed": True},
+            ],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(99)
+
+        assert result is not None
+        assert len(result.videos) == 1
+        assert result.videos[0].src == "https://www.youtube.com/watch?v=abc"
+
+    @pytest.mark.asyncio
+    async def test_no_videos_in_api_response(self, service):
+        """Releases without videos return an empty videos list."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "DOGA",
+            "artists": [{"name": "Juana Molina"}],
+            "labels": [],
+            "genres": [],
+            "styles": [],
+            "tracklist": [],
+            "images": [],
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(55)
+
+        assert result is not None
+        assert result.videos == []
+
 
 # ---------------------------------------------------------------------------
 # search

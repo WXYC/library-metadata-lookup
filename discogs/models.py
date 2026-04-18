@@ -44,6 +44,15 @@ class TrackItem(BaseModel):
     artists: list[str] = []  # Per-track artists (for compilations)
 
 
+class ReleaseVideo(BaseModel):
+    """A video associated with a release."""
+
+    src: str
+    title: str | None = None
+    duration: int | None = None  # Seconds
+    embed: bool = True
+
+
 class ReleaseInfo(BaseModel):
     """Information about a single release containing a track."""
 
@@ -85,6 +94,7 @@ class ReleaseMetadataResponse(BaseModel):
     extra_artists: list[ArtistCredit] = []
     labels: list[LabelCredit] = []
     released: str | None = None  # full date string, e.g. "2024-03-15"
+    videos: list[ReleaseVideo] = []
 
 
 class ArtistRef(BaseModel):
