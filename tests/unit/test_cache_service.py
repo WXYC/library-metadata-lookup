@@ -287,8 +287,20 @@ class TestGetRelease:
                 release_genre=[],
                 release_style=[],
                 release_video=[
-                    {"sequence": 1, "src": "https://www.youtube.com/watch?v=abc", "title": "Metronomic Underground", "duration": 456, "embed": True},
-                    {"sequence": 2, "src": "https://www.youtube.com/watch?v=def", "title": "French Disko", "duration": 204, "embed": False},
+                    {
+                        "sequence": 1,
+                        "src": "https://www.youtube.com/watch?v=abc",
+                        "title": "Metronomic Underground",
+                        "duration": 456,
+                        "embed": True,
+                    },
+                    {
+                        "sequence": 2,
+                        "src": "https://www.youtube.com/watch?v=def",
+                        "title": "French Disko",
+                        "duration": 204,
+                        "embed": False,
+                    },
                 ],
             )
         )
@@ -483,8 +495,17 @@ class TestWriteRelease:
             artist="Stereolab",
             release_url="https://discogs.com/release/1",
             videos=[
-                ReleaseVideo(src="https://www.youtube.com/watch?v=abc", title="Metronomic Underground", duration=456),
-                ReleaseVideo(src="https://www.youtube.com/watch?v=def", title="French Disko", duration=204, embed=False),
+                ReleaseVideo(
+                    src="https://www.youtube.com/watch?v=abc",
+                    title="Metronomic Underground",
+                    duration=456,
+                ),
+                ReleaseVideo(
+                    src="https://www.youtube.com/watch?v=def",
+                    title="French Disko",
+                    duration=204,
+                    embed=False,
+                ),
             ],
         )
 
@@ -497,7 +518,9 @@ class TestWriteRelease:
         all_executemany_sql = [call[0][0] for call in conn.executemany.call_args_list]
         assert any("release_video" in sql for sql in all_executemany_sql)
 
-        video_insert = next(c for c in conn.executemany.call_args_list if "release_video" in c[0][0])
+        video_insert = next(
+            c for c in conn.executemany.call_args_list if "release_video" in c[0][0]
+        )
         rows = video_insert[0][1]
         assert len(rows) == 2
         assert rows[0][1] == 1  # sequence 1
@@ -509,7 +532,9 @@ class TestWriteRelease:
         assert rows[1][5] is False
 
     @pytest.mark.asyncio
-    async def test_write_release_without_videos_skips_insert(self, cache_service, mock_asyncpg_pool):
+    async def test_write_release_without_videos_skips_insert(
+        self, cache_service, mock_asyncpg_pool
+    ):
         """write_release with no videos deletes old rows but skips executemany INSERT."""
         release = ReleaseMetadataResponse(
             release_id=1,

@@ -241,8 +241,14 @@ class TestReleaseMetadataResponseVideos:
             artist="Stereolab",
             release_url="https://www.discogs.com/release/1",
             videos=[
-                ReleaseVideo(src="https://www.youtube.com/watch?v=abc", title="Metronomic Underground", duration=456),
-                ReleaseVideo(src="https://www.youtube.com/watch?v=def", title="French Disko", duration=204),
+                ReleaseVideo(
+                    src="https://www.youtube.com/watch?v=abc",
+                    title="Metronomic Underground",
+                    duration=456,
+                ),
+                ReleaseVideo(
+                    src="https://www.youtube.com/watch?v=def", title="French Disko", duration=204
+                ),
             ],
         )
         assert len(release.videos) == 2
