@@ -591,9 +591,9 @@ class TestSearchLibraryWithFallback:
         )
         # The self-titled album should be included because "S/t" means the
         # album name is the same as the artist name.
-        assert any(r.title == "S/t" for r in results), (
-            "Self-titled album 'S/t' should match when Discogs album is the artist name"
-        )
+        assert any(
+            r.title == "S/t" for r in results
+        ), "Self-titled album 'S/t' should match when Discogs album is the artist name"
         assert fallback is False
 
     @pytest.mark.asyncio
@@ -715,6 +715,31 @@ class TestFilterResultsByTrackValidation:
 
         result = await filter_results_by_track_validation(
             items, "Unknown Song", "Queen", mock_discogs_service
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_discogs_returns_different_album(self, mock_discogs_service):
+        """Discogs search for library album '808 State' returns 'The Best Of 808 State:
+        Blueprint' — a different album that contains the track. The validation should
+        reject this because the Discogs album doesn't match the library item's title.
+
+        Bug: WXYC/library-metadata-lookup#115
+        """
+        items = [make_library_item(id=958, artist="808 State", title="808 State")]
+
+        # Discogs search for album="808 State" returns a best-of compilation
+        wrong_album = make_discogs_result(
+            release_id=7641756,
+            album="The Best Of 808 State: Blueprint",
+            artist="808 State",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[wrong_album])
+        # Track IS on that compilation — but it's the wrong album
+        mock_discogs_service.validate_track_on_release.return_value = True
+
+        result = await filter_results_by_track_validation(
+            items, "Flow Coma", "808 State", mock_discogs_service
         )
         assert result is None
 
