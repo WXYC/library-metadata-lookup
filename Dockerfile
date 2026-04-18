@@ -1,7 +1,7 @@
 FROM python:3.12-slim AS builder
 
 # Install Rust toolchain and build wxyc-etl wheel
-RUN apt-get update && apt-get install -y --no-install-recommends curl git gcc && \
+RUN apt-get update && apt-get install -y --no-install-recommends curl git gcc libc6-dev && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
     . "$HOME/.cargo/env" && \
     pip install --no-cache-dir maturin && \
