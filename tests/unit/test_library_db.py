@@ -1203,3 +1203,94 @@ class TestLibraryDBCacheInvalidation:
         artist_cache, search_cache = _get_library_caches()
         assert len(artist_cache) == 0
         assert len(search_cache) == 0
+
+
+class TestStreamingLinks:
+    """Tests for streaming_links table access."""
+
+    @pytest.mark.asyncio
+    async def test_get_streaming_links_returns_urls(self, tmp_path):
+        """When streaming_links has a row, return a dict of URLs."""
+        db_path = tmp_path / "test.db"
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+                "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+                "genre TEXT, format TEXT)"
+            )
+            await conn.execute(
+                "INSERT INTO library VALUES (100, 'Aluminum Tunes', 'Stereolab', "
+                "'St', 1, 1, 'Rock', 'CD')"
+            )
+            await conn.execute(
+                "CREATE TABLE streaming_links ("
+                "library_id INTEGER PRIMARY KEY, spotify_url TEXT, apple_music_url TEXT, "
+                "deezer_url TEXT, bandcamp_url TEXT, tidal_url TEXT, "
+                "youtube_music_url TEXT, soundcloud_url TEXT)"
+            )
+            await conn.execute(
+                "INSERT INTO streaming_links VALUES "
+                "(100, 'https://open.spotify.com/album/abc', NULL, NULL, "
+                "'https://stereolab.bandcamp.com/album/aluminum-tunes', NULL, NULL, NULL)"
+            )
+            await conn.commit()
+
+        db = LibraryDB(db_path)
+        await db.connect()
+        links = await db.get_streaming_links(100)
+        await db.close()
+
+        assert links is not None
+        assert links["spotify_url"] == "https://open.spotify.com/album/abc"
+        assert links["bandcamp_url"] == "https://stereolab.bandcamp.com/album/aluminum-tunes"
+        assert links["apple_music_url"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_streaming_links_returns_none_when_not_found(self, tmp_path):
+        """When no streaming_links row exists, return None."""
+        db_path = tmp_path / "test.db"
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+                "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+                "genre TEXT, format TEXT)"
+            )
+            await conn.execute(
+                "CREATE TABLE streaming_links ("
+                "library_id INTEGER PRIMARY KEY, spotify_url TEXT, apple_music_url TEXT, "
+                "deezer_url TEXT, bandcamp_url TEXT, tidal_url TEXT, "
+                "youtube_music_url TEXT, soundcloud_url TEXT)"
+            )
+            await conn.commit()
+
+        db = LibraryDB(db_path)
+        await db.connect()
+        links = await db.get_streaming_links(999)
+        await db.close()
+
+        assert links is None
+
+    @pytest.mark.asyncio
+    async def test_get_streaming_links_graceful_without_table(self, tmp_path):
+        """When streaming_links table doesn't exist, return None."""
+        db_path = tmp_path / "test.db"
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+                "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+                "genre TEXT, format TEXT)"
+            )
+            await conn.commit()
+
+        db = LibraryDB(db_path)
+        await db.connect()
+        links = await db.get_streaming_links(100)
+        await db.close()
+
+        assert links is None

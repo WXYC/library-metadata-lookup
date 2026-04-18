@@ -79,6 +79,7 @@ class LibraryDB:
         self._has_alternate_artist: bool = False
         self._has_label: bool = False
         self._has_compilation_track_artist: bool = False
+        self._has_streaming_links: bool = False
 
     async def connect(self):
         """Open database connection."""
@@ -108,17 +109,23 @@ class LibraryDB:
         self._has_alternate_artist = "alternate_artist_name" in column_names
         self._has_label = "label" in column_names
 
-        # Detect compilation_track_artist table
+        # Detect optional tables
         tables_cursor = await self._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='compilation_track_artist'"
         )
         self._has_compilation_track_artist = await tables_cursor.fetchone() is not None
 
+        tables_cursor = await self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='streaming_links'"
+        )
+        self._has_streaming_links = await tables_cursor.fetchone() is not None
+
         logger.info(
             f"Connected to SQLite database: {self.db_path} "
             f"(alternate_artist_name: {'yes' if self._has_alternate_artist else 'no'}, "
             f"label: {'yes' if self._has_label else 'no'}, "
-            f"compilation_track_artist: {'yes' if self._has_compilation_track_artist else 'no'})"
+            f"compilation_track_artist: {'yes' if self._has_compilation_track_artist else 'no'}, "
+            f"streaming_links: {'yes' if self._has_streaming_links else 'no'})"
         )
 
     async def is_available(self) -> bool:
@@ -492,3 +499,32 @@ class LibraryDB:
             return best_match
 
         return None
+
+    async def get_streaming_links(self, library_id: int) -> dict[str, str | None] | None:
+        """Get streaming service URLs for a library release.
+
+        Returns a dict with service URL keys (spotify_url, apple_music_url, etc.)
+        or None if no streaming links are available.
+        """
+        if not self._has_streaming_links or self._conn is None:
+            return None
+
+        cursor = await self._conn.execute(
+            "SELECT spotify_url, apple_music_url, deezer_url, bandcamp_url, "
+            "tidal_url, youtube_music_url, soundcloud_url "
+            "FROM streaming_links WHERE library_id = ?",
+            (library_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+
+        return {
+            "spotify_url": row[0],
+            "apple_music_url": row[1],
+            "deezer_url": row[2],
+            "bandcamp_url": row[3],
+            "tidal_url": row[4],
+            "youtube_music_url": row[5],
+            "soundcloud_url": row[6],
+        }

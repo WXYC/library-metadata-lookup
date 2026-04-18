@@ -825,11 +825,12 @@ async def enrich_artwork_results(
     items_with_artwork: list[tuple[LibraryItem, DiscogsSearchResult | None]],
     discogs_service: DiscogsService | None,
     song: str | None = None,
+    library_db: object | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
-    Fetches supplementary data in parallel (best-effort). Failures are silently
-    ignored — enriched fields remain None.
+    When library_db has a streaming_links table, uses direct URLs from the database.
+    Falls back to search URLs when direct links are not available.
     """
     if not discogs_service:
         return items_with_artwork
@@ -887,24 +888,43 @@ async def enrich_artwork_results(
 
         year_result, artist_bio, wikipedia_url = release_details_result
 
-        # Build streaming search URLs
+        # Get streaming URLs: prefer direct links from DB, fall back to search URLs
         spotify_url = None
+        apple_music_override = None
         youtube_music_url = None
         bandcamp_url = None
         soundcloud_url = None
+
+        if library_db and getattr(library_db, "_has_streaming_links", None) is True and item.id:
+            try:
+                links = await library_db.get_streaming_links(item.id)
+            except Exception:
+                links = None
+            if links:
+                spotify_url = links.get("spotify_url")
+                apple_music_override = links.get("apple_music_url")
+                youtube_music_url = links.get("youtube_music_url")
+                bandcamp_url = links.get("bandcamp_url")
+                soundcloud_url = links.get("soundcloud_url")
+
+        # Fall back to search URLs for any service without a direct link
         if artist and search_term:
-            spotify_url = _build_streaming_search_url(
-                "https://open.spotify.com/search/", artist, search_term
-            )
-            youtube_music_url = _build_streaming_search_url(
-                "https://music.youtube.com/search?q=", artist, search_term
-            )
-            bandcamp_url = _build_streaming_search_url(
-                "https://bandcamp.com/search?q=", artist, search_term
-            )
-            soundcloud_url = _build_streaming_search_url(
-                "https://soundcloud.com/search?q=", artist, search_term
-            )
+            if not spotify_url:
+                spotify_url = _build_streaming_search_url(
+                    "https://open.spotify.com/search/", artist, search_term
+                )
+            if not youtube_music_url:
+                youtube_music_url = _build_streaming_search_url(
+                    "https://music.youtube.com/search?q=", artist, search_term
+                )
+            if not bandcamp_url:
+                bandcamp_url = _build_streaming_search_url(
+                    "https://bandcamp.com/search?q=", artist, search_term
+                )
+            if not soundcloud_url:
+                soundcloud_url = _build_streaming_search_url(
+                    "https://soundcloud.com/search?q=", artist, search_term
+                )
 
         updated = artwork.model_copy(
             update={
@@ -912,7 +932,7 @@ async def enrich_artwork_results(
                 "artist_bio": artist_bio,
                 "wikipedia_url": wikipedia_url,
                 "spotify_url": spotify_url,
-                "apple_music_url": apple_music_result or None,
+                "apple_music_url": apple_music_override or apple_music_result or None,
                 "youtube_music_url": youtube_music_url,
                 "bandcamp_url": bandcamp_url,
                 "soundcloud_url": soundcloud_url,
@@ -1079,7 +1099,10 @@ async def perform_lookup(
     with telemetry.track_step("metadata_enrichment"):
         if items_with_artwork:
             items_with_artwork = await enrich_artwork_results(
-                items_with_artwork, discogs_service, song=parsed.song
+                items_with_artwork,
+                discogs_service,
+                song=parsed.song,
+                library_db=db,
             )
 
     # Step 5: Build context message
