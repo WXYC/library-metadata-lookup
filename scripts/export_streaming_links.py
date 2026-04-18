@@ -5,7 +5,7 @@ to verified streaming service URLs. This makes streaming data available to
 the LML API and all downstream clients.
 
 Usage:
-    .venv/bin/python scripts/export_streaming_links.py [--dry-run]
+    .venv/bin/python scripts/export_streaming_links.py [--library-db PATH] [--streaming-db PATH] [--dry-run]
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sqlite3
 
 logging.basicConfig(
@@ -22,13 +23,14 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-LIBRARY_DB = "library.db"
-STREAMING_DB = "streaming_availability.db"
-
 
 def main(args: argparse.Namespace) -> None:
-    sa = sqlite3.connect(STREAMING_DB)
-    lib = sqlite3.connect(LIBRARY_DB)
+    if not os.path.exists(args.streaming_db):
+        log.error(f"Streaming database {args.streaming_db} does not exist; skipping export")
+        return
+
+    sa = sqlite3.connect(args.streaming_db)
+    lib = sqlite3.connect(args.library_db)
 
     # Get all albums with at least one streaming URL
     rows = sa.execute("""
@@ -122,7 +124,7 @@ def main(args: argparse.Namespace) -> None:
             lib.commit()
 
     lib.commit()
-    log.info(f"Inserted {inserted:,} streaming_links rows into {LIBRARY_DB}")
+    log.info(f"Inserted {inserted:,} streaming_links rows into {args.library_db}")
 
     # Verify
     count = lib.execute("SELECT COUNT(*) FROM streaming_links").fetchone()[0]
@@ -132,6 +134,14 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export streaming URLs to library.db")
+    parser.add_argument(
+        "--library-db", default="library.db", help="Path to library.db (default: library.db)"
+    )
+    parser.add_argument(
+        "--streaming-db",
+        default="streaming_availability.db",
+        help="Path to streaming_availability.db (default: streaming_availability.db)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Show stats without writing")
     args = parser.parse_args()
     main(args)
