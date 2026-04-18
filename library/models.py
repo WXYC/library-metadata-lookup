@@ -30,6 +30,7 @@ class LibraryItem(BaseModel):
     format: str | None = None
     alternate_artist_name: str | None = None
     label: str | None = None
+    on_streaming: bool | None = None
 
     @property
     def call_number(self) -> str:
@@ -69,6 +70,7 @@ class LibraryItem(BaseModel):
             label=self.label,
             call_number=self.call_number,
             library_url=self.library_url,
+            on_streaming=self.on_streaming,
         )
 
 
