@@ -1,6 +1,6 @@
 """Unit tests for identity/router.py REST endpoints."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient

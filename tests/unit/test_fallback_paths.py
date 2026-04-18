@@ -17,9 +17,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from scripts.streaming_availability.discogs_enricher import (
-    build_artist_mapping,
     check_wxyc_schema,
     enrich_album,
+    load_entity_store_mapping,
     pick_best_match,
 )
 from scripts.streaming_availability.matching import score_match
@@ -210,41 +210,43 @@ class TestEnrichAlbumFallbackPath:
         assert result is None
 
 
-class TestArtistMappingFallbackPath:
-    """Test that when the artist_names fuzzy table is unavailable (connection error),
-    build_artist_mapping gracefully returns an empty mapping instead of crashing."""
+class TestEntityStoreMappingFallbackPath:
+    """Test that when the entity store is unavailable (connection error),
+    load_entity_store_mapping gracefully returns an empty mapping instead of crashing."""
 
     @pytest.mark.asyncio
     async def test_connection_failure_returns_empty_mapping(self) -> None:
-        """When the PG pool raises on every fetch, mapping is empty (not crash)."""
+        """When the PG pool raises on fetch, mapping is empty (not crash)."""
         pool = AsyncMock()
         pool.fetch = AsyncMock(side_effect=Exception("Connection refused"))
-        mapping = await build_artist_mapping(pool, LIBRARY_ARTISTS)
+        mapping = await load_entity_store_mapping(pool)
         assert mapping == {}
 
     @pytest.mark.asyncio
-    async def test_partial_failure_returns_partial_mapping(self) -> None:
-        """When some artist lookups fail, the mapping includes successful ones only."""
+    async def test_successful_mapping(self) -> None:
+        """When entity.identity has reconciled artists, they appear in the mapping."""
         pool = AsyncMock()
-        # First call succeeds (Bjork -> Bjork with diacritics), second fails
         pool.fetch = AsyncMock(
-            side_effect=[
-                [{"artist_name": "Bjork"}],
-                Exception("timeout"),
+            return_value=[
+                {"library_name": "Stereolab", "discogs_artist_id": 1000},
+                {"library_name": "Autechre", "discogs_artist_id": 77},
             ]
         )
-        mapping = await build_artist_mapping(pool, ["Bjork", "Stereolab"])
-        # Bjork matches exactly (case-insensitive), so it's excluded from mapping
-        # Stereolab errored out, so no mapping entry
-        assert mapping == {}
+        mapping = await load_entity_store_mapping(pool)
+        assert mapping == {"Stereolab": 1000, "Autechre": 77}
 
     @pytest.mark.asyncio
-    async def test_successful_mapping_with_name_variant(self) -> None:
-        """When artist_names returns a variant, it appears in the mapping."""
+    async def test_null_discogs_id_excluded(self) -> None:
+        """Rows with null discogs_artist_id are excluded from the mapping."""
         pool = AsyncMock()
-        pool.fetch = AsyncMock(return_value=[{"artist_name": "Stetsasonic"}])
-        mapping = await build_artist_mapping(pool, ["Stetasonic"])
-        assert mapping == {"Stetasonic": "Stetsasonic"}
+        pool.fetch = AsyncMock(
+            return_value=[
+                {"library_name": "Stereolab", "discogs_artist_id": 1000},
+                {"library_name": "Unknown Artist", "discogs_artist_id": None},
+            ]
+        )
+        mapping = await load_entity_store_mapping(pool)
+        assert mapping == {"Stereolab": 1000}
 
 
 class TestPickBestMatchFallbackParity:
