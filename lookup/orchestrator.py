@@ -698,6 +698,19 @@ async def filter_results_by_track_validation(
 
             best_result = response.results[0]
             if best_result.release_id:
+                # Verify the Discogs result is actually the same album, not a
+                # different release that shares words with the library title.
+                # e.g., searching for "808 State" might return "The Best Of
+                # 808 State: Blueprint" — a different album entirely.
+                discogs_album = (best_result.album or "").lower()
+                library_title = (item.title or "").lower()
+                if not album_title_acceptable(library_title, discogs_album):
+                    logger.debug(
+                        f"Track validation: Discogs returned '{best_result.album}' "
+                        f"for library item '{item.title}' — album mismatch, skipping"
+                    )
+                    return None
+
                 is_valid = await discogs_service.validate_track_on_release(
                     best_result.release_id, song, artist
                 )
