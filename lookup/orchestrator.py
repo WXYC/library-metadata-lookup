@@ -1099,6 +1099,12 @@ async def perform_lookup(
                     merged.extend(library_results)
                     library_results = merged
 
+    # Step 3c: Populate streaming status
+    if library_results and getattr(db, "_has_streaming_links", None) is True:
+        streaming_status = await db.get_streaming_status([r.id for r in library_results])
+        for result in library_results:
+            result.on_streaming = streaming_status.get(result.id, False)
+
     # Step 4: Fetch artwork
     with telemetry.track_step("artwork_fetch"):
         if library_results:

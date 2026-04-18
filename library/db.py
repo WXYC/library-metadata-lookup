@@ -528,3 +528,20 @@ class LibraryDB:
             "youtube_music_url": row[5],
             "soundcloud_url": row[6],
         }
+
+    async def get_streaming_status(self, library_ids: list[int]) -> dict[int, bool]:
+        """Check which library releases have streaming links.
+
+        Returns a dict mapping library_id → True for IDs that have at least one
+        streaming link. IDs not in the result are not on streaming.
+        """
+        if not self._has_streaming_links or self._conn is None or not library_ids:
+            return {}
+
+        placeholders = ",".join("?" * len(library_ids))
+        cursor = await self._conn.execute(
+            f"SELECT library_id FROM streaming_links WHERE library_id IN ({placeholders})",
+            library_ids,
+        )
+        rows = await cursor.fetchall()
+        return {row[0]: True for row in rows}

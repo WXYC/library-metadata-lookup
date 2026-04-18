@@ -442,6 +442,10 @@ class AlbumSearchResult(BaseModel):
     rotation_bin: RotationBin | None = None
     rotation_id: int | None = None
     plays: int | None = None
+    on_streaming: bool | None = Field(
+        None,
+        description="True if this release is available on at least one streaming service. False means only available in the WXYC physical library. Null if unknown.",
+    )
 
 
 class AddAlbumRequest(BaseModel):
@@ -887,6 +891,10 @@ class LibraryCatalogItem(BaseModel):
         description='Full call number for shelf lookup, e.g. "Rock CD ABC 123/45". Computed from genre, format, call_letters, artist_call_number, and release_call_number.\n',
     )
     library_url: str = Field(..., description="URL to view this release in the WXYC library")
+    on_streaming: bool | None = Field(
+        None,
+        description="True if this release is available on at least one streaming service. False means only available in the WXYC physical library. Null if unknown.",
+    )
 
 
 class DiscogsMatchResult(BaseModel):
@@ -913,7 +921,7 @@ class SearchType(StrEnum):
 
 
 class LookupResponse(BaseModel):
-    results: list[LookupResultItem] | None = Field([], validate_default=True)
+    results: list[LookupResultItem] | None = Field(default_factory=list)
     search_type: SearchType | None = Field(
         "none",
         description="The search strategy that produced results: direct, fallback, alternative, compilation, song_as_artist, or none\n",
