@@ -825,7 +825,7 @@ async def enrich_artwork_results(
     items_with_artwork: list[tuple[LibraryItem, DiscogsSearchResult | None]],
     discogs_service: DiscogsService | None,
     song: str | None = None,
-    library_db: object | None = None,
+    library_db: LibraryDB | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
