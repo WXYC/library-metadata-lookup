@@ -15,10 +15,10 @@ from core.dependencies import (
     flush_posthog,
     shutdown_posthog,
 )
-from identity.dependencies import close_entity_store
 from core.logging import setup_logging
 from core.sentry import init_sentry
 from discogs.router import router as discogs_router
+from identity.dependencies import close_entity_store
 from identity.router import router as identity_router
 from library.router import router as library_router
 from lookup.router import router as lookup_router
