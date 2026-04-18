@@ -8,6 +8,7 @@ from discogs.models import (
     LabelCredit,
     MemberRef,
     ReleaseMetadataResponse,
+    ReleaseVideo,
 )
 from generated.api_models import DiscogsMatchResult
 
@@ -192,3 +193,58 @@ class TestArtistDetails:
     def test_member_ref_defaults(self):
         ref = MemberRef(id=200, name="Rob Brown")
         assert ref.active is True
+
+
+# ---------------------------------------------------------------------------
+# ReleaseVideo model
+# ---------------------------------------------------------------------------
+
+
+class TestReleaseVideo:
+    def test_required_field(self):
+        video = ReleaseVideo(src="https://www.youtube.com/watch?v=abc")
+        assert video.src == "https://www.youtube.com/watch?v=abc"
+        assert video.title is None
+        assert video.duration is None
+        assert video.embed is True
+
+    def test_all_fields(self):
+        video = ReleaseVideo(
+            src="https://www.youtube.com/watch?v=abc",
+            title="Stereolab - French Disko",
+            duration=204,
+            embed=False,
+        )
+        assert video.title == "Stereolab - French Disko"
+        assert video.duration == 204
+        assert video.embed is False
+
+    def test_embed_defaults_true(self):
+        video = ReleaseVideo(src="https://www.youtube.com/watch?v=abc")
+        assert video.embed is True
+
+
+class TestReleaseMetadataResponseVideos:
+    def test_videos_default_to_empty(self):
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Emperor Tomato Ketchup",
+            artist="Stereolab",
+            release_url="https://www.discogs.com/release/1",
+        )
+        assert release.videos == []
+
+    def test_videos_populated(self):
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Emperor Tomato Ketchup",
+            artist="Stereolab",
+            release_url="https://www.discogs.com/release/1",
+            videos=[
+                ReleaseVideo(src="https://www.youtube.com/watch?v=abc", title="Metronomic Underground", duration=456),
+                ReleaseVideo(src="https://www.youtube.com/watch?v=def", title="French Disko", duration=204),
+            ],
+        )
+        assert len(release.videos) == 2
+        assert release.videos[0].title == "Metronomic Underground"
+        assert release.videos[1].duration == 204

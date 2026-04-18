@@ -21,6 +21,7 @@ from discogs.models import (
     MemberRef,
     ReleaseInfo,
     ReleaseMetadataResponse,
+    ReleaseVideo,
     TrackItem,
 )
 
@@ -243,7 +244,7 @@ class DiscogsCacheService:
                 ),
             )
 
-            # Genre/style tables may not exist if the pipeline hasn't been re-run
+            # Genre/style/video tables may not exist if the pipeline hasn't been re-run
             genre_style_results = await asyncio.gather(
                 self.pool.fetch(
                     "SELECT genre FROM release_genre WHERE release_id = $1",
@@ -251,6 +252,15 @@ class DiscogsCacheService:
                 ),
                 self.pool.fetch(
                     "SELECT style FROM release_style WHERE release_id = $1",
+                    release_id,
+                ),
+                self.pool.fetch(
+                    """
+                    SELECT sequence, src, title, duration, embed
+                    FROM release_video
+                    WHERE release_id = $1
+                    ORDER BY sequence
+                    """,
                     release_id,
                 ),
                 return_exceptions=True,
@@ -263,6 +273,11 @@ class DiscogsCacheService:
             style_rows = (
                 genre_style_results[1]
                 if not isinstance(genre_style_results[1], BaseException)
+                else []
+            )
+            video_rows = (
+                genre_style_results[2]
+                if not isinstance(genre_style_results[2], BaseException)
                 else []
             )
 
@@ -314,6 +329,16 @@ class DiscogsCacheService:
                     )
                 )
 
+            videos = [
+                ReleaseVideo(
+                    src=row["src"],
+                    title=row["title"],
+                    duration=row["duration"],
+                    embed=row["embed"] if row["embed"] is not None else True,
+                )
+                for row in video_rows
+            ]
+
             return ReleaseMetadataResponse(
                 release_id=release_id,
                 title=release_row["title"],
@@ -332,6 +357,7 @@ class DiscogsCacheService:
                 extra_artists=extra_artist_credits,
                 labels=label_credits,
                 released=release_row["released"],
+                videos=videos,
             )
 
         except Exception as e:
@@ -440,6 +466,27 @@ class DiscogsCacheService:
                         await conn.executemany(
                             "INSERT INTO release_style (release_id, style) VALUES ($1, $2)",
                             [(release.release_id, s) for s in release.styles],
+                        )
+                except Exception:
+                    pass
+
+                # Delete + re-insert videos (table may not exist yet)
+                try:
+                    await conn.execute(
+                        "DELETE FROM release_video WHERE release_id = $1",
+                        release.release_id,
+                    )
+                    if release.videos:
+                        await conn.executemany(
+                            """
+                            INSERT INTO release_video
+                                (release_id, sequence, src, title, duration, embed)
+                            VALUES ($1, $2, $3, $4, $5, $6)
+                            """,
+                            [
+                                (release.release_id, i + 1, v.src, v.title, v.duration, v.embed)
+                                for i, v in enumerate(release.videos)
+                            ],
                         )
                 except Exception:
                     pass

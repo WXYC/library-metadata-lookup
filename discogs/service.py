@@ -41,6 +41,7 @@ from discogs.models import (
     MemberRef,
     ReleaseInfo,
     ReleaseMetadataResponse,
+    ReleaseVideo,
     TrackItem,
     TrackReleasesResponse,
 )
@@ -539,6 +540,18 @@ class DiscogsService:
             images = data.get("images", [])
             artwork_url = images[0].get("uri") if images else None
 
+            # Extract videos (skip entries without a URI)
+            videos = [
+                ReleaseVideo(
+                    src=v["uri"],
+                    title=v.get("title"),
+                    duration=v.get("duration"),
+                    embed=v.get("embed", True),
+                )
+                for v in data.get("videos", [])
+                if v.get("uri")
+            ]
+
             release = ReleaseMetadataResponse(
                 release_id=release_id,
                 title=data.get("title", ""),
@@ -557,6 +570,7 @@ class DiscogsService:
                 extra_artists=extra_artist_credits,
                 labels=label_credits,
                 released=released,
+                videos=videos,
             )
 
             # Write back to cache for future queries
