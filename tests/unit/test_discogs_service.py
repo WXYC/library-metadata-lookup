@@ -485,8 +485,18 @@ class TestGetRelease:
             "tracklist": [],
             "images": [],
             "videos": [
-                {"uri": "https://www.youtube.com/watch?v=abc", "title": "Metronomic Underground", "duration": 456, "embed": True},
-                {"uri": "https://www.youtube.com/watch?v=def", "title": "French Disko", "duration": 204, "embed": False},
+                {
+                    "uri": "https://www.youtube.com/watch?v=abc",
+                    "title": "Metronomic Underground",
+                    "duration": 456,
+                    "embed": True,
+                },
+                {
+                    "uri": "https://www.youtube.com/watch?v=def",
+                    "title": "French Disko",
+                    "duration": 204,
+                    "embed": False,
+                },
             ],
         }
 
@@ -519,7 +529,12 @@ class TestGetRelease:
             "tracklist": [],
             "images": [],
             "videos": [
-                {"uri": "https://www.youtube.com/watch?v=abc", "title": "Moon Dust", "duration": 180, "embed": True},
+                {
+                    "uri": "https://www.youtube.com/watch?v=abc",
+                    "title": "Moon Dust",
+                    "duration": 180,
+                    "embed": True,
+                },
                 {"uri": "", "title": "No URI video", "duration": 100, "embed": True},
                 {"title": "Missing URI key entirely", "duration": 100, "embed": True},
             ],
