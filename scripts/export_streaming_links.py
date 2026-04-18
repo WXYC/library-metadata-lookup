@@ -11,7 +11,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import sqlite3
@@ -75,7 +74,8 @@ def main(args: argparse.Namespace) -> None:
     if args.dry_run:
         # Show stats
         from collections import Counter
-        service_counts = Counter()
+
+        service_counts: Counter[str] = Counter()
         for entry in links.values():
             for k in entry:
                 service_counts[k] += 1
