@@ -91,6 +91,8 @@ class ResultsDB:
             ("deezer_matched_artist", "TEXT"),
             ("deezer_matched_title", "TEXT"),
             ("deezer_checked_at", "TEXT"),
+            ("bandcamp_slug", "TEXT"),
+            ("bandcamp_url", "TEXT"),
         ]
         for col_name, col_type in migrations:
             if col_name not in columns:
@@ -270,6 +272,64 @@ class ResultsDB:
         cursor = await self._db.execute("""SELECT * FROM albums
                WHERE spotify_status = 'not_found' AND is_compilation = 0
                ORDER BY display_artist, display_title""")
+        return list(await cursor.fetchall())
+
+    async def update_bandcamp_slug(self, album_id: int, slug: str) -> None:
+        """Set the Bandcamp slug for an album."""
+        assert self._db is not None
+        async with self._write_lock:
+            await self._db.execute(
+                "UPDATE albums SET bandcamp_slug = ? WHERE id = ?",
+                (slug, album_id),
+            )
+            await self._db.commit()
+
+    async def update_bandcamp_url(self, album_id: int, url: str) -> None:
+        """Set the Bandcamp album URL for an album."""
+        assert self._db is not None
+        async with self._write_lock:
+            await self._db.execute(
+                "UPDATE albums SET bandcamp_url = ? WHERE id = ?",
+                (url, album_id),
+            )
+            await self._db.commit()
+
+    async def get_artists_without_bandcamp_slug(
+        self,
+        *,
+        not_on_streaming_only: bool = True,
+        limit: int | None = None,
+    ) -> list[aiosqlite.Row]:
+        """Get distinct artists with no bandcamp_slug set.
+
+        Args:
+            not_on_streaming_only: If True, only return artists not found on
+                Spotify (matching the not-on-streaming scope).
+            limit: Maximum number of distinct artists to return.
+        """
+        assert self._db is not None
+        query = (
+            "SELECT DISTINCT display_artist FROM albums "
+            "WHERE bandcamp_slug IS NULL AND is_compilation = 0"
+        )
+        if not_on_streaming_only:
+            query += " AND spotify_status = 'not_found'"
+        if limit is not None:
+            query += f" LIMIT {limit}"
+        cursor = await self._db.execute(query)
+        return list(await cursor.fetchall())
+
+    async def get_pending_bandcamp_lookup(self, limit: int | None = None) -> list[aiosqlite.Row]:
+        """Get albums with a slug but no album-level bandcamp_url."""
+        assert self._db is not None
+        query = (
+            "SELECT * FROM albums "
+            "WHERE bandcamp_slug IS NOT NULL AND bandcamp_slug != '' "
+            "AND bandcamp_url IS NULL AND is_compilation = 0"
+        )
+        if limit is not None:
+            query += f" LIMIT {limit}"
+        cursor = await self._db.execute(query)
         return list(await cursor.fetchall())
 
     async def get_all_results(self) -> list[aiosqlite.Row]:

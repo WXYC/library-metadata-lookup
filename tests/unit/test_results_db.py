@@ -198,3 +198,191 @@ class TestGetStats:
     async def test_stats_empty_db(self, db):
         stats = await db.get_stats()
         assert stats["total"] == 0
+
+
+class TestBandcampSlugMigration:
+    @pytest.mark.asyncio
+    async def test_bandcamp_slug_column_exists(self, db):
+        """The bandcamp_slug column should be created by migration."""
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["bandcamp_slug"] is None
+
+    @pytest.mark.asyncio
+    async def test_set_bandcamp_slug(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.update_bandcamp_slug(album_id, "stereolab")
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["bandcamp_slug"] == "stereolab"
+
+
+class TestGetArtistsWithoutBandcampSlug:
+    @pytest.mark.asyncio
+    async def test_returns_artists_without_slug(self, db):
+        await db.insert_albums(
+            [
+                _make_album(),
+                _make_album(
+                    normalized_artist="autechre",
+                    normalized_title="confield",
+                    display_artist="Autechre",
+                    display_title="Confield",
+                    library_ids=[3],
+                    formats=["cd"],
+                ),
+            ]
+        )
+        rows = await db.get_artists_without_bandcamp_slug(not_on_streaming_only=False)
+        artists = [r["display_artist"] for r in rows]
+        assert "Stereolab" in artists
+        assert "Autechre" in artists
+
+    @pytest.mark.asyncio
+    async def test_excludes_artists_with_slug(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
+        rows = await db.get_artists_without_bandcamp_slug(not_on_streaming_only=False)
+        artists = [r["display_artist"] for r in rows]
+        assert "Stereolab" not in artists
+
+    @pytest.mark.asyncio
+    async def test_excludes_compilations(self, db):
+        await db.insert_albums(
+            [
+                _make_album(
+                    normalized_artist="various artists",
+                    display_artist="Various Artists",
+                    is_compilation=True,
+                ),
+            ]
+        )
+        rows = await db.get_artists_without_bandcamp_slug(not_on_streaming_only=False)
+        artists = [r["display_artist"] for r in rows]
+        assert "Various Artists" not in artists
+
+    @pytest.mark.asyncio
+    async def test_not_on_streaming_only_filters(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.update_result(album_id, "spotify", "found", url="https://open.spotify.com/album/x")
+        # With not_on_streaming_only=True, found-on-spotify albums should be excluded
+        rows = await db.get_artists_without_bandcamp_slug(not_on_streaming_only=True)
+        assert len(rows) == 0
+
+    @pytest.mark.asyncio
+    async def test_not_on_streaming_includes_not_found(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.update_result(album_id, "spotify", "not_found")
+        rows = await db.get_artists_without_bandcamp_slug(not_on_streaming_only=True)
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_respects_limit(self, db):
+        await db.insert_albums(
+            [
+                _make_album(),
+                _make_album(
+                    normalized_artist="autechre",
+                    normalized_title="confield",
+                    display_artist="Autechre",
+                    display_title="Confield",
+                    library_ids=[3],
+                    formats=["cd"],
+                ),
+            ]
+        )
+        rows = await db.get_artists_without_bandcamp_slug(not_on_streaming_only=False, limit=1)
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_distinct_artists(self, db):
+        await db.insert_albums(
+            [
+                _make_album(),
+                _make_album(
+                    normalized_artist="stereolab",
+                    normalized_title="dots and loops",
+                    display_artist="Stereolab",
+                    display_title="Dots and Loops",
+                    library_ids=[5],
+                    formats=["cd"],
+                ),
+            ]
+        )
+        rows = await db.get_artists_without_bandcamp_slug(not_on_streaming_only=False)
+        artists = [r["display_artist"] for r in rows]
+        assert artists.count("Stereolab") == 1
+
+
+class TestGetPendingBandcampLookup:
+    @pytest.mark.asyncio
+    async def test_returns_albums_with_slug_and_no_url(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
+        pending = await db.get_pending_bandcamp_lookup()
+        assert len(pending) == 1
+        assert pending[0]["bandcamp_slug"] == "stereolab"
+
+    @pytest.mark.asyncio
+    async def test_excludes_empty_string_slug(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "")
+        pending = await db.get_pending_bandcamp_lookup()
+        assert len(pending) == 0
+
+    @pytest.mark.asyncio
+    async def test_excludes_albums_with_bandcamp_url(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.update_bandcamp_slug(album_id, "stereolab")
+        await db.update_bandcamp_url(
+            album_id, "https://stereolab.bandcamp.com/album/aluminum-tunes"
+        )
+        pending = await db.get_pending_bandcamp_lookup()
+        assert len(pending) == 0
+
+    @pytest.mark.asyncio
+    async def test_excludes_compilations(self, db):
+        await db.insert_albums(
+            [
+                _make_album(
+                    normalized_artist="various artists",
+                    display_artist="Various Artists",
+                    is_compilation=True,
+                ),
+            ]
+        )
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "someslug")
+        pending = await db.get_pending_bandcamp_lookup()
+        assert len(pending) == 0
+
+    @pytest.mark.asyncio
+    async def test_respects_limit(self, db):
+        await db.insert_albums(
+            [
+                _make_album(),
+                _make_album(
+                    normalized_artist="autechre",
+                    normalized_title="confield",
+                    display_artist="Autechre",
+                    display_title="Confield",
+                    library_ids=[3],
+                    formats=["cd"],
+                ),
+            ]
+        )
+        all_rows = await db.get_pending("spotify", limit=10)
+        for r in all_rows:
+            await db.update_bandcamp_slug(r["id"], "someslug")
+        pending = await db.get_pending_bandcamp_lookup(limit=1)
+        assert len(pending) == 1
