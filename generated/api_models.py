@@ -86,6 +86,7 @@ class FlowsheetEntryResponse(FlowsheetEntryBase):
     rotation_id: int | None = None
     rotation_bin: RotationBin | None = None
     request_flag: bool
+    segue: bool | None = None
     message: str | None = None
     artwork_url: str | None = None
     discogs_url: str | None = None
@@ -106,6 +107,7 @@ class FlowsheetSongEntry(FlowsheetEntryBase):
     record_label: str
     label_id: int | None = None
     request_flag: bool
+    segue: bool | None = None
     album_id: int | None = None
     rotation_id: int | None = None
     rotation_bin: RotationBin | None = None
@@ -129,6 +131,7 @@ class FlowsheetCreateSongFromCatalog(BaseModel):
     track_title: str
     rotation_id: int | None = None
     request_flag: bool
+    segue: bool | None = None
     record_label: str | None = None
 
 
@@ -137,6 +140,7 @@ class FlowsheetCreateSongFreeform(BaseModel):
     album_title: str
     track_title: str
     request_flag: bool
+    segue: bool | None = None
     record_label: str | None = None
     label_id: int | None = None
 
@@ -162,6 +166,7 @@ class FlowsheetUpdateRequest(BaseModel):
     record_label: str | None = None
     label_id: int | None = None
     request_flag: bool | None = None
+    segue: bool | None = None
 
 
 class FlowsheetQueryParams(BaseModel):
@@ -241,6 +246,7 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
     track_title: str | None = None
     record_label: str | None = None
     request_flag: bool
+    segue: bool | None = None
     rotation_bin: RotationBin | None = None
     artwork_url: str | None = None
     discogs_url: str | None = None
@@ -868,7 +874,8 @@ class LookupRequest(BaseModel):
     song: str | None = Field(None, description="Parsed song/track title")
     album: str | None = Field(None, description="Parsed album name")
     raw_message: str = Field(
-        ..., description="Original request message (needed for ambiguous format detection)"
+        ...,
+        description="Original request message (needed for ambiguous format detection)",
     )
 
 
