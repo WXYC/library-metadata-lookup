@@ -1,0 +1,50 @@
+name: Refresh Streaming Availability
+
+on:
+  schedule:
+    # Weekly on Sunday at midnight UTC
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -e "."
+
+      - name: Download current streaming_availability.db
+        run: |
+          gh release download streaming-data-v1 --pattern streaming_availability.db --dir . || echo "No existing release, starting fresh"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Run streaming availability pipeline
+        run: |
+          python -m scripts.streaming_availability \
+            --library-db library.db \
+            --results-db streaming_availability.db \
+            --retry-errors \
+            --batch-size 200
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+
+      - name: Verify export
+        run: |
+          python scripts/export_streaming_links.py \
+            --library-db library.db \
+            --streaming-db streaming_availability.db \
+            --dry-run
+
+      - name: Upload to GitHub Release
+        run: |
+          gh release upload streaming-data-v1 streaming_availability.db --clobber 2>/dev/null || \
+          gh release create streaming-data-v1 streaming_availability.db --title "Streaming availability data" --notes "Pre-computed streaming service URLs for WXYC library releases. Updated weekly by the refresh-streaming workflow."
+        env:
+          GH_TOKEN: ${{ github.token }}
