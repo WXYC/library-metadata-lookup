@@ -1295,6 +1295,93 @@ class TestStreamingLinks:
 
         assert links is None
 
+    @pytest.mark.asyncio
+    async def test_all_null_urls_returns_dict_with_nones(self, tmp_path):
+        """Insert streaming_links row where every URL is NULL. Returns dict with all None values."""
+        db_path = tmp_path / "test.db"
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+                "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+                "genre TEXT, format TEXT)"
+            )
+            await conn.execute(
+                "INSERT INTO library VALUES (100, 'Confield', 'Autechre', "
+                "'EL', 16, 1, 'Electronic', 'CD')"
+            )
+            await conn.execute(
+                "CREATE TABLE streaming_links ("
+                "library_id INTEGER PRIMARY KEY, spotify_url TEXT, apple_music_url TEXT, "
+                "deezer_url TEXT, bandcamp_url TEXT, tidal_url TEXT, "
+                "youtube_music_url TEXT, soundcloud_url TEXT)"
+            )
+            await conn.execute("INSERT INTO streaming_links (library_id) VALUES (100)")
+            await conn.commit()
+
+        db = LibraryDB(db_path)
+        await db.connect()
+        links = await db.get_streaming_links(100)
+        await db.close()
+
+        assert links is not None
+        assert all(v is None for v in links.values())
+
+    @pytest.mark.asyncio
+    async def test_has_streaming_links_flag_true_on_connect(self, tmp_path):
+        """Create DB with streaming_links table. After connect(), flag is True."""
+        db_path = tmp_path / "test.db"
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+                "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+                "genre TEXT, format TEXT)"
+            )
+            await conn.execute(
+                "CREATE TABLE streaming_links ("
+                "library_id INTEGER PRIMARY KEY, spotify_url TEXT, apple_music_url TEXT, "
+                "deezer_url TEXT, bandcamp_url TEXT, tidal_url TEXT, "
+                "youtube_music_url TEXT, soundcloud_url TEXT)"
+            )
+            await conn.commit()
+
+        db = LibraryDB(db_path)
+        await db.connect()
+        assert db._has_streaming_links is True
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_has_streaming_links_flag_false_without_table(self, tmp_path):
+        """Create DB without streaming_links table. Flag is False."""
+        db_path = tmp_path / "test.db"
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+                "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+                "genre TEXT, format TEXT)"
+            )
+            await conn.commit()
+
+        db = LibraryDB(db_path)
+        await db.connect()
+        assert db._has_streaming_links is False
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_conn_is_none(self):
+        """Set db._conn = None. get_streaming_links() returns None."""
+        db = LibraryDB()
+        db._conn = None
+        db._has_streaming_links = True
+
+        result = await db.get_streaming_links(100)
+        assert result is None
+
 
 class TestStreamingStatus:
     """Tests for get_streaming_status() batch method."""
@@ -1375,4 +1462,51 @@ class TestStreamingStatus:
         status = await db.get_streaming_status([100])
         await db.close()
 
+        assert status == {}
+
+    @pytest.mark.asyncio
+    async def test_streaming_status_empty_list(self, tmp_path):
+        """get_streaming_status([]) returns {}."""
+        db_path = tmp_path / "test.db"
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+                "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+                "genre TEXT, format TEXT)"
+            )
+            await conn.execute(
+                "CREATE TABLE streaming_links ("
+                "library_id INTEGER PRIMARY KEY, spotify_url TEXT, apple_music_url TEXT, "
+                "deezer_url TEXT, bandcamp_url TEXT, tidal_url TEXT, "
+                "youtube_music_url TEXT, soundcloud_url TEXT)"
+            )
+            await conn.commit()
+
+        db = LibraryDB(db_path)
+        await db.connect()
+        status = await db.get_streaming_status([])
+        await db.close()
+
+        assert status == {}
+
+    @pytest.mark.asyncio
+    async def test_streaming_status_when_flag_false(self):
+        """_has_streaming_links=False returns {}."""
+        db = LibraryDB()
+        db._conn = AsyncMock()
+        db._has_streaming_links = False
+
+        status = await db.get_streaming_status([100, 200])
+        assert status == {}
+
+    @pytest.mark.asyncio
+    async def test_streaming_status_when_conn_none(self):
+        """_conn=None returns {}."""
+        db = LibraryDB()
+        db._conn = None
+        db._has_streaming_links = True
+
+        status = await db.get_streaming_status([100, 200])
         assert status == {}
