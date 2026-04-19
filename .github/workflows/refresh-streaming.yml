@@ -28,9 +28,9 @@ jobs:
 
       - run: pip install -e "."
 
-      - name: Download current streaming_availability.db
+      - name: Download library.db and streaming_availability.db from release
         run: |
-          gh release download streaming-data-v1 --pattern streaming_availability.db --dir . || echo "No existing release, starting fresh"
+          gh release download streaming-data-v1 --dir . || echo "No existing release, starting fresh"
         env:
           GH_TOKEN: ${{ github.token }}
 
