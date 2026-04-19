@@ -16,6 +16,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install wxyc-etl from source
+        run: |
+          pip install maturin
+          git clone --depth 1 https://github.com/WXYC/wxyc-etl.git /tmp/wxyc-etl
+          cd /tmp/wxyc-etl/wxyc-etl-python
+          maturin build --release
+          pip install /tmp/wxyc-etl/target/wheels/*.whl
+
       - run: pip install -e "."
 
       - name: Download current streaming_availability.db
