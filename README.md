@@ -15,7 +15,7 @@ These projects depend on library-metadata-lookup:
 | [dj-site](https://github.com/WXYC/dj-site) | Indirect via Backend-Service. DJ flowsheet and card catalog frontend. |
 | [wxyc-ios-64](https://github.com/WXYC/wxyc-ios-64) | Indirect via Backend-Service. iOS/macOS/tvOS/watchOS app. |
 | [WXYC-Android](https://github.com/WXYC/WXYC-Android) | Indirect via Backend-Service. Android app. |
-| [discogs-cache](https://github.com/WXYC/discogs-cache) | Shared data. Its ETL pipeline produces `library.db` (consumed at runtime by this service) and populates the PostgreSQL Discogs cache (queried by `discogs/cache_service.py`). |
+| [discogs-cache](https://github.com/WXYC/discogs-etl) | Shared data. Its ETL pipeline produces `library.db` (consumed at runtime by this service) and populates the PostgreSQL Discogs cache (queried by `discogs/cache_service.py`). |
 
 ## Dependencies
 

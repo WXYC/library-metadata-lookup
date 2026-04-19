@@ -86,7 +86,7 @@ class LibraryDB:
         if not self.db_path.exists():
             raise FileNotFoundError(
                 f"Library database not found at {self.db_path}. "
-                "Upload via POST /admin/upload-library-db or see discogs-cache repo."
+                "Upload via POST /admin/upload-library-db or see discogs-etl repo."
             )
 
         self._conn = await aiosqlite.connect(self.db_path)

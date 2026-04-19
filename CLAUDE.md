@@ -64,7 +64,7 @@ The service supports an optional PostgreSQL cache for Discogs data:
 3. Write API results back to cache
 4. Gracefully degrade to API-only if cache unavailable
 
-Set `DATABASE_URL_DISCOGS` to enable. The cache schema is defined in [WXYC/discogs-cache](https://github.com/WXYC/discogs-cache).
+Set `DATABASE_URL_DISCOGS` to enable. The cache schema is defined in [WXYC/discogs-etl](https://github.com/WXYC/discogs-etl).
 
 ## Development
 
@@ -181,7 +181,7 @@ Content-Type: multipart/form-data
 The upload endpoint validates the SQLite file, closes the current DB connection,
 atomically replaces the file, and returns `{"status": "ok", "row_count": <int>}`.
 
-The ETL script in [discogs-cache](https://github.com/WXYC/discogs-cache) (`scripts/sync-library.sh`) handles daily uploads to both staging and production.
+The ETL script in [discogs-cache](https://github.com/WXYC/discogs-etl) (`scripts/sync-library.sh`) handles daily uploads to both staging and production.
 
 ### Health Check Behavior
 
@@ -233,7 +233,7 @@ Generates two SQL files for review before application: `va_flowsheet_updates.sql
 - **[request-o-matic](https://github.com/WXYC/request-o-matic)** -- The caller. Parses messages, calls this service, posts to Slack.
 - **[wxyc-shared](https://github.com/WXYC/wxyc-shared)** -- Shared API contract (`api.yaml`). Defines `LookupRequest`, `LookupResponse`, and related schemas. Python models are generated via `scripts/generate_api_models.sh` and committed to `generated/api_models.py`. The generated models are used as API boundary types; internal domain models (`LibraryItem`, `DiscogsSearchResult`) are converted via `to_catalog_item()` / `to_match_result()` methods.
 - **[wxyc-etl](https://github.com/WXYC/wxyc-etl)** -- Shared Rust library with Python bindings (PyO3/maturin). Provides `wxyc_etl.text` (artist name normalization, diacritics stripping, compilation detection) and `wxyc_etl.schema` (library.db column definitions). These were previously duplicated locally in `core/matching.py`.
-- **[discogs-cache](https://github.com/WXYC/discogs-cache)** -- ETL pipeline that populates the PostgreSQL Discogs cache consumed by `discogs/cache_service.py`. The pipeline is filtered by `library.db`, which discogs-cache generates from the WXYC MySQL catalog via `scripts/export_to_sqlite.py`. The `library.db` file serves dual purpose: runtime search for this service and primary input to the discogs-cache pipeline. The library ETL scripts (`export_to_sqlite.py`, `sync-library.sh`) live in discogs-cache.
+- **[discogs-cache](https://github.com/WXYC/discogs-etl)** -- ETL pipeline that populates the PostgreSQL Discogs cache consumed by `discogs/cache_service.py`. The pipeline is filtered by `library.db`, which discogs-cache generates from the WXYC MySQL catalog via `scripts/export_to_sqlite.py`. The `library.db` file serves dual purpose: runtime search for this service and primary input to the discogs-cache pipeline. The library ETL scripts (`export_to_sqlite.py`, `sync-library.sh`) live in discogs-cache.
 
 ## Example Music Data for Tests
 
