@@ -1,7 +1,8 @@
 """Track-level search on Spotify and Deezer APIs.
 
 Wraps the existing SpotifyClient.search_track and DeezerClient.search_track
-with find_best_match scoring.
+with find_best_match scoring. Applies a higher confidence floor for short
+titles to reduce false positives on generic track names.
 """
 
 from __future__ import annotations
@@ -12,6 +13,9 @@ from scripts.streaming_availability.matching import find_best_match
 
 logger = logging.getLogger(__name__)
 
+SHORT_TITLE_LENGTH = 4
+SHORT_TITLE_CONFIDENCE = 95.0
+
 # Spotify track result accessors
 _SPOTIFY_ARTIST = lambda r: r.get("artists", [{}])[0].get("name", "")  # noqa: E731
 _SPOTIFY_TITLE = lambda r: r.get("name", "")  # noqa: E731
@@ -21,6 +25,13 @@ _SPOTIFY_URL = lambda r: r.get("external_urls", {}).get("spotify", "")  # noqa: 
 _DEEZER_ARTIST = lambda r: r.get("artist", {}).get("name", "")  # noqa: E731
 _DEEZER_TITLE = lambda r: r.get("title", "")  # noqa: E731
 _DEEZER_URL = lambda r: r.get("link", "")  # noqa: E731
+
+
+def _passes_confidence_floor(title: str, match: dict) -> bool:
+    """Check if a match meets the confidence floor for its title length."""
+    if len(title.strip()) <= SHORT_TITLE_LENGTH:
+        return match["confidence"] >= SHORT_TITLE_CONFIDENCE
+    return True
 
 
 async def search_track_on_services(
@@ -48,7 +59,7 @@ async def search_track_on_services(
                 title_fn=_DEEZER_TITLE,
                 url_fn=_DEEZER_URL,
             )
-            if match:
+            if match and _passes_confidence_floor(title, match):
                 result["deezer_url"] = match["url"]
                 result["deezer_confidence"] = match["confidence"]
         except Exception:
@@ -66,7 +77,7 @@ async def search_track_on_services(
                 title_fn=_SPOTIFY_TITLE,
                 url_fn=_SPOTIFY_URL,
             )
-            if match:
+            if match and _passes_confidence_floor(title, match):
                 result["spotify_url"] = match["url"]
                 result["spotify_confidence"] = match["confidence"]
         except Exception:

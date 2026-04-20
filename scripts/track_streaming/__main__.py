@@ -353,6 +353,73 @@ async def phase_api_search(results_db: ResultsDB, args) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 4.5: URL validation
+# ---------------------------------------------------------------------------
+
+
+async def phase_validate(results_db: ResultsDB, args) -> tuple[int, int]:
+    """Validate matched track URLs against service metadata. Returns (valid, invalid)."""
+    import httpx
+
+    from scripts.track_streaming.validate import validate_deezer_url, validate_spotify_url
+
+    assert results_db._db is not None
+    cursor = await results_db._db.execute(
+        """SELECT id, artist, title, spotify_url, deezer_url
+           FROM track_results
+           WHERE resolution_status = 'api_match'
+             AND (spotify_url IS NOT NULL OR deezer_url IS NOT NULL)"""
+    )
+    rows = [dict(r) for r in await cursor.fetchall()]
+    logger.info("Validating %d API-matched track URLs", len(rows))
+
+    valid = 0
+    invalid = 0
+
+    async with httpx.AsyncClient() as http:
+        for i, row in enumerate(rows, 1):
+            if _shutdown_requested:
+                break
+
+            is_valid = True
+            if row["spotify_url"]:
+                is_valid = await validate_spotify_url(
+                    http, row["spotify_url"], row["artist"], row["title"]
+                )
+            if is_valid and row["deezer_url"]:
+                is_valid = await validate_deezer_url(
+                    http, row["deezer_url"], row["artist"], row["title"]
+                )
+
+            if is_valid:
+                valid += 1
+            else:
+                invalid += 1
+                logger.debug(
+                    "False positive: %s - %s (%s / %s)",
+                    row["artist"],
+                    row["title"],
+                    row["spotify_url"],
+                    row["deezer_url"],
+                )
+                await results_db.update_track_resolution(
+                    track_id=row["id"], status="false_positive"
+                )
+
+            if i % 100 == 0:
+                logger.info(
+                    "  Validate: %d / %d | valid: %d | false positive: %d",
+                    i,
+                    len(rows),
+                    valid,
+                    invalid,
+                )
+
+    logger.info("Validation complete: %d valid, %d false positives", valid, invalid)
+    return valid, invalid
+
+
+# ---------------------------------------------------------------------------
 # Phase 5: Album-level rollup
 # ---------------------------------------------------------------------------
 
@@ -442,6 +509,11 @@ async def run(args) -> None:
                 found, checked = await phase_api_search(results_db, args)
                 logger.info("Phase 4 complete: %d / %d found via API", found, checked)
 
+        # Phase 4.5: Validate API matches
+        if args.phase in ("validate", "all") and not _shutdown_requested:
+            valid, invalid = await phase_validate(results_db, args)
+            logger.info("Phase 4.5 complete: %d valid, %d false positives", valid, invalid)
+
         # Phase 5: Album rollup
         if args.phase in ("rollup", "all") and not _shutdown_requested:
             on, off = await phase_album_rollup(results_db)
@@ -471,7 +543,7 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
     )
     parser.add_argument(
         "--phase",
-        choices=["extract", "resolve", "search", "rollup", "all"],
+        choices=["extract", "resolve", "search", "validate", "rollup", "all"],
         default="all",
     )
     parser.add_argument("--batch-size", type=int, default=100)
