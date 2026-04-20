@@ -591,9 +591,9 @@ class TestSearchLibraryWithFallback:
         )
         # The self-titled album should be included because "S/t" means the
         # album name is the same as the artist name.
-        assert any(r.title == "S/t" for r in results), (
-            "Self-titled album 'S/t' should match when Discogs album is the artist name"
-        )
+        assert any(
+            r.title == "S/t" for r in results
+        ), "Self-titled album 'S/t' should match when Discogs album is the artist name"
         assert fallback is False
 
     @pytest.mark.asyncio
@@ -624,6 +624,37 @@ class TestSearchLibraryWithFallback:
         # Primary album should be sorted first
         assert results[0].title == "Emperor Tomato Ketchup"
         assert mock_library_db.search.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_album_only_search_when_no_artist(self, mock_library_db):
+        """When parser extracts album but no artist, search by album title alone.
+
+        Bug: "Keep On Climbin' from DJ-Kicks: Honey Dijon" parses as
+        artist=None, album="DJ-Kicks: Honey Dijon", song="Keep On Climbin'".
+        The library has "DJ Kicks: Honey Dijon" (no hyphen). Without an artist,
+        search_library_with_fallback should still search for the album.
+        """
+        dj_kicks = make_library_item(
+            id=71708,
+            artist="Various Artists - Electronic - D",
+            title="DJ Kicks: Honey Dijon",
+        )
+        mock_library_db.search.return_value = [dj_kicks]
+
+        parsed = ParsedRequest(
+            song="Keep On Climbin'",
+            artist=None,
+            album="DJ-Kicks: Honey Dijon",
+            raw_message="Keep On Climbin' from DJ-Kicks: Honey Dijon",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+
+        results, fallback = await search_library_with_fallback(
+            mock_library_db, parsed, ["DJ-Kicks: Honey Dijon"]
+        )
+        assert len(results) == 1
+        assert results[0].title == "DJ Kicks: Honey Dijon"
 
 
 # ---------------------------------------------------------------------------

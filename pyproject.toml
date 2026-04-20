@@ -38,6 +38,9 @@ dev = [
     "datamodel-code-generator[http]>=0.26.0",
 ]
 
+[tool.uv.sources]
+wxyc-etl = { path = "../wxyc-etl/wxyc-etl-python", editable = true }
+
 [build-system]
 requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -67,6 +70,11 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 module = "generated.*"
 ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["wxyc_etl", "wxyc_etl.*", "asyncpg", "asyncpg.*"]
+ignore_missing_imports = true
+follow_untyped_imports = true
 
 [tool.pytest.ini_options]
 markers = [
