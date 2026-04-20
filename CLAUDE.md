@@ -136,9 +136,10 @@ Optional:
 ## Code Style
 
 - Line length: 100 chars
-- Use `black` for formatting, `ruff` for linting
+- Use `ruff format` for formatting, `ruff check` for linting
 - Type hints encouraged
 - Async/await for all I/O operations
+- Pre-commit hook runs `ruff check` + `ruff format --check` on staged `.py` files. Activate with: `git config core.hooksPath .githooks`
 
 ## Deployment
 

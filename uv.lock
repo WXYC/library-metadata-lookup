@@ -512,7 +512,6 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "black" },
     { name = "datamodel-code-generator", extra = ["http"] },
     { name = "mypy" },
     { name = "pytest" },
@@ -527,7 +526,6 @@ requires-dist = [
     { name = "aiolimiter", specifier = ">=1.1.0" },
     { name = "aiosqlite", specifier = ">=0.19.0" },
     { name = "asyncpg", specifier = ">=0.29.0" },
-    { name = "black", marker = "extra == 'dev'", specifier = ">=23.0.0" },
     { name = "cachetools", specifier = ">=5.0.0" },
     { name = "datamodel-code-generator", extras = ["http"], marker = "extra == 'dev'", specifier = ">=0.26.0" },
     { name = "fastapi", specifier = ">=0.104.0" },
