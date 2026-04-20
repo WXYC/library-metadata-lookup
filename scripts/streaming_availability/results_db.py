@@ -474,6 +474,7 @@ class ResultsDB:
             - counts.get("pending", 0)
             - counts.get("local_miss", 0)
             - counts.get("not_found", 0)
+            - counts.get("false_positive", 0)
             - counts.get("error", 0)
         )
         return {

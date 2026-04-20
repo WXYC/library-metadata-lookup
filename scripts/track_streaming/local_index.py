@@ -34,6 +34,8 @@ class LocalStreamingIndex:
     """
 
     ARTIST_THRESHOLD = 80.0
+    SHORT_TITLE_THRESHOLD = 95.0  # Stricter for titles <= 4 chars
+    SHORT_TITLE_LENGTH = 4
 
     def __init__(self):
         self._index: dict[str, list[TrackEntry]] = defaultdict(list)
@@ -56,11 +58,17 @@ class LocalStreamingIndex:
         if not candidates:
             return None
 
+        threshold = (
+            self.SHORT_TITLE_THRESHOLD
+            if len(title.strip()) <= self.SHORT_TITLE_LENGTH
+            else self.ARTIST_THRESHOLD
+        )
+
         best_entry = None
         best_score = 0.0
         for entry in candidates:
             artist_score = score_match(artist, entry.artist)
-            if artist_score >= self.ARTIST_THRESHOLD and artist_score > best_score:
+            if artist_score >= threshold and artist_score > best_score:
                 best_score = artist_score
                 best_entry = entry
 

@@ -94,6 +94,29 @@ class TestLocalStreamingIndex:
         match = index.lookup("Duke Ellington", "Love")
         assert match is None
 
+    def test_short_title_requires_higher_artist_score(self):
+        """Short titles like 'Dub' need a stricter artist match to avoid false positives."""
+        index = self._build_index(
+            [
+                ("Autechre", "Dub", 1, None),
+            ]
+        )
+        # Exact artist match should still work even for short titles
+        match = index.lookup("Autechre", "Dub")
+        assert match is not None
+
+    def test_short_title_rejects_fuzzy_artist(self):
+        """Short title + fuzzy artist = too risky."""
+        index = self._build_index(
+            [
+                ("The Chemical Brothers", "Love", 1, None),
+            ]
+        )
+        # "Chemical Brothers" vs "The Chemical Brothers" would pass normal threshold
+        # but with a 3-char title, we need near-exact artist
+        match = index.lookup("Chemical Sisters", "Love")
+        assert match is None
+
     def test_stats(self):
         index = self._build_index(
             [

@@ -100,3 +100,33 @@ class TestSearchTrackOnServices:
     async def test_no_clients_returns_none(self):
         result = await search_track_on_services("Codeine", "Pickup Song", None, None)
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_short_title_exact_artist_accepted(self):
+        """Short title 'Dub' with exact artist match should pass the confidence floor."""
+        deezer = AsyncMock()
+        deezer.search_track.return_value = [
+            {
+                "title": "Dub",
+                "artist": {"name": "Autechre"},
+                "link": "https://www.deezer.com/track/999",
+            }
+        ]
+        result = await search_track_on_services("Autechre", "Dub", None, deezer)
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_short_title_fuzzy_artist_rejected(self):
+        """Short title with a marginal artist match should be rejected for short titles."""
+        deezer = AsyncMock()
+        # "Sango" vs "Sangoma" scores ~83 artist, 100 title → combined ~92
+        # Passes the normal 80 threshold but fails the 95 short-title floor
+        deezer.search_track.return_value = [
+            {
+                "title": "Dub",
+                "artist": {"name": "Sangoma"},
+                "link": "https://www.deezer.com/track/999",
+            }
+        ]
+        result = await search_track_on_services("Sango", "Dub", None, deezer)
+        assert result is None
