@@ -1,0 +1,11 @@
+#!/bin/sh
+# Pre-commit hook: lint and format check staged Python files.
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
+[ -z "$STAGED" ] && exit 0
+
+echo "Running ruff check..."
+ruff check $STAGED || exit 1
+
+echo "Running ruff format --check..."
+ruff format --check $STAGED || { echo "Run 'ruff format .' to fix."; exit 1; }
