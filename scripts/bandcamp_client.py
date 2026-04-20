@@ -76,7 +76,14 @@ class BandcampClient(BaseStreamingClient):
 
             if resp.status_code == 429:
                 if attempt < MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY * (2**attempt)
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            delay = RETRY_BASE_DELAY * (2**attempt)
+                    else:
+                        delay = RETRY_BASE_DELAY * (2**attempt)
                     log.warning(f"429 rate limited, retrying in {delay}s (attempt {attempt + 1})")
                     await asyncio.sleep(delay)
                     continue
