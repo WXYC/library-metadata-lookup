@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unittest.mock
 from unittest.mock import AsyncMock
 
 import httpx
@@ -71,7 +72,7 @@ class TestBandcampClientInit:
 
     def test_semaphore_limit(self):
         client = BandcampClient()
-        assert client._semaphore._value == 3
+        assert client._semaphore._value == 2
 
 
 class TestSearchArtist:
@@ -79,7 +80,7 @@ class TestSearchArtist:
     async def test_returns_matching_band(self):
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_autocomplete_response([_band_result()]))
+        mock_http.request = AsyncMock(return_value=_autocomplete_response([_band_result()]))
         client._http = mock_http
 
         results = await client.search_artist("Autechre")
@@ -93,7 +94,7 @@ class TestSearchArtist:
     async def test_filters_non_band_types(self):
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(
+        mock_http.request = AsyncMock(
             return_value=_autocomplete_response(
                 [
                     {
@@ -118,7 +119,7 @@ class TestSearchArtist:
     async def test_returns_empty_on_http_error(self):
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(
+        mock_http.request = AsyncMock(
             return_value=_error_response(
                 500, "https://bandcamp.com/api/fuzzysearch/2/app_autocomplete"
             )
@@ -132,7 +133,7 @@ class TestSearchArtist:
     async def test_returns_empty_on_no_results(self):
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_autocomplete_response([]))
+        mock_http.request = AsyncMock(return_value=_autocomplete_response([]))
         client._http = mock_http
 
         results = await client.search_artist("xyznonexistent")
@@ -142,7 +143,7 @@ class TestSearchArtist:
     async def test_extracts_slug_from_result(self):
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(
+        mock_http.request = AsyncMock(
             return_value=_autocomplete_response(
                 [_band_result(name="Flying Lotus", url="https://flyinglotus.bandcamp.com")]
             )
@@ -156,11 +157,29 @@ class TestSearchArtist:
     async def test_returns_empty_on_network_error(self):
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+        mock_http.request = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
         client._http = mock_http
 
         results = await client.search_artist("Unreachable")
         assert results == []
+
+    @pytest.mark.asyncio
+    async def test_retries_on_429(self):
+        rate_limited = _error_response(
+            429, "https://bandcamp.com/api/fuzzysearch/2/app_autocomplete"
+        )
+        success = _autocomplete_response([_band_result()])
+
+        client = BandcampClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(side_effect=[rate_limited, success])
+        client._http = mock_http
+
+        with unittest.mock.patch("scripts.bandcamp_client.RETRY_BASE_DELAY", 0.01):
+            results = await client.search_artist("Autechre")
+
+        assert len(results) == 1
+        assert mock_http.request.call_count == 2
 
 
 class TestFetchArtistCatalog:
@@ -182,7 +201,7 @@ class TestFetchArtistCatalog:
         """
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_html_response(html))
+        mock_http.request = AsyncMock(return_value=_html_response(html))
         client._http = mock_http
 
         albums = await client.fetch_artist_catalog("autechre")
@@ -200,7 +219,7 @@ class TestFetchArtistCatalog:
         """
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_html_response(html))
+        mock_http.request = AsyncMock(return_value=_html_response(html))
         client._http = mock_http
 
         albums = await client.fetch_artist_catalog("autechre")
@@ -213,7 +232,7 @@ class TestFetchArtistCatalog:
     async def test_returns_empty_on_404(self):
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(
+        mock_http.request = AsyncMock(
             return_value=_error_response(404, "https://nonexistent99.bandcamp.com/music")
         )
         client._http = mock_http
@@ -225,7 +244,7 @@ class TestFetchArtistCatalog:
     async def test_returns_empty_on_network_error(self):
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+        mock_http.request = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
         client._http = mock_http
 
         albums = await client.fetch_artist_catalog("broken")
@@ -239,7 +258,7 @@ class TestFetchArtistCatalog:
         """
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(return_value=_html_response(html))
+        mock_http.request = AsyncMock(return_value=_html_response(html))
         client._http = mock_http
 
         albums = await client.fetch_artist_catalog("autechre")

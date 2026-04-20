@@ -1,15 +1,22 @@
 """Bandcamp HTTP client for artist search and catalog scraping.
 
-Extends BaseStreamingClient with rate limiting (2 req/s) and concurrency
-control (semaphore of 3). Used by bandcamp_pipeline.py for both slug
-discovery (autocomplete API) and album-level matching (page scraping).
+Extends BaseStreamingClient with rate limiting (1 req/s) and concurrency
+control (semaphore of 2). Retries on 429 with exponential backoff.
+Used by bandcamp_pipeline.py for both slug discovery (autocomplete API)
+and album-level matching (page scraping).
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 
+import httpx
+
 from scripts.streaming_availability.http_client import BaseStreamingClient
+
+log = logging.getLogger(__name__)
 
 AUTOCOMPLETE_URL = "https://bandcamp.com/api/fuzzysearch/2/app_autocomplete"
 
@@ -39,14 +46,45 @@ def extract_slug(url: str | None) -> str | None:
     return match.group(1) if match else None
 
 
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 5.0  # seconds
+
+
 class BandcampClient(BaseStreamingClient):
     """Bandcamp HTTP client for autocomplete search and page scraping.
 
-    Rate limit: 2 requests/second, max 3 concurrent.
+    Rate limit: 1 request/second, max 2 concurrent.
+    Retries on 429 with exponential backoff.
     """
 
     def __init__(self) -> None:
-        super().__init__(rate_limit=(2, 1), semaphore_limit=3)
+        super().__init__(rate_limit=(1, 1), semaphore_limit=2)
+
+    async def _request_with_retry(self, method: str, url: str, **kwargs) -> httpx.Response | None:
+        """Make an HTTP request with retry on 429.
+
+        Returns the response, or None on failure after retries.
+        """
+        client = await self._get_client()
+        for attempt in range(MAX_RETRIES + 1):
+            async with self._semaphore:
+                await self._rate_limiter.acquire()
+                try:
+                    resp = await client.request(method, url, **kwargs)
+                except Exception:
+                    return None
+
+            if resp.status_code == 429:
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_BASE_DELAY * (2**attempt)
+                    log.warning(f"429 rate limited, retrying in {delay}s (attempt {attempt + 1})")
+                    await asyncio.sleep(delay)
+                    continue
+                log.warning(f"429 rate limited after {MAX_RETRIES} retries, giving up: {url}")
+                return None
+
+            return resp
+        return None
 
     async def search_artist(self, artist_name: str) -> list[dict]:
         """Search Bandcamp autocomplete for artist pages.
@@ -54,19 +92,14 @@ class BandcampClient(BaseStreamingClient):
         Returns list of dicts with keys: name, url, slug.
         Only returns band results (type "b").
         """
-        client = await self._get_client()
-        async with self._semaphore:
-            await self._rate_limiter.acquire()
-            try:
-                resp = await client.get(
-                    AUTOCOMPLETE_URL,
-                    params={"q": artist_name, "param": "b"},
-                    timeout=10.0,
-                )
-                if resp.status_code != 200:
-                    return []
-            except Exception:
-                return []
+        resp = await self._request_with_retry(
+            "GET",
+            AUTOCOMPLETE_URL,
+            params={"q": artist_name, "param": "b"},
+            timeout=10.0,
+        )
+        if resp is None or resp.status_code != 200:
+            return []
 
         data = resp.json()
         results = []
@@ -92,15 +125,9 @@ class BandcampClient(BaseStreamingClient):
         Deduplicates by URL.
         """
         url = f"https://{slug}.bandcamp.com/music"
-        client = await self._get_client()
-        async with self._semaphore:
-            await self._rate_limiter.acquire()
-            try:
-                resp = await client.get(url, timeout=15.0, follow_redirects=True)
-                if resp.status_code != 200:
-                    return []
-            except Exception:
-                return []
+        resp = await self._request_with_retry("GET", url, timeout=15.0, follow_redirects=True)
+        if resp is None or resp.status_code != 200:
+            return []
 
         html = resp.text
         seen_paths: set[str] = set()

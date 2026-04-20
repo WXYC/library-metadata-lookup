@@ -12,7 +12,7 @@ search discoveries are passed to lookup via an asyncio.Queue so album
 matching begins immediately as slugs are found.
 
 Usage:
-    .venv/bin/python scripts/bandcamp_pipeline.py [--phase {search,lookup,both}]
+    python -m scripts.bandcamp_pipeline [--phase {search,lookup,both}]
         [--include-streaming] [--artist-fallback] [--dry-run] [--limit N]
 """
 
@@ -360,11 +360,60 @@ async def load_wikidata_slugs(db: ResultsDB) -> int:
     return updated
 
 
+async def dry_run(db: ResultsDB, *, include_streaming: bool = False) -> None:
+    """Report what the pipeline would do without making any changes."""
+    assert db._db is not None
+
+    # Count albums with existing bandcamp_url
+    cursor = await db._db.execute(
+        "SELECT COUNT(*) FROM albums WHERE bandcamp_url LIKE '%/album/%' AND bandcamp_slug IS NULL"
+    )
+    row = await cursor.fetchone()
+    album_level = row[0] if row else 0
+
+    cursor = await db._db.execute(
+        "SELECT COUNT(*) FROM albums "
+        "WHERE bandcamp_url IS NOT NULL AND bandcamp_url NOT LIKE '%/album/%' "
+        "AND bandcamp_slug IS NULL"
+    )
+    row = await cursor.fetchone()
+    artist_level = row[0] if row else 0
+
+    if album_level or artist_level:
+        log.info(
+            f"Migration would process: "
+            f"{album_level} album-level URLs (keep), "
+            f"{artist_level} artist-level URLs (clear for re-matching)"
+        )
+
+    # Count artists to search
+    rows = await db.get_artists_without_bandcamp_slug(
+        not_on_streaming_only=not include_streaming,
+    )
+    log.info(f"Search phase would query {len(rows)} artists")
+    for r in rows[:10]:
+        log.info(f"  {r['display_artist']}")
+    if len(rows) > 10:
+        log.info(f"  ... and {len(rows) - 10} more")
+
+    # Count albums pending lookup
+    pending = await db.get_pending_bandcamp_lookup()
+    if pending:
+        slugs = {r["bandcamp_slug"] for r in pending}
+        log.info(f"Lookup phase would process {len(pending)} albums across {len(slugs)} slugs")
+    else:
+        log.info("No albums currently pending Bandcamp lookup")
+
+
 async def main(args: argparse.Namespace) -> None:
     db = ResultsDB(args.db_path)
     await db.connect()
 
     try:
+        if args.dry_run:
+            await dry_run(db, include_streaming=args.include_streaming)
+            return
+
         # One-time migration of existing bandcamp_url values
         await migrate_existing_bandcamp_urls(db)
 
