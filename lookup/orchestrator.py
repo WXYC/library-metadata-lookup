@@ -278,6 +278,14 @@ async def search_library_with_fallback(
     all_results: list[LibraryItem] = []
     seen_ids: set[int] = set()
 
+    if not parsed.artist and albums:
+        # No artist parsed — search by album title alone
+        for album in albums:
+            results = await db.search(query=album, limit=_FETCH_LIMIT)
+            if results:
+                return results[:MAX_SEARCH_RESULTS], False
+        return [], bool(parsed.song)
+
     if parsed.artist and albums:
 
         async def search_one_album(album: str) -> list[LibraryItem]:
