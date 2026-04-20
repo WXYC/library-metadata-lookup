@@ -70,7 +70,37 @@ def main(args: argparse.Namespace) -> None:
             if soundcloud and "soundcloud_url" not in entry:
                 entry["soundcloud_url"] = soundcloud
 
-    log.info(f"Library release IDs with streaming links: {len(links)}")
+    log.info(f"Library release IDs with streaming links (album-level): {len(links)}")
+
+    # Supplement with track-level results for singles and compilations
+    # Check if track_results table exists
+    has_tracks = sa.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='track_results'"
+    ).fetchone()
+    track_links_added = 0
+    if has_tracks:
+        track_rows = sa.execute("""
+            SELECT a.library_ids, tr.spotify_url, tr.deezer_url
+            FROM track_results tr
+            JOIN albums a ON a.id = tr.album_id
+            WHERE tr.resolution_status IN ('local_match', 'api_match')
+              AND (tr.spotify_url IS NOT NULL OR tr.deezer_url IS NOT NULL)
+        """).fetchall()
+        for lib_ids_json, spotify, deezer in track_rows:
+            lib_ids = json.loads(lib_ids_json)
+            for lib_id in lib_ids:
+                if lib_id not in links:
+                    links[lib_id] = {}
+                entry = links[lib_id]
+                if spotify and "spotify_url" not in entry:
+                    entry["spotify_url"] = spotify
+                    track_links_added += 1
+                if deezer and "deezer_url" not in entry:
+                    entry["deezer_url"] = deezer
+                    track_links_added += 1
+        log.info(f"Track-level URLs added: {track_links_added}")
+
+    log.info(f"Library release IDs with streaming links (total): {len(links)}")
     sa.close()
 
     if args.dry_run:
