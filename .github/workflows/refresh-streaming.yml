@@ -1,5 +1,11 @@
 name: Refresh Streaming Availability
 
+# Incremental refresh only — retries errors and processes newly added albums.
+# Full catalog runs (65k+ albums) exceed CI time limits and should be done
+# locally, then uploaded:
+#   python -m scripts.streaming_availability --library-db library.db --results-db streaming_availability.db
+#   gh release upload streaming-data-v1 streaming_availability.db --clobber
+
 on:
   schedule:
     # Weekly on Sunday at midnight UTC
@@ -9,6 +15,7 @@ on:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
