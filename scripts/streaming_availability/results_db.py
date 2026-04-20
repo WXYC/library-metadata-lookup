@@ -52,6 +52,30 @@ CREATE TABLE IF NOT EXISTS albums (
 
 CREATE INDEX IF NOT EXISTS idx_albums_spotify_status ON albums(spotify_status);
 CREATE INDEX IF NOT EXISTS idx_albums_apple_status ON albums(apple_status);
+
+CREATE TABLE IF NOT EXISTS track_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    album_id INTEGER NOT NULL,
+    artist TEXT NOT NULL,
+    title TEXT NOT NULL,
+    position TEXT,
+    source TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    resolution_status TEXT NOT NULL DEFAULT 'pending',
+    resolved_via TEXT,
+    resolved_album_id INTEGER,
+    resolved_release_id INTEGER,
+    spotify_url TEXT,
+    spotify_confidence REAL,
+    deezer_url TEXT,
+    deezer_confidence REAL,
+    checked_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(album_id, artist, title)
+);
+
+CREATE INDEX IF NOT EXISTS idx_track_results_status ON track_results(resolution_status);
+CREATE INDEX IF NOT EXISTS idx_track_results_album ON track_results(album_id);
 """
 
 
@@ -339,3 +363,110 @@ class ResultsDB:
             "SELECT * FROM albums ORDER BY display_artist, display_title"
         )
         return list(await cursor.fetchall())
+
+    # -----------------------------------------------------------------------
+    # Track-level results
+    # -----------------------------------------------------------------------
+
+    async def insert_tracks(self, tracks: list[dict]) -> int:
+        """Bulk insert track results. Uses INSERT OR IGNORE for idempotent resume."""
+        assert self._db is not None
+        inserted = 0
+        async with self._write_lock:
+            for t in tracks:
+                cursor = await self._db.execute(
+                    """INSERT OR IGNORE INTO track_results
+                       (album_id, artist, title, position, source, source_type)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        t["album_id"],
+                        t["artist"],
+                        t["title"],
+                        t.get("position"),
+                        t["source"],
+                        t["source_type"],
+                    ),
+                )
+                if cursor.rowcount > 0:
+                    inserted += 1
+            await self._db.commit()
+        return inserted
+
+    async def get_pending_tracks(self, limit: int = 100) -> list[aiosqlite.Row]:
+        """Get tracks with resolution_status = 'pending'."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "SELECT * FROM track_results WHERE resolution_status = 'pending' LIMIT ?",
+            (limit,),
+        )
+        return list(await cursor.fetchall())
+
+    async def update_track_resolution(
+        self,
+        track_id: int,
+        status: str,
+        *,
+        resolved_via: str | None = None,
+        resolved_album_id: int | None = None,
+        resolved_release_id: int | None = None,
+        spotify_url: str | None = None,
+        spotify_confidence: float | None = None,
+        deezer_url: str | None = None,
+        deezer_confidence: float | None = None,
+    ) -> None:
+        """Update resolution status for a track."""
+        assert self._db is not None
+        now = datetime.now(UTC).isoformat()
+        async with self._write_lock:
+            await self._db.execute(
+                """UPDATE track_results SET
+                   resolution_status = ?, resolved_via = ?,
+                   resolved_album_id = ?, resolved_release_id = ?,
+                   spotify_url = ?, spotify_confidence = ?,
+                   deezer_url = ?, deezer_confidence = ?,
+                   checked_at = ?
+                   WHERE id = ?""",
+                (
+                    status,
+                    resolved_via,
+                    resolved_album_id,
+                    resolved_release_id,
+                    spotify_url,
+                    spotify_confidence,
+                    deezer_url,
+                    deezer_confidence,
+                    now,
+                    track_id,
+                ),
+            )
+            await self._db.commit()
+
+    async def get_track_stats(self) -> dict:
+        """Get counts of track results by resolution status."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "SELECT resolution_status, COUNT(*) FROM track_results GROUP BY resolution_status"
+        )
+        stats = {row[0]: row[1] for row in await cursor.fetchall()}
+        stats["total"] = sum(stats.values())
+        return stats
+
+    async def get_album_track_summary(self, album_id: int) -> dict:
+        """Summarize track resolution for a single album."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "SELECT resolution_status, COUNT(*) FROM track_results WHERE album_id = ? GROUP BY resolution_status",
+            (album_id,),
+        )
+        counts = {row[0]: row[1] for row in await cursor.fetchall()}
+        total = sum(counts.values())
+        resolved = (
+            total - counts.get("pending", 0) - counts.get("not_found", 0) - counts.get("error", 0)
+        )
+        return {
+            "total": total,
+            "resolved": resolved,
+            "not_found": counts.get("not_found", 0),
+            "pending": counts.get("pending", 0),
+            "on_streaming": resolved > 0,
+        }
