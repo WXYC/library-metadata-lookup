@@ -591,9 +591,9 @@ class TestSearchLibraryWithFallback:
         )
         # The self-titled album should be included because "S/t" means the
         # album name is the same as the artist name.
-        assert any(
-            r.title == "S/t" for r in results
-        ), "Self-titled album 'S/t' should match when Discogs album is the artist name"
+        assert any(r.title == "S/t" for r in results), (
+            "Self-titled album 'S/t' should match when Discogs album is the artist name"
+        )
         assert fallback is False
 
     @pytest.mark.asyncio
