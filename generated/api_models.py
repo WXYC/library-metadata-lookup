@@ -429,6 +429,10 @@ class Album(BaseModel):
     add_date: AwareDatetime | None = None
     disc_quantity: int | None = None
     alternate_artist_name: str | None = None
+    album_artist: str | None = Field(
+        None,
+        description='Credited album artist for compilations (e.g., "Kruder & Dorfmeister" on a DJ-Kicks release filed under Various Artists).',
+    )
 
 
 class AlbumSearchResult(BaseModel):
@@ -452,6 +456,7 @@ class AlbumSearchResult(BaseModel):
         None,
         description="True if this release is available on at least one streaming service. False means only available in the WXYC physical library. Null if unknown.",
     )
+    album_artist: str | None = Field(None, description="Credited album artist for compilations.")
 
 
 class AddAlbumRequest(BaseModel):
@@ -464,6 +469,7 @@ class AddAlbumRequest(BaseModel):
     format_id: int
     disc_quantity: int | None = None
     alternate_artist_name: str | None = None
+    album_artist: str | None = None
 
 
 class Label(BaseModel):
