@@ -874,7 +874,8 @@ class LookupRequest(BaseModel):
     song: str | None = Field(None, description="Parsed song/track title")
     album: str | None = Field(None, description="Parsed album name")
     raw_message: str = Field(
-        ..., description="Original request message (needed for ambiguous format detection)"
+        ...,
+        description="Original request message (needed for ambiguous format detection)",
     )
 
 
@@ -927,7 +928,7 @@ class SearchType(StrEnum):
 
 
 class LookupResponse(BaseModel):
-    results: list[LookupResultItem] | None = Field([], validate_default=True)
+    results: list[LookupResultItem] | None = Field(default_factory=list)
     search_type: SearchType | None = Field(
         "none",
         description="The search strategy that produced results: direct, fallback, alternative, compilation, song_as_artist, or none\n",
