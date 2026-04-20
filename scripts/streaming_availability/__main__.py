@@ -10,6 +10,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import asyncpg
 import asyncio
 import logging
 import os
@@ -333,7 +337,7 @@ async def _process_deezer(
 
 async def _process_discogs_enrichment(
     results_db: ResultsDB,
-    pool: object,
+    pool: asyncpg.Pool,
     batch_size: int,
     entity_mapping: dict[str, int] | None = None,
 ) -> None:
