@@ -346,9 +346,7 @@ class LibraryDB:
                 like_fields.append("alternate_artist_name")
             if self._has_album_artist:
                 like_fields.append("album_artist")
-            conditions.append(
-                "(" + " OR ".join(f"{f} LIKE ?" for f in like_fields) + ")"
-            )
+            conditions.append("(" + " OR ".join(f"{f} LIKE ?" for f in like_fields) + ")")
             params.extend([f"%{word}%"] * len(like_fields))
 
         params.append(limit)
