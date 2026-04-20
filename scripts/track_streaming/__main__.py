@@ -378,8 +378,20 @@ async def phase_album_rollup(results_db: ResultsDB) -> tuple[int, int]:
 
         if summary["on_streaming"]:
             on_streaming += 1
+            # Update albums table so populate-on-streaming.py sees the result
+            await results_db._db.execute(
+                "UPDATE albums SET spotify_status = 'found' WHERE id = ? AND spotify_status != 'found'",
+                (album_id,),
+            )
         else:
             off_streaming += 1
+            await results_db._db.execute(
+                "UPDATE albums SET spotify_status = 'not_found' WHERE id = ? AND spotify_status = 'skipped'",
+                (album_id,),
+            )
+
+    async with results_db._write_lock:
+        await results_db._db.commit()
 
     logger.info(
         "Album rollup: %d on streaming, %d off streaming, %d total",
