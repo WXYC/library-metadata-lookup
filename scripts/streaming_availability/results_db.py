@@ -401,6 +401,15 @@ class ResultsDB:
         )
         return list(await cursor.fetchall())
 
+    async def get_local_miss_tracks(self, limit: int = 100) -> list[aiosqlite.Row]:
+        """Get tracks that missed local resolution, ready for API search."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "SELECT * FROM track_results WHERE resolution_status = 'local_miss' LIMIT ?",
+            (limit,),
+        )
+        return list(await cursor.fetchall())
+
     async def update_track_resolution(
         self,
         track_id: int,
@@ -461,7 +470,11 @@ class ResultsDB:
         counts = {row[0]: row[1] for row in await cursor.fetchall()}
         total = sum(counts.values())
         resolved = (
-            total - counts.get("pending", 0) - counts.get("not_found", 0) - counts.get("error", 0)
+            total
+            - counts.get("pending", 0)
+            - counts.get("local_miss", 0)
+            - counts.get("not_found", 0)
+            - counts.get("error", 0)
         )
         return {
             "total": total,

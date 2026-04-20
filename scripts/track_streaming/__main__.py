@@ -264,11 +264,9 @@ async def phase_local_resolve(results_db: ResultsDB, index: LocalStreamingIndex)
                 )
                 resolved += 1
             else:
-                # Mark as checked_local so we don't re-check, but leave pending for API
-                # Actually, leave as pending — the API phase picks up pending tracks
-                pass
+                await results_db.update_track_resolution(track_id=row["id"], status="local_miss")
 
-        if checked % 5000 == 0:
+        if checked % 5000 == 0 and checked > 0:
             logger.info("  Local resolve: %d checked, %d resolved", checked, resolved)
 
     # Mark remaining pending tracks that weren't matched locally as 'pending_api'
@@ -304,11 +302,11 @@ async def phase_api_search(results_db: ResultsDB, args) -> tuple[int, int]:
 
     try:
         while not _shutdown_requested:
-            pending = await results_db.get_pending_tracks(limit=args.batch_size)
-            if not pending:
+            tracks = await results_db.get_local_miss_tracks(limit=args.batch_size)
+            if not tracks:
                 break
 
-            for row in pending:
+            for row in tracks:
                 if _shutdown_requested:
                     break
                 checked += 1
