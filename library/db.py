@@ -77,6 +77,7 @@ class LibraryDB:
         self.db_path = db_path or DEFAULT_DB_PATH
         self._conn: aiosqlite.Connection | None = None
         self._has_alternate_artist: bool = False
+        self._has_album_artist: bool = False
         self._has_label: bool = False
         self._has_compilation_track_artist: bool = False
         self._has_streaming_links: bool = False
@@ -107,6 +108,7 @@ class LibraryDB:
             )
 
         self._has_alternate_artist = "alternate_artist_name" in column_names
+        self._has_album_artist = "album_artist" in column_names
         self._has_label = "label" in column_names
 
         # Detect optional tables
@@ -123,6 +125,7 @@ class LibraryDB:
         logger.info(
             f"Connected to SQLite database: {self.db_path} "
             f"(alternate_artist_name: {'yes' if self._has_alternate_artist else 'no'}, "
+            f"album_artist: {'yes' if self._has_album_artist else 'no'}, "
             f"label: {'yes' if self._has_label else 'no'}, "
             f"compilation_track_artist: {'yes' if self._has_compilation_track_artist else 'no'}, "
             f"streaming_links: {'yes' if self._has_streaming_links else 'no'})"
@@ -156,6 +159,8 @@ class LibraryDB:
         )
         if self._has_alternate_artist:
             cols += f", {p}alternate_artist_name"
+        if self._has_album_artist:
+            cols += f", {p}album_artist"
         if self._has_label:
             cols += f", {p}label"
         return cols
@@ -256,8 +261,16 @@ class LibraryDB:
             conditions: list[str] = []
             params: list[str | int] = []
             if artist:
-                if self._has_alternate_artist:
+                if self._has_alternate_artist and self._has_album_artist:
+                    conditions.append(
+                        "(artist LIKE ? OR alternate_artist_name LIKE ? OR album_artist LIKE ?)"
+                    )
+                    params.extend([f"%{artist}%", f"%{artist}%", f"%{artist}%"])
+                elif self._has_alternate_artist:
                     conditions.append("(artist LIKE ? OR alternate_artist_name LIKE ?)")
+                    params.extend([f"%{artist}%", f"%{artist}%"])
+                elif self._has_album_artist:
+                    conditions.append("(artist LIKE ? OR album_artist LIKE ?)")
                     params.extend([f"%{artist}%", f"%{artist}%"])
                 else:
                     conditions.append("artist LIKE ?")
@@ -328,12 +341,15 @@ class LibraryDB:
         conditions: list[str] = []
         params: list[str | int] = []
         for word in significant_words:
+            like_fields = ["title", "artist"]
             if self._has_alternate_artist:
-                conditions.append("(title LIKE ? OR artist LIKE ? OR alternate_artist_name LIKE ?)")
-                params.extend([f"%{word}%", f"%{word}%", f"%{word}%"])
-            else:
-                conditions.append("(title LIKE ? OR artist LIKE ?)")
-                params.extend([f"%{word}%", f"%{word}%"])
+                like_fields.append("alternate_artist_name")
+            if self._has_album_artist:
+                like_fields.append("album_artist")
+            conditions.append(
+                "(" + " OR ".join(f"{f} LIKE ?" for f in like_fields) + ")"
+            )
+            params.extend([f"%{word}%"] * len(like_fields))
 
         params.append(limit)
 
@@ -371,22 +387,19 @@ class LibraryDB:
         # Search for candidates using partial match on longest word
         prefix = search_word[:3] if len(search_word) >= 3 else search_word
 
+        fuzzy_fields = ["artist", "title"]
         if self._has_alternate_artist:
-            sql = f"""
-                SELECT {self._select_columns()}
-                FROM library
-                WHERE artist LIKE ? OR title LIKE ? OR alternate_artist_name LIKE ?
-                LIMIT 500
-            """
-            fuzzy_params: tuple[str, ...] = (f"%{prefix}%", f"%{prefix}%", f"%{prefix}%")
-        else:
-            sql = f"""
-                SELECT {self._select_columns()}
-                FROM library
-                WHERE artist LIKE ? OR title LIKE ?
-                LIMIT 500
-            """
-            fuzzy_params = (f"%{prefix}%", f"%{prefix}%")
+            fuzzy_fields.append("alternate_artist_name")
+        if self._has_album_artist:
+            fuzzy_fields.append("album_artist")
+        where_clause = " OR ".join(f"{f} LIKE ?" for f in fuzzy_fields)
+        sql = f"""
+            SELECT {self._select_columns()}
+            FROM library
+            WHERE {where_clause}
+            LIMIT 500
+        """
+        fuzzy_params: tuple[str, ...] = tuple(f"%{prefix}%" for _ in fuzzy_fields)
 
         assert self._conn is not None, "Database not connected. Call connect() first."
         cursor = await self._conn.execute(sql, fuzzy_params)
@@ -462,6 +475,12 @@ class LibraryDB:
             unions.append(
                 "SELECT alternate_artist_name AS name FROM library "
                 "WHERE alternate_artist_name IS NOT NULL AND alternate_artist_name LIKE ?"
+            )
+            params_list.append(f"{prefix}%")
+        if self._has_album_artist:
+            unions.append(
+                "SELECT album_artist AS name FROM library "
+                "WHERE album_artist IS NOT NULL AND album_artist LIKE ?"
             )
             params_list.append(f"{prefix}%")
         if self._has_compilation_track_artist:
