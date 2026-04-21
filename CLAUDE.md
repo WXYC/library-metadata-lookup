@@ -246,6 +246,31 @@ Options: `--phase` (default: both, runs concurrently), `--include-streaming` (se
 
 Uses `BandcampClient` (`scripts/bandcamp_client.py`) extending `BaseStreamingClient` with rate limiting (1 req/s, semaphore 2) and 429 retry with exponential backoff. Optionally loads Wikidata slugs via `DATABASE_URL_WIKIDATA`.
 
+### Artist Name Variation Audit (`scripts/variation_audit/`)
+
+Cross-references WXYC library catalog artist name variations against local Discogs and MusicBrainz datasets. Classifies each relationship (ALIAS, MEMBER_OF_GROUP, SEPARATE_ARTIST, COLLABORATION, SPELLING_VARIANT, SPLIT_RELEASE) and identifies artists that should have their own library code. Output includes flowsheet play counts and own-release counts for prioritization.
+
+**Pre-step** (extract Discogs artist CSVs, ~7 seconds):
+```bash
+mkdir -p /tmp/discogs_artists
+ln -sf /path/to/discogs_artists.xml /tmp/discogs_artists/artists.xml
+discogs-xml-converter /tmp/discogs_artists/ --output-dir /tmp/discogs_artists/
+```
+
+**Usage:**
+```bash
+uv run python -m scripts.variation_audit \
+  --library-db library.db \
+  --graph-db ../semantic-index/data/wxyc_artist_graph.db \
+  --sql-dump ../tubafrenzy/wxycmusic-full-2026-03-28.sql \
+  --discogs-csv-dir /tmp/discogs_artists/ \
+  --mb-alias-tsv ../musicbrainz-cache/data/mbdump/artist_alias \
+  --mb-artist-tsv ../musicbrainz-cache/data/mbdump/artist \
+  --output-dir ../docs/variation-audit/
+```
+
+Discogs CSVs and MusicBrainz TSVs are optional; the script gracefully degrades using only the semantic-index entity resolution and member-of data when external files are missing.
+
 ## Relationship to Other Repos
 
 - **[request-o-matic](https://github.com/WXYC/request-o-matic)** -- The caller. Parses messages, calls this service, posts to Slack.
