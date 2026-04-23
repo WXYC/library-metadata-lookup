@@ -119,6 +119,18 @@ class SpotifyClient(BaseStreamingClient):
                 await asyncio.sleep(retry_after)
                 continue
 
+            if resp.status_code in (500, 502, 503, 504):
+                wait = min(2**attempt, 30)
+                logger.warning(
+                    "Spotify %d, retrying in %ds (attempt %d/%d)",
+                    resp.status_code,
+                    wait,
+                    attempt + 1,
+                    self._max_retries,
+                )
+                await asyncio.sleep(wait)
+                continue
+
             if resp.status_code != 200:
                 logger.warning(
                     "Spotify search returned %d for %s - %s",
