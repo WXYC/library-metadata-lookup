@@ -258,6 +258,10 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
     soundcloud_url: str | None = None
     artist_bio: str | None = None
     artist_wikipedia_url: str | None = None
+    on_streaming: bool | None = Field(
+        None,
+        description="Whether this album is available on streaming platforms. False means WXYC library exclusive. Null if unknown.",
+    )
 
 
 class EntryType2(StrEnum):
@@ -457,6 +461,14 @@ class AlbumSearchResult(BaseModel):
         description="True if this release is available on at least one streaming service. False means only available in the WXYC physical library. Null if unknown.",
     )
     album_artist: str | None = Field(None, description="Credited album artist for compilations.")
+    date_lost: AwareDatetime | None = Field(
+        None,
+        description="When the release was marked missing from the physical library. Null if in library.",
+    )
+    date_found: AwareDatetime | None = Field(
+        None,
+        description="When a previously missing release was found. Null if never lost.",
+    )
 
 
 class AddAlbumRequest(BaseModel):
