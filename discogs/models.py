@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Annotated, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Discriminator
 
 from generated.api_models import DiscogsMatchResult as _GeneratedDiscogsMatchResult
 
@@ -112,12 +113,98 @@ class MemberRef(BaseModel):
     active: bool = True
 
 
+# MARK: - Resolved Markup Tokens
+
+
+class PlainTextToken(BaseModel):
+    """Plain text content."""
+
+    type: Literal["plainText"] = "plainText"
+    text: str
+
+
+class ArtistLinkToken(BaseModel):
+    """Artist link with display name and URL."""
+
+    type: Literal["artistLink"] = "artistLink"
+    name: str  # original name (may include disambiguation suffix)
+    display_name: str  # suffix stripped for display
+    url: str
+
+
+class LabelNameToken(BaseModel):
+    """Label name (displayed as plain text, not linked)."""
+
+    type: Literal["labelName"] = "labelName"
+    name: str
+
+
+class ReleaseLinkToken(BaseModel):
+    """Release link with title and URL."""
+
+    type: Literal["releaseLink"] = "releaseLink"
+    title: str
+    url: str
+
+
+class MasterLinkToken(BaseModel):
+    """Master release link with title and URL."""
+
+    type: Literal["masterLink"] = "masterLink"
+    title: str
+    url: str
+
+
+class BoldToken(BaseModel):
+    """Bold text content."""
+
+    type: Literal["bold"] = "bold"
+    content: str
+
+
+class ItalicToken(BaseModel):
+    """Italic text content."""
+
+    type: Literal["italic"] = "italic"
+    content: str
+
+
+class UnderlineToken(BaseModel):
+    """Underlined text content."""
+
+    type: Literal["underline"] = "underline"
+    content: str
+
+
+class UrlLinkToken(BaseModel):
+    """URL link with optional href and display content."""
+
+    type: Literal["urlLink"] = "urlLink"
+    href: str | None  # None when URL string is invalid
+    content: str
+
+
+ResolvedToken = Annotated[
+    PlainTextToken
+    | ArtistLinkToken
+    | LabelNameToken
+    | ReleaseLinkToken
+    | MasterLinkToken
+    | BoldToken
+    | ItalicToken
+    | UnderlineToken
+    | UrlLinkToken,
+    Discriminator("type"),
+]
+
+
 class ArtistDetails(BaseModel):
     """Full artist details from Discogs."""
 
     artist_id: int
     name: str
     profile: str | None = None
+    profile_tokens: list[ResolvedToken] | None = None
     image_url: str | None = None
     name_variations: list[str] = []
     aliases: list[ArtistRef] = []

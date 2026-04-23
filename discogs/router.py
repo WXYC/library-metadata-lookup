@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from core.dependencies import get_discogs_cache_service, get_discogs_service
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
+from discogs.markup_parser import DiscogsServiceResolver, parse_async
 from discogs.models import (
     ArtistDetails,
     DiscogsSearchRequest,
@@ -131,6 +132,13 @@ async def get_artist(
             status_code=404,
             detail=f"Artist {artist_id} not found",
         )
+
+    if result.profile:
+        try:
+            resolver = DiscogsServiceResolver(svc)
+            result.profile_tokens = await parse_async(result.profile, resolver)
+        except Exception:
+            logger.warning("Failed to parse profile markup for artist %d", artist_id)
 
     return result
 
