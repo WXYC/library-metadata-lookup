@@ -265,7 +265,8 @@ async def run(args) -> None:
         cursor = await db.execute(
             "SELECT COUNT(*) FROM albums WHERE discogs_release_id IS NOT NULL"
         )
-        total_matched = (await cursor.fetchone())[0]
+        row = await cursor.fetchone()
+        total_matched = row[0] if row else 0
         logger.info("Total albums with Discogs match: %d", total_matched)
 
     finally:
