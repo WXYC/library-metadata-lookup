@@ -73,10 +73,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://dj.wxyc.org",
-    ],
+    allow_origins=[],
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
