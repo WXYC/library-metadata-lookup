@@ -24,6 +24,8 @@ from library.router import router as library_router
 from lookup.router import router as lookup_router
 from routers.admin import router as admin_router
 from routers.health import router as health_router
+from streaming.dependencies import close_streaming_clients
+from streaming.router import router as streaming_router
 
 load_dotenv()
 
@@ -58,6 +60,7 @@ async def lifespan(app: FastAPI):
     await close_library_db()
     await close_discogs_service()
     await close_entity_store()
+    await close_streaming_clients()
     logger.info("All services shut down")
 
 
@@ -93,6 +96,7 @@ app.include_router(lookup_router, prefix="/api/v1", tags=["lookup"])
 app.include_router(library_router, prefix="/api/v1", tags=["library"])
 app.include_router(discogs_router, prefix="/api/v1", tags=["discogs"])
 app.include_router(identity_router, prefix="/identity", tags=["identity"])
+app.include_router(streaming_router, prefix="/api/v1", tags=["streaming"])
 
 if __name__ == "__main__":
     import uvicorn

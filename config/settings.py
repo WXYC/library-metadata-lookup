@@ -12,6 +12,12 @@ class Settings(BaseSettings):
 
     # API Keys - Optional
     discogs_token: str | None = Field(None, description="Discogs API token for artwork lookup")
+    spotify_client_id: str | None = Field(
+        None, description="Spotify client ID for streaming availability checks"
+    )
+    spotify_client_secret: str | None = Field(
+        None, description="Spotify client secret for streaming availability checks"
+    )
 
     # Database Configuration
     library_db_path: Path = Field(
