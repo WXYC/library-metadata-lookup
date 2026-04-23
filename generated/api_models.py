@@ -469,6 +469,10 @@ class AlbumSearchResult(BaseModel):
         None,
         description="When a previously missing release was found. Null if never lost.",
     )
+    artwork_url: str | None = Field(
+        None,
+        description="Album cover artwork URL from Discogs. Null if artwork has not been fetched yet or is unavailable.",
+    )
 
 
 class AddAlbumRequest(BaseModel):
