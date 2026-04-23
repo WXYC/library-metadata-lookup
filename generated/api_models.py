@@ -946,7 +946,7 @@ class SearchType(StrEnum):
 
 
 class LookupResponse(BaseModel):
-    results: list[LookupResultItem] | None = Field(default_factory=list)
+    results: list[LookupResultItem] | None = Field([], validate_default=True)
     search_type: SearchType | None = Field(
         "none",
         description="The search strategy that produced results: direct, fallback, alternative, compilation, song_as_artist, or none\n",
