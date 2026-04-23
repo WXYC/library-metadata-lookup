@@ -285,12 +285,12 @@ def _resolve_token(token: _DiscogsToken, resolved_ids: dict[str, str]) -> Resolv
             return ArtistLinkToken(name=name, display_name=display_name, url=url)
 
         case _ArtistId(id=id):
-            name = resolved_ids.get(f"artist-{id}")
-            if name is None:
+            resolved_name = resolved_ids.get(f"artist-{id}")
+            if resolved_name is None:
                 return None
-            display_name = strip_disambiguation_suffix(name)
+            display_name = strip_disambiguation_suffix(resolved_name)
             url = f"https://www.discogs.com/artist/{id}"
-            return ArtistLinkToken(name=name, display_name=display_name, url=url)
+            return ArtistLinkToken(name=resolved_name, display_name=display_name, url=url)
 
         case _ReleaseId(id=id):
             title = resolved_ids.get(f"release-{id}")
