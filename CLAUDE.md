@@ -39,6 +39,7 @@ All strategy implementations live in `lookup/orchestrator.py`.
 - `discogs/cache_service.py` -- PostgreSQL cache (asyncpg + pg_trgm)
 - `discogs/memory_cache.py` -- In-memory TTL cache (cachetools)
 - `core/search.py` -- Declarative search strategy pattern + ambiguous format detection
+- `discogs/markup_parser.py` -- Discogs markup parser: tokenize/resolve `[a=Name]`, `[a12345]`, `[b]...[/b]`, etc. into structured `ResolvedToken` models. Includes `EntityResolver` protocol and `DiscogsServiceResolver` adapter for async ID resolution. Translated from iOS `DiscogsMarkupParser.swift`.
 - `discogs/matching.py` -- Discogs-specific normalization (strip_discogs_suffix, normalize_for_track_comparison, normalize_artist_for_validation)
 - `core/dependencies.py` -- FastAPI DI for LibraryDB + DiscogsService
 - `identity/router.py` -- `GET /identity/resolve` and `POST /identity/bulk` endpoints for identity resolution
