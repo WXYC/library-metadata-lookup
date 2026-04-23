@@ -87,6 +87,55 @@ def score_match(query: str, result: str) -> float:
     return base_score
 
 
+_AND_RE = re.compile(r"\band\b", re.IGNORECASE)
+_AMPERSAND_RE = re.compile(r"\s*&\s*")
+_FEAT_RE = re.compile(r"\s+(?:feat\.?|featuring|ft\.?)\s+.*$", re.IGNORECASE)
+_DISCOGS_DISAMBIG_RE = re.compile(r"\s*\(\d+\)\s*$")
+
+
+def normalize_artist_credit(artist: str) -> list[str]:
+    """Generate artist name variants for Discogs fuzzy matching.
+
+    Returns a list of variants to try, in priority order (original first).
+    Handles: "and" ↔ "&", slash-separated collaborations, parenthetical
+    disambiguation suffixes, and "feat." credits.
+    """
+    original = artist.strip()
+    if not original:
+        return []
+
+    seen: set[str] = {original}
+    variants: list[str] = [original]
+
+    def _add(v: str) -> None:
+        v = v.strip()
+        if v and v not in seen:
+            seen.add(v)
+            variants.append(v)
+
+    # "and" ↔ "&"
+    if _AND_RE.search(original):
+        _add(_AND_RE.sub("&", original))
+    if "&" in original:
+        _add(_AMPERSAND_RE.sub(" and ", original))
+
+    # Slash-separated collaborations → extract first artist
+    if "/" in original and " / " not in original:
+        first = original.split("/")[0].strip()
+        if len(first) >= 2:
+            _add(first)
+
+    # "feat." / "featuring" → extract primary artist
+    if _FEAT_RE.search(original):
+        _add(_FEAT_RE.sub("", original))
+
+    # Parenthetical Discogs disambiguation: "Artist (2)" → "Artist"
+    if _DISCOGS_DISAMBIG_RE.search(original):
+        _add(_DISCOGS_DISAMBIG_RE.sub("", original))
+
+    return variants
+
+
 def is_acceptable_match(artist_score: float, title_score: float) -> bool:
     """Returns True if both artist and title scores meet the acceptance threshold (>= 80)."""
     return artist_score >= 80.0 and title_score >= 80.0
