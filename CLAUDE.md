@@ -41,6 +41,10 @@ All strategy implementations live in `lookup/orchestrator.py`.
 - `core/search.py` -- Declarative search strategy pattern + ambiguous format detection
 - `discogs/matching.py` -- Discogs-specific normalization (strip_discogs_suffix, normalize_for_track_comparison, normalize_artist_for_validation)
 - `core/dependencies.py` -- FastAPI DI for LibraryDB + DiscogsService
+- `streaming/router.py` -- `POST /streaming-check` endpoint for single-release streaming availability
+- `streaming/orchestrator.py` -- Concurrent streaming checks across Spotify, Deezer, Apple Music, Bandcamp
+- `streaming/models.py` -- Request/response Pydantic models (`StreamingCheckRequest`, `StreamingCheckResponse`)
+- `streaming/dependencies.py` -- FastAPI DI for streaming service clients (SpotifyClient, DeezerClient, etc.)
 - `identity/router.py` -- `GET /identity/resolve` and `POST /identity/bulk` endpoints for identity resolution
 - `identity/models.py` -- Pydantic models for identity resolution responses
 - `identity/dependencies.py` -- FastAPI DI for EntityStore (reuses `DATABASE_URL_DISCOGS` pool)
@@ -54,6 +58,16 @@ The service exposes REST endpoints for querying the `entity.identity` table in t
 - `POST /identity/bulk` with `{"names": ["Stereolab", "Autechre", ...]}` -- Resolve a batch of names. Returns `identities` (found) and `unresolved` (not found).
 
 Both endpoints return 503 when `DATABASE_URL_DISCOGS` is not set or the entity schema is not applied.
+
+### Streaming Check Endpoint
+
+`POST /api/v1/streaming-check` checks whether an album is available on streaming platforms. Used by tubafrenzy and Backend-Service to set the `on_streaming` flag when a new release is added to the library.
+
+Request: `{"artist": "Stereolab", "title": "Aluminum Tunes"}`
+
+Response includes `on_streaming` (true/false/null) and per-service match details with URLs and confidence scores. Checks run concurrently across Spotify, Deezer, Apple Music, and Bandcamp. The endpoint is stateless -- it does not cache results.
+
+Requires `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` for Spotify checks. Other services (Deezer, Apple Music, Bandcamp) need no auth. If Spotify credentials are not set, Spotify checks are skipped.
 
 ### Discogs Cache (Optional)
 
@@ -128,6 +142,8 @@ Required:
 
 Optional:
 - `DATABASE_URL_DISCOGS` -- PostgreSQL URL for Discogs cache
+- `SPOTIFY_CLIENT_ID` -- Spotify client ID for streaming availability checks
+- `SPOTIFY_CLIENT_SECRET` -- Spotify client secret for streaming availability checks
 - `SENTRY_DSN` -- Sentry error tracking
 - `POSTHOG_API_KEY` -- PostHog telemetry
 - `LIBRARY_DB_PATH` -- Path to SQLite database (default: `library.db`)
