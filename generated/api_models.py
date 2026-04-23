@@ -969,6 +969,204 @@ class LookupResponse(BaseModel):
     )
 
 
+class DiscogsSearchRequest(BaseModel):
+    artist: str | None = None
+    album: str | None = None
+    track: str | None = None
+    label: str | None = None
+    format: str | None = None
+
+
+class DiscogsEnrichedSearchResult(BaseModel):
+    album: str | None = None
+    artist: str | None = None
+    release_id: int
+    release_url: str
+    artwork_url: str | None = None
+    confidence: float | None = 0
+    release_year: int | None = None
+    artist_bio: str | None = None
+    wikipedia_url: str | None = None
+    spotify_url: str | None = None
+    apple_music_url: str | None = None
+    youtube_music_url: str | None = None
+    bandcamp_url: str | None = None
+    soundcloud_url: str | None = None
+
+
+class DiscogsSearchResponse(BaseModel):
+    results: list[DiscogsEnrichedSearchResult] | None = Field([], validate_default=True)
+    total: int | None = 0
+    cached: bool | None = False
+
+
+class DiscogsTrackItem(BaseModel):
+    position: str
+    title: str
+    duration: str | None = None
+    artists: list[str] | None = []
+
+
+class DiscogsArtistCredit(BaseModel):
+    artist_id: int | None = None
+    name: str
+    join: str | None = Field("", description='Join phrase (e.g. " & ", ", ")')
+    role: str | None = Field(
+        None, description='Role for extra artists (e.g. "Producer", "Mixed By")'
+    )
+
+
+class DiscogsLabelCredit(BaseModel):
+    label_id: int | None = None
+    name: str
+    catno: str | None = Field(None, description="Catalog number")
+
+
+class DiscogsReleaseVideo(BaseModel):
+    src: str
+    title: str | None = None
+    duration: int | None = Field(None, description="Duration in seconds")
+    embed: bool | None = True
+
+
+class DiscogsReleaseMetadata(BaseModel):
+    release_id: int
+    title: str
+    artist: str
+    year: int | None = None
+    label: str | None = None
+    artist_id: int | None = None
+    label_id: int | None = None
+    genres: list[str] | None = []
+    styles: list[str] | None = []
+    tracklist: list[DiscogsTrackItem] | None = Field([], validate_default=True)
+    artwork_url: str | None = None
+    release_url: str
+    cached: bool | None = False
+    artists: list[DiscogsArtistCredit] | None = Field([], validate_default=True)
+    extra_artists: list[DiscogsArtistCredit] | None = Field([], validate_default=True)
+    labels: list[DiscogsLabelCredit] | None = Field([], validate_default=True)
+    released: str | None = Field(None, description="Release date as ISO string")
+    videos: list[DiscogsReleaseVideo] | None = Field([], validate_default=True)
+
+
+class Type1(StrEnum):
+    plainText = "plainText"
+    artistLink = "artistLink"
+    labelName = "labelName"
+    releaseLink = "releaseLink"
+    masterLink = "masterLink"
+    bold = "bold"
+    italic = "italic"
+    underline = "underline"
+    urlLink = "urlLink"
+
+
+class DiscogsResolvedToken(BaseModel):
+    type: Type1
+    text: str | None = Field(None, description="Content for plainText tokens")
+    name: str | None = Field(None, description="Name for artistLink and labelName tokens")
+    display_name: str | None = Field(
+        None,
+        description="Display name for artistLink tokens (disambiguation suffix stripped)",
+    )
+    title: str | None = Field(None, description="Title for releaseLink and masterLink tokens")
+    url: str | None = Field(None, description="URL for artistLink, releaseLink, masterLink tokens")
+    href: str | None = Field(None, description="URL for urlLink tokens (null if URL is invalid)")
+    content: str | None = Field(
+        None, description="Content for bold, italic, underline, and urlLink tokens"
+    )
+
+
+class Alias(BaseModel):
+    id: int
+    name: str
+
+
+class Member(BaseModel):
+    id: int
+    name: str
+    active: bool | None = True
+
+
+class DiscogsArtistDetails(BaseModel):
+    artist_id: int
+    name: str
+    profile: str | None = None
+    profile_tokens: list[DiscogsResolvedToken] | None = Field(
+        None, description="Pre-parsed structured tokens from the Discogs profile markup"
+    )
+    image_url: str | None = None
+    name_variations: list[str] | None = []
+    aliases: list[Alias] | None = Field([], validate_default=True)
+    members: list[Member] | None = Field([], validate_default=True)
+    urls: list[str] | None = []
+    cached: bool | None = False
+
+
+class DiscogsReleaseInfo(BaseModel):
+    album: str
+    artist: str
+    release_id: int
+    release_url: str
+    is_compilation: bool | None = False
+
+
+class DiscogsTrackReleasesResponse(BaseModel):
+    track: str | None = None
+    artist: str | None = None
+    releases: list[DiscogsReleaseInfo] | None = Field([], validate_default=True)
+    total: int | None = 0
+    cached: bool | None = False
+
+
+class LibrarySearchItem(BaseModel):
+    id: int
+    title: str | None = None
+    artist: str | None = None
+    call_letters: str | None = None
+    artist_call_number: int | None = None
+    release_call_number: int | None = None
+    genre: str | None = None
+    format: str | None = None
+    alternate_artist_name: str | None = None
+    label: str | None = None
+    on_streaming: bool | None = None
+    call_number: str | None = Field(None, description='Computed call number (e.g. "Rock CD S 1/1")')
+    library_url: str | None = Field(None, description="URL to the release on wxyc.info")
+
+
+class LibrarySearchResponse(BaseModel):
+    results: list[LibrarySearchItem] | None = None
+    total: int | None = None
+    query: str | None = None
+
+
+class StreamingCheckRequest(BaseModel):
+    artist: str = Field(..., description="Artist name to search for")
+    title: str = Field(..., description="Album title to search for")
+
+
+class StreamingSourceMatch(BaseModel):
+    url: str = Field(..., description="URL to the matched album on the service")
+    confidence: float = Field(..., description="Match confidence score (0-100)")
+
+
+class StreamingCheckSources(BaseModel):
+    spotify: StreamingSourceMatch | None = None
+    deezer: StreamingSourceMatch | None = None
+    apple_music: StreamingSourceMatch | None = None
+    bandcamp: StreamingSourceMatch | None = None
+
+
+class StreamingCheckResponse(BaseModel):
+    on_streaming: bool = Field(
+        ...,
+        description="True if found on any service, false if absent on all, null if inconclusive.",
+    )
+    sources: StreamingCheckSources
+
+
 class AppConfig(BaseModel):
     posthogApiKey: str = Field(..., description="PostHog analytics write key (public by design)")
     posthogHost: str = Field(..., description="PostHog ingestion host")
@@ -1021,7 +1219,7 @@ class ArtworkSearchResponse(BaseModel):
     confidence: float | None = Field(None, description="Confidence score of the match (0-1)")
 
 
-class Type1(StrEnum):
+class Type2(StrEnum):
     artist = "artist"
     release = "release"
     master = "master"
@@ -1029,7 +1227,7 @@ class Type1(StrEnum):
 
 class EntityResolveResponse(BaseModel):
     name: str = Field(..., description="Entity name")
-    type: Type1 = Field(..., description="Discogs entity type")
+    type: Type2 = Field(..., description="Discogs entity type")
     id: int = Field(..., description="Discogs entity ID")
 
 
