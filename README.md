@@ -203,6 +203,8 @@ They are excluded by default (`addopts = "-m 'not integration'"` in `pyproject.t
 - `POSTHOG_API_KEY` -- PostHog telemetry
 - `LIBRARY_DB_PATH` -- Path to SQLite library database (default: `library.db`)
 - `ADMIN_TOKEN` -- Bearer token for admin endpoints (library.db upload)
+- `STREAMING_WEBHOOK_URLS` -- Comma-separated URLs to POST streaming status changes after library.db upload
+- `ETL_NOTIFY_KEY` -- Bearer token for streaming webhook authentication
 - `LOG_LEVEL` -- Logging level (default: `INFO`)
 
 ### Discogs cache TTL settings

@@ -98,6 +98,15 @@ class Settings(BaseSettings):
         None, description="Bearer token for admin endpoints (e.g. library.db upload)"
     )
 
+    # Streaming Webhook Configuration
+    streaming_webhook_urls: str | None = Field(
+        None,
+        description="Comma-separated URLs to POST streaming status changes after library.db upload",
+    )
+    etl_notify_key: str | None = Field(
+        None, description="Bearer token for streaming webhook authentication"
+    )
+
     # Application Metadata
     app_name: str = Field(default="Library-Metadata-Lookup", description="Application name")
     app_version: str = Field(default="0.1.0", description="Application version")
