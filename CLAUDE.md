@@ -149,6 +149,8 @@ Optional:
 - `POSTHOG_API_KEY` -- PostHog telemetry
 - `LIBRARY_DB_PATH` -- Path to SQLite database (default: `library.db`)
 - `ADMIN_TOKEN` -- Bearer token for admin endpoints (upload endpoint)
+- `STREAMING_WEBHOOK_URLS` -- Comma-separated URLs to POST streaming status changes after library.db upload
+- `ETL_NOTIFY_KEY` -- Bearer token for streaming webhook authentication
 
 ## Code Style
 
