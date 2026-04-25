@@ -10,8 +10,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
-    # API Keys - Optional
-    discogs_token: str | None = Field(None, description="Discogs API token for artwork lookup")
+    # API Keys - Optional (Discogs: token OR key+secret, token takes precedence)
+    discogs_token: str | None = Field(None, description="Discogs personal access token")
+    discogs_api_key: str | None = Field(None, description="Discogs OAuth consumer key")
+    discogs_api_secret: str | None = Field(None, description="Discogs OAuth consumer secret")
     spotify_client_id: str | None = Field(
         None, description="Spotify client ID for streaming availability checks"
     )

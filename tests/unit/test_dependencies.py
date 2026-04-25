@@ -143,8 +143,19 @@ class TestCloseLibraryDB:
 
 class TestGetDiscogsService:
     @pytest.mark.asyncio
-    async def test_no_token_returns_none(self, mock_settings):
+    async def test_no_credentials_returns_none(self, mock_settings):
         mock_settings.discogs_token = None
+        mock_settings.discogs_api_key = None
+        mock_settings.discogs_api_secret = None
+        result = await get_discogs_service(mock_settings)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_partial_key_secret_treated_as_no_credentials(self, mock_settings):
+        # Only one of key/secret is set — not enough to authenticate.
+        mock_settings.discogs_token = None
+        mock_settings.discogs_api_key = "only-key"
+        mock_settings.discogs_api_secret = None
         result = await get_discogs_service(mock_settings)
         assert result is None
 
@@ -159,8 +170,39 @@ class TestGetDiscogsService:
 
             result = await get_discogs_service(mock_settings)
 
-            mock_svc_cls.assert_called_once_with("test-token", cache_service=None)
+            mock_svc_cls.assert_called_once_with(token="test-token", cache_service=None)
             assert result is mock_svc
+
+    @pytest.mark.asyncio
+    async def test_creates_service_with_key_secret(self, mock_settings):
+        mock_settings.discogs_token = None
+        mock_settings.discogs_api_key = "my-key"
+        mock_settings.discogs_api_secret = "my-secret"
+        mock_settings.database_url_discogs = None
+
+        with patch("core.dependencies.DiscogsService") as mock_svc_cls:
+            mock_svc = AsyncMock()
+            mock_svc_cls.return_value = mock_svc
+
+            result = await get_discogs_service(mock_settings)
+
+            mock_svc_cls.assert_called_once_with(
+                api_key="my-key", api_secret="my-secret", cache_service=None
+            )
+            assert result is mock_svc
+
+    @pytest.mark.asyncio
+    async def test_token_takes_precedence_over_key_secret(self, mock_settings):
+        mock_settings.discogs_token = "test-token"
+        mock_settings.discogs_api_key = "my-key"
+        mock_settings.discogs_api_secret = "my-secret"
+        mock_settings.database_url_discogs = None
+
+        with patch("core.dependencies.DiscogsService") as mock_svc_cls:
+            mock_svc_cls.return_value = AsyncMock()
+            await get_discogs_service(mock_settings)
+            # Token wins; key/secret are not passed.
+            mock_svc_cls.assert_called_once_with(token="test-token", cache_service=None)
 
     @pytest.mark.asyncio
     async def test_creates_pool_with_database_url(self, mock_settings):
@@ -184,7 +226,7 @@ class TestGetDiscogsService:
 
             mock_create.assert_called_once()
             mock_cache_cls.assert_called_once_with(mock_pool)
-            mock_svc_cls.assert_called_once_with("test-token", cache_service=mock_cache)
+            mock_svc_cls.assert_called_once_with(token="test-token", cache_service=mock_cache)
 
     @pytest.mark.asyncio
     async def test_pool_error_degrades_gracefully(self, mock_settings):
@@ -205,7 +247,7 @@ class TestGetDiscogsService:
             await get_discogs_service(mock_settings)
 
             # Service created without cache
-            mock_svc_cls.assert_called_once_with("test-token", cache_service=None)
+            mock_svc_cls.assert_called_once_with(token="test-token", cache_service=None)
 
     @pytest.mark.asyncio
     async def test_cached_instance(self, mock_settings):

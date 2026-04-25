@@ -39,6 +39,33 @@ class TestDiscogsServiceInit:
         assert service.cache_service is None
         assert service._client is None
 
+    def test_init_with_token_builds_token_auth_header(self):
+        svc = DiscogsService(token="abc123")
+        assert svc._auth_header == "Discogs token=abc123"
+
+    def test_init_with_key_secret_builds_key_secret_auth_header(self):
+        svc = DiscogsService(api_key="my-key", api_secret="my-secret")
+        assert svc._auth_header == "Discogs key=my-key, secret=my-secret"
+
+    def test_init_token_takes_precedence_over_key_secret(self):
+        svc = DiscogsService(token="abc123", api_key="my-key", api_secret="my-secret")
+        assert svc._auth_header == "Discogs token=abc123"
+
+    def test_init_with_no_credentials_raises(self):
+        with pytest.raises(ValueError, match="token or api_key"):
+            DiscogsService()
+
+    def test_init_with_partial_key_secret_raises(self):
+        with pytest.raises(ValueError, match="token or api_key"):
+            DiscogsService(api_key="only-key")
+
+    @pytest.mark.asyncio
+    async def test_get_client_uses_auth_header(self):
+        svc = DiscogsService(api_key="my-key", api_secret="my-secret")
+        client = await svc._get_client()
+        assert client.headers["Authorization"] == "Discogs key=my-key, secret=my-secret"
+        await svc.close()
+
     @pytest.mark.asyncio
     async def test_get_client_creates_once(self, service):
         client = await service._get_client()
