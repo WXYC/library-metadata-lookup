@@ -1013,13 +1013,14 @@ async def perform_lookup(
     """
     # Build a ParsedRequest from the LookupRequest for compatibility with
     # search functions that expect ParsedRequest
+    raw_message = request.raw_message or ""
     parsed = ParsedRequest(
         song=request.song,
         album=request.album,
         artist=request.artist,
         is_request=True,
         message_type=MessageType.REQUEST,
-        raw_message=request.raw_message,
+        raw_message=raw_message,
     )
 
     library_results: list[LibraryItem] = []
@@ -1064,7 +1065,7 @@ async def perform_lookup(
         search_state = await execute_search_pipeline(
             parsed=parsed,
             db=db,
-            raw_message=request.raw_message,
+            raw_message=raw_message,
             strategies=strategies,
             albums_for_search=albums_for_search,
             song_not_found=song_not_found,

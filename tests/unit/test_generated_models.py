@@ -34,9 +34,12 @@ class TestLookupRequest:
         assert req.song is None
         assert req.album is None
 
-    def test_raw_message_required(self):
-        with pytest.raises(ValueError):
-            LookupRequest()
+    def test_all_fields_optional(self):
+        req = LookupRequest()
+        assert req.artist is None
+        assert req.song is None
+        assert req.album is None
+        assert req.raw_message is None
 
 
 class TestLibraryCatalogItem:

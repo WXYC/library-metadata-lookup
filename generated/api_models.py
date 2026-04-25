@@ -891,13 +891,21 @@ class DiscogsRelease(BaseModel):
     images: list[DiscogsImage] | None = None
 
 
+class StreamingLinks(BaseModel):
+    spotify_url: str | None = Field(None, description="Spotify album URL")
+    apple_music_url: str | None = Field(None, description="Apple Music album URL")
+    youtube_music_url: str | None = Field(None, description="YouTube Music search URL")
+    bandcamp_url: str | None = Field(None, description="Bandcamp album URL")
+    soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
+
+
 class LookupRequest(BaseModel):
     artist: str | None = Field(None, description="Parsed artist name")
     song: str | None = Field(None, description="Parsed song/track title")
     album: str | None = Field(None, description="Parsed album name")
-    raw_message: str = Field(
-        ...,
-        description="Original request message (needed for ambiguous format detection)",
+    raw_message: str | None = Field(
+        None,
+        description="Original request message (used for ambiguous format detection). Optional when structured fields (artist, album, song) are provided.\n",
     )
 
 
@@ -933,6 +941,14 @@ class DiscogsMatchResult(BaseModel):
     release_url: str = Field(..., description="URL to the release on Discogs")
     artwork_url: str | None = Field(None, description="Artwork image URL")
     confidence: confloat(ge=0.0, le=1.0) | None = Field(0, description="Match confidence score")
+    release_year: int | None = Field(None, description="Release year from Discogs")
+    artist_bio: str | None = Field(None, description="Artist biography from Discogs profile")
+    wikipedia_url: str | None = Field(None, description="Wikipedia URL for the artist")
+    spotify_url: str | None = Field(None, description="Spotify album URL")
+    apple_music_url: str | None = Field(None, description="Apple Music album URL")
+    youtube_music_url: str | None = Field(None, description="YouTube Music search URL")
+    bandcamp_url: str | None = Field(None, description="Bandcamp album URL")
+    soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
 
 
 class LookupResultItem(BaseModel):
