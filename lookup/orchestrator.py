@@ -1064,7 +1064,7 @@ async def perform_lookup(
         search_state = await execute_search_pipeline(
             parsed=parsed,
             db=db,
-            raw_message=request.raw_message,
+            raw_message=request.raw_message or "",
             strategies=strategies,
             albums_for_search=albums_for_search,
             song_not_found=song_not_found,
