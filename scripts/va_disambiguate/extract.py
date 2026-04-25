@@ -58,6 +58,7 @@ def _run_query(query: str, columns: list[str]) -> list[dict]:
     ssh_target = f"{SSH_USER}@{SSH_HOST}"
     mysql_cmd = (
         f"mysql -h {MYSQL_HOST} -u {MYSQL_USER} -p'{MYSQL_PASSWORD}' "
+        f"--default-character-set=utf8 "
         f'-B -N {MYSQL_DATABASE} -e "{query}"'
     )
 
@@ -157,7 +158,7 @@ def apply_sql_file(sql_path: str) -> None:
         raise RuntimeError("TUBAFRENZY_DB_PASSWORD not set.")
 
     ssh_target = f"{SSH_USER}@{SSH_HOST}"
-    mysql_cmd = f"mysql -h {MYSQL_HOST} -u {MYSQL_USER} -p'{MYSQL_PASSWORD}' {MYSQL_DATABASE}"
+    mysql_cmd = f"mysql -h {MYSQL_HOST} -u {MYSQL_USER} -p'{MYSQL_PASSWORD}' --default-character-set=utf8 {MYSQL_DATABASE}"
 
     logger.info(f"Applying {sql_path} via {ssh_target}...")
     start = time.time()
