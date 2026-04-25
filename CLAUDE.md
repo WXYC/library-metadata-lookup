@@ -22,7 +22,7 @@ Strategies are defined declaratively in `core/search.py` and executed in order:
 | Strategy | Trigger | Implementation |
 |---|---|---|
 | `ARTIST_PLUS_ALBUM` | Has artist, album, or song | `search_library_with_fallback()` |
-| `SWAPPED_INTERPRETATION` | No results + "X - Y" format | `search_with_alternative_interpretation()` |
+| `SWAPPED_INTERPRETATION` | No results + "X - Y" / "X, Y" / "X. Y" format | `search_with_alternative_interpretation()` |
 | `TRACK_ON_COMPILATION` | Song not found + artist + song | `search_compilations_for_track()` |
 | `SONG_AS_ARTIST` | No results + song but no artist | `search_song_as_artist()` |
 

@@ -393,6 +393,16 @@ class TestDetectAmbiguousFormat:
                 ("Stereolab", "Dots and Loops"),
                 id="period",
             ),
+            pytest.param(
+                "Lost Love, Adult.",
+                ("Lost Love", "Adult."),
+                id="comma",
+            ),
+            pytest.param(
+                "Autechre, Confield",
+                ("Autechre", "Confield"),
+                id="comma-spaced",
+            ),
         ],
     )
     def test_detects_ambiguous_formats(self, message, expected):

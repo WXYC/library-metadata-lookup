@@ -287,3 +287,39 @@ class TestExecuteSearchPipeline:
         assert state.found_on_compilation is True
         assert state.results == [compilation]
         assert state.discogs_titles == {46602: "Trax Records 20th Anniversary Collection"}
+
+    @pytest.mark.asyncio
+    async def test_comma_format_triggers_swapped_interpretation(self):
+        """Comma-separated 'song, artist' triggers SWAPPED_INTERPRETATION.
+
+        Regression test: "Lost Love, Adult." was parsed as song="Lost Love",
+        album="Adult.", artist=None. ARTIST_PLUS_ALBUM found nothing, and
+        SWAPPED_INTERPRETATION was skipped because detect_ambiguous_format
+        didn't recognize comma format. The request fell through to
+        SONG_AS_ARTIST which returned wrong results.
+        """
+        adult_item = _item(id=13766, artist="Adult.", title="Resuscitation")
+
+        search_lib = AsyncMock(return_value=([], False))
+        search_alt = AsyncMock(return_value=([adult_item], None))
+        search_comp = AsyncMock(return_value=([], {}))
+        search_song = AsyncMock(return_value=([], None))
+
+        strategies = build_strategies(search_lib, search_alt, search_comp, search_song)
+
+        parsed = ParsedRequest(
+            song="Lost Love",
+            album="Adult.",
+            raw_message="Lost Love, Adult.",
+        )
+
+        state = await execute_search_pipeline(
+            parsed,
+            AsyncMock(),
+            "Lost Love, Adult.",
+            strategies,
+        )
+
+        assert state.results == [adult_item]
+        assert SearchStrategyType.SWAPPED_INTERPRETATION in state.strategies_tried
+        search_song.assert_not_awaited()
