@@ -160,14 +160,27 @@ class DiscogsService:
     then fall back to Discogs API, and cache API results for future queries.
     """
 
-    def __init__(self, token: str, cache_service: DiscogsCacheService | None = None):
-        """Initialize the service with a Discogs API token.
+    def __init__(
+        self,
+        token: str | None = None,
+        cache_service: DiscogsCacheService | None = None,
+        *,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+    ):
+        """Initialize the service with Discogs API credentials.
 
-        Args:
-            token: Discogs API token
-            cache_service: Optional PostgreSQL cache service for local caching
+        Supports two auth methods (token takes precedence when both are supplied):
+          1. Personal access token: ``DiscogsService(token="abc123")``
+          2. OAuth consumer key/secret: ``DiscogsService(api_key="k", api_secret="s")``
         """
-        self.token = token
+        if token:
+            self._auth_header = f"Discogs token={token}"
+        elif api_key and api_secret:
+            self._auth_header = f"Discogs key={api_key}, secret={api_secret}"
+        else:
+            raise ValueError("Provide either token or api_key+api_secret")
+        self.token = token or api_key  # backward-compat for callers reading .token
         self.cache_service = cache_service
         self._client: httpx.AsyncClient | None = None
 
@@ -177,7 +190,7 @@ class DiscogsService:
             self._client = httpx.AsyncClient(
                 base_url=DISCOGS_API_BASE,
                 headers={
-                    "Authorization": f"Discogs token={self.token}",
+                    "Authorization": self._auth_header,
                     "User-Agent": "LibraryMetadataLookupService/1.0",
                 },
                 timeout=10.0,

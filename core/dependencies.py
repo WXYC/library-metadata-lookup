@@ -80,8 +80,10 @@ async def get_discogs_service(
     global _discogs_service
     global _discogs_pool
 
-    if not settings.discogs_token:
-        logger.debug("DISCOGS_TOKEN not set - Discogs service disabled")
+    has_token = bool(settings.discogs_token)
+    has_key_secret = bool(settings.discogs_api_key and settings.discogs_api_secret)
+    if not has_token and not has_key_secret:
+        logger.debug("No Discogs credentials set - Discogs service disabled")
         return None
 
     if _discogs_service is None:
@@ -103,7 +105,16 @@ async def get_discogs_service(
             cache_service = DiscogsCacheService(_discogs_pool)
             logger.info("Discogs cache service enabled")
 
-        _discogs_service = DiscogsService(settings.discogs_token, cache_service=cache_service)
+        if has_token:
+            _discogs_service = DiscogsService(
+                token=settings.discogs_token, cache_service=cache_service
+            )
+        else:
+            _discogs_service = DiscogsService(
+                api_key=settings.discogs_api_key,
+                api_secret=settings.discogs_api_secret,
+                cache_service=cache_service,
+            )
         logger.info(
             f"Discogs service initialized (cache: {'enabled' if cache_service else 'disabled'})"
         )
