@@ -9,7 +9,6 @@ from httpx import ASGITransport, AsyncClient
 from discogs.models import (
     ArtistDetails,
     ArtistRef,
-    DiscogsSearchResponse,
     MasterRelease,
     MemberRef,
     ReleaseMetadataResponse,
@@ -17,7 +16,6 @@ from discogs.models import (
 )
 from discogs.router import _require_service
 from discogs.service import DiscogsService
-from tests.factories import make_discogs_result
 from tests.unit.conftest import override_deps
 
 # ---------------------------------------------------------------------------
@@ -148,22 +146,11 @@ class TestGetRelease:
         assert resp.status_code == 503
 
 
-class TestSearchReleases:
-    @pytest.mark.asyncio
-    async def test_success(self, app_with_discogs, mock_discogs):
-        mock_discogs.search = AsyncMock(
-            return_value=DiscogsSearchResponse(
-                results=[
-                    make_discogs_result(
-                        release_id=1,
-                        album="Album",
-                        artist="Artist",
-                    )
-                ],
-                total=1,
-            )
-        )
+class TestSearchReleasesRemoved:
+    """The /discogs/search endpoint has been removed. All callers use /lookup instead."""
 
+    @pytest.mark.asyncio
+    async def test_endpoint_returns_404(self, app_with_discogs):
         async with AsyncClient(
             transport=ASGITransport(app=app_with_discogs), base_url="http://test"
         ) as client:
@@ -172,26 +159,7 @@ class TestSearchReleases:
                 json={"artist": "Artist", "album": "Album"},
             )
 
-        assert resp.status_code == 200
-        assert resp.json()["total"] == 1
-
-    @pytest.mark.asyncio
-    async def test_no_params_returns_400(self, app_with_discogs):
-        async with AsyncClient(
-            transport=ASGITransport(app=app_with_discogs), base_url="http://test"
-        ) as client:
-            resp = await client.post("/api/v1/discogs/search", json={})
-
-        assert resp.status_code == 400
-
-    @pytest.mark.asyncio
-    async def test_no_service_returns_503(self, app_without_discogs):
-        async with AsyncClient(
-            transport=ASGITransport(app=app_without_discogs), base_url="http://test"
-        ) as client:
-            resp = await client.post("/api/v1/discogs/search", json={"artist": "Artist"})
-
-        assert resp.status_code == 503
+        assert resp.status_code == 404 or resp.status_code == 405
 
 
 # ---------------------------------------------------------------------------
