@@ -333,12 +333,12 @@ We analyzed 65,147 releases in the WXYC library catalog (58,913 non-compilation,
 
 | Service | Albums with URL |
 |---------|----------------|
-| Spotify | 46,786 |
-| Deezer | 25,568 |
-| Bandcamp | 2,795 |
-| Apple Music | 288 |
-| Tidal | 10 |
-| **Total with any URL** | **47,588** |
+| Spotify | <!-- gen:url.spotify -->46,786<!-- /gen --> |
+| Deezer | <!-- gen:url.deezer -->25,568<!-- /gen --> |
+| Bandcamp | <!-- gen:url.bandcamp -->2,795<!-- /gen --> |
+| Apple Music | <!-- gen:url.apple -->288<!-- /gen --> |
+| Tidal | <!-- gen:url.tidal -->10<!-- /gen --> |
+| **Total with any URL** | **<!-- gen:url.any -->47,588<!-- /gen -->** |
 
 The Bandcamp count reflects only album-level URLs persisted in `bandcamp_url`. The 5,898 artist-page fallback URLs from Method 32 were cleared by the Apr 19 `bandcamp_pipeline` migration (which preserved the slugs in `bandcamp_slug` for later album-level re-matching).
 
@@ -346,7 +346,7 @@ The Bandcamp count reflects only album-level URLs persisted in `bandcamp_url`. T
 
 | Category | Count | % |
 |----------|-------|---|
-| Matched to Discogs release | 45,494 | 77.2% |
+| Matched to Discogs release | <!-- gen:discogs.matched_non_comp -->45,494<!-- /gen --> | 77.2% |
 | Not matched | 13,419 | 22.8% |
 
 ### VA Compilations
@@ -374,10 +374,10 @@ The Bandcamp count reflects only album-level URLs persisted in `bandcamp_url`. T
 
 | Status | Count |
 |--------|-------|
-| ON_STREAMING = 1 | 58,787 |
-| ON_STREAMING = 0 (exclusive) | 3,490 |
-| NULL (unknown — obscure compilations/samplers) | 2,417 |
-| **Total LIBRARY_RELEASE rows** | **64,694** |
+| ON_STREAMING = 1 | <!-- gen:on_streaming.yes -->58,787<!-- /gen --> |
+| ON_STREAMING = 0 (exclusive) | <!-- gen:on_streaming.no -->3,490<!-- /gen --> |
+| NULL (unknown — obscure compilations/samplers) | <!-- gen:on_streaming.null -->2,417<!-- /gen --> |
+| **Total LIBRARY_RELEASE rows** | **<!-- gen:on_streaming.total -->64,694<!-- /gen -->** |
 
 The 453-row gap between LIBRARY_RELEASE (64,694) and the streaming-availability snapshot (65,147) reflects releases that have been removed from the live library since the snapshot was taken on Apr 23. The percentages in the Overview are computed against the snapshot total.
 
@@ -385,9 +385,9 @@ The 453-row gap between LIBRARY_RELEASE (64,694) and the streaming-availability 
 
 | Category | Count |
 |----------|-------|
-| Total catalog | 65,147 |
-| Non-compilations | 58,913 |
-| Compilations | 6,234 |
+| Total catalog | <!-- gen:catalog.total -->65,147<!-- /gen --> |
+| Non-compilations | <!-- gen:catalog.non_compilation -->58,913<!-- /gen --> |
+| Compilations | <!-- gen:catalog.compilation -->6,234<!-- /gen --> |
 | Masters imported | 2,530,697 |
 
 ## Key Lessons
