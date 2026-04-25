@@ -66,6 +66,28 @@ plugins = ["pydantic.mypy"]
 module = "generated.*"
 ignore_errors = true
 
+# One-off streaming-pipeline scripts: archived as historical record of the
+# methods described in `streaming_analysis_report.md`. Not actively maintained,
+# so mypy enforcement is relaxed. Add new entries sparingly — service code and
+# new pipeline scripts should remain fully typed.
+[[tool.mypy.overrides]]
+module = [
+    "scripts.bandcamp_lookup",
+    "scripts.bandcamp_search",
+    "scripts.canonicalize_albums",
+    "scripts.canonicalize_compilations",
+    "scripts.enrich_discogs_matches",
+    "scripts.kagi_streaming_search",
+    "scripts.match_compilations",
+    "scripts.merge_cta",
+    "scripts.musicbrainz_matching",
+    "scripts.revalidate_misses",
+    "scripts.revalidate_spotify",
+    "scripts.spotify_artist_catalog",
+    "scripts.validate_streaming_urls",
+]
+ignore_errors = true
+
 [[tool.mypy.overrides]]
 module = ["wxyc_etl", "wxyc_etl.*", "asyncpg", "asyncpg.*"]
 ignore_missing_imports = true

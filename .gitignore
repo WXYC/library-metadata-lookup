@@ -46,3 +46,24 @@ va_catalog_inserts.sql
 va_disambiguate_unresolved.csv
 streaming_availability.db
 streaming_report.csv
+
+# Streaming pipeline artifacts (intermediate match outputs, scratch data)
+album_llm_matches.json
+bandcamp_matches.json
+canonicalized_album_names.json
+canonicalized_names.json
+compilation_canonicalized.json
+compilation_llm_matches.json
+compilation_track_artists.json
+compilation_unmatched.json
+discogs_fuzzy_matches.json
+kagi_false_positives.json
+kagi_search_results.json
+llm_streaming_analysis.json
+musicbrainz_matches.json
+spotify_revalidation_false_positives.json
+not_on_streaming.csv
+cta_inserts.sql
+
+# Claude Code local config
+.claude/
