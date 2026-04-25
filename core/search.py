@@ -18,7 +18,7 @@ from services.parser import ParsedRequest
 
 
 def detect_ambiguous_format(raw_message: str) -> tuple[str, str] | None:
-    """Detect if message has ambiguous 'X - Y' or 'X. Y' format.
+    """Detect if message has ambiguous 'X - Y', 'X, Y', or 'X. Y' format.
 
     These formats are ambiguous because they could be interpreted as either:
     - Artist: X, Title: Y
@@ -42,6 +42,12 @@ def detect_ambiguous_format(raw_message: str) -> tuple[str, str] | None:
         if part1 and part2:
             return (part1, part2)
 
+    # Check for "X, Y" pattern (comma separator)
+    if "," in raw_message:
+        parts = raw_message.split(",", 1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            return (parts[0].strip(), parts[1].strip())
+
     # Check for "X. Y" pattern (period followed by space)
     if ". " in raw_message:
         parts = raw_message.split(". ", 1)
@@ -64,7 +70,7 @@ class SearchStrategyType(StrEnum):
     """Fallback to just artist name when album/song search fails."""
 
     SWAPPED_INTERPRETATION = "swapped_interpretation"
-    """Try "X - Y" format as both artist/title orderings."""
+    """Try "X - Y", "X, Y", or "X. Y" format as both artist/title orderings."""
 
     TRACK_ON_COMPILATION = "track_on_compilation"
     """Find song on compilation albums via Discogs cross-reference."""
