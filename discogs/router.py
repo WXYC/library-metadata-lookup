@@ -9,8 +9,6 @@ from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.markup_parser import DiscogsServiceResolver, parse_async
 from discogs.models import (
     ArtistDetails,
-    DiscogsSearchRequest,
-    DiscogsSearchResponse,
     EntityResolveResponse,
     EntityType,
     ReleaseMetadataResponse,
@@ -80,33 +78,6 @@ async def get_release(
         )
 
     return result
-
-
-@router.post(
-    "/search",
-    response_model=DiscogsSearchResponse,
-    summary="Search Discogs releases",
-    responses={
-        200: {"description": "Search results returned"},
-        400: {"description": "No search parameters provided"},
-        503: {"description": "Discogs service not configured"},
-    },
-)
-async def search_releases(
-    request: DiscogsSearchRequest,
-    limit: int = Query(5, ge=1, le=50, description="Maximum number of results"),
-    service: DiscogsService | None = Depends(get_discogs_service),
-) -> DiscogsSearchResponse:
-    """Search Discogs for releases matching the criteria."""
-    svc = _require_service(service)
-
-    if not request.artist and not request.album and not request.track:
-        raise HTTPException(
-            status_code=400,
-            detail="At least one of artist, album, or track must be provided",
-        )
-
-    return await svc.search(request, limit=limit)
 
 
 @router.get(
