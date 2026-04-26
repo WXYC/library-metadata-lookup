@@ -1181,7 +1181,7 @@ async def perform_lookup(
         parsed, found_on_compilation, song_not_found, has_results=bool(library_results)
     )
 
-    # Step 4c: Resolve external identifiers for each result's artist
+    # Step 6: Resolve external identifiers for each result's artist
     identities_by_artist: dict[str, ReconciledIdentity] = {}
     if entity_store is not None and library_results:
         with telemetry.track_step("identity_resolution"):

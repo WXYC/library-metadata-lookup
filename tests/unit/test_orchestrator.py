@@ -938,6 +938,55 @@ class TestPerformLookupReconciledIdentity:
         # Only one DB lookup despite two results
         assert entity_store.get_identity.call_count == 1
 
+    @pytest.mark.asyncio
+    async def test_entity_store_exception_does_not_fail_lookup(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """A transient entity-store failure leaves reconciled_identity None
+        rather than turning the whole /lookup response into a 500."""
+        mock_library_db.search.return_value = [queen_item]
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        entity_store = AsyncMock()
+        entity_store.get_identity = AsyncMock(side_effect=ConnectionError("entity DB down"))
+
+        request = LookupRequest(artist="Queen", album="A Night at the Opera", raw_message="...")
+
+        response = await perform_lookup(
+            request, mock_library_db, mock_discogs_service, telemetry, entity_store=entity_store
+        )
+
+        # Lookup still succeeds; the field is just absent for the failed artist.
+        assert len(response.results) == 1
+        assert response.results[0].reconciled_identity is None
+
+    @pytest.mark.asyncio
+    async def test_compilation_entries_skip_identity_lookup(
+        self, mock_library_db, mock_discogs_service, telemetry, compilation_item
+    ):
+        """Compilation entries (artist='Various Artists - ...') aren't keyed in
+        entity.identity, so they get reconciled_identity=None — not an error."""
+        mock_library_db.search.return_value = [compilation_item]
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        entity_store = AsyncMock()
+        entity_store.get_identity = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Various Artists - Rock - D",
+            album="Disco Not Disco",
+            raw_message="...",
+        )
+
+        response = await perform_lookup(
+            request, mock_library_db, mock_discogs_service, telemetry, entity_store=entity_store
+        )
+
+        assert len(response.results) == 1
+        assert response.results[0].reconciled_identity is None
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - ambiguous format

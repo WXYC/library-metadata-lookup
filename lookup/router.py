@@ -72,14 +72,18 @@ async def handle_lookup(
 
         # Send telemetry
         if posthog_client:
+            results = response.results or []
             telemetry.send_to_posthog(
                 posthog_client,
                 {
-                    "results_count": len(response.results or []),
+                    "results_count": len(results),
                     "search_type": response.search_type,
                     "had_artist": bool(request.artist),
                     "had_album": bool(request.album),
                     "had_song": bool(request.song),
+                    "reconciled_identity_count": sum(
+                        1 for r in results if r.reconciled_identity is not None
+                    ),
                 },
             )
 
