@@ -204,8 +204,23 @@ They are excluded by default (`addopts = "-m 'not integration'"` in `pyproject.t
 - `LIBRARY_DB_PATH` -- Path to SQLite library database (default: `library.db`)
 - `ADMIN_TOKEN` -- Bearer token for admin endpoints (library.db upload)
 - `STREAMING_WEBHOOK_URLS` -- Comma-separated URLs to POST streaming status changes after library.db upload
-- `ETL_NOTIFY_KEY` -- Bearer token for streaming webhook authentication
+- `ETL_NOTIFY_KEY` -- Bearer token used by LML when *pushing* the streaming-status webhook to tubafrenzy
+- `LML_API_KEY` -- Bearer token required from tubafrenzy / Backend-Service callers on protected endpoints (see "Inbound auth" below)
+- `LML_REQUIRE_AUTH` -- When `true`, enforce `LML_API_KEY` on protected endpoints. Defaults to `false` so the dep can be deployed before consumers are updated; flip after all callers send the bearer header.
 - `LOG_LEVEL` -- Logging level (default: `INFO`)
+
+### Inbound auth (`LML_API_KEY`)
+
+Tubafrenzy and Backend-Service call LML for streaming checks, library search, autocomplete, and Discogs lookups. When `LML_REQUIRE_AUTH=true`, those callers must send `Authorization: Bearer <LML_API_KEY>` on every request to:
+
+- `POST /api/v1/streaming-check`
+- `POST /api/v1/lookup`
+- `GET /api/v1/library/search`
+- `GET /api/v1/discogs/...` (all five endpoints)
+
+`/health`, `/admin/*` (uses its own `ADMIN_TOKEN`), and `/identity/*` are not gated by `LML_API_KEY`.
+
+If `LML_REQUIRE_AUTH=true` and `LML_API_KEY` is unset, protected endpoints return 500 (fail loudly rather than silently accepting all requests).
 
 ### Discogs cache TTL settings
 

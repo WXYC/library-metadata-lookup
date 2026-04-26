@@ -5,10 +5,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from config.settings import get_settings
+from core.auth import require_lml_key
 from core.dependencies import (
     close_discogs_service,
     close_library_db,
@@ -87,13 +88,23 @@ async def posthog_flush_middleware(request: Request, call_next):
     return response
 
 
+# Health and admin keep their own auth posture:
+#   - /health is open for Railway healthchecks
+#   - /admin/* uses ADMIN_TOKEN (see routers/admin.py:_validate_auth)
+# Identity is open for now (semantic-index consumes it; separate decision).
 app.include_router(health_router, prefix="", tags=["health"])
 app.include_router(admin_router, prefix="/admin", tags=["admin"])
-app.include_router(lookup_router, prefix="/api/v1", tags=["lookup"])
-app.include_router(library_router, prefix="/api/v1", tags=["library"])
-app.include_router(discogs_router, prefix="/api/v1", tags=["discogs"])
 app.include_router(identity_router, prefix="/identity", tags=["identity"])
-app.include_router(streaming_router, prefix="/api/v1", tags=["streaming"])
+
+# Tubafrenzy / Backend-Service-facing routers: protected by LML_API_KEY when
+# LML_REQUIRE_AUTH is true. See core/auth.py for the rollout phasing.
+_lml_protected = [Depends(require_lml_key)]
+app.include_router(lookup_router, prefix="/api/v1", tags=["lookup"], dependencies=_lml_protected)
+app.include_router(library_router, prefix="/api/v1", tags=["library"], dependencies=_lml_protected)
+app.include_router(discogs_router, prefix="/api/v1", tags=["discogs"], dependencies=_lml_protected)
+app.include_router(
+    streaming_router, prefix="/api/v1", tags=["streaming"], dependencies=_lml_protected
+)
 
 if __name__ == "__main__":
     import uvicorn
