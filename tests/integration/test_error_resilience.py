@@ -154,6 +154,134 @@ class TestBulkIdentityEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Bulk resource bounds (memory + wall-clock)
+# ---------------------------------------------------------------------------
+
+
+class TestBulkResourceBounds:
+    """Bulk identity endpoint stays within memory and timing budgets.
+
+    Reuses the same dependency-overridden client setup as TestBulkIdentityEndpoint
+    so that the entity-store mock returns deterministically without hitting
+    PostgreSQL. The assertions catch regressions like accidental N+1 query
+    patterns, unbounded retries, or per-name buffering that would blow up
+    memory on larger payloads.
+    """
+
+    @pytest_asyncio.fixture
+    async def app_client_with_entity_store(self, library_db, test_settings):
+        """httpx AsyncClient with a mock EntityStore that resolves a fixed subset.
+
+        Identical wiring to TestBulkIdentityEndpoint.app_client_with_entity_store;
+        duplicated here so the two test classes can be run independently and so
+        each fixture stays scoped to its own class without cross-class coupling.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        identity_routes = [r for r in app.routes if hasattr(r, "path") and "/identity" in r.path]
+        if not identity_routes:
+            pytest.skip("Identity endpoints not yet available on this branch")
+
+        mock_store = AsyncMock()
+
+        async def mock_get_identity(name):
+            if name in WXYC_ARTISTS[:10]:
+                return MagicMock(
+                    library_name=name,
+                    discogs_artist_id=100 + WXYC_ARTISTS.index(name),
+                    wikidata_qid=None,
+                    musicbrainz_artist_id=None,
+                    spotify_artist_id=None,
+                    apple_music_artist_id=None,
+                    bandcamp_id=None,
+                    reconciliation_status="reconciled",
+                )
+            return None
+
+        mock_store.get_identity = AsyncMock(side_effect=mock_get_identity)
+
+        try:
+            from identity.dependencies import get_entity_store
+
+            app.dependency_overrides[get_entity_store] = lambda: mock_store
+        except ImportError:
+            pytest.skip("Identity module not available on this branch")
+
+        app.dependency_overrides[get_library_db] = lambda: library_db
+        app.dependency_overrides[get_discogs_service] = lambda: None
+        app.dependency_overrides[get_posthog_client] = lambda: None
+        app.dependency_overrides[get_settings] = lambda: test_settings
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            yield client
+
+        app.dependency_overrides.clear()
+
+    @pytest.mark.parametrize("size", [100, 1000, 5000])
+    @pytest.mark.asyncio
+    async def test_bulk_memory_bounded_under_200mb(self, app_client_with_entity_store, size: int):
+        """Peak traced memory stays under 200 MB for bulk requests up to 5000 names.
+
+        Catches regressions where bulk identity resolution accidentally
+        materializes per-name intermediate buffers, retains response objects
+        beyond the request lifecycle, or triggers unbounded query result
+        accumulation.
+        """
+        import tracemalloc
+
+        names = _generate_artist_names(size)
+
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            resp = await app_client_with_entity_store.post("/identity/bulk", json={"names": names})
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert resp.status_code == 200
+        body = resp.json()
+        total = len(body["identities"]) + len(body["unresolved"])
+        assert total == size, f"Expected {size} total, got {total}"
+
+        peak_mb = peak / (1024 * 1024)
+        assert peak < 200 * 1024 * 1024, (
+            f"Bulk request of {size} names used {peak_mb:.1f} MB peak (limit: 200 MB)"
+        )
+
+    @pytest.mark.parametrize("size,timeout_s", [(1000, 30.0), (5000, 30.0)])
+    @pytest.mark.asyncio
+    async def test_bulk_completes_within_timeout(
+        self, app_client_with_entity_store, size: int, timeout_s: float
+    ):
+        """Bulk request of up to 5000 names completes well under 30 s wall-clock.
+
+        Catches regressions like accidental N+1 query patterns or unbounded
+        retries that would compound latency with payload size.
+        """
+        import time
+
+        names = _generate_artist_names(size)
+
+        start = time.perf_counter()
+        resp = await app_client_with_entity_store.post("/identity/bulk", json={"names": names})
+        elapsed = time.perf_counter() - start
+
+        assert resp.status_code == 200
+        body = resp.json()
+        total = len(body["identities"]) + len(body["unresolved"])
+        assert total == size, f"Expected {size} total, got {total}"
+
+        assert elapsed < timeout_s, (
+            f"Bulk request of {size} names took {elapsed:.2f}s (timeout: {timeout_s}s)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Source transport connection failures
 # ---------------------------------------------------------------------------
 
