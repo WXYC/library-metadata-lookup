@@ -100,6 +100,23 @@ class Settings(BaseSettings):
         None, description="Bearer token for admin endpoints (e.g. library.db upload)"
     )
 
+    # LML API Auth (tubafrenzy / Backend-Service -> LML)
+    lml_api_key: str | None = Field(
+        None,
+        description=(
+            "Bearer token required from tubafrenzy / Backend-Service callers. "
+            "Compared against the Authorization header on protected endpoints."
+        ),
+    )
+    lml_require_auth: bool = Field(
+        default=False,
+        description=(
+            "When True, enforce LML_API_KEY on tubafrenzy/Backend-Service-facing endpoints. "
+            "Default False so the dep can be deployed before consumers are updated; "
+            "flip to True after all callers send the bearer header."
+        ),
+    )
+
     # Streaming Webhook Configuration
     streaming_webhook_urls: str | None = Field(
         None,

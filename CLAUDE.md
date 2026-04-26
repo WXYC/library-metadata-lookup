@@ -150,7 +150,25 @@ Optional:
 - `LIBRARY_DB_PATH` -- Path to SQLite database (default: `library.db`)
 - `ADMIN_TOKEN` -- Bearer token for admin endpoints (upload endpoint)
 - `STREAMING_WEBHOOK_URLS` -- Comma-separated URLs to POST streaming status changes after library.db upload
-- `ETL_NOTIFY_KEY` -- Bearer token for streaming webhook authentication
+- `ETL_NOTIFY_KEY` -- Bearer token used by LML when *pushing* the streaming-status webhook to tubafrenzy
+- `LML_API_KEY` -- Bearer token required from tubafrenzy / Backend-Service callers (see "Inbound Auth" below)
+- `LML_REQUIRE_AUTH` -- When `true`, enforce `LML_API_KEY` on protected endpoints. Default `false` (see rollout phasing in `core/auth.py`)
+
+### Inbound Auth (`LML_API_KEY`)
+
+`core/auth.py:require_lml_key` is a FastAPI dependency that validates `Authorization: Bearer <LML_API_KEY>` on every tubafrenzy / Backend-Service-facing endpoint. Wired in `main.py` via `app.include_router(..., dependencies=[Depends(require_lml_key)])` for the `lookup`, `library`, `discogs`, and `streaming` routers.
+
+Three auth surfaces in this service, intentionally separate:
+
+| Surface | Direction | Env var | Implementation |
+|---|---|---|---|
+| Inbound from tubafrenzy / Backend-Service | tubafrenzy → LML | `LML_API_KEY` | `core/auth.py:require_lml_key` (router-level dep) |
+| `/admin/*` (library.db upload) | ETL → LML | `ADMIN_TOKEN` | `routers/admin.py:_validate_auth` (per-route call) |
+| Outbound streaming-status webhook | LML → tubafrenzy | `ETL_NOTIFY_KEY` | `routers/admin.py:_send_streaming_webhook` (sends `Authorization: Bearer ...`) |
+
+Untouched: `/health`, `/identity/resolve`, `/identity/bulk`. Identity routes are consumed by semantic-index too, so locking them down is a separate decision.
+
+**Rollout:** `LML_REQUIRE_AUTH` defaults to `false` so the dep can ship before consumers send the header. Once tubafrenzy and Backend-Service are updated, flip the flag in Railway to enforce.
 
 ## Code Style
 
