@@ -7,7 +7,36 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Discriminator
 
+from generated.api_models import (
+    Alias,
+    DiscogsArtistCredit,
+    DiscogsLabelCredit,
+    DiscogsReleaseInfo,
+    DiscogsReleaseMetadata,
+    DiscogsReleaseVideo,
+    DiscogsTrackItem,
+    DiscogsTrackReleasesResponse,
+    Member,
+)
 from generated.api_models import DiscogsMatchResult as _GeneratedDiscogsMatchResult
+
+# Backward-compatible aliases for Discogs schemas now defined in api.yaml.
+# See WXYC/library-metadata-lookup#111.
+#
+# ArtistDetails is intentionally NOT aliased to the generated DiscogsArtistDetails:
+# its profile_tokens field uses the locally-defined ResolvedToken discriminated
+# union (markup tokens), which the api.yaml schema currently flattens into a
+# permissive single class. Keeping ArtistDetails local preserves type-safe
+# variant access for callers that read profile_tokens.
+ArtistCredit = DiscogsArtistCredit
+LabelCredit = DiscogsLabelCredit
+TrackItem = DiscogsTrackItem
+ReleaseVideo = DiscogsReleaseVideo
+ReleaseInfo = DiscogsReleaseInfo
+TrackReleasesResponse = DiscogsTrackReleasesResponse
+ReleaseMetadataResponse = DiscogsReleaseMetadata
+ArtistRef = Alias
+MemberRef = Member
 
 
 class TracksAutocompleteResponse(BaseModel):
@@ -17,100 +46,6 @@ class TracksAutocompleteResponse(BaseModel):
     total: int = 0
     artist: str
     cached: bool = True
-
-
-class ArtistCredit(BaseModel):
-    """An artist credit on a release."""
-
-    artist_id: int | None = None
-    name: str
-    join: str = ""  # join phrase: " & ", ", ", etc.
-    role: str | None = None  # for extra artists: "Producer", "Mixed By"
-
-
-class LabelCredit(BaseModel):
-    """A label credit on a release."""
-
-    label_id: int | None = None
-    name: str
-    catno: str | None = None
-
-
-class TrackItem(BaseModel):
-    """A single track on a release."""
-
-    position: str
-    title: str
-    duration: str | None = None
-    artists: list[str] = []  # Per-track artists (for compilations)
-
-
-class ReleaseVideo(BaseModel):
-    """A video associated with a release."""
-
-    src: str
-    title: str | None = None
-    duration: int | None = None  # Seconds
-    embed: bool = True
-
-
-class ReleaseInfo(BaseModel):
-    """Information about a single release containing a track."""
-
-    album: str
-    artist: str
-    release_id: int
-    release_url: str
-    is_compilation: bool = False
-
-
-class TrackReleasesResponse(BaseModel):
-    """Response for finding all releases containing a track."""
-
-    track: str
-    artist: str | None = None
-    releases: list[ReleaseInfo] = []
-    total: int = 0
-    cached: bool = False
-
-
-class ReleaseMetadataResponse(BaseModel):
-    """Full release metadata from Discogs."""
-
-    release_id: int
-    title: str
-    artist: str
-    year: int | None = None
-    label: str | None = None
-    artist_id: int | None = None
-    label_id: int | None = None
-    genres: list[str] = []
-    styles: list[str] = []
-    tracklist: list[TrackItem] = []
-    artwork_url: str | None = None
-    release_url: str
-    cached: bool = False
-    # Enriched fields (additive, backward-compatible)
-    artists: list[ArtistCredit] = []
-    extra_artists: list[ArtistCredit] = []
-    labels: list[LabelCredit] = []
-    released: str | None = None  # full date string, e.g. "2024-03-15"
-    videos: list[ReleaseVideo] = []
-
-
-class ArtistRef(BaseModel):
-    """Reference to a related artist (alias or similar)."""
-
-    id: int
-    name: str
-
-
-class MemberRef(BaseModel):
-    """Reference to a group member."""
-
-    id: int
-    name: str
-    active: bool = True
 
 
 # MARK: - Resolved Markup Tokens

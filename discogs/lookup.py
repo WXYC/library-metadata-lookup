@@ -60,7 +60,7 @@ async def lookup_releases_by_track(
 
     # Validate that the track actually exists on each release
     releases = []
-    for release_info in response.releases:
+    for release_info in response.releases or []:
         if artist and release_info.release_id:
             is_valid = await service.validate_track_on_release(
                 release_info.release_id, track, artist

@@ -442,13 +442,13 @@ async def search_compilations_for_track(
                     song_search, parsed.artist, artist_as_keyword=True
                 ),
             )
-            raw_releases = list(response.releases)
+            raw_releases = list(response.releases or [])
 
             # Only merge VA results if the artist-scoped search found no compilations
             has_compilation = any(r.is_compilation for r in raw_releases)
             if not has_compilation:
                 seen_album_keys = {r.album.lower() for r in raw_releases}
-                for r in va_response.releases:
+                for r in va_response.releases or []:
                     if r.is_compilation and r.album.lower() not in seen_album_keys:
                         raw_releases.append(r)
                         seen_album_keys.add(r.album.lower())
