@@ -410,7 +410,7 @@ class DiscogsCacheService:
                         (release.release_id, release.artist_id, release.artist, 0, None)
                     )
                 # Extra artists (extra=1)
-                for a in release.extra_artists:
+                for a in release.extra_artists or []:
                     artist_data.append((release.release_id, a.artist_id, a.name, 1, a.role))
 
                 if artist_data:
@@ -511,8 +511,8 @@ class DiscogsCacheService:
                     )
 
                     track_artist_data = []
-                    for i, t in enumerate(release.tracklist):
-                        for artist in t.artists:
+                    for i, t in enumerate(release.tracklist or []):
+                        for artist in t.artists or []:
                             track_artist_data.append((release.release_id, i + 1, artist))
 
                     if track_artist_data:

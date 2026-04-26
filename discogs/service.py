@@ -988,7 +988,7 @@ class DiscogsService:
         track_lower = normalize_for_track_comparison(track)
         artist_lower = normalize_artist_for_validation(artist)
 
-        for item in release.tracklist:
+        for item in release.tracklist or []:
             item_title = normalize_for_track_comparison(item.title)
             # Check if track title matches
             if track_lower not in item_title and item_title not in track_lower:
