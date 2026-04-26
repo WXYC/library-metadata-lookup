@@ -24,9 +24,11 @@ from core.telemetry import RequestTelemetry
 from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult, ReleaseInfo
 from discogs.service import DiscogsService
+from generated.api_models import ReconciledIdentity
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
+from scripts.entity_resolution.store import EntityStore, Identity
 from services.parser import MessageType, ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -995,11 +997,53 @@ def build_context_message(
     return None
 
 
+def _identity_to_reconciled(identity: Identity) -> ReconciledIdentity:
+    """Convert an EntityStore Identity dataclass to the shared ReconciledIdentity schema."""
+    return ReconciledIdentity(
+        discogs_artist_id=identity.discogs_artist_id,
+        musicbrainz_artist_id=identity.musicbrainz_artist_id,
+        wikidata_qid=identity.wikidata_qid,
+        spotify_artist_id=identity.spotify_artist_id,
+        apple_music_artist_id=identity.apple_music_artist_id,
+        bandcamp_id=identity.bandcamp_id,
+    )
+
+
+async def _resolve_identities(
+    artist_names: list[str], entity_store: EntityStore
+) -> dict[str, ReconciledIdentity]:
+    """Look up reconciled identities for unique artist names.
+
+    Returns a dict keyed by the artist name. Names not found in the entity
+    store are omitted, so callers should treat a missing key as "no identity."
+    Lookups across the unique names run concurrently.
+    """
+    unique = list({name for name in artist_names if name})
+    if not unique:
+        return {}
+
+    identities = await asyncio.gather(
+        *(entity_store.get_identity(name) for name in unique),
+        return_exceptions=True,
+    )
+
+    result: dict[str, ReconciledIdentity] = {}
+    for name, identity in zip(unique, identities, strict=True):
+        if isinstance(identity, BaseException):
+            logger.warning("EntityStore.get_identity failed for %r: %s", name, identity)
+            continue
+        if identity is not None:
+            result[name] = _identity_to_reconciled(identity)
+    return result
+
+
 async def perform_lookup(
     request: LookupRequest,
     db: LibraryDB,
     discogs_service: DiscogsService | None,
     telemetry: RequestTelemetry,
+    *,
+    entity_store: EntityStore | None = None,
 ) -> LookupResponse:
     """Orchestrate the full lookup pipeline.
 
@@ -1137,6 +1181,19 @@ async def perform_lookup(
         parsed, found_on_compilation, song_not_found, has_results=bool(library_results)
     )
 
+    # Step 4c: Resolve external identifiers for each result's artist
+    identities_by_artist: dict[str, ReconciledIdentity] = {}
+    if entity_store is not None and library_results:
+        with telemetry.track_step("identity_resolution"):
+            identities_by_artist = await _resolve_identities(
+                [item.artist for item in library_results if item.artist], entity_store
+            )
+
+    def _identity_for(item: LibraryItem) -> ReconciledIdentity | None:
+        if not item.artist:
+            return None
+        return identities_by_artist.get(item.artist)
+
     # Build response (convert internal models to API contract models)
     result_items = []
     if items_with_artwork:
@@ -1145,11 +1202,17 @@ async def perform_lookup(
                 LookupResultItem(
                     library_item=item.to_catalog_item(),
                     artwork=artwork.to_match_result() if artwork else None,
+                    reconciled_identity=_identity_for(item),
                 )
             )
     elif library_results:
         for item in library_results:
-            result_items.append(LookupResultItem(library_item=item.to_catalog_item()))
+            result_items.append(
+                LookupResultItem(
+                    library_item=item.to_catalog_item(),
+                    reconciled_identity=_identity_for(item),
+                )
+            )
 
     return LookupResponse(
         results=result_items,

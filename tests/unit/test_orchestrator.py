@@ -827,6 +827,119 @@ class TestPerformLookupArtwork:
 
 
 # ---------------------------------------------------------------------------
+# Tests: perform_lookup - reconciled identity
+# ---------------------------------------------------------------------------
+
+
+class TestPerformLookupReconciledIdentity:
+    """Test that perform_lookup populates reconciled_identity for results."""
+
+    @pytest.mark.asyncio
+    async def test_populates_reconciled_identity_when_entity_store_has_artist(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """Each result gets ReconciledIdentity from EntityStore.get_identity."""
+        from scripts.entity_resolution.store import Identity
+
+        mock_library_db.search.return_value = [queen_item]
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        entity_store = AsyncMock()
+        entity_store.get_identity = AsyncMock(
+            return_value=Identity(
+                id=42,
+                library_name="Queen",
+                discogs_artist_id=7894,
+                wikidata_qid="Q15862",
+                spotify_artist_id="1dfeR4HaWDbWqFHLkxsg1d",
+            )
+        )
+
+        request = LookupRequest(artist="Queen", album="A Night at the Opera", raw_message="...")
+
+        response = await perform_lookup(
+            request, mock_library_db, mock_discogs_service, telemetry, entity_store=entity_store
+        )
+
+        assert len(response.results) == 1
+        identity = response.results[0].reconciled_identity
+        assert identity is not None
+        assert identity.discogs_artist_id == 7894
+        assert identity.wikidata_qid == "Q15862"
+        assert identity.spotify_artist_id == "1dfeR4HaWDbWqFHLkxsg1d"
+        # Unset fields are None on the schema
+        assert identity.musicbrainz_artist_id is None
+
+    @pytest.mark.asyncio
+    async def test_omits_reconciled_identity_when_entity_store_is_none(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """When EntityStore isn't configured, reconciled_identity is left None."""
+        mock_library_db.search.return_value = [queen_item]
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(artist="Queen", album="A Night at the Opera", raw_message="...")
+
+        # No entity_store kwarg — defaults to None
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert len(response.results) == 1
+        assert response.results[0].reconciled_identity is None
+
+    @pytest.mark.asyncio
+    async def test_omits_reconciled_identity_when_artist_unknown_to_entity_store(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """Artists that don't appear in entity.identity get None — not an error."""
+        mock_library_db.search.return_value = [queen_item]
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        entity_store = AsyncMock()
+        entity_store.get_identity = AsyncMock(return_value=None)
+
+        request = LookupRequest(artist="Queen", album="A Night at the Opera", raw_message="...")
+
+        response = await perform_lookup(
+            request, mock_library_db, mock_discogs_service, telemetry, entity_store=entity_store
+        )
+
+        assert len(response.results) == 1
+        assert response.results[0].reconciled_identity is None
+
+    @pytest.mark.asyncio
+    async def test_dedupes_lookup_per_artist_across_results(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item, queen_game_item
+    ):
+        """Two results for the same artist trigger only one EntityStore.get_identity call."""
+        from scripts.entity_resolution.store import Identity
+
+        mock_library_db.search.return_value = [queen_item, queen_game_item]
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        entity_store = AsyncMock()
+        entity_store.get_identity = AsyncMock(
+            return_value=Identity(id=1, library_name="Queen", discogs_artist_id=7894)
+        )
+
+        request = LookupRequest(artist="Queen", raw_message="Queen")
+
+        response = await perform_lookup(
+            request, mock_library_db, mock_discogs_service, telemetry, entity_store=entity_store
+        )
+
+        assert len(response.results) == 2
+        # Both results share the same reconciled identity
+        assert response.results[0].reconciled_identity.discogs_artist_id == 7894
+        assert response.results[1].reconciled_identity.discogs_artist_id == 7894
+        # Only one DB lookup despite two results
+        assert entity_store.get_identity.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Tests: perform_lookup - ambiguous format
 # ---------------------------------------------------------------------------
 

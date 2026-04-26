@@ -14,12 +14,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT="$PROJECT_DIR/generated/api_models.py"
 
-# Resolve api.yaml source
+# Resolve api.yaml source. Inside a worktree, `git rev-parse --show-toplevel`
+# returns the worktree path, not the main repo, so use --git-common-dir to find
+# the real repo root.
 SIBLING_PATH="$PROJECT_DIR/../wxyc-shared/api.yaml"
-if [[ "$PROJECT_DIR" == */.claude/worktrees/* ]]; then
-    # Inside a worktree — look at the real repo's sibling
-    REPO_ROOT="$(cd "$PROJECT_DIR" && git rev-parse --show-toplevel 2>/dev/null || echo "$PROJECT_DIR")"
-    SIBLING_PATH="$REPO_ROOT/../wxyc-shared/api.yaml"
+if MAIN_GIT_DIR="$(cd "$PROJECT_DIR" && git rev-parse --git-common-dir 2>/dev/null)"; then
+    if [[ "$MAIN_GIT_DIR" != /* ]]; then
+        MAIN_GIT_DIR="$PROJECT_DIR/$MAIN_GIT_DIR"
+    fi
+    MAIN_REPO_ROOT="$(cd "$MAIN_GIT_DIR/.." && pwd)"
+    SIBLING_PATH="$MAIN_REPO_ROOT/../wxyc-shared/api.yaml"
 fi
 
 if [[ -f "$SIBLING_PATH" ]]; then
