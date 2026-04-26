@@ -200,11 +200,20 @@ Untouched: `/health`, `/identity/resolve`, `/identity/bulk`. Identity routes are
 | Lint & Format | All pushes + PRs | -- |
 | Type Check | All pushes + PRs | -- |
 | Unit Tests | All pushes + PRs | -- |
-| Deploy to Staging | Push to `main` | lint, typecheck, test |
+| E2E Tests | All pushes + PRs | -- |
+| Postgres Tests | All pushes + PRs | -- |
+| CI Marker Sync | All pushes + PRs | -- |
+| Deploy to Staging | Push to `main` | lint, typecheck, test, e2e, test-postgres |
 | Smoke Test (Staging) | Push to `main` | deploy-staging |
 | Integration Tests | Push to `main` | smoke-test-staging |
-| Deploy to Production | Push to `prod` | lint, typecheck, test |
+| Deploy to Production | Push to `prod` | lint, typecheck, test, e2e, test-postgres |
 | Smoke Test (Production) | Push to `prod` | deploy-production |
+
+**E2E Tests** run `pytest tests/e2e/ -v -m e2e`. The `tests/e2e/test_lookup_e2e.py` suite uses an in-memory SQLite library and a mock Discogs service — no credentials required. The `tests/e2e/discogs/test_endpoints.py` suite hits the real Discogs API and self-skips at collection if `DISCOGS_TOKEN` is unset (PR runs from forks may have no secret access).
+
+**Postgres Tests** run `pytest tests/integration/ -v -m postgres` against a `postgres:16-alpine` service container on port 5433. The `EntityStore` CRUD tests run end-to-end against a fresh `entity` schema. The Discogs reconciliation tests skip themselves when the `release_artist` table is missing — that table is part of the discogs-cache fixture and is too large to load in CI.
+
+**CI Marker Sync** invokes the reusable workflow at `WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml` to guarantee that every `@pytest.mark.<X>` actually used by a test is either re-selected by some CI `pytest -m` invocation or explicitly opted out via a `# ci-sync-skip: <marker> reason: <text>` comment in `pyproject.toml`. This guards against the silent-deselection bug pattern (WXYC/discogs-etl#103, WXYC/library-metadata-lookup#159).
 
 ### Library Database Upload
 
