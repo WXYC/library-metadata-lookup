@@ -980,7 +980,7 @@ class SearchType(StrEnum):
 
 
 class LookupResponse(BaseModel):
-    results: list[LookupResultItem] | None = Field(default_factory=list)
+    results: list[LookupResultItem] | None = Field([], validate_default=True)
     search_type: SearchType | None = Field(
         "none",
         description="The search strategy that produced results: direct, fallback, alternative, compilation, song_as_artist, or none\n",
@@ -1042,15 +1042,15 @@ class DiscogsReleaseMetadata(BaseModel):
     label_id: int | None = None
     genres: list[str] | None = []
     styles: list[str] | None = []
-    tracklist: list[DiscogsTrackItem] | None = Field(default_factory=list)
+    tracklist: list[DiscogsTrackItem] | None = Field([], validate_default=True)
     artwork_url: str | None = None
     release_url: str
     cached: bool | None = False
-    artists: list[DiscogsArtistCredit] | None = Field(default_factory=list)
-    extra_artists: list[DiscogsArtistCredit] | None = Field(default_factory=list)
-    labels: list[DiscogsLabelCredit] | None = Field(default_factory=list)
+    artists: list[DiscogsArtistCredit] | None = Field([], validate_default=True)
+    extra_artists: list[DiscogsArtistCredit] | None = Field([], validate_default=True)
+    labels: list[DiscogsLabelCredit] | None = Field([], validate_default=True)
     released: str | None = Field(None, description="Release date as ISO string")
-    videos: list[DiscogsReleaseVideo] | None = Field(default_factory=list)
+    videos: list[DiscogsReleaseVideo] | None = Field([], validate_default=True)
 
 
 class Type1(StrEnum):
@@ -1101,8 +1101,8 @@ class DiscogsArtistDetails(BaseModel):
     )
     image_url: str | None = None
     name_variations: list[str] | None = []
-    aliases: list[Alias] | None = Field(default_factory=list)
-    members: list[Member] | None = Field(default_factory=list)
+    aliases: list[Alias] | None = Field([], validate_default=True)
+    members: list[Member] | None = Field([], validate_default=True)
     urls: list[str] | None = []
     cached: bool | None = False
 
@@ -1118,7 +1118,7 @@ class DiscogsReleaseInfo(BaseModel):
 class DiscogsTrackReleasesResponse(BaseModel):
     track: str | None = None
     artist: str | None = None
-    releases: list[DiscogsReleaseInfo] | None = Field(default_factory=list)
+    releases: list[DiscogsReleaseInfo] | None = Field([], validate_default=True)
     total: int | None = 0
     cached: bool | None = False
 
