@@ -9,9 +9,11 @@ from core.dependencies import get_discogs_service, get_library_db, get_posthog_c
 from core.telemetry import RequestTelemetry, get_cache_stats, init_cache_stats
 from discogs.memory_cache import set_skip_cache
 from discogs.service import DiscogsService
+from identity.dependencies import get_entity_store
 from library.db import LibraryDB
 from lookup.models import LookupRequest, LookupResponse
 from lookup.orchestrator import perform_lookup
+from scripts.entity_resolution.store import EntityStore
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ async def handle_lookup(
     request: LookupRequest,
     db: LibraryDB = Depends(get_library_db),
     discogs_service: DiscogsService | None = Depends(get_discogs_service),
+    entity_store: EntityStore | None = Depends(get_entity_store),
     posthog_client: Posthog | None = Depends(get_posthog_client),
     skip_cache: bool = False,
 ):
@@ -61,6 +64,7 @@ async def handle_lookup(
             db=db,
             discogs_service=discogs_service,
             telemetry=telemetry,
+            entity_store=entity_store,
         )
 
         # Attach cache stats

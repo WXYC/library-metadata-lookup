@@ -899,6 +899,19 @@ class StreamingLinks(BaseModel):
     soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
 
 
+class ReconciledIdentity(BaseModel):
+    discogs_artist_id: int | None = Field(None, description="Discogs artist ID")
+    musicbrainz_artist_id: str | None = Field(None, description="MusicBrainz artist UUID")
+    wikidata_qid: str | None = Field(None, description='Wikidata QID (e.g. "Q12345")')
+    spotify_artist_id: str | None = Field(
+        None, description="Spotify artist ID (the Spotify URI suffix)"
+    )
+    apple_music_artist_id: str | None = Field(None, description="Apple Music artist ID")
+    bandcamp_id: str | None = Field(
+        None, description="Bandcamp slug (the subdomain in `<slug>.bandcamp.com`)"
+    )
+
+
 class LookupRequest(BaseModel):
     artist: str | None = Field(None, description="Parsed artist name")
     song: str | None = Field(None, description="Parsed song/track title")
@@ -954,6 +967,7 @@ class DiscogsMatchResult(BaseModel):
 class LookupResultItem(BaseModel):
     library_item: LibraryCatalogItem
     artwork: DiscogsMatchResult | None = None
+    reconciled_identity: ReconciledIdentity | None = None
 
 
 class SearchType(StrEnum):
@@ -966,7 +980,7 @@ class SearchType(StrEnum):
 
 
 class LookupResponse(BaseModel):
-    results: list[LookupResultItem] | None = Field([], validate_default=True)
+    results: list[LookupResultItem] | None = Field(default_factory=list)
     search_type: SearchType | None = Field(
         "none",
         description="The search strategy that produced results: direct, fallback, alternative, compilation, song_as_artist, or none\n",
@@ -987,37 +1001,6 @@ class LookupResponse(BaseModel):
     cache_stats: dict[str, Any] | None = Field(
         None, description="Cache hit/miss statistics from the lookup"
     )
-
-
-class DiscogsSearchRequest(BaseModel):
-    artist: str | None = None
-    album: str | None = None
-    track: str | None = None
-    label: str | None = None
-    format: str | None = None
-
-
-class DiscogsEnrichedSearchResult(BaseModel):
-    album: str | None = None
-    artist: str | None = None
-    release_id: int
-    release_url: str
-    artwork_url: str | None = None
-    confidence: float | None = 0
-    release_year: int | None = None
-    artist_bio: str | None = None
-    wikipedia_url: str | None = None
-    spotify_url: str | None = None
-    apple_music_url: str | None = None
-    youtube_music_url: str | None = None
-    bandcamp_url: str | None = None
-    soundcloud_url: str | None = None
-
-
-class DiscogsSearchResponse(BaseModel):
-    results: list[DiscogsEnrichedSearchResult] | None = Field([], validate_default=True)
-    total: int | None = 0
-    cached: bool | None = False
 
 
 class DiscogsTrackItem(BaseModel):
@@ -1059,15 +1042,15 @@ class DiscogsReleaseMetadata(BaseModel):
     label_id: int | None = None
     genres: list[str] | None = []
     styles: list[str] | None = []
-    tracklist: list[DiscogsTrackItem] | None = Field([], validate_default=True)
+    tracklist: list[DiscogsTrackItem] | None = Field(default_factory=list)
     artwork_url: str | None = None
     release_url: str
     cached: bool | None = False
-    artists: list[DiscogsArtistCredit] | None = Field([], validate_default=True)
-    extra_artists: list[DiscogsArtistCredit] | None = Field([], validate_default=True)
-    labels: list[DiscogsLabelCredit] | None = Field([], validate_default=True)
+    artists: list[DiscogsArtistCredit] | None = Field(default_factory=list)
+    extra_artists: list[DiscogsArtistCredit] | None = Field(default_factory=list)
+    labels: list[DiscogsLabelCredit] | None = Field(default_factory=list)
     released: str | None = Field(None, description="Release date as ISO string")
-    videos: list[DiscogsReleaseVideo] | None = Field([], validate_default=True)
+    videos: list[DiscogsReleaseVideo] | None = Field(default_factory=list)
 
 
 class Type1(StrEnum):
@@ -1118,8 +1101,8 @@ class DiscogsArtistDetails(BaseModel):
     )
     image_url: str | None = None
     name_variations: list[str] | None = []
-    aliases: list[Alias] | None = Field([], validate_default=True)
-    members: list[Member] | None = Field([], validate_default=True)
+    aliases: list[Alias] | None = Field(default_factory=list)
+    members: list[Member] | None = Field(default_factory=list)
     urls: list[str] | None = []
     cached: bool | None = False
 
@@ -1135,7 +1118,7 @@ class DiscogsReleaseInfo(BaseModel):
 class DiscogsTrackReleasesResponse(BaseModel):
     track: str | None = None
     artist: str | None = None
-    releases: list[DiscogsReleaseInfo] | None = Field([], validate_default=True)
+    releases: list[DiscogsReleaseInfo] | None = Field(default_factory=list)
     total: int | None = 0
     cached: bool | None = False
 
