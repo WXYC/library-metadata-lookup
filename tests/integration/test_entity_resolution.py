@@ -186,6 +186,68 @@ class TestDiscogsReconciliationIntegration:
 
 
 @pytest.mark.pg
+class TestIdentityRouterEntityStoreUnavailable:
+    """Identity routes return 503 — not 500 — when the entity schema is missing.
+
+    Regression for #169: a misconfigured deploy (no DATABASE_URL_DISCOGS, or DSN
+    pointing at a DB without the entity schema applied) used to leak a 500.
+    """
+
+    @pytest_asyncio.fixture(autouse=True)
+    async def set_up_entity_schema(self, pg_pool):
+        """Override the module-level autouse fixture: keep the schema *missing*."""
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+        yield
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+
+    @pytest_asyncio.fixture
+    async def app_with_pg_dsn(self, monkeypatch):
+        """Reset the dep cache and point Settings at the test DSN."""
+        import identity.dependencies as deps
+        from config.settings import get_settings
+
+        monkeypatch.setenv("DATABASE_URL_DISCOGS", DATABASE_URL)
+        get_settings.cache_clear()
+        deps._entity_store = None
+        deps._entity_pg = None
+        deps._entity_probe_failed = False
+
+        from main import app
+
+        yield app
+
+        deps._entity_store = None
+        deps._entity_pg = None
+        deps._entity_probe_failed = False
+        get_settings.cache_clear()
+
+    @pytest.mark.asyncio
+    async def test_resolve_returns_503_when_entity_schema_missing(self, app_with_pg_dsn):
+        from httpx import ASGITransport, AsyncClient
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_pg_dsn), base_url="http://test"
+        ) as ac:
+            resp = await ac.get("/identity/resolve", params={"name": "Stereolab"})
+
+        assert resp.status_code == 503
+        assert "entity store" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_bulk_returns_503_when_entity_schema_missing(self, app_with_pg_dsn):
+        from httpx import ASGITransport, AsyncClient
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_pg_dsn), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/identity/bulk", json={"names": ["Stereolab"]})
+
+        assert resp.status_code == 503
+
+
+@pytest.mark.pg
 class TestDeduplicationIntegration:
     """Test deduplication against real PostgreSQL."""
 

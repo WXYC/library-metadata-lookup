@@ -6,6 +6,7 @@ that query the ``entity.identity`` table in the discogs-cache database.
 
 import logging
 
+from asyncpg.exceptions import PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from identity.dependencies import get_entity_store
@@ -19,6 +20,11 @@ from scripts.entity_resolution.store import EntityStore, Identity
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["identity"])
+
+_ENTITY_STORE_UNAVAILABLE_DETAIL = (
+    "Entity store is not available. Ensure DATABASE_URL_DISCOGS is configured "
+    "and the entity schema has been applied."
+)
 
 
 def _identity_to_response(identity: Identity) -> IdentityResponse:
@@ -38,11 +44,7 @@ def _identity_to_response(identity: Identity) -> IdentityResponse:
 def _require_entity_store(store: EntityStore | None) -> EntityStore:
     """Raise 503 if the entity store is not available."""
     if store is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Entity store is not available. Ensure DATABASE_URL_DISCOGS is configured "
-            "and the entity schema has been applied.",
-        )
+        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
     return store
 
 
@@ -62,7 +64,11 @@ async def resolve_identity(
 ) -> IdentityResponse:
     """Look up a single artist name in the entity identity store."""
     store = _require_entity_store(entity_store)
-    identity = await store.get_identity(name)
+    try:
+        identity = await store.get_identity(name)
+    except (PostgresError, OSError):
+        logger.exception("Entity store query failed for name=%r", name)
+        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
     if identity is None:
         raise HTTPException(status_code=404, detail=f"No identity found for '{name}'")
     return _identity_to_response(identity)
@@ -92,7 +98,13 @@ async def bulk_resolve_identities(
     unresolved: list[str] = []
 
     for name in request.names:
-        identity = await store.get_identity(name)
+        try:
+            identity = await store.get_identity(name)
+        except (PostgresError, OSError):
+            # Fail closed on partial PG failure: the caller cannot distinguish
+            # "name had no identity" from "PG died before this name was tried".
+            logger.exception("Entity store query failed mid-bulk for name=%r", name)
+            raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
         if identity is not None:
             identities.append(_identity_to_response(identity))
         else:

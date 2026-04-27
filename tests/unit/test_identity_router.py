@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock
 
+import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -206,6 +207,63 @@ class TestEntityStoreUnavailable:
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
                 resp = await ac.get("/identity/resolve", params={"name": "Stereolab"})
+
+        assert resp.status_code == 503
+        assert "entity store" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_resolve_returns_503_when_pg_raises_undefined_table(
+        self, app_client, mock_entity_store
+    ):
+        """A mid-request asyncpg.UndefinedTableError maps to 503, not 500."""
+        mock_entity_store.get_identity.side_effect = asyncpg.UndefinedTableError(
+            'relation "entity.identity" does not exist'
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.get("/identity/resolve", params={"name": "Stereolab"})
+
+        assert resp.status_code == 503
+        assert "entity store" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_resolve_returns_503_when_pg_unreachable(self, app_client, mock_entity_store):
+        """A mid-request OSError (PG host unreachable) maps to 503, not 500."""
+        mock_entity_store.get_identity.side_effect = OSError("connection refused")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.get("/identity/resolve", params={"name": "Stereolab"})
+
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_bulk_returns_503_when_pg_fails_midway(self, app_client, mock_entity_store):
+        """Bulk endpoint returns 503 (not partial 200) when PG dies mid-request.
+
+        Distinguishing 'this name had no identity' (correctly in unresolved[]) from
+        'this name was never tried because PG died' is impossible from a partial
+        response — fail closed instead.
+        """
+        good = _make_identity_record("Autechre", id=1, discogs_artist_id=12)
+
+        async def flaky_get_identity(name: str):
+            if name == "Autechre":
+                return good
+            raise asyncpg.PostgresConnectionError("server closed the connection unexpectedly")
+
+        mock_entity_store.get_identity.side_effect = flaky_get_identity
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/identity/bulk",
+                json={"names": ["Autechre", "Stereolab"]},
+            )
 
         assert resp.status_code == 503
         assert "entity store" in resp.json()["detail"].lower()
