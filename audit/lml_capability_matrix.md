@@ -70,8 +70,8 @@ Cache: TTLCache for `find_similar_artist` and `search` results, cleared on `/adm
 | `POST /lookup {artist:"µ-Ziq", album:"Lunatic Harness"}` | `/lookup` | `search_type=direct`, hit. ✅ |
 | `POST /lookup {artist:"μ-Ziq"}` (no album) | `/lookup` | `search_type=fallback`, 5 hits. ✅ |
 | `POST /lookup {artist:"Σtella"}` | `/lookup` | 0 hits — artist not in WXYC catalog (not a fuzzy bug). |
-| `GET /identity/resolve?name=Stereolab` | `/identity/resolve` | **HTTP 500** in both staging and production. Should be 503 when `DATABASE_URL_DISCOGS` is unset, per `CLAUDE.md`. ⚠️ |
-| `POST /identity/bulk` | `/identity/bulk` | **HTTP 500**. Same issue. ⚠️ |
+| `GET /identity/resolve?name=Stereolab` | `/identity/resolve` | 200 / 404 normally; **503** when `DATABASE_URL_DISCOGS` is unset or the `entity` schema is missing (fixed in #169). |
+| `POST /identity/bulk` | `/identity/bulk` | 200 normally; **503** when entity store is unavailable, including mid-request `asyncpg.PostgresError` (fail-closed; fixed in #169). |
 
 ## Codepoint subtlety: U+00B5 vs U+03BC
 
