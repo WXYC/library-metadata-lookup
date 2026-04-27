@@ -23,32 +23,35 @@ FROM discogs_mapping
 WHERE discogs_artist_id = ANY($1)\
 """
 
+# Templates use ``{values}`` / ``{name}`` placeholders substituted via
+# :py:meth:`str.replace`, NOT :py:meth:`str.format`, so literal SPARQL braces
+# need no doubling. See ``SparqlSource.query_batched``.
 _SPARQL_DISCOGS_TO_QID = """\
-SELECT ?item ?discogsId WHERE {{
-  VALUES ?discogsId {{ {values} }}
+SELECT ?item ?discogsId WHERE {
+  VALUES ?discogsId { {values} }
   ?item wdt:P1953 ?discogsId .
-}}\
+}\
 """
 
 _SPARQL_NAME_SEARCH = """\
-SELECT ?item ?itemLabel WHERE {{
+SELECT ?item ?itemLabel WHERE {
   ?item rdfs:label "{name}"@en .
-  {{ ?item wdt:P106/wdt:P279* wd:Q639669 . }}
+  { ?item wdt:P106/wdt:P279* wd:Q639669 . }
   UNION
-  {{ ?item wdt:P31 wd:Q215380 . }}
+  { ?item wdt:P31 wd:Q215380 . }
   UNION
-  {{ ?item wdt:P31 wd:Q5 . ?item wdt:P106 ?occ . ?occ wdt:P279* wd:Q639669 . }}
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
-}} LIMIT 5\
+  { ?item wdt:P31 wd:Q5 . ?item wdt:P106 ?occ . ?occ wdt:P279* wd:Q639669 . }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . }
+} LIMIT 5\
 """
 
 _SPARQL_STREAMING_IDS = """\
-SELECT ?item ?spotifyId ?appleMusicId ?bandcampId WHERE {{
-  VALUES ?item {{ {values} }}
-  OPTIONAL {{ ?item wdt:P1902 ?spotifyId . }}
-  OPTIONAL {{ ?item wdt:P2850 ?appleMusicId . }}
-  OPTIONAL {{ ?item wdt:P3283 ?bandcampId . }}
-}}\
+SELECT ?item ?spotifyId ?appleMusicId ?bandcampId WHERE {
+  VALUES ?item { {values} }
+  OPTIONAL { ?item wdt:P1902 ?spotifyId . }
+  OPTIONAL { ?item wdt:P2850 ?appleMusicId . }
+  OPTIONAL { ?item wdt:P3283 ?bandcampId . }
+}\
 """
 
 
@@ -115,9 +118,8 @@ class WikidataReconciler:
 
     async def _resolve_qids_via_sparql(self, discogs_ids: set[int]) -> dict[int, str]:
         """Resolve Discogs IDs to QIDs via SPARQL P1953 property."""
-        values_str = " ".join(f'"{did}"' for did in discogs_ids)
-        sparql = _SPARQL_DISCOGS_TO_QID.format(values=values_str)
-        bindings = await self._sparql.query_batched(sparql, [f"Q{did}" for did in discogs_ids])
+        items = [f'"{did}"' for did in discogs_ids]
+        bindings = await self._sparql.query_batched(_SPARQL_DISCOGS_TO_QID, items)
 
         result: dict[int, str] = {}
         for binding in bindings:
@@ -145,7 +147,7 @@ class WikidataReconciler:
             Wikidata QID of the best match, or None if not found.
         """
         escaped_name = name.replace('"', '\\"')
-        sparql = _SPARQL_NAME_SEARCH.format(name=escaped_name)
+        sparql = _SPARQL_NAME_SEARCH.replace("{name}", escaped_name)
         bindings = await self._sparql.query(sparql)
 
         if not bindings:
