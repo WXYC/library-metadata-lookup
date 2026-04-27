@@ -11,7 +11,12 @@ from generated.api_models import (
     DiscogsReleaseMetadata,
 )
 from release.models import ReleaseResolveRequest
-from release.orchestrator import _ResolverDependencies, resolve_release
+from release.orchestrator import (
+    _apple_album_id_from_url,
+    _ResolverDependencies,
+    _spotify_album_id_from_url,
+    resolve_release,
+)
 from streaming.models import SourceMatch, StreamingCheckResponse, StreamingCheckSources
 
 
@@ -65,6 +70,42 @@ def _make_release(**overrides) -> DiscogsReleaseMetadata:
     return DiscogsReleaseMetadata.model_validate(base)
 
 
+class TestSpotifyAlbumIdExtraction:
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("https://open.spotify.com/album/abc123XYZ", "abc123XYZ"),
+            ("https://open.spotify.com/album/abc123XYZ?si=tracking", "abc123XYZ"),
+            ("https://open.spotify.com/track/zzz", None),
+            ("https://example.com/album/notspotify", None),
+            ("", None),
+        ],
+    )
+    def test_extraction(self, url, expected):
+        assert _spotify_album_id_from_url(url) == expected
+
+
+class TestAppleAlbumIdExtraction:
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            # Modern Apple URL shape: /<locale>/album/<slug>/<id>
+            ("https://music.apple.com/us/album/aluminum-tunes/123456789", "123456789"),
+            # Legacy "id<digits>" shape still seen in some iTunes responses.
+            ("https://music.apple.com/us/album/foo/id987654321", "987654321"),
+            # Slug containing digits must NOT be mistaken for the album ID.
+            ("https://music.apple.com/us/album/my-album-1999/123456789", "123456789"),
+            # Wrong host: don't claim a match.
+            ("https://example.com/album/foo/123456789", None),
+            # Track URL, not album.
+            ("https://music.apple.com/us/track/foo/123456789", None),
+            ("", None),
+        ],
+    )
+    def test_extraction(self, url, expected):
+        assert _apple_album_id_from_url(url) == expected
+
+
 class TestParsedUrlRouting:
     @pytest.mark.asyncio
     async def test_unrecognized_url_returns_warning(self):
@@ -74,6 +115,10 @@ class TestParsedUrlRouting:
                 ReleaseResolveRequest(url="https://example.com/foo"), deps
             )
         cs.assert_not_called()
+        # source="unknown" so consumers can disambiguate from a real "discogs_release"
+        # response that happens to have an empty canonical (very different reasons).
+        assert response.source == "unknown"
+        assert response.source_id == "https://example.com/foo"
         assert response.canonical.artist == ""
         assert any("recognize the URL" in w for w in response.warnings)
 
@@ -186,6 +231,51 @@ class TestBandcampBranch:
         assert response.streaming.on_streaming is True
 
     @pytest.mark.asyncio
+    async def test_passes_bandcamp_none_to_streaming_when_input_is_bandcamp(self):
+        # Performance guarantee: don't run a Bandcamp fuzzy search when the
+        # caller already gave us a Bandcamp URL. The streaming orchestrator
+        # should be invoked with bandcamp=None.
+        bandcamp = MagicMock()
+        check_mock = AsyncMock(return_value=_stream(on_streaming=False))
+        with (
+            patch("release.orchestrator.resolve_bandcamp_album", new=AsyncMock()) as mock_resolve,
+            patch("release.orchestrator.check_streaming_availability", new=check_mock),
+        ):
+            from release.bandcamp_resolver import BandcampResolveResult
+            from release.models import CanonicalRelease, ReleaseIdentifiers
+
+            url = "https://juana-molina.bandcamp.com/album/doga"
+            mock_resolve.return_value = BandcampResolveResult(
+                canonical=CanonicalRelease(artist="Juana Molina", title="DOGA"),
+                identifiers=ReleaseIdentifiers(bandcamp_album_url=url),
+                warnings=[],
+            )
+
+            await resolve_release(ReleaseResolveRequest(url=url), _deps(bandcamp=bandcamp))
+
+        # Inspect the kwargs the orchestrator passed to check_streaming_availability.
+        check_mock.assert_awaited_once()
+        assert check_mock.await_args.kwargs["bandcamp"] is None
+
+    @pytest.mark.asyncio
+    async def test_passes_bandcamp_client_to_streaming_for_discogs_input(self):
+        # Sanity check the inverse: a Discogs paste should route through the
+        # full Bandcamp fuzzy match (so we still discover the Bandcamp URL if
+        # one exists for this album).
+        discogs = AsyncMock()
+        discogs.get_release.return_value = _make_release()
+        bandcamp = MagicMock()
+        check_mock = AsyncMock(return_value=_stream(on_streaming=False))
+        with patch("release.orchestrator.check_streaming_availability", new=check_mock):
+            await resolve_release(
+                ReleaseResolveRequest(url="https://www.discogs.com/release/12345"),
+                _deps(discogs=discogs, bandcamp=bandcamp),
+            )
+
+        check_mock.assert_awaited_once()
+        assert check_mock.await_args.kwargs["bandcamp"] is bandcamp
+
+    @pytest.mark.asyncio
     async def test_bandcamp_fetch_failure_returns_warnings(self):
         bandcamp = MagicMock()
         with (
@@ -293,6 +383,25 @@ class TestIdentityWriteBack:
         # Caller still gets a usable response.
         assert response.canonical.artist == "Juana Molina"
         assert any("identifiers" in w.lower() for w in response.warnings)
+
+    @pytest.mark.asyncio
+    async def test_skips_when_canonical_artist_is_empty(self):
+        # Defensive: a Discogs release with missing artist should not write
+        # library_name="" into entity.identity.
+        discogs = AsyncMock()
+        discogs.get_release.return_value = _make_release(artist="", artist_id=None)
+        store = AsyncMock()
+        deps = _deps(discogs=discogs, entity_store=store)
+
+        with patch(
+            "release.orchestrator.check_streaming_availability",
+            new=AsyncMock(return_value=_stream()),
+        ):
+            await resolve_release(
+                ReleaseResolveRequest(url="https://www.discogs.com/release/12345"), deps
+            )
+
+        store.upsert_identity.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_bandcamp_writeback_uses_slug(self):

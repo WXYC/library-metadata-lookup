@@ -82,9 +82,15 @@ class ReleaseIdentifiers(BaseModel):
 
 
 class ReleaseResolveResponse(BaseModel):
-    """Response body for ``POST /api/v1/releases/resolve``."""
+    """Response body for ``POST /api/v1/releases/resolve``.
 
-    source: Literal["discogs_release", "discogs_master", "bandcamp"]
+    ``source`` is ``"unknown"`` when the input URL did not match any supported
+    pattern; ``canonical`` is empty in that case and ``warnings`` explains why.
+    Clients should check ``warnings`` regardless of ``source`` before consuming
+    ``canonical`` — the orchestrator's contract is "always 200, partial OK".
+    """
+
+    source: Literal["discogs_release", "discogs_master", "bandcamp", "unknown"]
     source_id: str
     canonical: CanonicalRelease
     identifiers: ReleaseIdentifiers = Field(default_factory=ReleaseIdentifiers)

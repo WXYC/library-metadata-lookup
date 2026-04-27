@@ -27,6 +27,7 @@ able to fall back to manual entry without losing the partial prefill.
 from __future__ import annotations
 
 import logging
+import re
 
 from discogs.service import DiscogsService
 from release.bandcamp_resolver import resolve_bandcamp_album
@@ -41,7 +42,7 @@ from release.models import (
     ReleaseResolveResponse,
 )
 from release.url_parser import ParsedUrl, parse_url
-from scripts.bandcamp_client import BandcampClient
+from scripts.bandcamp_client import BandcampClient, extract_slug
 from scripts.entity_resolution.store import EntityStore
 from scripts.streaming_availability.apple_music_client import AppleMusicClient
 from scripts.streaming_availability.deezer_client import DeezerClient
@@ -89,7 +90,7 @@ async def resolve_release(
         # Return 200 with a warning so the form falls back to manual entry; the
         # alternative (HTTPException) hides the partial information from the user.
         return ReleaseResolveResponse(
-            source="discogs_release",  # placeholder; canonical is missing anyway
+            source="unknown",
             source_id=request.url or request.id or "",
             canonical=CanonicalRelease(artist="", title=""),
             identifiers=ReleaseIdentifiers(),
@@ -125,7 +126,8 @@ async def resolve_release(
 
     # Identity write-back: any newly-discovered IDs land in entity.identity
     # for the artist. Idempotent + COALESCE-based — never clobbers existing data.
-    if canonical is not None and deps.entity_store is not None:
+    # Require a non-empty artist name so we never insert library_name="".
+    if canonical is not None and canonical.artist and deps.entity_store is not None:
         await _writeback_identity(deps.entity_store, canonical, identifiers, warnings)
 
     return ReleaseResolveResponse(
@@ -163,6 +165,11 @@ async def _check_streaming(
     if canonical is None or not canonical.artist or not canonical.title:
         return None
 
+    # Skip the Bandcamp leg when the input is a Bandcamp URL — we already know
+    # the answer with certainty, and re-fuzzy-matching would burn 2+ rate-limited
+    # HTTP calls (autocomplete + catalog scrape) for a result we'd discard.
+    bandcamp_for_check = None if parsed.source == "bandcamp" else deps.bandcamp
+
     try:
         streaming = await check_streaming_availability(
             canonical.artist,
@@ -170,7 +177,7 @@ async def _check_streaming(
             spotify=deps.spotify,
             deezer=deps.deezer,
             apple_music=deps.apple_music,
-            bandcamp=deps.bandcamp,
+            bandcamp=bandcamp_for_check,
         )
     except Exception:
         logger.exception("Streaming check failed for %s - %s", canonical.artist, canonical.title)
@@ -208,19 +215,23 @@ def _merge_streaming_identifiers(
     )
 
 
+_SPOTIFY_ALBUM_ID_RE = re.compile(r"open\.spotify\.com/album/([A-Za-z0-9]+)")
+_APPLE_ALBUM_ID_RE = re.compile(r"music\.apple\.com/[a-z]{2}/album/[^/?#]+/(?:id)?(\d{6,})")
+
+
 def _spotify_album_id_from_url(url: str) -> str | None:
     """``open.spotify.com/album/<id>`` → ``<id>``. Returns None on a non-album URL."""
-    import re
-
-    match = re.search(r"open\.spotify\.com/album/([A-Za-z0-9]+)", url)
+    match = _SPOTIFY_ALBUM_ID_RE.search(url)
     return match.group(1) if match else None
 
 
 def _apple_album_id_from_url(url: str) -> str | None:
-    """Apple Music album URLs end in ``id<digits>`` or ``/<digits>``. Be tolerant."""
-    import re
+    """``music.apple.com/<locale>/album/<slug>/<id>`` (or ``/id<id>``) → ``<id>``.
 
-    match = re.search(r"(?:id|/)(\d{6,})", url)
+    Anchored on the Apple host so a slug containing digits cannot be mistaken
+    for the album ID.
+    """
+    match = _APPLE_ALBUM_ID_RE.search(url)
     return match.group(1) if match else None
 
 
@@ -261,6 +272,4 @@ async def _writeback_identity(
 def _bandcamp_slug_from_url(url: str | None) -> str | None:
     if not url:
         return None
-    from scripts.bandcamp_client import extract_slug
-
     return extract_slug(url)

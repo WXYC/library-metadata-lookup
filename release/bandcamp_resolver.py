@@ -86,13 +86,19 @@ def parse_bandcamp_album_html(html: str, album_url: str) -> BandcampResolveResul
         )
 
     # Find the MusicAlbum block (skip MusicGroup, BreadcrumbList, etc).
+    # Bandcamp ships @type as a string most of the time, but schema.org allows
+    # arrays (e.g. ["MusicAlbum", "Product"]); tolerate both shapes.
     album_data: dict | None = None
     for block in blocks:
         try:
             parsed = json.loads(block.strip())
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict) and parsed.get("@type") == "MusicAlbum":
+        if not isinstance(parsed, dict):
+            continue
+        type_value = parsed.get("@type")
+        types = type_value if isinstance(type_value, list) else [type_value]
+        if "MusicAlbum" in types:
             album_data = parsed
             break
 
