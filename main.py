@@ -23,6 +23,7 @@ from identity.dependencies import close_entity_store
 from identity.router import router as identity_router
 from library.router import router as library_router
 from lookup.router import router as lookup_router
+from release.router import router as release_router
 from routers.admin import router as admin_router
 from routers.health import router as health_router
 from streaming.dependencies import close_streaming_clients
@@ -105,6 +106,7 @@ app.include_router(discogs_router, prefix="/api/v1", tags=["discogs"], dependenc
 app.include_router(
     streaming_router, prefix="/api/v1", tags=["streaming"], dependencies=_lml_protected
 )
+app.include_router(release_router, prefix="/api/v1", tags=["release"], dependencies=_lml_protected)
 
 if __name__ == "__main__":
     import uvicorn

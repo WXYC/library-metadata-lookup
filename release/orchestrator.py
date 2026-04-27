@@ -1,0 +1,252 @@
+"""Top-level resolve() for the ``POST /api/v1/releases/resolve`` endpoint.
+
+Threads:
+
+  paste-URL or (source, id)
+        |
+        v
+  url_parser.parse_url      (pure)
+        |
+        v
+  discogs_resolver.resolve_discogs_release    (Bandcamp branch added in a follow-up PR)
+        |
+        v
+  streaming.orchestrator.check_streaming_availability
+        |
+        v
+  identity write-back via EntityStore.upsert_identity
+        |
+        v
+  ReleaseResolveResponse
+
+Each step accumulates ``warnings``. The endpoint always returns 200 with
+whatever it managed to put together — the music director's form should be
+able to fall back to manual entry without losing the partial prefill.
+
+Bandcamp URLs are recognized by the URL parser but, in this PR, return a
+warning that says they're not yet supported. The follow-up PR adds the
+Bandcamp branch (album page fetch + JSON-LD parse + streaming-check
+short-circuit). Splitting the work this way keeps each PR reviewable in one
+sitting without blocking the Discogs prefill flow on the HTML-scraping path.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+
+from discogs.service import DiscogsService
+from release.discogs_resolver import (
+    resolve_discogs_master,
+    resolve_discogs_release,
+)
+from release.models import (
+    CanonicalRelease,
+    ReleaseIdentifiers,
+    ReleaseResolveRequest,
+    ReleaseResolveResponse,
+)
+from release.url_parser import ParsedUrl, parse_url
+from scripts.entity_resolution.store import EntityStore
+from scripts.streaming_availability.apple_music_client import AppleMusicClient
+from scripts.streaming_availability.deezer_client import DeezerClient
+from scripts.streaming_availability.spotify_client import SpotifyClient
+from streaming.models import StreamingCheckResponse, StreamingCheckSources
+from streaming.orchestrator import check_streaming_availability
+
+logger = logging.getLogger(__name__)
+
+
+class _ResolverDependencies:
+    """Bundle the I/O dependencies the orchestrator needs.
+
+    Kept as a private class so the FastAPI router (and the tests) can build
+    one explicitly. We don't use ``functools.partial`` because the streaming
+    clients may individually be None when their credentials are unset.
+    """
+
+    def __init__(
+        self,
+        *,
+        discogs: DiscogsService,
+        spotify: SpotifyClient | None,
+        deezer: DeezerClient | None,
+        apple_music: AppleMusicClient | None,
+        entity_store: EntityStore | None,
+    ) -> None:
+        self.discogs = discogs
+        self.spotify = spotify
+        self.deezer = deezer
+        self.apple_music = apple_music
+        self.entity_store = entity_store
+
+
+async def resolve_release(
+    request: ReleaseResolveRequest,
+    deps: _ResolverDependencies,
+) -> ReleaseResolveResponse:
+    """Resolve a paste-URL or (source, id) into the prefill payload."""
+    parsed = _resolve_to_parsed_url(request)
+    if parsed is None:
+        # Either the URL didn't parse or the explicit (source, id) was malformed.
+        # Return 200 with a warning so the form falls back to manual entry; the
+        # alternative (HTTPException) hides the partial information from the user.
+        return ReleaseResolveResponse(
+            source="unknown",
+            source_id=request.url or request.id or "",
+            canonical=CanonicalRelease(artist="", title=""),
+            identifiers=ReleaseIdentifiers(),
+            streaming=None,
+            warnings=[
+                "Could not recognize the URL or source. "
+                "Supported: Discogs release URLs (e.g. discogs.com/release/12345). "
+                "Bandcamp album URLs are recognized by the parser but not yet wired up."
+            ],
+        )
+
+    # Dispatch to the right resolver.
+    if parsed.source == "discogs_release":
+        discogs_result = await resolve_discogs_release(deps.discogs, parsed.identifier)
+        canonical = discogs_result.canonical
+        identifiers = discogs_result.identifiers
+        warnings = list(discogs_result.warnings)
+    elif parsed.source == "discogs_master":
+        master_result = await resolve_discogs_master(deps.discogs, parsed.identifier)
+        canonical = master_result.canonical
+        identifiers = master_result.identifiers
+        warnings = list(master_result.warnings)
+    else:  # bandcamp — recognized by the parser, not yet wired up in the orchestrator
+        return ReleaseResolveResponse(
+            source="bandcamp",
+            source_id=parsed.identifier,
+            canonical=CanonicalRelease(artist="", title=""),
+            identifiers=ReleaseIdentifiers(bandcamp_album_url=parsed.identifier),
+            streaming=None,
+            warnings=[
+                "Bandcamp album URLs are not yet supported. "
+                "Coming in a follow-up PR — paste a Discogs release URL for now."
+            ],
+        )
+
+    streaming = await _check_streaming(canonical, deps, warnings)
+
+    # Promote streaming-side identifiers (Spotify/Apple) into the response.
+    identifiers = _merge_streaming_identifiers(identifiers, streaming)
+
+    # Identity write-back: any newly-discovered IDs land in entity.identity
+    # for the artist. Idempotent + COALESCE-based — never clobbers existing data.
+    # Require a non-empty artist name so we never insert library_name="".
+    if canonical is not None and canonical.artist and deps.entity_store is not None:
+        await _writeback_identity(deps.entity_store, canonical, identifiers, warnings)
+
+    return ReleaseResolveResponse(
+        source=parsed.source,
+        source_id=parsed.identifier,
+        canonical=canonical or CanonicalRelease(artist="", title=""),
+        identifiers=identifiers,
+        streaming=streaming,
+        warnings=warnings,
+    )
+
+
+def _resolve_to_parsed_url(request: ReleaseResolveRequest) -> ParsedUrl | None:
+    """Translate a request into a ParsedUrl. URL field takes precedence."""
+    if request.url:
+        return parse_url(request.url)
+    if request.source and request.id:
+        return ParsedUrl(source=request.source, identifier=request.id)
+    return None
+
+
+async def _check_streaming(
+    canonical: CanonicalRelease | None,
+    deps: _ResolverDependencies,
+    warnings: list[str],
+) -> StreamingCheckResponse | None:
+    """Run the streaming-availability fan-out across configured services.
+
+    Skips the check when canonical metadata is missing — there's nothing to
+    search for. The Bandcamp leg of the streaming check is intentionally
+    not configured here yet (no BandcampClient dep); it's added in the
+    follow-up PR alongside the Bandcamp resolver.
+    """
+    if canonical is None or not canonical.artist or not canonical.title:
+        return None
+
+    try:
+        return await check_streaming_availability(
+            canonical.artist,
+            canonical.title,
+            spotify=deps.spotify,
+            deezer=deps.deezer,
+            apple_music=deps.apple_music,
+            bandcamp=None,
+        )
+    except Exception:
+        logger.exception("Streaming check failed for %s - %s", canonical.artist, canonical.title)
+        warnings.append("Streaming-availability check failed; on-streaming flag not set.")
+        return None
+
+
+_SPOTIFY_ALBUM_ID_RE = re.compile(r"open\.spotify\.com/album/([A-Za-z0-9]+)")
+_APPLE_ALBUM_ID_RE = re.compile(r"music\.apple\.com/[a-z]{2}/album/[^/?#]+/(?:id)?(\d{6,})")
+
+
+def _spotify_album_id_from_url(url: str) -> str | None:
+    """``open.spotify.com/album/<id>`` → ``<id>``. Returns None on a non-album URL."""
+    match = _SPOTIFY_ALBUM_ID_RE.search(url)
+    return match.group(1) if match else None
+
+
+def _apple_album_id_from_url(url: str) -> str | None:
+    """``music.apple.com/<locale>/album/<slug>/<id>`` (or ``/id<id>``) → ``<id>``.
+
+    Anchored on the Apple host so a slug containing digits cannot be mistaken
+    for the album ID.
+    """
+    match = _APPLE_ALBUM_ID_RE.search(url)
+    return match.group(1) if match else None
+
+
+def _merge_streaming_identifiers(
+    identifiers: ReleaseIdentifiers, streaming: StreamingCheckResponse | None
+) -> ReleaseIdentifiers:
+    """Promote Spotify/Apple IDs found during the streaming check into the response."""
+    if streaming is None:
+        return identifiers
+
+    sources: StreamingCheckSources = streaming.sources
+    spotify_id = _spotify_album_id_from_url(sources.spotify.url) if sources.spotify else None
+    apple_id = _apple_album_id_from_url(sources.apple_music.url) if sources.apple_music else None
+
+    return identifiers.model_copy(
+        update={
+            "spotify_album_id": identifiers.spotify_album_id or spotify_id,
+            "apple_music_album_id": identifiers.apple_music_album_id or apple_id,
+        }
+    )
+
+
+async def _writeback_identity(
+    store: EntityStore,
+    canonical: CanonicalRelease,
+    identifiers: ReleaseIdentifiers,
+    warnings: list[str],
+) -> None:
+    """Push newly-learned IDs into ``entity.identity`` keyed on the artist name.
+
+    Reuses the existing ``upsert_identity`` SQL pattern (``ON CONFLICT ... DO
+    UPDATE`` with ``COALESCE``) so populated fields are never clobbered. The
+    artist row is created on first sight.
+    """
+    try:
+        await store.upsert_identity(
+            canonical.artist,
+            discogs_artist_id=identifiers.discogs_artist_id,
+        )
+    except Exception:
+        logger.exception("Identity write-back failed for %s", canonical.artist)
+        warnings.append(
+            "Could not record cross-source identifiers for "
+            f"'{canonical.artist}' — prefill returned, identity store left untouched."
+        )
