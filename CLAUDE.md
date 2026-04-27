@@ -70,6 +70,54 @@ Response includes `on_streaming` (true/false/null) and per-service match details
 
 Requires `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` for Spotify checks. Other services (Deezer, Apple Music, Bandcamp) need no auth. If Spotify credentials are not set, Spotify checks are skipped.
 
+### Release Resolve Endpoint
+
+`POST /api/v1/releases/resolve` takes a Discogs release URL or Bandcamp album URL (or an explicit `(source, id)` pair) and returns canonical release metadata, cross-source identifiers, and a streaming-availability snapshot — everything tubafrenzy's rotation-release create form needs to prefill in one round trip.
+
+Request (one of):
+```json
+{ "url": "https://www.discogs.com/release/12345" }
+{ "url": "https://artist.bandcamp.com/album/slug" }
+{ "source": "discogs_release", "id": "12345" }
+```
+
+Response:
+```json
+{
+  "source": "discogs_release",
+  "source_id": "12345",
+  "canonical": {
+    "artist": "Juana Molina",
+    "title": "DOGA",
+    "label": "Sonamos",
+    "catno": "SON-001",
+    "year": 2024,
+    "country": null,
+    "formats": []
+  },
+  "identifiers": {
+    "discogs_release_id": 12345,
+    "discogs_artist_id": 999,
+    "spotify_album_id": "abc...",
+    "bandcamp_album_url": null,
+    ...
+  },
+  "streaming": { "on_streaming": true, "sources": { ... } },
+  "warnings": []
+}
+```
+
+Implementation lives in `release/`:
+- `url_parser.py` — pure URL → `(source, id)` parser. Supports Discogs `/release/<id>` and `/master/<id>` (with locale prefixes and slugs) and Bandcamp `<artist>.bandcamp.com/album/<slug>`.
+- `discogs_resolver.py` — wraps `DiscogsService.get_release()` so the existing 3-tier cache + API rate-limit handling applies.
+- `bandcamp_resolver.py` — fetches the Bandcamp album page (rate-limited via the existing `BandcampClient`) and parses the embedded JSON-LD `MusicAlbum` blob. Self-released (publisher subdomain == artist subdomain) returns `label: null`.
+- `orchestrator.py` — dispatches by source, then runs `check_streaming_availability`. When the input is a Bandcamp URL, the Bandcamp leg is short-circuited to confidence 100 with the input URL (don't refuzzy a URL the DJ explicitly gave us).
+- Identity write-back: any newly-discovered IDs land in `entity.identity` via the existing `EntityStore.upsert_identity()` (`ON CONFLICT ... DO UPDATE` with `COALESCE` — never clobbers existing data).
+
+Genre and style are intentionally not surfaced — the rotation form has no genre field, so the music director picks manually.
+
+The endpoint always returns 200 with a `warnings[]` array. Partial failures (Discogs rate limit, malformed Bandcamp page, missing master support) become warnings rather than 5xx; the form falls back to manual entry.
+
 ### Discogs Cache (Optional)
 
 The service supports an optional PostgreSQL cache for Discogs data:

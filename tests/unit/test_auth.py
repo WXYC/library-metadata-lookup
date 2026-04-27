@@ -128,6 +128,7 @@ class TestProtectedRouteRegistration:
 
     EXPECTED_PROTECTED = [
         ("POST", "/api/v1/streaming-check"),
+        ("POST", "/api/v1/releases/resolve"),
         ("GET", "/api/v1/library/search"),
         ("POST", "/api/v1/lookup"),
         ("GET", "/api/v1/discogs/track-releases"),
