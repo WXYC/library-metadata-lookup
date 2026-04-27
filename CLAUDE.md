@@ -245,7 +245,7 @@ Untouched: `/health`, `/identity/resolve`, `/identity/bulk`. Identity routes are
 
 ### Pytest markers (architecture A)
 
-Markers route CI by infrastructure, not taxonomy. See the WXYC test-patterns guide (`plans/test-patterns.md`, Section 3) for the canonical vocabulary; LML uses two:
+Markers route CI by infrastructure, not taxonomy. See the WXYC test-patterns guide ([WXYC/wiki, plans/test-patterns.md, Section 3](https://github.com/WXYC/wiki/blob/main/plans/test-patterns.md#3-marker-conventions)) for the canonical vocabulary; LML uses two:
 
 | Marker | Meaning | CI provisions |
 |---|---|---|
