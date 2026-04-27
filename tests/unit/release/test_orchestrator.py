@@ -1,13 +1,8 @@
-"""End-to-end tests for the resolve_release orchestrator with all I/O mocked.
-
-Bandcamp branch is intentionally tested only at the "returns warning, not yet
-supported" level here. Full Bandcamp orchestration tests come with the
-follow-up PR that wires the resolver in.
-"""
+"""End-to-end tests for the resolve_release orchestrator with all I/O mocked."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -28,6 +23,7 @@ from streaming.models import SourceMatch, StreamingCheckResponse, StreamingCheck
 def _deps(
     *,
     discogs=None,
+    bandcamp=None,
     spotify=None,
     deezer=None,
     apple_music=None,
@@ -36,6 +32,7 @@ def _deps(
     """Build a _ResolverDependencies with sensible defaults for tests."""
     return _ResolverDependencies(
         discogs=discogs or AsyncMock(),
+        bandcamp=bandcamp or MagicMock(),
         spotify=spotify,
         deezer=deezer,
         apple_music=apple_music,
@@ -190,24 +187,149 @@ class TestDiscogsBranch:
         assert any("master" in w.lower() for w in response.warnings)
 
 
-class TestBandcampNotYetSupported:
+class TestBandcampBranch:
     @pytest.mark.asyncio
-    async def test_bandcamp_url_returns_warning_without_io(self):
-        # The URL parser recognizes Bandcamp, but the resolver isn't wired up yet.
-        # Until the follow-up PR lands, a bandcamp paste returns a clear warning
-        # and never touches the streaming or identity paths.
-        deps = _deps()
-        with patch("release.orchestrator.check_streaming_availability") as cs:
+    async def test_short_circuits_bandcamp_streaming_check(self):
+        # The DJ pasted a Bandcamp URL — we should mark Bandcamp as a confident
+        # match and not waste a fuzzy lookup.
+        bandcamp = MagicMock()
+        with (
+            patch(
+                "release.orchestrator.resolve_bandcamp_album",
+                new=AsyncMock(),
+            ) as mock_resolve,
+            patch(
+                "release.orchestrator.check_streaming_availability",
+                new=AsyncMock(return_value=_stream(on_streaming=False)),
+            ),
+        ):
+            from release.bandcamp_resolver import BandcampResolveResult
+            from release.models import CanonicalRelease, ReleaseIdentifiers
+
+            url = "https://juana-molina.bandcamp.com/album/doga"
+            mock_resolve.return_value = BandcampResolveResult(
+                canonical=CanonicalRelease(artist="Juana Molina", title="DOGA", label=None),
+                identifiers=ReleaseIdentifiers(bandcamp_album_url=url),
+                warnings=[],
+            )
+
             response = await resolve_release(
-                ReleaseResolveRequest(url="https://juana-molina.bandcamp.com/album/doga"), deps
+                ReleaseResolveRequest(url=url), _deps(bandcamp=bandcamp)
+            )
+
+        assert response.source == "bandcamp"
+        assert response.canonical.label is None  # self-released stays null
+        assert response.streaming is not None
+        # Short-circuit: Bandcamp pinned to the input URL with confidence 100,
+        # on_streaming flipped to True.
+        assert response.streaming.sources.bandcamp is not None
+        assert response.streaming.sources.bandcamp.url == url
+        assert response.streaming.sources.bandcamp.confidence == 100.0
+        assert response.streaming.on_streaming is True
+
+    @pytest.mark.asyncio
+    async def test_passes_bandcamp_none_to_streaming_when_input_is_bandcamp(self):
+        # Performance guarantee: don't run a Bandcamp fuzzy search when the
+        # caller already gave us a Bandcamp URL.
+        bandcamp = MagicMock()
+        check_mock = AsyncMock(return_value=_stream(on_streaming=False))
+        with (
+            patch("release.orchestrator.resolve_bandcamp_album", new=AsyncMock()) as mock_resolve,
+            patch("release.orchestrator.check_streaming_availability", new=check_mock),
+        ):
+            from release.bandcamp_resolver import BandcampResolveResult
+            from release.models import CanonicalRelease, ReleaseIdentifiers
+
+            url = "https://juana-molina.bandcamp.com/album/doga"
+            mock_resolve.return_value = BandcampResolveResult(
+                canonical=CanonicalRelease(artist="Juana Molina", title="DOGA"),
+                identifiers=ReleaseIdentifiers(bandcamp_album_url=url),
+                warnings=[],
+            )
+
+            await resolve_release(ReleaseResolveRequest(url=url), _deps(bandcamp=bandcamp))
+
+        check_mock.assert_awaited_once()
+        assert check_mock.await_args.kwargs["bandcamp"] is None
+
+    @pytest.mark.asyncio
+    async def test_passes_bandcamp_client_to_streaming_for_discogs_input(self):
+        # Sanity check the inverse: a Discogs paste should route through the
+        # full Bandcamp fuzzy match (so we still discover the Bandcamp URL).
+        discogs = AsyncMock()
+        discogs.get_release.return_value = _make_release()
+        bandcamp = MagicMock()
+        check_mock = AsyncMock(return_value=_stream(on_streaming=False))
+        with patch("release.orchestrator.check_streaming_availability", new=check_mock):
+            await resolve_release(
+                ReleaseResolveRequest(url="https://www.discogs.com/release/12345"),
+                _deps(discogs=discogs, bandcamp=bandcamp),
+            )
+
+        check_mock.assert_awaited_once()
+        assert check_mock.await_args.kwargs["bandcamp"] is bandcamp
+
+    @pytest.mark.asyncio
+    async def test_bandcamp_fetch_failure_returns_warnings(self):
+        bandcamp = MagicMock()
+        with (
+            patch(
+                "release.orchestrator.resolve_bandcamp_album",
+                new=AsyncMock(),
+            ) as mock_resolve,
+            patch("release.orchestrator.check_streaming_availability") as cs,
+        ):
+            from release.bandcamp_resolver import BandcampResolveResult
+            from release.models import ReleaseIdentifiers
+
+            mock_resolve.return_value = BandcampResolveResult(
+                canonical=None,
+                identifiers=ReleaseIdentifiers(bandcamp_album_url="https://x.bandcamp.com/album/y"),
+                warnings=["could not be fetched"],
+            )
+
+            response = await resolve_release(
+                ReleaseResolveRequest(url="https://x.bandcamp.com/album/y"),
+                _deps(bandcamp=bandcamp),
             )
 
         cs.assert_not_called()
-        assert response.source == "bandcamp"
-        assert response.source_id == "https://juana-molina.bandcamp.com/album/doga"
-        assert response.identifiers.bandcamp_album_url == response.source_id
         assert response.canonical.artist == ""
-        assert any("not yet supported" in w.lower() for w in response.warnings)
+        assert response.warnings == ["could not be fetched"]
+        assert response.streaming is None
+
+    @pytest.mark.asyncio
+    async def test_bandcamp_writeback_uses_slug(self):
+        bandcamp = MagicMock()
+        store = AsyncMock()
+        with (
+            patch(
+                "release.orchestrator.resolve_bandcamp_album",
+                new=AsyncMock(),
+            ) as mock_resolve,
+            patch(
+                "release.orchestrator.check_streaming_availability",
+                new=AsyncMock(return_value=_stream()),
+            ),
+        ):
+            from release.bandcamp_resolver import BandcampResolveResult
+            from release.models import CanonicalRelease, ReleaseIdentifiers
+
+            url = "https://juana-molina.bandcamp.com/album/doga"
+            mock_resolve.return_value = BandcampResolveResult(
+                canonical=CanonicalRelease(artist="Juana Molina", title="DOGA"),
+                identifiers=ReleaseIdentifiers(bandcamp_album_url=url),
+                warnings=[],
+            )
+
+            await resolve_release(
+                ReleaseResolveRequest(url=url),
+                _deps(bandcamp=bandcamp, entity_store=store),
+            )
+
+        kwargs = store.upsert_identity.call_args.kwargs
+        # The slug, not the full URL — matches what bandcamp_pipeline.py writes.
+        assert kwargs["bandcamp_id"] == "juana-molina"
 
 
 class TestStreamingFailureSurfacesAsWarning:

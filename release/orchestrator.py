@@ -8,7 +8,7 @@ Threads:
   url_parser.parse_url      (pure)
         |
         v
-  discogs_resolver.resolve_discogs_release    (Bandcamp branch added in a follow-up PR)
+  discogs_resolver.resolve_discogs_release   OR   bandcamp_resolver.resolve_bandcamp_album
         |
         v
   streaming.orchestrator.check_streaming_availability
@@ -22,12 +22,6 @@ Threads:
 Each step accumulates ``warnings``. The endpoint always returns 200 with
 whatever it managed to put together — the music director's form should be
 able to fall back to manual entry without losing the partial prefill.
-
-Bandcamp URLs are recognized by the URL parser but, in this PR, return a
-warning that says they're not yet supported. The follow-up PR adds the
-Bandcamp branch (album page fetch + JSON-LD parse + streaming-check
-short-circuit). Splitting the work this way keeps each PR reviewable in one
-sitting without blocking the Discogs prefill flow on the HTML-scraping path.
 """
 
 from __future__ import annotations
@@ -36,6 +30,7 @@ import logging
 import re
 
 from discogs.service import DiscogsService
+from release.bandcamp_resolver import resolve_bandcamp_album
 from release.discogs_resolver import (
     resolve_discogs_master,
     resolve_discogs_release,
@@ -47,11 +42,12 @@ from release.models import (
     ReleaseResolveResponse,
 )
 from release.url_parser import ParsedUrl, parse_url
+from scripts.bandcamp_client import BandcampClient, extract_slug
 from scripts.entity_resolution.store import EntityStore
 from scripts.streaming_availability.apple_music_client import AppleMusicClient
 from scripts.streaming_availability.deezer_client import DeezerClient
 from scripts.streaming_availability.spotify_client import SpotifyClient
-from streaming.models import StreamingCheckResponse, StreamingCheckSources
+from streaming.models import SourceMatch, StreamingCheckResponse, StreamingCheckSources
 from streaming.orchestrator import check_streaming_availability
 
 logger = logging.getLogger(__name__)
@@ -69,12 +65,14 @@ class _ResolverDependencies:
         self,
         *,
         discogs: DiscogsService,
+        bandcamp: BandcampClient,
         spotify: SpotifyClient | None,
         deezer: DeezerClient | None,
         apple_music: AppleMusicClient | None,
         entity_store: EntityStore | None,
     ) -> None:
         self.discogs = discogs
+        self.bandcamp = bandcamp
         self.spotify = spotify
         self.deezer = deezer
         self.apple_music = apple_music
@@ -99,8 +97,8 @@ async def resolve_release(
             streaming=None,
             warnings=[
                 "Could not recognize the URL or source. "
-                "Supported: Discogs release URLs (e.g. discogs.com/release/12345). "
-                "Bandcamp album URLs are recognized by the parser but not yet wired up."
+                "Supported: Discogs release URLs (e.g. discogs.com/release/12345) "
+                "and Bandcamp album URLs (e.g. artist.bandcamp.com/album/slug)."
             ],
         )
 
@@ -115,22 +113,15 @@ async def resolve_release(
         canonical = master_result.canonical
         identifiers = master_result.identifiers
         warnings = list(master_result.warnings)
-    else:  # bandcamp — recognized by the parser, not yet wired up in the orchestrator
-        return ReleaseResolveResponse(
-            source="bandcamp",
-            source_id=parsed.identifier,
-            canonical=CanonicalRelease(artist="", title=""),
-            identifiers=ReleaseIdentifiers(bandcamp_album_url=parsed.identifier),
-            streaming=None,
-            warnings=[
-                "Bandcamp album URLs are not yet supported. "
-                "Coming in a follow-up PR — paste a Discogs release URL for now."
-            ],
-        )
+    else:  # bandcamp
+        bandcamp_result = await resolve_bandcamp_album(deps.bandcamp, parsed.identifier)
+        canonical = bandcamp_result.canonical
+        identifiers = bandcamp_result.identifiers
+        warnings = list(bandcamp_result.warnings)
 
-    streaming = await _check_streaming(canonical, deps, warnings)
+    streaming = await _check_streaming(canonical, parsed, deps, warnings)
 
-    # Promote streaming-side identifiers (Spotify/Apple) into the response.
+    # Promote streaming-side identifiers (Spotify/Apple/Bandcamp) into the response.
     identifiers = _merge_streaming_identifiers(identifiers, streaming)
 
     # Identity write-back: any newly-discovered IDs land in entity.identity
@@ -160,32 +151,47 @@ def _resolve_to_parsed_url(request: ReleaseResolveRequest) -> ParsedUrl | None:
 
 async def _check_streaming(
     canonical: CanonicalRelease | None,
+    parsed: ParsedUrl,
     deps: _ResolverDependencies,
     warnings: list[str],
 ) -> StreamingCheckResponse | None:
-    """Run the streaming-availability fan-out across configured services.
+    """Run the streaming-availability fan-out.
 
     Skips the check when canonical metadata is missing — there's nothing to
-    search for. The Bandcamp leg of the streaming check is intentionally
-    not configured here yet (no BandcampClient dep); it's added in the
-    follow-up PR alongside the Bandcamp resolver.
+    search for. Short-circuits the Bandcamp leg when the input itself is a
+    Bandcamp URL: re-fuzzy-matching a URL the DJ explicitly gave us would
+    just throw away certainty.
     """
     if canonical is None or not canonical.artist or not canonical.title:
         return None
 
+    # Skip the Bandcamp leg when the input is a Bandcamp URL — we already know
+    # the answer with certainty, and re-fuzzy-matching would burn 2+ rate-limited
+    # HTTP calls (autocomplete + catalog scrape) for a result we'd discard.
+    bandcamp_for_check = None if parsed.source == "bandcamp" else deps.bandcamp
+
     try:
-        return await check_streaming_availability(
+        streaming = await check_streaming_availability(
             canonical.artist,
             canonical.title,
             spotify=deps.spotify,
             deezer=deps.deezer,
             apple_music=deps.apple_music,
-            bandcamp=None,
+            bandcamp=bandcamp_for_check,
         )
     except Exception:
         logger.exception("Streaming check failed for %s - %s", canonical.artist, canonical.title)
         warnings.append("Streaming-availability check failed; on-streaming flag not set.")
         return None
+
+    if parsed.source == "bandcamp":
+        # Trust the URL the DJ pasted. Confidence 100 + on_streaming=True are
+        # safe overrides because we know the URL resolves to a real album.
+        streaming.sources.bandcamp = SourceMatch(url=parsed.identifier, confidence=100.0)
+        if streaming.on_streaming is not True:
+            streaming.on_streaming = True
+
+    return streaming
 
 
 _SPOTIFY_ALBUM_ID_RE = re.compile(r"open\.spotify\.com/album/([A-Za-z0-9]+)")
@@ -211,18 +217,20 @@ def _apple_album_id_from_url(url: str) -> str | None:
 def _merge_streaming_identifiers(
     identifiers: ReleaseIdentifiers, streaming: StreamingCheckResponse | None
 ) -> ReleaseIdentifiers:
-    """Promote Spotify/Apple IDs found during the streaming check into the response."""
+    """Promote Spotify/Apple/Bandcamp IDs found during the streaming check into the response."""
     if streaming is None:
         return identifiers
 
     sources: StreamingCheckSources = streaming.sources
     spotify_id = _spotify_album_id_from_url(sources.spotify.url) if sources.spotify else None
     apple_id = _apple_album_id_from_url(sources.apple_music.url) if sources.apple_music else None
+    bandcamp_url = sources.bandcamp.url if sources.bandcamp else None
 
     return identifiers.model_copy(
         update={
             "spotify_album_id": identifiers.spotify_album_id or spotify_id,
             "apple_music_album_id": identifiers.apple_music_album_id or apple_id,
+            "bandcamp_album_url": identifiers.bandcamp_album_url or bandcamp_url,
         }
     )
 
@@ -239,10 +247,17 @@ async def _writeback_identity(
     UPDATE`` with ``COALESCE``) so populated fields are never clobbered. The
     artist row is created on first sight.
     """
+    # Bandcamp doesn't expose an integer artist ID, so we use the album URL's
+    # subdomain as the bandcamp_id placeholder. This matches existing
+    # entity.identity rows populated by bandcamp_pipeline.py, which also uses
+    # the slug as bandcamp_id.
+    bandcamp_id = extract_slug(identifiers.bandcamp_album_url) if identifiers.bandcamp_album_url else None
+
     try:
         await store.upsert_identity(
             canonical.artist,
             discogs_artist_id=identifiers.discogs_artist_id,
+            bandcamp_id=bandcamp_id,
         )
     except Exception:
         logger.exception("Identity write-back failed for %s", canonical.artist)
