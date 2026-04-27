@@ -101,11 +101,11 @@ Get full release metadata from Discogs.
 
 ### `POST /api/v1/releases/resolve`
 
-Resolve a Discogs release URL (or an explicit `(source, id)` pair) to canonical release metadata, cross-source identifiers, and streaming availability — the prefill payload for tubafrenzy's rotation-release create form.
+Resolve a Discogs release URL or Bandcamp album URL (or an explicit `(source, id)` pair) to canonical release metadata, cross-source identifiers, and streaming availability — the prefill payload for tubafrenzy's rotation-release create form.
 
-Request: `{"url": "https://www.discogs.com/release/12345"}` or `{"source": "discogs_release", "id": "12345"}`.
+Request: `{"url": "https://www.discogs.com/release/12345"}` or `{"url": "https://artist.bandcamp.com/album/slug"}` or `{"source": "discogs_release", "id": "12345"}`.
 
-Response includes `canonical` (artist, title, label, catno, year), `identifiers` (cross-source IDs learned from Discogs + the streaming check), `streaming` (per-service availability), and `warnings[]` for non-fatal issues. Always returns 200 — the form falls back to manual entry on partial prefill. Bandcamp URL support comes in a follow-up PR.
+Response includes `canonical` (artist, title, label, catno, year), `identifiers` (cross-source IDs learned from Discogs + the streaming check), `streaming` (per-service availability), and `warnings[]` for non-fatal issues. Always returns 200 — the form falls back to manual entry on partial prefill.
 
 ### `POST /admin/upload-library-db`
 

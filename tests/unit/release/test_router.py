@@ -1,8 +1,8 @@
-"""HTTP-layer tests for POST /api/v1/releases/resolve (Discogs path)."""
+"""HTTP-layer tests for POST /api/v1/releases/resolve."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -38,6 +38,7 @@ def _deps_with_discogs(release):
     discogs.get_release.return_value = release
     return _ResolverDependencies(
         discogs=discogs,
+        bandcamp=MagicMock(),
         spotify=None,
         deezer=None,
         apple_music=None,
