@@ -13,6 +13,7 @@ from core.auth import require_lml_key
 from core.dependencies import (
     close_discogs_service,
     close_library_db,
+    close_musicbrainz_pg,
     flush_posthog,
     shutdown_posthog,
 )
@@ -62,6 +63,7 @@ async def lifespan(app: FastAPI):
     await close_library_db()
     await close_discogs_service()
     await close_entity_store()
+    await close_musicbrainz_pg()
     await close_streaming_clients()
     logger.info("All services shut down")
 

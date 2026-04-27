@@ -136,6 +136,48 @@ class DiscogsCacheService:
             logger.error(f"Cache search failed: {e}")
             raise CacheUnavailableError(f"Cache search failed: {e}") from e
 
+    async def search_artists_by_name(self, name: str, *, limit: int = 5) -> list[dict]:
+        """Fuzzy-match an artist name against ``artist`` and ``artist_name_variation``.
+
+        Used by the Phase 1.5 mojibake-recovery fallback in the lookup
+        endpoint. Trigram similarity over diacritic-stripped lowercased
+        names; the canonical ``artist.name`` is returned even when the
+        match comes via ``artist_name_variation``.
+
+        Args:
+            name: Artist name (or skeleton) to search for.
+            limit: Maximum number of distinct artists to return.
+
+        Returns:
+            List of dicts with keys ``id``, ``name``, ``score``.
+
+        Raises:
+            CacheUnavailableError: If the database is unreachable.
+        """
+        try:
+            query = """
+                SELECT id, name, max(score) AS score FROM (
+                    SELECT a.id, a.name,
+                        similarity(lower(f_unaccent(a.name)), lower(f_unaccent($1))) AS score
+                    FROM artist a
+                    WHERE lower(f_unaccent(a.name)) % lower(f_unaccent($1))
+                    UNION ALL
+                    SELECT a.id, a.name,
+                        similarity(lower(f_unaccent(anv.name)), lower(f_unaccent($1))) AS score
+                    FROM artist a
+                    JOIN artist_name_variation anv ON anv.artist_id = a.id
+                    WHERE lower(f_unaccent(anv.name)) % lower(f_unaccent($1))
+                ) sub
+                GROUP BY id, name
+                ORDER BY score DESC
+                LIMIT $2
+            """
+            rows = await self.pool.fetch(query, name, limit)
+            return [{"id": r["id"], "name": r["name"], "score": float(r["score"])} for r in rows]
+        except Exception as e:
+            logger.error(f"Cache search_artists_by_name failed: {e}")
+            raise CacheUnavailableError(f"Cache search_artists_by_name failed: {e}") from e
+
     async def autocomplete_tracks(
         self, artist: str, q: str, *, release: str | None = None, limit: int = 20
     ) -> list[str]:
