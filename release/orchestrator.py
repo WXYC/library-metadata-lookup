@@ -251,7 +251,9 @@ async def _writeback_identity(
     # subdomain as the bandcamp_id placeholder. This matches existing
     # entity.identity rows populated by bandcamp_pipeline.py, which also uses
     # the slug as bandcamp_id.
-    bandcamp_id = extract_slug(identifiers.bandcamp_album_url) if identifiers.bandcamp_album_url else None
+    bandcamp_id = (
+        extract_slug(identifiers.bandcamp_album_url) if identifiers.bandcamp_album_url else None
+    )
 
     try:
         await store.upsert_identity(
