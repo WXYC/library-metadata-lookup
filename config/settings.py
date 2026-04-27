@@ -57,6 +57,16 @@ class Settings(BaseSettings):
         description="PostgreSQL connection URL for Discogs cache",
     )
 
+    # MusicBrainz Cache Database Configuration
+    database_url_musicbrainz: str | None = Field(
+        None,
+        description=(
+            "PostgreSQL connection URL for the musicbrainz-cache. Used by the "
+            "Phase 1.5 mojibake-recovery external-cache fallback in /api/v1/lookup. "
+            "Optional; when unset, the MB leg of the fallback is skipped."
+        ),
+    )
+
     # Discogs Cache Configuration
     discogs_track_cache_ttl: int = Field(
         default=3600, description="TTL in seconds for Discogs track cache (default: 1 hour)"

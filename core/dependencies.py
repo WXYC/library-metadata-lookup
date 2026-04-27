@@ -11,6 +11,7 @@ from core.exceptions import ServiceInitializationError
 from discogs.cache_service import DiscogsCacheService
 from discogs.service import DiscogsService
 from library.db import LibraryDB
+from scripts.entity_resolution.sources import PgSource
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ _library_db: LibraryDB | None = None
 _discogs_service: DiscogsService | None = None
 _discogs_pool: asyncpg.Pool | None = None
 _posthog_client: Posthog | None = None
+_musicbrainz_pg: PgSource | None = None
 
 
 async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryDB:
@@ -154,6 +156,43 @@ async def get_discogs_cache_service(
         return None
 
     return DiscogsCacheService(_discogs_pool)
+
+
+async def get_musicbrainz_pg(
+    settings: Settings = Depends(get_settings),
+) -> PgSource | None:
+    """Get a PgSource for the musicbrainz-cache PostgreSQL DB, if configured.
+
+    Used by the Phase 1.5 mojibake-recovery external-cache fallback in
+    ``/api/v1/lookup``. Returns ``None`` when ``DATABASE_URL_MUSICBRAINZ`` is
+    unset so the lookup endpoint gracefully degrades to discogs-only fallback
+    (or library-only when neither cache is configured).
+    """
+    global _musicbrainz_pg
+
+    if _musicbrainz_pg is not None:
+        return _musicbrainz_pg
+
+    dsn = settings.database_url_musicbrainz
+    if not dsn:
+        logger.debug("DATABASE_URL_MUSICBRAINZ not set -- MB cache fallback disabled")
+        return None
+
+    try:
+        _musicbrainz_pg = PgSource(dsn)
+        logger.info("MusicBrainz cache source initialized")
+        return _musicbrainz_pg
+    except Exception as e:
+        logger.warning("Failed to initialize MusicBrainz cache source: %s: %s", type(e).__name__, e)
+        return None
+
+
+async def close_musicbrainz_pg() -> None:
+    """Close the musicbrainz-cache PgSource."""
+    global _musicbrainz_pg
+    if _musicbrainz_pg is not None:
+        await _musicbrainz_pg.close()
+        _musicbrainz_pg = None
 
 
 def get_posthog_client(settings: Settings = Depends(get_settings)) -> Posthog | None:

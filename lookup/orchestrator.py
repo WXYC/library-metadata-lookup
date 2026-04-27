@@ -21,13 +21,16 @@ from core.search import (
     get_search_type_from_state,
 )
 from core.telemetry import RequestTelemetry
+from discogs.cache_service import DiscogsCacheService
 from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult, ReleaseInfo
 from discogs.service import DiscogsService
-from generated.api_models import ReconciledIdentity
+from generated.api_models import LibraryCatalogItem, ReconciledIdentity
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
+from lookup.external_search import search_external_artists
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
+from scripts.entity_resolution.sources import PgSourceProtocol
 from scripts.entity_resolution.store import EntityStore, Identity
 from services.parser import MessageType, ParsedRequest
 
@@ -1044,6 +1047,8 @@ async def perform_lookup(
     telemetry: RequestTelemetry,
     *,
     entity_store: EntityStore | None = None,
+    discogs_cache: DiscogsCacheService | None = None,
+    mb_pg: PgSourceProtocol | None = None,
 ) -> LookupResponse:
     """Orchestrate the full lookup pipeline.
 
@@ -1214,6 +1219,31 @@ async def perform_lookup(
                 )
             )
 
+    # Step 7: External-cache fallback (Phase 1.5 mojibake recovery).
+    # Opt-in via include_external_caches; only artist-keyed requests trigger
+    # the fallback today (the lossy bucket is dominated by artist skeletons).
+    external_source: str | None = "library" if result_items else None
+    if not result_items and request.include_external_caches and parsed.artist:
+        with telemetry.track_step("external_cache_fallback"):
+            candidates, source = await search_external_artists(
+                parsed.artist,
+                discogs_cache=discogs_cache,
+                mb_pg=mb_pg,
+            )
+        if candidates:
+            external_source = source
+            for candidate in candidates:
+                result_items.append(
+                    LookupResultItem(
+                        library_item=LibraryCatalogItem(
+                            id=0,
+                            artist=candidate["name"],
+                            call_number="(external)",
+                            library_url="",
+                        ),
+                    )
+                )
+
     return LookupResponse(
         results=result_items,
         search_type=search_type,
@@ -1221,4 +1251,5 @@ async def perform_lookup(
         found_on_compilation=found_on_compilation,
         context_message=context,
         corrected_artist=corrected_artist,
+        external_source=external_source,
     )
