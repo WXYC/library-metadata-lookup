@@ -4,7 +4,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from scripts.entity_resolution.wikidata import WikidataReconciler
+from scripts.entity_resolution.wikidata import (
+    _SPARQL_DISCOGS_TO_QID,
+    WikidataReconciler,
+)
 
 
 @pytest.fixture
@@ -67,6 +70,29 @@ class TestDiscogsIdToQidViaCache:
         result = await reconciler.resolve_qids_from_discogs_ids({12})
         assert result[12] == "Q378288"
         mock_sparql.query_batched.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sparql_fallback_passes_template_and_quoted_ids(
+        self, reconciler, mock_wikidata_pg, mock_sparql
+    ):
+        """The SPARQL fallback must hand ``query_batched`` the *unformatted*
+        template and the SPARQL-quoted Discogs IDs as items, so batching
+        actually splits the work and the literal SPARQL braces survive.
+
+        Regression: WXYC/library-metadata-lookup#182. Previously the call
+        site pre-substituted ``{values}`` (defeating batching) and then passed
+        ``Q``-prefixed strings as items (wrong format and never used).
+        """
+        mock_wikidata_pg.fetchall = AsyncMock(return_value=[])
+        mock_sparql.query_batched = AsyncMock(return_value=[])
+
+        await reconciler.resolve_qids_from_discogs_ids({12, 34})
+
+        mock_sparql.query_batched.assert_called_once()
+        template_arg, items_arg = mock_sparql.query_batched.call_args.args
+        assert template_arg is _SPARQL_DISCOGS_TO_QID
+        assert "{values}" in template_arg
+        assert set(items_arg) == {'"12"', '"34"'}
 
 
 class TestNameSearch:

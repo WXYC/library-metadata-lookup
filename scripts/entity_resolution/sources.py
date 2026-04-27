@@ -152,7 +152,12 @@ class SparqlSource:
         """Execute a SPARQL query in batches over a VALUES list.
 
         The template should contain a ``{values}`` placeholder that will be
-        replaced with space-separated items for each batch.
+        replaced with space-separated items for each batch. Substitution uses
+        :py:meth:`str.replace` rather than :py:meth:`str.format` because
+        SPARQL block syntax uses literal ``{`` and ``}`` everywhere — those
+        would crash ``str.format`` with ``ValueError: unexpected '{' in field
+        name``. Templates therefore stay readable as raw SPARQL with no brace
+        doubling.
 
         Args:
             sparql_template: SPARQL template with ``{values}`` placeholder.
@@ -165,7 +170,7 @@ class SparqlSource:
         for i in range(0, len(items), self._batch_size):
             batch = items[i : i + self._batch_size]
             values_str = " ".join(batch)
-            sparql = sparql_template.format(values=values_str)
+            sparql = sparql_template.replace("{values}", values_str)
             bindings = await self.query(sparql)
             all_bindings.extend(bindings)
         return all_bindings
