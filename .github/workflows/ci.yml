@@ -65,7 +65,7 @@ jobs:
       - run: mypy . --ignore-missing-imports
 
   test:
-    name: Unit Tests
+    name: Default Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,7 +81,10 @@ jobs:
           maturin build --release
           pip install /tmp/wxyc-etl/target/wheels/*.whl
       - run: pip install -e ".[dev]"
-      - run: pytest tests/unit/ -v --cov=. --cov-report=xml
+      # Default `pytest` honours pyproject addopts (`-m 'not pg and not external_api'`),
+      # so this job runs every unmarked test across tests/unit/, tests/integration/, and
+      # tests/e2e/. Infra-tagged tests run in their own jobs (`pg`, `external_api`).
+      - run: pytest -v --cov=. --cov-report=xml
       - name: Upload coverage reports
         uses: codecov/codecov-action@v4
         with:
@@ -90,8 +93,8 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  e2e:
-    name: E2E Tests
+  external_api:
+    name: External API Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,17 +110,16 @@ jobs:
           maturin build --release
           pip install /tmp/wxyc-etl/target/wheels/*.whl
       - run: pip install -e ".[dev]"
-      - name: Run E2E tests
-        # tests/e2e/test_lookup_e2e.py runs against in-memory SQLite + mock Discogs.
-        # tests/e2e/discogs/* requires DISCOGS_TOKEN and self-skips at collection
-        # when no credentials are present (see tests/e2e/discogs/conftest.py); it
-        # is exercised by the deploy-time integration job, not on every PR.
+      - name: Run external_api tests
+        # tests/e2e/discogs/* and the real-API classes in tests/integration/test_api_discogs.py
+        # require DISCOGS_TOKEN. They self-skip at collection if no credentials are present
+        # (PR runs from forks may have no secret access).
         env:
           DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
-        run: pytest tests/e2e/ -v -m "e2e"
+        run: pytest -v -m "external_api"
 
-  test-postgres:
-    name: Postgres Tests
+  pg:
+    name: PG Tests
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -147,13 +149,14 @@ jobs:
           maturin build --release
           pip install /tmp/wxyc-etl/target/wheels/*.whl
       - run: pip install -e ".[dev]"
-      - name: Run Postgres tests
-        # Reconciliation tests skip themselves when release_artist is missing,
-        # which is fine: the discogs-cache fixture is too large to load in CI.
-        # The EntityStore CRUD tests run fully against a fresh schema.
+      - name: Run PG tests
+        # EntityStore CRUD runs end-to-end against a fresh schema. Reconciliation tests
+        # skip themselves when release_artist is missing -- the discogs-cache fixture is
+        # too large to load in CI. test_va_discogs_lookup.py self-skips without
+        # DATABASE_URL_DISCOGS, which is intentional in CI.
         env:
           DATABASE_URL_TEST: postgresql://discogs:discogs@localhost:5433/discogs
-        run: pytest tests/integration/ -v -m "postgres"
+        run: pytest -v -m "pg"
 
   marker-sync:
     name: CI Marker Sync
@@ -167,7 +170,7 @@ jobs:
     name: Deploy to Staging
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lint, typecheck, test, e2e, test-postgres]
+    needs: [lint, typecheck, test, external_api, pg]
     steps:
       - uses: actions/checkout@v4
       - name: Install Railway CLI
@@ -205,36 +208,11 @@ jobs:
           print('Smoke test passed:', json.dumps(services))
           "
 
-  integration:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [smoke-test-staging]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install wxyc-etl from source
-        run: |
-          pip install maturin
-          git clone --depth 1 https://github.com/WXYC/wxyc-etl.git /tmp/wxyc-etl
-          cd /tmp/wxyc-etl/wxyc-etl-python
-          maturin build --release
-          pip install /tmp/wxyc-etl/target/wheels/*.whl
-      - run: pip install -e ".[dev]"
-      - name: Run integration tests
-        env:
-          DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
-          TEST_ENV: staging
-        run: pytest tests/integration/ -v -m "integration"
-
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/prod'
-    needs: [lint, typecheck, test, e2e, test-postgres]
+    needs: [lint, typecheck, test, external_api, pg]
     steps:
       - uses: actions/checkout@v4
       - name: Install Railway CLI

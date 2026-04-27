@@ -6,29 +6,11 @@ DISCOGS_API_KEY + DISCOGS_API_SECRET is set (see conftest).
 
 import pytest
 
-pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
+pytestmark = [pytest.mark.external_api, pytest.mark.asyncio]
 
 
-class TestDiscogsSearch:
-    async def test_search_returns_results_for_known_artist(self, real_discogs_client):
-        response = await real_discogs_client.post(
-            "/api/v1/discogs/search",
-            json={"artist": "Stereolab", "album": "Dots and Loops"},
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert len(data["results"]) > 0
-        assert data["results"][0]["release_id"] is not None
-        assert "release_url" in data["results"][0]
-
-    async def test_search_returns_empty_for_nonexistent(self, real_discogs_client):
-        response = await real_discogs_client.post(
-            "/api/v1/discogs/search",
-            json={"artist": "xyznonexistent12345", "album": "nothing"},
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["results"] == []
+# /api/v1/discogs/search was removed in commit c5f1e65 (PR #157), so the
+# TestDiscogsSearch class that previously lived here is gone.
 
 
 class TestDiscogsRelease:

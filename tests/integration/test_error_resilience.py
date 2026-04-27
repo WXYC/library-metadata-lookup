@@ -16,9 +16,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
-pytestmark = pytest.mark.integration
-
-
 # ---------------------------------------------------------------------------
 # WXYC example artist names for bulk tests
 # ---------------------------------------------------------------------------

@@ -12,8 +12,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-pytestmark = pytest.mark.e2e
-
 
 class TestDirectLookup:
     """Artist + album lookups that hit the library directly."""

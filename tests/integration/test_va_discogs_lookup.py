@@ -17,7 +17,10 @@ from scripts.va_disambiguate.discogs_lookup import (
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL_DISCOGS")
-pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="DATABASE_URL_DISCOGS not set")
+pytestmark = [
+    pytest.mark.pg,
+    pytest.mark.skipif(not DATABASE_URL, reason="DATABASE_URL_DISCOGS not set"),
+]
 
 
 @pytest_asyncio.fixture

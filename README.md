@@ -178,19 +178,19 @@ uvicorn main:app --reload
 
 ### Running tests
 
+The repo follows the architecture-A marker scheme (see the WXYC test-patterns guide, Section 3): markers route CI by infrastructure, not by tier. Tier directories (`tests/unit/`, `tests/integration/`, `tests/e2e/`) survive for documentation only.
+
 ```bash
-# Unit tests only (default, fast -- 472 tests)
-uv run pytest tests/unit/ -v
+# Default: every unmarked test (unit-equivalent + the in-memory-SQLite/mocked
+# integration + e2e tests). Excludes pg + external_api per pyproject addopts.
+uv run pytest -v
 
-# Integration tests only (real SQLite/FTS5 -- 48 tests)
-uv run pytest -m integration -v
+# PG-backed tests (entity store CRUD, etc.). Needs DATABASE_URL_TEST.
+uv run pytest -v -m pg
 
-# All tests with coverage (520 tests, 97% source coverage)
-uv run pytest -m "" --cov=. --cov-report=term-missing -v
+# Real-Discogs-API tests. Needs DISCOGS_TOKEN.
+uv run pytest -v -m external_api
 ```
-
-Integration tests use a real in-memory SQLite database with FTS5 and seed data.
-They are excluded by default (`addopts = "-m 'not integration'"` in `pyproject.toml`).
 
 ## Environment Variables
 

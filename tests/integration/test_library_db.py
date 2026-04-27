@@ -2,8 +2,6 @@
 
 import pytest
 
-pytestmark = pytest.mark.integration
-
 
 class TestFTS5Search:
     @pytest.mark.asyncio

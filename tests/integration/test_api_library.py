@@ -2,8 +2,6 @@
 
 import pytest
 
-pytestmark = pytest.mark.integration
-
 
 class TestLibrarySearchEndpoint:
     @pytest.mark.asyncio
