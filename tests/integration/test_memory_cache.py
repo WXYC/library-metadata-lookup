@@ -10,8 +10,6 @@ from discogs.memory_cache import (
     set_skip_cache,
 )
 
-pytestmark = pytest.mark.integration
-
 
 class TestCacheIntegration:
     @pytest.fixture(autouse=True)

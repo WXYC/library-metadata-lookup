@@ -5,8 +5,6 @@ import pytest
 
 from library.db import LibraryDB
 
-pytestmark = pytest.mark.integration
-
 
 async def _create_library_db_with_streaming(db_path, *, include_streaming_table=True):
     """Create a library.db with library + optional streaming_links tables."""

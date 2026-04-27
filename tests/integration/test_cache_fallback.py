@@ -13,8 +13,6 @@ import pytest
 
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 
-pytestmark = pytest.mark.integration
-
 
 class TestCacheFallbackOnCorruptedData:
     """Cache DB with corrupted release rows triggers fallback to API."""

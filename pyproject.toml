@@ -95,13 +95,10 @@ follow_untyped_imports = true
 
 [tool.pytest.ini_options]
 markers = [
-    "unit: pure logic tests, no external dependencies",
-    "postgres: needs PostgreSQL (gated by DATABASE_URL_TEST)",
-    "integration: needs external service or fixture data",
-    "e2e: full pipeline end-to-end test",
-    "slow: marks tests as slow",
+    "pg: needs a PostgreSQL service (DATABASE_URL_TEST)",
+    "external_api: needs network + a real API key (e.g. DISCOGS_TOKEN)",
 ]
-addopts = "-m 'not integration and not postgres and not e2e and not slow'"
+addopts = "-m 'not pg and not external_api'"
 console_output_style = "progress"
 testpaths = ["tests"]
 pythonpath = ["."]

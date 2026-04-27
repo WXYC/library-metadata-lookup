@@ -7,8 +7,6 @@ import pytest
 from discogs.models import DiscogsSearchRequest
 from discogs.service import DiscogsService
 
-pytestmark = pytest.mark.integration
-
 
 class TestDiscogsEndpoints:
     @pytest.mark.asyncio
@@ -21,10 +19,7 @@ class TestDiscogsEndpoints:
         resp = await app_client.get("/api/v1/discogs/release/123")
         assert resp.status_code == 503
 
-    @pytest.mark.asyncio
-    async def test_search_503_without_service(self, app_client):
-        resp = await app_client.post("/api/v1/discogs/search", json={"artist": "Queen"})
-        assert resp.status_code == 503
+    # /api/v1/discogs/search was removed in commit c5f1e65 (PR #157).
 
     @pytest.mark.asyncio
     async def test_artist_503_without_service(self, app_client):
@@ -37,6 +32,7 @@ class TestDiscogsEndpoints:
         assert resp.status_code == 503
 
 
+@pytest.mark.external_api
 class TestDiscogsApiSearch:
     """Tests that hit the real Discogs API (no cache) to verify search results."""
 
@@ -66,6 +62,7 @@ class TestDiscogsApiSearch:
         )
 
 
+@pytest.mark.external_api
 class TestEntityResolution:
     """Integration tests for entity resolution using real Discogs API."""
 

@@ -3,7 +3,7 @@
 These tests run against a test PostgreSQL (Docker on port 5433) with the
 entity schema applied and Discogs fixture data loaded.
 
-Run with: pytest -m postgres -v
+Run with: pytest -m pg -v
 Requires: DATABASE_URL_TEST env var or Docker postgres on port 5433.
 """
 
@@ -87,7 +87,7 @@ async def set_up_entity_schema(pg_pool):
         await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
 
 
-@pytest.mark.postgres
+@pytest.mark.pg
 class TestEntityStoreCRUD:
     """Test entity store CRUD operations against real PostgreSQL."""
 
@@ -150,7 +150,7 @@ class TestEntityStoreCRUD:
         assert rows[0]["method"] == "exact_match"
 
 
-@pytest.mark.postgres
+@pytest.mark.pg
 class TestDiscogsReconciliationIntegration:
     """Test Discogs reconciliation against real discogs-cache data.
 
@@ -185,7 +185,7 @@ class TestDiscogsReconciliationIntegration:
             assert match.method in ("exact_match", "member_group", "alias_match", "name_variation")
 
 
-@pytest.mark.postgres
+@pytest.mark.pg
 class TestDeduplicationIntegration:
     """Test deduplication against real PostgreSQL."""
 

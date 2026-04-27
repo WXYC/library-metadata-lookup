@@ -199,19 +199,31 @@ Untouched: `/health`, `/identity/resolve`, `/identity/bulk`. Identity routes are
 |---|---|---|
 | Lint & Format | All pushes + PRs | -- |
 | Type Check | All pushes + PRs | -- |
-| Unit Tests | All pushes + PRs | -- |
-| E2E Tests | All pushes + PRs | -- |
-| Postgres Tests | All pushes + PRs | -- |
+| Default Tests | All pushes + PRs | -- |
+| External API Tests | All pushes + PRs | -- |
+| PG Tests | All pushes + PRs | -- |
 | CI Marker Sync | All pushes + PRs | -- |
-| Deploy to Staging | Push to `main` | lint, typecheck, test, e2e, test-postgres |
+| Deploy to Staging | Push to `main` | lint, typecheck, test, external_api, pg |
 | Smoke Test (Staging) | Push to `main` | deploy-staging |
-| Integration Tests | Push to `main` | smoke-test-staging |
-| Deploy to Production | Push to `prod` | lint, typecheck, test, e2e, test-postgres |
+| Deploy to Production | Push to `prod` | lint, typecheck, test, external_api, pg |
 | Smoke Test (Production) | Push to `prod` | deploy-production |
 
-**E2E Tests** run `pytest tests/e2e/ -v -m e2e`. The `tests/e2e/test_lookup_e2e.py` suite uses an in-memory SQLite library and a mock Discogs service — no credentials required. The `tests/e2e/discogs/test_endpoints.py` suite hits the real Discogs API and self-skips at collection if `DISCOGS_TOKEN` is unset (PR runs from forks may have no secret access).
+### Pytest markers (architecture A)
 
-**Postgres Tests** run `pytest tests/integration/ -v -m postgres` against a `postgres:16-alpine` service container on port 5433. The `EntityStore` CRUD tests run end-to-end against a fresh `entity` schema. The Discogs reconciliation tests skip themselves when the `release_artist` table is missing — that table is part of the discogs-cache fixture and is too large to load in CI.
+Markers route CI by infrastructure, not taxonomy. See the WXYC test-patterns guide (`plans/test-patterns.md`, Section 3) for the canonical vocabulary; LML uses two:
+
+| Marker | Meaning | CI provisions |
+|---|---|---|
+| `pg` | needs a PostgreSQL service | `postgres:16-alpine` service container, `DATABASE_URL_TEST` |
+| `external_api` | needs a real third-party API key (Discogs) | `DISCOGS_TOKEN` secret |
+
+Default `pytest` (no `-m`) runs every unmarked test across `tests/unit/`, `tests/integration/`, and `tests/e2e/`. Tier directories are documentation; CI routes by markers.
+
+**Default Tests** runs `pytest -v --cov=...` -- pyproject's `addopts = "-m 'not pg and not external_api'"` excludes the infra-tagged tests.
+
+**External API Tests** runs `pytest -v -m external_api`. The `tests/e2e/discogs/*` suite and the `TestDiscogsApiSearch` / `TestEntityResolution` classes in `tests/integration/test_api_discogs.py` hit the real Discogs API; they self-skip at collection if `DISCOGS_TOKEN` is unset (PR runs from forks may have no secret access).
+
+**PG Tests** runs `pytest -v -m pg` against a `postgres:16-alpine` service container on port 5433. The `EntityStore` CRUD tests in `tests/integration/test_entity_resolution.py` run end-to-end against a fresh `entity` schema. The Discogs reconciliation tests skip themselves when the `release_artist` table is missing -- that table is part of the discogs-cache fixture and is too large to load in CI. `tests/integration/test_va_discogs_lookup.py` self-skips without `DATABASE_URL_DISCOGS`, which is intentional in CI.
 
 **CI Marker Sync** invokes the reusable workflow at `WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml` to guarantee that every `@pytest.mark.<X>` actually used by a test is either re-selected by some CI `pytest -m` invocation or explicitly opted out via a `# ci-sync-skip: <marker> reason: <text>` comment in `pyproject.toml`. This guards against the silent-deselection bug pattern (WXYC/discogs-etl#103, WXYC/library-metadata-lookup#159).
 

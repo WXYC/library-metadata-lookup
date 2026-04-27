@@ -13,8 +13,6 @@ from discogs.models import (
     TrackReleasesResponse,
 )
 
-pytestmark = pytest.mark.integration
-
 
 class TestLookupPipeline:
     @pytest.mark.asyncio
