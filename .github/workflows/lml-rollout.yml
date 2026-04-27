@@ -1,0 +1,94 @@
+name: LML Rollout (manual)
+
+# One-shot ops workflow for the LML auth + prefill rollout.
+# Triggers a Railway env-var change on the production service without
+# requiring local Railway auth. The token never leaves GitHub.
+#
+# Usage:
+#   gh workflow run lml-rollout.yml --ref main -f action=set-api-key
+#   gh workflow run lml-rollout.yml --ref main -f action=flip-require-auth-on
+#   gh workflow run lml-rollout.yml --ref main -f action=flip-require-auth-off
+#
+# Required GH secrets:
+#   RAILWAY_TOKEN_PRODUCTION   project-scoped Railway token (already configured)
+#   LML_API_KEY                bearer-token value (set before action=set-api-key)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Step to perform"
+        required: true
+        type: choice
+        options:
+          - set-api-key
+          - flip-require-auth-on
+          - flip-require-auth-off
+
+jobs:
+  apply:
+    name: Apply ${{ inputs.action }}
+    runs-on: ubuntu-latest
+    env:
+      # Project-scoped token. Setting once at the job level keeps it out of step echoes.
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
+      SERVICE: library-metadata-lookup
+    steps:
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Show CLI version
+        run: railway --version
+
+      - name: Apply
+        env:
+          LML_API_KEY: ${{ secrets.LML_API_KEY }}
+        run: |
+          set -euo pipefail
+          case "${{ inputs.action }}" in
+            set-api-key)
+              if [ -z "${LML_API_KEY:-}" ]; then
+                echo "::error::LML_API_KEY GH secret is not set. Add it (gh secret set LML_API_KEY) before running this action."
+                exit 1
+              fi
+              # --set takes KEY=VALUE; quoting prevents shell from interpreting any special chars in the bearer.
+              railway variables --service "$SERVICE" --set "LML_API_KEY=$LML_API_KEY"
+              ;;
+            flip-require-auth-on)
+              railway variables --service "$SERVICE" --set "LML_REQUIRE_AUTH=true"
+              ;;
+            flip-require-auth-off)
+              railway variables --service "$SERVICE" --set "LML_REQUIRE_AUTH=false"
+              ;;
+          esac
+
+      - name: Verify (names + presence only — no values)
+        run: |
+          set -euo pipefail
+          # --kv prints KEY=VALUE; mask values so they never appear in logs.
+          railway variables --kv --service "$SERVICE" \
+            | awk -F= '
+                /^LML_API_KEY=/   { printf "LML_API_KEY=<set, %d chars>\n", length($2); next }
+                /^LML_REQUIRE_AUTH=/ { print }
+              '
+
+      - name: Wait for redeploy + health probe
+        run: |
+          set -euo pipefail
+          # Railway redeploys automatically on env-var change. Give it a minute, then probe.
+          echo "Sleeping 60s for redeploy..."
+          sleep 60
+          for i in 1 2 3 4 5 6; do
+            if curl -sf -m 10 https://library-metadata-lookup-production.up.railway.app/health > /tmp/health.json; then
+              status=$(python3 -c "import json,sys;print(json.load(open('/tmp/health.json'))['status'])")
+              echo "Health attempt $i: $status"
+              if [ "$status" = "healthy" ] || [ "$status" = "degraded" ]; then
+                exit 0
+              fi
+            else
+              echo "Health attempt $i: HTTP error"
+            fi
+            sleep 10
+          done
+          echo "::error::Service did not return healthy/degraded after 6 attempts"
+          exit 1
