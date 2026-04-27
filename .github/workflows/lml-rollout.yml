@@ -8,10 +8,13 @@ name: LML Rollout (manual)
 #   gh workflow run lml-rollout.yml --ref main -f action=set-api-key
 #   gh workflow run lml-rollout.yml --ref main -f action=flip-require-auth-on
 #   gh workflow run lml-rollout.yml --ref main -f action=flip-require-auth-off
+#   gh workflow run lml-rollout.yml --ref main -f action=set-etl-notify-key
 #
 # Required GH secrets:
 #   RAILWAY_TOKEN_PRODUCTION   project-scoped Railway token (already configured)
 #   LML_API_KEY                bearer-token value (set before action=set-api-key)
+#   ETL_NOTIFY_KEY             bearer used when LML POSTs the streaming-status webhook
+#                              to tubafrenzy (set before action=set-etl-notify-key)
 
 on:
   workflow_dispatch:
@@ -24,6 +27,7 @@ on:
           - set-api-key
           - flip-require-auth-on
           - flip-require-auth-off
+          - set-etl-notify-key
 
 jobs:
   apply:
@@ -43,6 +47,7 @@ jobs:
       - name: Apply
         env:
           LML_API_KEY: ${{ secrets.LML_API_KEY }}
+          ETL_NOTIFY_KEY: ${{ secrets.ETL_NOTIFY_KEY }}
         run: |
           set -euo pipefail
           case "${{ inputs.action }}" in
@@ -60,6 +65,13 @@ jobs:
             flip-require-auth-off)
               railway variables --service "$SERVICE" --set "LML_REQUIRE_AUTH=false"
               ;;
+            set-etl-notify-key)
+              if [ -z "${ETL_NOTIFY_KEY:-}" ]; then
+                echo "::error::ETL_NOTIFY_KEY GH secret is not set. Add it (gh secret set ETL_NOTIFY_KEY) before running this action."
+                exit 1
+              fi
+              railway variables --service "$SERVICE" --set "ETL_NOTIFY_KEY=$ETL_NOTIFY_KEY"
+              ;;
           esac
 
       - name: Verify (names + presence only — no values)
@@ -68,7 +80,8 @@ jobs:
           # --kv prints KEY=VALUE; mask values so they never appear in logs.
           railway variables --kv --service "$SERVICE" \
             | awk -F= '
-                /^LML_API_KEY=/   { printf "LML_API_KEY=<set, %d chars>\n", length($2); next }
+                /^LML_API_KEY=/      { printf "LML_API_KEY=<set, %d chars>\n", length($2); next }
+                /^ETL_NOTIFY_KEY=/   { printf "ETL_NOTIFY_KEY=<set, %d chars>\n", length($2); next }
                 /^LML_REQUIRE_AUTH=/ { print }
               '
 
