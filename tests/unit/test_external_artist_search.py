@@ -149,3 +149,48 @@ class TestSearchExternalArtists:
         mock_discogs_cache.search_artists_by_name.assert_awaited_once_with("Artist", limit=3)
         # Result count comes from the cache; assert all candidates were preserved.
         assert len(candidates) == 10
+
+    @pytest.mark.asyncio
+    async def test_mb_query_unions_alias_table(self, mock_discogs_cache, mock_mb_pg):
+        """Phase 1.6b: MB fuzzy must search mb_artist AND mb_artist_alias.
+
+        Aliases live in mb_artist_alias (e.g. ASCII variant of a diacritic
+        name); querying only mb_artist undercuts recall on the lossy-mojibake
+        matcher. Asserts the SQL string references both tables so a future
+        refactor that drops the alias leg is caught here.
+        """
+        mock_discogs_cache.search_artists_by_name.return_value = []
+
+        await search_external_artists(
+            "Csillagrablok",
+            discogs_cache=mock_discogs_cache,
+            mb_pg=mock_mb_pg,
+        )
+
+        mock_mb_pg.fetchall.assert_awaited_once()
+        sql = mock_mb_pg.fetchall.call_args.args[0]
+        assert "mb_artist_alias" in sql
+        assert "mb_artist" in sql
+
+    @pytest.mark.asyncio
+    async def test_mb_alias_match_returns_canonical_name(self, mock_discogs_cache, mock_mb_pg):
+        """When the match comes via mb_artist_alias, the row carries the
+        parent mb_artist.name so the matcher's skeleton-Levenshtein scoring
+        operates on the canonical form, not the alias.
+        """
+        mock_discogs_cache.search_artists_by_name.return_value = []
+        # Simulating a row that the SQL would emit when the trigram hit was
+        # against mb_artist_alias.name='Csillagrablok' but the SELECT pulls
+        # the canonical mb_artist.name.
+        mock_mb_pg.fetchall.return_value = [
+            {"id": "mb-uuid-csgr", "name": "Csillagrablók", "score": 0.71},
+        ]
+
+        candidates, source = await search_external_artists(
+            "Csillagrablok",
+            discogs_cache=mock_discogs_cache,
+            mb_pg=mock_mb_pg,
+        )
+
+        assert source == "musicbrainz"
+        assert candidates == [{"id": "mb-uuid-csgr", "name": "Csillagrablók"}]
