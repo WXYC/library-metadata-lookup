@@ -134,3 +134,61 @@ class TestSkipsAlreadyReconciled:
         )
         assert "Stereolab" in results
         assert "Autechre" not in results
+
+
+class TestDiacriticInsensitiveMatch:
+    """The cache filter (`scripts/filter_csv.py:normalize_artist`) loads rows
+    into the cache after stripping diacritics, so a Discogs row for "Björk" is
+    loaded if WXYC has "Bjork". The reconciler must match with the same
+    normalization or the load is wasted on every diacritic-different artist
+    (the prod 17% reconciliation rate vs ~99% LML coverage).
+    """
+
+    @pytest.mark.asyncio
+    async def test_wxyc_no_diacritics_matches_discogs_with_diacritics(self, reconciler, mock_pg):
+        """WXYC 'Bjork' (no umlaut) must match Discogs 'Björk' in release_artist."""
+        # Cache contains 'björk' (lowercased only); reconciler must strip
+        # diacritics on both sides so 'bjork' matches.
+        mock_pg.fetchall = AsyncMock(return_value=[{"artist_name": "bjork", "artist_id": 7777}])
+        results = await reconciler.reconcile_batch(["Bjork"])
+        assert "Bjork" in results
+        assert results["Bjork"].discogs_artist_id == 7777
+        assert results["Bjork"].method == "exact_match"
+
+    @pytest.mark.asyncio
+    async def test_wxyc_with_diacritics_matches_diacritic_stripped_cache(self, reconciler, mock_pg):
+        """WXYC 'Hermanos Gutiérrez' must match a row whose normalized form is 'hermanos gutierrez'."""
+        mock_pg.fetchall = AsyncMock(
+            return_value=[{"artist_name": "hermanos gutierrez", "artist_id": 9001}]
+        )
+        results = await reconciler.reconcile_batch(["Hermanos Gutiérrez"])
+        assert "Hermanos Gutiérrez" in results
+        assert results["Hermanos Gutiérrez"].discogs_artist_id == 9001
+
+    @pytest.mark.asyncio
+    async def test_normalized_input_passed_to_sql(self, reconciler, mock_pg):
+        """The names sent to the SQL `ANY($1)` array must already be diacritic-stripped
+        and lowercased — matching the `lower(f_unaccent(...))` expression on the
+        column side (which is what the existing GIN index on release_artist uses)."""
+        mock_pg.fetchall = AsyncMock(return_value=[])
+        await reconciler.reconcile_batch(["Björk", "Hermanos Gutiérrez", "Stereolab"])
+        # Inspect the ANY($1) parameter on the first call
+        first_call_args = mock_pg.fetchall.await_args_list[0].args
+        sql_arg, names_arg = first_call_args
+        assert "lower(f_unaccent(" in sql_arg, (
+            "EXACT_MATCH SQL must use lower(f_unaccent(...)) on the column side "
+            "to be diacritic-insensitive (matches the indexed expression)."
+        )
+        assert sorted(names_arg) == sorted(["bjork", "hermanos gutierrez", "stereolab"]), (
+            "Names sent to SQL must be diacritic-stripped + lowercased before being "
+            "compared against lower(f_unaccent(column))."
+        )
+
+    @pytest.mark.asyncio
+    async def test_canonical_preserved_in_result(self, reconciler, mock_pg):
+        """Even after normalization, the result keys are the original canonical names."""
+        mock_pg.fetchall = AsyncMock(return_value=[{"artist_name": "bjork", "artist_id": 7777}])
+        results = await reconciler.reconcile_batch(["Björk"])
+        assert "Björk" in results
+        # Original spelling preserved as the dict key for write-back to entity.identity.
+        assert results["Björk"].discogs_artist_id == 7777
