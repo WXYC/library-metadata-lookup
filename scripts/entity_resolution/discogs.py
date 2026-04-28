@@ -5,6 +5,18 @@ Resolves WXYC library artist names to Discogs artist IDs via a cascade:
 2. Member/group lookup via ``artist_member``
 3. Alias/name variation fallback via ``artist_alias`` and ``artist_name_variation``
 
+Matching is diacritic-insensitive on both sides (``lower(f_unaccent(col))``
+on the column, ``normalize_artist_name(name)`` on the input). The cache load
+pipeline (``discogs-etl/scripts/filter_csv.py:normalize_artist``) strips
+diacritics when deciding which Discogs rows to retain, so reconciliation has
+to use the same normalization or any artist whose WXYC spelling differs in
+diacritics from the Discogs spelling silently goes unreconciled — which is
+the gap that produced the 17% reconciliation rate observed in prod.
+
+The ``lower(f_unaccent(...))`` column expression matches the existing GIN
+trigram index in the discogs-cache schema (see
+``discogs-etl/schema/create_indexes.sql``) so this remains an indexed lookup.
+
 Ported from semantic-index ``reconciliation.py``.
 """
 
@@ -13,34 +25,36 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from wxyc_etl.text import normalize_artist_name
+
 from scripts.entity_resolution.sources import PgSource
 
 logger = logging.getLogger(__name__)
 
 _EXACT_MATCH_SQL = """\
-SELECT DISTINCT lower(ra.artist_name) AS artist_name, ra.artist_id
+SELECT DISTINCT lower(f_unaccent(ra.artist_name)) AS artist_name, ra.artist_id
 FROM release_artist ra
 WHERE ra.extra = 0
   AND ra.artist_id IS NOT NULL
-  AND lower(ra.artist_name) = ANY($1)\
+  AND lower(f_unaccent(ra.artist_name)) = ANY($1)\
 """
 
 _MEMBER_MATCH_SQL = """\
-SELECT DISTINCT lower(am.member_name) AS member_name, am.member_id
+SELECT DISTINCT lower(f_unaccent(am.member_name)) AS member_name, am.member_id
 FROM artist_member am
-WHERE lower(am.member_name) = ANY($1)\
+WHERE lower(f_unaccent(am.member_name)) = ANY($1)\
 """
 
 _ALIAS_MATCH_SQL = """\
-SELECT DISTINCT lower(aa.alias_name) AS alias_name, aa.artist_id
+SELECT DISTINCT lower(f_unaccent(aa.alias_name)) AS alias_name, aa.artist_id
 FROM artist_alias aa
-WHERE lower(aa.alias_name) = ANY($1)\
+WHERE lower(f_unaccent(aa.alias_name)) = ANY($1)\
 """
 
 _NAME_VARIATION_MATCH_SQL = """\
-SELECT DISTINCT lower(nv.name) AS name, nv.artist_id
+SELECT DISTINCT lower(f_unaccent(nv.name)) AS name, nv.artist_id
 FROM artist_name_variation nv
-WHERE lower(nv.name) = ANY($1)\
+WHERE lower(f_unaccent(nv.name)) = ANY($1)\
 """
 
 
@@ -94,83 +108,88 @@ class DiscogsReconciler:
 
         results: dict[str, ReconciliationMatch] = {}
 
-        # Build lowercase -> canonical mapping
-        lower_to_canonical = {n.lower(): n for n in effective_names}
+        # Build normalized (diacritic-stripped + lowercased) -> canonical mapping.
+        # The same normalization is applied to the column side via
+        # ``lower(f_unaccent(...))`` in each stage's SQL so the comparison is
+        # symmetric. Two canonicals that normalize to the same form (e.g.
+        # ``Björk`` and ``Bjork``) collapse to the same key — both resolve to
+        # the same Discogs ID, so dropping one is correct.
+        normalized_to_canonical = {normalize_artist_name(n): n for n in effective_names}
 
         # Stage 1: Exact match
-        unmatched = set(lower_to_canonical.keys())
-        for batch_lower in self._batches(list(unmatched)):
-            matched = await self._exact_match(batch_lower)
-            for lower_name, artist_id in matched.items():
-                canonical = lower_to_canonical.get(lower_name)
+        unmatched = set(normalized_to_canonical.keys())
+        for batch_normalized in self._batches(list(unmatched)):
+            matched = await self._exact_match(batch_normalized)
+            for normalized_name, artist_id in matched.items():
+                canonical = normalized_to_canonical.get(normalized_name)
                 if canonical is None:
                     continue
                 results[canonical] = ReconciliationMatch(artist_id, "exact_match")
-                unmatched.discard(lower_name)
+                unmatched.discard(normalized_name)
 
         # Stage 2: Member/group match
         if unmatched:
-            for batch_lower in self._batches(list(unmatched)):
-                matched = await self._member_match(batch_lower)
-                for lower_name, artist_id in matched.items():
-                    canonical = lower_to_canonical.get(lower_name)
+            for batch_normalized in self._batches(list(unmatched)):
+                matched = await self._member_match(batch_normalized)
+                for normalized_name, artist_id in matched.items():
+                    canonical = normalized_to_canonical.get(normalized_name)
                     if canonical is None:
                         continue
                     results[canonical] = ReconciliationMatch(artist_id, "member_group")
-                    unmatched.discard(lower_name)
+                    unmatched.discard(normalized_name)
 
         # Stage 3: Alias match
         if unmatched:
-            for batch_lower in self._batches(list(unmatched)):
-                matched = await self._alias_match(batch_lower)
-                for lower_name, artist_id in matched.items():
-                    canonical = lower_to_canonical.get(lower_name)
+            for batch_normalized in self._batches(list(unmatched)):
+                matched = await self._alias_match(batch_normalized)
+                for normalized_name, artist_id in matched.items():
+                    canonical = normalized_to_canonical.get(normalized_name)
                     if canonical is None:
                         continue
                     results[canonical] = ReconciliationMatch(artist_id, "alias_match")
-                    unmatched.discard(lower_name)
+                    unmatched.discard(normalized_name)
 
         # Stage 4: Name variation fallback
         if unmatched:
-            for batch_lower in self._batches(list(unmatched)):
-                matched = await self._name_variation_match(batch_lower)
-                for lower_name, artist_id in matched.items():
-                    canonical = lower_to_canonical.get(lower_name)
+            for batch_normalized in self._batches(list(unmatched)):
+                matched = await self._name_variation_match(batch_normalized)
+                for normalized_name, artist_id in matched.items():
+                    canonical = normalized_to_canonical.get(normalized_name)
                     if canonical is None:
                         continue
                     results[canonical] = ReconciliationMatch(artist_id, "name_variation")
-                    unmatched.discard(lower_name)
+                    unmatched.discard(normalized_name)
 
         return results
 
-    async def _exact_match(self, lower_names: list[str]) -> dict[str, int]:
-        """Stage 1: Exact name match against release_artist."""
-        rows = await self._pg.fetchall(_EXACT_MATCH_SQL, lower_names)
+    async def _exact_match(self, normalized_names: list[str]) -> dict[str, int]:
+        """Stage 1: Diacritic-insensitive exact match against release_artist."""
+        rows = await self._pg.fetchall(_EXACT_MATCH_SQL, normalized_names)
         if not rows:
             return {}
         return {
             row["artist_name"]: row["artist_id"] for row in rows if row["artist_id"] is not None
         }
 
-    async def _member_match(self, lower_names: list[str]) -> dict[str, int]:
-        """Stage 2: Member/group lookup via artist_member."""
-        rows = await self._pg.fetchall(_MEMBER_MATCH_SQL, lower_names)
+    async def _member_match(self, normalized_names: list[str]) -> dict[str, int]:
+        """Stage 2: Diacritic-insensitive member/group lookup via artist_member."""
+        rows = await self._pg.fetchall(_MEMBER_MATCH_SQL, normalized_names)
         if not rows:
             return {}
         return {
             row["member_name"]: row["member_id"] for row in rows if row["member_id"] is not None
         }
 
-    async def _alias_match(self, lower_names: list[str]) -> dict[str, int]:
-        """Stage 3: Alias lookup via artist_alias."""
-        rows = await self._pg.fetchall(_ALIAS_MATCH_SQL, lower_names)
+    async def _alias_match(self, normalized_names: list[str]) -> dict[str, int]:
+        """Stage 3: Diacritic-insensitive alias lookup via artist_alias."""
+        rows = await self._pg.fetchall(_ALIAS_MATCH_SQL, normalized_names)
         if not rows:
             return {}
         return {row["alias_name"]: row["artist_id"] for row in rows if row["artist_id"] is not None}
 
-    async def _name_variation_match(self, lower_names: list[str]) -> dict[str, int]:
-        """Stage 4: Name variation lookup via artist_name_variation."""
-        rows = await self._pg.fetchall(_NAME_VARIATION_MATCH_SQL, lower_names)
+    async def _name_variation_match(self, normalized_names: list[str]) -> dict[str, int]:
+        """Stage 4: Diacritic-insensitive name variation lookup via artist_name_variation."""
+        rows = await self._pg.fetchall(_NAME_VARIATION_MATCH_SQL, normalized_names)
         if not rows:
             return {}
         return {row["name"]: row["artist_id"] for row in rows if row["artist_id"] is not None}
