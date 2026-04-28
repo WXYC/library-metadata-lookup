@@ -1,0 +1,129 @@
+name: Set Railway env var (manual)
+
+# One-shot ops workflow: upserts a single env var on the production Railway
+# service for library-metadata-lookup, then waits for the auto-redeploy and
+# probes /health. Used to rotate secrets (LML_API_KEY, ETL_NOTIFY_KEY, …)
+# without requiring a local Railway CLI session — the project-scoped
+# RAILWAY_TOKEN_PRODUCTION secret stays in GitHub.
+#
+# Usage:
+#   gh workflow run set-railway-var.yml --ref main -f key=LML_API_KEY
+#   gh workflow run set-railway-var.yml --ref main -f key=ETL_NOTIFY_KEY
+#
+# The value is read from a same-named GH secret. Override with `secret_name`:
+#   gh workflow run set-railway-var.yml --ref main -f key=LML_API_KEY -f secret_name=LML_API_KEY_NEW
+#
+# This workflow only handles secret values that come from GH secrets. For
+# plain configuration toggles (e.g. boolean feature flags), edit them on the
+# Railway dashboard or via a one-off ci.yml change — they don't belong in
+# GH secrets, and exposing them as a workflow_dispatch choice list invites
+# accidents.
+#
+# Required GH secrets:
+#   RAILWAY_TOKEN_PRODUCTION   project-scoped Railway token
+#   <key>                      the value to set (one per supported key —
+#                              add new ones to the resolve step's case)
+
+on:
+  workflow_dispatch:
+    inputs:
+      key:
+        description: 'Env var name to set on Railway'
+        required: true
+        type: string
+      secret_name:
+        description: 'GH secret name holding the value (defaults to `key`)'
+        required: false
+        type: string
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    env:
+      # Project-scoped token. Setting once at the job level keeps it out of step echoes.
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
+      SERVICE: library-metadata-lookup
+    steps:
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Show CLI version
+        run: railway --version
+
+      - name: Resolve secret value
+        id: resolve
+        env:
+          # Read every potentially relevant secret upfront. GH won't let us
+          # index `secrets[var]` dynamically, so any new key the workflow
+          # supports has to be listed here.
+          LML_API_KEY: ${{ secrets.LML_API_KEY }}
+          ETL_NOTIFY_KEY: ${{ secrets.ETL_NOTIFY_KEY }}
+        run: |
+          set -euo pipefail
+          KEY="${{ inputs.key }}"
+          SECRET_NAME="${{ inputs.secret_name || inputs.key }}"
+          case "$SECRET_NAME" in
+            LML_API_KEY)    VALUE="$LML_API_KEY" ;;
+            ETL_NOTIFY_KEY) VALUE="$ETL_NOTIFY_KEY" ;;
+            *)
+              echo "::error::Unsupported secret_name '$SECRET_NAME'. Add it to the resolve step's env block + case statement."
+              exit 1
+              ;;
+          esac
+          if [ -z "${VALUE:-}" ]; then
+            echo "::error::Secret '$SECRET_NAME' is empty or not set"
+            exit 1
+          fi
+          # Mask + export to job env so the next step can read $KEY/$VALUE.
+          echo "::add-mask::$VALUE"
+          {
+            echo "VALUE<<EOF"
+            echo "$VALUE"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+          echo "KEY=$KEY" >> "$GITHUB_ENV"
+          echo "length=${#VALUE}" >> "$GITHUB_OUTPUT"
+
+      - name: Apply
+        run: |
+          set -euo pipefail
+          # Quoting prevents shell from interpreting any special chars in the value.
+          railway variables --service "$SERVICE" --set "$KEY=$VALUE"
+
+      - name: Verify (key + length only — no value)
+        run: |
+          set -euo pipefail
+          # --kv prints KEY=VALUE; we report only the length to keep the
+          # bearer out of logs. Splitting on the *first* `=` so values
+          # ending in base64 padding aren't truncated by awk -F=.
+          railway variables --kv --service "$SERVICE" \
+            | grep "^${KEY}=" \
+            | awk -v k="$KEY" '{
+                idx = index($0, "=");
+                printf "%s=<set, %d chars>\n", k, length($0) - idx;
+              }'
+
+      - name: Wait for redeploy + health probe
+        run: |
+          set -euo pipefail
+          # Railway redeploys automatically on env-var change. Give it a minute, then probe.
+          echo "Sleeping 60s for redeploy..."
+          sleep 60
+          for i in 1 2 3 4 5 6; do
+            if curl -sf -m 10 https://library-metadata-lookup-production.up.railway.app/health > /tmp/health.json; then
+              status=$(python3 -c "import json,sys;print(json.load(open('/tmp/health.json'))['status'])")
+              echo "Health attempt $i: $status"
+              if [ "$status" = "healthy" ] || [ "$status" = "degraded" ]; then
+                exit 0
+              fi
+            else
+              echo "Health attempt $i: HTTP error"
+            fi
+            sleep 10
+          done
+          echo "::error::Service did not return healthy/degraded after 6 attempts"
+          exit 1
+
+      - name: Summary
+        run: |
+          echo "Set ${{ env.KEY }} (${{ steps.resolve.outputs.length }} chars) on Railway service ${{ env.SERVICE }}."
