@@ -193,3 +193,60 @@ async def upload_library_db(
     if webhook_result is not None:
         response["webhook"] = webhook_result
     return JSONResponse(content=response)
+
+
+@router.post(
+    "/upload-streaming-db",
+    summary="Upload a streaming_availability.db backup",
+    responses={
+        200: {"description": "Upload successful"},
+        400: {"description": "Invalid SQLite database"},
+        401: {"description": "Missing authorization"},
+        403: {"description": "Invalid or missing token"},
+    },
+)
+async def upload_streaming_db(
+    file: UploadFile,
+    settings: Settings = Depends(get_settings),
+    authorization: str | None = Header(None),
+):
+    """Store a streaming_availability.db backup on the Railway volume.
+
+    This file is not used at runtime — it's a backup of the analysis database
+    that contains all streaming search results, track-level data, and Discogs
+    match state. Validated as SQLite with an 'albums' table before writing.
+    """
+    _validate_auth(settings, authorization)
+
+    db_dir = settings.resolved_library_db_path.parent
+    db_path = db_dir / "streaming_availability.db"
+    tmp_path = db_dir / "streaming_availability.db.tmp"
+
+    try:
+        content = await file.read()
+        tmp_path.write_bytes(content)
+    except Exception as e:
+        logger.error(f"Failed to write uploaded streaming DB: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to write file: {e}") from e
+
+    try:
+        conn = sqlite3.connect(str(tmp_path))
+        row_count = conn.execute("SELECT count(*) FROM albums").fetchone()[0]
+        conn.close()
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid SQLite database: {e}",
+        ) from e
+
+    os.replace(str(tmp_path), str(db_path))
+    logger.info(f"Streaming database backed up: {db_path} ({row_count} albums)")
+
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "row_count": row_count,
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+    )
