@@ -7,6 +7,9 @@ import pytest
 from scripts.entity_resolution.sources import SparqlSource
 from scripts.entity_resolution.wikidata import (
     _SPARQL_DISCOGS_TO_QID,
+    _SPARQL_QID_TO_DISCOGS_ARTIST,
+    _SPARQL_QID_TO_DISCOGS_MASTER,
+    _SPARQL_QID_TO_DISCOGS_RELEASE,
     _SPARQL_STREAMING_IDS,
     WikidataReconciler,
 )
@@ -219,3 +222,112 @@ class TestGracefulDegradation:
         result = await reconciler_no_cache.resolve_qids_from_discogs_ids({12})
         assert result[12] == "Q378288"
         mock_sparql.query_batched.assert_called_once()
+
+
+class TestQidToDiscogsId:
+    """The inverse direction of resolve_qids_from_discogs_ids.
+
+    Wikidata QIDs are substantially more stable than Discogs IDs (which
+    Discogs admins can reorganize / merge / re-assign). When a caller has a
+    QID and needs the *current* Discogs ID — for example, an integration
+    test that wants to fetch the canonical Discogs entity for a known
+    Wikidata-pinned artist — this is the lookup direction that survives
+    Discogs reshuffling.
+    """
+
+    @pytest.mark.asyncio
+    async def test_artist_kind_uses_p1953(self, reconciler_no_cache, mock_sparql):
+        """kind='artist' resolves QID -> P1953 (Discogs artist ID)."""
+        mock_sparql.query_batched = AsyncMock(
+            return_value=[
+                {
+                    "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q334652"},
+                    "discogsId": {"type": "literal", "value": "388"},
+                }
+            ]
+        )
+        result = await reconciler_no_cache.resolve_discogs_ids_from_qids({"Q334652"}, kind="artist")
+        assert result == {"Q334652": 388}
+        # Confirm the SPARQL template that was rendered targets P1953.
+        template_arg = mock_sparql.query_batched.await_args.args[0]
+        assert template_arg is _SPARQL_QID_TO_DISCOGS_ARTIST
+        assert "wdt:P1953" in template_arg
+
+    @pytest.mark.asyncio
+    async def test_master_kind_uses_p1954(self, reconciler_no_cache, mock_sparql):
+        """kind='master' resolves QID -> P1954 (Discogs master release ID)."""
+        mock_sparql.query_batched = AsyncMock(
+            return_value=[
+                {
+                    "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q3037397"},
+                    "discogsId": {"type": "literal", "value": "30682"},
+                }
+            ]
+        )
+        result = await reconciler_no_cache.resolve_discogs_ids_from_qids(
+            {"Q3037397"}, kind="master"
+        )
+        assert result == {"Q3037397": 30682}
+        template_arg = mock_sparql.query_batched.await_args.args[0]
+        assert template_arg is _SPARQL_QID_TO_DISCOGS_MASTER
+        assert "wdt:P1954" in template_arg
+
+    @pytest.mark.asyncio
+    async def test_release_kind_uses_p2206(self, reconciler_no_cache, mock_sparql):
+        """kind='release' resolves QID -> P2206 (Discogs release ID)."""
+        mock_sparql.query_batched = AsyncMock(return_value=[])
+        await reconciler_no_cache.resolve_discogs_ids_from_qids({"Q123"}, kind="release")
+        template_arg = mock_sparql.query_batched.await_args.args[0]
+        assert template_arg is _SPARQL_QID_TO_DISCOGS_RELEASE
+        assert "wdt:P2206" in template_arg
+
+    @pytest.mark.asyncio
+    async def test_invalid_kind_raises(self, reconciler_no_cache):
+        """Unknown ``kind`` raises rather than silently picking a property."""
+        with pytest.raises(ValueError, match="kind"):
+            await reconciler_no_cache.resolve_discogs_ids_from_qids({"Q1"}, kind="label")
+
+    @pytest.mark.asyncio
+    async def test_qids_passed_with_wd_prefix(self, reconciler_no_cache, mock_sparql):
+        """SPARQL VALUES clause needs `wd:` prefix on each QID; bare `Q...` is a parse error."""
+        mock_sparql.query_batched = AsyncMock(return_value=[])
+        await reconciler_no_cache.resolve_discogs_ids_from_qids({"Q334652"}, kind="artist")
+        items_arg = mock_sparql.query_batched.await_args.args[1]
+        assert items_arg == ["wd:Q334652"]
+
+    @pytest.mark.asyncio
+    async def test_empty_qids_short_circuits(self, reconciler_no_cache, mock_sparql):
+        """Empty input does no SPARQL request."""
+        result = await reconciler_no_cache.resolve_discogs_ids_from_qids(set(), kind="artist")
+        assert result == {}
+        mock_sparql.query_batched.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_property_skipped(self, reconciler_no_cache, mock_sparql):
+        """A QID that has no P1953 value (e.g. obscure artist) is omitted from the result, not None-valued."""
+        mock_sparql.query_batched = AsyncMock(
+            return_value=[
+                {
+                    "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q1"},
+                    # discogsId binding intentionally absent — Wikidata returns no row
+                    # at all in this case, but mirroring the defensive parsing in
+                    # resolve_qids_from_discogs_ids is the right shape.
+                }
+            ]
+        )
+        result = await reconciler_no_cache.resolve_discogs_ids_from_qids({"Q1"}, kind="artist")
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_non_integer_discogs_id_skipped(self, reconciler_no_cache, mock_sparql):
+        """Defensive: a malformed Wikidata literal that does not parse as int is skipped."""
+        mock_sparql.query_batched = AsyncMock(
+            return_value=[
+                {
+                    "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q1"},
+                    "discogsId": {"type": "literal", "value": "not-a-number"},
+                }
+            ]
+        )
+        result = await reconciler_no_cache.resolve_discogs_ids_from_qids({"Q1"}, kind="artist")
+        assert result == {}
