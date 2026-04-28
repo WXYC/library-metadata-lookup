@@ -2,6 +2,7 @@
 
 import os
 
+import httpx
 import pytest
 import pytest_asyncio
 
@@ -25,24 +26,39 @@ _QID_DOTS_AND_LOOPS_ALBUM = "Q3037397"
 _PINNED_DOTS_AND_LOOPS_RELEASE_ID = 90416  # canonical vinyl LP, no Wikidata QID
 
 
-@pytest_asyncio.fixture(scope="module")
+# Track how many times the resolver is invoked so the module-scoped fixture
+# can be tested for actually being module-scoped — not silently recreated by
+# pytest-asyncio's loop-scope handling.
+_resolver_call_count = 0
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def canonical_discogs_ids() -> dict[str, int]:
     """Resolve each test fixture QID to its current Discogs ID via Wikidata.
 
-    Runs once per pytest session (module scope) — two SPARQL round-trips
-    cached for the duration of the test run. Skips dependent tests rather
-    than passing a stale ID through on any of:
-    - Wikidata SPARQL endpoint unreachable / timing out
+    Runs once per module (asserted via ``_resolver_call_count`` — see
+    ``test_fixture_runs_once_per_module``). The result is a plain dict with
+    no async resources held, so the value is safe to share across tests
+    even though each test gets its own event loop.
+
+    Skips dependent tests rather than passing a stale ID through on any of:
+    - Wikidata SPARQL endpoint unreachable / timing out (httpx.HTTPError)
+    - SPARQL response missing/malformed (asyncio.TimeoutError covers slow paths)
     - The QID exists but the property (P1953 / P1954) was removed
     - The Wikidata literal is non-numeric (defensive)
     """
+    global _resolver_call_count
+    _resolver_call_count += 1
+
     reconciler = WikidataReconciler(sparql=SparqlSource())
     try:
         artist_ids = await reconciler.resolve_discogs_ids_from_qids({_QID_STEREOLAB}, kind="artist")
         master_ids = await reconciler.resolve_discogs_ids_from_qids(
             {_QID_DOTS_AND_LOOPS_ALBUM}, kind="master"
         )
-    except Exception as exc:
+    # Narrow to network-shaped failures only — programmer errors (AttributeError
+    # etc.) should still fail loud rather than be swallowed into a skip.
+    except (httpx.HTTPError, TimeoutError) as exc:
         pytest.skip(f"Wikidata SPARQL unreachable ({type(exc).__name__}: {exc})")
 
     artist_id = artist_ids.get(_QID_STEREOLAB)
@@ -180,6 +196,26 @@ class TestEntityResolution:
         assert result is not None
         assert result.title == "Dots And Loops"
         assert result.master_id == master_id
+
+    @pytest.mark.asyncio
+    async def test_fixture_runs_once_per_module(self, canonical_discogs_ids):
+        """The module-scoped resolver fixture must not be silently recreated per test.
+
+        pytest-asyncio's interaction between ``scope="module"`` fixtures and
+        function-scoped event loops has historically caused fixtures to be
+        re-evaluated per test — wasting Wikidata SPARQL round-trips and
+        invalidating the docstring's "two SPARQL queries per session" claim.
+        ``loop_scope="module"`` on the fixture pins this. By the time this
+        test runs, the resolver should have been invoked exactly once across
+        every test in the class that consumed the fixture.
+        """
+        # `canonical_discogs_ids` is requested here only so the fixture is
+        # definitely live by the time we read the counter.
+        assert canonical_discogs_ids is not None
+        assert _resolver_call_count == 1, (
+            f"canonical_discogs_ids fixture was invoked {_resolver_call_count} times; "
+            "expected exactly 1 with module-scoped fixture + module-scoped loop."
+        )
 
     @pytest.mark.asyncio
     async def test_artist_not_found(self):
