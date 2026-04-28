@@ -4,8 +4,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from scripts.entity_resolution.sources import SparqlSource
 from scripts.entity_resolution.wikidata import (
     _SPARQL_DISCOGS_TO_QID,
+    _SPARQL_STREAMING_IDS,
     WikidataReconciler,
 )
 
@@ -138,6 +140,51 @@ class TestStreamingIdFetch:
         assert ids.spotify_artist_id == "2cGiltMnETMr482N3F3ILQK"
         assert ids.apple_music_artist_id == "1234567"
         assert ids.bandcamp_id == "autechre"
+
+    @pytest.mark.asyncio
+    async def test_passes_wd_prefixed_qids_to_query_batched(self, reconciler, mock_sparql):
+        """``fetch_streaming_ids`` must hand ``query_batched`` items already
+        prefixed with ``wd:`` so the rendered SPARQL ``VALUES`` clause is
+        syntactically valid (bare ``Q378288`` is a SPARQL parse error).
+
+        Regression: WXYC/library-metadata-lookup#187.
+        """
+        mock_sparql.query_batched = AsyncMock(return_value=[])
+
+        await reconciler.fetch_streaming_ids(["Q378288", "Q123"])
+
+        mock_sparql.query_batched.assert_called_once()
+        template_arg, items_arg = mock_sparql.query_batched.call_args.args
+        assert template_arg is _SPARQL_STREAMING_IDS
+        assert items_arg == ["wd:Q378288", "wd:Q123"]
+
+    @pytest.mark.asyncio
+    async def test_rendered_sparql_uses_wd_prefix(self, mock_wikidata_pg, monkeypatch):
+        """End-to-end through real ``SparqlSource``: capture the substituted
+        SPARQL and confirm the VALUES clause has ``wd:Q...``, not bare ``Q...``.
+
+        Regression: WXYC/library-metadata-lookup#187. Without the prefix,
+        Wikidata's SPARQL endpoint rejects the query at parse time.
+        """
+        sparql = SparqlSource(batch_size=10)
+        captured: list[str] = []
+
+        async def fake_query(query_str: str):
+            captured.append(query_str)
+            return []
+
+        monkeypatch.setattr(sparql, "query", fake_query)
+        reconciler = WikidataReconciler(sparql=sparql, wikidata_pg=mock_wikidata_pg)
+
+        await reconciler.fetch_streaming_ids(["Q378288", "Q123"])
+
+        assert len(captured) == 1
+        rendered = captured[0]
+        assert "wd:Q378288" in rendered
+        assert "wd:Q123" in rendered
+        # No bare QIDs anywhere in the VALUES clause.
+        assert "{ Q378288" not in rendered
+        assert " Q378288 " not in rendered
 
     @pytest.mark.asyncio
     async def test_partial_streaming_ids(self, reconciler, mock_sparql):
