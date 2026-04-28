@@ -2,6 +2,7 @@
 
 Resolves:
 - Discogs artist ID -> Wikidata QID (via wikidata-cache P1953 mapping or SPARQL)
+- QID -> Discogs artist/master/release ID (via SPARQL P1953 / P1954 / P2206)
 - Artist name -> QID (via SPARQL name search for musicians/musical groups)
 - QID -> streaming platform IDs (Spotify P1902, Apple Music P2850, Bandcamp P3283)
 
@@ -12,10 +13,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Literal
 
 from scripts.entity_resolution.sources import PgSource, SparqlSource
 
 logger = logging.getLogger(__name__)
+
+DiscogsKind = Literal["artist", "master", "release"]
 
 _CACHE_DISCOGS_TO_QID_SQL = """\
 SELECT discogs_artist_id, qid
@@ -32,6 +36,38 @@ SELECT ?item ?discogsId WHERE {
   ?item wdt:P1953 ?discogsId .
 }\
 """
+
+# Inverse direction of _SPARQL_DISCOGS_TO_QID. One template per Wikidata
+# property — the property is hard-coded rather than parameterized so that
+# query plans cache cleanly on the Wikidata Query Service and so the rendered
+# SPARQL stays readable in logs. Selection happens in
+# ``WikidataReconciler.resolve_discogs_ids_from_qids`` via the ``kind`` arg.
+_SPARQL_QID_TO_DISCOGS_ARTIST = """\
+SELECT ?item ?discogsId WHERE {
+  VALUES ?item { {values} }
+  ?item wdt:P1953 ?discogsId .
+}\
+"""
+
+_SPARQL_QID_TO_DISCOGS_MASTER = """\
+SELECT ?item ?discogsId WHERE {
+  VALUES ?item { {values} }
+  ?item wdt:P1954 ?discogsId .
+}\
+"""
+
+_SPARQL_QID_TO_DISCOGS_RELEASE = """\
+SELECT ?item ?discogsId WHERE {
+  VALUES ?item { {values} }
+  ?item wdt:P2206 ?discogsId .
+}\
+"""
+
+_SPARQL_TEMPLATE_BY_KIND: dict[DiscogsKind, str] = {
+    "artist": _SPARQL_QID_TO_DISCOGS_ARTIST,
+    "master": _SPARQL_QID_TO_DISCOGS_MASTER,
+    "release": _SPARQL_QID_TO_DISCOGS_RELEASE,
+}
 
 _SPARQL_NAME_SEARCH = """\
 SELECT ?item ?itemLabel WHERE {
@@ -131,6 +167,65 @@ class WikidataReconciler:
                     result[int(discogs_id_str)] = qid
                 except (ValueError, TypeError):
                     continue
+
+        return result
+
+    async def resolve_discogs_ids_from_qids(
+        self,
+        qids: set[str],
+        *,
+        kind: DiscogsKind = "artist",
+    ) -> dict[str, int]:
+        """Resolve Wikidata QIDs to current Discogs IDs via SPARQL.
+
+        Inverse of :meth:`resolve_qids_from_discogs_ids`. Use this when the
+        QID is the stable handle and you need the *current* Discogs ID — for
+        example, an integration test that wants to fetch the canonical Discogs
+        entity for a known Wikidata-pinned artist, or any code path that needs
+        to survive Discogs admin operations that re-assign numeric IDs (delete
+        + re-create, merge, etc.).
+
+        Args:
+            qids: Wikidata QIDs (e.g. ``"Q334652"``) to resolve.
+            kind: Selects the Wikidata property to follow:
+
+                - ``"artist"`` → P1953 (Discogs artist ID, default)
+                - ``"master"`` → P1954 (Discogs master release ID)
+                - ``"release"`` → P2206 (Discogs release ID)
+
+        Returns:
+            Dict mapping QID to current Discogs ID for QIDs that have the
+            requested property set in Wikidata. QIDs without the property —
+            or with non-integer values — are omitted from the result rather
+            than mapped to ``None``, matching the shape of
+            ``resolve_qids_from_discogs_ids``.
+
+        Raises:
+            ValueError: If ``kind`` is not one of the supported values.
+        """
+        if kind not in _SPARQL_TEMPLATE_BY_KIND:
+            raise ValueError(
+                f"unknown kind={kind!r}; expected one of {sorted(_SPARQL_TEMPLATE_BY_KIND)}"
+            )
+        if not qids:
+            return {}
+
+        # Prefix with ``wd:`` so the rendered ``VALUES ?item { ... }`` clause is
+        # syntactically valid SPARQL — bare ``Q334652`` is a parse error.
+        items = [f"wd:{qid}" for qid in qids]
+        bindings = await self._sparql.query_batched(_SPARQL_TEMPLATE_BY_KIND[kind], items)
+
+        result: dict[str, int] = {}
+        for binding in bindings:
+            item_uri = self._sparql.binding_value(binding, "item")
+            discogs_id_str = self._sparql.binding_value(binding, "discogsId")
+            if not item_uri or not discogs_id_str:
+                continue
+            qid = self._sparql.extract_qid(item_uri)
+            try:
+                result[qid] = int(discogs_id_str)
+            except (ValueError, TypeError):
+                continue
 
         return result
 

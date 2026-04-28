@@ -3,9 +3,59 @@
 import os
 
 import pytest
+import pytest_asyncio
 
 from discogs.models import DiscogsSearchRequest
 from discogs.service import DiscogsService
+from scripts.entity_resolution.sources import SparqlSource
+from scripts.entity_resolution.wikidata import WikidataReconciler
+
+# Wikidata QIDs for entities used by ``TestEntityResolution``. QIDs are
+# substantially more stable than Discogs IDs (Discogs admin operations can
+# delete + re-create + re-assign IDs, see PR #204 for an incident); a QID is
+# resolved to its current Discogs ID via SPARQL P1953 / P1954 / P2206 at
+# fixture setup time so the tests survive Discogs reshuffling without a
+# human re-pinning IDs.
+#
+# Releases (P2206) very rarely have their own Wikidata entries — albums are
+# represented at the master level — so the release test stays pinned by
+# integer ID with a comment.
+_QID_STEREOLAB = "Q334652"
+_QID_DOTS_AND_LOOPS_ALBUM = "Q3037397"
+_PINNED_DOTS_AND_LOOPS_RELEASE_ID = 90416  # canonical vinyl LP, no Wikidata QID
+
+
+@pytest_asyncio.fixture(scope="module")
+async def canonical_discogs_ids() -> dict[str, int]:
+    """Resolve each test fixture QID to its current Discogs ID via Wikidata.
+
+    Runs once per pytest session (module scope) — two SPARQL round-trips
+    cached for the duration of the test run. Skips dependent tests rather
+    than passing a stale ID through on any of:
+    - Wikidata SPARQL endpoint unreachable / timing out
+    - The QID exists but the property (P1953 / P1954) was removed
+    - The Wikidata literal is non-numeric (defensive)
+    """
+    reconciler = WikidataReconciler(sparql=SparqlSource())
+    try:
+        artist_ids = await reconciler.resolve_discogs_ids_from_qids({_QID_STEREOLAB}, kind="artist")
+        master_ids = await reconciler.resolve_discogs_ids_from_qids(
+            {_QID_DOTS_AND_LOOPS_ALBUM}, kind="master"
+        )
+    except Exception as exc:
+        pytest.skip(f"Wikidata SPARQL unreachable ({type(exc).__name__}: {exc})")
+
+    artist_id = artist_ids.get(_QID_STEREOLAB)
+    master_id = master_ids.get(_QID_DOTS_AND_LOOPS_ALBUM)
+    if artist_id is None or master_id is None:
+        pytest.skip(
+            "Wikidata SPARQL did not return Discogs IDs for the pinned QIDs "
+            "(transient outage or property removed) — skipping ID-resolution tests."
+        )
+    return {
+        "stereolab_artist": artist_id,
+        "dots_and_loops_master": master_id,
+    }
 
 
 class TestDiscogsEndpoints:
@@ -67,14 +117,37 @@ class TestEntityResolution:
     """Integration tests for entity resolution using real Discogs API."""
 
     @pytest.mark.asyncio
-    async def test_resolve_artist(self):
-        """Resolve a known artist (Stereolab, ID 388) and verify name.
+    async def test_resolve_artist(self, canonical_discogs_ids):
+        """Resolve Stereolab (Wikidata Q334652) and verify name + ID round-trip.
 
-        IDs 2206 / 64977 / 17854 used to point at Stereolab + Dots And Loops
-        but Discogs reorganized the data behind those IDs around 2026-04-28.
-        Re-pinned to the canonical IDs verified via direct API probe and
-        cross-checked against LML's `entity.identity.discogs_artist_id` for
-        Stereolab.
+        The Discogs artist ID is resolved fresh from Wikidata P1953 at fixture
+        setup, so the test survives Discogs admin operations that re-assign
+        numeric IDs. See PR #204 for the incident this guard exists for.
+        """
+        token = os.environ.get("DISCOGS_TOKEN")
+        if not token:
+            pytest.skip("DISCOGS_TOKEN not set")
+
+        artist_id = canonical_discogs_ids["stereolab_artist"]
+        service = DiscogsService(token=token, cache_service=None)
+        try:
+            result = await service.get_artist_details(artist_id)
+        finally:
+            await service.close()
+
+        assert result is not None
+        assert result.name == "Stereolab"
+        assert result.artist_id == artist_id
+
+    @pytest.mark.asyncio
+    async def test_resolve_release(self):
+        """Resolve a known release (Dots And Loops, vinyl LP, ID 90416) and verify title.
+
+        Releases are not modeled at the entity level in Wikidata (only the
+        abstract album / master is — see ``test_resolve_master``), so this
+        test stays pinned to a numeric ID and will need manual re-pinning if
+        Discogs ever reorganizes this specific pressing. The pinned ID is the
+        canonical original Stereolab vinyl LP.
         """
         token = os.environ.get("DISCOGS_TOKEN")
         if not token:
@@ -82,47 +155,31 @@ class TestEntityResolution:
 
         service = DiscogsService(token=token, cache_service=None)
         try:
-            result = await service.get_artist_details(388)
-        finally:
-            await service.close()
-
-        assert result is not None
-        assert result.name == "Stereolab"
-        assert result.artist_id == 388
-
-    @pytest.mark.asyncio
-    async def test_resolve_release(self):
-        """Resolve a known release (Dots And Loops, vinyl LP, ID 90416) and verify title."""
-        token = os.environ.get("DISCOGS_TOKEN")
-        if not token:
-            pytest.skip("DISCOGS_TOKEN not set")
-
-        service = DiscogsService(token=token, cache_service=None)
-        try:
-            result = await service.get_release(90416)
+            result = await service.get_release(_PINNED_DOTS_AND_LOOPS_RELEASE_ID)
         finally:
             await service.close()
 
         assert result is not None
         assert result.title == "Dots And Loops"
-        assert result.release_id == 90416
+        assert result.release_id == _PINNED_DOTS_AND_LOOPS_RELEASE_ID
 
     @pytest.mark.asyncio
-    async def test_resolve_master(self):
-        """Resolve a known master release (Dots And Loops, master ID 30682) and verify title."""
+    async def test_resolve_master(self, canonical_discogs_ids):
+        """Resolve Dots And Loops master (Wikidata Q3037397) via P1954 and verify title."""
         token = os.environ.get("DISCOGS_TOKEN")
         if not token:
             pytest.skip("DISCOGS_TOKEN not set")
 
+        master_id = canonical_discogs_ids["dots_and_loops_master"]
         service = DiscogsService(token=token, cache_service=None)
         try:
-            result = await service.get_master(30682)
+            result = await service.get_master(master_id)
         finally:
             await service.close()
 
         assert result is not None
         assert result.title == "Dots And Loops"
-        assert result.master_id == 30682
+        assert result.master_id == master_id
 
     @pytest.mark.asyncio
     async def test_artist_not_found(self):
