@@ -175,7 +175,10 @@ class WikidataReconciler:
         if not qids:
             return {}
 
-        bindings = await self._sparql.query_batched(_SPARQL_STREAMING_IDS, qids)
+        # Prefix with ``wd:`` so the rendered ``VALUES ?item { ... }`` clause is
+        # syntactically valid SPARQL — bare ``Q378288`` is a parse error.
+        items = [f"wd:{qid}" for qid in qids]
+        bindings = await self._sparql.query_batched(_SPARQL_STREAMING_IDS, items)
 
         result: dict[str, StreamingIds] = {}
         for binding in bindings:
