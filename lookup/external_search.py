@@ -21,14 +21,29 @@ logger = logging.getLogger(__name__)
 
 ExternalSource = Literal["discogs", "musicbrainz"]
 
+# Trigram similarity over mb_artist.name UNION mb_artist_alias.name. Aliases
+# carry alternate spellings and ASCII transliterations of accented names
+# (e.g. 'Csillagrablok' -> 'Csillagrablók'); skipping them undercuts recall
+# on the lossy-mojibake matcher. The canonical mb_artist.name is returned
+# even when the trigram hit was against an alias row, so downstream skeleton
+# scoring operates on the canonical form.
 _MB_ARTIST_FUZZY_SQL = """\
-SELECT gid AS id, name,
-       similarity(lower(name), lower($1)) AS score
-FROM mb_artist
-WHERE lower(name) %% lower($1)
+SELECT id, name, max(score) AS score FROM (
+    SELECT a.gid AS id, a.name,
+           similarity(lower(a.name), lower($1)) AS score
+    FROM mb_artist a
+    WHERE lower(a.name) % lower($1)
+    UNION ALL
+    SELECT a.gid AS id, a.name,
+           similarity(lower(aa.name), lower($1)) AS score
+    FROM mb_artist a
+    JOIN mb_artist_alias aa ON aa.artist = a.id
+    WHERE lower(aa.name) % lower($1)
+) sub
+GROUP BY id, name
 ORDER BY score DESC
 LIMIT $2\
-""".replace("%%", "%")
+"""
 
 
 async def search_external_artists(

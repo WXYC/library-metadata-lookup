@@ -120,7 +120,7 @@ Set `DATABASE_URL_DISCOGS` to enable. The cache schema is defined in [WXYC/disco
 
 `POST /api/v1/lookup` accepts an opt-in `include_external_caches: bool` flag (default `false`). When the WXYC library catalog returns no results AND the request supplies an `artist` field AND the flag is set, the orchestrator runs a fuzzy artist-name search against the discogs-cache PostgreSQL DB; on miss it falls through to musicbrainz-cache. The matched canonical name is wrapped in a synthetic `LookupResultItem` (`library_item.id = 0`, `call_number = "(external)"`, `library_url = ""`) so the caller's existing scoring code applies as-is. The response carries an `external_source` field — `'library' | 'discogs' | 'musicbrainz' | null` — for provenance.
 
-Used by the lossy-mojibake matcher (`tubafrenzy/scripts/db/recovery/lossy_mojibake_recovery.py`) to recover canonical artist names for skeletons not in the WXYC physical catalog. Implementation in `lookup/external_search.py`; the discogs-cache trigram query lives in `discogs/cache_service.py:search_artists_by_name`.
+Used by the lossy-mojibake matcher (`tubafrenzy/scripts/db/recovery/lossy_mojibake_recovery.py`) to recover canonical artist names for skeletons not in the WXYC physical catalog. Implementation in `lookup/external_search.py`; the discogs-cache trigram query lives in `discogs/cache_service.py:search_artists_by_name`. Both legs UNION their primary artist table with the alias/variation table (discogs: `artist_name_variation`; musicbrainz: `mb_artist_alias`) so ASCII transliterations and alternate spellings hit, and the canonical primary name is what comes back.
 
 Wiring:
 - `DATABASE_URL_DISCOGS` (already required for the standard cache) covers the discogs leg.
