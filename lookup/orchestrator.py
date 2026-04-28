@@ -9,6 +9,7 @@ import asyncio
 import logging
 import re
 from functools import partial
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -28,7 +29,11 @@ from discogs.service import DiscogsService
 from generated.api_models import LibraryCatalogItem, ReconciledIdentity
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
-from lookup.external_search import search_external_artists
+from lookup.external_search import (
+    search_external_albums,
+    search_external_artists,
+    search_external_tracks,
+)
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from scripts.entity_resolution.sources import PgSourceProtocol
 from scripts.entity_resolution.store import EntityStore, Identity
@@ -1219,17 +1224,41 @@ async def perform_lookup(
                 )
             )
 
-    # Step 7: External-cache fallback (Phase 1.5 mojibake recovery).
-    # Opt-in via include_external_caches; only artist-keyed requests trigger
-    # the fallback today (the lossy bucket is dominated by artist skeletons).
+    # Step 7: External-cache fallback (Phase 1.5 + 1.7 mojibake recovery).
+    # Opt-in via include_external_caches. The lossy-mojibake matcher sends
+    # column-typed bodies, so we dispatch by which skeleton field is set:
+    # artist takes precedence (highest-precision lookup), then album, then
+    # song. A bare raw_message with no typed field skips the fallback —
+    # LABEL_NAME is too noisy to be useful here.
     external_source: str | None = "library" if result_items else None
-    if not result_items and request.include_external_caches and parsed.artist:
-        with telemetry.track_step("external_cache_fallback"):
-            candidates, source = await search_external_artists(
-                parsed.artist,
-                discogs_cache=discogs_cache,
-                mb_pg=mb_pg,
-            )
+    if not result_items and request.include_external_caches:
+        candidates: list[dict[str, Any]] = []
+        source: str | None = None
+        if parsed.artist:
+            with telemetry.track_step("external_cache_fallback"):
+                rows, source = await search_external_artists(
+                    parsed.artist,
+                    discogs_cache=discogs_cache,
+                    mb_pg=mb_pg,
+                )
+            candidates = [{"artist": r["name"], "title": ""} for r in rows]
+        elif parsed.album:
+            with telemetry.track_step("external_cache_fallback"):
+                rows, source = await search_external_albums(
+                    parsed.album,
+                    discogs_cache=discogs_cache,
+                    mb_pg=mb_pg,
+                )
+            candidates = [{"artist": r["artist"], "title": r["title"]} for r in rows]
+        elif parsed.song:
+            with telemetry.track_step("external_cache_fallback"):
+                rows, source = await search_external_tracks(
+                    parsed.song,
+                    discogs_cache=discogs_cache,
+                    mb_pg=mb_pg,
+                )
+            candidates = [{"artist": r["artist"], "title": r["title"]} for r in rows]
+
         if candidates:
             external_source = source
             for candidate in candidates:
@@ -1237,7 +1266,8 @@ async def perform_lookup(
                     LookupResultItem(
                         library_item=LibraryCatalogItem(
                             id=0,
-                            artist=candidate["name"],
+                            artist=candidate["artist"],
+                            title=candidate["title"] or None,
                             call_number="(external)",
                             library_url="",
                         ),

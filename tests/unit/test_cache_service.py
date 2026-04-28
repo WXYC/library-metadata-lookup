@@ -867,3 +867,76 @@ class TestWriteArtistDetails:
         assert any("artist_name_variation" in sql for sql in all_sql)
         assert any("artist_member" in sql for sql in all_sql)
         assert any("artist_url" in sql for sql in all_sql)
+
+
+class TestSearchReleasesByTitle:
+    @pytest.mark.asyncio
+    async def test_returns_release_with_canonical_artist(self, cache_service, mock_asyncpg_pool):
+        """Phase 1.7: fuzzy release-title hit returns canonical title + primary artist."""
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[
+                {"id": 12345, "title": "DOGA", "artist": "Juana Molina", "score": 0.81},
+            ]
+        )
+        results = await cache_service.search_releases_by_title("DOG")
+        assert results == [
+            {"id": 12345, "title": "DOGA", "artist": "Juana Molina", "score": 0.81},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_query_targets_release_title_trigram_with_extra_zero(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """The SQL must use the trigram operator on release.title and pin extra=0."""
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        await cache_service.search_releases_by_title("Aluminum Tunes", limit=3)
+        call = mock_asyncpg_pool.fetch.call_args
+        sql = call.args[0]
+        assert "release_artist" in sql
+        assert "extra = 0" in sql
+        assert "f_unaccent" in sql
+        assert "%" in sql  # trigram operator
+        assert call.args[1] == "Aluminum Tunes"
+        assert call.args[2] == 3
+
+    @pytest.mark.asyncio
+    async def test_raises_cache_unavailable_on_pool_error(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn lost"))
+        with pytest.raises(CacheUnavailableError):
+            await cache_service.search_releases_by_title("anything")
+
+
+class TestSearchTracksByTitle:
+    @pytest.mark.asyncio
+    async def test_returns_track_with_release_artist(self, cache_service, mock_asyncpg_pool):
+        """Phase 1.7: fuzzy track-title hit returns canonical title + parent release artist."""
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[
+                {"id": 555, "title": "Back, Baby", "artist": "Jessica Pratt", "score": 0.92},
+            ]
+        )
+        results = await cache_service.search_tracks_by_title("Back Baby")
+        assert results == [
+            {"id": 555, "title": "Back, Baby", "artist": "Jessica Pratt", "score": 0.92},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_query_targets_release_track_title_trigram(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        await cache_service.search_tracks_by_title("la paradoja", limit=2)
+        call = mock_asyncpg_pool.fetch.call_args
+        sql = call.args[0]
+        assert "release_track" in sql
+        assert "release_artist" in sql
+        assert "f_unaccent" in sql
+        assert "%" in sql
+        assert call.args[1] == "la paradoja"
+        assert call.args[2] == 2
+
+    @pytest.mark.asyncio
+    async def test_raises_cache_unavailable_on_pool_error(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn lost"))
+        with pytest.raises(CacheUnavailableError):
+            await cache_service.search_tracks_by_title("anything")

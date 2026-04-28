@@ -28,6 +28,8 @@ async def app_client_with_external_caches(library_db, test_settings):
 
     discogs_cache = AsyncMock()
     discogs_cache.search_artists_by_name = AsyncMock(return_value=[])
+    discogs_cache.search_releases_by_title = AsyncMock(return_value=[])
+    discogs_cache.search_tracks_by_title = AsyncMock(return_value=[])
 
     mb_pg = AsyncMock()
     mb_pg.fetchall = AsyncMock(return_value=[])
@@ -131,3 +133,80 @@ class TestExternalCacheFallback:
         assert body["external_source"] == "musicbrainz"
         assert len(body["results"]) == 1
         assert body["results"][0]["library_item"]["artist"] == "Csillagrablók"
+
+    @pytest.mark.asyncio
+    async def test_album_skeleton_falls_back_to_discogs_releases(
+        self, app_client_with_external_caches
+    ):
+        """Phase 1.7: a RELEASE_TITLE skeleton (album, no artist) hits the release leg."""
+        client = app_client_with_external_caches
+        client.discogs_cache.search_releases_by_title.return_value = [
+            {"id": 12345, "title": "DOGA", "artist": "Juana Molina", "score": 0.81},
+        ]
+
+        resp = await client.post(
+            "/api/v1/lookup",
+            json={
+                "album": "ZZZNotInLibraryAlbum",
+                "raw_message": "ZZZNotInLibraryAlbum",
+                "include_external_caches": True,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["external_source"] == "discogs"
+        assert len(body["results"]) == 1
+        item = body["results"][0]["library_item"]
+        assert item["artist"] == "Juana Molina"
+        assert item["title"] == "DOGA"
+        # Artist branch must NOT have fired.
+        client.discogs_cache.search_artists_by_name.assert_not_called()
+        client.discogs_cache.search_tracks_by_title.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_song_skeleton_falls_back_to_mb_recording(self, app_client_with_external_caches):
+        """Phase 1.7: a SONG_TITLE skeleton with discogs miss + MB recording hit."""
+        client = app_client_with_external_caches
+        client.discogs_cache.search_tracks_by_title.return_value = []
+        client.mb_pg.fetchall.return_value = [
+            {"id": 42, "title": "la paradoja", "artist": "Juana Molina", "score": 0.85},
+        ]
+
+        resp = await client.post(
+            "/api/v1/lookup",
+            json={
+                "song": "la paradja",
+                "raw_message": "la paradja",
+                "include_external_caches": True,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["external_source"] == "musicbrainz"
+        assert len(body["results"]) == 1
+        item = body["results"][0]["library_item"]
+        assert item["artist"] == "Juana Molina"
+        assert item["title"] == "la paradoja"
+        # MB query SQL must reference mb_recording, not mb_release / mb_artist.
+        sql = client.mb_pg.fetchall.call_args.args[0]
+        assert "mb_recording" in sql
+
+    @pytest.mark.asyncio
+    async def test_label_only_request_skips_fallback(self, app_client_with_external_caches):
+        """A bare raw_message (no typed field, e.g. LABEL_NAME case) skips the fallback."""
+        client = app_client_with_external_caches
+
+        resp = await client.post(
+            "/api/v1/lookup",
+            json={
+                "raw_message": "ESP Disk'",
+                "include_external_caches": True,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body.get("external_source") is None
+        client.discogs_cache.search_artists_by_name.assert_not_called()
+        client.discogs_cache.search_releases_by_title.assert_not_called()
+        client.discogs_cache.search_tracks_by_title.assert_not_called()
+        client.mb_pg.fetchall.assert_not_called()
