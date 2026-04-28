@@ -331,3 +331,36 @@ class TestQidToDiscogsId:
         )
         result = await reconciler_no_cache.resolve_discogs_ids_from_qids({"Q1"}, kind="artist")
         assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_rendered_sparql_uses_wd_prefix(self, mock_wikidata_pg, monkeypatch):
+        """End-to-end through real ``SparqlSource``: capture the substituted SPARQL
+        and confirm the VALUES clause has ``wd:Q...`` and the right ``wdt:P...``
+        property for each ``kind``.
+
+        Mirrors the same defensive shape as ``test_rendered_sparql_uses_wd_prefix``
+        for ``fetch_streaming_ids`` (regression: WXYC/library-metadata-lookup#187).
+        Without the prefix, Wikidata's SPARQL endpoint rejects the query at parse time.
+        """
+        sparql = SparqlSource(batch_size=10)
+        captured: list[str] = []
+
+        async def fake_query(query_str: str):
+            captured.append(query_str)
+            return []
+
+        monkeypatch.setattr(sparql, "query", fake_query)
+        reconciler = WikidataReconciler(sparql=sparql, wikidata_pg=mock_wikidata_pg)
+
+        await reconciler.resolve_discogs_ids_from_qids({"Q334652"}, kind="artist")
+        await reconciler.resolve_discogs_ids_from_qids({"Q3037397"}, kind="master")
+        await reconciler.resolve_discogs_ids_from_qids({"Q1"}, kind="release")
+
+        assert len(captured) == 3
+        artist_q, master_q, release_q = captured
+        assert "wd:Q334652" in artist_q and "wdt:P1953" in artist_q
+        assert "wd:Q3037397" in master_q and "wdt:P1954" in master_q
+        assert "wd:Q1" in release_q and "wdt:P2206" in release_q
+        # No bare QIDs anywhere in the rendered VALUES clauses.
+        for q in captured:
+            assert "{ Q" not in q, f"bare QID leaked into SPARQL: {q!r}"
