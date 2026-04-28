@@ -178,6 +178,99 @@ class DiscogsCacheService:
             logger.error(f"Cache search_artists_by_name failed: {e}")
             raise CacheUnavailableError(f"Cache search_artists_by_name failed: {e}") from e
 
+    async def search_releases_by_title(self, title: str, *, limit: int = 5) -> list[dict]:
+        """Fuzzy-match an album/release title against ``release.title``.
+
+        Used by the Phase 1.7 mojibake-recovery fallback when the lossy
+        matcher sends a RELEASE_TITLE skeleton (no artist). Pairs each
+        matched release with its primary ``release_artist.artist_name`` so
+        the matcher's skeleton scoring has both the canonical title and
+        an artist context.
+
+        Args:
+            title: Release title (or skeleton) to search for.
+            limit: Maximum number of distinct releases to return.
+
+        Returns:
+            List of dicts with keys ``id``, ``title``, ``artist``, ``score``.
+
+        Raises:
+            CacheUnavailableError: If the database is unreachable.
+        """
+        try:
+            query = """
+                SELECT id, title, artist, max(score) AS score FROM (
+                    SELECT r.id, r.title, ra.artist_name AS artist,
+                        similarity(lower(f_unaccent(r.title)), lower(f_unaccent($1))) AS score
+                    FROM release r
+                    JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
+                    WHERE lower(f_unaccent(r.title)) % lower(f_unaccent($1))
+                ) sub
+                GROUP BY id, title, artist
+                ORDER BY score DESC
+                LIMIT $2
+            """
+            rows = await self.pool.fetch(query, title, limit)
+            return [
+                {
+                    "id": r["id"],
+                    "title": r["title"],
+                    "artist": r["artist"],
+                    "score": float(r["score"]),
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error(f"Cache search_releases_by_title failed: {e}")
+            raise CacheUnavailableError(f"Cache search_releases_by_title failed: {e}") from e
+
+    async def search_tracks_by_title(self, title: str, *, limit: int = 5) -> list[dict]:
+        """Fuzzy-match a track title against ``release_track.title``.
+
+        Used by the Phase 1.7 mojibake-recovery fallback when the lossy
+        matcher sends a SONG_TITLE skeleton. Returns the canonical track
+        title plus the parent release's primary artist so the matcher has
+        an artist context — the lossy bucket is dominated by song titles
+        (443 of 815 rows) and library has no song-level FTS.
+
+        Args:
+            title: Track title (or skeleton) to search for.
+            limit: Maximum number of distinct (track, artist) pairs to return.
+
+        Returns:
+            List of dicts with keys ``id`` (release_id), ``title``,
+            ``artist``, ``score``.
+
+        Raises:
+            CacheUnavailableError: If the database is unreachable.
+        """
+        try:
+            query = """
+                SELECT release_id AS id, title, artist, max(score) AS score FROM (
+                    SELECT rt.release_id, rt.title, ra.artist_name AS artist,
+                        similarity(lower(f_unaccent(rt.title)), lower(f_unaccent($1))) AS score
+                    FROM release_track rt
+                    JOIN release_artist ra ON ra.release_id = rt.release_id AND ra.extra = 0
+                    WHERE lower(f_unaccent(rt.title)) % lower(f_unaccent($1))
+                ) sub
+                GROUP BY release_id, title, artist
+                ORDER BY score DESC
+                LIMIT $2
+            """
+            rows = await self.pool.fetch(query, title, limit)
+            return [
+                {
+                    "id": r["id"],
+                    "title": r["title"],
+                    "artist": r["artist"],
+                    "score": float(r["score"]),
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error(f"Cache search_tracks_by_title failed: {e}")
+            raise CacheUnavailableError(f"Cache search_tracks_by_title failed: {e}") from e
+
     async def autocomplete_tracks(
         self, artist: str, q: str, *, release: str | None = None, limit: int = 20
     ) -> list[str]:

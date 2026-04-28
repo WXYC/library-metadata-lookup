@@ -1355,22 +1355,64 @@ class TestPerformLookupExternalCacheFallback:
         assert response.external_source is None
 
     @pytest.mark.asyncio
-    async def test_no_external_query_when_artist_field_missing(
+    async def test_no_external_query_when_no_typed_field(
         self, mock_library_db, mock_discogs_service, telemetry
     ):
-        """Phase 1.5 only handles artist-skeleton lookups — album/song-only requests skip the fallback."""
+        """Phase 1.7: a bare raw_message with no typed field (LABEL_NAME case) skips fallback."""
         mock_library_db.search.return_value = []
         mock_library_db.find_similar_artist.return_value = None
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
 
         discogs_cache = AsyncMock()
         discogs_cache.search_artists_by_name = AsyncMock(return_value=[])
+        discogs_cache.search_releases_by_title = AsyncMock(return_value=[])
+        discogs_cache.search_tracks_by_title = AsyncMock(return_value=[])
         mb_pg = AsyncMock()
         mb_pg.fetchall = AsyncMock(return_value=[])
 
         request = LookupRequest(
-            album="Some Album",
-            raw_message="Some Album",
+            raw_message="ESP Disk'",
+            include_external_caches=True,
+        )
+
+        response = await perform_lookup(
+            request,
+            mock_library_db,
+            mock_discogs_service,
+            telemetry,
+            discogs_cache=discogs_cache,
+            mb_pg=mb_pg,
+        )
+
+        assert response.external_source is None
+        discogs_cache.search_artists_by_name.assert_not_called()
+        discogs_cache.search_releases_by_title.assert_not_called()
+        discogs_cache.search_tracks_by_title.assert_not_called()
+        mb_pg.fetchall.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_album_skeleton_falls_back_to_discogs_releases(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Phase 1.7: RELEASE_TITLE skeleton -> discogs release fuzzy hit -> synthetic result."""
+        mock_library_db.search.return_value = []
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        discogs_cache = AsyncMock()
+        discogs_cache.search_artists_by_name = AsyncMock(return_value=[])
+        discogs_cache.search_releases_by_title = AsyncMock(
+            return_value=[
+                {"id": 12345, "title": "DOGA", "artist": "Juana Molina", "score": 0.81},
+            ]
+        )
+        discogs_cache.search_tracks_by_title = AsyncMock(return_value=[])
+        mb_pg = AsyncMock()
+        mb_pg.fetchall = AsyncMock(return_value=[])
+
+        request = LookupRequest(
+            album="DOG",
+            raw_message="DOG",
             include_external_caches=True,
         )
 
@@ -1388,6 +1430,110 @@ class TestPerformLookupExternalCacheFallback:
                 mb_pg=mb_pg,
             )
 
-        assert response.external_source is None
+        assert response.external_source == "discogs"
+        assert len(response.results) == 1
+        item = response.results[0].library_item
+        assert item.artist == "Juana Molina"
+        assert item.title == "DOGA"
+        # Artist branch must NOT have fired; only release branch.
         discogs_cache.search_artists_by_name.assert_not_called()
-        mb_pg.fetchall.assert_not_called()
+        discogs_cache.search_tracks_by_title.assert_not_called()
+        discogs_cache.search_releases_by_title.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_song_skeleton_falls_back_to_discogs_tracks(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Phase 1.7: SONG_TITLE skeleton -> discogs track fuzzy hit -> synthetic result."""
+        mock_library_db.search.return_value = []
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        discogs_cache = AsyncMock()
+        discogs_cache.search_artists_by_name = AsyncMock(return_value=[])
+        discogs_cache.search_releases_by_title = AsyncMock(return_value=[])
+        discogs_cache.search_tracks_by_title = AsyncMock(
+            return_value=[
+                {
+                    "id": 555,
+                    "title": "Back, Baby",
+                    "artist": "Jessica Pratt",
+                    "score": 0.92,
+                },
+            ]
+        )
+        mb_pg = AsyncMock()
+        mb_pg.fetchall = AsyncMock(return_value=[])
+
+        request = LookupRequest(
+            song="Back Baby",
+            raw_message="Back Baby",
+            include_external_caches=True,
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache=discogs_cache,
+                mb_pg=mb_pg,
+            )
+
+        assert response.external_source == "discogs"
+        assert len(response.results) == 1
+        item = response.results[0].library_item
+        assert item.artist == "Jessica Pratt"
+        assert item.title == "Back, Baby"
+        discogs_cache.search_artists_by_name.assert_not_called()
+        discogs_cache.search_releases_by_title.assert_not_called()
+        discogs_cache.search_tracks_by_title.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_artist_takes_precedence_over_album_when_both_present(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """When the request supplies both artist AND album, artist branch runs first."""
+        mock_library_db.search.return_value = []
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        discogs_cache = AsyncMock()
+        discogs_cache.search_artists_by_name = AsyncMock(
+            return_value=[{"id": 1, "name": "Stereolab", "score": 0.9}]
+        )
+        discogs_cache.search_releases_by_title = AsyncMock(return_value=[])
+        discogs_cache.search_tracks_by_title = AsyncMock(return_value=[])
+        mb_pg = AsyncMock()
+        mb_pg.fetchall = AsyncMock(return_value=[])
+
+        request = LookupRequest(
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            raw_message="Stereolab Aluminum Tunes",
+            include_external_caches=True,
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache=discogs_cache,
+                mb_pg=mb_pg,
+            )
+
+        assert response.external_source == "discogs"
+        discogs_cache.search_artists_by_name.assert_awaited_once()
+        discogs_cache.search_releases_by_title.assert_not_called()
+        discogs_cache.search_tracks_by_title.assert_not_called()
