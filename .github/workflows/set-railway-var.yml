@@ -58,6 +58,7 @@ jobs:
           # supports has to be listed here.
           LML_API_KEY: ${{ secrets.LML_API_KEY }}
           ETL_NOTIFY_KEY: ${{ secrets.ETL_NOTIFY_KEY }}
+          DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
         run: |
           set -euo pipefail
           KEY="${{ inputs.key }}"
@@ -65,6 +66,7 @@ jobs:
           case "$SECRET_NAME" in
             LML_API_KEY)    VALUE="$LML_API_KEY" ;;
             ETL_NOTIFY_KEY) VALUE="$ETL_NOTIFY_KEY" ;;
+            DISCOGS_TOKEN)  VALUE="$DISCOGS_TOKEN" ;;
             *)
               echo "::error::Unsupported secret_name '$SECRET_NAME'. Add it to the resolve step's env block + case statement."
               exit 1
