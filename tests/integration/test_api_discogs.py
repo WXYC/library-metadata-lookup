@@ -68,54 +68,61 @@ class TestEntityResolution:
 
     @pytest.mark.asyncio
     async def test_resolve_artist(self):
-        """Resolve a known artist (Stereolab, ID 2206) and verify name."""
+        """Resolve a known artist (Stereolab, ID 388) and verify name.
+
+        IDs 2206 / 64977 / 17854 used to point at Stereolab + Dots And Loops
+        but Discogs reorganized the data behind those IDs around 2026-04-28.
+        Re-pinned to the canonical IDs verified via direct API probe and
+        cross-checked against LML's `entity.identity.discogs_artist_id` for
+        Stereolab.
+        """
         token = os.environ.get("DISCOGS_TOKEN")
         if not token:
             pytest.skip("DISCOGS_TOKEN not set")
 
         service = DiscogsService(token=token, cache_service=None)
         try:
-            result = await service.get_artist_details(2206)
+            result = await service.get_artist_details(388)
         finally:
             await service.close()
 
         assert result is not None
         assert result.name == "Stereolab"
-        assert result.artist_id == 2206
+        assert result.artist_id == 388
 
     @pytest.mark.asyncio
     async def test_resolve_release(self):
-        """Resolve a known release (Dots and Loops, ID 64977) and verify title."""
+        """Resolve a known release (Dots And Loops, vinyl LP, ID 90416) and verify title."""
         token = os.environ.get("DISCOGS_TOKEN")
         if not token:
             pytest.skip("DISCOGS_TOKEN not set")
 
         service = DiscogsService(token=token, cache_service=None)
         try:
-            result = await service.get_release(64977)
+            result = await service.get_release(90416)
         finally:
             await service.close()
 
         assert result is not None
         assert result.title == "Dots And Loops"
-        assert result.release_id == 64977
+        assert result.release_id == 90416
 
     @pytest.mark.asyncio
     async def test_resolve_master(self):
-        """Resolve a known master release (Dots and Loops, master ID 17854) and verify title."""
+        """Resolve a known master release (Dots And Loops, master ID 30682) and verify title."""
         token = os.environ.get("DISCOGS_TOKEN")
         if not token:
             pytest.skip("DISCOGS_TOKEN not set")
 
         service = DiscogsService(token=token, cache_service=None)
         try:
-            result = await service.get_master(17854)
+            result = await service.get_master(30682)
         finally:
             await service.close()
 
         assert result is not None
         assert result.title == "Dots And Loops"
-        assert result.master_id == 17854
+        assert result.master_id == 30682
 
     @pytest.mark.asyncio
     async def test_artist_not_found(self):
