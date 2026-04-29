@@ -1,14 +1,14 @@
 name: Set Railway env var (manual)
 
-# One-shot ops workflow: upserts a single env var on the production Railway
-# service for library-metadata-lookup, then waits for the auto-redeploy and
-# probes /health. Used to rotate secrets (LML_API_KEY, ETL_NOTIFY_KEY, …)
-# without requiring a local Railway CLI session — the project-scoped
-# RAILWAY_TOKEN_PRODUCTION secret stays in GitHub.
+# One-shot ops workflow: upserts a single env var on the production or staging
+# Railway service for library-metadata-lookup, then waits for the auto-redeploy
+# and probes /health. Used to rotate secrets (LML_API_KEY, ETL_NOTIFY_KEY,
+# DISCOGS_TOKEN, …) without requiring a local Railway CLI session — the
+# project-scoped RAILWAY_TOKEN_{PRODUCTION,STAGING} secrets stay in GitHub.
 #
 # Usage:
 #   gh workflow run set-railway-var.yml --ref main -f key=LML_API_KEY
-#   gh workflow run set-railway-var.yml --ref main -f key=ETL_NOTIFY_KEY
+#   gh workflow run set-railway-var.yml --ref main -f key=DISCOGS_TOKEN -f env=staging
 #
 # The value is read from a same-named GH secret. Override with `secret_name`:
 #   gh workflow run set-railway-var.yml --ref main -f key=LML_API_KEY -f secret_name=LML_API_KEY_NEW
@@ -20,7 +20,8 @@ name: Set Railway env var (manual)
 # accidents.
 #
 # Required GH secrets:
-#   RAILWAY_TOKEN_PRODUCTION   project-scoped Railway token
+#   RAILWAY_TOKEN_PRODUCTION   project-scoped Railway token for production
+#   RAILWAY_TOKEN_STAGING      project-scoped Railway token for staging
 #   <key>                      the value to set (one per supported key —
 #                              add new ones to the resolve step's case)
 
@@ -35,14 +36,23 @@ on:
         description: 'GH secret name holding the value (defaults to `key`)'
         required: false
         type: string
+      env:
+        description: 'Railway environment to target'
+        required: false
+        type: choice
+        default: production
+        options:
+          - production
+          - staging
 
 jobs:
   apply:
     runs-on: ubuntu-latest
     env:
       # Project-scoped token. Setting once at the job level keeps it out of step echoes.
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
+      RAILWAY_TOKEN: ${{ inputs.env == 'staging' && secrets.RAILWAY_TOKEN_STAGING || secrets.RAILWAY_TOKEN_PRODUCTION }}
       SERVICE: library-metadata-lookup
+      HEALTH_URL: ${{ inputs.env == 'staging' && 'https://library-metadata-lookup-staging.up.railway.app/health' || 'https://library-metadata-lookup-production.up.railway.app/health' }}
     steps:
       - name: Install Railway CLI
         run: npm install -g @railway/cli
@@ -112,7 +122,7 @@ jobs:
           echo "Sleeping 60s for redeploy..."
           sleep 60
           for i in 1 2 3 4 5 6; do
-            if curl -sf -m 10 https://library-metadata-lookup-production.up.railway.app/health > /tmp/health.json; then
+            if curl -sf -m 10 "$HEALTH_URL" > /tmp/health.json; then
               status=$(python3 -c "import json,sys;print(json.load(open('/tmp/health.json'))['status'])")
               echo "Health attempt $i: $status"
               if [ "$status" = "healthy" ] || [ "$status" = "degraded" ]; then
@@ -128,4 +138,4 @@ jobs:
 
       - name: Summary
         run: |
-          echo "Set ${{ env.KEY }} (${{ steps.resolve.outputs.length }} chars) on Railway service ${{ env.SERVICE }}."
+          echo "Set ${{ env.KEY }} (${{ steps.resolve.outputs.length }} chars) on Railway service ${{ env.SERVICE }} (${{ inputs.env }})."
