@@ -234,8 +234,17 @@ class DiscogsReconciler:
             # collide with a canonical already in the input (avoids conflating
             # two different library entries) or that normalize to an empty
             # string. First-canonical-wins on duplicate variants.
+            # Sort `unmatched` so variant generation order is deterministic.
+            # `unmatched` is a set; Python's set iteration is hash-randomized
+            # under default PYTHONHASHSEED, which would let `setdefault`'s
+            # first-canonical-wins rule attribute the same variant to a
+            # different canonical across runs on identical input. That's
+            # functionally harmless (both canonicals resolve to the same
+            # Discogs ID, eventually) but makes diff-driven prod audits
+            # non-reproducible. The sort cost is O(N log N) on a set we
+            # already iterate in full, so the overhead is negligible.
             variant_to_canonical: dict[str, str] = {}
-            for canonical_normalized in unmatched:
+            for canonical_normalized in sorted(unmatched):
                 canonical = normalized_to_canonical[canonical_normalized]
                 for variant in _preprocessing_variants(canonical):
                     v_norm = normalize_artist_name(variant)
