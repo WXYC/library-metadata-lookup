@@ -1,5 +1,6 @@
 """Unit tests for routers/admin.py -- library.db upload endpoint."""
 
+import asyncio
 import sqlite3
 from unittest.mock import AsyncMock, patch
 
@@ -564,7 +565,7 @@ class TestUploadWebhookIntegration:
 
     @pytest.mark.asyncio
     async def test_sends_streaming_diff(self, tmp_path, webhook_settings):
-        """Upload with streaming changes triggers webhook with correct diff."""
+        """Upload with streaming changes triggers background webhook with correct diff."""
         from main import app
 
         # Old DB at the configured path with streaming_ids [1, 2, 3]
@@ -577,12 +578,14 @@ class TestUploadWebhookIntegration:
         patcher, mock_post = _mock_httpx_client(200)
         with patcher:
             resp = await self._upload(app, webhook_settings, upload_file)
+            await asyncio.sleep(0)  # let background task run
 
         assert resp.status_code == 200
         body = resp.json()
-        assert "webhook" in body
+        assert body["webhook"]["status"] == "pending"
+        assert body["webhook"]["changes_count"] == 2
 
-        # Verify the POST payload
+        # Verify the POST payload sent in background
         call_kwargs = mock_post.call_args
         payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
         changes = payload["changes"]
@@ -628,7 +631,7 @@ class TestUploadWebhookIntegration:
 
     @pytest.mark.asyncio
     async def test_webhook_failure_returns_200(self, tmp_path, webhook_settings):
-        """Webhook failure does not fail the upload."""
+        """Webhook failure does not fail the upload (fires in background)."""
         from main import app
 
         _make_valid_sqlite_db(webhook_settings.library_db_path, streaming_ids=[1])
@@ -639,11 +642,12 @@ class TestUploadWebhookIntegration:
         patcher, _ = _mock_httpx_client(side_effect=httpx.ConnectError("refused"))
         with patcher:
             resp = await self._upload(app, webhook_settings, upload_file)
+            await asyncio.sleep(0)  # let background task run (and fail)
 
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "ok"
-        assert body["webhook"][0]["status"] == "failed"
+        assert body["webhook"]["status"] == "pending"
 
     @pytest.mark.asyncio
     async def test_first_ever_upload(self, tmp_path, webhook_settings):
@@ -657,6 +661,7 @@ class TestUploadWebhookIntegration:
         patcher, mock_post = _mock_httpx_client(200)
         with patcher:
             resp = await self._upload(app, webhook_settings, upload_file)
+            await asyncio.sleep(0)
 
         assert resp.status_code == 200
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
@@ -677,6 +682,7 @@ class TestUploadWebhookIntegration:
         patcher, mock_post = _mock_httpx_client(200)
         with patcher:
             resp = await self._upload(app, webhook_settings, upload_file)
+            await asyncio.sleep(0)
 
         assert resp.status_code == 200
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
@@ -697,6 +703,7 @@ class TestUploadWebhookIntegration:
         patcher, mock_post = _mock_httpx_client(200)
         with patcher:
             resp = await self._upload(app, webhook_settings, upload_file)
+            await asyncio.sleep(0)
 
         assert resp.status_code == 200
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
@@ -717,8 +724,9 @@ class TestUploadWebhookIntegration:
         patcher, mock_post = _mock_httpx_client(200)
         with patcher:
             resp = await self._upload(app, multi_webhook_settings, upload_file)
+            await asyncio.sleep(0)
 
         assert resp.status_code == 200
         body = resp.json()
-        assert len(body["webhook"]) == 2
-        assert all(r["status"] == "sent" for r in body["webhook"])
+        assert body["webhook"]["status"] == "pending"
+        assert body["webhook"]["changes_count"] == 1

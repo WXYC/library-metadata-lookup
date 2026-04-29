@@ -92,7 +92,14 @@ async def _send_streaming_webhooks(
     """Send streaming changes to all comma-separated webhook URLs concurrently."""
     urls = [u.strip() for u in webhook_urls.split(",") if u.strip()]
     tasks = [_send_streaming_webhook(url, notify_key, changes) for url in urls]
-    return list(await asyncio.gather(*tasks))
+    results = list(await asyncio.gather(*tasks))
+    logger.info(
+        "Streaming webhook complete: %d changes to %d URLs: %s",
+        len(changes),
+        len(results),
+        ", ".join(f"{r['url']} -> {r['status']}" for r in results),
+    )
+    return results
 
 
 def _validate_auth(
@@ -171,18 +178,14 @@ async def upload_library_db(
     os.replace(str(tmp_path), str(db_path))
     logger.info(f"Library database replaced: {db_path} ({row_count} rows)")
 
-    # Send streaming webhook after successful swap
-    webhook_result = None
+    # Fire streaming webhooks in the background (don't block the upload response)
     if settings.streaming_webhook_urls and changes:
-        webhook_result = await _send_streaming_webhooks(
-            settings.streaming_webhook_urls,
-            settings.etl_notify_key,
-            changes,
-        )
-        logger.info(
-            "Streaming webhook sent: %d changes to %d URLs",
-            len(changes),
-            len(webhook_result),
+        asyncio.create_task(
+            _send_streaming_webhooks(
+                settings.streaming_webhook_urls,
+                settings.etl_notify_key,
+                changes,
+            )
         )
 
     response: dict = {
@@ -190,8 +193,8 @@ async def upload_library_db(
         "row_count": row_count,
         "timestamp": datetime.now(UTC).isoformat(),
     }
-    if webhook_result is not None:
-        response["webhook"] = webhook_result
+    if settings.streaming_webhook_urls and changes:
+        response["webhook"] = {"status": "pending", "changes_count": len(changes)}
     return JSONResponse(content=response)
 
 
