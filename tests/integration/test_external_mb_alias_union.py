@@ -48,6 +48,22 @@ async def mb_pg_source():
 
     try:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+        # `unaccent` + an IMMUTABLE `f_unaccent(text)` wrapper mirror what the
+        # discogs-cache and musicbrainz-cache schemas install on prod. The
+        # extension's `unaccent(text)` is STABLE; the wrapper makes it
+        # IMMUTABLE so it can be used in expression indexes and equality-
+        # comparable predicates. Without these here, the integration tests
+        # blow up with `function f_unaccent(text) does not exist` against the
+        # bare `postgres:16-alpine` CI container.
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
+        await conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION f_unaccent(text)
+                RETURNS text AS $func$
+                    SELECT public.unaccent('public.unaccent', $1)
+                $func$ LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+            """
+        )
         await conn.execute("DROP TABLE IF EXISTS mb_artist_alias CASCADE")
         await conn.execute("DROP TABLE IF EXISTS mb_artist CASCADE")
         await conn.execute(
