@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import sentry_sdk
+from rapidfuzz import fuzz
 from wxyc_etl.text import is_compilation_artist
 
 from config.settings import get_settings
@@ -72,6 +73,15 @@ DISCOGS_API_BASE = "https://api.discogs.com"
 # seconds; once we cross that, the bucket has reset and there's no benefit to
 # waiting longer for the same 429.
 _MAX_RETRY_DELAY_SECONDS = 60.0
+
+# Fuzzy fallback for `validate_track_on_release` artist matching. Strict substring
+# matching loses on collaboration trios where neither name is a substring of the
+# other (e.g., request "Orcutt Shelley Miller" vs release artist
+# "Bill Orcutt, Tashi Shelley & Robbie Miller"). rapidfuzz token_set_ratio is
+# order- and stopword-tolerant; the threshold was chosen so that one shared
+# token across two short names ("Bill Orcutt" vs "Orcutt Shelley Miller") just
+# clears the bar (~70.6) while unrelated artists score well below 50. See LML#210.
+_ARTIST_FUZZY_MATCH_THRESHOLD = 70
 
 
 def _compute_retry_delay(attempt: int, retry_after_header: str | None) -> float:
@@ -1083,12 +1093,37 @@ class DiscogsService:
                             f"Validated: '{track}' by '{artist}' found on release {release_id}"
                         )
                         return True
+                # Fuzzy fallback: when no individual per-track artist substring-matches,
+                # compare against the joined credit string. Catches collaboration trios
+                # where each member is credited separately but the request uses the
+                # compact group name (LML#210).
+                joined = normalize_artist_for_validation(" ".join(item.artists))
+                if (
+                    joined
+                    and fuzz.token_set_ratio(artist_lower, joined) >= _ARTIST_FUZZY_MATCH_THRESHOLD
+                ):
+                    logger.info(
+                        f"Validated (fuzzy): '{track}' by '{artist}' on release {release_id}"
+                    )
+                    return True
             else:
                 # For single-artist releases, check release artist
                 release_artist = normalize_artist_for_validation(release.artist)
 
                 if artist_lower in release_artist or release_artist in artist_lower:
                     logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")
+                    return True
+
+                # Fuzzy fallback for the same trio scenario (LML#210), but where
+                # all members are listed in the single release-artist string.
+                if (
+                    release_artist
+                    and fuzz.token_set_ratio(artist_lower, release_artist)
+                    >= _ARTIST_FUZZY_MATCH_THRESHOLD
+                ):
+                    logger.info(
+                        f"Validated (fuzzy): '{track}' by '{artist}' on release {release_id}"
+                    )
                     return True
 
         logger.info(f"Track '{track}' by '{artist}' NOT found on release {release_id}")
