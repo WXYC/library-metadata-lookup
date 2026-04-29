@@ -32,18 +32,30 @@ ExternalSource = Literal["discogs", "musicbrainz"]
 # on the lossy-mojibake matcher. The canonical mb_artist.name is returned
 # even when the trigram hit was against an alias row, so downstream skeleton
 # scoring operates on the canonical form.
+#
+# Both sides of the `%` predicate are wrapped in `lower(f_unaccent(...))` for
+# symmetry with the discogs leg (`discogs/cache_service.py:search_artists_by_name`).
+# The lossy-mojibake matcher feeds in diacritic-stripped skeletons (`Bjork`,
+# `Sigur Ros`); without f_unaccent on the column side, those skeletons would
+# miss MB rows whose canonical name carries diacritics (`Björk`, `Sigur Rós`),
+# undercutting recall. See WXYC/library-metadata-lookup#194.
+#
+# Index dependency: this query benefits from expression-trigram indexes on
+# `lower(f_unaccent(mb_artist.name))` and `lower(f_unaccent(mb_artist_alias.name))`.
+# Without expression indexes, the `%` predicate falls back to a sequential scan.
+# Coordinate with WXYC/musicbrainz-cache to ship matching index DDL.
 _MB_ARTIST_FUZZY_SQL = """\
 SELECT id, name, max(score) AS score FROM (
     SELECT a.gid AS id, a.name,
-           similarity(lower(a.name), lower($1)) AS score
+           similarity(lower(f_unaccent(a.name)), lower(f_unaccent($1))) AS score
     FROM mb_artist a
-    WHERE lower(a.name) % lower($1)
+    WHERE lower(f_unaccent(a.name)) % lower(f_unaccent($1))
     UNION ALL
     SELECT a.gid AS id, a.name,
-           similarity(lower(aa.name), lower($1)) AS score
+           similarity(lower(f_unaccent(aa.name)), lower(f_unaccent($1))) AS score
     FROM mb_artist a
     JOIN mb_artist_alias aa ON aa.artist = a.id
-    WHERE lower(aa.name) % lower($1)
+    WHERE lower(f_unaccent(aa.name)) % lower(f_unaccent($1))
 ) sub
 GROUP BY id, name
 ORDER BY score DESC

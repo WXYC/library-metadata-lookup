@@ -98,6 +98,80 @@ class TestSearchExternalArtists:
         mock_discogs_cache.search_artists_by_name.assert_not_called()
         mock_mb_pg.fetchall.assert_not_called()
 
+
+class TestMbArtistFunaccentSymmetry:
+    """The MB artist fuzzy query must wrap BOTH sides of the trigram `%` predicate
+    in `lower(f_unaccent(...))` for symmetry with the discogs leg. The lossy-mojibake
+    matcher feeds in diacritic-stripped skeletons (e.g. "Bjork", "Sigur Ros"); without
+    f_unaccent on the column side, those skeletons miss MB rows whose canonical name
+    carries diacritics (e.g. "Björk", "Sigur Rós"), undercutting recall.
+
+    The discogs leg already uses lower(f_unaccent(...)) on both sides — see
+    discogs/cache_service.py:search_artists_by_name. This test pins the MB-side
+    parity so a regression that drops f_unaccent fails loud.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mb_artist_query_uses_f_unaccent_on_both_sides(
+        self, mock_discogs_cache, mock_mb_pg
+    ):
+        """SQL passed to mb_pg.fetchall wraps both column and parameter in f_unaccent."""
+        # Discogs returns nothing so we fall through to MB.
+        mock_discogs_cache.search_artists_by_name.return_value = []
+        mock_mb_pg.fetchall.return_value = []
+
+        await search_external_artists(
+            "Bjork",
+            discogs_cache=mock_discogs_cache,
+            mb_pg=mock_mb_pg,
+        )
+
+        # MB query was issued; inspect the SQL string.
+        assert mock_mb_pg.fetchall.await_count >= 1
+        sql_arg = mock_mb_pg.fetchall.await_args_list[0].args[0]
+
+        # Both sides of the trigram `%` predicate wrapped in f_unaccent.
+        # mb_artist row form: WHERE lower(f_unaccent(a.name)) % lower(f_unaccent($1))
+        # mb_artist_alias row form: WHERE lower(f_unaccent(aa.name)) % lower(f_unaccent($1))
+        assert "f_unaccent(a.name)" in sql_arg, (
+            "mb_artist column side must be wrapped in f_unaccent for symmetry with "
+            "the diacritic-stripped skeletons that the lossy-mojibake matcher feeds in."
+        )
+        assert "f_unaccent(aa.name)" in sql_arg, (
+            "mb_artist_alias column side must also be wrapped in f_unaccent — both "
+            "the artist and alias arms of the UNION need to be symmetric."
+        )
+        # The parameter side (lower(f_unaccent($1))) must also be wrapped — without
+        # it, the column expression and parameter expression don't compare apples-to-apples.
+        assert sql_arg.count("f_unaccent($1)") >= 2, (
+            "Parameter side ($1) must be wrapped in f_unaccent in BOTH the artist "
+            "and alias arms of the UNION (count >= 2)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_unaccented_skeleton_matches_accented_mb_artist(
+        self, mock_discogs_cache, mock_mb_pg
+    ):
+        """End-to-end: a diacritic-stripped skeleton resolves through the MB leg
+        when discogs has no match. Mirrors the discogs-side behavior already shipped
+        and gated by this PR's SQL change.
+        """
+        mock_discogs_cache.search_artists_by_name.return_value = []
+        # MB has the canonical accented form; the unaccented `%` predicate would have
+        # missed it before this PR (no f_unaccent on the column side).
+        mock_mb_pg.fetchall.return_value = [
+            {"id": "mb-bjork-uuid", "name": "Björk", "score": 0.93},
+        ]
+
+        candidates, source = await search_external_artists(
+            "Bjork",  # diacritic-stripped
+            discogs_cache=mock_discogs_cache,
+            mb_pg=mock_mb_pg,
+        )
+
+        assert source == "musicbrainz"
+        assert [c["name"] for c in candidates] == ["Björk"]
+
     @pytest.mark.asyncio
     async def test_discogs_unavailable_falls_through_to_musicbrainz(
         self, mock_discogs_cache, mock_mb_pg
