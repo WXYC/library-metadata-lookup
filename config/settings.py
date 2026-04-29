@@ -102,7 +102,12 @@ class Settings(BaseSettings):
         default=5, description="Max concurrent Discogs API requests"
     )
     discogs_max_retries: int = Field(
-        default=2, description="Max retry attempts on 429 rate limit errors"
+        default=5,
+        description=(
+            "Max retry attempts on 429 rate limit errors. With jittered exponential backoff "
+            "capped at 60s, 5 retries spans roughly 0.5–62s of total wait — enough to ride "
+            "out a typical Discogs 60s rate-limit window without throwing away in-flight work."
+        ),
     )
 
     # Admin Configuration
