@@ -10,7 +10,14 @@ from httpx import ASGITransport, AsyncClient
 
 from config.settings import Settings, get_settings
 from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+from routers.admin import _background_tasks
 from tests.unit.conftest import override_deps
+
+
+async def _drain_background_tasks():
+    """Await all pending background webhook tasks so assertions can verify their effects."""
+    while _background_tasks:
+        await asyncio.gather(*_background_tasks)
 
 
 def _make_valid_sqlite_db(path, streaming_ids=None) -> int:
@@ -578,7 +585,7 @@ class TestUploadWebhookIntegration:
         patcher, mock_post = _mock_httpx_client(200)
         with patcher:
             resp = await self._upload(app, webhook_settings, upload_file)
-            await asyncio.sleep(0)  # let background task run
+            await _drain_background_tasks()
 
         assert resp.status_code == 200
         body = resp.json()
@@ -642,7 +649,7 @@ class TestUploadWebhookIntegration:
         patcher, _ = _mock_httpx_client(side_effect=httpx.ConnectError("refused"))
         with patcher:
             resp = await self._upload(app, webhook_settings, upload_file)
-            await asyncio.sleep(0)  # let background task run (and fail)
+            await _drain_background_tasks()
 
         assert resp.status_code == 200
         body = resp.json()
@@ -661,7 +668,7 @@ class TestUploadWebhookIntegration:
         patcher, mock_post = _mock_httpx_client(200)
         with patcher:
             resp = await self._upload(app, webhook_settings, upload_file)
-            await asyncio.sleep(0)
+            await _drain_background_tasks()
 
         assert resp.status_code == 200
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
@@ -682,7 +689,7 @@ class TestUploadWebhookIntegration:
         patcher, mock_post = _mock_httpx_client(200)
         with patcher:
             resp = await self._upload(app, webhook_settings, upload_file)
-            await asyncio.sleep(0)
+            await _drain_background_tasks()
 
         assert resp.status_code == 200
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
@@ -703,7 +710,7 @@ class TestUploadWebhookIntegration:
         patcher, mock_post = _mock_httpx_client(200)
         with patcher:
             resp = await self._upload(app, webhook_settings, upload_file)
-            await asyncio.sleep(0)
+            await _drain_background_tasks()
 
         assert resp.status_code == 200
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
@@ -724,7 +731,7 @@ class TestUploadWebhookIntegration:
         patcher, mock_post = _mock_httpx_client(200)
         with patcher:
             resp = await self._upload(app, multi_webhook_settings, upload_file)
-            await asyncio.sleep(0)
+            await _drain_background_tasks()
 
         assert resp.status_code == 200
         body = resp.json()
