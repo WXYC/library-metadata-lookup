@@ -259,6 +259,32 @@ class TestNamePreprocessingStage:
         # Exactly one SQL call: Stage 1 exact match. No cascade past it.
         assert mock_pg.fetchall.await_count == 1
 
+    @pytest.mark.asyncio
+    async def test_variant_resolves_via_inner_name_variation_stage(self, reconciler, mock_pg):
+        """Stage 5 internally re-runs all four equality stages against the variant.
+        When a variant misses inner stages 1–3 but hits stage 4 (name_variation),
+        the canonical still resolves with method="name_preprocessing" — the outer
+        method label does not leak the inner stage that produced the hit.
+        """
+        mock_pg.fetchall = AsyncMock(
+            side_effect=[
+                [],  # Stage 1 exact (canonical) — miss
+                [],  # Stage 2 member (canonical) — miss
+                [],  # Stage 3 alias (canonical) — miss
+                [],  # Stage 4 name_variation (canonical) — miss
+                [],  # Stage 5 inner: exact match on variant — miss
+                [],  # Stage 5 inner: member match on variant — miss
+                [],  # Stage 5 inner: alias match on variant — miss
+                [{"name": "microphones", "artist_id": 7777}],  # Stage 5 inner: name_variation hit
+            ]
+        )
+        results = await reconciler.reconcile_batch(["The Microphones"])
+        assert "The Microphones" in results
+        assert results["The Microphones"].discogs_artist_id == 7777
+        # Outer label is name_preprocessing, NOT name_variation, even though
+        # the hit happened at stage 4 inside the preprocessing cascade.
+        assert results["The Microphones"].method == "name_preprocessing"
+
 
 class TestDiacriticInsensitiveMatch:
     """The cache filter (`scripts/filter_csv.py:normalize_artist`) loads rows
