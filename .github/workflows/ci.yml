@@ -170,7 +170,11 @@ jobs:
     name: Deploy to Staging
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lint, typecheck, test, external_api, pg]
+    # external_api is intentionally NOT a deploy gate — Discogs drift is an external
+    # availability signal, not a precondition for shipping our own code. The job
+    # still runs and reports per-PR; a red status is visible without blocking the
+    # deploy chain. See WXYC/library-metadata-lookup#208.
+    needs: [lint, typecheck, test, pg]
     steps:
       - uses: actions/checkout@v4
       - name: Install Railway CLI
@@ -212,7 +216,8 @@ jobs:
     name: Deploy to Production
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/prod'
-    needs: [lint, typecheck, test, external_api, pg]
+    # external_api is intentionally NOT a deploy gate — see deploy-staging for the rationale.
+    needs: [lint, typecheck, test, pg]
     steps:
       - uses: actions/checkout@v4
       - name: Install Railway CLI
