@@ -311,6 +311,8 @@ The `services.discogs_api` field on `GET /health` carries one of a fixed vocabul
 
 Any value other than `ok` / `unavailable` flips the overall status to `degraded` (or `unhealthy` if a core service like `database` is also down).
 
+The probe also projects its result onto the active Sentry trace as the `discogs_api.check` tag (e.g. `discogs_api.check=auth-error`), so historic `/health` incidents can be queried by failure mode in the Sentry trace explorer without re-pulling Railway logs.
+
 ## Scripts
 
 ### Streaming Report Stats Regenerator (`scripts/regenerate_report_stats.py`)

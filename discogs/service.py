@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
 
 from config.settings import get_settings
@@ -257,26 +258,38 @@ class DiscogsService:
 
         Returns a ``DiscogsApiCheckResult`` so ``/health`` can distinguish
         token-rotation drift (401/403), rate limits (429), upstream outages
-        (5xx), and network failures from each other.
+        (5xx), and network failures from each other. The result is also
+        projected onto the active Sentry trace as the ``discogs_api.check``
+        tag so historic incidents are queryable in trace explorer.
         """
+        # NetworkError covers DNS/refused/reset; TimeoutException covers
+        # every connect/read/write/pool timeout. Both signal "couldn't reach
+        # Discogs" — anything else (LocalProtocolError, UnsupportedProtocol,
+        # RemoteProtocolError) is a programmer/protocol bug and falls through
+        # to ERROR with a log line.
         try:
             client = await self._get_client()
             resp = await client.get("/oauth/identity")
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError):
-            return DiscogsApiCheckResult.NETWORK_ERROR
-        except Exception:
-            return DiscogsApiCheckResult.ERROR
+        except (httpx.NetworkError, httpx.TimeoutException):
+            result = DiscogsApiCheckResult.NETWORK_ERROR
+        except Exception as exc:
+            logger.warning("Unexpected error in Discogs check_api: %r", exc)
+            result = DiscogsApiCheckResult.ERROR
+        else:
+            status = resp.status_code
+            if status == 200:
+                result = DiscogsApiCheckResult.OK
+            elif status in (401, 403):
+                result = DiscogsApiCheckResult.AUTH_ERROR
+            elif status == 429:
+                result = DiscogsApiCheckResult.RATE_LIMITED
+            elif 500 <= status < 600:
+                result = DiscogsApiCheckResult.UPSTREAM_ERROR
+            else:
+                result = DiscogsApiCheckResult.ERROR
 
-        status = resp.status_code
-        if status == 200:
-            return DiscogsApiCheckResult.OK
-        if status in (401, 403):
-            return DiscogsApiCheckResult.AUTH_ERROR
-        if status == 429:
-            return DiscogsApiCheckResult.RATE_LIMITED
-        if 500 <= status < 600:
-            return DiscogsApiCheckResult.UPSTREAM_ERROR
-        return DiscogsApiCheckResult.ERROR
+        sentry_sdk.set_tag("discogs_api.check", result.value)
+        return result
 
     async def _request_with_retry(
         self,
