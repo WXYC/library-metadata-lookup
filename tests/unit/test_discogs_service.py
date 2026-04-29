@@ -12,7 +12,7 @@ from discogs.models import (
     TrackItem,
     TrackReleasesResponse,
 )
-from discogs.service import DiscogsService
+from discogs.service import DiscogsApiCheckResult, DiscogsService
 
 
 @pytest.fixture
@@ -91,33 +91,83 @@ class TestDiscogsServiceInit:
 
 
 class TestCheckApi:
+    """check_api returns a DiscogsApiCheckResult discriminating failure modes."""
+
     @pytest.mark.asyncio
-    async def test_check_api_200(self, service):
+    async def test_check_api_200_returns_ok(self, service):
         mock_client = AsyncMock()
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_client.get = AsyncMock(return_value=mock_resp)
         service._client = mock_client
 
-        assert await service.check_api() is True
+        assert await service.check_api() == DiscogsApiCheckResult.OK
 
     @pytest.mark.asyncio
-    async def test_check_api_non_200(self, service):
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_check_api_auth_error(self, service, status):
         mock_client = AsyncMock()
         mock_resp = MagicMock()
-        mock_resp.status_code = 401
+        mock_resp.status_code = status
         mock_client.get = AsyncMock(return_value=mock_resp)
         service._client = mock_client
 
-        assert await service.check_api() is False
+        assert await service.check_api() == DiscogsApiCheckResult.AUTH_ERROR
 
     @pytest.mark.asyncio
-    async def test_check_api_exception(self, service):
+    async def test_check_api_rate_limited(self, service):
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        service._client = mock_client
+
+        assert await service.check_api() == DiscogsApiCheckResult.RATE_LIMITED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    async def test_check_api_upstream_error(self, service, status):
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = status
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        service._client = mock_client
+
+        assert await service.check_api() == DiscogsApiCheckResult.UPSTREAM_ERROR
+
+    @pytest.mark.asyncio
+    async def test_check_api_unknown_status_falls_through_to_error(self, service):
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 418
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        service._client = mock_client
+
+        assert await service.check_api() == DiscogsApiCheckResult.ERROR
+
+    @pytest.mark.asyncio
+    async def test_check_api_connect_error_is_network_error(self, service):
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(side_effect=httpx.ConnectError("fail"))
         service._client = mock_client
 
-        assert await service.check_api() is False
+        assert await service.check_api() == DiscogsApiCheckResult.NETWORK_ERROR
+
+    @pytest.mark.asyncio
+    async def test_check_api_timeout_is_network_error(self, service):
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=httpx.ReadTimeout("slow"))
+        service._client = mock_client
+
+        assert await service.check_api() == DiscogsApiCheckResult.NETWORK_ERROR
+
+    @pytest.mark.asyncio
+    async def test_check_api_unexpected_exception_is_error(self, service):
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=RuntimeError("boom"))
+        service._client = mock_client
+
+        assert await service.check_api() == DiscogsApiCheckResult.ERROR
 
 
 # ---------------------------------------------------------------------------

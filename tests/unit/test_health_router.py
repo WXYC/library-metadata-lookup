@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from discogs.service import DiscogsService
+from discogs.service import DiscogsApiCheckResult, DiscogsService
 from library.db import LibraryDB
 from routers.health import (
     _check_database,
@@ -35,17 +35,24 @@ class TestCheckDatabase:
 
 
 class TestCheckDiscogsApi:
-    @pytest.mark.asyncio
-    async def test_ok(self):
-        svc = AsyncMock(spec=DiscogsService)
-        svc.check_api = AsyncMock(return_value=True)
-        assert await _check_discogs_api(svc) == "ok"
+    """The probe surfaces the enum's string value verbatim into /health."""
 
     @pytest.mark.asyncio
-    async def test_error(self):
+    @pytest.mark.parametrize(
+        "result,expected",
+        [
+            (DiscogsApiCheckResult.OK, "ok"),
+            (DiscogsApiCheckResult.AUTH_ERROR, "auth-error"),
+            (DiscogsApiCheckResult.RATE_LIMITED, "rate-limited"),
+            (DiscogsApiCheckResult.UPSTREAM_ERROR, "upstream-error"),
+            (DiscogsApiCheckResult.NETWORK_ERROR, "network-error"),
+            (DiscogsApiCheckResult.ERROR, "error"),
+        ],
+    )
+    async def test_renders_each_enum_value(self, result, expected):
         svc = AsyncMock(spec=DiscogsService)
-        svc.check_api = AsyncMock(return_value=False)
-        assert await _check_discogs_api(svc) == "error"
+        svc.check_api = AsyncMock(return_value=result)
+        assert await _check_discogs_api(svc) == expected
 
     @pytest.mark.asyncio
     async def test_none_service(self):
@@ -114,7 +121,7 @@ class TestHealthEndpoint:
     @pytest.fixture
     def mock_discogs(self):
         svc = AsyncMock(spec=DiscogsService)
-        svc.check_api = AsyncMock(return_value=True)
+        svc.check_api = AsyncMock(return_value=DiscogsApiCheckResult.OK)
         svc.cache_service = AsyncMock()
         svc.cache_service.is_available = AsyncMock(return_value=True)
         return svc
@@ -153,7 +160,7 @@ class TestHealthEndpoint:
         from main import app
 
         svc = AsyncMock(spec=DiscogsService)
-        svc.check_api = AsyncMock(return_value=False)
+        svc.check_api = AsyncMock(return_value=DiscogsApiCheckResult.AUTH_ERROR)
         svc.cache_service = AsyncMock()
         svc.cache_service.is_available = AsyncMock(return_value=False)
 
@@ -174,6 +181,7 @@ class TestHealthEndpoint:
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "degraded"
+        assert body["services"]["discogs_api"] == "auth-error"
 
     @pytest.mark.asyncio
     async def test_unhealthy_returns_503(self, mock_settings):

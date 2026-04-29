@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from discogs.service import DiscogsApiCheckResult
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_library_item
 
@@ -27,7 +28,7 @@ def mock_discogs_service():
     service = AsyncMock()
     service.search = AsyncMock()
     service.validate_track_on_release = AsyncMock()
-    service.check_api = AsyncMock(return_value=True)
+    service.check_api = AsyncMock(return_value=DiscogsApiCheckResult.OK)
     service.cache_service = None
     return service
 

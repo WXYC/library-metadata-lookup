@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -184,6 +185,22 @@ def calculate_confidence(
     return min(score, 1.0)
 
 
+class DiscogsApiCheckResult(StrEnum):
+    """Outcome of a Discogs API connectivity probe.
+
+    The string values are surfaced verbatim by ``GET /health`` so operators can
+    distinguish auth drift, rate limiting, and upstream outages without a log
+    pull. See ``routers/health.py:_check_discogs_api``.
+    """
+
+    OK = "ok"
+    AUTH_ERROR = "auth-error"  # 401, 403
+    RATE_LIMITED = "rate-limited"  # 429
+    UPSTREAM_ERROR = "upstream-error"  # 5xx
+    NETWORK_ERROR = "network-error"  # connection / timeout
+    ERROR = "error"  # unknown / other
+
+
 class DiscogsService:
     """Service for all Discogs API interactions with caching.
 
@@ -235,14 +252,31 @@ class DiscogsService:
             await self._client.aclose()
             self._client = None
 
-    async def check_api(self) -> bool:
-        """Check Discogs API connectivity."""
+    async def check_api(self) -> DiscogsApiCheckResult:
+        """Probe Discogs API connectivity, classifying the failure mode.
+
+        Returns a ``DiscogsApiCheckResult`` so ``/health`` can distinguish
+        token-rotation drift (401/403), rate limits (429), upstream outages
+        (5xx), and network failures from each other.
+        """
         try:
             client = await self._get_client()
             resp = await client.get("/oauth/identity")
-            return bool(resp.status_code == 200)
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError):
+            return DiscogsApiCheckResult.NETWORK_ERROR
         except Exception:
-            return False
+            return DiscogsApiCheckResult.ERROR
+
+        status = resp.status_code
+        if status == 200:
+            return DiscogsApiCheckResult.OK
+        if status in (401, 403):
+            return DiscogsApiCheckResult.AUTH_ERROR
+        if status == 429:
+            return DiscogsApiCheckResult.RATE_LIMITED
+        if 500 <= status < 600:
+            return DiscogsApiCheckResult.UPSTREAM_ERROR
+        return DiscogsApiCheckResult.ERROR
 
     async def _request_with_retry(
         self,
