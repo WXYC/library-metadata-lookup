@@ -54,6 +54,21 @@ jobs:
       SERVICE: library-metadata-lookup
       HEALTH_URL: ${{ inputs.env == 'staging' && 'https://library-metadata-lookup-staging.up.railway.app/health' || 'https://library-metadata-lookup-production.up.railway.app/health' }}
     steps:
+      - name: Validate Railway token resolved for the requested environment
+        # GitHub's `&& X || Y` ternary returns the right operand when the left
+        # is empty/false. If RAILWAY_TOKEN_STAGING is unset (or someone deletes
+        # it), an `env=staging` invocation would silently fall back to
+        # RAILWAY_TOKEN_PRODUCTION and rotate the production secret instead —
+        # an invisible blast-radius escalation. Fail loud on resolved-empty.
+        env:
+          ENV_UPPER: ${{ inputs.env == 'staging' && 'STAGING' || 'PRODUCTION' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RAILWAY_TOKEN:-}" ]; then
+            echo "::error::RAILWAY_TOKEN resolved empty for env=${{ inputs.env }}. Verify RAILWAY_TOKEN_${ENV_UPPER} is set as a repo secret."
+            exit 1
+          fi
+
       - name: Install Railway CLI
         run: npm install -g @railway/cli
 
