@@ -155,6 +155,91 @@ class TestHandleLookup:
         mock_init.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_cache_stats_projected_onto_sentry_transaction(self, app_client):
+        """The numeric cache_stats fields are attached to the active Sentry transaction
+        as `lml.cache.*` data, so they appear in trace explorer alongside latency.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+        stats = {
+            "memory_hits": 2,
+            "pg_hits": 5,
+            "pg_misses": 1,
+            "api_calls": 3,
+            "pg_time_ms": 12.5,
+            "api_time_ms": 480.7,
+        }
+        mock_transaction = Mock()
+        mock_transaction.set_data = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value=stats),
+            patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        # Six numeric fields → six set_data calls
+        actual_calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        assert actual_calls == {
+            "lml.cache.memory_hits": 2,
+            "lml.cache.pg_hits": 5,
+            "lml.cache.pg_misses": 1,
+            "lml.cache.api_calls": 3,
+            "lml.cache.pg_time_ms": 12.5,
+            "lml.cache.api_time_ms": 480.7,
+        }
+
+    @pytest.mark.asyncio
+    async def test_cache_stats_projection_no_op_without_active_transaction(self, app_client):
+        """When there is no active Sentry transaction, projection is a no-op (no crash)."""
+        response = LookupResponse(results=[], search_type="direct")
+        mock_scope = Mock()
+        mock_scope.transaction = None  # no active transaction
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value={"api_calls": 1}),
+            patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_cache_stats_projection_skips_non_numeric(self, app_client):
+        """Non-numeric values in cache_stats are skipped (defensive — current shape is all numeric)."""
+        response = LookupResponse(results=[], search_type="direct")
+        stats = {"api_calls": 2, "weird_string": "nope", "weird_none": None}
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value=stats),
+            patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        actual_calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        assert actual_calls == {"lml.cache.api_calls": 2}
+
+    @pytest.mark.asyncio
     async def test_response_includes_call_number(self, app_client):
         """Regression: call_number must appear in the JSON response."""
         result_item = LookupResultItem(

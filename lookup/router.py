@@ -3,6 +3,7 @@
 import logging
 
 import httpx
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException
 from posthog import Posthog
 
@@ -28,6 +29,28 @@ from scripts.entity_resolution.store import EntityStore
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["lookup"])
+
+
+def _project_cache_stats_to_transaction(stats: dict | None) -> None:
+    """Attach numeric cache_stats fields to the current Sentry transaction.
+
+    Each field becomes a `lml.cache.<key>` data attribute on the transaction
+    so the data joins against the trace in Sentry's trace explorer. No-op
+    when there is no active transaction (Sentry not initialized, or call
+    happening outside a request span).
+
+    Non-numeric values (strings, None) are skipped — the cache_stats schema
+    is all-numeric today, but keep the projection defensive in case that
+    ever drifts.
+    """
+    if not stats:
+        return
+    transaction = sentry_sdk.get_current_scope().transaction
+    if transaction is None:
+        return
+    for key, value in stats.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            transaction.set_data(f"lml.cache.{key}", value)
 
 
 @router.post(
@@ -85,6 +108,12 @@ async def handle_lookup(
 
         # Attach cache stats
         response.cache_stats = get_cache_stats()
+
+        # Project cache_stats onto the active Sentry transaction so it joins
+        # against the trace in Sentry's trace explorer (alongside latency,
+        # status, etc.). No-op when there is no active transaction (no
+        # SENTRY_DSN configured, or running outside a request span).
+        _project_cache_stats_to_transaction(response.cache_stats)
 
         # Send telemetry
         if posthog_client:
