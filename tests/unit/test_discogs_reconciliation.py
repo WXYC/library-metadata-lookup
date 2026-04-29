@@ -136,6 +136,130 @@ class TestSkipsAlreadyReconciled:
         assert "Autechre" not in results
 
 
+class TestPreprocessingVariants:
+    """The preprocessing helper yields variant candidate names from a canonical.
+    Pure function — testable in isolation without a Reconciler.
+    """
+
+    def test_strips_leading_the(self):
+        from scripts.entity_resolution.discogs import _preprocessing_variants
+
+        variants = _preprocessing_variants("The Microphones")
+        assert "Microphones" in variants
+
+    def test_replaces_ampersand_with_and(self):
+        from scripts.entity_resolution.discogs import _preprocessing_variants
+
+        variants = _preprocessing_variants("Mount Eerie & Julie Doiron")
+        assert "Mount Eerie and Julie Doiron" in variants
+
+    def test_strips_bracket_annotations(self):
+        from scripts.entity_resolution.discogs import _preprocessing_variants
+
+        # The motivating example from the issue body — "Adam X [DJ]"
+        variants = _preprocessing_variants("Adam X [DJ]")
+        assert "Adam X" in variants
+
+    def test_splits_multi_artist_credit(self):
+        from scripts.entity_resolution.discogs import _preprocessing_variants
+
+        variants = _preprocessing_variants("Juana Molina / Cat Power")
+        assert "Juana Molina" in variants
+        assert "Cat Power" in variants
+
+    def test_excludes_canonical_itself(self):
+        """The canonical name is never returned as its own variant."""
+        from scripts.entity_resolution.discogs import _preprocessing_variants
+
+        variants = _preprocessing_variants("Stereolab")
+        assert "Stereolab" not in variants
+
+    def test_no_variants_for_simple_name(self):
+        """A name with no preprocessing-applicable patterns yields no variants."""
+        from scripts.entity_resolution.discogs import _preprocessing_variants
+
+        # "Stereolab" has no leading "The ", no "&", no brackets, no split markers.
+        assert _preprocessing_variants("Stereolab") == []
+
+
+class TestNamePreprocessingStage:
+    """Stage 5 cascade: when an unmatched canonical's preprocessed variant
+    hits one of the four equality stages, the canonical resolves with
+    method="name_preprocessing".
+    """
+
+    @pytest.mark.asyncio
+    async def test_leading_the_strip_resolves_via_exact_match(self, reconciler, mock_pg):
+        """'The Microphones' has no exact match, but 'Microphones' (variant) does."""
+        mock_pg.fetchall = AsyncMock(
+            side_effect=[
+                [],  # Stage 1 exact match (canonical "the microphones") — miss
+                [],  # Stage 2 member — miss
+                [],  # Stage 3 alias — miss
+                [],  # Stage 4 name variation — miss
+                [
+                    {"artist_name": "microphones", "artist_id": 5050}
+                ],  # Stage 5 ⇒ exact match on variant
+            ]
+        )
+        results = await reconciler.reconcile_batch(["The Microphones"])
+        assert "The Microphones" in results
+        assert results["The Microphones"].discogs_artist_id == 5050
+        assert results["The Microphones"].method == "name_preprocessing"
+
+    @pytest.mark.asyncio
+    async def test_bracket_strip_resolves(self, reconciler, mock_pg):
+        """'Adam X [DJ]' miss; 'Adam X' (bracket-stripped) hits exact match."""
+        mock_pg.fetchall = AsyncMock(
+            side_effect=[
+                [],  # Stage 1 — miss
+                [],  # Stage 2 — miss
+                [],  # Stage 3 — miss
+                [],  # Stage 4 — miss
+                [{"artist_name": "adam x", "artist_id": 8181}],  # Stage 5 ⇒ exact on stripped
+            ]
+        )
+        results = await reconciler.reconcile_batch(["Adam X [DJ]"])
+        assert "Adam X [DJ]" in results
+        assert results["Adam X [DJ]"].discogs_artist_id == 8181
+        assert results["Adam X [DJ]"].method == "name_preprocessing"
+
+    @pytest.mark.asyncio
+    async def test_split_resolves_via_first_part(self, reconciler, mock_pg):
+        """Multi-artist credit 'Juana Molina / Cat Power' resolves via 'Juana Molina'."""
+        mock_pg.fetchall = AsyncMock(
+            side_effect=[
+                [],  # Stage 1 — miss
+                [],  # Stage 2 — miss
+                [],  # Stage 3 — miss
+                [],  # Stage 4 — miss
+                [{"artist_name": "juana molina", "artist_id": 1234}],  # Stage 5 ⇒ exact on split
+            ]
+        )
+        results = await reconciler.reconcile_batch(["Juana Molina / Cat Power"])
+        assert "Juana Molina / Cat Power" in results
+        assert results["Juana Molina / Cat Power"].discogs_artist_id == 1234
+        assert results["Juana Molina / Cat Power"].method == "name_preprocessing"
+
+    @pytest.mark.asyncio
+    async def test_no_variant_match_keeps_no_match(self, reconciler, mock_pg):
+        """If no variant matches any equality stage, the canonical stays unresolved."""
+        mock_pg.fetchall = AsyncMock(return_value=[])
+        results = await reconciler.reconcile_batch(["The Nonexistent & [Demo]"])
+        assert results == {}
+
+    @pytest.mark.asyncio
+    async def test_preprocessing_does_not_run_when_canonical_matches_earlier(
+        self, reconciler, mock_pg
+    ):
+        """An exact-match hit on the canonical short-circuits the cascade —
+        Stage 5 does not run, no extra SQL is issued."""
+        mock_pg.fetchall = AsyncMock(return_value=[{"artist_name": "the books", "artist_id": 4242}])
+        await reconciler.reconcile_batch(["The Books"])
+        # Exactly one SQL call: Stage 1 exact match. No cascade past it.
+        assert mock_pg.fetchall.await_count == 1
+
+
 class TestDiacriticInsensitiveMatch:
     """The cache filter (`scripts/filter_csv.py:normalize_artist`) loads rows
     into the cache after stripping diacritics, so a Discogs row for "Björk" is
