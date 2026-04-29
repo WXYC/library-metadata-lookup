@@ -250,9 +250,9 @@ Untouched: `/health`, `/identity/resolve`, `/identity/bulk`. Identity routes are
 | External API Tests | All pushes + PRs | -- |
 | PG Tests | All pushes + PRs | -- |
 | CI Marker Sync | All pushes + PRs | -- |
-| Deploy to Staging | Push to `main` | lint, typecheck, test, external_api, pg |
+| Deploy to Staging | Push to `main` | lint, typecheck, test, pg |
 | Smoke Test (Staging) | Push to `main` | deploy-staging |
-| Deploy to Production | Push to `prod` | lint, typecheck, test, external_api, pg |
+| Deploy to Production | Push to `prod` | lint, typecheck, test, pg |
 | Smoke Test (Production) | Push to `prod` | deploy-production |
 
 ### Pytest markers (architecture A)
