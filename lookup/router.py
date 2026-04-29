@@ -42,15 +42,22 @@ def _project_cache_stats_to_transaction(stats: dict | None) -> None:
     Non-numeric values (strings, None) are skipped — the cache_stats schema
     is all-numeric today, but keep the projection defensive in case that
     ever drifts.
+
+    Observability must not break the request path: any exception raised by
+    the Sentry SDK or by an unexpected stats shape is caught and logged at
+    WARNING. The request keeps going.
     """
     if not stats:
         return
-    transaction = sentry_sdk.get_current_scope().transaction
-    if transaction is None:
-        return
-    for key, value in stats.items():
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            transaction.set_data(f"lml.cache.{key}", value)
+    try:
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is None:
+            return
+        for key, value in stats.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                transaction.set_data(f"lml.cache.{key}", value)
+    except Exception as e:
+        logger.warning("Failed to project cache_stats onto Sentry transaction: %s", e)
 
 
 @router.post(

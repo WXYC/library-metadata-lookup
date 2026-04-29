@@ -274,6 +274,64 @@ class TestHandleLookup:
         )
 
     @pytest.mark.asyncio
+    async def test_cache_stats_projection_failure_does_not_break_request(self, app_client):
+        """If the Sentry projection raises, the request must still succeed.
+        Observability mustn't break the request path.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+        mock_transaction = Mock()
+        mock_transaction.set_data = Mock(side_effect=RuntimeError("boom"))
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value={"api_calls": 1}),
+            patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_cache_stats_projection_handles_non_dict_object_gracefully(self, app_client):
+        """End-to-end forward-compat: when get_cache_stats() returns a model-like
+        object (no `.items()`), the projection must not break the request. This is
+        the live-fire version of the future-bug from wxyc-shared#86: the projection's
+        try/except must catch the AttributeError so the request still 200s.
+        """
+        from dataclasses import dataclass
+
+        @dataclass
+        class FakeCacheStatsModel:
+            # Mimics a Pydantic v2 BaseModel: attribute access works, no `.items()`.
+            api_calls: int = 7
+            pg_hits: int = 3
+
+        fake_stats = FakeCacheStatsModel()
+        response = LookupResponse(results=[], search_type="direct")
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value=fake_stats),
+            patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
     async def test_response_includes_call_number(self, app_client):
         """Regression: call_number must appear in the JSON response."""
         result_item = LookupResultItem(
