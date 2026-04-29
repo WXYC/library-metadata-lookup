@@ -146,28 +146,72 @@ class TestCheckApi:
         assert await service.check_api() == DiscogsApiCheckResult.ERROR
 
     @pytest.mark.asyncio
-    async def test_check_api_connect_error_is_network_error(self, service):
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ConnectError("dns fail"),
+            httpx.ReadError("peer reset"),
+            httpx.WriteError("write fail"),
+            httpx.ConnectTimeout("connect timeout"),
+            httpx.ReadTimeout("read timeout"),
+            httpx.WriteTimeout("write timeout"),
+            httpx.PoolTimeout("pool timeout"),
+        ],
+    )
+    async def test_check_api_transport_errors_are_network_error(self, service, exc):
         mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=httpx.ConnectError("fail"))
+        mock_client.get = AsyncMock(side_effect=exc)
         service._client = mock_client
 
         assert await service.check_api() == DiscogsApiCheckResult.NETWORK_ERROR
 
     @pytest.mark.asyncio
-    async def test_check_api_timeout_is_network_error(self, service):
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=httpx.ReadTimeout("slow"))
-        service._client = mock_client
-
-        assert await service.check_api() == DiscogsApiCheckResult.NETWORK_ERROR
-
-    @pytest.mark.asyncio
-    async def test_check_api_unexpected_exception_is_error(self, service):
+    async def test_check_api_unexpected_exception_is_error_and_logs(self, service, caplog):
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(side_effect=RuntimeError("boom"))
         service._client = mock_client
 
-        assert await service.check_api() == DiscogsApiCheckResult.ERROR
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="discogs.service"):
+            assert await service.check_api() == DiscogsApiCheckResult.ERROR
+
+        assert any("RuntimeError" in r.message or "boom" in r.message for r in caplog.records), (
+            f"expected unexpected-exception log breadcrumb, got: {[r.message for r in caplog.records]}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status,expected",
+        [
+            (200, "ok"),
+            (401, "auth-error"),
+            (429, "rate-limited"),
+            (503, "upstream-error"),
+        ],
+    )
+    async def test_check_api_sets_sentry_tag_for_each_outcome(self, service, status, expected):
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = status
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        service._client = mock_client
+
+        with patch("discogs.service.sentry_sdk") as mock_sdk:
+            await service.check_api()
+
+        mock_sdk.set_tag.assert_called_once_with("discogs_api.check", expected)
+
+    @pytest.mark.asyncio
+    async def test_check_api_sets_sentry_tag_on_transport_error(self, service):
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=httpx.ConnectError("fail"))
+        service._client = mock_client
+
+        with patch("discogs.service.sentry_sdk") as mock_sdk:
+            await service.check_api()
+
+        mock_sdk.set_tag.assert_called_once_with("discogs_api.check", "network-error")
 
 
 # ---------------------------------------------------------------------------
