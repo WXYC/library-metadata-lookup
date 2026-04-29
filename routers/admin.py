@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["admin"])
 
+# Strong references to background tasks to prevent GC before completion.
+# See https://docs.python.org/3/library/asyncio-task.html#creating-tasks
+_background_tasks: set[asyncio.Task] = set()
+
 
 def _get_streaming_ids(db_path: Path) -> set[int]:
     """Read the set of library_ids from streaming_links in a SQLite file.
@@ -180,13 +184,15 @@ async def upload_library_db(
 
     # Fire streaming webhooks in the background (don't block the upload response)
     if settings.streaming_webhook_urls and changes:
-        asyncio.create_task(
+        task = asyncio.create_task(
             _send_streaming_webhooks(
                 settings.streaming_webhook_urls,
                 settings.etl_notify_key,
                 changes,
             )
         )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     response: dict = {
         "status": "ok",
