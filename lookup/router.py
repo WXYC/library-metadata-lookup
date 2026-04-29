@@ -106,14 +106,19 @@ async def handle_lookup(
             http_client=http_client,
         )
 
-        # Attach cache stats
-        response.cache_stats = get_cache_stats()
+        # Attach cache stats. Read from the raw dict returned by
+        # get_cache_stats() before assignment to response.cache_stats: once
+        # wxyc-shared#86 ships a typed CacheStats Pydantic model, assigning
+        # the dict to response.cache_stats will auto-convert it into a model
+        # instance, and the projection (which calls `.items()`) would break.
+        stats = get_cache_stats()
+        response.cache_stats = stats
 
         # Project cache_stats onto the active Sentry transaction so it joins
         # against the trace in Sentry's trace explorer (alongside latency,
         # status, etc.). No-op when there is no active transaction (no
         # SENTRY_DSN configured, or running outside a request span).
-        _project_cache_stats_to_transaction(response.cache_stats)
+        _project_cache_stats_to_transaction(stats)
 
         # Send telemetry
         if posthog_client:

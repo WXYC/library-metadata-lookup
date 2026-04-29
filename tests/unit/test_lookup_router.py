@@ -240,6 +240,40 @@ class TestHandleLookup:
         assert actual_calls == {"lml.cache.api_calls": 2}
 
     @pytest.mark.asyncio
+    async def test_cache_stats_projection_called_with_raw_get_cache_stats_return(self, app_client):
+        """The projection helper must be invoked with the exact object returned by
+        get_cache_stats(), not with response.cache_stats. Once wxyc-shared#86 ships
+        a typed CacheStats Pydantic model, assigning a dict to response.cache_stats
+        will auto-convert it into a model instance (whose `.items()` method does not
+        exist), and the projection would AttributeError. Reading from the raw return
+        value of get_cache_stats() insulates the projection from that future shape change.
+        """
+        stats = {"api_calls": 4, "pg_hits": 2}
+        response = LookupResponse(results=[], search_type="direct")
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value=stats),
+            patch("lookup.router._project_cache_stats_to_transaction") as mock_project,
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        # Identity check: must be the exact dict from get_cache_stats(), not a
+        # copy that might have been routed through response.cache_stats.
+        mock_project.assert_called_once()
+        passed_arg = mock_project.call_args.args[0]
+        assert passed_arg is stats, (
+            "_project_cache_stats_to_transaction must be called with the raw dict "
+            "returned by get_cache_stats(), not with response.cache_stats (which may "
+            "be coerced into a typed Pydantic model in the future)."
+        )
+
+    @pytest.mark.asyncio
     async def test_response_includes_call_number(self, app_client):
         """Regression: call_number must appear in the JSON response."""
         result_item = LookupResultItem(
