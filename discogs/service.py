@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -64,6 +65,37 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 DISCOGS_API_BASE = "https://api.discogs.com"
+
+# Cap individual retry sleeps. Discogs's per-token rate-limit window is 60
+# seconds; once we cross that, the bucket has reset and there's no benefit to
+# waiting longer for the same 429.
+_MAX_RETRY_DELAY_SECONDS = 60.0
+
+
+def _compute_retry_delay(attempt: int, retry_after_header: str | None) -> float:
+    """Compute how long to sleep before the next retry of a 429-rate-limited request.
+
+    If Discogs sent a numeric ``Retry-After`` header, honor it (capped).
+    Otherwise, use exponential backoff with jitter so multiple parallel
+    backfill containers don't synchronize their retry waves into the next 429.
+
+    Args:
+        attempt: 0-indexed retry attempt number.
+        retry_after_header: Raw value of the ``Retry-After`` response header,
+            or None. RFC 9110 allows seconds (numeric) or HTTP-date; Discogs
+            sends seconds, so non-numeric values fall through to backoff.
+
+    Returns:
+        Delay in seconds, never exceeding ``_MAX_RETRY_DELAY_SECONDS``.
+    """
+    if retry_after_header is not None:
+        try:
+            return min(float(retry_after_header), _MAX_RETRY_DELAY_SECONDS)
+        except ValueError:
+            pass
+    base = 2**attempt
+    jitter = random.uniform(0.5, 1.5)
+    return min(base * jitter, _MAX_RETRY_DELAY_SECONDS)
 
 
 def calculate_confidence(
@@ -251,11 +283,12 @@ class DiscogsService:
 
                     if response.status_code == 429:
                         if attempt < max_retries:
-                            # Exponential backoff: 1s, 2s, 4s...
-                            delay = 2**attempt
+                            retry_after = response.headers.get("Retry-After")
+                            delay = _compute_retry_delay(attempt, retry_after)
                             logger.warning(
-                                f"Discogs rate limit hit, retrying in {delay}s "
-                                f"(attempt {attempt + 1}/{max_retries + 1})"
+                                f"Discogs rate limit hit, retrying in {delay:.2f}s "
+                                f"(attempt {attempt + 1}/{max_retries + 1}, "
+                                f"Retry-After={retry_after})"
                             )
                             await asyncio.sleep(delay)
                             continue

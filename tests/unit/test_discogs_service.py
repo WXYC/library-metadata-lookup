@@ -179,6 +179,87 @@ class TestRequestWithRetry:
         resp = await service._request_with_retry("GET", "/test", max_retries=0)
         assert resp is None
 
+    @pytest.mark.asyncio
+    async def test_429_honors_retry_after_header(self, service):
+        """When Discogs sends Retry-After, sleep that long instead of exponential backoff."""
+        mock_client = AsyncMock()
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "7"}
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.headers = {}
+        mock_client.request = AsyncMock(side_effect=[resp_429, resp_200])
+        service._client = mock_client
+
+        with patch("discogs.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            resp = await service._request_with_retry("GET", "/test", max_retries=1)
+        assert resp.status_code == 200
+        mock_sleep.assert_awaited_once_with(7.0)
+
+    @pytest.mark.asyncio
+    async def test_429_retry_after_capped_at_max_delay(self, service):
+        """Retry-After values larger than the 60s cap are clamped."""
+        mock_client = AsyncMock()
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "300"}
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.headers = {}
+        mock_client.request = AsyncMock(side_effect=[resp_429, resp_200])
+        service._client = mock_client
+
+        with patch("discogs.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await service._request_with_retry("GET", "/test", max_retries=1)
+        delay = mock_sleep.await_args_list[0].args[0]
+        assert delay == 60.0
+
+    @pytest.mark.asyncio
+    async def test_429_backoff_jittered(self, service):
+        """Without Retry-After, backoff calls random.uniform(0.5, 1.5) for jitter."""
+        mock_client = AsyncMock()
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {}
+        mock_client.request = AsyncMock(return_value=resp_429)
+        service._client = mock_client
+
+        with (
+            patch("discogs.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch("discogs.service.random.uniform", return_value=1.25) as mock_uniform,
+        ):
+            await service._request_with_retry("GET", "/test", max_retries=3)
+        # 3 retries → 3 sleep calls + 3 jitter calls
+        assert mock_sleep.await_count == 3
+        assert mock_uniform.call_count == 3
+        # Each call to random.uniform should request the same jitter range.
+        for call in mock_uniform.call_args_list:
+            assert call.args == (0.5, 1.5)
+        # Attempts 0, 1, 2 → bases 1, 2, 4 → with jitter factor 1.25 → 1.25, 2.5, 5.0
+        delays = [c.args[0] for c in mock_sleep.await_args_list]
+        assert delays == [1.25, 2.5, 5.0]
+
+    @pytest.mark.asyncio
+    async def test_429_invalid_retry_after_falls_back_to_backoff(self, service):
+        """Non-numeric Retry-After (HTTP-date or junk) falls back to jittered backoff."""
+        mock_client = AsyncMock()
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.headers = {}
+        mock_client.request = AsyncMock(side_effect=[resp_429, resp_200])
+        service._client = mock_client
+
+        with patch("discogs.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            resp = await service._request_with_retry("GET", "/test", max_retries=1)
+        assert resp.status_code == 200
+        delay = mock_sleep.await_args_list[0].args[0]
+        # Falls through to exponential at attempt 0: base 1s, jittered into [0.5, 1.5]
+        assert 0.5 <= delay <= 1.5
+
 
 # ---------------------------------------------------------------------------
 # _parse_title
