@@ -1036,6 +1036,68 @@ class TestValidateTrackOnRelease:
         assert result is True
 
     @pytest.mark.asyncio
+    async def test_collaboration_trio_release_artist_matches_via_token_set(self, service):
+        """Trio collaboration: request artist tokens are a subset of the release artist string.
+
+        A release credited to "Bill Orcutt, Tashi Shelley & Robbie Miller" should validate
+        for a request with artist="Orcutt Shelley Miller" (the trio's compact name in WXYC's
+        flowsheet). Strict substring match fails because no individual member's name is a
+        substring of the trio name. token_set_ratio handles the overlap. See LML#210.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=34993109,
+            title="Orcutt Shelley Miller",
+            artist="Bill Orcutt, Tashi Shelley & Robbie Miller",
+            release_url="https://discogs.com/release/34993109",
+            tracklist=[
+                TrackItem(position="1", title="A Star Is Born"),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(
+                34993109, "A Star Is Born", "Orcutt Shelley Miller"
+            )
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_collaboration_trio_per_track_artists_match_via_token_set(self, service):
+        """Same trio scenario, but each member is credited as a separate per-track artist."""
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Compilation",
+            artist="Various Artists",
+            release_url="https://discogs.com/release/1",
+            tracklist=[
+                TrackItem(
+                    position="1",
+                    title="A Star Is Born",
+                    artists=["Bill Orcutt", "Tashi Shelley", "Robbie Miller"],
+                ),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(
+                1, "A Star Is Born", "Orcutt Shelley Miller"
+            )
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_token_set_fuzzy_does_not_match_unrelated_artist(self, service):
+        """The fuzzy fallback must still reject artists with no token overlap."""
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Some Album",
+            artist="Bill Orcutt, Tashi Shelley & Robbie Miller",
+            release_url="https://discogs.com/release/1",
+            tracklist=[
+                TrackItem(position="1", title="A Star Is Born"),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(1, "A Star Is Born", "Duke Ellington")
+        assert result is False
+
+    @pytest.mark.asyncio
     async def test_diacritics_in_track_title(self, service):
         """Track title with diacritics should match the unaccented search query.
 
