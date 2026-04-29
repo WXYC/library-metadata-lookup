@@ -297,6 +297,20 @@ When `library.db` is missing (e.g., on first deploy before first upload):
 - Service is functional for non-database endpoints
 - After uploading library.db, next request triggers reconnection
 
+The `services.discogs_api` field on `GET /health` carries one of a fixed vocabulary of values defined by `DiscogsApiCheckResult` in `discogs/service.py`:
+
+| Value | Meaning |
+|---|---|
+| `ok` | Probe succeeded (200) |
+| `auth-error` | Token rejected (401, 403) — usually rotation drift |
+| `rate-limited` | Discogs is throttling us (429) |
+| `upstream-error` | Discogs returned 5xx |
+| `network-error` | Connection or timeout failure (`httpx.ConnectError`/`TimeoutException`/`NetworkError`) |
+| `error` | Unknown / unclassified failure |
+| `unavailable` | `discogs_service` not configured (no token) |
+
+Any value other than `ok` / `unavailable` flips the overall status to `degraded` (or `unhealthy` if a core service like `database` is also down).
+
 ## Scripts
 
 ### Streaming Report Stats Regenerator (`scripts/regenerate_report_stats.py`)

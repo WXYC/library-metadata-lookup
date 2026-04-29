@@ -25,10 +25,14 @@ async def _check_database(db: LibraryDB) -> str:
 
 
 async def _check_discogs_api(discogs_service: DiscogsService | None) -> str:
-    """Ping the Discogs API via the service's own client."""
+    """Ping the Discogs API via the service's own client.
+
+    Returns the ``DiscogsApiCheckResult`` enum's string value so operators can
+    distinguish auth drift, rate limits, and upstream outages from one another.
+    """
     if discogs_service is None:
         return "unavailable"
-    return "ok" if await discogs_service.check_api() else "error"
+    return (await discogs_service.check_api()).value
 
 
 async def _check_discogs_cache(discogs_service: DiscogsService | None) -> str:
