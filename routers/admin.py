@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from config.settings import Settings, get_settings
 from core.dependencies import close_library_db
@@ -258,4 +258,43 @@ async def upload_streaming_db(
             "row_count": row_count,
             "timestamp": datetime.now(UTC).isoformat(),
         }
+    )
+
+
+@router.get(
+    "/download-streaming-db",
+    summary="Download the current streaming_availability.db backup",
+    responses={
+        200: {
+            "description": "Streaming database file",
+            "content": {"application/octet-stream": {}},
+        },
+        401: {"description": "Missing authorization"},
+        403: {"description": "Invalid or missing token"},
+        404: {"description": "streaming_availability.db not present on the volume"},
+    },
+)
+async def download_streaming_db(
+    settings: Settings = Depends(get_settings),
+    authorization: str | None = Header(None),
+):
+    """Stream the current streaming_availability.db from the Railway volume.
+
+    Symmetric with `POST /admin/upload-streaming-db`. Lets the daily
+    library-sync pipeline (WXYC/discogs-etl) read the file directly from the
+    volume instead of round-tripping it through a GitHub Release.
+    """
+    _validate_auth(settings, authorization)
+
+    db_path = settings.resolved_library_db_path.parent / "streaming_availability.db"
+    if not db_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="streaming_availability.db not found on volume",
+        )
+
+    return FileResponse(
+        path=db_path,
+        media_type="application/octet-stream",
+        filename="streaming_availability.db",
     )
