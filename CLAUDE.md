@@ -289,6 +289,17 @@ atomically replaces the file, and returns `{"status": "ok", "row_count": <int>}`
 
 The ETL script in [discogs-cache](https://github.com/WXYC/discogs-etl) (`scripts/sync-library.sh`) handles daily uploads to both staging and production.
 
+### Streaming Database Backup (Upload + Download)
+
+`streaming_availability.db` is the analysis database for streaming-availability search results. It's a sibling of `library.db` on the Railway volume. Two symmetric admin endpoints, both gated by `ADMIN_TOKEN`:
+
+```
+POST /admin/upload-streaming-db    # multipart upload, validates `albums` table
+GET  /admin/download-streaming-db  # FileResponse stream of the volume copy (404 if missing)
+```
+
+The download endpoint lets the daily library-sync pipeline (WXYC/discogs-etl) read the file directly from the Railway volume instead of round-tripping it through a GitHub Release, making the volume the canonical source.
+
 ### Health Check Behavior
 
 When `library.db` is missing (e.g., on first deploy before first upload):

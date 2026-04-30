@@ -1,4 +1,4 @@
-"""Unit tests for routers/admin.py -- library.db upload endpoint."""
+"""Unit tests for routers/admin.py -- library.db upload + streaming-db endpoints."""
 
 import asyncio
 import sqlite3
@@ -737,3 +737,98 @@ class TestUploadWebhookIntegration:
         body = resp.json()
         assert body["webhook"]["status"] == "pending"
         assert body["webhook"]["changes_count"] == 1
+
+
+class TestDownloadStreamingDB:
+    """Tests for GET /admin/download-streaming-db."""
+
+    async def _get(self, app, settings, headers=None):
+        with override_deps(
+            app,
+            {
+                get_library_db: AsyncMock(),
+                get_discogs_service: None,
+                get_posthog_client: None,
+                get_settings: settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                return await client.get("/admin/download-streaming-db", headers=headers or {})
+
+    @pytest.mark.asyncio
+    async def test_missing_auth_header(self, admin_settings):
+        """No Authorization header -> 401."""
+        from main import app
+
+        resp = await self._get(app, admin_settings)
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Missing authorization"
+
+    @pytest.mark.asyncio
+    async def test_malformed_auth_header(self, admin_settings):
+        """Authorization header without 'Bearer ' prefix -> 403."""
+        from main import app
+
+        resp = await self._get(app, admin_settings, headers={"Authorization": "test-secret-token"})
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "Invalid token"
+
+    @pytest.mark.asyncio
+    async def test_wrong_bearer_token(self, admin_settings):
+        """Wrong token -> 403."""
+        from main import app
+
+        resp = await self._get(app, admin_settings, headers={"Authorization": "Bearer wrong-token"})
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "Invalid token"
+
+    @pytest.mark.asyncio
+    async def test_no_admin_token_configured(self, no_token_settings):
+        """ADMIN_TOKEN not set -> 403."""
+        from main import app
+
+        resp = await self._get(app, no_token_settings, headers={"Authorization": "Bearer anything"})
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_file_not_found(self, admin_settings):
+        """Valid token but streaming_availability.db missing on the volume -> 404."""
+        from main import app
+
+        # admin_settings.library_db_path lives in tmp_path; sibling streaming
+        # file does not exist.
+        assert not (
+            admin_settings.resolved_library_db_path.parent / "streaming_availability.db"
+        ).exists()
+
+        resp = await self._get(
+            app, admin_settings, headers={"Authorization": "Bearer test-secret-token"}
+        )
+        assert resp.status_code == 404
+        assert "streaming_availability.db" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_successful_download(self, admin_settings):
+        """Valid token + file present -> 200 with byte-for-byte payload."""
+        from main import app
+
+        streaming_path = (
+            admin_settings.resolved_library_db_path.parent / "streaming_availability.db"
+        )
+        # SQLite file header bytes ("SQLite format 3\0") plus arbitrary trailing bytes
+        # are sufficient for streaming the file -- the download endpoint does not
+        # validate contents, only reads + streams them back.
+        payload = b"SQLite format 3\x00" + b"streaming-db-test-payload" * 100
+        streaming_path.write_bytes(payload)
+
+        resp = await self._get(
+            app, admin_settings, headers={"Authorization": "Bearer test-secret-token"}
+        )
+
+        assert resp.status_code == 200
+        assert resp.content == payload
+        assert resp.headers["content-type"] == "application/octet-stream"
+        # FileResponse sets Content-Disposition: attachment with the filename
+        assert "streaming_availability.db" in resp.headers.get("content-disposition", "")
