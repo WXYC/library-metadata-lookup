@@ -2,10 +2,12 @@
 
 import logging
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from posthog import Posthog
 
 from core.dependencies import (
+    get_apple_music_http_client,
     get_discogs_cache_service,
     get_discogs_service,
     get_library_db,
@@ -59,6 +61,7 @@ async def handle_lookup(
     mb_pg: PgSource | None = Depends(get_musicbrainz_pg),
     entity_store: EntityStore | None = Depends(get_entity_store),
     posthog_client: Posthog | None = Depends(get_posthog_client),
+    http_client: httpx.AsyncClient = Depends(get_apple_music_http_client),
     skip_cache: bool = False,
 ):
     """Process a lookup request."""
@@ -77,6 +80,7 @@ async def handle_lookup(
             entity_store=entity_store,
             discogs_cache=discogs_cache,
             mb_pg=mb_pg,
+            http_client=http_client,
         )
 
         # Attach cache stats

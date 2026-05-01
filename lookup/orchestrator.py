@@ -834,15 +834,19 @@ def _build_streaming_search_url(base: str, artist: str, term: str) -> str:
 async def _fetch_apple_music_url(
     artist: str, song: str, http_client: httpx.AsyncClient | None = None
 ) -> str | None:
-    """Search the iTunes API for an Apple Music link. Free, no auth required."""
+    """Search the iTunes API for an Apple Music link. Free, no auth required.
+
+    Requires a shared ``http_client``; returns ``None`` when one isn't
+    provided so callers can degrade gracefully. Constructing a fresh
+    ``httpx.AsyncClient`` per probe is what leaked FDs in the 2026-05-01
+    LML outage (issue #241), so the per-call fallback was removed.
+    """
+    if http_client is None:
+        return None
     try:
         query = quote(f"{artist} {song}")
         url = f"https://itunes.apple.com/search?term={query}&entity=song&media=music&limit=1"
-        if http_client:
-            resp = await http_client.get(url)
-        else:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(url)
+        resp = await http_client.get(url)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -857,11 +861,16 @@ async def enrich_artwork_results(
     discogs_service: DiscogsService | None,
     song: str | None = None,
     library_db: LibraryDB | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
     When library_db has a streaming_links table, uses direct URLs from the database.
     Falls back to search URLs when direct links are not available.
+
+    ``http_client`` is the shared ``httpx.AsyncClient`` used for the iTunes
+    Search probe. Passing ``None`` skips the Apple Music lookup — the
+    orchestrator never instantiates its own client (issue #241).
     """
     if not discogs_service:
         return items_with_artwork
@@ -910,7 +919,7 @@ async def enrich_artwork_results(
         async def fetch_apple_music() -> str | None:
             if not artist or not search_term:
                 return None
-            return await _fetch_apple_music_url(artist, search_term)
+            return await _fetch_apple_music_url(artist, search_term, http_client=http_client)
 
         release_details_result, apple_music_result = await asyncio.gather(
             fetch_release_details(),
@@ -1054,6 +1063,7 @@ async def perform_lookup(
     entity_store: EntityStore | None = None,
     discogs_cache: DiscogsCacheService | None = None,
     mb_pg: PgSourceProtocol | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> LookupResponse:
     """Orchestrate the full lookup pipeline.
 
@@ -1184,6 +1194,7 @@ async def perform_lookup(
                 discogs_service,
                 song=parsed.song,
                 library_db=db,
+                http_client=http_client,
             )
 
     # Step 5: Build context message

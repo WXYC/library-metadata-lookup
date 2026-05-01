@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config.settings import get_settings
 from core.auth import require_lml_key
 from core.dependencies import (
+    close_apple_music_http_client,
     close_discogs_service,
     close_library_db,
     close_musicbrainz_pg,
@@ -65,6 +66,7 @@ async def lifespan(app: FastAPI):
     await close_entity_store()
     await close_musicbrainz_pg()
     await close_streaming_clients()
+    await close_apple_music_http_client()
     logger.info("All services shut down")
 
 
