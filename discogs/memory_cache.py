@@ -74,7 +74,7 @@ def create_ttl_cache(maxsize: int, ttl: int) -> TTLCache:
     Returns:
         TTLCache instance
     """
-    cache = TTLCache(maxsize=maxsize, ttl=ttl)
+    cache: TTLCache = TTLCache(maxsize=maxsize, ttl=ttl)
     _cache_registry.append(cache)
     return cache
 
