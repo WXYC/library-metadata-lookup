@@ -1,8 +1,10 @@
 """FastAPI dependency injection providers."""
 
+import asyncio
 import logging
 
 import asyncpg
+import httpx
 from fastapi import Depends
 from posthog import Posthog
 
@@ -19,8 +21,11 @@ logger = logging.getLogger(__name__)
 _library_db: LibraryDB | None = None
 _discogs_service: DiscogsService | None = None
 _discogs_pool: asyncpg.Pool | None = None
+_discogs_init_lock: asyncio.Lock = asyncio.Lock()
 _posthog_client: Posthog | None = None
 _musicbrainz_pg: PgSource | None = None
+_apple_music_http_client: httpx.AsyncClient | None = None
+_apple_music_http_client_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryDB:
@@ -88,7 +93,17 @@ async def get_discogs_service(
         logger.debug("No Discogs credentials set - Discogs service disabled")
         return None
 
-    if _discogs_service is None:
+    if _discogs_service is not None:
+        return _discogs_service
+
+    # Serialize concurrent first-callers so only one creates the cache pool.
+    # Without this lock, each caller passes the `is None` check, each awaits
+    # ``asyncpg.create_pool``, and all but one pool is orphaned with up to 5
+    # open connections (FDs). See issue #241.
+    async with _discogs_init_lock:
+        if _discogs_service is not None:
+            return _discogs_service
+
         cache_service = None
 
         if settings.database_url_discogs and _discogs_pool is None:
@@ -121,7 +136,7 @@ async def get_discogs_service(
             f"Discogs service initialized (cache: {'enabled' if cache_service else 'disabled'})"
         )
 
-    return _discogs_service
+        return _discogs_service
 
 
 async def close_discogs_service() -> None:
@@ -193,6 +208,34 @@ async def close_musicbrainz_pg() -> None:
     if _musicbrainz_pg is not None:
         await _musicbrainz_pg.close()
         _musicbrainz_pg = None
+
+
+async def get_apple_music_http_client() -> httpx.AsyncClient:
+    """Process-lifetime ``httpx.AsyncClient`` for the iTunes Search probe.
+
+    The lookup orchestrator probes ``itunes.apple.com/search`` once per
+    enriched result item. Constructing a fresh ``httpx.AsyncClient`` per
+    probe (the previous behavior) leaked file descriptors under sustained
+    /api/v1/lookup traffic and exhausted the container's FD limit on
+    2026-05-01 (issue #241). A shared client is returned instead and
+    closed on app shutdown via ``close_apple_music_http_client``.
+    """
+    global _apple_music_http_client
+    if _apple_music_http_client is not None:
+        return _apple_music_http_client
+    async with _apple_music_http_client_lock:
+        if _apple_music_http_client is None:
+            _apple_music_http_client = httpx.AsyncClient(timeout=5.0)
+            logger.info("Apple Music shared HTTP client initialized")
+        return _apple_music_http_client
+
+
+async def close_apple_music_http_client() -> None:
+    """Close the shared Apple Music HTTP client on app shutdown."""
+    global _apple_music_http_client
+    if _apple_music_http_client is not None:
+        await _apple_music_http_client.aclose()
+        _apple_music_http_client = None
 
 
 def get_posthog_client(settings: Settings = Depends(get_settings)) -> Posthog | None:

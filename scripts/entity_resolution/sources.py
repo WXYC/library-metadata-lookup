@@ -57,11 +57,19 @@ class PgSource:
     def __init__(self, dsn: str) -> None:
         self._dsn = dsn
         self._pool: asyncpg.Pool | None = None
+        # Serializes concurrent first-callers to ``_get_pool``. Without it,
+        # both callers pass the ``self._pool is None`` check and each await
+        # ``asyncpg.create_pool``, orphaning all but one pool with up to 5
+        # open connections (FDs). See issue #241.
+        self._pool_lock: asyncio.Lock = asyncio.Lock()
 
     async def _get_pool(self) -> asyncpg.Pool:
-        if self._pool is None:
-            self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
-        return self._pool
+        if self._pool is not None:
+            return self._pool
+        async with self._pool_lock:
+            if self._pool is None:
+                self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+            return self._pool
 
     async def fetchall(self, query: str, *args: Any) -> list[dict[str, Any]]:
         """Execute a query and return all rows as dicts."""
