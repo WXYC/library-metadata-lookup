@@ -18,9 +18,16 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["admin"])
 
+STREAMING_DB_FILENAME = "streaming_availability.db"
+
 # Strong references to background tasks to prevent GC before completion.
 # See https://docs.python.org/3/library/asyncio-task.html#creating-tasks
 _background_tasks: set[asyncio.Task] = set()
+
+
+def _streaming_db_path(settings: Settings) -> Path:
+    """Sibling of library.db on the Railway volume."""
+    return settings.resolved_library_db_path.parent / STREAMING_DB_FILENAME
 
 
 def _get_streaming_ids(db_path: Path) -> set[int]:
@@ -227,9 +234,8 @@ async def upload_streaming_db(
     """
     _validate_auth(settings, authorization)
 
-    db_dir = settings.resolved_library_db_path.parent
-    db_path = db_dir / "streaming_availability.db"
-    tmp_path = db_dir / "streaming_availability.db.tmp"
+    db_path = _streaming_db_path(settings)
+    tmp_path = db_path.with_suffix(db_path.suffix + ".tmp")
 
     try:
         content = await file.read()
@@ -286,15 +292,15 @@ async def download_streaming_db(
     """
     _validate_auth(settings, authorization)
 
-    db_path = settings.resolved_library_db_path.parent / "streaming_availability.db"
+    db_path = _streaming_db_path(settings)
     if not db_path.exists():
         raise HTTPException(
             status_code=404,
-            detail="streaming_availability.db not found on volume",
+            detail=f"{STREAMING_DB_FILENAME} not found on volume",
         )
 
     return FileResponse(
         path=db_path,
         media_type="application/octet-stream",
-        filename="streaming_availability.db",
+        filename=STREAMING_DB_FILENAME,
     )
