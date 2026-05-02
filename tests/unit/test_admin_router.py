@@ -830,5 +830,4 @@ class TestDownloadStreamingDB:
         assert resp.status_code == 200
         assert resp.content == payload
         assert resp.headers["content-type"] == "application/octet-stream"
-        # FileResponse sets Content-Disposition: attachment with the filename
         assert "streaming_availability.db" in resp.headers.get("content-disposition", "")
