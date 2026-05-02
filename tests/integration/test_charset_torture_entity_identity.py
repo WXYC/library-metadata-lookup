@@ -1,0 +1,112 @@
+"""Charset-torture round-trip CI for entity.identity (PostgreSQL).
+
+Implements WX-1.2.1 for the PG leg of LML's primary storage. The
+``entity.identity`` table is the canonical name index consumed by
+semantic-index (via ``--entity-source=lml``); a byte-corrupting write
+here propagates into every downstream consumer of ``EntityStore``.
+
+Each corpus entry round-trips through ``EntityStore.upsert_identity`` →
+``get_identity``. We assert byte equality of ``library_name``. The
+table's UNIQUE constraint on ``library_name`` is the only normalization
+that could matter; PostgreSQL's TEXT type preserves bytes verbatim, so
+this test catches any future regression where the column type changes
+or a normalization step is silently inserted.
+"""
+
+from __future__ import annotations
+
+import os
+
+import asyncpg
+import pytest
+import pytest_asyncio
+
+from scripts.entity_resolution.sources import PgSource
+from scripts.entity_resolution.store import EntityStore
+from tests.charset_torture import CharsetTortureEntry, entry_id, iter_entries
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL_TEST",
+    "postgresql://discogs:discogs@localhost:5433/discogs",
+)
+
+CORPUS_ENTRIES = list(iter_entries())
+
+# Inputs PostgreSQL TEXT cannot store. Keyed by (category, input). The SQL
+# standard forbids U+0000 in character types; psycopg/asyncpg both reject
+# it at protocol level. App-layer strip belongs to WX-3, not WX-1.
+PG_TEXT_XFAIL_INPUTS: dict[tuple[str, str], str] = {
+    ("quoting", "null\x00byte"): (
+        "[lml:pg-null-byte] PostgreSQL TEXT rejects U+0000 (SQL standard)"
+    ),
+}
+
+
+@pytest_asyncio.fixture
+async def pg_pool():
+    """Create a connection pool to the test database, or skip on connect failure."""
+    try:
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
+    except Exception as e:
+        pytest.skip(f"Cannot connect to test PostgreSQL: {e}")
+        return
+    yield pool
+    await pool.close()
+
+
+@pytest_asyncio.fixture
+async def entity_store(pg_pool):
+    """EntityStore over a freshly-created entity schema."""
+    async with pg_pool.acquire() as conn:
+        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+        await conn.execute("CREATE SCHEMA entity")
+        await conn.execute("""
+            CREATE TABLE entity.identity (
+                id SERIAL PRIMARY KEY,
+                library_name TEXT NOT NULL UNIQUE,
+                discogs_artist_id INTEGER,
+                wikidata_qid TEXT,
+                musicbrainz_artist_id TEXT,
+                spotify_artist_id TEXT,
+                apple_music_artist_id TEXT,
+                bandcamp_id TEXT,
+                reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+    source = PgSource.__new__(PgSource)
+    source._dsn = DATABASE_URL
+    source._pool = pg_pool
+    yield EntityStore(source)
+    async with pg_pool.acquire() as conn:
+        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", CORPUS_ENTRIES, ids=entry_id)
+async def test_entity_identity_storage_roundtrip(
+    entity_store: EntityStore,
+    entry: CharsetTortureEntry,
+    request: pytest.FixtureRequest,
+) -> None:
+    """upsert_identity → get_identity must preserve library_name byte-for-byte."""
+    xfail_reason = PG_TEXT_XFAIL_INPUTS.get((entry["category"], entry["input"]))
+    if xfail_reason is not None:
+        request.applymarker(pytest.mark.xfail(reason=xfail_reason, strict=True, raises=Exception))
+
+    upserted = await entity_store.upsert_identity(library_name=entry["input"])
+    assert upserted is not None, f"{entry['category']}: upsert returned None"
+    assert upserted.library_name == entry["input"], (
+        f"{entry['category']}: upsert lost bytes ({entry['notes']})"
+    )
+
+    fetched = await entity_store.get_identity(entry["input"])
+    assert fetched is not None, (
+        f"{entry['category']}: get_identity could not locate row ({entry['notes']!r})"
+    )
+    assert fetched.library_name == entry["input"], (
+        f"{entry['category']}: read-back lost bytes ({entry['notes']})"
+    )
+    assert fetched.id == upserted.id
