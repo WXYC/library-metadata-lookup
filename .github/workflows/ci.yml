@@ -56,9 +56,7 @@ jobs:
           cache: 'pip'
       # wxyc-etl resolves from PyPI as a transitive dep of `pip install -e ".[dev]"`.
       # `[tool.uv.sources]` in pyproject.toml is uv-only and doesn't apply to pip.
-      - run: |
-          pip install -e ".[dev]"
-          pip install mypy
+      - run: pip install -e ".[dev]"
       - run: mypy . --ignore-missing-imports
 
   test:

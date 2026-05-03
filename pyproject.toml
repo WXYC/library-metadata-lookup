@@ -33,7 +33,7 @@ dev = [
     "pytest-httpx>=0.22.0",
     "pytest-cov>=4.0.0",
     "ruff>=0.1.0",
-    "mypy>=1.0.0",
+    "mypy==1.19.1",
     "datamodel-code-generator[http]>=0.26.0",
 ]
 
