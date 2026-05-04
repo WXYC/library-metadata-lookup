@@ -12,6 +12,23 @@ from tests.factories import LOOKUP_BODY, make_catalog_item, make_match_result
 from tests.unit.conftest import override_deps
 
 
+def _full_cache_stats() -> dict:
+    """A fully-populated cache_stats dict matching the typed CacheStats schema.
+
+    `init_cache_stats()` populates every field in production; tests that mock
+    `get_cache_stats` need to do the same so the typed `CacheStats(**stats)`
+    conversion in the router doesn't raise on missing required fields.
+    """
+    return {
+        "memory_hits": 0,
+        "pg_hits": 0,
+        "pg_misses": 0,
+        "api_calls": 1,
+        "pg_time_ms": 0.0,
+        "api_time_ms": 0.0,
+    }
+
+
 @pytest.fixture
 def mock_db():
     return AsyncMock(spec=LibraryDB)
@@ -205,7 +222,7 @@ class TestHandleLookup:
 
         with (
             patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
-            patch("lookup.router.get_cache_stats", return_value={"api_calls": 1}),
+            patch("lookup.router.get_cache_stats", return_value=_full_cache_stats()),
             patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
         ):
             mock_lookup.return_value = response
@@ -216,39 +233,35 @@ class TestHandleLookup:
 
         assert resp.status_code == 200
 
-    @pytest.mark.asyncio
-    async def test_cache_stats_projection_skips_non_numeric(self, app_client):
-        """Non-numeric values in cache_stats are skipped (defensive — current shape is all numeric)."""
-        response = LookupResponse(results=[], search_type="direct")
+    def test_projection_skips_non_numeric_values(self):
+        """Direct unit test of `_project_cache_stats_to_transaction`'s defensive
+        behavior. The router-level typed CacheStats now guarantees all-numeric
+        fields, but the projection helper keeps the isinstance check as belt-
+        and-suspenders for any future caller that doesn't go through the router.
+        """
+        from lookup.router import _project_cache_stats_to_transaction
+
         stats = {"api_calls": 2, "weird_string": "nope", "weird_none": None}
         mock_transaction = Mock()
         mock_scope = Mock()
         mock_scope.transaction = mock_transaction
 
-        with (
-            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
-            patch("lookup.router.get_cache_stats", return_value=stats),
-            patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
-        ):
-            mock_lookup.return_value = response
-            async with AsyncClient(
-                transport=ASGITransport(app=app_client), base_url="http://test"
-            ) as client:
-                await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+        with patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope):
+            _project_cache_stats_to_transaction(stats)
 
         actual_calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
         assert actual_calls == {"lml.cache.api_calls": 2}
 
     @pytest.mark.asyncio
     async def test_cache_stats_projection_called_with_raw_get_cache_stats_return(self, app_client):
-        """The projection helper must be invoked with the exact object returned by
-        get_cache_stats(), not with response.cache_stats. Once wxyc-shared#86 ships
-        a typed CacheStats Pydantic model, assigning a dict to response.cache_stats
-        will auto-convert it into a model instance (whose `.items()` method does not
-        exist), and the projection would AttributeError. Reading from the raw return
-        value of get_cache_stats() insulates the projection from that future shape change.
+        """The projection helper must be invoked with the exact dict returned by
+        get_cache_stats(), not with response.cache_stats. response.cache_stats is
+        now a typed CacheStats Pydantic model (wxyc-shared#86), whose `.items()`
+        method does not exist; the projection iterates via `.items()` so passing
+        the model would AttributeError. Reading from the raw return value of
+        get_cache_stats() keeps the projection working regardless.
         """
-        stats = {"api_calls": 4, "pg_hits": 2}
+        stats = _full_cache_stats()
         response = LookupResponse(results=[], search_type="direct")
 
         with (
@@ -269,8 +282,8 @@ class TestHandleLookup:
         passed_arg = mock_project.call_args.args[0]
         assert passed_arg is stats, (
             "_project_cache_stats_to_transaction must be called with the raw dict "
-            "returned by get_cache_stats(), not with response.cache_stats (which may "
-            "be coerced into a typed Pydantic model in the future)."
+            "returned by get_cache_stats(), not with response.cache_stats (which is "
+            "now a typed CacheStats Pydantic model)."
         )
 
     @pytest.mark.asyncio
@@ -286,41 +299,7 @@ class TestHandleLookup:
 
         with (
             patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
-            patch("lookup.router.get_cache_stats", return_value={"api_calls": 1}),
-            patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
-        ):
-            mock_lookup.return_value = response
-            async with AsyncClient(
-                transport=ASGITransport(app=app_client), base_url="http://test"
-            ) as client:
-                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
-
-        assert resp.status_code == 200
-
-    @pytest.mark.asyncio
-    async def test_cache_stats_projection_handles_non_dict_object_gracefully(self, app_client):
-        """End-to-end forward-compat: when get_cache_stats() returns a model-like
-        object (no `.items()`), the projection must not break the request. This is
-        the live-fire version of the future-bug from wxyc-shared#86: the projection's
-        try/except must catch the AttributeError so the request still 200s.
-        """
-        from dataclasses import dataclass
-
-        @dataclass
-        class FakeCacheStatsModel:
-            # Mimics a Pydantic v2 BaseModel: attribute access works, no `.items()`.
-            api_calls: int = 7
-            pg_hits: int = 3
-
-        fake_stats = FakeCacheStatsModel()
-        response = LookupResponse(results=[], search_type="direct")
-        mock_transaction = Mock()
-        mock_scope = Mock()
-        mock_scope.transaction = mock_transaction
-
-        with (
-            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
-            patch("lookup.router.get_cache_stats", return_value=fake_stats),
+            patch("lookup.router.get_cache_stats", return_value=_full_cache_stats()),
             patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope),
         ):
             mock_lookup.return_value = response
