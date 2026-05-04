@@ -970,6 +970,26 @@ class LookupResultItem(BaseModel):
     reconciled_identity: ReconciledIdentity | None = None
 
 
+class CacheStats(BaseModel):
+    memory_hits: conint(ge=0) = Field(
+        ..., description="Hits in LML's per-process in-memory TTL cache"
+    )
+    pg_hits: conint(ge=0) = Field(..., description="Hits in the discogs-cache PostgreSQL cache")
+    pg_misses: conint(ge=0) = Field(
+        ...,
+        description="Misses in the discogs-cache PostgreSQL cache (forced an API call or fallback)",
+    )
+    api_calls: conint(ge=0) = Field(
+        ..., description="Number of Discogs API calls made during the lookup"
+    )
+    pg_time_ms: confloat(ge=0.0) = Field(
+        ..., description="Total milliseconds spent in PostgreSQL cache lookups"
+    )
+    api_time_ms: confloat(ge=0.0) = Field(
+        ..., description="Total milliseconds spent in Discogs API calls"
+    )
+
+
 class SearchType(StrEnum):
     direct = "direct"
     fallback = "fallback"
@@ -998,9 +1018,7 @@ class LookupResponse(BaseModel):
     corrected_artist: str | None = Field(
         None, description="Fuzzy-corrected artist name if different from the original"
     )
-    cache_stats: dict[str, Any] | None = Field(
-        None, description="Cache hit/miss statistics from the lookup"
-    )
+    cache_stats: CacheStats | None = None
 
 
 class DiscogsTrackItem(BaseModel):
