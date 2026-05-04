@@ -26,7 +26,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: 'pip'
-      - run: pip install ruff
+      # Install the project's pinned ruff (see pyproject.toml dev deps) so a
+      # ruff release with new lint rules cannot silently fail this job on an
+      # unrelated PR. See WXYC/library-metadata-lookup#249.
+      - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
 
@@ -40,7 +43,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: 'pip'
-      - run: pip install "datamodel-code-generator[http]" ruff
+      # Install the project's pinned datamodel-code-generator + ruff (see
+      # pyproject.toml dev deps) so a new release with different generated-code
+      # formatting cannot silently fail this job on an unrelated PR. See
+      # WXYC/library-metadata-lookup#249. The script prefers .venv/bin/ then
+      # falls back to PATH, where the editable install lands the binaries.
+      - run: pip install -e ".[dev]"
       - run: bash scripts/generate_api_models.sh
       - name: Check for drift
         run: git diff --exit-code generated/
