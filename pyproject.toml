@@ -32,9 +32,14 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-httpx>=0.22.0",
     "pytest-cov>=4.0.0",
-    "ruff>=0.1.0",
+    # ruff, mypy, and datamodel-code-generator are pinned (not >=) so a new
+    # release that changes lint rules, type-check rules, or generated-code
+    # formatting cannot silently fail CI on an unrelated PR. Bumps should be
+    # deliberate, reviewable PRs. See WXYC/library-metadata-lookup#244 (mypy)
+    # and #249 (datamodel-codegen + ruff).
+    "ruff==0.15.6",
     "mypy==1.19.1",
-    "datamodel-code-generator[http]>=0.26.0",
+    "datamodel-code-generator[http]==0.56.1",
 ]
 
 [tool.uv.sources]
