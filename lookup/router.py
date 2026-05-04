@@ -19,6 +19,7 @@ from core.telemetry import RequestTelemetry, get_cache_stats, init_cache_stats
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
 from discogs.service import DiscogsService
+from generated.api_models import CacheStats
 from identity.dependencies import get_entity_store
 from library.db import LibraryDB
 from lookup.models import LookupRequest, LookupResponse
@@ -113,13 +114,12 @@ async def handle_lookup(
             http_client=http_client,
         )
 
-        # Attach cache stats. Read from the raw dict returned by
-        # get_cache_stats() before assignment to response.cache_stats: once
-        # wxyc-shared#86 ships a typed CacheStats Pydantic model, assigning
-        # the dict to response.cache_stats will auto-convert it into a model
-        # instance, and the projection (which calls `.items()`) would break.
+        # Attach cache stats. wxyc-shared#86 has shipped the typed CacheStats
+        # Pydantic model, so the response field is no longer dict-shaped —
+        # convert before assignment. Keep the raw dict around for the Sentry
+        # projection (which iterates via `.items()`).
         stats = get_cache_stats()
-        response.cache_stats = stats
+        response.cache_stats = CacheStats(**stats) if stats else None
 
         # Project cache_stats onto the active Sentry transaction so it joins
         # against the trace in Sentry's trace explorer (alongside latency,
