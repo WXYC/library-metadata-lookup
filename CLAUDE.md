@@ -201,6 +201,24 @@ Optional:
 - `LML_API_KEY` -- Bearer token required from tubafrenzy / Backend-Service callers (see "Inbound Auth" below)
 - `LML_REQUIRE_AUTH` -- When `true`, enforce `LML_API_KEY` on protected endpoints. Default `false` (see rollout phasing in `core/auth.py`)
 
+### Cross-cache-identity feature flags
+
+Per-cache toggles for which `wxyc_library` hook table the matcher reads (legacy schema vs. new normalized schema), plus an emergency rollback flag for the §3.2.2.1 manual-override skip endpoint. All default `false`.
+
+The **canonical inventory** (with naming-convention rationale, phase state machine, rollout-checklist locations, and approval gates) lives in `WXYC/Backend-Service/CLAUDE.md` "Cross-cache-identity feature flags (canonical inventory)". When a flag is renamed or its default changes, both the canonical Backend section AND this list must update in the same PR; CI on this repo grep-asserts the names listed here match the §4.2 inventory.
+
+| Flag | Scope | Default | Set true when |
+|---|---|---|---|
+| `LML_USE_NEW_HOOK_DISCOGS` | per-cache (Docker discogs, port 5433) | `false` | Docker discogs cache parity-check passes 7 consecutive days |
+| `LML_USE_NEW_HOOK_DISCOGS_FULL` | per-cache (Homebrew full discogs) | `false` | Homebrew (full) discogs cache parity-check passes 7 consecutive days |
+| `LML_USE_NEW_HOOK_MUSICBRAINZ` | per-cache | `false` | musicbrainz cache parity-check passes 7 consecutive days |
+| `LML_USE_NEW_HOOK_WIKIDATA` | per-cache | `false` | wikidata cache parity-check passes 7 consecutive days |
+| `LML_MANUAL_OVERRIDE_CHECK_DISABLED` | global | `false` | Emergency rollback only — disables the §3.2.2.1 manual-override skip endpoint call. Backend's write rules still reject low-confidence reruns of manual rows correctly, just less efficiently. |
+
+Production location: Railway environment variables for the LML service. Updater is Jake via the Railway dashboard. The per-cache flags require 7 consecutive days of clean parity-check audit (E5 daily report); `LML_MANUAL_OVERRIDE_CHECK_DISABLED` is for unscheduled emergency rollback only.
+
+Plan reference: `WXYC/wiki/plans/library-hook-canonicalization-plan.md` §4.2.
+
 ### Inbound Auth (`LML_API_KEY`)
 
 `core/auth.py:require_lml_key` is a FastAPI dependency that validates `Authorization: Bearer <LML_API_KEY>` on every tubafrenzy / Backend-Service-facing endpoint. Wired in `main.py` via `app.include_router(..., dependencies=[Depends(require_lml_key)])` for the `lookup`, `library`, `discogs`, and `streaming` routers.

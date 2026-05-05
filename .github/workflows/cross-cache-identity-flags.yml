@@ -1,0 +1,29 @@
+name: Cross-cache-identity flag-doc consistency
+
+# Asserts that the LML-owned cross-cache-identity feature flags listed in
+# CLAUDE.md match the §4.2 locked inventory. Runs on every PR (including
+# doc-only ones — the existing ci.yml ignores `*.md` paths, but this check
+# specifically guards CLAUDE.md drift, so it must run unconditionally).
+#
+# Plan reference: WXYC/wiki plans/library-hook-canonicalization-plan.md §4.2.
+
+on:
+  pull_request:
+    paths:
+      - 'CLAUDE.md'
+      - 'scripts/check_cross_cache_identity_flags.sh'
+      - '.github/workflows/cross-cache-identity-flags.yml'
+  push:
+    branches: [main, prod]
+    paths:
+      - 'CLAUDE.md'
+      - 'scripts/check_cross_cache_identity_flags.sh'
+      - '.github/workflows/cross-cache-identity-flags.yml'
+
+jobs:
+  check:
+    name: Flag-doc consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check_cross_cache_identity_flags.sh
