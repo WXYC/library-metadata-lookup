@@ -1,8 +1,8 @@
 """Unit tests for matching functions (relocated from core/matching.py)."""
 
 import pytest
-from wxyc_etl.text import is_compilation_artist, strip_diacritics
-from wxyc_etl.text import normalize_artist_name as normalize_for_comparison
+from wxyc_etl.text import is_compilation_artist
+from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from core.search import detect_ambiguous_format
 from discogs.matching import (
@@ -12,43 +12,6 @@ from discogs.matching import (
 )
 from discogs.service import calculate_confidence
 from lookup.orchestrator import is_self_titled, map_library_format_to_discogs
-
-# ---------------------------------------------------------------------------
-# strip_diacritics
-# ---------------------------------------------------------------------------
-
-
-class TestStripDiacritics:
-    """Tests for Unicode diacritics removal."""
-
-    @pytest.mark.parametrize(
-        "input_text, expected",
-        [
-            ("Björk", "Bjork"),
-            ("Sigur Rós", "Sigur Ros"),
-            ("Zoé", "Zoe"),
-            ("Motörhead", "Motorhead"),
-            ("Godspeed You! Black Emperor", "Godspeed You! Black Emperor"),
-            ("Bjork", "Bjork"),
-            ("", ""),
-            ("Hüsker Dü", "Husker Du"),
-            ("Café Tacvba", "Cafe Tacvba"),
-        ],
-        ids=[
-            "bjork",
-            "sigur_ros",
-            "zoe",
-            "motorhead",
-            "punctuation_preserved",
-            "ascii_unchanged",
-            "empty_string",
-            "husker_du",
-            "cafe_tacvba",
-        ],
-    )
-    def test_strip_diacritics(self, input_text, expected):
-        assert strip_diacritics(input_text) == expected
-
 
 # ---------------------------------------------------------------------------
 # strip_discogs_suffix
@@ -113,17 +76,25 @@ class TestNormalizeForComparison:
             ("Björk", "bjork"),
             ("SIGUR RÓS", "sigur ros"),
             ("Motörhead", "motorhead"),
-            (None, ""),
             ("", ""),
             ("  Björk  ", "bjork"),
+            # Charter forms (wxyc-etl 0.2.0): Greek final-form sigma folds to medial,
+            # Cf code points (e.g. soft-hyphen U+00AD) are stripped, but ZWJ U+200D
+            # is preserved. Regression coverage for LML#168 (Στella) and the broader
+            # WX-2 normalizer charter migration.
+            ("Οδυσσεύς", "οδυσσευσ"),
+            ("Bjö­rk", "bjork"),
+            ("Bjö‍rk", "bjo‍rk"),
         ],
         ids=[
             "bjork_lowercase",
             "sigur_ros_uppercase",
             "motorhead",
-            "none_input",
             "empty_string",
             "trims_whitespace",
+            "greek_final_sigma_folds",
+            "soft_hyphen_stripped",
+            "zwj_preserved",
         ],
     )
     def test_normalize_for_comparison(self, input_text, expected):

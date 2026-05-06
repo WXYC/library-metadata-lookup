@@ -11,7 +11,7 @@ detection) lives in wxyc_etl.text.
 
 import re
 
-from wxyc_etl.text import normalize_artist_name as normalize_for_comparison
+from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 # Discogs disambiguation suffix: (2), (22), etc.
 _DISCOGS_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")
