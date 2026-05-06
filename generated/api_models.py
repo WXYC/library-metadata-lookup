@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import date as date_aliased
 from datetime import time as time_aliased
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, Field, RootModel, confloat, conint
@@ -920,6 +920,10 @@ class LookupRequest(BaseModel):
         None,
         description="Original request message (used for ambiguous format detection). Optional when structured fields (artist, album, song) are provided.\n",
     )
+    include_identity: bool | None = Field(
+        False,
+        description="Per cross-cache-identity plan §3.2.2 (E2-LML write contract). When true, the response carries an additional `identity` block (the §3.2.5 cascade's per-source resolution detail), and `api_version` is set to 2. When false (the default), the response is byte-identical to v0.5.0 — `identity` is absent and `api_version` is omitted. Backend's `library-identity-writer.ts` (E2-BS) sets this to true on every call; other consumers (catalog search, dj-site proxy, iOS apps) leave it false.\n",
+    )
 
 
 class LibraryCatalogItem(BaseModel):
@@ -990,6 +994,10 @@ class CacheStats(BaseModel):
     )
 
 
+class ApiVersion(IntEnum):
+    integer_2 = 2
+
+
 class SearchType(StrEnum):
     direct = "direct"
     fallback = "fallback"
@@ -999,26 +1007,62 @@ class SearchType(StrEnum):
     none = "none"
 
 
-class LookupResponse(BaseModel):
-    results: list[LookupResultItem] | None = Field([], validate_default=True)
-    search_type: SearchType | None = Field(
-        "none",
-        description="The search strategy that produced results: direct, fallback, alternative, compilation, song_as_artist, or none\n",
+class IdentitySource(StrEnum):
+    discogs = "discogs"
+    musicbrainz = "musicbrainz"
+    wikidata = "wikidata"
+    spotify = "spotify"
+    apple_music = "apple_music"
+    bandcamp = "bandcamp"
+
+
+class IdentityMethod(StrEnum):
+    manual = "manual"
+    cross_source_agreement = "cross_source_agreement"
+    exact_match = "exact_match"
+    name_variation = "name_variation"
+    member_group = "member_group"
+    alias_match = "alias_match"
+    trigram = "trigram"
+    llm = "llm"
+
+
+class IdentitySkipReason(StrEnum):
+    error = "error"
+    manual_override_protected = "manual_override_protected"
+    disabled = "disabled"
+    prerequisite_failed = "prerequisite_failed"
+
+
+class IdentityResolution(BaseModel):
+    source: IdentitySource
+    attempted: bool = Field(
+        ...,
+        description="True when this source's leg actually ran (whether or not it found a match). False when it was skipped — `reason` is populated, `external_id`/`method`/`confidence` are NULL.\n",
     )
-    song_not_found: bool | None = Field(
-        False,
-        description="True if search fell back to artist-only (track not confirmed on results)",
+    external_id: str | None = Field(
+        None,
+        description="The external identifier this leg resolved to (Discogs release ID, MusicBrainz MBID, Wikidata QID, Spotify URI suffix, Apple Music ID, Bandcamp slug). Stored as a string regardless of the source's native type so the API surface is uniform; Backend casts to the per-source column type when writing `library_identity_source`. NULL when `attempted: false`, or when the leg ran but found no match.\n",
     )
-    found_on_compilation: bool | None = Field(
-        False, description="True if the track was found on a compilation album"
+    method: IdentityMethod | None = Field(
+        None,
+        description="The matcher method that produced the resolution. NULL when `attempted: false` or when the leg ran but found no match.\n",
     )
-    context_message: str | None = Field(
-        None, description="Human-readable context string for display"
+    confidence: confloat(ge=0.0, le=1.0) | None = Field(
+        None,
+        description="Confidence in [0, 1]. Must fall within the method's locked range from plan §3.4.1 — Backend's writer rejects rows where confidence is out of range. NULL when `attempted: false` or when the leg ran but found no match.\n",
     )
-    corrected_artist: str | None = Field(
-        None, description="Fuzzy-corrected artist name if different from the original"
+    reason: IdentitySkipReason | None = Field(
+        None,
+        description="Required when `attempted: false`; absent or NULL otherwise.\n",
     )
-    cache_stats: CacheStats | None = None
+
+
+class LookupIdentityBlock(BaseModel):
+    resolved: list[IdentityResolution] = Field(
+        ...,
+        description="One entry per known source. Order is stable (matches the `IdentitySource` enum order). Always populated even when no source resolved — the array carries `attempted: false` entries in that case.\n",
+    )
 
 
 class DiscogsTrackItem(BaseModel):
@@ -1257,3 +1301,30 @@ class SpotifyTrackResponse(BaseModel):
     artist: str = Field(..., description="Primary artist name")
     album: str = Field(..., description="Album name")
     artworkUrl: str | None = Field(None, description="Album artwork URL from Spotify")
+
+
+class LookupResponse(BaseModel):
+    api_version: ApiVersion | None = Field(
+        None,
+        description="Present and equal to 2 only when the request set `include_identity: true`. Absent for the v1-compatible shape so existing consumers see byte-identical responses.\n",
+    )
+    results: list[LookupResultItem] | None = Field([], validate_default=True)
+    search_type: SearchType | None = Field(
+        "none",
+        description="The search strategy that produced results: direct, fallback, alternative, compilation, song_as_artist, or none\n",
+    )
+    song_not_found: bool | None = Field(
+        False,
+        description="True if search fell back to artist-only (track not confirmed on results)",
+    )
+    found_on_compilation: bool | None = Field(
+        False, description="True if the track was found on a compilation album"
+    )
+    context_message: str | None = Field(
+        None, description="Human-readable context string for display"
+    )
+    corrected_artist: str | None = Field(
+        None, description="Fuzzy-corrected artist name if different from the original"
+    )
+    cache_stats: CacheStats | None = None
+    identity: LookupIdentityBlock | None = None
