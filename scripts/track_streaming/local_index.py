@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import NamedTuple
 
-from wxyc_etl.text import normalize_artist_name as normalize_for_comparison
+from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from scripts.streaming_availability.matching import score_match
 

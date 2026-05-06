@@ -6,7 +6,7 @@ import aiosqlite
 from cachetools import TTLCache  # type: ignore[import-untyped]
 from rapidfuzz import fuzz
 from wxyc_etl.schema import library_columns
-from wxyc_etl.text import normalize_artist_name as normalize_for_comparison
+from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from library.models import LibraryItem
 

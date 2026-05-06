@@ -33,7 +33,8 @@ import logging
 import re
 from dataclasses import dataclass
 
-from wxyc_etl.text import normalize_artist_name, split_artist_name
+from wxyc_etl.text import split_artist_name
+from wxyc_etl.text import to_match_form as normalize_artist_name
 
 from scripts.entity_resolution.sources import PgSource
 

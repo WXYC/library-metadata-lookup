@@ -23,7 +23,7 @@ dependencies = [
     "aiolimiter>=1.1.0",
     "sentry-sdk[fastapi]>=2.0.0",
     "python-multipart>=0.0.6",
-    "wxyc-etl>=0.1.0",
+    "wxyc-etl>=0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -41,9 +41,6 @@ dev = [
     "mypy==1.19.1",
     "datamodel-code-generator[http]==0.56.1",
 ]
-
-[tool.uv.sources]
-wxyc-etl = { path = "../wxyc-etl/wxyc-etl-python", editable = true }
 
 [build-system]
 requires = ["setuptools>=65.0", "wheel"]

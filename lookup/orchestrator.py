@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 import httpx
 from wxyc_etl.text import is_compilation_artist
-from wxyc_etl.text import normalize_artist_name as normalize_for_comparison
+from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from core.search import (
     build_strategies,

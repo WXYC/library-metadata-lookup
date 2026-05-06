@@ -544,7 +544,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.6" },
     { name = "sentry-sdk", extras = ["fastapi"], specifier = ">=2.0.0" },
     { name = "uvicorn", specifier = ">=0.24.0" },
-    { name = "wxyc-etl", editable = "../wxyc-etl/wxyc-etl-python" },
+    { name = "wxyc-etl", specifier = ">=0.2.0" },
 ]
 provides-extras = ["dev"]
 
@@ -1254,16 +1254,15 @@ wheels = [
 
 [[package]]
 name = "wxyc-etl"
-source = { editable = "../wxyc-etl/wxyc-etl-python" }
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "python-json-logger" },
     { name = "sentry-sdk" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
-    { name = "python-json-logger", specifier = ">=2.0" },
-    { name = "sentry-sdk", specifier = ">=2.0" },
+sdist = { url = "https://files.pythonhosted.org/packages/01/2b/456c14ace24a8436eee473dfd3279a2ebc10739541795ce0b1cc55859d6e/wxyc_etl-0.2.0.tar.gz", hash = "sha256:27f22e88aaa4d1aa2d58b235b9d912816fb94e79f213f7302aa3ceb1ba2fc7ae", size = 126611, upload-time = "2026-05-06T05:26:59.598Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c2/14/7b04ce851ccb8d78b38fc52561b13908527a276fc64115eea4e6fc14a9a0/wxyc_etl-0.2.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:7e1c033c27e3b5414aa92964526bc51b1d7440a0fe070f0ef43502f9f9440091", size = 790009, upload-time = "2026-05-06T05:26:55.337Z" },
+    { url = "https://files.pythonhosted.org/packages/52/34/ec077356c1eb071583c7f3858f9c19fd8d2c7ad2525e152acd05321ed51f/wxyc_etl-0.2.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:1d69370e8fac4a22af294c10bde8b400817715331f4f4e1e848858411ffaa7ff", size = 824551, upload-time = "2026-05-06T05:26:56.818Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/0f/fec4b411456cbcbc08788b64ae751573627129d5b521df2505866c107df6/wxyc_etl-0.2.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ffb034d439b4acf0510e283a4a67b58e72a4249bdaf1e3bb36452722cdd4d6ab", size = 1050818, upload-time = "2026-05-06T05:26:58.405Z" },
 ]
-provides-extras = ["dev"]
