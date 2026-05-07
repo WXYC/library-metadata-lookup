@@ -32,13 +32,16 @@ DATABASE_URL = os.getenv(
 
 CORPUS_ENTRIES = list(iter_entries())
 
-# Inputs PostgreSQL TEXT cannot store. Keyed by (category, input). The SQL
-# standard forbids U+0000 in character types; psycopg/asyncpg both reject
-# it at protocol level. App-layer strip belongs to WX-3, not WX-1.
-PG_TEXT_XFAIL_INPUTS: dict[tuple[str, str], str] = {
-    ("quoting", "null\x00byte"): (
-        "[lml:pg-null-byte] PostgreSQL TEXT rejects U+0000 (SQL standard)"
-    ),
+# Inputs whose stored form differs from ``entry["input"]`` because
+# ``EntityStore`` strips them at the write boundary. PostgreSQL TEXT cannot
+# carry U+0000 (SQL standard 22021); per WXYC/docs#18 the org-wide policy is
+# to strip at every PG TEXT write boundary. The corpus keeps the original
+# input bytes — this map records what comes back out. The vendored
+# ``charset-torture.json`` is SHA-pinned to ``@wxyc/shared``; this override
+# lives in-repo because the strip is an LML-side decision and the corpus's
+# ``expected_storage`` field remains the upstream byte-preservation contract.
+PG_TEXT_STRIP_OVERRIDES: dict[tuple[str, str], str] = {
+    ("quoting", "null\x00byte"): "nullbyte",
 }
 
 
@@ -91,14 +94,18 @@ async def test_entity_identity_storage_roundtrip(
     entry: CharsetTortureEntry,
     request: pytest.FixtureRequest,
 ) -> None:
-    """upsert_identity → get_identity must preserve library_name byte-for-byte."""
-    xfail_reason = PG_TEXT_XFAIL_INPUTS.get((entry["category"], entry["input"]))
-    if xfail_reason is not None:
-        request.applymarker(pytest.mark.xfail(reason=xfail_reason, strict=True, raises=Exception))
+    """upsert_identity → get_identity must preserve library_name byte-for-byte.
+
+    Exception: inputs in ``PG_TEXT_STRIP_OVERRIDES`` are stripped at the write
+    boundary (see WXYC/docs#18) and read back in their stripped form.
+    """
+    expected_stored = PG_TEXT_STRIP_OVERRIDES.get(
+        (entry["category"], entry["input"]), entry["input"]
+    )
 
     upserted = await entity_store.upsert_identity(library_name=entry["input"])
     assert upserted is not None, f"{entry['category']}: upsert returned None"
-    assert upserted.library_name == entry["input"], (
+    assert upserted.library_name == expected_stored, (
         f"{entry['category']}: upsert lost bytes ({entry['notes']})"
     )
 
@@ -106,7 +113,7 @@ async def test_entity_identity_storage_roundtrip(
     assert fetched is not None, (
         f"{entry['category']}: get_identity could not locate row ({entry['notes']!r})"
     )
-    assert fetched.library_name == entry["input"], (
+    assert fetched.library_name == expected_stored, (
         f"{entry['category']}: read-back lost bytes ({entry['notes']})"
     )
     assert fetched.id == upserted.id

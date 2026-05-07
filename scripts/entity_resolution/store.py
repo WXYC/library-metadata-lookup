@@ -15,6 +15,20 @@ from scripts.entity_resolution.sources import PgSource
 logger = logging.getLogger(__name__)
 
 
+def _strip_nul(value: str | None) -> str | None:
+    """Strip U+0000 from a string before sending it to a PostgreSQL TEXT column.
+
+    PostgreSQL TEXT cannot store U+0000 (psycopg/asyncpg raise
+    ``CharacterNotInRepertoireError``). Per WXYC/docs#18 the org-wide policy
+    is to strip at the write boundary. Preserves ``None`` so COALESCE-based
+    upserts continue to skip absent fields rather than overwriting them with
+    the empty string.
+    """
+    if value is None:
+        return None
+    return value.replace("\x00", "")
+
+
 @dataclass
 class Identity:
     """A row from ``entity.identity``."""
@@ -121,18 +135,25 @@ class EntityStore:
         Uses ``ON CONFLICT ... DO UPDATE`` with ``COALESCE`` so that populated
         fields are never overwritten with NULL.
 
+        Strips U+0000 from every TEXT-bound argument before INSERT. PostgreSQL
+        TEXT cannot store U+0000 (the SQL standard forbids it; psycopg/asyncpg
+        surface it as ``CharacterNotInRepertoireError``). Per WXYC/docs#18 the
+        org-wide policy is to strip at the write boundary — U+0000 in artist
+        metadata is always corruption, never intent. Idempotent and preserves
+        ``None`` semantics.
+
         Returns:
             The upserted Identity, or None if the query failed.
         """
         record = await self._pg.fetchone(
             _UPSERT_IDENTITY_SQL,
-            library_name,
+            _strip_nul(library_name),
             discogs_artist_id,
-            wikidata_qid,
-            musicbrainz_artist_id,
-            spotify_artist_id,
-            apple_music_artist_id,
-            bandcamp_id,
+            _strip_nul(wikidata_qid),
+            _strip_nul(musicbrainz_artist_id),
+            _strip_nul(spotify_artist_id),
+            _strip_nul(apple_music_artist_id),
+            _strip_nul(bandcamp_id),
         )
         if record is None:
             return None
@@ -141,10 +162,14 @@ class EntityStore:
     async def get_identity(self, library_name: str) -> Identity | None:
         """Look up an identity by library name.
 
+        ``library_name`` is U+0000-stripped before the query so a caller that
+        looked up a value it just upserted finds the same row, even if the
+        original input contained NUL bytes.
+
         Returns:
             The matching Identity, or None if not found.
         """
-        record = await self._pg.fetchone(_GET_IDENTITY_SQL, library_name)
+        record = await self._pg.fetchone(_GET_IDENTITY_SQL, _strip_nul(library_name))
         if record is None:
             return None
         return _record_to_identity(record)
@@ -158,7 +183,7 @@ class EntityStore:
         Returns:
             List of matching identities (empty list if none or on failure).
         """
-        records = await self._pg.fetchall(_GET_BY_STATUS_SQL, status)
+        records = await self._pg.fetchall(_GET_BY_STATUS_SQL, _strip_nul(status))
         if records is None:
             return []
         return [_record_to_identity(r) for r in records]
@@ -170,7 +195,7 @@ class EntityStore:
             identity_id: The ``entity.identity.id`` to update.
             status: New reconciliation status value.
         """
-        await self._pg.execute(_UPDATE_STATUS_SQL, identity_id, status)
+        await self._pg.execute(_UPDATE_STATUS_SQL, identity_id, _strip_nul(status))
 
     async def log_reconciliation(
         self,
@@ -192,8 +217,8 @@ class EntityStore:
         await self._pg.execute(
             _LOG_RECONCILIATION_SQL,
             identity_id,
-            source,
-            external_id,
+            _strip_nul(source),
+            _strip_nul(external_id),
             confidence,
-            method,
+            _strip_nul(method),
         )
