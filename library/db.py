@@ -39,6 +39,24 @@ STOPWORDS = frozenset(
 # Default path to SQLite database (relative to project root)
 DEFAULT_DB_PATH = Path(__file__).parent.parent / "library.db"
 
+# FTS5 tokenizer extends unicode61 with the Symbol category and U+200D ZWJ so
+# bare-emoji rows (`👋`, `🎵`) and ZWJ graphemes (`👨‍👩‍👧‍👦`, `🇺🇸`) get tokenized.
+# The default unicode61 categories ('L* N* Co') drop everything else, leaving
+# the FTS index with no token to anchor a supplementary-plane row on.
+# Cf is NOT included wholesale — that would merge tokens around zero-width-space,
+# BOM, soft-hyphen, etc. ZWJ is opted in explicitly via tokenchars.
+# Production schema in WXYC/discogs-etl's export_to_sqlite.py must match.
+LIBRARY_FTS_TOKENIZER = "unicode61 categories 'L* N* Co S*' tokenchars '‍'"
+
+LIBRARY_FTS_CREATE_SQL = f"""
+    CREATE VIRTUAL TABLE library_fts USING fts5(
+        title, artist,
+        tokenize="{LIBRARY_FTS_TOKENIZER}",
+        content=library,
+        content_rowid=id
+    )
+"""
+
 # Module-level caches for library search results.
 # Lazy-initialized from settings. Cleared when the database is closed/replaced.
 _artist_cache: TTLCache | None = None
