@@ -34,6 +34,17 @@ import re
 from dataclasses import dataclass
 
 from wxyc_etl.text import split_artist_name
+
+# NOTE(WXYC/library-metadata-lookup#262): per `library-hook-canonicalization-plan`
+# §3.3.1 step 5 the resolver path is the canonical identity-matching consumer
+# and should call `to_identity_match_form`, but the swap is deferred until the
+# PG column expressions adopt a matching `wxyc_identity_match_artist()` analog
+# (per `wxyc-etl/docs/normalization.md`). Today the column side uses
+# `lower(f_unaccent(col))` (≈ `to_match_form` semantics); switching the input
+# alone strips leading articles asymmetrically (input "The Beatles" → "beatles",
+# col → "the beatles") and collapses the Stage 5 preprocessing variants into
+# the canonical key, breaking exact matches for Discogs rows with a "The "
+# prefix.
 from wxyc_etl.text import to_match_form as normalize_artist_name
 
 from scripts.entity_resolution.sources import PgSource
