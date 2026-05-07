@@ -16,13 +16,17 @@ logger = logging.getLogger(__name__)
 
 
 def _strip_nul(value: str | None) -> str | None:
-    """Strip U+0000 from a string before sending it to a PostgreSQL TEXT column.
+    """Strip U+0000 from a string before any PostgreSQL TEXT op.
 
-    PostgreSQL TEXT cannot store U+0000 (psycopg/asyncpg raise
-    ``CharacterNotInRepertoireError``). Per WXYC/docs#18 the org-wide policy
-    is to strip at the write boundary. Preserves ``None`` so COALESCE-based
-    upserts continue to skip absent fields rather than overwriting them with
-    the empty string.
+    PostgreSQL TEXT cannot carry U+0000 (the SQL standard forbids it;
+    psycopg/asyncpg surface it as ``CharacterNotInRepertoireError``). Per
+    WXYC/docs#18 the org-wide policy is to strip at every PG TEXT boundary —
+    U+0000 in artist metadata is always corruption, never intent. Applied to
+    INSERT/UPDATE writes AND to SELECT-by-name lookups so a caller looking
+    up a value it just upserted finds the stored row.
+
+    Preserves ``None`` so COALESCE-based upserts continue to skip absent
+    fields rather than overwriting them with the empty string. Idempotent.
     """
     if value is None:
         return None
@@ -135,12 +139,9 @@ class EntityStore:
         Uses ``ON CONFLICT ... DO UPDATE`` with ``COALESCE`` so that populated
         fields are never overwritten with NULL.
 
-        Strips U+0000 from every TEXT-bound argument before INSERT. PostgreSQL
-        TEXT cannot store U+0000 (the SQL standard forbids it; psycopg/asyncpg
-        surface it as ``CharacterNotInRepertoireError``). Per WXYC/docs#18 the
-        org-wide policy is to strip at the write boundary — U+0000 in artist
-        metadata is always corruption, never intent. Idempotent and preserves
-        ``None`` semantics.
+        Every TEXT-bound argument is passed through ``_strip_nul`` before the
+        query — same WX-3.B boundary policy as the read paths in this class
+        (see ``_strip_nul`` for the rationale).
 
         Returns:
             The upserted Identity, or None if the query failed.

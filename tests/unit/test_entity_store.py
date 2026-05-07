@@ -6,7 +6,32 @@ import pytest
 
 from scripts.entity_resolution.store import (
     EntityStore,
+    _strip_nul,
 )
+
+
+class TestStripNul:
+    """Locks the WX-3.B boundary contract on the private helper."""
+
+    def test_returns_none_for_none(self) -> None:
+        assert _strip_nul(None) is None
+
+    def test_returns_input_unchanged_when_no_nul(self) -> None:
+        assert _strip_nul("Stereolab") == "Stereolab"
+
+    def test_strips_single_nul(self) -> None:
+        assert _strip_nul("a\x00b") == "ab"
+
+    def test_strips_all_nuls(self) -> None:
+        assert _strip_nul("\x00a\x00b\x00") == "ab"
+
+    def test_empty_string_passthrough(self) -> None:
+        assert _strip_nul("") == ""
+
+    def test_idempotent(self) -> None:
+        once = _strip_nul("a\x00b\x00c")
+        twice = _strip_nul(once)
+        assert once == twice == "abc"
 
 
 @pytest.fixture
