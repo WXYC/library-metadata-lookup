@@ -29,7 +29,7 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 
-from library.db import LibraryDB
+from library.db import LIBRARY_FTS_CREATE_SQL, LibraryDB
 from tests.charset_torture import CharsetTortureEntry, entry_id, iter_entries
 
 CORPUS_ENTRIES = list(iter_entries())
@@ -37,14 +37,7 @@ CORPUS_ENTRIES = list(iter_entries())
 # Inputs whose `LibraryDB.search()` round-trip fails today. Keyed by
 # (category, input) so additions are explicit and grep-able. WX-3 auditors
 # search the codebase by the bracketed tag prefix.
-SEARCH_XFAIL_INPUTS: dict[tuple[str, str], str] = {
-    ("emoji", "👋"): "[lml:fts5-supplementary-plane] bare 4-byte emoji not tokenized by unicode61",
-    ("emoji", "🎵"): "[lml:fts5-supplementary-plane] bare 4-byte emoji not tokenized by unicode61",
-    ("emoji", "🎸"): "[lml:fts5-supplementary-plane] bare 4-byte emoji not tokenized by unicode61",
-    ("zwj", "👨‍👩‍👧‍👦"): "[lml:zwj-grapheme] ZWJ family sequence not segmented",
-    ("zwj", "🇺🇸"): "[lml:zwj-grapheme] regional indicator pair not segmented",
-    ("zwj", "👨‍🎤"): "[lml:zwj-grapheme] ZWJ man+microphone not segmented",
-}
+SEARCH_XFAIL_INPUTS: dict[tuple[str, str], str] = {}
 
 
 @pytest_asyncio.fixture
@@ -65,13 +58,7 @@ async def empty_library_db():
             format TEXT
         )
     """)
-    await conn.execute("""
-        CREATE VIRTUAL TABLE library_fts USING fts5(
-            title, artist,
-            content=library,
-            content_rowid=id
-        )
-    """)
+    await conn.execute(LIBRARY_FTS_CREATE_SQL)
     await conn.commit()
     db._conn = conn
     yield db
