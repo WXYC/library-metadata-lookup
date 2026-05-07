@@ -46,7 +46,12 @@ DEFAULT_DB_PATH = Path(__file__).parent.parent / "library.db"
 # Cf is NOT included wholesale — that would merge tokens around zero-width-space,
 # BOM, soft-hyphen, etc. ZWJ is opted in explicitly via tokenchars.
 # Production schema in WXYC/discogs-etl's export_to_sqlite.py must match.
-LIBRARY_FTS_TOKENIZER = "unicode61 categories 'L* N* Co S*' tokenchars '‍'"
+#
+# Note: this string is embedded inside a double-quoted SQL attribute below;
+# it must not contain `"`. The U+200D ZWJ in `tokenchars` is written as the
+# explicit `\u200d` escape so the source stays unambiguous in editors and
+# diffs that render zero-width characters invisibly.
+LIBRARY_FTS_TOKENIZER = "unicode61 categories 'L* N* Co S*' tokenchars '\u200d'"
 
 LIBRARY_FTS_CREATE_SQL = f"""
     CREATE VIRTUAL TABLE library_fts USING fts5(
