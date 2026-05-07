@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from release.bandcamp_resolver import (
@@ -136,6 +137,47 @@ class TestFetchBandcampAlbumHtml:
         html = await fetch_bandcamp_album_html(client, "https://x.bandcamp.com/album/y")
 
         assert html is None
+
+    @pytest.mark.asyncio
+    async def test_forces_utf8_when_no_charset_in_content_type(self):
+        """Bandcamp serves UTF-8 but the response Content-Type may omit `charset=`.
+
+        When the charset is missing, httpx's autodetect can guess wrong (or fall
+        back to ISO-8859-1 if no detector is installed), producing mojibake on
+        diacritic-bearing artist/album names. The resolver must force UTF-8
+        decoding so the JSON-LD blob and downstream identity rows stay clean.
+
+        Reference: WXYC/library-metadata-lookup#260, WXYC/docs#17 (WX-3.D).
+        """
+        # Build a real httpx.Response with Content-Type lacking `charset=`.
+        # We pass `default_encoding="iso-8859-1"` to deterministically trigger
+        # the broken decode path the ticket describes — this is the byte-for-byte
+        # mojibake httpx produces on environments without charset-normalizer.
+        # A real Bandcamp page is mostly ASCII markup with a few diacritic bytes,
+        # which is exactly the shape autodetect struggles with.
+        artist = "Sigur Rós"
+        body = (
+            b'<html><head><script type="application/ld+json">{"@type":"MusicAlbum",'
+            b'"name":"( )","byArtist":{"name":"' + artist.encode("utf-8") + b'"}}'
+            b"</script></head><body>" + b"a" * 5000 + b"</body></html>"
+        )
+        response = httpx.Response(
+            200,
+            headers={"Content-Type": "text/html"},
+            content=body,
+            default_encoding="iso-8859-1",
+        )
+
+        client = MagicMock()
+        client._request_with_retry = AsyncMock(return_value=response)
+
+        html = await fetch_bandcamp_album_html(client, "https://sigurros.bandcamp.com/album/_")
+
+        assert html is not None
+        # Correctly decoded — the diacritic survived as a single Unicode codepoint.
+        assert "Sigur Rós" in html
+        # And the ISO-8859-1 mojibake form is absent.
+        assert "Sigur RÃ³s" not in html
 
 
 class TestResolveBandcampAlbum:
