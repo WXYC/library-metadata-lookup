@@ -160,6 +160,13 @@ async def fetch_bandcamp_album_html(client: BandcampClient, album_url: str) -> s
         return None
     if response is None or response.status_code != 200:
         return None
+    # Force UTF-8 decoding. Bandcamp serves UTF-8, but the Content-Type header
+    # sometimes omits `charset=`; httpx then either runs autodetect (if
+    # charset-normalizer is installed) or falls back to ISO-8859-1, both of
+    # which can mojibake diacritic-bearing artist/album names (e.g. "Sigur Rós"
+    # -> "Sigur RÃ³s") and land corrupt bytes in JSON-LD downstream.
+    # Reference: WXYC/library-metadata-lookup#260, WXYC/docs#17 (WX-3.D).
+    response.encoding = "utf-8"
     return response.text
 
 
