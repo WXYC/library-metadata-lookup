@@ -266,16 +266,7 @@ class TestFetchArtistCatalog:
 
     @pytest.mark.asyncio
     async def test_forces_utf8_when_no_charset_in_content_type(self):
-        """Bandcamp serves UTF-8 but the response Content-Type may omit `charset=`.
-
-        When the charset is missing, httpx falls back to its default encoding
-        (ISO-8859-1 unless `charset-normalizer` autodetects otherwise), producing
-        mojibake on diacritic-bearing album titles. The catalog fetch must force
-        UTF-8 decoding so titles like "Csillagrablók" survive the regex pass.
-
-        Reference: WXYC/library-metadata-lookup#265, WXYC/docs#19 (WX-3.F).
-        Mirrors the shape fixed in PR #263 for `release/bandcamp_resolver.py`.
-        """
+        # httpx defaults to ISO-8859-1 when Content-Type omits charset=; force UTF-8.
         title = "Csillagrablók"
         body = (
             b'<a href="/album/csillagrablok"><p class="title">'
