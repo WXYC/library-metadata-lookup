@@ -136,6 +136,10 @@ class BandcampClient(BaseStreamingClient):
         if resp is None or resp.status_code != 200:
             return []
 
+        # Bandcamp serves UTF-8 but its Content-Type often omits `charset=`;
+        # force UTF-8 so diacritic-bearing album titles don't mojibake. See
+        # release/bandcamp_resolver.py for the same shape.
+        resp.encoding = "utf-8"
         html = resp.text
         seen_paths: set[str] = set()
         albums: list[dict] = []

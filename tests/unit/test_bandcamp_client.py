@@ -263,3 +263,39 @@ class TestFetchArtistCatalog:
 
         albums = await client.fetch_artist_catalog("autechre")
         assert len(albums) == 1
+
+    @pytest.mark.asyncio
+    async def test_forces_utf8_when_no_charset_in_content_type(self):
+        """Bandcamp serves UTF-8 but the response Content-Type may omit `charset=`.
+
+        When the charset is missing, httpx falls back to its default encoding
+        (ISO-8859-1 unless `charset-normalizer` autodetects otherwise), producing
+        mojibake on diacritic-bearing album titles. The catalog fetch must force
+        UTF-8 decoding so titles like "Csillagrablók" survive the regex pass.
+
+        Reference: WXYC/library-metadata-lookup#265, WXYC/docs#19 (WX-3.F).
+        Mirrors the shape fixed in PR #263 for `release/bandcamp_resolver.py`.
+        """
+        title = "Csillagrablók"
+        body = (
+            b'<a href="/album/csillagrablok"><p class="title">'
+            + title.encode("utf-8")
+            + b"</p></a>"
+        )
+        response = httpx.Response(
+            200,
+            headers={"Content-Type": "text/html"},
+            content=body,
+            default_encoding="iso-8859-1",
+            request=httpx.Request("GET", "https://csillagrablok.bandcamp.com/music"),
+        )
+
+        client = BandcampClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(return_value=response)
+        client._http = mock_http
+
+        albums = await client.fetch_artist_catalog("csillagrablok")
+
+        assert len(albums) == 1
+        assert albums[0]["title"] == title
