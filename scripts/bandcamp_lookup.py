@@ -45,8 +45,7 @@ async def fetch_bandcamp_albums(
             if resp.status_code != 200:
                 return []
 
-            # Bandcamp omits `charset=` on most pages; force UTF-8 before
-            # reading resp.text so diacritics don't mojibake.
+            # Bandcamp omits charset= on most pages; force UTF-8 before resp.text.
             resp.encoding = "utf-8"
 
             # Extract album URLs and titles from the page
