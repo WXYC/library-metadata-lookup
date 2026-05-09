@@ -756,6 +756,59 @@ async def filter_results_by_track_validation(
     return None
 
 
+async def find_library_albums_with_cached_track(
+    db: LibraryDB,
+    song: str | None,
+    artist: str | None,
+    discogs_service: DiscogsService | None,
+    limit: int = MAX_SEARCH_RESULTS,
+) -> list[LibraryItem]:
+    """Find WXYC library albums whose Discogs cache entry lists ``song`` by ``artist``.
+
+    Used as a safety net after ``filter_results_by_track_validation`` fails to
+    confirm any artist-fallback candidate. The PG cache holds full Discogs
+    tracklist data with trigram-indexed track titles, so a single lookup can
+    answer "which releases by this artist contain this track?" in milliseconds —
+    even when the upstream ``resolve_albums_for_track`` / API path missed it.
+
+    Cache-only by design: skips any API fallback path. Returns ``[]`` cleanly
+    when the cache is unavailable, fails, or has nothing for the query.
+    """
+    if not discogs_service or not song or not artist:
+        return []
+    cache_service = getattr(discogs_service, "cache_service", None)
+    if cache_service is None:
+        return []
+
+    try:
+        cached_releases = await cache_service.search_releases_by_track(
+            track=song, artist=artist, limit=20
+        )
+    except Exception as e:
+        logger.warning(f"Cache lookup for track-album promotion failed: {e}")
+        return []
+
+    if not cached_releases:
+        return []
+
+    matches: list[LibraryItem] = []
+    seen_ids: set[int] = set()
+
+    for release in cached_releases:
+        candidate_items = await search_album_fuzzy(db, release.album)
+        for item in candidate_items:
+            if item.id in seen_ids:
+                continue
+            if not artist_matches_item(item, artist):
+                continue
+            matches.append(item)
+            seen_ids.add(item.id)
+            if len(matches) >= limit:
+                return matches
+
+    return matches
+
+
 async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id: int) -> str | None:
     """Try artist image, then label image, for a release with no cover art."""
     release = await discogs_service.get_release(release_id)
@@ -1154,6 +1207,18 @@ async def perform_lookup(
                 if validated:
                     library_results = validated
                     song_not_found = False
+                elif song_not_found:
+                    # Per-result validation confirmed nothing. Ask the local
+                    # PG cache directly: "any release by this artist whose
+                    # tracklist contains this song?" — and promote the matching
+                    # library album. Catches the case where the upstream
+                    # track→releases lookup missed a release the cache holds.
+                    promoted = await find_library_albums_with_cached_track(
+                        db, parsed.song, parsed.artist, discogs_service
+                    )
+                    if promoted:
+                        library_results = promoted
+                        song_not_found = False
         elif search_state.artist_fallback_results:
             # Compilation found, but the artist's own album may also contain the track.
             # Validate the artist fallback results (saved before compilation search

@@ -26,6 +26,7 @@ from lookup.orchestrator import (
     fetch_artwork_for_items,
     filter_results_by_artist,
     filter_results_by_track_validation,
+    find_library_albums_with_cached_track,
     resolve_albums_for_track,
     search_library_with_fallback,
     search_with_alternative_interpretation,
@@ -773,6 +774,195 @@ class TestFilterResultsByTrackValidation:
             items, "Flow Coma", "808 State", mock_discogs_service
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: find_library_albums_with_cached_track
+# ---------------------------------------------------------------------------
+
+
+class TestFindLibraryAlbumsWithCachedTrack:
+    """Tests for the cache-driven promotion safety net.
+
+    When the artist-only fallback returned albums that all fail track validation,
+    this helper consults the local Discogs PG cache directly: "give me releases
+    by this artist that contain this track" — and surfaces the matching WXYC
+    library albums. Catches the case where the upstream Discogs query in
+    `resolve_albums_for_track` missed the answer that the local cache holds.
+
+    Reproduces: "bucky skank by lee scratch perry" returned 5 unrelated Lee Perry
+    albums while skipping "Live at Maritime Hall", which the cache knows contains
+    that track.
+    """
+
+    def _cache_releases(self, *titles_and_artists):
+        from discogs.models import ReleaseInfo
+
+        return [
+            ReleaseInfo(
+                album=album,
+                artist=artist,
+                release_id=1000 + i,
+                release_url=f"https://discogs.com/release/{1000 + i}",
+                is_compilation=False,
+            )
+            for i, (album, artist) in enumerate(titles_and_artists)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_returns_library_album_when_cache_links_track_to_release(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """Cache says 'Bucky Skank' is on a release whose title matches a WXYC
+        library album by the same artist → that album is returned."""
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
+            return_value=self._cache_releases(
+                ("Lee Scratch Perry Live At Maritime Hall", "Lee 'Scratch' Perry")
+            )
+        )
+
+        maritime = make_library_item(
+            id=12682,
+            artist="Lee 'Scratch' Perry",
+            title="Live at Maritime Hall",
+        )
+        mock_library_db.search.return_value = [maritime]
+
+        result = await find_library_albums_with_cached_track(
+            mock_library_db,
+            "Bucky Skank",
+            "Lee 'Scratch' Perry",
+            mock_discogs_service,
+        )
+
+        assert len(result) == 1
+        assert result[0].id == 12682
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_without_discogs_service(self, mock_library_db):
+        result = await find_library_albums_with_cached_track(
+            mock_library_db, "Song", "Artist", None
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_without_cache_service(self, mock_library_db, mock_discogs_service):
+        """No PG cache attached → helper is a no-op (we don't fall back to the API)."""
+        mock_discogs_service.cache_service = None
+        result = await find_library_albums_with_cached_track(
+            mock_library_db, "Song", "Artist", mock_discogs_service
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_song_or_artist_missing(
+        self, mock_library_db, mock_discogs_service
+    ):
+        mock_discogs_service.cache_service = AsyncMock()
+        assert (
+            await find_library_albums_with_cached_track(
+                mock_library_db, None, "Artist", mock_discogs_service
+            )
+            == []
+        )
+        assert (
+            await find_library_albums_with_cached_track(
+                mock_library_db, "Song", None, mock_discogs_service
+            )
+            == []
+        )
+        # Cache should never be consulted when inputs are insufficient
+        mock_discogs_service.cache_service.search_releases_by_track.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_cache_has_no_matching_releases(
+        self, mock_library_db, mock_discogs_service
+    ):
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+        result = await find_library_albums_with_cached_track(
+            mock_library_db, "Song", "Artist", mock_discogs_service
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_skips_releases_with_no_library_match(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """Cache returns a release the WXYC library doesn't carry."""
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
+            return_value=self._cache_releases(("Some Bootleg Compilation", "Lee Perry"))
+        )
+        mock_library_db.search.return_value = []
+
+        result = await find_library_albums_with_cached_track(
+            mock_library_db, "Song", "Lee Perry", mock_discogs_service
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_filters_out_library_rows_with_wrong_artist(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """FTS returns an album with a matching title but a different artist."""
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
+            return_value=self._cache_releases(("Live at Maritime Hall", "Lee Perry"))
+        )
+        wrong_artist = make_library_item(
+            id=99, artist="Some Other Band", title="Live at Maritime Hall"
+        )
+        mock_library_db.search.return_value = [wrong_artist]
+
+        result = await find_library_albums_with_cached_track(
+            mock_library_db, "Bucky Skank", "Lee 'Scratch' Perry", mock_discogs_service
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_dedupes_when_multiple_releases_resolve_to_same_library_row(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """Two cache releases for the same album (different pressings) → one row."""
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
+            return_value=self._cache_releases(
+                ("Live at Maritime Hall", "Lee 'Scratch' Perry"),
+                ("Lee Scratch Perry Live At Maritime Hall", "Lee 'Scratch' Perry"),
+            )
+        )
+        maritime = make_library_item(
+            id=12682, artist="Lee 'Scratch' Perry", title="Live at Maritime Hall"
+        )
+        mock_library_db.search.return_value = [maritime]
+
+        result = await find_library_albums_with_cached_track(
+            mock_library_db,
+            "Bucky Skank",
+            "Lee 'Scratch' Perry",
+            mock_discogs_service,
+        )
+        assert len(result) == 1
+        assert result[0].id == 12682
+
+    @pytest.mark.asyncio
+    async def test_cache_failure_returns_empty_does_not_raise(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """Cache exceptions degrade gracefully — caller still gets a usable answer."""
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
+            side_effect=RuntimeError("cache offline")
+        )
+        result = await find_library_albums_with_cached_track(
+            mock_library_db,
+            "Song",
+            "Artist",
+            mock_discogs_service,
+        )
+        assert result == []
 
 
 # ---------------------------------------------------------------------------

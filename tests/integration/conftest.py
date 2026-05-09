@@ -87,6 +87,16 @@ SEED_ITEMS = [
     (39, "Confield", "Autechre", "EL", 16, 1, "Electronic", "CD"),
     (40, "1st Class", "Large Professor", "HH", 1, 1, "Hiphop", "CD"),
     (41, "...Destroys The Space Invaders", "Prince Jammy", "RE", 1, 1, "Reggae", "Vinyl"),
+    # Lee 'Scratch' Perry: cluster used by the cache-promotion regression test.
+    # Five fallback albums with low-id slots, plus "Live at Maritime Hall" deeper
+    # in the catalog -- mirrors the production layout where the song-bearing
+    # album sits past the artist-only FTS5 top-N slice.
+    (12663, "Chicken Scratch", "Lee 'Scratch' Perry", "Pe", 1, 1, "Reggae", "Vinyl"),
+    (12664, 'Ooh! Wah! 12"', "Lee 'Scratch' Perry", "Pe", 1, 2, "Reggae", "Vinyl"),
+    (12665, "History Mystery Prophecy", "Lee 'Scratch' Perry", "Pe", 1, 3, "Reggae", "Vinyl"),
+    (12680, "Arkology", "Lee 'Scratch' Perry", "Pe", 1, 17, "Reggae", "CD"),
+    (12684, "Dub Fire", "Lee 'Scratch' Perry", "Pe", 1, 21, "Reggae", "CD"),
+    (12682, "Live at Maritime Hall", "Lee 'Scratch' Perry", "Pe", 1, 20, "Reggae", "CD"),
 ]
 
 

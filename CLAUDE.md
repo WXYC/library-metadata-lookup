@@ -11,7 +11,7 @@ Library Metadata Lookup is a FastAPI service for WXYC radio that searches the li
 1. **Artist Correction**: Fuzzy match artist against library catalog to fix typos
 2. **Album Resolution**: If song provided without album, query Discogs for album names
 3. **Search Pipeline**: Execute strategies in order until results are found (see below)
-4. **Track Validation**: If fallback returned all artist albums, validate each against Discogs tracklists
+4. **Track Validation**: If fallback returned all artist albums, validate each against Discogs tracklists. When validation can't confirm any candidate AND we're showing artist-fallback results, `find_library_albums_with_cached_track()` consults the local PG cache directly ("releases by this artist whose tracklist contains this song") and promotes any matching library album over the unrelated fallback. Cache-only — never falls back to the API.
 5. **Artwork Fetch**: Fetch album art from Discogs for each result
 6. **Context Message**: Generate context string for the caller
 
