@@ -454,6 +454,127 @@ class TestPerformLookupFallback:
         assert len(response.results) == 1
         assert response.results[0].library_item.title == "A Night at the Opera"
 
+    @pytest.mark.asyncio
+    async def test_promotes_album_known_to_contain_track_from_local_cache(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """When per-result Discogs validation can't confirm any artist-fallback
+        candidate, the orchestrator should consult the local Discogs PG cache
+        for "releases by this artist containing this track" and promote the
+        matching library album.
+
+        Reproduces "bucky skank by lee scratch perry": the artist-only fallback
+        returned 5 unrelated Lee Perry albums, all failed validation, and the
+        library album that actually contains the song ("Live at Maritime Hall")
+        was never surfaced — even though the local cache had the answer.
+        """
+        # Five fallback albums that don't contain the track
+        fallback_items = [
+            LibraryItem(
+                id=12663,
+                artist="Lee 'Scratch' Perry",
+                title="Chicken Scratch",
+                call_letters="Pe",
+                artist_call_number=1,
+                release_call_number=1,
+                genre="Reggae",
+                format="vinyl",
+            ),
+            LibraryItem(
+                id=12664,
+                artist="Lee 'Scratch' Perry",
+                title='Ooh! Wah! 12"',
+                call_letters="Pe",
+                artist_call_number=1,
+                release_call_number=2,
+                genre="Reggae",
+                format="vinyl",
+            ),
+        ]
+        # The actual answer (in the library, but not in the fallback's top-N FTS slice)
+        maritime = LibraryItem(
+            id=12682,
+            artist="Lee 'Scratch' Perry",
+            title="Live at Maritime Hall",
+            call_letters="Pe",
+            artist_call_number=1,
+            release_call_number=20,
+            genre="Reggae",
+            format="cd",
+        )
+
+        mock_library_db.find_similar_artist.return_value = None
+
+        # Mirror the production FTS5 behavior: queries containing the song words
+        # ("bucky"/"skank") match nothing because no album *title* contains
+        # those tokens. Only the artist-only and album-title-based queries hit.
+        async def fake_search(query=None, **kwargs):
+            q = (query or "").lower()
+            if "bucky" in q or "skank" in q:
+                return []
+            if "maritime" in q:
+                return [maritime]
+            if "scratch" in q or "perry" in q:
+                return fallback_items
+            return []
+
+        mock_library_db.search.side_effect = fake_search
+
+        # Per-result validation fails for all fallback items (none contain the track)
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        mock_discogs_service.validate_track_on_release.return_value = False
+
+        from discogs.models import ReleaseInfo, TrackReleasesResponse
+
+        # Compilation strategy's two API calls return nothing (mirrors prod where
+        # the artist-only fallback isn't replaced by a compilation hit)
+        mock_discogs_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Bucky Skank",
+                artist="Lee 'Scratch' Perry",
+                releases=[],
+                total=0,
+                cached=False,
+            )
+        )
+
+        # The local PG cache holds the answer — Maritime Hall has Bucky Skank
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
+            return_value=[
+                ReleaseInfo(
+                    album="Lee Scratch Perry Live At Maritime Hall",
+                    artist="Lee 'Scratch' Perry",
+                    release_id=2865555,
+                    release_url="https://discogs.com/release/2865555",
+                    is_compilation=False,
+                ),
+            ]
+        )
+
+        request = LookupRequest(
+            artist="Lee 'Scratch' Perry",
+            song="Bucky Skank",
+            raw_message="bucky skank by lee scratch perry",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        titles = [r.library_item.title for r in response.results]
+        assert "Live at Maritime Hall" in titles, (
+            f"Cache-known album should be promoted; got: {titles}"
+        )
+        assert response.song_not_found is False, (
+            "Promoting a confirmed track-bearing album should clear song_not_found"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - compilation search

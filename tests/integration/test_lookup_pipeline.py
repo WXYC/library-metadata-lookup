@@ -498,3 +498,158 @@ class TestTrackOnArtistAlbumAndCompilation:
         assert response.found_on_compilation is True
         # Artist's own album should come before the compilation
         assert titles.index("London Zoo") < titles.index("The Sound of Dub")
+
+
+class TestPromoteAlbumFromCachedTrackData:
+    """Cache-driven safety net for the artist-only fallback.
+
+    When the artist-only FTS5 fallback returns N albums by ID order, none of
+    which can be validated against the requested track, but the local Discogs
+    PG cache holds the answer — promote the cache-known album.
+
+    Reproduces "bucky skank by lee scratch perry": fallback returned 5 unrelated
+    Lee Perry albums, validator couldn't confirm Bucky Skank on any, while the
+    cache knew it was on "Live at Maritime Hall" all along.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cache_promotes_song_bearing_album_over_unrelated_fallback(self, library_db):
+        """Library has 6 Lee Perry albums; FTS-by-ID returns 5 that don't have
+        "Bucky Skank"; cache says it's on "Live at Maritime Hall" → promotion
+        should surface Maritime Hall and clear `song_not_found`.
+        """
+        from core.telemetry import RequestTelemetry, init_cache_stats
+        from discogs.models import (
+            DiscogsSearchResponse,
+            ReleaseInfo,
+            TrackReleasesResponse,
+        )
+        from lookup.models import LookupRequest
+        from lookup.orchestrator import perform_lookup
+
+        init_cache_stats()
+
+        mock_service = AsyncMock(
+            spec_set=[
+                "search_releases_by_track",
+                "validate_track_on_release",
+                "search",
+                "get_release",
+                "cache_service",
+            ]
+        )
+
+        # Compilation/artist-keyword Discogs lookups return nothing (mirrors prod).
+        mock_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Bucky Skank",
+                artist="Lee 'Scratch' Perry",
+                releases=[],
+                total=0,
+                cached=False,
+            )
+        )
+
+        # Per-result Discogs.search returns nothing for the validator either, so
+        # `filter_results_by_track_validation` cannot confirm any fallback album.
+        mock_service.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
+        mock_service.validate_track_on_release = AsyncMock(return_value=False)
+        mock_service.get_release = AsyncMock(return_value=None)
+
+        # The PG cache holds the answer.
+        mock_service.cache_service = AsyncMock()
+        mock_service.cache_service.search_releases_by_track = AsyncMock(
+            return_value=[
+                ReleaseInfo(
+                    album="Lee Scratch Perry Live At Maritime Hall",
+                    artist="Lee 'Scratch' Perry",
+                    release_id=2865555,
+                    release_url="https://www.discogs.com/release/2865555",
+                    is_compilation=False,
+                ),
+            ]
+        )
+
+        request = LookupRequest(
+            artist="Lee 'Scratch' Perry",
+            song="Bucky Skank",
+            raw_message="bucky skank by lee scratch perry",
+        )
+
+        # Patch the upstream track→releases lookup to return nothing — this is
+        # exactly the production failure mode the safety net is designed for.
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(request, library_db, mock_service, RequestTelemetry())
+
+        titles = [r.library_item.title for r in response.results]
+        assert "Live at Maritime Hall" in titles, (
+            f"Cache-known song-bearing album should be promoted; got: {titles}"
+        )
+        # Promotion replaces the unrelated fallback set
+        for noise in ("Chicken Scratch", "Arkology", "Dub Fire"):
+            assert noise not in titles, (
+                f"{noise!r} doesn't contain the song; should be replaced, got: {titles}"
+            )
+        assert response.song_not_found is False, (
+            "song_not_found should clear once a track-bearing album is confirmed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_promotion_when_cache_has_no_matching_release(self, library_db):
+        """Cache empty → existing artist-fallback behavior is preserved."""
+        from core.telemetry import RequestTelemetry, init_cache_stats
+        from discogs.models import DiscogsSearchResponse, TrackReleasesResponse
+        from lookup.models import LookupRequest
+        from lookup.orchestrator import perform_lookup
+
+        init_cache_stats()
+
+        mock_service = AsyncMock(
+            spec_set=[
+                "search_releases_by_track",
+                "validate_track_on_release",
+                "search",
+                "get_release",
+                "cache_service",
+            ]
+        )
+        mock_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Bucky Skank",
+                artist="Lee 'Scratch' Perry",
+                releases=[],
+                total=0,
+                cached=False,
+            )
+        )
+        mock_service.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
+        mock_service.validate_track_on_release = AsyncMock(return_value=False)
+        mock_service.get_release = AsyncMock(return_value=None)
+
+        # Cache has no answer either
+        mock_service.cache_service = AsyncMock()
+        mock_service.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+
+        request = LookupRequest(
+            artist="Lee 'Scratch' Perry",
+            song="Bucky Skank",
+            raw_message="bucky skank by lee scratch perry",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(request, library_db, mock_service, RequestTelemetry())
+
+        # Without a cache answer we keep the artist-fallback behavior:
+        # the user still gets albums by the artist, and song_not_found stays True.
+        assert response.song_not_found is True
+        assert len(response.results) >= 1
+        for r in response.results:
+            assert "Perry" in (r.library_item.artist or "")
