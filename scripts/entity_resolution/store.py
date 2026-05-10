@@ -111,6 +111,29 @@ INSERT INTO entity.reconciliation_log (identity_id, source, external_id, confide
 VALUES ($1, $2, $3, $4, $5)\
 """
 
+# Most-recent reconciliation log row per source for a given identity.
+# DISTINCT ON keeps a single row per source, ordered by created_at DESC so we
+# pick the latest attempt — matching the "most recent matcher decision" notion
+# §3.4.1.1 needs to compose from. Sub-0.70 rows are NOT excluded here; the
+# composer applies Rule 6 (sidecar-floor exclusion) separately.
+_LATEST_LOG_BY_SOURCE_SQL = """\
+SELECT DISTINCT ON (source)
+       source, external_id, confidence, method
+FROM entity.reconciliation_log
+WHERE identity_id = $1
+ORDER BY source, created_at DESC\
+"""
+
+
+@dataclass
+class ProvenanceRow:
+    """Most-recent reconciliation log row for one (identity, source) pair."""
+
+    source: str
+    external_id: str
+    confidence: float | None
+    method: str
+
 
 class EntityStore:
     """CRUD interface for the entity identity store.
@@ -197,6 +220,34 @@ class EntityStore:
             status: New reconciliation status value.
         """
         await self._pg.execute(_UPDATE_STATUS_SQL, identity_id, _strip_nul(status))
+
+    async def get_latest_provenance_by_source(self, identity_id: int) -> dict[str, ProvenanceRow]:
+        """Return the most-recent reconciliation_log row per source.
+
+        Used by the bulk-resolve composer (`/api/v1/identity/bulk-resolve-libraries`)
+        to feed §3.4.1.1's composition rules. Keyed by source string
+        (`'discogs'`, `'musicbrainz'`, etc.) so callers can join against the
+        external IDs already stored on `entity.identity`.
+
+        Returns an empty dict on legacy identities that have no log rows;
+        the composer falls back to a default method/confidence in that case
+        (see §3.4.1 — `exact_match` is the documented "deterministic
+        idempotent" tier and matches the pre-pivot semantics where any
+        populated column was treated as a clean exact match).
+        """
+        rows = await self._pg.fetchall(_LATEST_LOG_BY_SOURCE_SQL, identity_id)
+        if not rows:
+            return {}
+        result: dict[str, ProvenanceRow] = {}
+        for row in rows:
+            source = row["source"]
+            result[source] = ProvenanceRow(
+                source=source,
+                external_id=row["external_id"],
+                confidence=row["confidence"],
+                method=row["method"],
+            )
+        return result
 
     async def log_reconciliation(
         self,
