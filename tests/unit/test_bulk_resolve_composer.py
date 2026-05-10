@@ -93,13 +93,19 @@ async def test_single_source_exact_match_legacy_default():
 
 
 @pytest.mark.asyncio
-async def test_two_sources_no_log_rows_triggers_agreement_boost():
-    """Two populated columns at legacy default 1.00 → cross_source_agreement 1.00.
+async def test_two_sources_no_log_rows_do_not_trigger_agreement_boost():
+    """Two populated columns at legacy default → no Rule 2 boost.
 
-    The pre-pivot data has no per-source log rows, so both legs default
-    to exact_match 1.00. Two non-inherited sources => Rule 2 boost.
-    Worked example: "Three sources, all exact_match 1.00, all cross-ref →
-    cross_source_agreement 1.00".
+    Log-less identities are marked `is_inherited=True` internally so the
+    cross-source-agreement detector (Rule 3) excludes them. Without that
+    gate, every legacy identity with ≥2 populated columns would inflate
+    to ≥0.95 — defeating the post-#207/#216/#217/#218 propagation work,
+    where many MBID/Spotify legs land via inheritance rather than
+    independent matchers.
+
+    Wire-format: still `exact_match` per leg with confidence 1.00 (the
+    populated column is treated as authoritative); composed method is
+    just the weakest leg's method (here, `exact_match`).
     """
     identity = _make_identity(
         discogs_artist_id=2154,
@@ -108,8 +114,12 @@ async def test_two_sources_no_log_rows_triggers_agreement_boost():
     result = await compose_for_identity(library_id=11, identity=identity, entity_store=_store())
 
     assert result.kind is BulkResolveResultKind.single_artist
-    assert result.method is IdentityMethod.cross_source_agreement
-    assert result.confidence == 1.00
+    # Composed method is the weakest leg's method; both legs are
+    # exact_match per the legacy default.
+    assert result.method is IdentityMethod.exact_match
+    # MIN of (1.00, 1.00) without the agreement boost.
+    assert result.confidence == pytest.approx(1.00)
+    # Both per-source rows still appear in provenance (above SIDECAR_FLOOR).
     assert len(result.provenance) == 2
 
 
@@ -183,6 +193,44 @@ async def test_two_independent_legs_with_name_variation_lifts_to_agreement_floor
     assert by_source[IdentitySource.discogs].method is IdentityMethod.exact_match
     assert by_source[IdentitySource.musicbrainz].confidence == 0.92
     assert by_source[IdentitySource.musicbrainz].method is IdentityMethod.name_variation
+
+
+@pytest.mark.asyncio
+async def test_four_source_legacy_identity_does_not_inflate_via_rule_2():
+    """Regression: a 4-source log-less legacy identity must NOT inflate.
+
+    Pre-fix, four populated columns with no reconciliation_log entries
+    would default to exact_match 1.00 each, all four would count as
+    independent (`is_inherited=False`), Rule 2 would trigger, and the
+    composed confidence would land at MAX(0.95, 1.00) = 1.00 with method
+    `cross_source_agreement` — falsely claiming positive cross-reference
+    evidence on legacy data that has none.
+
+    Post-fix, log-less legs are marked `is_inherited=True` internally so
+    Rule 3 excludes them, the agreement detector returns False, and the
+    composer falls through to Rule 4 (MIN-of-confidences with the weakest
+    leg's method).
+    """
+    identity = _make_identity(
+        discogs_artist_id=12345,
+        musicbrainz_artist_id="mb-abc",
+        wikidata_qid="Q12345",
+        spotify_artist_id="spotify-xyz",
+    )
+    # No provenance log rows at all — pure legacy data.
+    result = await compose_for_identity(library_id=42, identity=identity, entity_store=_store())
+
+    assert result.kind is BulkResolveResultKind.single_artist
+    assert result.method is IdentityMethod.exact_match
+    assert result.confidence == pytest.approx(1.00)
+    # All four sources populated and present in provenance.
+    assert len(result.provenance) == 4
+    assert {p.source for p in result.provenance} == {
+        IdentitySource.discogs,
+        IdentitySource.musicbrainz,
+        IdentitySource.wikidata,
+        IdentitySource.spotify,
+    }
 
 
 @pytest.mark.asyncio

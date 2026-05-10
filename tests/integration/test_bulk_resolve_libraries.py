@@ -125,9 +125,13 @@ class TestBulkResolveLibrariesEndpoint:
         assert result["library_id"] == 1234
         assert result["main"]["discogs_artist_id"] == 2154
         assert result["main"]["wikidata_qid"] == "Q484464"
-        # Two non-inherited sources at legacy default → cross_source_agreement.
-        assert result["method"] == "cross_source_agreement"
-        assert result["confidence"] == 1.0
+        # Log-less identity: both legs default to exact_match 1.00 but are
+        # internally marked is_inherited=True so Rule 3 excludes them from
+        # the cross-source-agreement detector. Composed method is just the
+        # weakest leg's mapped method (exact_match), confidence is MIN
+        # without the boost.
+        assert result["method"] == "exact_match"
+        assert result["confidence"] == pytest.approx(1.0)
         assert len(result["provenance"]) == 2
 
     @pytest.mark.asyncio
