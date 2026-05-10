@@ -57,10 +57,15 @@ AGREEMENT_FLOOR = 0.95
 _INHERITED_METHOD = "inherited"
 
 # When the entity store has populated columns but no per-source provenance
-# log rows (legacy data), treat them as `exact_match` 1.00 — §3.4.1's
-# matrix lists `exact_match` as the "deterministic idempotent" tier and
-# this matches the pre-pivot semantics where any populated column was
-# considered authoritative.
+# log rows (legacy data), treat them as `exact_match` 1.00 on the wire —
+# §3.4.1's matrix lists `exact_match` as the "deterministic idempotent"
+# tier and this matches the pre-pivot semantics where any populated column
+# was considered authoritative. INTERNALLY we mark these rows
+# `is_inherited=True` so Rule 3 excludes them from the cross-source-agreement
+# detector — without that gate, two log-less legacy sources would always
+# trip Rule 2 and inflate composed confidence to ≥0.95. The wire format
+# stays honest (`exact_match` / 1.00); the boost path stays grounded in
+# positive matcher evidence.
 _LEGACY_DEFAULT_METHOD = IdentityMethod.exact_match
 _LEGACY_DEFAULT_CONFIDENCE = 1.00
 
@@ -127,13 +132,36 @@ def _build_per_source_rows(
     methods don't pollute the response).
     """
     external_ids = _identity_to_external_ids(identity)
+    # Defensive log: any per-source row that has a populated external_id but
+    # whose log key doesn't match the StrEnum value would fall through to the
+    # legacy path silently. If a future enum-value rename or casing drift
+    # breaks the lookup, this surfaces it before the rows hit production.
+    populated_sources = {s.value for s in external_ids}
+    log_keys = set(provenance.keys())
+    if populated_sources and log_keys and not (populated_sources & log_keys) and provenance:
+        logger.warning(
+            "bulk_resolve: identity %d has populated external_ids %s and "
+            "reconciliation_log entries %s but the keys don't intersect — "
+            "every source will fall to the legacy default. Check "
+            "IdentitySource enum vs reconciliation_log.source casing.",
+            identity.id,
+            sorted(populated_sources),
+            sorted(log_keys),
+        )
+
     rows: list[_ComposedRow] = []
     for source, external_id in external_ids.items():
         log_row = provenance.get(source.value)
         if log_row is None:
+            # Log-less identity. See _LEGACY_DEFAULT_METHOD docstring above:
+            # we report `exact_match` 1.00 on the wire (best approximation
+            # for a populated entity.identity column) but mark the row
+            # `is_inherited=True` so the cross-source-agreement detector
+            # (Rule 2 / Rule 3) excludes it. Without that gate, two legacy
+            # legs always boost composed confidence to ≥0.95.
             method = _LEGACY_DEFAULT_METHOD
             confidence = _LEGACY_DEFAULT_CONFIDENCE
-            is_inherited = False
+            is_inherited = True
         else:
             confidence = log_row.confidence if log_row.confidence is not None else 0.0
             if log_row.method == _INHERITED_METHOD:
@@ -264,6 +292,13 @@ async def compose_for_identity(
     the lookup found no row — we return `kind: unresolved`. When present,
     we read the per-source reconciliation log to assemble provenance and
     apply §3.4.1.1 composition.
+
+    TODO(WXYC/library-metadata-lookup#274): the caller of this function
+    looks up `identity` via exact `library_name = $1` against the
+    `entity.identity` table — Backend will pass `library.artist_name`
+    straight from its denormalized column, so diacritic / smart-quote /
+    `&` vs `and` divergence will surface as silent misses. #274 tracks
+    the canonical-form lookup that closes that gap.
     """
     if identity is None:
         return BulkResolveResult(
