@@ -1065,6 +1065,73 @@ class LookupIdentityBlock(BaseModel):
     )
 
 
+class BulkResolveInput(BaseModel):
+    library_id: int = Field(..., description="Backend `wxyc_schema.library.id` (FK target).")
+    artist_name: str = Field(
+        ..., description="Hint — Backend's denormalized artist name for the row."
+    )
+    album_title: str = Field(
+        ..., description="Hint — Backend's denormalized album title for the row."
+    )
+
+
+class BulkResolveResultKind(StrEnum):
+    single_artist = "single_artist"
+    compilation = "compilation"
+    unresolved = "unresolved"
+
+
+class BulkResolveProvenanceEntry(BaseModel):
+    source: IdentitySource
+    method: IdentityMethod
+    confidence: confloat(ge=0.0, le=1.0) = Field(
+        ...,
+        description="Per-source confidence in [0, 1], within the source's locked method range from §3.4.1. NULL when `external_id` is NULL — the source ran but produced no candidate, so confidence is undefined (not zero). When non-null, equal to or greater than the top-level `confidence` (composition rules either MIN or boost, never lower a per-source row).\n",
+    )
+    external_id: str | None = Field(
+        None,
+        description="The external identifier this source resolved to (Discogs release ID, MusicBrainz MBID, Wikidata QID, Spotify URI suffix, etc.). NULL when the source ran but found no match (the row is still surfaced so consumers see the leg ran); `confidence` is also NULL in that case.\n",
+    )
+
+
+class BulkResolveTrackIdentity(BaseModel):
+    track_position: str = Field(..., description="Track position; matches the request input.")
+    sources: list[BulkResolveProvenanceEntry] = Field(
+        ...,
+        description="One per-source row per source LML composed the track from. Empty array means LML attempted resolution at track grain and found no matches.\n",
+    )
+
+
+class BulkResolveResult(BaseModel):
+    kind: BulkResolveResultKind
+    library_id: int = Field(..., description="Backend `library.id` for this result.")
+    main: ReconciledIdentity | None = Field(
+        None,
+        description="Composed external IDs for `kind: single_artist`. NULL for every other `kind`. URL construction is the consumer's job (see existing ReconciledIdentity contract).\n",
+    )
+    method: IdentityMethod | None = Field(
+        None,
+        description="The composed top-level method LML's bulk-resolve handler picked per §3.4.1.1 (typically the strongest leg's method, or `cross_source_agreement` when Rule 2 boosted). NULL for `kind: unresolved`.\n",
+    )
+    confidence: confloat(ge=0.0, le=1.0) | None = Field(
+        None,
+        description="Composed top-level confidence in [0, 1] — the MIN of resolved sources' confidences after composition (§3.4.1.1 Rule 4), unless boosted by cross-source agreement (Rule 2). NULL for `kind: unresolved`.\n",
+    )
+    provenance: list[BulkResolveProvenanceEntry] = Field(
+        ...,
+        description="Per-source rows feeding LML's composition. Always present; empty array means LML attempted the cascade and no source produced a row above the §3.4.1.1 Rule 6 floor.\n",
+    )
+    tracks: list[BulkResolveTrackIdentity] | None = Field(
+        None,
+        description="Set only for `kind: compilation`; absent for every other `kind`. Empty array when LML has no per-track data for the V/A row yet. Two states (present-array or absent), not three.\n",
+    )
+
+
+class BulkResolveLibrariesResponse(BaseModel):
+    results: list[BulkResolveResult]
+    cache_stats: CacheStats | None = None
+
+
 class DiscogsTrackItem(BaseModel):
     position: str
     title: str
@@ -1328,3 +1395,12 @@ class LookupResponse(BaseModel):
     )
     cache_stats: CacheStats | None = None
     identity: LookupIdentityBlock | None = None
+
+
+class BulkResolveLibrariesRequest(BaseModel):
+    inputs: list[BulkResolveInput] = Field(
+        ...,
+        description="Inputs to resolve. Order preserved in `BulkResolveLibrariesResponse.results`.\n",
+        max_length=1000,
+        min_length=1,
+    )

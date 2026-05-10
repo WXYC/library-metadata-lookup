@@ -22,6 +22,7 @@ from core.logging import setup_logging
 from core.sentry import init_sentry
 from discogs.router import router as discogs_router
 from identity.dependencies import close_entity_store
+from identity.router import api_v1_router as identity_api_v1_router
 from identity.router import router as identity_router
 from library.router import router as library_router
 from lookup.router import router as lookup_router
@@ -111,6 +112,14 @@ app.include_router(
     streaming_router, prefix="/api/v1", tags=["streaming"], dependencies=_lml_protected
 )
 app.include_router(release_router, prefix="/api/v1", tags=["release"], dependencies=_lml_protected)
+# `POST /api/v1/identity/bulk-resolve-libraries` (WXYC/library-metadata-lookup#272)
+# — the cross-cache-identity contract endpoint added per the 2026-05-09 pivot
+# (BS#800). Sits under `/api/v1` so it inherits the LML bearer auth posture
+# the open `/identity/{resolve,bulk}` routes do not (those are consumed by
+# semantic-index and locking them down is a separate decision).
+app.include_router(
+    identity_api_v1_router, prefix="/api/v1", tags=["lookup"], dependencies=_lml_protected
+)
 
 if __name__ == "__main__":
     import uvicorn

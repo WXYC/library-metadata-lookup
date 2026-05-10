@@ -57,6 +57,7 @@ The service exposes REST endpoints for querying the `entity.identity` table in t
 
 - `GET /identity/resolve?name=Stereolab` -- Look up a single artist name. Returns 200 with external IDs or 404.
 - `POST /identity/bulk` with `{"names": ["Stereolab", "Autechre", ...]}` -- Resolve a batch of names. Returns `identities` (found) and `unresolved` (not found).
+- `POST /api/v1/identity/bulk-resolve-libraries` -- Cross-cache-identity contract endpoint per the 2026-05-09 pivot (BS#800). Backend POSTs library rows; LML composes per-source provenance via §3.4.1.1 Rules 2-6 and returns one verdict per row (`kind: single_artist | compilation | unresolved`). Implementation lives in `identity/bulk_resolve.py`; sits under `/api/v1/` so it inherits `LML_API_KEY` bearer auth.
 
 Both endpoints return 503 when `DATABASE_URL_DISCOGS` is not set or the entity schema is not applied.
 
