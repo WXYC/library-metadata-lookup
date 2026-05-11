@@ -12,6 +12,8 @@ from discogs.models import (
     EntityResolveResponse,
     EntityType,
     ReleaseMetadataResponse,
+    SearchByTrackResponse,
+    SearchByTrackResult,
     TrackReleasesResponse,
     TracksAutocompleteResponse,
 )
@@ -150,6 +152,63 @@ async def resolve_entity(
         if master is None:
             raise HTTPException(status_code=404, detail=f"Master {entity_id} not found")
         return EntityResolveResponse(name=master.title, type=entity_type, id=entity_id)
+
+
+@router.get(
+    "/search-by-track",
+    response_model=SearchByTrackResponse,
+    summary="Find Discogs releases by track title (album-by-track search)",
+    description="""
+    Fuzzy-match a track title against ``release_track.title`` and return
+    the parent releases. This is the LML-side primitive that Backend-Service
+    wraps to deliver dj-site catalog search by track title (e.g. searching
+    "vi scose poise" returns the *Confield* release_id).
+
+    Returns one row per ``release_id``; multiple pressings of the same
+    album appear as distinct rows. Bridge to library rows on the caller
+    side via ``library.canonical_entity_id = 'discogs:' || release_id``.
+
+    The default ``score_threshold`` of 0.3 catches partial-track-title
+    queries ("scose poise" → "VI Scose Poise"); raise to 0.5+ to require
+    near-exact matches.
+    """,
+    responses={
+        200: {"description": "Matched releases returned (may be empty on cache error)"},
+        422: {"description": "Missing required q parameter"},
+        503: {"description": "Discogs cache not available"},
+    },
+)
+async def search_by_track(
+    q: str = Query(..., description="Track title query (need not be exact)"),
+    limit: int = Query(50, ge=1, le=200, description="Maximum number of results"),
+    score_threshold: float = Query(
+        0.3,
+        ge=0,
+        le=1,
+        description="Minimum trigram similarity in [0, 1]; default 0.3 = pg_trgm default",
+    ),
+    cache: DiscogsCacheService | None = Depends(get_discogs_cache_service),
+) -> SearchByTrackResponse:
+    """Fuzzy-search Discogs cache tracklists for a track-title match."""
+    if cache is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Discogs cache is not available. Set DATABASE_URL_DISCOGS.",
+        )
+
+    try:
+        rows = await cache.search_albums_by_track_title(
+            q, limit=limit, score_threshold=score_threshold
+        )
+    except CacheUnavailableError:
+        logger.warning("Cache error during search-by-track, returning empty results")
+        return SearchByTrackResponse(results=[], total=0, query=q)
+
+    return SearchByTrackResponse(
+        results=[SearchByTrackResult(**r) for r in rows],
+        total=len(rows),
+        query=q,
+    )
 
 
 @router.get(

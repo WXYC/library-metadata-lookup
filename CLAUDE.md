@@ -71,6 +71,14 @@ Response includes `on_streaming` (true/false/null) and per-service match details
 
 Requires `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` for Spotify checks. Other services (Deezer, Apple Music, Bandcamp) need no auth. If Spotify credentials are not set, Spotify checks are skipped.
 
+### Album-by-Track Search Endpoint
+
+`GET /api/v1/discogs/search-by-track?q=<track-title>&limit=50&score_threshold=0.3` fuzzy-matches a track title against `release_track.title` in the Discogs cache and returns the parent releases. This is the LML-side primitive that Backend-Service wraps to deliver dj-site catalog search by track title (e.g. searching `"vi scose poise"` returns the *Confield* release_id, which Backend joins against `library.canonical_entity_id` to surface the WXYC library row).
+
+Returns one row per `release_id`. Multiple pressings of the same album appear as distinct rows (each has its own `release_id` and shares a `master_id`); callers handle cross-pressing dedupe via their own library lookup. The default `score_threshold` of 0.3 (pg_trgm's default similarity threshold) catches partial-title queries (`"scose poise"` → `"VI Scose Poise"` at ~0.78); raise to 0.5+ for near-exact matches.
+
+Implementation in `discogs/cache_service.py:search_albums_by_track_title()` (the SQL primitive) + `discogs/router.py:search_by_track()` (the route). Tests at `tests/unit/test_search_by_track.py` (unit, mocked cache) + `tests/integration/test_search_by_track_pg.py` (pg-marked smoke, self-skips when `release_track` is absent or empty).
+
 ### Release Resolve Endpoint
 
 `POST /api/v1/releases/resolve` takes a Discogs release URL or Bandcamp album URL (or an explicit `(source, id)` pair) and returns canonical release metadata, cross-source identifiers, and a streaming-availability snapshot — everything tubafrenzy's rotation-release create form needs to prefill in one round trip.

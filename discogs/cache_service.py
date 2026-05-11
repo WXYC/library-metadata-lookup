@@ -224,6 +224,97 @@ class DiscogsCacheService:
             logger.error(f"Cache search_releases_by_title failed: {e}")
             raise CacheUnavailableError(f"Cache search_releases_by_title failed: {e}") from e
 
+    async def search_albums_by_track_title(
+        self,
+        track_title: str,
+        *,
+        limit: int = 50,
+        score_threshold: float = 0.3,
+    ) -> list[dict]:
+        """Find Discogs releases whose tracklist contains a track whose title
+        fuzzy-matches the query.
+
+        Used by the ``GET /api/v1/discogs/search-by-track`` endpoint, which is
+        the LML-side primitive for album-by-track search. The caller
+        (Backend-Service) joins the returned ``release_id`` values against
+        ``library.canonical_entity_id`` to find library rows containing the
+        matched track.
+
+        Dedupes to one row per ``release_id`` (a release with multiple
+        ``extra=0`` artist credits — e.g. Duke Ellington & John Coltrane —
+        would otherwise produce one row per credit; we keep the highest-score
+        track-match row and report the first credited artist). Different
+        pressings of the same album appear as distinct rows because each has
+        its own ``release_id``; the caller handles cross-pressing dedupe via
+        the library lookup.
+
+        Args:
+            track_title: Track title query (need not be exact).
+            limit: Maximum number of results.
+            score_threshold: Minimum trigram similarity (in [0, 1]) to
+                include. The pg_trgm default of 0.3 catches "scose poise" →
+                "VI Scose Poise" but not "scose" (similarity ≈ 0.25); raise
+                to 0.5+ to require near-exact track-title matches.
+
+        Returns:
+            List of dicts with keys:
+              - release_id (int): Discogs release ID
+              - master_id (int | None): Discogs master ID (parent album)
+              - release_title (str)
+              - release_artist (str): primary artist (first row where extra=0)
+              - track_title (str)
+              - track_position (str): e.g. "1", "A1", "B3"
+              - score (float): trigram similarity, in [0, 1]
+
+        Raises:
+            CacheUnavailableError: If the database is unreachable.
+        """
+        try:
+            query = """
+                SELECT *
+                FROM (
+                    SELECT DISTINCT ON (rt.release_id)
+                        rt.release_id,
+                        r.master_id,
+                        r.title AS release_title,
+                        ra.artist_name AS release_artist,
+                        rt.title AS track_title,
+                        rt.position AS track_position,
+                        similarity(
+                            lower(f_unaccent(rt.title)),
+                            lower(f_unaccent($1))
+                        ) AS score
+                    FROM release_track rt
+                    JOIN release r ON r.id = rt.release_id
+                    JOIN release_artist ra
+                        ON ra.release_id = r.id AND ra.extra = 0
+                    WHERE lower(f_unaccent(rt.title)) % lower(f_unaccent($1))
+                      AND similarity(
+                            lower(f_unaccent(rt.title)),
+                            lower(f_unaccent($1))
+                          ) >= $2
+                    ORDER BY rt.release_id, score DESC
+                ) deduped
+                ORDER BY score DESC, release_id
+                LIMIT $3
+            """
+            rows = await self.pool.fetch(query, track_title, score_threshold, limit)
+            return [
+                {
+                    "release_id": r["release_id"],
+                    "master_id": r["master_id"],
+                    "release_title": r["release_title"],
+                    "release_artist": r["release_artist"],
+                    "track_title": r["track_title"],
+                    "track_position": r["track_position"],
+                    "score": float(r["score"]),
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error(f"Cache search_albums_by_track_title failed: {e}")
+            raise CacheUnavailableError(f"Cache search_albums_by_track_title failed: {e}") from e
+
     async def search_tracks_by_title(self, title: str, *, limit: int = 5) -> list[dict]:
         """Fuzzy-match a track title against ``release_track.title``.
 

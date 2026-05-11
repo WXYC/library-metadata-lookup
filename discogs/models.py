@@ -48,6 +48,31 @@ class TracksAutocompleteResponse(BaseModel):
     cached: bool = True
 
 
+class SearchByTrackResult(BaseModel):
+    """A single album-by-track search hit from the Discogs cache.
+
+    Returned by ``GET /api/v1/discogs/search-by-track``. One row per
+    matching ``release_id``; callers (Backend-Service) bridge to library
+    rows via ``library.canonical_entity_id = 'discogs:' || release_id``.
+    """
+
+    release_id: int
+    master_id: int | None = None
+    release_title: str
+    release_artist: str
+    track_title: str
+    track_position: str
+    score: float
+
+
+class SearchByTrackResponse(BaseModel):
+    """Response for ``GET /api/v1/discogs/search-by-track``."""
+
+    results: list[SearchByTrackResult] = []
+    total: int = 0
+    query: str
+
+
 # MARK: - Resolved Markup Tokens
 
 
