@@ -1,12 +1,14 @@
 """FastAPI dependency injection providers."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 import asyncpg
 import httpx
 from fastapi import Depends
-from posthog import Posthog
 from wxyc_fastapi.observability import get_posthog_client as _shared_posthog_client
 
 from config.settings import Settings, get_settings
@@ -15,6 +17,9 @@ from discogs.cache_service import DiscogsCacheService
 from discogs.service import DiscogsService
 from library.db import LibraryDB
 from scripts.entity_resolution.sources import PgSource
+
+if TYPE_CHECKING:
+    from posthog import Posthog
 
 logger = logging.getLogger(__name__)
 

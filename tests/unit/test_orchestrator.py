@@ -14,12 +14,12 @@ All external dependencies (LibraryDB, DiscogsService) are mocked.
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from wxyc_fastapi.observability import RequestTelemetry
 
 from discogs.models import DiscogsSearchResponse
 from library.models import LibraryItem
 from lookup.models import LookupRequest, LookupResponse
 from lookup.orchestrator import perform_lookup
+from tests.conftest import make_lml_telemetry
 from tests.factories import make_discogs_result, make_library_item
 
 # ---------------------------------------------------------------------------
@@ -30,11 +30,7 @@ from tests.factories import make_discogs_result, make_library_item
 @pytest.fixture
 def telemetry():
     """Create a telemetry tracker for tests."""
-    return RequestTelemetry(
-        api_call_keys=["discogs"],
-        distinct_id="library-metadata-lookup-service",
-        event_prefix="lookup",
-    )
+    return make_lml_telemetry()
 
 
 @pytest.fixture

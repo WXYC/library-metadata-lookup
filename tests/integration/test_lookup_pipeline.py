@@ -229,11 +229,12 @@ class TestQuotedArtistNameValidation:
         passes validation even when the library doesn't have it. The self-titled
         album (which does NOT contain 'Bob') should be excluded.
         """
-        from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
+        from wxyc_fastapi.observability import init_cache_stats
 
         from discogs.service import DiscogsService
         from lookup.models import LookupRequest
         from lookup.orchestrator import perform_lookup
+        from tests.conftest import make_lml_telemetry
 
         init_cache_stats()
 
@@ -318,11 +319,7 @@ class TestQuotedArtistNameValidation:
             request,
             library_db,
             mock_service,
-            RequestTelemetry(
-                api_call_keys=["discogs"],
-                distinct_id="library-metadata-lookup-service",
-                event_prefix="lookup",
-            ),
+            make_lml_telemetry(),
         )
 
         # The self-titled album must NOT be returned as a compilation match.
@@ -349,11 +346,12 @@ class TestVACompilationTrackSearch:
         When Discogs reports a track is on this compilation, the pipeline should find
         the library entry and return found_on_compilation=True.
         """
-        from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
+        from wxyc_fastapi.observability import init_cache_stats
 
         from discogs.service import DiscogsService
         from lookup.models import LookupRequest
         from lookup.orchestrator import perform_lookup
+        from tests.conftest import make_lml_telemetry
 
         init_cache_stats()
 
@@ -396,11 +394,7 @@ class TestVACompilationTrackSearch:
             request,
             library_db,
             mock_service,
-            RequestTelemetry(
-                api_call_keys=["discogs"],
-                distinct_id="library-metadata-lookup-service",
-                event_prefix="lookup",
-            ),
+            make_lml_telemetry(),
         )
 
         assert response.found_on_compilation is True, (
@@ -429,10 +423,11 @@ class TestTrackOnArtistAlbumAndCompilation:
         - (27, "Pressure", "The Bug") - another Bug album (should be excluded)
         - (28, "The Sound of Dub", "Various Artists - Reggae") - compilation
         """
-        from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
+        from wxyc_fastapi.observability import init_cache_stats
 
         from lookup.models import LookupRequest
         from lookup.orchestrator import perform_lookup
+        from tests.conftest import make_lml_telemetry
 
         init_cache_stats()
 
@@ -508,11 +503,7 @@ class TestTrackOnArtistAlbumAndCompilation:
                 request,
                 library_db,
                 mock_service,
-                RequestTelemetry(
-                    api_call_keys=["discogs"],
-                    distinct_id="library-metadata-lookup-service",
-                    event_prefix="lookup",
-                ),
+                make_lml_telemetry(),
             )
 
         titles = [r.library_item.title for r in response.results]
@@ -548,7 +539,7 @@ class TestPromoteAlbumFromCachedTrackData:
         "Bucky Skank"; cache says it's on "Live at Maritime Hall" → promotion
         should surface Maritime Hall and clear `song_not_found`.
         """
-        from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
+        from wxyc_fastapi.observability import init_cache_stats
 
         from discogs.models import (
             DiscogsSearchResponse,
@@ -557,6 +548,7 @@ class TestPromoteAlbumFromCachedTrackData:
         )
         from lookup.models import LookupRequest
         from lookup.orchestrator import perform_lookup
+        from tests.conftest import make_lml_telemetry
 
         init_cache_stats()
 
@@ -618,11 +610,7 @@ class TestPromoteAlbumFromCachedTrackData:
                 request,
                 library_db,
                 mock_service,
-                RequestTelemetry(
-                    api_call_keys=["discogs"],
-                    distinct_id="library-metadata-lookup-service",
-                    event_prefix="lookup",
-                ),
+                make_lml_telemetry(),
             )
 
         titles = [r.library_item.title for r in response.results]
@@ -641,11 +629,12 @@ class TestPromoteAlbumFromCachedTrackData:
     @pytest.mark.asyncio
     async def test_no_promotion_when_cache_has_no_matching_release(self, library_db):
         """Cache empty → existing artist-fallback behavior is preserved."""
-        from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
+        from wxyc_fastapi.observability import init_cache_stats
 
         from discogs.models import DiscogsSearchResponse, TrackReleasesResponse
         from lookup.models import LookupRequest
         from lookup.orchestrator import perform_lookup
+        from tests.conftest import make_lml_telemetry
 
         init_cache_stats()
 
@@ -690,11 +679,7 @@ class TestPromoteAlbumFromCachedTrackData:
                 request,
                 library_db,
                 mock_service,
-                RequestTelemetry(
-                    api_call_keys=["discogs"],
-                    distinct_id="library-metadata-lookup-service",
-                    event_prefix="lookup",
-                ),
+                make_lml_telemetry(),
             )
 
         # Without a cache answer we keep the artist-fallback behavior:

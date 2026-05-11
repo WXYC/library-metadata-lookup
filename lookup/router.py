@@ -1,11 +1,13 @@
 """Lookup API router."""
 
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import httpx
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException
-from posthog import Posthog
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats, init_cache_stats
 
 from core.dependencies import (
@@ -26,6 +28,9 @@ from lookup.models import LookupRequest, LookupResponse
 from lookup.orchestrator import perform_lookup
 from scripts.entity_resolution.sources import PgSource
 from scripts.entity_resolution.store import EntityStore
+
+if TYPE_CHECKING:
+    from posthog import Posthog
 
 logger = logging.getLogger(__name__)
 

@@ -3,10 +3,24 @@
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from wxyc_fastapi.observability import RequestTelemetry
 
 from discogs.service import DiscogsApiCheckResult
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_library_item
+
+
+def make_lml_telemetry() -> RequestTelemetry:
+    """Build a `RequestTelemetry` with LML's production parameters.
+
+    Single source of truth so the per-call kwargs in `lookup/router.py` and
+    every test that constructs telemetry stay in sync.
+    """
+    return RequestTelemetry(
+        api_call_keys=["discogs"],
+        distinct_id="library-metadata-lookup-service",
+        event_prefix="lookup",
+    )
 
 
 @pytest.fixture
