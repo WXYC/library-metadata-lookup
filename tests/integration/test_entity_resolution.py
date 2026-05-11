@@ -186,6 +186,153 @@ class TestDiscogsReconciliationIntegration:
 
 
 @pytest.mark.pg
+class TestDiscogsReconciliationSQLSmoke:
+    """Smoke-test that each of the four reconciler SQL strings parses and
+    executes against a Postgres with the wxyc_identity_match_* functions
+    deployed (WXYC/discogs-etl#195, alembic 0004).
+
+    Why this test exists: the sibling ``test_reconcile_known_artists`` (above)
+    self-skips when ``release_artist`` is empty, which is the CI scenario.
+    Pre-#285 that meant CI never executed the
+    ``wxyc_identity_match_artist(col)`` SQL even after the flip — only prod
+    saw the symmetric pair under live traffic. This test closes that gap by
+    running each query with an empty ``ANY($1)`` array against stub tables,
+    asserting only that the SQL parses, the function call resolves, and the
+    rowset comes back empty.
+
+    Skip behavior: when ``wxyc_identity_match_artist`` is not present in
+    ``pg_proc`` (e.g. CI's vanilla ``postgres:16-alpine`` without alembic
+    0004 applied), this class self-skips. The function depends on the
+    ``unaccent`` extension and the ``wxyc_unaccent`` text-search dictionary
+    (which requires the rules file installed at the server's
+    ``$SHAREDIR/tsearch_data/``), neither of which is trivially provisioned
+    on the CI service container.
+
+    TODO(wxyc-etl): wxyc-etl 0.4.0 does not ship
+    ``wxyc_identity_match_functions.sql`` as package data — it lives only in
+    the wxyc-etl source tree at ``data/`` and is vendored byte-for-byte into
+    each cache repo. If a future release exposes the canonical SQL as
+    ``importlib.resources``-readable package data, the fixture below could
+    deploy the functions inline (idempotent ``CREATE OR REPLACE``) and the
+    smoke test would run on CI's plain postgres-16 service container — at
+    which point the skip becomes the exception rather than the rule. Until
+    then this test runs only on caches where alembic 0004 has been applied
+    (homebrew dev cache + Railway prod / staging).
+    """
+
+    @pytest_asyncio.fixture(autouse=True)
+    async def ensure_reconciler_schema(self, pg_pool):
+        """Skip when ``wxyc_identity_match_artist`` isn't deployed, otherwise
+        create stub tables matching the columns each reconciler query reads.
+
+        Same skip pattern as ``test_reconcile_known_artists`` (which skips on
+        missing ``release_artist``) — keeps the test inert on fresh CI
+        postgres instances while still exercising the SQL on any
+        alembic-0004-applied cache.
+
+        Stub tables are idempotent (``IF NOT EXISTS``) so this is a no-op on a
+        real discogs-cache where the tables already exist with populated
+        data. The test queries always pass ``[]`` for ``ANY($1)``, so the
+        rowset is empty regardless of whether the underlying table is.
+        """
+        async with pg_pool.acquire() as conn:
+            exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = $1)",
+                "wxyc_identity_match_artist",
+            )
+            if not exists:
+                pytest.skip(
+                    "wxyc_identity_match_artist not deployed -- needs alembic 0004 "
+                    "from WXYC/discogs-etl. CI's plain postgres-16 service container "
+                    "doesn't have it. See class docstring for the TODO."
+                )
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS release_artist (
+                    release_id INTEGER,
+                    artist_id INTEGER,
+                    artist_name TEXT,
+                    extra INTEGER DEFAULT 0
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS artist_member (
+                    artist_id INTEGER,
+                    member_id INTEGER,
+                    member_name TEXT
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS artist_alias (
+                    artist_id INTEGER,
+                    alias_name TEXT
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS artist_name_variation (
+                    artist_id INTEGER,
+                    name TEXT
+                )
+            """)
+        yield
+
+    @pytest.mark.asyncio
+    async def test_exact_match_sql_parses_and_executes(self, pg_source):
+        from scripts.entity_resolution.discogs import _EXACT_MATCH_SQL
+
+        rows = await pg_source.fetchall(_EXACT_MATCH_SQL, [])
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_member_match_sql_parses_and_executes(self, pg_source):
+        from scripts.entity_resolution.discogs import _MEMBER_MATCH_SQL
+
+        rows = await pg_source.fetchall(_MEMBER_MATCH_SQL, [])
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_alias_match_sql_parses_and_executes(self, pg_source):
+        from scripts.entity_resolution.discogs import _ALIAS_MATCH_SQL
+
+        rows = await pg_source.fetchall(_ALIAS_MATCH_SQL, [])
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_name_variation_match_sql_parses_and_executes(self, pg_source):
+        from scripts.entity_resolution.discogs import _NAME_VARIATION_MATCH_SQL
+
+        rows = await pg_source.fetchall(_NAME_VARIATION_MATCH_SQL, [])
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_all_four_match_functions_exist(self, pg_pool):
+        """Confirm the full family of cross-cache-identity functions deploys
+        together. Pinned because LML's reconciler only currently uses the
+        ``_artist`` flavor, but the column-side flip in #285 was paired with
+        a function family deploy in discogs-etl#195; a future reconciler
+        change that reaches for ``_title`` / ``_with_punctuation`` /
+        ``_with_disambiguator_strip`` should fail loudly here rather than
+        at runtime if any sibling went missing.
+        """
+        expected = {
+            "wxyc_identity_match_artist",
+            "wxyc_identity_match_title",
+            "wxyc_identity_match_with_punctuation",
+            "wxyc_identity_match_with_disambiguator_strip",
+        }
+        async with pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT proname FROM pg_proc WHERE proname = ANY($1)",
+                list(expected),
+            )
+        present = {row["proname"] for row in rows}
+        missing = expected - present
+        assert not missing, (
+            f"Missing wxyc_identity_match_* functions: {sorted(missing)}. "
+            "Re-run alembic 0004 from WXYC/discogs-etl against this cache."
+        )
+
+
+@pytest.mark.pg
 class TestIdentityRouterEntityStoreUnavailable:
     """Identity routes return 503 — not 500 — when the entity schema is missing.
 
