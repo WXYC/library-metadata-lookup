@@ -297,6 +297,56 @@ class TestPerformLookupAlbumResolution:
         assert response.song_not_found is False
 
     @pytest.mark.asyncio
+    async def test_song_title_album_ranked_before_sibling_album(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """An album title matching the requested song should outrank sibling albums."""
+        sibling_album = make_library_item(
+            id=51753,
+            artist="Junior Kimbrough",
+            title="You Better Run (The Essential Junior Kimbrough)",
+            call_letters="KI",
+            release_call_number=5,
+        )
+        matching_album = make_library_item(
+            id=51752,
+            artist="Junior Kimbrough",
+            title="Meet Me in the City",
+            call_letters="KI",
+            release_call_number=4,
+        )
+        mock_library_db.find_similar_artist.return_value = None
+        mock_library_db.search.side_effect = [
+            [sibling_album],
+            [matching_album],
+        ]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Junior Kimbrough",
+            song="Meet Me in the City",
+            raw_message="Meet Me in the City by Junior Kimbrough",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[
+                ("Junior Kimbrough", "You Better Run (The Essential Junior Kimbrough)"),
+                ("Junior Kimbrough", "Meet Me in the City"),
+            ],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert [result.library_item.title for result in response.results] == [
+            "Meet Me in the City",
+            "You Better Run (The Essential Junior Kimbrough)",
+        ]
+        assert response.song_not_found is False
+
+    @pytest.mark.asyncio
     async def test_track_validation_filters_album_resolved_results(
         self,
         mock_library_db,

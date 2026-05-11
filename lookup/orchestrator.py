@@ -340,9 +340,21 @@ async def search_library_with_fallback(
                     all_results.append(item)
 
         if all_results:
-            primary_album_lower = albums[0].lower()
+            song_normalized = normalize_for_comparison(parsed.song or "")
+            primary_album_normalized = normalize_for_comparison(albums[0])
+
+            def album_result_rank(item: LibraryItem) -> tuple[bool, bool]:
+                title_normalized = normalize_for_comparison(item.title or "")
+                return (
+                    bool(song_normalized and song_normalized in title_normalized),
+                    bool(
+                        primary_album_normalized
+                        and primary_album_normalized in title_normalized
+                    ),
+                )
+
             all_results.sort(
-                key=lambda r: primary_album_lower in (r.title or "").lower(),
+                key=album_result_rank,
                 reverse=True,
             )
             return all_results, False
