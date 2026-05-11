@@ -6,6 +6,7 @@ import httpx
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException
 from posthog import Posthog
+from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats, init_cache_stats
 
 from core.dependencies import (
     get_apple_music_http_client,
@@ -15,7 +16,6 @@ from core.dependencies import (
     get_musicbrainz_pg,
     get_posthog_client,
 )
-from core.telemetry import RequestTelemetry, get_cache_stats, init_cache_stats
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
 from discogs.service import DiscogsService
@@ -96,11 +96,14 @@ async def handle_lookup(
     skip_cache: bool = False,
 ):
     """Process a lookup request."""
-    # Initialize telemetry
     init_cache_stats()
     if skip_cache:
         set_skip_cache(True)
-    telemetry = RequestTelemetry()
+    telemetry = RequestTelemetry(
+        api_call_keys=["discogs"],
+        distinct_id="library-metadata-lookup-service",
+        event_prefix="lookup",
+    )
 
     try:
         response = await perform_lookup(

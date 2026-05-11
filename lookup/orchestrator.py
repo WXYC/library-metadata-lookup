@@ -15,13 +15,13 @@ from urllib.parse import quote
 import httpx
 from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
+from wxyc_fastapi.observability import RequestTelemetry
 
 from core.search import (
     build_strategies,
     execute_search_pipeline,
     get_search_type_from_state,
 )
-from core.telemetry import RequestTelemetry
 from discogs.cache_service import DiscogsCacheService
 from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult, ReleaseInfo

@@ -229,7 +229,8 @@ class TestQuotedArtistNameValidation:
         passes validation even when the library doesn't have it. The self-titled
         album (which does NOT contain 'Bob') should be excluded.
         """
-        from core.telemetry import RequestTelemetry, init_cache_stats
+        from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
+
         from discogs.service import DiscogsService
         from lookup.models import LookupRequest
         from lookup.orchestrator import perform_lookup
@@ -313,7 +314,16 @@ class TestQuotedArtistNameValidation:
             raw_message='Bob by Weird "Al" Yankovich',
         )
 
-        response = await perform_lookup(request, library_db, mock_service, RequestTelemetry())
+        response = await perform_lookup(
+            request,
+            library_db,
+            mock_service,
+            RequestTelemetry(
+                api_call_keys=["discogs"],
+                distinct_id="library-metadata-lookup-service",
+                event_prefix="lookup",
+            ),
+        )
 
         # The self-titled album must NOT be returned as a compilation match.
         # Artist-only fallback results are acceptable (song_not_found=True).
@@ -339,7 +349,8 @@ class TestVACompilationTrackSearch:
         When Discogs reports a track is on this compilation, the pipeline should find
         the library entry and return found_on_compilation=True.
         """
-        from core.telemetry import RequestTelemetry, init_cache_stats
+        from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
+
         from discogs.service import DiscogsService
         from lookup.models import LookupRequest
         from lookup.orchestrator import perform_lookup
@@ -381,7 +392,16 @@ class TestVACompilationTrackSearch:
             raw_message="Dancing Queen by Chuquimamani-Condori",
         )
 
-        response = await perform_lookup(request, library_db, mock_service, RequestTelemetry())
+        response = await perform_lookup(
+            request,
+            library_db,
+            mock_service,
+            RequestTelemetry(
+                api_call_keys=["discogs"],
+                distinct_id="library-metadata-lookup-service",
+                event_prefix="lookup",
+            ),
+        )
 
         assert response.found_on_compilation is True, (
             "Track on VA compilation should set found_on_compilation=True"
@@ -409,7 +429,8 @@ class TestTrackOnArtistAlbumAndCompilation:
         - (27, "Pressure", "The Bug") - another Bug album (should be excluded)
         - (28, "The Sound of Dub", "Various Artists - Reggae") - compilation
         """
-        from core.telemetry import RequestTelemetry, init_cache_stats
+        from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
+
         from lookup.models import LookupRequest
         from lookup.orchestrator import perform_lookup
 
@@ -483,7 +504,16 @@ class TestTrackOnArtistAlbumAndCompilation:
             new_callable=AsyncMock,
             return_value=[],
         ):
-            response = await perform_lookup(request, library_db, mock_service, RequestTelemetry())
+            response = await perform_lookup(
+                request,
+                library_db,
+                mock_service,
+                RequestTelemetry(
+                    api_call_keys=["discogs"],
+                    distinct_id="library-metadata-lookup-service",
+                    event_prefix="lookup",
+                ),
+            )
 
         titles = [r.library_item.title for r in response.results]
         assert "London Zoo" in titles, (
@@ -518,7 +548,8 @@ class TestPromoteAlbumFromCachedTrackData:
         "Bucky Skank"; cache says it's on "Live at Maritime Hall" → promotion
         should surface Maritime Hall and clear `song_not_found`.
         """
-        from core.telemetry import RequestTelemetry, init_cache_stats
+        from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
+
         from discogs.models import (
             DiscogsSearchResponse,
             ReleaseInfo,
@@ -583,7 +614,16 @@ class TestPromoteAlbumFromCachedTrackData:
             new_callable=AsyncMock,
             return_value=[],
         ):
-            response = await perform_lookup(request, library_db, mock_service, RequestTelemetry())
+            response = await perform_lookup(
+                request,
+                library_db,
+                mock_service,
+                RequestTelemetry(
+                    api_call_keys=["discogs"],
+                    distinct_id="library-metadata-lookup-service",
+                    event_prefix="lookup",
+                ),
+            )
 
         titles = [r.library_item.title for r in response.results]
         assert "Live at Maritime Hall" in titles, (
@@ -601,7 +641,8 @@ class TestPromoteAlbumFromCachedTrackData:
     @pytest.mark.asyncio
     async def test_no_promotion_when_cache_has_no_matching_release(self, library_db):
         """Cache empty → existing artist-fallback behavior is preserved."""
-        from core.telemetry import RequestTelemetry, init_cache_stats
+        from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
+
         from discogs.models import DiscogsSearchResponse, TrackReleasesResponse
         from lookup.models import LookupRequest
         from lookup.orchestrator import perform_lookup
@@ -645,7 +686,16 @@ class TestPromoteAlbumFromCachedTrackData:
             new_callable=AsyncMock,
             return_value=[],
         ):
-            response = await perform_lookup(request, library_db, mock_service, RequestTelemetry())
+            response = await perform_lookup(
+                request,
+                library_db,
+                mock_service,
+                RequestTelemetry(
+                    api_call_keys=["discogs"],
+                    distinct_id="library-metadata-lookup-service",
+                    event_prefix="lookup",
+                ),
+            )
 
         # Without a cache answer we keep the artist-fallback behavior:
         # the user still gets albums by the artist, and song_not_found stays True.
