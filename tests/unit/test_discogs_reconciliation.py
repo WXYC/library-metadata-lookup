@@ -189,44 +189,46 @@ class TestNamePreprocessingStage:
     """
 
     @pytest.mark.asyncio
-    async def test_leading_the_strip_resolves_via_exact_match(self, reconciler, mock_pg):
-        """'The Microphones' has no exact match, but 'Microphones' (variant) does."""
+    async def test_leading_the_subsumed_by_baseline_normalization(self, reconciler, mock_pg):
+        """Post-#280 the article-strip is part of the locked-on baseline that
+        ``to_identity_match_form`` applies on the input side and
+        ``wxyc_identity_match_artist`` applies on the column side. ``The
+        Microphones`` therefore normalizes to ``microphones`` directly — Stage 1
+        exact match resolves it, and the Stage 5 preprocessing cascade never
+        runs for this case.
+        """
         mock_pg.fetchall = AsyncMock(
-            side_effect=[
-                [],  # Stage 1 exact match (canonical "the microphones") — miss
-                [],  # Stage 2 member — miss
-                [],  # Stage 3 alias — miss
-                [],  # Stage 4 name variation — miss
-                [
-                    {"artist_name": "microphones", "artist_id": 5050}
-                ],  # Stage 5 ⇒ exact match on variant
-            ]
+            return_value=[{"artist_name": "microphones", "artist_id": 5050}]
         )
         results = await reconciler.reconcile_batch(["The Microphones"])
         assert "The Microphones" in results
         assert results["The Microphones"].discogs_artist_id == 5050
-        assert results["The Microphones"].method == "name_preprocessing"
+        # Stage 1 (exact_match) hits, not name_preprocessing — the baseline
+        # already strips the leading article on both sides.
+        assert results["The Microphones"].method == "exact_match"
+        assert mock_pg.fetchall.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_bracket_strip_resolves(self, reconciler, mock_pg):
-        """'Adam X [DJ]' miss; 'Adam X' (bracket-stripped) hits exact match."""
-        mock_pg.fetchall = AsyncMock(
-            side_effect=[
-                [],  # Stage 1 — miss
-                [],  # Stage 2 — miss
-                [],  # Stage 3 — miss
-                [],  # Stage 4 — miss
-                [{"artist_name": "adam x", "artist_id": 8181}],  # Stage 5 ⇒ exact on stripped
-            ]
-        )
+    async def test_bracket_strip_subsumed_by_baseline_normalization(self, reconciler, mock_pg):
+        """Post-#280 the bracket-strip is part of the locked-on baseline.
+        ``Adam X [DJ]`` normalizes to ``adam x`` directly on both sides, so
+        Stage 1 resolves without needing the preprocessing cascade.
+        """
+        mock_pg.fetchall = AsyncMock(return_value=[{"artist_name": "adam x", "artist_id": 8181}])
         results = await reconciler.reconcile_batch(["Adam X [DJ]"])
         assert "Adam X [DJ]" in results
         assert results["Adam X [DJ]"].discogs_artist_id == 8181
-        assert results["Adam X [DJ]"].method == "name_preprocessing"
+        assert results["Adam X [DJ]"].method == "exact_match"
+        assert mock_pg.fetchall.await_count == 1
 
     @pytest.mark.asyncio
     async def test_split_resolves_via_first_part(self, reconciler, mock_pg):
-        """Multi-artist credit 'Juana Molina / Cat Power' resolves via 'Juana Molina'."""
+        """Multi-artist credit 'Juana Molina / Cat Power' resolves via 'Juana Molina'.
+
+        Multi-credit splitting is NOT in the locked-on baseline, so the canonical
+        ``juana molina / cat power`` still misses Stages 1-4 and the Stage 5
+        split variant ``juana molina`` is what produces the hit.
+        """
         mock_pg.fetchall = AsyncMock(
             side_effect=[
                 [],  # Stage 1 — miss
@@ -254,7 +256,10 @@ class TestNamePreprocessingStage:
     ):
         """An exact-match hit on the canonical short-circuits the cascade —
         Stage 5 does not run, no extra SQL is issued."""
-        mock_pg.fetchall = AsyncMock(return_value=[{"artist_name": "the books", "artist_id": 4242}])
+        # Post-#280: `to_identity_match_form("The Books")` is `"books"` (article
+        # stripped by the locked-on baseline), so the mock returns the row whose
+        # `wxyc_identity_match_artist` form is `"books"`.
+        mock_pg.fetchall = AsyncMock(return_value=[{"artist_name": "books", "artist_id": 4242}])
         await reconciler.reconcile_batch(["The Books"])
         # Exactly one SQL call: Stage 1 exact match. No cascade past it.
         assert mock_pg.fetchall.await_count == 1
@@ -265,6 +270,10 @@ class TestNamePreprocessingStage:
         When a variant misses inner stages 1–3 but hits stage 4 (name_variation),
         the canonical still resolves with method="name_preprocessing" — the outer
         method label does not leak the inner stage that produced the hit.
+
+        Uses an ampersand input because ``&`` → ``and`` is NOT in the locked-on
+        baseline; the preprocessing variant is still the only path that exercises
+        it.
         """
         mock_pg.fetchall = AsyncMock(
             side_effect=[
@@ -275,15 +284,16 @@ class TestNamePreprocessingStage:
                 [],  # Stage 5 inner: exact match on variant — miss
                 [],  # Stage 5 inner: member match on variant — miss
                 [],  # Stage 5 inner: alias match on variant — miss
-                [{"name": "microphones", "artist_id": 7777}],  # Stage 5 inner: name_variation hit
+                # Stage 5 inner: name_variation hit on `"mount eerie and julie doiron"`
+                [{"name": "mount eerie and julie doiron", "artist_id": 7777}],
             ]
         )
-        results = await reconciler.reconcile_batch(["The Microphones"])
-        assert "The Microphones" in results
-        assert results["The Microphones"].discogs_artist_id == 7777
+        results = await reconciler.reconcile_batch(["Mount Eerie & Julie Doiron"])
+        assert "Mount Eerie & Julie Doiron" in results
+        assert results["Mount Eerie & Julie Doiron"].discogs_artist_id == 7777
         # Outer label is name_preprocessing, NOT name_variation, even though
         # the hit happened at stage 4 inside the preprocessing cascade.
-        assert results["The Microphones"].method == "name_preprocessing"
+        assert results["Mount Eerie & Julie Doiron"].method == "name_preprocessing"
 
 
 class TestDiacriticInsensitiveMatch:
@@ -318,20 +328,21 @@ class TestDiacriticInsensitiveMatch:
     @pytest.mark.asyncio
     async def test_normalized_input_passed_to_sql(self, reconciler, mock_pg):
         """The names sent to the SQL `ANY($1)` array must already be diacritic-stripped
-        and lowercased — matching the `lower(f_unaccent(...))` expression on the
-        column side (which is what the existing GIN index on release_artist uses)."""
+        and lowercased — matching the `wxyc_identity_match_artist(...)` expression on
+        the column side (post-#280 symmetric pair)."""
         mock_pg.fetchall = AsyncMock(return_value=[])
         await reconciler.reconcile_batch(["Björk", "Hermanos Gutiérrez", "Stereolab"])
         # Inspect the ANY($1) parameter on the first call
         first_call_args = mock_pg.fetchall.await_args_list[0].args
         sql_arg, names_arg = first_call_args
-        assert "lower(f_unaccent(" in sql_arg, (
-            "EXACT_MATCH SQL must use lower(f_unaccent(...)) on the column side "
-            "to be diacritic-insensitive (matches the indexed expression)."
+        assert "wxyc_identity_match_artist(" in sql_arg, (
+            "EXACT_MATCH SQL must use wxyc_identity_match_artist(...) on the column "
+            "side to be symmetric with to_identity_match_form on the input side. "
+            "See WXYC/library-metadata-lookup#280."
         )
         assert sorted(names_arg) == sorted(["bjork", "hermanos gutierrez", "stereolab"]), (
-            "Names sent to SQL must be diacritic-stripped + lowercased before being "
-            "compared against lower(f_unaccent(column))."
+            "Names sent to SQL must be normalized via to_identity_match_form before "
+            "being compared against wxyc_identity_match_artist(column)."
         )
 
     @pytest.mark.asyncio
@@ -344,25 +355,23 @@ class TestDiacriticInsensitiveMatch:
         assert results["Björk"].discogs_artist_id == 7777
 
 
-class TestNormalizationAsymmetryGuard:
-    """Regression tests that pin the deferred-swap decision from
-    WXYC/library-metadata-lookup#262.
+class TestNormalizationSymmetryGuard:
+    """Regression tests that pin the post-flip symmetric pair from
+    WXYC/library-metadata-lookup#280.
 
-    The reconciler intentionally uses ``to_match_form`` (not
-    ``to_identity_match_form``) on the input side because the discogs-cache
-    column side stores ``lower(f_unaccent(...))`` and the matching Postgres
-    analog ``wxyc_identity_match_artist()`` has not shipped (plan §3.3.5
-    pending). Flipping the input alone would create asymmetry (leading-article
-    drop, paren-suffix strip) and break the Stage 5 preprocessing variants.
-    These tests fail loudly if a future drive-by edit swaps the alias before
-    the column side moves.
+    The reconciler uses ``to_identity_match_form`` on the input side and
+    ``wxyc_identity_match_artist(col)`` on the column side (deployed in
+    WXYC/discogs-etl#195). Both sides strip leading articles, paren
+    suffixes, and bracket annotations identically. These tests fail loudly
+    if a future drive-by edit reverts the alias to ``to_match_form`` or
+    leaves the SQL using ``lower(f_unaccent(col))``.
     """
 
     @pytest.mark.asyncio
-    async def test_leading_article_preserved_on_input_side(self, reconciler, mock_pg):
-        """``to_match_form`` keeps leading "The "; ``to_identity_match_form`` would
-        drop it. The discogs-cache column stores ``lower(f_unaccent("The Microphones"))``
-        = ``"the microphones"`` — so the input must match that, not "microphones".
+    async def test_leading_article_stripped_on_input_side(self, reconciler, mock_pg):
+        """``to_identity_match_form`` drops leading "The "; the
+        ``wxyc_identity_match_artist`` column side strips it the same way, so
+        the input batch must carry the stripped form.
         """
         mock_pg.fetchall = AsyncMock(return_value=[])
         await reconciler.reconcile_batch(["The Microphones"])
@@ -375,56 +384,49 @@ class TestNormalizationAsymmetryGuard:
         # these assertions break in a non-obvious way. `list(...)` makes
         # the contract explicit.
         names_list = list(names_arg)
-        assert "the microphones" in names_list, (
-            "Stage 1 input must preserve the leading article so the input matches "
-            "the discogs-cache column form. If this fails, the reconciler has been "
-            "swapped to to_identity_match_form before the PG analog landed — "
-            "see #262 deferred-swap note."
+        assert "microphones" in names_list, (
+            "Stage 1 input must carry the article-stripped form so the input "
+            "matches the wxyc_identity_match_artist column form. If this fails, "
+            "the reconciler has been reverted to to_match_form — see #280."
         )
-        assert "microphones" not in names_list, (
-            "If 'microphones' (article-stripped) is in the input batch, the reconciler "
-            "is using to_identity_match_form. Revert until the PG analog ships."
+        assert "the microphones" not in names_list, (
+            "If 'the microphones' (article-preserving) is in the input batch, "
+            "the reconciler has been reverted to to_match_form. Restore "
+            "to_identity_match_form per WXYC/library-metadata-lookup#280."
         )
 
     @pytest.mark.asyncio
-    async def test_paren_suffix_preserved_on_input_side(self, reconciler, mock_pg):
-        """``to_match_form`` keeps trailing parens; ``to_identity_match_form`` drops
-        ``(Live)`` / ``(2024 Remaster)``-style suffixes. Asymmetric vs the
-        discogs-cache column form.
+    async def test_paren_suffix_stripped_on_input_side(self, reconciler, mock_pg):
+        """``to_identity_match_form`` drops ``(Live)`` / ``(2024 Remaster)``
+        suffixes; the ``wxyc_identity_match_artist`` column side does the same.
         """
         mock_pg.fetchall = AsyncMock(return_value=[])
-        # Use a (Live) suffix shape — to_match_form preserves, to_identity_match_form drops.
         await reconciler.reconcile_batch(["Stereolab (Live)"])
         first_call_args = mock_pg.fetchall.await_args_list[0].args
         _, names_arg = first_call_args
         names_list = list(names_arg)
-        # to_match_form lowercases but preserves the paren; the cache-side
-        # `lower(f_unaccent("Stereolab (Live)"))` would equal "stereolab (live)".
-        assert "stereolab (live)" in names_list, (
-            "Stage 1 input must preserve the trailing paren suffix to stay symmetric "
-            "with the discogs-cache column form. See #262 deferred-swap note."
+        assert "stereolab" in names_list, (
+            "Stage 1 input must carry the paren-stripped form to stay symmetric "
+            "with the wxyc_identity_match_artist column form. See #280."
         )
-        # Negative-case symmetry with the leading-article test: if the
-        # paren-stripped form `"stereolab"` is in the input batch, the
-        # reconciler is using to_identity_match_form (which drops `(Live)`
-        # suffixes). Revert until the PG analog ships.
-        assert "stereolab" not in names_list, (
-            "If 'stereolab' (paren-stripped) is in the input batch, the reconciler "
-            "is using to_identity_match_form. Revert until the PG analog ships."
+        assert "stereolab (live)" not in names_list, (
+            "If 'stereolab (live)' (paren-preserving) is in the input batch, the "
+            "reconciler has been reverted to to_match_form. Restore "
+            "to_identity_match_form per WXYC/library-metadata-lookup#280."
         )
 
     @pytest.mark.asyncio
-    async def test_reconciler_imports_to_match_form_not_identity_form(self):
-        """Static guard: the reconciler module's `normalize_artist_name` alias must
-        bind to ``wxyc_etl.text.to_match_form`` until the PG analog ships.
+    async def test_reconciler_imports_to_identity_match_form(self):
+        """Static guard: the reconciler module's `normalize_artist_name` alias
+        must bind to ``wxyc_etl.text.to_identity_match_form`` post-#280.
         """
         from wxyc_etl.text import to_identity_match_form, to_match_form
 
         from scripts.entity_resolution import discogs as reconciler_module
 
-        assert reconciler_module.normalize_artist_name is to_match_form, (
-            "Reconciler must import `to_match_form as normalize_artist_name`. "
-            "Swapping to to_identity_match_form is gated on plan §3.3.5 (PG analog). "
-            "See WXYC/library-metadata-lookup#262."
+        assert reconciler_module.normalize_artist_name is to_identity_match_form, (
+            "Reconciler must import `to_identity_match_form as normalize_artist_name`. "
+            "Reverting to to_match_form re-introduces the asymmetry that #280 closed. "
+            "See WXYC/library-metadata-lookup#280."
         )
-        assert reconciler_module.normalize_artist_name is not to_identity_match_form
+        assert reconciler_module.normalize_artist_name is not to_match_form
