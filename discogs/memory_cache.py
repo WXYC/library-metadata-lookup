@@ -10,8 +10,7 @@ from typing import Any, TypeVar
 
 from cachetools import TTLCache  # type: ignore[import-untyped]
 from pydantic import BaseModel
-
-from core.telemetry import record_memory_cache_hit
+from wxyc_fastapi.observability import get_cache_stats_recorder
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +148,7 @@ def async_cached(cache: TTLCache) -> Callable[[Callable[..., T]], Callable[..., 
             # Check cache
             if key in cache:
                 logger.debug(f"Cache hit for {func.__name__}")
-                record_memory_cache_hit()
+                get_cache_stats_recorder().record_memory_cache_hit()
                 result = cache[key]
                 return _set_cached_flag(result, cached=True)  # type: ignore[no-any-return]
 

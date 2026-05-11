@@ -86,9 +86,8 @@ def mock_posthog_client():
 @pytest.fixture(autouse=True)
 def reset_caches():
     """Clear all in-memory caches, rate limiting state, and ContextVars between tests."""
-    from core.telemetry import _cache_stats_var
+    from wxyc_fastapi.observability.cache_stats import _cache_stats_var
 
-    # Capture tokens so we can reset after test
     cache_stats_token = _cache_stats_var.set(None)
     set_skip_cache(False)
     yield

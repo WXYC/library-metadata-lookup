@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from wxyc_fastapi.observability import flush_posthog, init_sentry, shutdown_posthog
 
 from config.settings import get_settings
 from core.auth import require_lml_key
@@ -15,11 +16,8 @@ from core.dependencies import (
     close_discogs_service,
     close_library_db,
     close_musicbrainz_pg,
-    flush_posthog,
-    shutdown_posthog,
 )
 from core.logging import setup_logging
-from core.sentry import init_sentry
 from discogs.router import router as discogs_router
 from identity.dependencies import close_entity_store
 from identity.router import api_v1_router as identity_api_v1_router
@@ -38,6 +36,7 @@ settings = get_settings()
 
 init_sentry(
     dsn=settings.sentry_dsn,
+    service_name="library-metadata-lookup",
     environment=settings.environment,
     release=settings.app_version,
 )

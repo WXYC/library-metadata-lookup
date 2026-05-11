@@ -8,11 +8,9 @@ import core.dependencies as deps_module
 from core.dependencies import (
     close_discogs_service,
     close_library_db,
-    flush_posthog,
     get_discogs_service,
     get_library_db,
     get_posthog_client,
-    shutdown_posthog,
 )
 
 
@@ -22,12 +20,10 @@ def reset_globals():
     deps_module._library_db = None
     deps_module._discogs_service = None
     deps_module._discogs_pool = None
-    deps_module._posthog_client = None
     yield
     deps_module._library_db = None
     deps_module._discogs_service = None
     deps_module._discogs_pool = None
-    deps_module._posthog_client = None
 
 
 # ---------------------------------------------------------------------------
@@ -285,72 +281,23 @@ class TestCloseDiscogsService:
 
 
 # ---------------------------------------------------------------------------
-# get_posthog_client
+# get_posthog_client (LML-side gating)
 # ---------------------------------------------------------------------------
 
 
 class TestGetPosthogClient:
-    def test_disabled_returns_none(self, mock_settings):
+    """LML adds an `enable_telemetry` short-circuit on top of the wxyc-fastapi singleton."""
+
+    def test_short_circuits_when_telemetry_disabled(self, mock_settings):
         mock_settings.enable_telemetry = False
-        assert get_posthog_client(mock_settings) is None
+        with patch("core.dependencies._shared_posthog_client") as mock_shared:
+            assert get_posthog_client(mock_settings) is None
+        mock_shared.assert_not_called()
 
-    def test_no_key_returns_none(self, mock_settings):
+    def test_delegates_with_lookup_event_prefix(self, mock_settings):
         mock_settings.enable_telemetry = True
-        mock_settings.posthog_api_key = None
-        assert get_posthog_client(mock_settings) is None
-
-    def test_creates_client(self, mock_settings):
-        mock_settings.enable_telemetry = True
-        mock_settings.posthog_api_key = "phc_test"
-        mock_settings.posthog_host = "https://app.posthog.com"
-
-        with patch("core.dependencies.Posthog") as mock_ph_cls:
-            mock_client = Mock()
-            mock_ph_cls.return_value = mock_client
-
-            result = get_posthog_client(mock_settings)
-
-            mock_ph_cls.assert_called_once_with(
-                project_api_key="phc_test",
-                host="https://app.posthog.com",
-            )
-            assert result is mock_client
-
-    def test_cached_client(self, mock_settings):
-        mock_client = Mock()
-        deps_module._posthog_client = mock_client
-        mock_settings.enable_telemetry = True
-        mock_settings.posthog_api_key = "phc_test"
-
-        result = get_posthog_client(mock_settings)
-        assert result is mock_client
-
-
-# ---------------------------------------------------------------------------
-# flush_posthog / shutdown_posthog
-# ---------------------------------------------------------------------------
-
-
-class TestFlushPosthog:
-    def test_flushes(self):
-        mock_client = Mock()
-        deps_module._posthog_client = mock_client
-        flush_posthog()
-        mock_client.flush.assert_called_once()
-
-    def test_noop_when_none(self):
-        deps_module._posthog_client = None
-        flush_posthog()  # should not raise
-
-
-class TestShutdownPosthog:
-    def test_shuts_down(self):
-        mock_client = Mock()
-        deps_module._posthog_client = mock_client
-        shutdown_posthog()
-        mock_client.shutdown.assert_called_once()
-        assert deps_module._posthog_client is None
-
-    def test_noop_when_none(self):
-        deps_module._posthog_client = None
-        shutdown_posthog()  # should not raise
+        with patch("core.dependencies._shared_posthog_client") as mock_shared:
+            mock_shared.return_value = Mock()
+            client = get_posthog_client(mock_settings)
+        assert client is mock_shared.return_value
+        mock_shared.assert_called_once_with(event_prefix="lookup")

@@ -12,15 +12,14 @@ import httpx
 import sentry_sdk
 from rapidfuzz import fuzz
 from wxyc_etl.text import is_compilation_artist
-
-from config.settings import get_settings
-from core.telemetry import (
-    record_discogs_api_call,
-    record_pg_cache_hit,
-    record_pg_cache_miss,
+from wxyc_fastapi.observability import (
+    add_breadcrumb,
+    get_cache_stats_recorder,
     timed_api,
     timed_pg,
 )
+
+from config.settings import get_settings
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import (
     ARTIST_CACHE,
@@ -54,15 +53,14 @@ from discogs.ratelimit import get_rate_limiter, get_semaphore
 if TYPE_CHECKING:
     from discogs.cache_service import DiscogsCacheService
 
-# Import Sentry breadcrumb helper (fail gracefully if not initialized)
-try:
-    from core.sentry import add_discogs_breadcrumb
-except ImportError:
 
-    def add_discogs_breadcrumb(
-        operation: str, data: dict[str, Any] | None = None, level: str = "info"
-    ) -> None:
-        pass  # No-op if Sentry not available
+def add_discogs_breadcrumb(
+    operation: str,
+    data: dict[str, Any] | None = None,
+    level: str = "info",
+) -> None:
+    """Module-local alias that pins the ``"discogs"`` category for breadcrumbs."""
+    add_breadcrumb(category="discogs", message=operation, data=data, level=level)
 
 
 logger = logging.getLogger(__name__)
@@ -408,7 +406,7 @@ class DiscogsService:
                     )
                 if cached_releases:
                     logger.info(f"Cache hit: found {len(cached_releases)} releases for '{track}'")
-                    record_pg_cache_hit()
+                    get_cache_stats_recorder().record_pg_cache_hit()
                     add_discogs_breadcrumb(
                         "cache_hit", {"track": track, "count": len(cached_releases)}
                     )
@@ -420,7 +418,7 @@ class DiscogsService:
                         cached=True,
                     )
                 logger.debug(f"Cache miss for track '{track}'")
-                record_pg_cache_miss()
+                get_cache_stats_recorder().record_pg_cache_miss()
                 add_discogs_breadcrumb("cache_miss", {"track": track})
             except Exception as e:
                 logger.warning(f"Cache lookup failed, falling back to API: {e}")
@@ -453,7 +451,7 @@ class DiscogsService:
                 response = await self._request_with_retry("GET", "/database/search", params=params)
 
             if response is not None:
-                record_discogs_api_call()
+                get_cache_stats_recorder().record_api_call()
                 response.raise_for_status()
                 data = response.json()
 
@@ -483,7 +481,7 @@ class DiscogsService:
                     )
 
                 if response is not None:
-                    record_discogs_api_call()
+                    get_cache_stats_recorder().record_api_call()
                     response.raise_for_status()
                     data = response.json()
 
@@ -565,11 +563,11 @@ class DiscogsService:
                     cached_release = await self.cache_service.get_release(release_id)
                 if cached_release:
                     logger.info(f"Cache hit: release {release_id}")
-                    record_pg_cache_hit()
+                    get_cache_stats_recorder().record_pg_cache_hit()
                     add_discogs_breadcrumb("cache_hit", {"release_id": release_id})
                     return cached_release
                 logger.debug(f"Cache miss for release {release_id}")
-                record_pg_cache_miss()
+                get_cache_stats_recorder().record_pg_cache_miss()
                 add_discogs_breadcrumb("cache_miss", {"release_id": release_id})
             except Exception as e:
                 logger.warning(f"Cache lookup failed, falling back to API: {e}")
@@ -584,7 +582,7 @@ class DiscogsService:
                 logger.warning(f"Failed to fetch release {release_id} (rate limited or error)")
                 return None
 
-            record_discogs_api_call()
+            get_cache_stats_recorder().record_api_call()
             response.raise_for_status()
             data = response.json()
 
@@ -715,10 +713,10 @@ class DiscogsService:
                     cached_details = await self.cache_service.get_artist_details(artist_id)
                 if cached_details:
                     logger.info(f"Cache hit: artist {artist_id}")
-                    record_pg_cache_hit()
+                    get_cache_stats_recorder().record_pg_cache_hit()
                     return cached_details
                 logger.debug(f"Cache miss for artist {artist_id}")
-                record_pg_cache_miss()
+                get_cache_stats_recorder().record_pg_cache_miss()
             except Exception as e:
                 logger.warning(f"Cache lookup failed, falling back to API: {e}")
 
@@ -727,7 +725,7 @@ class DiscogsService:
                 response = await self._request_with_retry("GET", f"/artists/{artist_id}")
             if response is None:
                 return None
-            record_discogs_api_call()
+            get_cache_stats_recorder().record_api_call()
             add_discogs_breadcrumb("get_artist_details", {"artist_id": artist_id})
             response.raise_for_status()
             data = response.json()
@@ -802,7 +800,7 @@ class DiscogsService:
                 response = await self._request_with_retry("GET", f"/labels/{label_id}")
             if response is None:
                 return None
-            record_discogs_api_call()
+            get_cache_stats_recorder().record_api_call()
             add_discogs_breadcrumb("get_label_image", {"label_id": label_id})
             response.raise_for_status()
             data = response.json()
@@ -827,7 +825,7 @@ class DiscogsService:
                 response = await self._request_with_retry("GET", f"/masters/{master_id}")
             if response is None:
                 return None
-            record_discogs_api_call()
+            get_cache_stats_recorder().record_api_call()
             add_discogs_breadcrumb("get_master", {"master_id": master_id})
             response.raise_for_status()
             data = response.json()
@@ -873,7 +871,7 @@ class DiscogsService:
                     )
                 if cached:
                     logger.info(f"Cache hit: found {len(cached)} releases for search")
-                    record_pg_cache_hit()
+                    get_cache_stats_recorder().record_pg_cache_hit()
                     add_discogs_breadcrumb("cache_hit", {"count": len(cached)})
                     results = []
                     for row in cached:
@@ -900,7 +898,7 @@ class DiscogsService:
                     results.sort(key=lambda r: r.confidence, reverse=True)
                     return DiscogsSearchResponse(results=results, total=len(results), cached=True)
                 logger.debug("Cache miss for search")
-                record_pg_cache_miss()
+                get_cache_stats_recorder().record_pg_cache_miss()
                 add_discogs_breadcrumb("cache_miss", {"artist": request.artist})
             except Exception as e:
                 logger.warning(f"Cache search failed, falling back to API: {e}")
@@ -916,7 +914,7 @@ class DiscogsService:
                 logger.warning("Discogs search failed (rate limited or error)")
                 return DiscogsSearchResponse(cached=False)
 
-            record_discogs_api_call()
+            get_cache_stats_recorder().record_api_call()
             response.raise_for_status()
             data = response.json()
 
@@ -938,7 +936,7 @@ class DiscogsService:
                         "GET", "/database/search", params=fallback_params
                     )
                 if response is not None:
-                    record_discogs_api_call()
+                    get_cache_stats_recorder().record_api_call()
                     response.raise_for_status()
                     data = response.json()
 
@@ -1058,13 +1056,13 @@ class DiscogsService:
                         f"Cache {'validated' if cached_result else 'rejected'}: "
                         f"'{track}' by '{artist}' on release {release_id}"
                     )
-                    record_pg_cache_hit()
+                    get_cache_stats_recorder().record_pg_cache_hit()
                     add_discogs_breadcrumb(
                         "cache_hit", {"release_id": release_id, "validated": cached_result}
                     )
                     return cached_result
                 logger.debug(f"Cache miss for validation on release {release_id}")
-                record_pg_cache_miss()
+                get_cache_stats_recorder().record_pg_cache_miss()
                 add_discogs_breadcrumb("cache_miss", {"release_id": release_id})
             except Exception as e:
                 logger.warning(f"Cache validation failed, falling back to API: {e}")

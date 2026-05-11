@@ -193,8 +193,8 @@ Optional:
 - `DATABASE_URL_MUSICBRAINZ` -- PostgreSQL URL for the musicbrainz-cache. Powers the MB leg of the `/api/v1/lookup` external-cache fallback (Phase 1.5 mojibake recovery). Optional; when unset the MB leg is skipped.
 - `SPOTIFY_CLIENT_ID` -- Spotify client ID for streaming availability checks
 - `SPOTIFY_CLIENT_SECRET` -- Spotify client secret for streaming availability checks
-- `SENTRY_DSN` -- Sentry error tracking
-- `POSTHOG_API_KEY` -- PostHog telemetry
+- `SENTRY_DSN` -- Sentry error tracking. Init lives in [`wxyc-fastapi`](https://github.com/WXYC/wxyc-fastapi); LML calls `init_sentry(service_name="library-metadata-lookup", environment=settings.environment, ...)` at startup. The default `HttpxIntegration` is on, so outbound calls (Discogs, Spotify, Deezer, Apple Music, Bandcamp) are traced.
+- `POSTHOG_API_KEY` -- PostHog telemetry. Client construction lives in `wxyc-fastapi` as a process-wide singleton; LML's `core/dependencies.get_posthog_client` only wraps it with the LML-side `enable_telemetry` flag. The shared client warns once per process when this is unset.
 - `LIBRARY_DB_PATH` -- Path to SQLite database (default: `library.db`)
 - `ADMIN_TOKEN` -- Bearer token for admin endpoints (upload endpoint)
 - `STREAMING_WEBHOOK_URLS` -- Comma-separated URLs to POST streaming status changes after library.db upload
