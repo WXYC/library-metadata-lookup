@@ -21,22 +21,61 @@ from tests.unit.conftest import override_deps
 # ---------------------------------------------------------------------------
 
 
+class _MockTxn:
+    """Async context manager standing in for ``conn.transaction()``."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+
+class _MockAcquire:
+    """Async context manager standing in for ``pool.acquire()``."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *_):
+        return None
+
+
+def _make_cache_svc(fetch_rows: list[dict]) -> tuple[DiscogsCacheService, AsyncMock]:
+    """Build a ``DiscogsCacheService`` whose ``pool.acquire()`` yields a
+    connection mock with ``transaction``/``fetchval``/``fetch`` wired up.
+
+    Returns ``(svc, mock_conn)`` so tests can assert on the underlying
+    connection's method calls.
+    """
+    mock_conn = AsyncMock()
+    mock_conn.transaction = lambda: _MockTxn()
+    mock_conn.fetchval = AsyncMock(return_value=None)
+    mock_conn.fetch = AsyncMock(return_value=fetch_rows)
+
+    mock_pool = AsyncMock()
+    mock_pool.acquire = lambda: _MockAcquire(mock_conn)
+
+    svc = DiscogsCacheService.__new__(DiscogsCacheService)
+    svc.pool = mock_pool
+    return svc, mock_conn
+
+
 class TestSearchAlbumsByTrackTitle:
     """Direct tests of the cache method.
 
-    Uses an AsyncMock for the underlying ``self.pool`` so we can assert
-    on the parametrised SQL call without spinning a real Postgres.
+    Mocks ``pool.acquire`` so we can assert on the parametrised SQL call
+    without spinning a real Postgres. The method opens a transaction +
+    binds ``pg_trgm.similarity_threshold`` before fetching, so the mocked
+    connection needs ``transaction()`` / ``fetchval()`` / ``fetch()``.
     """
-
-    def _make_svc(self, fetch_rows: list[dict]) -> DiscogsCacheService:
-        svc = DiscogsCacheService.__new__(DiscogsCacheService)
-        svc.pool = AsyncMock()
-        svc.pool.fetch = AsyncMock(return_value=fetch_rows)
-        return svc
 
     @pytest.mark.asyncio
     async def test_returns_projected_dicts(self):
-        svc = self._make_svc(
+        svc, _ = _make_cache_svc(
             [
                 {
                     "release_id": 1573110,
@@ -66,19 +105,19 @@ class TestSearchAlbumsByTrackTitle:
 
     @pytest.mark.asyncio
     async def test_passes_query_limit_and_threshold_to_pg(self):
-        svc = self._make_svc([])
+        svc, conn = _make_cache_svc([])
         await svc.search_albums_by_track_title("scose poise", limit=10, score_threshold=0.5)
-        # Positional args: (sql, query, threshold, limit).
-        call_args = svc.pool.fetch.await_args.args
+        # Positional args to fetch: (sql, query, threshold, limit).
+        call_args = conn.fetch.await_args.args
         assert call_args[1] == "scose poise"
         assert call_args[2] == 0.5
         assert call_args[3] == 10
 
     @pytest.mark.asyncio
     async def test_defaults_threshold_to_pg_trgm_default(self):
-        svc = self._make_svc([])
+        svc, conn = _make_cache_svc([])
         await svc.search_albums_by_track_title("anything")
-        call_args = svc.pool.fetch.await_args.args
+        call_args = conn.fetch.await_args.args
         assert call_args[2] == 0.3  # pg_trgm default
         assert call_args[3] == 50  # function default
 
@@ -87,7 +126,7 @@ class TestSearchAlbumsByTrackTitle:
         # asyncpg's Real → Python decimal-like type would surface as Decimal in
         # some installs; the projection coerces to plain float so callers can
         # rely on the type.
-        svc = self._make_svc(
+        svc, _ = _make_cache_svc(
             [
                 {
                     "release_id": 1,
@@ -107,7 +146,7 @@ class TestSearchAlbumsByTrackTitle:
     async def test_master_id_passes_through_null(self):
         # Releases with no master_id (singles, demos, V/A one-offs) come back
         # with master_id NULL. The projection preserves None.
-        svc = self._make_svc(
+        svc, _ = _make_cache_svc(
             [
                 {
                     "release_id": 99,
@@ -124,10 +163,63 @@ class TestSearchAlbumsByTrackTitle:
         assert result[0]["master_id"] is None
 
     @pytest.mark.asyncio
+    async def test_null_track_position_passes_through(self):
+        # ``release_track.position`` is nullable in the Discogs schema. The
+        # projection must preserve None; the Pydantic model handles it
+        # downstream (see endpoint test).
+        svc, _ = _make_cache_svc(
+            [
+                {
+                    "release_id": 9999,
+                    "master_id": None,
+                    "release_title": "Digital Only",
+                    "release_artist": "Some Artist",
+                    "track_title": "Track",
+                    "track_position": None,
+                    "score": 0.9,
+                }
+            ]
+        )
+        result = await svc.search_albums_by_track_title("track")
+        assert result[0]["track_position"] is None
+
+    @pytest.mark.asyncio
+    async def test_sets_pg_trgm_similarity_threshold_per_query(self):
+        """The ``%`` operator in the WHERE clause reads ``pg_trgm.similarity_threshold``
+        (a session GUC defaulting to 0.3). Without binding the per-call
+        threshold, callers requesting < 0.3 silently get 0.3 behavior because
+        the operator's GIN-index lookup floors at the GUC value regardless of
+        the explicit ``similarity(...) >= $2`` clause.
+
+        The cache method must run the query inside a transaction that
+        ``SELECT set_config('pg_trgm.similarity_threshold', $1, true)`` to
+        make the operator floor match the caller's request. ``is_local =
+        true`` scopes the change to the transaction so concurrent queries on
+        other pool connections aren't affected."""
+        svc, conn = _make_cache_svc([])
+
+        await svc.search_albums_by_track_title("vi scose poise", score_threshold=0.15)
+
+        # Verify the connection bound the threshold inside the transaction.
+        set_config_calls = [
+            call
+            for call in conn.fetchval.await_args_list
+            if call.args and "set_config" in str(call.args[0]).lower()
+        ]
+        assert set_config_calls, (
+            "expected the cache method to bind pg_trgm.similarity_threshold via "
+            "set_config(...) inside the transaction; otherwise the `%` operator's "
+            "GUC default (0.3) silently overrides the caller's threshold."
+        )
+        # And that the binding used the per-call value with is_local=true.
+        call = set_config_calls[0]
+        assert call.args[1] == "0.15"
+        assert call.args[2] is True
+
+    @pytest.mark.asyncio
     async def test_wraps_db_errors_as_cache_unavailable(self):
-        svc = DiscogsCacheService.__new__(DiscogsCacheService)
-        svc.pool = AsyncMock()
-        svc.pool.fetch = AsyncMock(side_effect=RuntimeError("connection refused"))
+        svc, conn = _make_cache_svc([])
+        conn.fetch = AsyncMock(side_effect=RuntimeError("connection refused"))
 
         with pytest.raises(CacheUnavailableError) as exc_info:
             await svc.search_albums_by_track_title("anything")
@@ -290,6 +382,61 @@ class TestSearchByTrackEndpoint:
             )
         assert resp.status_code == 503
         assert "DATABASE_URL_DISCOGS" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_null_track_position_round_trips(self, app_with_cache, mock_cache):
+        """``release_track.position`` is nullable in the Discogs schema (digital
+        releases and some compilations omit it). The response model must accept
+        ``track_position: None`` so the endpoint doesn't return 500 on those
+        rows."""
+        mock_cache.search_albums_by_track_title = AsyncMock(
+            return_value=[
+                {
+                    "release_id": 9999,
+                    "master_id": None,
+                    "release_title": "Digital Only",
+                    "release_artist": "Some Artist",
+                    "track_title": "Track With No Position",
+                    "track_position": None,
+                    "score": 0.95,
+                }
+            ]
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_cache), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/search-by-track",
+                params={"q": "track with no position"},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["results"][0]["track_position"] is None
+
+    @pytest.mark.asyncio
+    async def test_threshold_below_pg_trgm_default_is_admitted(self, app_with_cache, mock_cache):
+        """``score_threshold=0.1`` must reach the cache layer (which is
+        responsible for binding ``pg_trgm.similarity_threshold`` for the
+        query). The API parameter accepts ``ge=0``; rejecting low thresholds
+        at the API layer would mask the real issue (without SET-LOCAL
+        plumbing in the cache, the GUC's 0.3 default short-circuits ``%`` and
+        callers get 0.3 behavior regardless)."""
+        mock_cache.search_albums_by_track_title = AsyncMock(return_value=[])
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_cache), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/search-by-track",
+                params={"q": "t", "score_threshold": 0.1},
+            )
+
+        assert resp.status_code == 200
+        mock_cache.search_albums_by_track_title.assert_called_once_with(
+            "t", limit=50, score_threshold=0.1
+        )
 
     @pytest.mark.asyncio
     async def test_cache_error_returns_empty_results_not_500(self, app_with_cache, mock_cache):

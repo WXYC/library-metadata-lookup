@@ -54,6 +54,10 @@ class SearchByTrackResult(BaseModel):
     Returned by ``GET /api/v1/discogs/search-by-track``. One row per
     matching ``release_id``; callers (Backend-Service) bridge to library
     rows via ``library.canonical_entity_id = 'discogs:' || release_id``.
+
+    ``track_position`` is nullable because ``release_track.position`` is
+    nullable in the Discogs schema (digital releases and some compilations
+    omit it).
     """
 
     release_id: int
@@ -61,7 +65,7 @@ class SearchByTrackResult(BaseModel):
     release_title: str
     release_artist: str
     track_title: str
-    track_position: str
+    track_position: str | None = None
     score: float
 
 

@@ -248,13 +248,23 @@ class DiscogsCacheService:
         its own ``release_id``; the caller handles cross-pressing dedupe via
         the library lookup.
 
+        The query runs inside a transaction that binds
+        ``pg_trgm.similarity_threshold`` (a session GUC defaulting to 0.3)
+        to the caller's ``score_threshold`` via ``set_config(..., is_local =
+        true)``. Without this, the ``%`` operator silently floors at 0.3
+        regardless of the explicit ``similarity(...) >= $2`` clause, so
+        callers passing ``score_threshold=0.1`` would get 0.3 behavior. The
+        ``is_local`` flag scopes the GUC change to the transaction so
+        concurrent queries on other pool connections aren't affected.
+
         Args:
             track_title: Track title query (need not be exact).
             limit: Maximum number of results.
             score_threshold: Minimum trigram similarity (in [0, 1]) to
                 include. The pg_trgm default of 0.3 catches "scose poise" →
                 "VI Scose Poise" but not "scose" (similarity ≈ 0.25); raise
-                to 0.5+ to require near-exact track-title matches.
+                to 0.5+ to require near-exact track-title matches. Values
+                below 0.3 are honored because we bind the per-query GUC.
 
         Returns:
             List of dicts with keys:
@@ -298,7 +308,19 @@ class DiscogsCacheService:
                 ORDER BY score DESC, release_id
                 LIMIT $3
             """
-            rows = await self.pool.fetch(query, track_title, score_threshold, limit)
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    # Bind pg_trgm.similarity_threshold per query so the `%`
+                    # operator floor matches the caller's score_threshold.
+                    # is_local=true scopes the GUC change to the transaction
+                    # so concurrent queries on other pool connections aren't
+                    # affected.
+                    await conn.fetchval(
+                        "SELECT set_config('pg_trgm.similarity_threshold', $1, $2)",
+                        str(score_threshold),
+                        True,
+                    )
+                    rows = await conn.fetch(query, track_title, score_threshold, limit)
             return [
                 {
                     "release_id": r["release_id"],
