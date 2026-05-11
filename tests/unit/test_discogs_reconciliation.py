@@ -342,3 +342,73 @@ class TestDiacriticInsensitiveMatch:
         assert "Björk" in results
         # Original spelling preserved as the dict key for write-back to entity.identity.
         assert results["Björk"].discogs_artist_id == 7777
+
+
+class TestNormalizationAsymmetryGuard:
+    """Regression tests that pin the deferred-swap decision from
+    WXYC/library-metadata-lookup#262 (E3 step 5f).
+
+    The reconciler intentionally uses ``to_match_form`` (not
+    ``to_identity_match_form``) on the input side because the discogs-cache
+    column side stores ``lower(f_unaccent(...))`` and the matching Postgres
+    analog ``wxyc_identity_match_artist()`` has not shipped yet (plan §3.3.5
+    is still pending as of 2026-05-11). Flipping the input alone would
+    create asymmetry (leading-article drop, paren-suffix strip) and break
+    the Stage 5 preprocessing variants. These tests fail loudly if a
+    future drive-by edit swaps the alias before the column side moves.
+    """
+
+    @pytest.mark.asyncio
+    async def test_leading_article_preserved_on_input_side(self, reconciler, mock_pg):
+        """``to_match_form`` keeps leading "The "; ``to_identity_match_form`` would
+        drop it. The discogs-cache column stores ``lower(f_unaccent("The Beatles"))``
+        = ``"the beatles"`` — so the input must match that, not "beatles".
+        """
+        mock_pg.fetchall = AsyncMock(return_value=[])
+        await reconciler.reconcile_batch(["The Beatles"])
+        first_call_args = mock_pg.fetchall.await_args_list[0].args
+        _, names_arg = first_call_args
+        assert "the beatles" in names_arg, (
+            "Stage 1 input must preserve the leading article so the input matches "
+            "the discogs-cache column form. If this fails, the reconciler has been "
+            "swapped to to_identity_match_form before the PG analog landed — "
+            "see #262 deferred-swap note."
+        )
+        assert "beatles" not in names_arg, (
+            "If 'beatles' (article-stripped) is in the input batch, the reconciler "
+            "is using to_identity_match_form. Revert until the PG analog ships."
+        )
+
+    @pytest.mark.asyncio
+    async def test_paren_suffix_preserved_on_input_side(self, reconciler, mock_pg):
+        """``to_match_form`` keeps trailing parens; ``to_identity_match_form`` drops
+        ``(Live)`` / ``(2024 Remaster)``-style suffixes. Asymmetric vs the
+        discogs-cache column form.
+        """
+        mock_pg.fetchall = AsyncMock(return_value=[])
+        # Use a (Live) suffix shape — to_match_form preserves, to_identity_match_form drops.
+        await reconciler.reconcile_batch(["Stereolab (Live)"])
+        first_call_args = mock_pg.fetchall.await_args_list[0].args
+        _, names_arg = first_call_args
+        # to_match_form lowercases but preserves the paren; the cache-side
+        # `lower(f_unaccent("Stereolab (Live)"))` would equal "stereolab (live)".
+        assert "stereolab (live)" in names_arg, (
+            "Stage 1 input must preserve the trailing paren suffix to stay symmetric "
+            "with the discogs-cache column form. See #262 deferred-swap note."
+        )
+
+    @pytest.mark.asyncio
+    async def test_reconciler_imports_to_match_form_not_identity_form(self):
+        """Static guard: the reconciler module's `normalize_artist_name` alias must
+        bind to ``wxyc_etl.text.to_match_form`` until the PG analog ships.
+        """
+        from wxyc_etl.text import to_identity_match_form, to_match_form
+
+        from scripts.entity_resolution import discogs as reconciler_module
+
+        assert reconciler_module.normalize_artist_name is to_match_form, (
+            "Reconciler must import `to_match_form as normalize_artist_name`. "
+            "Swapping to to_identity_match_form is gated on plan §3.3.5 (PG analog). "
+            "See WXYC/library-metadata-lookup#262 (E3 step 5f)."
+        )
+        assert reconciler_module.normalize_artist_name is not to_identity_match_form
