@@ -12,17 +12,16 @@ Resolves WXYC library artist names to Discogs artist IDs via a cascade:
    same equality cascade reused on the variant strings, so no new index or
    query plan is added.
 
-Matching is diacritic-insensitive on both sides (``lower(f_unaccent(col))``
-on the column, ``normalize_artist_name(name)`` on the input). The cache load
-pipeline (``discogs-etl/scripts/filter_csv.py:normalize_artist``) strips
-diacritics when deciding which Discogs rows to retain, so reconciliation has
-to use the same normalization or any artist whose WXYC spelling differs in
-diacritics from the Discogs spelling silently goes unreconciled — which is
-the gap that produced the 17% reconciliation rate observed in prod.
-
-The ``lower(f_unaccent(...))`` column expression matches the existing GIN
-trigram index in the discogs-cache schema (see
-``discogs-etl/schema/create_indexes.sql``) so this remains an indexed lookup.
+Matching uses ``wxyc_identity_match_artist(col)`` on the column and
+``to_identity_match_form(name)`` (aliased here as ``normalize_artist_name``)
+on the input — the symmetric pair specified by wiki
+``plans/library-hook-canonicalization.md`` §3.3.5. The discogs-cache
+deploys ``wxyc_identity_match_artist`` as the Postgres analog of the Rust
+``to_identity_match_form`` (WXYC/discogs-etl#195), so the two sides
+collapse the same case + diacritic + leading-article + paren-suffix axes
+identically. The cache-side functional GIN trigram index rebuild over the
+new function expression is tracked separately; ``= ANY(...)`` exact lookups
+fall back to per-row evaluation in the meantime.
 
 Ported from semantic-index ``reconciliation.py``.
 """
@@ -35,59 +34,40 @@ from dataclasses import dataclass
 
 from wxyc_etl.text import split_artist_name
 
-# NOTE(WXYC/library-metadata-lookup#262): the resolver path is the canonical
-# identity-matching consumer and should call `to_identity_match_form` per
-# `library-hook-canonicalization-plan` §3.3.1 step 5, but the swap is
-# deferred until the PG column expressions adopt a matching
-# `wxyc_identity_match_artist()` analog (plan §3.3.5 — pending; see wiki
-# §3.3.0 status). Today the discogs-cache column side uses
-# `lower(f_unaccent(col))` (≈ `to_match_form` semantics; see
-# `discogs-etl/scripts/run_pipeline.py` GIN indexes on `release_artist`,
-# `release`, `release_track`, `release_track_artist`). Switching the input
-# alone strips leading articles asymmetrically (input "The X" → "x", col →
-# "the x") and collapses the Stage 5 preprocessing variants into the
-# canonical key, breaking exact matches for Discogs rows with a "The "
-# prefix. The Stage 5 cheap-derivation pipeline (strip "The ", `&` → `and`,
-# bracket-strip, multi-credit split) is the LML replacement for those folds
-# until the column side moves; flipping the input alone would short-circuit
-# those variants without symmetric column support. The symmetric pair to
-# watch:
-#   - `identity/normalize.py:canonicalize_for_identity_lookup` already uses
-#     `to_identity_match_form` because its target column is
-#     `entity.identity.library_name` (LML-owned, stored verbatim), NOT a
-#     `lower(f_unaccent(...))` cache column.
-#   - This file's target columns ARE `lower(f_unaccent(...))`; flipping
-#     here requires the PG analog to ship first.
-from wxyc_etl.text import to_match_form as normalize_artist_name
+# The reconciler is the canonical identity-matching consumer per wiki
+# `plans/library-hook-canonicalization.md` §3.3.1 step 5. Symmetric pair:
+# `to_identity_match_form` on the input side, `wxyc_identity_match_artist`
+# on the column side (deployed in WXYC/discogs-etl#195).
+from wxyc_etl.text import to_identity_match_form as normalize_artist_name
 
 from scripts.entity_resolution.sources import PgSource
 
 logger = logging.getLogger(__name__)
 
 _EXACT_MATCH_SQL = """\
-SELECT DISTINCT lower(f_unaccent(ra.artist_name)) AS artist_name, ra.artist_id
+SELECT DISTINCT wxyc_identity_match_artist(ra.artist_name) AS artist_name, ra.artist_id
 FROM release_artist ra
 WHERE ra.extra = 0
   AND ra.artist_id IS NOT NULL
-  AND lower(f_unaccent(ra.artist_name)) = ANY($1)\
+  AND wxyc_identity_match_artist(ra.artist_name) = ANY($1)\
 """
 
 _MEMBER_MATCH_SQL = """\
-SELECT DISTINCT lower(f_unaccent(am.member_name)) AS member_name, am.member_id
+SELECT DISTINCT wxyc_identity_match_artist(am.member_name) AS member_name, am.member_id
 FROM artist_member am
-WHERE lower(f_unaccent(am.member_name)) = ANY($1)\
+WHERE wxyc_identity_match_artist(am.member_name) = ANY($1)\
 """
 
 _ALIAS_MATCH_SQL = """\
-SELECT DISTINCT lower(f_unaccent(aa.alias_name)) AS alias_name, aa.artist_id
+SELECT DISTINCT wxyc_identity_match_artist(aa.alias_name) AS alias_name, aa.artist_id
 FROM artist_alias aa
-WHERE lower(f_unaccent(aa.alias_name)) = ANY($1)\
+WHERE wxyc_identity_match_artist(aa.alias_name) = ANY($1)\
 """
 
 _NAME_VARIATION_MATCH_SQL = """\
-SELECT DISTINCT lower(f_unaccent(nv.name)) AS name, nv.artist_id
+SELECT DISTINCT wxyc_identity_match_artist(nv.name) AS name, nv.artist_id
 FROM artist_name_variation nv
-WHERE lower(f_unaccent(nv.name)) = ANY($1)\
+WHERE wxyc_identity_match_artist(nv.name) = ANY($1)\
 """
 
 
@@ -196,12 +176,13 @@ class DiscogsReconciler:
 
         results: dict[str, ReconciliationMatch] = {}
 
-        # Build normalized (diacritic-stripped + lowercased) -> canonical mapping.
-        # The same normalization is applied to the column side via
-        # ``lower(f_unaccent(...))`` in each stage's SQL so the comparison is
-        # symmetric. Two canonicals that normalize to the same form (e.g.
-        # ``Björk`` and ``Bjork``) collapse to the same key — both resolve to
-        # the same Discogs ID, so dropping one is correct.
+        # Build normalized (identity-form) -> canonical mapping. The same
+        # normalization is applied to the column side via
+        # ``wxyc_identity_match_artist(...)`` in each stage's SQL so the
+        # comparison is symmetric (wiki §3.3.5). Two canonicals that normalize
+        # to the same form (e.g. ``Björk`` and ``Bjork``, or ``The Books`` and
+        # ``Books``) collapse to the same key — both resolve to the same
+        # Discogs ID, so dropping one is correct.
         normalized_to_canonical = {normalize_artist_name(n): n for n in effective_names}
 
         # Stage 1: Exact match
