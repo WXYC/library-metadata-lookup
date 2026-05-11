@@ -35,24 +35,23 @@ from dataclasses import dataclass
 
 from wxyc_etl.text import split_artist_name
 
-# NOTE(WXYC/library-metadata-lookup#262, E3 step 5f, re-verified 2026-05-11):
-# per `library-hook-canonicalization-plan` §3.3.1 step 5 the resolver path is
-# the canonical identity-matching consumer and should call
-# `to_identity_match_form`, but the swap is deferred until the PG column
-# expressions adopt a matching `wxyc_identity_match_artist()` analog (per
-# `wxyc-etl/docs/normalization.md` and plan §3.3.5 — still STILL REQUIRED /
-# pending as of 2026-05-11; see wiki §3.3.0 status update). Today the
-# discogs-cache column side uses `lower(f_unaccent(col))` (≈ `to_match_form`
-# semantics; see `discogs-etl/scripts/run_pipeline.py` GIN indexes on
-# `release_artist`, `release`, `release_track`, `release_track_artist`).
-# Switching the input alone strips leading articles asymmetrically (input
-# "The Beatles" → "beatles", col → "the beatles") and collapses the Stage 5
-# preprocessing variants into the canonical key, breaking exact matches for
-# Discogs rows with a "The " prefix. The Stage 5 cheap-derivation pipeline
-# (strip "The ", `&` → `and`, bracket-strip, multi-credit split) is the LML
-# replacement for those folds until the column side moves; flipping the
-# input alone would short-circuit those variants without symmetric column
-# support. The symmetric pair to watch:
+# NOTE(WXYC/library-metadata-lookup#262): the resolver path is the canonical
+# identity-matching consumer and should call `to_identity_match_form` per
+# `library-hook-canonicalization-plan` §3.3.1 step 5, but the swap is
+# deferred until the PG column expressions adopt a matching
+# `wxyc_identity_match_artist()` analog (plan §3.3.5 — pending; see wiki
+# §3.3.0 status). Today the discogs-cache column side uses
+# `lower(f_unaccent(col))` (≈ `to_match_form` semantics; see
+# `discogs-etl/scripts/run_pipeline.py` GIN indexes on `release_artist`,
+# `release`, `release_track`, `release_track_artist`). Switching the input
+# alone strips leading articles asymmetrically (input "The X" → "x", col →
+# "the x") and collapses the Stage 5 preprocessing variants into the
+# canonical key, breaking exact matches for Discogs rows with a "The "
+# prefix. The Stage 5 cheap-derivation pipeline (strip "The ", `&` → `and`,
+# bracket-strip, multi-credit split) is the LML replacement for those folds
+# until the column side moves; flipping the input alone would short-circuit
+# those variants without symmetric column support. The symmetric pair to
+# watch:
 #   - `identity/normalize.py:canonicalize_for_identity_lookup` already uses
 #     `to_identity_match_form` because its target column is
 #     `entity.identity.library_name` (LML-owned, stored verbatim), NOT a

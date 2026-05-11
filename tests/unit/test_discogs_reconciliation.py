@@ -346,36 +346,36 @@ class TestDiacriticInsensitiveMatch:
 
 class TestNormalizationAsymmetryGuard:
     """Regression tests that pin the deferred-swap decision from
-    WXYC/library-metadata-lookup#262 (E3 step 5f).
+    WXYC/library-metadata-lookup#262.
 
     The reconciler intentionally uses ``to_match_form`` (not
     ``to_identity_match_form``) on the input side because the discogs-cache
     column side stores ``lower(f_unaccent(...))`` and the matching Postgres
-    analog ``wxyc_identity_match_artist()`` has not shipped yet (plan §3.3.5
-    is still pending as of 2026-05-11). Flipping the input alone would
-    create asymmetry (leading-article drop, paren-suffix strip) and break
-    the Stage 5 preprocessing variants. These tests fail loudly if a
-    future drive-by edit swaps the alias before the column side moves.
+    analog ``wxyc_identity_match_artist()`` has not shipped (plan §3.3.5
+    pending). Flipping the input alone would create asymmetry (leading-article
+    drop, paren-suffix strip) and break the Stage 5 preprocessing variants.
+    These tests fail loudly if a future drive-by edit swaps the alias before
+    the column side moves.
     """
 
     @pytest.mark.asyncio
     async def test_leading_article_preserved_on_input_side(self, reconciler, mock_pg):
         """``to_match_form`` keeps leading "The "; ``to_identity_match_form`` would
-        drop it. The discogs-cache column stores ``lower(f_unaccent("The Beatles"))``
-        = ``"the beatles"`` — so the input must match that, not "beatles".
+        drop it. The discogs-cache column stores ``lower(f_unaccent("The Microphones"))``
+        = ``"the microphones"`` — so the input must match that, not "microphones".
         """
         mock_pg.fetchall = AsyncMock(return_value=[])
-        await reconciler.reconcile_batch(["The Beatles"])
+        await reconciler.reconcile_batch(["The Microphones"])
         first_call_args = mock_pg.fetchall.await_args_list[0].args
         _, names_arg = first_call_args
-        assert "the beatles" in names_arg, (
+        assert "the microphones" in names_arg, (
             "Stage 1 input must preserve the leading article so the input matches "
             "the discogs-cache column form. If this fails, the reconciler has been "
             "swapped to to_identity_match_form before the PG analog landed — "
             "see #262 deferred-swap note."
         )
-        assert "beatles" not in names_arg, (
-            "If 'beatles' (article-stripped) is in the input batch, the reconciler "
+        assert "microphones" not in names_arg, (
+            "If 'microphones' (article-stripped) is in the input batch, the reconciler "
             "is using to_identity_match_form. Revert until the PG analog ships."
         )
 
@@ -409,6 +409,6 @@ class TestNormalizationAsymmetryGuard:
         assert reconciler_module.normalize_artist_name is to_match_form, (
             "Reconciler must import `to_match_form as normalize_artist_name`. "
             "Swapping to to_identity_match_form is gated on plan §3.3.5 (PG analog). "
-            "See WXYC/library-metadata-lookup#262 (E3 step 5f)."
+            "See WXYC/library-metadata-lookup#262."
         )
         assert reconciler_module.normalize_artist_name is not to_identity_match_form
