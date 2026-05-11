@@ -166,6 +166,16 @@ class EntityStore:
         query — same WX-3.B boundary policy as the read paths in this class
         (see ``_strip_nul`` for the rationale).
 
+        Asymmetry note (WXYC/library-metadata-lookup#274 follow-up): this
+        method writes ``library_name`` verbatim, but ``get_identity_canonical``
+        reads with a canonical-form lookup. The read-side bridge depends on
+        stored rows already being canonical (post-#207/#216/#217/#218
+        reconciliation). New ingestion runs that call this method directly
+        will re-introduce non-canonical rows unless callers canonicalize
+        upstream. Tracked under the planned plan §3.3 step 4 work, which
+        will move canonicalization into a Postgres functional-index and
+        moot the asymmetry.
+
         Returns:
             The upserted Identity, or None if the query failed.
         """
@@ -224,6 +234,10 @@ class EntityStore:
         # (semantic-index via /identity/bulk still gets the exact-match shape).
         from identity.normalize import canonicalize_for_identity_lookup
 
+        # `_strip_nul` returns `str | None`; the `or ""` is needed because
+        # `canonicalize_for_identity_lookup` expects `str`. The None branch is
+        # unreachable in practice (signature is `str`) but kept for type-checker
+        # symmetry with the rest of this class.
         canonical = canonicalize_for_identity_lookup(_strip_nul(library_name) or "")
         record = await self._pg.fetchone(_GET_IDENTITY_SQL, canonical)
         if record is None:
