@@ -66,12 +66,17 @@ async def set_up_entity_schema(pg_pool):
             )
         """)
         # Seed a couple of identities representative of WXYC's catalog.
+        # Per #274's approach-2 bridge: `library_name` is stored in canonical
+        # form (lowercase, no diacritics, ``and`` conjunction, ASCII quotes) —
+        # the same shape `identity.normalize.canonicalize_for_identity_lookup`
+        # emits — so the bulk-resolve-libraries handler's canonical lookup
+        # resolves whatever non-canonical variant Backend posts.
         await conn.execute(
             """
             INSERT INTO entity.identity (library_name, discogs_artist_id, wikidata_qid)
             VALUES
-                ('Stereolab', 2154, 'Q484464'),
-                ('Juana Molina', 305253, 'Q272615')
+                ('stereolab', 2154, 'Q484464'),
+                ('juana molina', 305253, 'Q272615')
             """
         )
     yield
@@ -158,6 +163,46 @@ class TestBulkResolveLibrariesEndpoint:
             "unresolved",
             "single_artist",
         ]
+
+    @pytest.mark.asyncio
+    async def test_canonical_lookup_collapses_divergence_vectors(self, app_client, pg_pool):
+        """Per #274: diverged inputs resolve to the same canonical-form row.
+
+        Seeds three identities in canonical form (lowercase, no diacritics,
+        ``and`` conjunction, ASCII apostrophe) and posts non-canonical
+        variants. Each should land on its canonical row instead of returning
+        ``unresolved`` — the silent miss-rate driver flagged by #273's review.
+        """
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO entity.identity (library_name, discogs_artist_id)
+                VALUES
+                    ('nilufer yanya', 5499521),
+                    ('sleater and kinney', 99999),
+                    ('don''t stop', 88888)
+                """
+            )
+
+        resp = await app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "inputs": [
+                    {"library_id": 1, "artist_name": "Nilüfer Yanya", "album_title": "x"},
+                    {"library_id": 2, "artist_name": "Sleater & Kinney", "album_title": "x"},
+                    {"library_id": 3, "artist_name": "Don’t Stop", "album_title": "x"},
+                ]
+            },
+        )
+
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        kinds = [r["kind"] for r in results]
+        # Pre-#274 every one of these would have been `unresolved`.
+        assert kinds == ["single_artist", "single_artist", "single_artist"]
+        assert results[0]["main"]["discogs_artist_id"] == 5499521
+        assert results[1]["main"]["discogs_artist_id"] == 99999
+        assert results[2]["main"]["discogs_artist_id"] == 88888
 
     @pytest.mark.asyncio
     async def test_413_for_oversized_request(self, app_client):

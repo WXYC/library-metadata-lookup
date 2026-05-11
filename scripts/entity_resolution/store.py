@@ -198,6 +198,38 @@ class EntityStore:
             return None
         return _record_to_identity(record)
 
+    async def get_identity_canonical(self, library_name: str) -> Identity | None:
+        """Look up an identity by a non-canonical artist name.
+
+        Pre-canonicalizes ``library_name`` via
+        ``identity.normalize.canonicalize_for_identity_lookup`` and exact-matches
+        the canonical form against ``entity.identity.library_name``. This is the
+        approach-2 bridge from WXYC/library-metadata-lookup#274: it collapses
+        the divergence vectors Backend's denormalized ``library.artist_name``
+        column carries (diacritics, smart quotes, ``&`` vs ``and``, case,
+        whitespace) into a single canonical key.
+
+        Correctness assumes the stored ``library_name`` is itself in the same
+        canonical form — true post-reconciliation runs #207/#216/#217/#218.
+        When the Postgres analog of ``to_identity_match_form`` lands
+        (plan §3.3 step 4), this method's SQL can be swapped for a
+        ``WHERE wxyc_norm_artist(library_name) = wxyc_norm_artist($1)``
+        functional-index query and the stored-canonicality assumption drops.
+
+        Returns:
+            The matching Identity, or None if no canonical row exists.
+        """
+        # Local import keeps the wxyc_etl Rust extension off the module-load
+        # path for store consumers that don't use the bulk-resolve handler
+        # (semantic-index via /identity/bulk still gets the exact-match shape).
+        from identity.normalize import canonicalize_for_identity_lookup
+
+        canonical = canonicalize_for_identity_lookup(_strip_nul(library_name) or "")
+        record = await self._pg.fetchone(_GET_IDENTITY_SQL, canonical)
+        if record is None:
+            return None
+        return _record_to_identity(record)
+
     async def get_identities_by_status(self, status: str) -> list[Identity]:
         """Return all identities with the given reconciliation status.
 
