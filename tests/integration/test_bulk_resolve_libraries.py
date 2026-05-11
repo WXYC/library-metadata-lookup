@@ -65,18 +65,17 @@ async def set_up_entity_schema(pg_pool):
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
         """)
-        # Seed a couple of identities representative of WXYC's catalog.
-        # Per #274's approach-2 bridge: `library_name` is stored in canonical
-        # form (lowercase, no diacritics, ``and`` conjunction, ASCII quotes) —
-        # the same shape `identity.normalize.canonicalize_for_identity_lookup`
-        # emits — so the bulk-resolve-libraries handler's canonical lookup
-        # resolves whatever non-canonical variant Backend posts.
+        # Seed in verbatim Backend casing — matches the production shape
+        # surfaced by the #276 audit (99.8% of entity.identity rows are
+        # mixed-case verbatim, not canonical). The handler's three-leg
+        # fall-through (#276) handles both verbatim hits and canonical-form
+        # divergence on top of this shape.
         await conn.execute(
             """
             INSERT INTO entity.identity (library_name, discogs_artist_id, wikidata_qid)
             VALUES
-                ('stereolab', 2154, 'Q484464'),
-                ('juana molina', 305253, 'Q272615')
+                ('Stereolab', 2154, 'Q484464'),
+                ('Juana Molina', 305253, 'Q272615')
             """
         )
     yield
@@ -165,13 +164,39 @@ class TestBulkResolveLibrariesEndpoint:
         ]
 
     @pytest.mark.asyncio
+    async def test_case_drift_resolves_via_lower_fall_through(self, app_client, pg_pool):
+        """Per #276: case drift between Backend input and verbatim-cased storage hits.
+
+        Seeds verbatim mixed-case rows (the production shape per the #276
+        audit — 99.8% of `entity.identity.library_name` is mixed-case
+        verbatim). Posts the *lowercase* variant and asserts the LOWER fall-
+        through leg resolves both rows. This is the regression test for the
+        #275 ship: that PR canonicalized the input to lowercase and would
+        have missed the verbatim-stored row entirely.
+        """
+        resp = await app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "inputs": [
+                    {"library_id": 1, "artist_name": "stereolab", "album_title": "x"},
+                    {"library_id": 2, "artist_name": "JUANA MOLINA", "album_title": "x"},
+                ]
+            },
+        )
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert [r["kind"] for r in results] == ["single_artist", "single_artist"]
+        assert results[0]["main"]["discogs_artist_id"] == 2154
+        assert results[1]["main"]["discogs_artist_id"] == 305253
+
+    @pytest.mark.asyncio
     async def test_canonical_lookup_collapses_divergence_vectors(self, app_client, pg_pool):
         """Per #274: diverged inputs resolve to the same canonical-form row.
 
         Seeds three identities in canonical form (lowercase, no diacritics,
         ``and`` conjunction, ASCII apostrophe) and posts non-canonical
-        variants. Each should land on its canonical row instead of returning
-        ``unresolved`` — the silent miss-rate driver flagged by #273's review.
+        variants. Each should land on its canonical row via the canonical
+        leg of the #276 three-leg fall-through.
         """
         async with pg_pool.acquire() as conn:
             await conn.execute(

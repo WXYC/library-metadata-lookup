@@ -1,9 +1,10 @@
 """Unit tests for the identity-lookup canonicalization helper.
 
-The helper produces the canonical form used by
-``EntityStore.get_identity_canonical()`` (per WXYC/library-metadata-lookup#274
-bridge approach 2). It must collapse the divergence vectors Backend's
-``library.artist_name`` column can carry into the cross-cache-identity lookup:
+The helper produces the canonical form used by the third leg of
+``EntityStore.resolve_library_name()`` (the bulk-resolve-libraries lookup
+path, per WXYC/library-metadata-lookup#274 / #276). It must collapse the
+divergence vectors Backend's ``library.artist_name`` column can carry into
+the cross-cache-identity lookup:
 
 - Diacritics (Nilüfer Yanya vs Nilufer Yanya)
 - Curly vs straight quotes (Don't vs Don’t)
