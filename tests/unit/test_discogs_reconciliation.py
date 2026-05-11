@@ -182,10 +182,22 @@ class TestPreprocessingVariants:
         assert _preprocessing_variants("Stereolab") == []
 
 
-class TestNamePreprocessingStage:
-    """Stage 5 cascade: when an unmatched canonical's preprocessed variant
-    hits one of the four equality stages, the canonical resolves with
-    method="name_preprocessing".
+class TestBaselineSubsumesPreprocessingCases:
+    """Cases that USED to require Stage 5 name-preprocessing but are now
+    handled directly by Stage 1 exact match after #280.
+
+    Post-#280 the reconciler normalizes both sides with the locked-on
+    ``to_identity_match_form`` baseline (input) and ``wxyc_identity_match_artist``
+    (column). That baseline strips leading articles ("The ") and bracket
+    annotations ("[DJ]") on both sides, so canonicals that previously needed
+    the Stage 5 preprocessing variant to match now hit Stage 1 directly. These
+    tests pin that subsumption — if a future change loosens the baseline or
+    reverts to ``to_match_form``, Stage 1 will miss and these tests will start
+    seeing method="name_preprocessing" (or no match at all).
+
+    Distinct from ``TestNamePreprocessingStage`` below, which covers folds NOT
+    in the baseline (ampersand → "and", multi-artist credit splitting) — those
+    still genuinely require Stage 5.
     """
 
     @pytest.mark.asyncio
@@ -220,6 +232,21 @@ class TestNamePreprocessingStage:
         assert results["Adam X [DJ]"].discogs_artist_id == 8181
         assert results["Adam X [DJ]"].method == "exact_match"
         assert mock_pg.fetchall.await_count == 1
+
+
+class TestNamePreprocessingStage:
+    """Stage 5 cascade: when an unmatched canonical's preprocessed variant
+    hits one of the four equality stages, the canonical resolves with
+    method="name_preprocessing".
+
+    Post-#280 several folds that used to require Stage 5 (leading "The ",
+    bracket annotations, paren suffixes) are now subsumed by the locked-on
+    baseline applied symmetrically on both sides — see
+    ``TestBaselineSubsumesPreprocessingCases`` for the tests pinning that
+    subsumption. The cases in this class cover the folds that are NOT in
+    the baseline and therefore still need the Stage 5 cascade: ampersand →
+    "and" substitution and multi-artist credit splitting.
+    """
 
     @pytest.mark.asyncio
     async def test_split_resolves_via_first_part(self, reconciler, mock_pg):
@@ -327,9 +354,14 @@ class TestDiacriticInsensitiveMatch:
 
     @pytest.mark.asyncio
     async def test_normalized_input_passed_to_sql(self, reconciler, mock_pg):
-        """The names sent to the SQL `ANY($1)` array must already be diacritic-stripped
-        and lowercased — matching the `wxyc_identity_match_artist(...)` expression on
-        the column side (post-#280 symmetric pair)."""
+        """Names sent to the SQL `ANY($1)` array are normalized via
+        ``to_identity_match_form`` on the input side, symmetric with
+        ``wxyc_identity_match_artist`` on the column side (post-#280). The
+        baseline collapses case, diacritics, leading articles, paren suffixes,
+        and bracket annotations identically on both sides. The inputs used here
+        (Björk, Hermanos Gutiérrez, Stereolab) lack the other constructs, so the
+        observed batch is just the case+diacritic fold — the symmetry, not the
+        single-axis fold, is what this test pins."""
         mock_pg.fetchall = AsyncMock(return_value=[])
         await reconciler.reconcile_batch(["Björk", "Hermanos Gutiérrez", "Stereolab"])
         # Inspect the ANY($1) parameter on the first call
