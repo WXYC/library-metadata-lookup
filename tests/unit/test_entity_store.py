@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from scripts.entity_resolution.store import (
+    _GET_IDENTITY_LOWER_SQL,
     EntityStore,
     _strip_nul,
 )
@@ -215,10 +216,11 @@ class TestResolveLibraryName:
         assert identity is not None
         assert identity.id == 42
         assert mock_pg.fetchone.await_count == 2
-        # Leg 2 SQL contains LOWER(...) — assert via the SQL string itself,
-        # not the bind value (the bind is still the verbatim input).
+        # Assert against the SQL constant rather than substring-matching the
+        # SQL text — keeps the test sensitive to the right thing (which
+        # query ran) without breaking on whitespace / formatting changes.
         leg_2_sql = mock_pg.fetchone.await_args_list[1][0][0]
-        assert "lower(library_name)" in leg_2_sql.lower()
+        assert leg_2_sql == _GET_IDENTITY_LOWER_SQL
         # Canonical leg is skipped (canonical(input) equals input).
         # No third query.
 
@@ -280,6 +282,42 @@ class TestResolveLibraryName:
         mock_pg.fetchone = AsyncMock(return_value=None)
         await store.resolve_library_name("Stereolab")
         assert mock_pg.fetchone.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_string_input_returns_none_cleanly(self, store, mock_pg):
+        """Empty input must not raise and must not exercise leg 3.
+
+        Leg 1 binds the empty string and misses; leg 2 the same; leg 3's
+        canonical form is also empty, so the `if canonical and ...` guard
+        skips it. Net: 2 queries, None returned.
+        """
+        mock_pg.fetchone = AsyncMock(return_value=None)
+        identity = await store.resolve_library_name("")
+        assert identity is None
+        assert mock_pg.fetchone.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_leg_2_lower_sql_includes_order_by_id_for_determinism(self, store, mock_pg):
+        """Locks the deterministic tie-break.
+
+        When two stored rows lower-match (e.g., both ``'Stereolab'`` and
+        ``'stereolab'`` exist — `library_name`'s UNIQUE constraint is
+        case-sensitive, so this is allowed), `ORDER BY id ASC` guarantees
+        the oldest row wins. Without it the row PG returns can flip between
+        deploys / connection pools.
+        """
+        mock_pg.fetchone = AsyncMock(
+            side_effect=[
+                None,  # leg 1 miss
+                self._row("Stereolab", id=42, discogs_artist_id=2154),
+            ]
+        )
+        await store.resolve_library_name("stereolab")
+        leg_2_sql = mock_pg.fetchone.await_args_list[1][0][0]
+        # Both clauses must be present — `LIMIT 1` without `ORDER BY` would
+        # be non-deterministic on ambiguous case.
+        assert "ORDER BY id ASC" in leg_2_sql
+        assert "LIMIT 1" in leg_2_sql
 
 
 class TestUpdateStatus:

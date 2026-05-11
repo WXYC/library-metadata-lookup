@@ -230,6 +230,99 @@ class TestBulkResolveLibrariesEndpoint:
         assert results[2]["main"]["discogs_artist_id"] == 88888
 
     @pytest.mark.asyncio
+    async def test_all_three_legs_resolve_in_one_batch(self, app_client, pg_pool):
+        """Mixed-shape stored rows + mixed-shape inputs all resolve in one call.
+
+        Locks the full chain end-to-end. Seeds three rows in three different
+        shapes (verbatim mixed-case, canonical, canonical) and posts inputs
+        that each trigger a different leg, plus one miss.
+
+        Layout:
+
+        | input                | matches via         | stored row             |
+        |---------------------|---------------------|------------------------|
+        | ``"Stereolab"``      | leg 1 (verbatim)    | ``'Stereolab'``        |
+        | ``"sTeReOlAb"``      | leg 2 (LOWER)       | ``'Stereolab'``        |
+        | ``"Nilüfer Yanya"``  | leg 3 (canonical)   | ``'nilufer yanya'``    |
+        | ``"Sleater & Kinney"`` | leg 3 (canonical) | ``'sleater and kinney'`` |
+        | ``"Nobody Knows"``   | (all legs miss)     | —                       |
+        """
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO entity.identity (library_name, discogs_artist_id)
+                VALUES
+                    ('nilufer yanya', 5499521),
+                    ('sleater and kinney', 99999)
+                """
+            )
+            # Note: 'Stereolab' is already seeded with discogs_artist_id=2154
+            # by the schema fixture.
+
+        resp = await app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "inputs": [
+                    {"library_id": 1, "artist_name": "Stereolab", "album_title": "x"},
+                    {"library_id": 2, "artist_name": "sTeReOlAb", "album_title": "x"},
+                    {"library_id": 3, "artist_name": "Nilüfer Yanya", "album_title": "x"},
+                    {"library_id": 4, "artist_name": "Sleater & Kinney", "album_title": "x"},
+                    {"library_id": 5, "artist_name": "Nobody Knows", "album_title": "x"},
+                ]
+            },
+        )
+
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert [r["kind"] for r in results] == [
+            "single_artist",
+            "single_artist",
+            "single_artist",
+            "single_artist",
+            "unresolved",
+        ]
+        # Same identity reached via two different legs (1 and 2) → same row.
+        assert results[0]["main"]["discogs_artist_id"] == 2154
+        assert results[1]["main"]["discogs_artist_id"] == 2154
+        assert results[2]["main"]["discogs_artist_id"] == 5499521
+        assert results[3]["main"]["discogs_artist_id"] == 99999
+        assert results[4]["main"] is None
+
+    @pytest.mark.asyncio
+    async def test_leg_2_picks_lowest_id_when_two_rows_lower_match(self, app_client, pg_pool):
+        """`library_name` is case-sensitive-UNIQUE; two case-variants can co-exist.
+
+        Seed two rows whose lower-form is identical (``'Stereolab'`` already
+        in fixture; add ``'stereolab'``). Post a third case variant
+        (``"sTeReOlAb"``) so leg 1 misses but leg 2's `LOWER(...)` matches
+        both stored rows. The `ORDER BY id ASC` tie-break must pick the
+        oldest (the fixture's ``'Stereolab'``, id 1).
+        """
+        async with pg_pool.acquire() as conn:
+            # Insert a second case-variant. Discogs id is intentionally
+            # different so we can tell which row leg 2 picked.
+            await conn.execute(
+                "INSERT INTO entity.identity (library_name, discogs_artist_id) "
+                "VALUES ('stereolab', 99999)"
+            )
+
+        resp = await app_client.post(
+            "/api/v1/identity/bulk-resolve-libraries",
+            json={
+                "inputs": [
+                    {"library_id": 1, "artist_name": "sTeReOlAb", "album_title": "x"},
+                ]
+            },
+        )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["kind"] == "single_artist"
+        # Oldest row wins (the fixture's `'Stereolab'`, discogs_artist_id=2154),
+        # not the freshly-inserted `'stereolab'` (id=99999).
+        assert result["main"]["discogs_artist_id"] == 2154
+
+    @pytest.mark.asyncio
     async def test_413_for_oversized_request(self, app_client):
         """1001 inputs → 413."""
         oversized = [

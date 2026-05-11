@@ -95,12 +95,19 @@ WHERE library_name = $1\
 # without a functional `(LOWER(library_name))` index, but the table is
 # ~24K rows so a seq scan stays sub-millisecond and the leg only fires on
 # leg-1 miss.
+#
+# `ORDER BY id ASC` makes the pick deterministic when two stored rows
+# lower-match (e.g., both ``'Stereolab'`` and ``'stereolab'`` exist — the
+# UNIQUE constraint on `library_name` is case-sensitive, so this is
+# allowed). The oldest row wins; without the ordering the row PG returns
+# could flip between deploys / connection pools.
 _GET_IDENTITY_LOWER_SQL = """\
 SELECT id, library_name, discogs_artist_id, wikidata_qid,
        musicbrainz_artist_id, spotify_artist_id,
        apple_music_artist_id, bandcamp_id, reconciliation_status
 FROM entity.identity
 WHERE LOWER(library_name) = LOWER($1)
+ORDER BY id ASC
 LIMIT 1\
 """
 
@@ -277,6 +284,13 @@ class EntityStore:
         # canonical == verbatim.lower(), leg 2's `LOWER(library_name) =
         # LOWER(verbatim)` set is a superset of leg 3's `library_name =
         # canonical` set, so leg 3 brings nothing new.
+        #
+        # Assumption: Python ``str.lower()`` and PG ``LOWER()`` agree for
+        # the inputs we care about (ASCII + Latin-script Unicode). They can
+        # diverge on long-tail cases (Turkish dotted I, Greek final sigma)
+        # depending on the database's collation; for WXYC's catalog the 3
+        # non-ASCII rows (Beyoncé, etc.) don't exercise that edge. If a
+        # future divergence audit surfaces hits, narrow the short-circuit.
         canonical = canonicalize_for_identity_lookup(verbatim)
         if canonical and canonical != verbatim and canonical != verbatim.lower():
             record = await self._pg.fetchone(_GET_IDENTITY_SQL, canonical)
