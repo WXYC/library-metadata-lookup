@@ -65,7 +65,7 @@ class TestBulkResolveLibrariesEndpoint:
     @pytest.mark.asyncio
     async def test_single_artist_returns_main_and_provenance(self, app_client, mock_entity_store):
         """A populated identity → kind=single_artist with ReconciledIdentity main."""
-        mock_entity_store.get_identity.return_value = _identity(
+        mock_entity_store.get_identity_canonical.return_value = _identity(
             "Stereolab", id=1, discogs_artist_id=2154, wikidata_qid="Q484464"
         )
         mock_entity_store.get_latest_provenance_by_source.return_value = {}
@@ -123,12 +123,12 @@ class TestBulkResolveLibrariesEndpoint:
         assert result["provenance"] == []
         assert result["tracks"] == []
         # V/A short-circuits the entity lookup — should never call get_identity.
-        mock_entity_store.get_identity.assert_not_awaited()
+        mock_entity_store.get_identity_canonical.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unresolved_when_identity_missing(self, app_client, mock_entity_store):
         """No entity row for the artist → kind=unresolved."""
-        mock_entity_store.get_identity.return_value = None
+        mock_entity_store.get_identity_canonical.return_value = None
 
         async with AsyncClient(
             transport=ASGITransport(app=app_client), base_url="http://test"
@@ -163,7 +163,7 @@ class TestBulkResolveLibrariesEndpoint:
             mapping = {"Stereolab": _identity("Stereolab", id=1, discogs_artist_id=1)}
             return mapping.get(name)
 
-        mock_entity_store.get_identity.side_effect = get_identity
+        mock_entity_store.get_identity_canonical.side_effect = get_identity
         mock_entity_store.get_latest_provenance_by_source.return_value = {}
 
         async with AsyncClient(
@@ -204,7 +204,7 @@ class TestBulkResolveLibrariesEndpoint:
 
         assert resp.status_code == 413
         # Cap-check fires before any DB work.
-        mock_entity_store.get_identity.assert_not_awaited()
+        mock_entity_store.get_identity_canonical.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_503_when_entity_store_unavailable(self, mock_settings):
@@ -241,6 +241,49 @@ class TestBulkResolveLibrariesEndpoint:
         assert resp.status_code == 503
 
     @pytest.mark.asyncio
+    async def test_canonicalizes_artist_name_before_entity_lookup(
+        self, app_client, mock_entity_store
+    ):
+        """Per #274: diacritic / smart-quote / `&` divergence must not miss.
+
+        The handler must call ``get_identity_canonical`` (which pre-normalizes
+        via ``identity.normalize.canonicalize_for_identity_lookup``), NOT the
+        exact-match ``get_identity``. Backend posts ``library.artist_name``
+        verbatim from its denormalized column; any drift from
+        ``entity.identity.library_name``'s canonical form would otherwise
+        surface as a silent unresolved verdict.
+        """
+        mock_entity_store.get_identity_canonical.return_value = _identity(
+            "nilufer yanya", id=1, discogs_artist_id=5499521, wikidata_qid="Q21470020"
+        )
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/identity/bulk-resolve-libraries",
+                json={
+                    "inputs": [
+                        {
+                            "library_id": 42,
+                            "artist_name": "Nilüfer Yanya",
+                            "album_title": "Painless",
+                        }
+                    ]
+                },
+            )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["kind"] == "single_artist"
+        assert result["main"]["discogs_artist_id"] == 5499521
+        mock_entity_store.get_identity_canonical.assert_awaited_once_with("Nilüfer Yanya")
+        # The legacy exact-match path must not be exercised — divergence
+        # vectors would otherwise leak past as silent unresolved verdicts.
+        mock_entity_store.get_identity.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_422_for_validation_error(self, app_client, mock_entity_store):
         """Missing required field per-input → 422 (Pydantic validation)."""
         async with AsyncClient(
@@ -252,4 +295,4 @@ class TestBulkResolveLibrariesEndpoint:
             )
 
         assert resp.status_code == 422
-        mock_entity_store.get_identity.assert_not_awaited()
+        mock_entity_store.get_identity_canonical.assert_not_awaited()

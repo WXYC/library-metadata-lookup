@@ -131,6 +131,53 @@ class TestGetIdentity:
         assert identity is None
 
 
+class TestGetIdentityCanonical:
+    """Bridge implementation for WXYC/library-metadata-lookup#274.
+
+    ``get_identity_canonical()`` pre-normalizes the input via
+    ``identity.normalize.canonicalize_for_identity_lookup`` and then performs
+    the existing exact-match SQL. The stored ``library_name`` is assumed to be
+    in the same canonical form (post-#207/#216/#217/#218 reconciliation).
+    """
+
+    @pytest.mark.asyncio
+    async def test_passes_canonical_form_to_sql(self, store, mock_pg):
+        """A non-canonical input is canonicalized before the SQL bind param."""
+        mock_pg.fetchone = AsyncMock(return_value=None)
+        await store.get_identity_canonical("Nilüfer Yanya")
+        call_args = mock_pg.fetchone.call_args
+        # SQL bind parameter (positional arg #1 of fetchone) is the canonical
+        # form, not the raw input.
+        assert call_args[0][1] == "nilufer yanya"
+
+    @pytest.mark.asyncio
+    async def test_returns_identity_when_canonical_form_matches(self, store, mock_pg):
+        """Stored canonical row → returns Identity even when input is non-canonical."""
+        mock_pg.fetchone = AsyncMock(
+            return_value={
+                "id": 7,
+                "library_name": "nilufer yanya",
+                "discogs_artist_id": 5499521,
+                "wikidata_qid": "Q21470020",
+                "musicbrainz_artist_id": None,
+                "spotify_artist_id": None,
+                "apple_music_artist_id": None,
+                "bandcamp_id": None,
+                "reconciliation_status": "reconciled",
+            }
+        )
+        identity = await store.get_identity_canonical("Nilüfer Yanya")
+        assert identity is not None
+        assert identity.discogs_artist_id == 5499521
+        assert identity.wikidata_qid == "Q21470020"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_miss(self, store, mock_pg):
+        mock_pg.fetchone = AsyncMock(return_value=None)
+        identity = await store.get_identity_canonical("Some Artist")
+        assert identity is None
+
+
 class TestUpdateStatus:
     @pytest.mark.asyncio
     async def test_updates_reconciliation_status(self, store, mock_pg):
