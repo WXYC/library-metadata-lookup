@@ -8,9 +8,8 @@ core/matching.py during the wxyc_etl migration.
 Generic text normalization (diacritics stripping, case folding, compilation
 detection) lives in wxyc_etl.text.
 
-Per WXYC/library-metadata-lookup#262 (E3 step 5f, 2026-05-11): the helpers
-in this module are **validation utilities**, NOT cross-cache identity
-matching. They normalize Discogs API tracklist strings against
+The helpers in this module are **validation utilities**, NOT cross-cache
+identity matching. They normalize Discogs API tracklist strings against
 user-supplied / library-provided track titles and artist names so the
 "does this release contain this track?" check survives typographic noise
 (``Me & Mr. Jones`` vs ``Me And Mr Jones``, ``"Weird Al" Yankovic`` vs
