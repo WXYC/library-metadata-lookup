@@ -10,6 +10,7 @@ Requires: DATABASE_URL_TEST env var or Docker postgres on port 5433.
 from __future__ import annotations
 
 import os
+from typing import ClassVar
 
 import asyncpg
 import pytest
@@ -208,32 +209,34 @@ class TestDiscogsReconciliationSQLSmoke:
     ``$SHAREDIR/tsearch_data/``), neither of which is trivially provisioned
     on the CI service container.
 
-    TODO(wxyc-etl): wxyc-etl 0.4.0 does not ship
-    ``wxyc_identity_match_functions.sql`` as package data — it lives only in
-    the wxyc-etl source tree at ``data/`` and is vendored byte-for-byte into
-    each cache repo. If a future release exposes the canonical SQL as
-    ``importlib.resources``-readable package data, the fixture below could
-    deploy the functions inline (idempotent ``CREATE OR REPLACE``) and the
-    smoke test would run on CI's plain postgres-16 service container — at
-    which point the skip becomes the exception rather than the rule. Until
-    then this test runs only on caches where alembic 0004 has been applied
-    (homebrew dev cache + Railway prod / staging).
+    TODO(wxyc-etl): when wxyc-etl ships ``wxyc_identity_match_functions.sql``
+    as ``importlib.resources``-readable package data, the fixture below can
+    deploy the functions inline and this test will run on CI's plain
+    postgres-16 service container. Today the SQL only lives in the wxyc-etl
+    source tree and is vendored byte-for-byte into each cache repo.
     """
+
+    _STUB_TABLES: ClassVar[dict[str, str]] = {
+        "release_artist": (
+            "release_id INTEGER, artist_id INTEGER, artist_name TEXT, extra INTEGER DEFAULT 0"
+        ),
+        "artist_member": "artist_id INTEGER, member_id INTEGER, member_name TEXT",
+        "artist_alias": "artist_id INTEGER, alias_name TEXT",
+        "artist_name_variation": "artist_id INTEGER, name TEXT",
+    }
 
     @pytest_asyncio.fixture(autouse=True)
     async def ensure_reconciler_schema(self, pg_pool):
         """Skip when ``wxyc_identity_match_artist`` isn't deployed, otherwise
-        create stub tables matching the columns each reconciler query reads.
+        ensure the four reconciler tables exist (stub them only if absent),
+        and drop any stubs we created on teardown.
 
         Same skip pattern as ``test_reconcile_known_artists`` (which skips on
-        missing ``release_artist``) — keeps the test inert on fresh CI
-        postgres instances while still exercising the SQL on any
-        alembic-0004-applied cache.
-
-        Stub tables are idempotent (``IF NOT EXISTS``) so this is a no-op on a
-        real discogs-cache where the tables already exist with populated
-        data. The test queries always pass ``[]`` for ``ANY($1)``, so the
-        rowset is empty regardless of whether the underlying table is.
+        missing ``release_artist``). On a real discogs-cache the tables exist
+        with data, so ``CREATE TABLE IF NOT EXISTS`` is a no-op and the
+        teardown's ``created_tables`` set is empty — real data survives. On a
+        fresh PG (currently unreachable: we skip before getting here) only the
+        stubs we created get dropped, so cross-test pollution can't accrete.
         """
         async with pg_pool.acquire() as conn:
             exists = await conn.fetchval(
@@ -246,34 +249,22 @@ class TestDiscogsReconciliationSQLSmoke:
                     "from WXYC/discogs-etl. CI's plain postgres-16 service container "
                     "doesn't have it. See class docstring for the TODO."
                 )
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS release_artist (
-                    release_id INTEGER,
-                    artist_id INTEGER,
-                    artist_name TEXT,
-                    extra INTEGER DEFAULT 0
+            created_tables: set[str] = set()
+            for table_name, columns in self._STUB_TABLES.items():
+                pre_existing = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = current_schema() AND table_name = $1)",
+                    table_name,
                 )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS artist_member (
-                    artist_id INTEGER,
-                    member_id INTEGER,
-                    member_name TEXT
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS artist_alias (
-                    artist_id INTEGER,
-                    alias_name TEXT
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS artist_name_variation (
-                    artist_id INTEGER,
-                    name TEXT
-                )
-            """)
-        yield
+                if not pre_existing:
+                    await conn.execute(f"CREATE TABLE {table_name} ({columns})")
+                    created_tables.add(table_name)
+        try:
+            yield
+        finally:
+            async with pg_pool.acquire() as conn:
+                for table_name in created_tables:
+                    await conn.execute(f"DROP TABLE IF EXISTS {table_name}")
 
     @pytest.mark.asyncio
     async def test_exact_match_sql_parses_and_executes(self, pg_source):
@@ -302,6 +293,28 @@ class TestDiscogsReconciliationSQLSmoke:
 
         rows = await pg_source.fetchall(_NAME_VARIATION_MATCH_SQL, [])
         assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_wxyc_identity_match_artist_strips_leading_article(self, pg_pool):
+        """Behavior-assertion: ``wxyc_identity_match_artist('The Microphones')``
+        must return ``'microphones'`` — same body shape as the Rust
+        ``to_identity_match_form`` (lowercase + leading-article strip).
+
+        The other tests in this class only prove the SQL parses and the
+        function symbol resolves. They'd still pass if a future alembic
+        revision redeployed the function with a no-op body. This test pins
+        the actual transformation behavior for one canonical case, so
+        drift between the PG function and the Rust reference fails loudly
+        here.
+        """
+        async with pg_pool.acquire() as conn:
+            result = await conn.fetchval("SELECT wxyc_identity_match_artist($1)", "The Microphones")
+        assert result == "microphones", (
+            f"wxyc_identity_match_artist('The Microphones') returned {result!r}; "
+            "expected 'microphones' (lowercase + leading-article strip). "
+            "Function body has drifted from the Rust to_identity_match_form. "
+            "See WXYC/wxyc-etl#112 + WXYC/discogs-etl#195."
+        )
 
     @pytest.mark.asyncio
     async def test_all_four_match_functions_exist(self, pg_pool):
