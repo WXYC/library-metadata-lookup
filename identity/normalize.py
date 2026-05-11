@@ -18,11 +18,25 @@ The canonical form layered here on top of
 shared normalizer does not yet do but the issue lists as observed
 divergence vectors:
 
-- Smart-quote / modifier-letter apostrophe folds (`’`, `‘`, `ʼ` → `'`).
+- Apostrophe-class fold (`’`, `‘`, `ʼ`, `ʹ` → `'`). Scope is single-quote
+  shapes only — double-quote pairs (`“ ”`), guillemets (`« »`), and
+  quotation-dash variants are not folded, on the assumption that they
+  don't appear as artist-name divergence vectors in the WXYC catalog.
+  If a future divergence audit (e.g., the BS#802 rollout report) surfaces
+  hits for those, widen the fold here.
 - Conjunction fold (``Sleater & Kinney`` ↔ ``Sleater and Kinney``).
+  Keyed on whitespace around ASCII ``&`` only. Fullwidth ``＆`` (U+FF06)
+  does **not** fold to ``and`` here — NFKC inside ``to_identity_match_form``
+  runs after this regex, so the fullwidth form normalizes to ASCII ``&``
+  too late to catch. The case is exotic enough for WXYC's catalog that we
+  lock the limitation rather than complicate the layering; see
+  ``tests/unit/test_identity_normalize.py::test_fullwidth_ampersand_not_folded``.
 
 Whitespace runs collapse to a single ASCII space, and the result is
 lower-cased + leading/trailing-trimmed by ``to_identity_match_form``.
+``\\s+`` matches Unicode whitespace (NBSP, thin space, etc.) — Backend's
+column has carried those when artist names were pasted from rich-text
+sources.
 """
 
 from __future__ import annotations

@@ -53,13 +53,15 @@ class TestCanonicalizeForIdentityLookup:
         [
             "Sleater & Kinney",
             "Sleater and Kinney",
-            "Sleater  &  Kinney",
+            "Sleater  &  Kinney",  # padded spaces around `&`
+            "Sleater &  Kinney",  # asymmetric whitespace
             "sleater and kinney",
-            "Sleater & Kinney",  # explicit ampersand
+            "Sleater & Kinney",  # NBSP around `&` (rich-text paste)
+            "Sleater and Kinney",  # NBSP around `and`
         ],
     )
     def test_ampersand_and_and_collapse(self, variant: str) -> None:
-        """``&`` and ``and`` (with any surrounding whitespace) collapse to one form."""
+        """``&`` and ``and`` (with any surrounding whitespace, ASCII or NBSP) collapse."""
         assert canonicalize_for_identity_lookup(variant) == "sleater and kinney"
 
     def test_whitespace_collapses(self) -> None:
@@ -93,3 +95,34 @@ class TestCanonicalizeForIdentityLookup:
         assert "and" not in result, (
             f"Bare-glued ampersand should not be rewritten to 'and'; got {result!r}"
         )
+
+    def test_fullwidth_ampersand_not_folded(self) -> None:
+        """Fullwidth ``＆`` (U+FF06) is a documented limitation, not a bug.
+
+        The conjunction regex runs before ``to_identity_match_form``'s NFKC
+        pass, so by the time NFKC rewrites ``＆`` to ASCII ``&`` the fold
+        opportunity is gone. The case is exceptionally rare in WXYC's
+        catalog (Japanese typography on a US college-radio system) and the
+        module docstring locks the scope. This test pins the limitation so
+        a future refactor that moves NFKC up in the pipeline gets a
+        deliberate signal that it has changed contract.
+        """
+        # NFKC inside `to_identity_match_form` does still produce ASCII `&`,
+        # so the result keeps the literal ampersand rather than `and`.
+        assert canonicalize_for_identity_lookup("Sleater ＆ Kinney") == "sleater & kinney"
+
+    def test_inherits_trailing_paren_strip_from_wxyc_etl(self) -> None:
+        """`(Live)` / `(2024 Remaster)` suffixes drop via `to_identity_match_form`.
+
+        Pin the inheritance because the bulk-resolve handler depends on it:
+        a stored canonical row ``stereolab`` should resolve a Backend post of
+        ``Stereolab (Live)`` to the same identity.
+        """
+        assert canonicalize_for_identity_lookup("Stereolab (Live)") == "stereolab"
+        assert canonicalize_for_identity_lookup("Cat Power (2024 Remaster)") == "cat power"
+
+    def test_inherits_leading_article_drop_from_wxyc_etl(self) -> None:
+        """`The Beatles` and Discogs `Beatles, The` collapse to one form."""
+        canonical = canonicalize_for_identity_lookup("The Beatles")
+        assert canonical == canonicalize_for_identity_lookup("Beatles, The") == canonical
+        assert canonical == "beatles"
