@@ -91,6 +91,19 @@ FROM entity.identity
 WHERE library_name = $1\
 """
 
+# Case-insensitive leg of `resolve_library_name` (#276). Not index-backed
+# without a functional `(LOWER(library_name))` index, but the table is
+# ~24K rows so a seq scan stays sub-millisecond and the leg only fires on
+# leg-1 miss.
+_GET_IDENTITY_LOWER_SQL = """\
+SELECT id, library_name, discogs_artist_id, wikidata_qid,
+       musicbrainz_artist_id, spotify_artist_id,
+       apple_music_artist_id, bandcamp_id, reconciliation_status
+FROM entity.identity
+WHERE LOWER(library_name) = LOWER($1)
+LIMIT 1\
+"""
+
 _GET_BY_STATUS_SQL = """\
 SELECT id, library_name, discogs_artist_id, wikidata_qid,
        musicbrainz_artist_id, spotify_artist_id,
@@ -166,15 +179,13 @@ class EntityStore:
         query — same WX-3.B boundary policy as the read paths in this class
         (see ``_strip_nul`` for the rationale).
 
-        Asymmetry note (WXYC/library-metadata-lookup#274 follow-up): this
-        method writes ``library_name`` verbatim, but ``get_identity_canonical``
-        reads with a canonical-form lookup. The read-side bridge depends on
-        stored rows already being canonical (post-#207/#216/#217/#218
-        reconciliation). New ingestion runs that call this method directly
-        will re-introduce non-canonical rows unless callers canonicalize
-        upstream. Tracked under the planned plan §3.3 step 4 work, which
-        will move canonicalization into a Postgres functional-index and
-        moot the asymmetry.
+        Storage note: this method writes ``library_name`` verbatim. The
+        bulk-resolve-libraries handler reads via the three-leg
+        ``resolve_library_name`` fall-through (exact → LOWER → canonical),
+        so verbatim writes resolve correctly on Backend's verbatim posts.
+        Once plan §3.3 step 4 lands the Postgres analog of
+        ``to_identity_match_form``, the read can move to a functional-index
+        canonical lookup and the storage shape stops mattering.
 
         Returns:
             The upserted Identity, or None if the query failed.
@@ -208,41 +219,71 @@ class EntityStore:
             return None
         return _record_to_identity(record)
 
-    async def get_identity_canonical(self, library_name: str) -> Identity | None:
-        """Look up an identity by a non-canonical artist name.
+    async def resolve_library_name(self, library_name: str) -> Identity | None:
+        """Look up an identity for a non-canonical artist name, with fall-through.
 
-        Pre-canonicalizes ``library_name`` via
-        ``identity.normalize.canonicalize_for_identity_lookup`` and exact-matches
-        the canonical form against ``entity.identity.library_name``. This is the
-        approach-2 bridge from WXYC/library-metadata-lookup#274: it collapses
-        the divergence vectors Backend's denormalized ``library.artist_name``
-        column carries (diacritics, smart quotes, ``&`` vs ``and``, case,
-        whitespace) into a single canonical key.
+        Three-leg lookup per WXYC/library-metadata-lookup#276. Replaces the
+        canonical-only ``get_identity_canonical`` from #275, which regressed
+        the hit rate against the verbatim-cased production data the audit
+        surfaced (99.8% of stored rows are mixed-case).
 
-        Correctness assumes the stored ``library_name`` is itself in the same
-        canonical form — true post-reconciliation runs #207/#216/#217/#218.
-        When the Postgres analog of ``to_identity_match_form`` lands
-        (plan §3.3 step 4), this method's SQL can be swapped for a
-        ``WHERE wxyc_norm_artist(library_name) = wxyc_norm_artist($1)``
-        functional-index query and the stored-canonicality assumption drops.
+        Legs run sequentially and return the first hit:
+
+        1. **Exact match** — ``WHERE library_name = $1`` against the verbatim
+           (NUL-stripped) input. Uses the unique index. Handles the dominant
+           production path where Backend's input shape equals storage.
+        2. **Case-insensitive match** — ``WHERE LOWER(library_name) = LOWER($1)``.
+           Catches pure case-drift between Backend and storage. Seq-scans
+           ~24K rows but stays sub-millisecond at that size.
+        3. **Canonical match** — ``WHERE library_name = $canonical($1)`` against
+           the ``canonicalize_for_identity_lookup`` form. Catches inputs whose
+           canonical form equals a stored row (rare in current production —
+           ~0.2% per the #276 audit — but free correctness for those rows
+           and the eventual full-canonical backfill).
+
+        Legs 2 and 3 are skipped when their bind value duplicates an earlier
+        leg's, keeping the hot path at one query for the dominant exact-hit
+        case. Per-call worst case is three sequential index/seq-scan queries;
+        for a 1,000-row bulk request that's ~3,000 queries on miss, all on
+        the same PG connection — well within the per-handler latency budget.
+
+        ``library_name`` is U+0000-stripped (WX-3.B boundary policy) before
+        every leg.
 
         Returns:
-            The matching Identity, or None if no canonical row exists.
+            The matching Identity, or None if all legs miss.
         """
         # Local import keeps the wxyc_etl Rust extension off the module-load
-        # path for store consumers that don't use the bulk-resolve handler
-        # (semantic-index via /identity/bulk still gets the exact-match shape).
+        # path for store consumers that don't use this method.
         from identity.normalize import canonicalize_for_identity_lookup
 
-        # `_strip_nul` returns `str | None`; the `or ""` is needed because
-        # `canonicalize_for_identity_lookup` expects `str`. The None branch is
-        # unreachable in practice (signature is `str`) but kept for type-checker
-        # symmetry with the rest of this class.
-        canonical = canonicalize_for_identity_lookup(_strip_nul(library_name) or "")
-        record = await self._pg.fetchone(_GET_IDENTITY_SQL, canonical)
-        if record is None:
-            return None
-        return _record_to_identity(record)
+        verbatim = _strip_nul(library_name) or ""
+
+        # Leg 1: exact match (verbatim, uses unique index).
+        record = await self._pg.fetchone(_GET_IDENTITY_SQL, verbatim)
+        if record is not None:
+            return _record_to_identity(record)
+
+        # Leg 2: case-insensitive match (lowers the *stored* side). Always
+        # runs on leg 1 miss — input casing doesn't matter, since LOWER()
+        # applies to the stored column.
+        record = await self._pg.fetchone(_GET_IDENTITY_LOWER_SQL, verbatim)
+        if record is not None:
+            return _record_to_identity(record)
+
+        # Leg 3: canonical form (diacritic strip, article drop, etc.). Skip
+        # when the canonical bind would duplicate a previous leg's result
+        # set: if canonical == verbatim, leg 1 already covered it; if
+        # canonical == verbatim.lower(), leg 2's `LOWER(library_name) =
+        # LOWER(verbatim)` set is a superset of leg 3's `library_name =
+        # canonical` set, so leg 3 brings nothing new.
+        canonical = canonicalize_for_identity_lookup(verbatim)
+        if canonical and canonical != verbatim and canonical != verbatim.lower():
+            record = await self._pg.fetchone(_GET_IDENTITY_SQL, canonical)
+            if record is not None:
+                return _record_to_identity(record)
+
+        return None
 
     async def get_identities_by_status(self, status: str) -> list[Identity]:
         """Return all identities with the given reconciliation status.

@@ -222,14 +222,14 @@ async def bulk_resolve_libraries(
             continue
 
         try:
-            # Canonical-form lookup (issue #274): Backend posts
-            # `library.artist_name` verbatim from its denormalized column, so
-            # diacritic / smart-quote / `&`-vs-`and` / case / whitespace drift
-            # from the stored canonical key would otherwise surface as silent
-            # unresolved verdicts. `get_identity_canonical` applies
-            # `identity.normalize.canonicalize_for_identity_lookup` before the
-            # exact-match SQL.
-            identity: Identity | None = await store.get_identity_canonical(input_row.artist_name)
+            # Three-leg fall-through lookup (issues #274 / #276): exact match
+            # first (handles the 99.8% dominant case where Backend's
+            # `library.artist_name` shape equals storage), then case-
+            # insensitive `LOWER()` (catches pure case drift), then canonical
+            # form (catches diacritic / `&`-vs-`and` / smart-quote / etc.
+            # divergence when storage happens to be canonical). Strictly ≥
+            # legacy `get_identity()` hit rate.
+            identity: Identity | None = await store.resolve_library_name(input_row.artist_name)
         except (PostgresError, OSError):
             # Fail closed on partial PG failure — the caller cannot
             # distinguish "row had no identity" from "PG died before this

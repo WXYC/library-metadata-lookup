@@ -131,51 +131,155 @@ class TestGetIdentity:
         assert identity is None
 
 
-class TestGetIdentityCanonical:
-    """Bridge implementation for WXYC/library-metadata-lookup#274.
+class TestResolveLibraryName:
+    """Three-leg fall-through lookup per WXYC/library-metadata-lookup#276.
 
-    ``get_identity_canonical()`` pre-normalizes the input via
-    ``identity.normalize.canonicalize_for_identity_lookup`` and then performs
-    the existing exact-match SQL. The stored ``library_name`` is assumed to be
-    in the same canonical form (post-#207/#216/#217/#218 reconciliation).
+    `resolve_library_name()` is the bulk-resolve-libraries handler's lookup
+    path. The #276 production audit found `entity.identity.library_name` rows
+    are stored in verbatim Backend casing (99.8% mixed-case, articles
+    preserved, `&` preserved). A canonical-only lookup misses almost
+    everything; the legacy exact-match handles the dominant path.
+
+    The method tries three legs in order, returning the first hit:
+
+    1. **Exact match** — `WHERE library_name = $verbatim_input`. Catches
+       the 99.8% dominant case where Backend's input shape equals the
+       stored shape. Uses the unique index.
+    2. **Case-insensitive match** — `WHERE LOWER(library_name) = LOWER($verbatim_input)`.
+       Catches pure case-drift (Backend posts ``"stereolab"`` against stored
+       ``"Stereolab"``, or vice-versa). Seq-scans ~23K rows without a
+       functional index but stays sub-millisecond at that size.
+    3. **Canonical match** — `WHERE library_name = $canonical_input`.
+       Catches inputs whose canonical form happens to equal a stored
+       canonical row (only ~0.2% of stored rows per the #276 audit are
+       already canonical, but it's free correctness for those rows and
+       the eventual full backfill).
+
+    Short-circuits: legs 2 and 3 are skipped when their bind value
+    duplicates an earlier leg's (e.g., input ``"stereolab"`` is its own
+    lower-form, so leg 2 is redundant). The exact-match leg always runs.
+
+    Net hit rate is strictly ≥ legacy `get_identity()` exact-match; the
+    additional legs are pure additive coverage.
     """
 
-    @pytest.mark.asyncio
-    async def test_passes_canonical_form_to_sql(self, store, mock_pg):
-        """A non-canonical input is canonicalized before the SQL bind param."""
-        mock_pg.fetchone = AsyncMock(return_value=None)
-        await store.get_identity_canonical("Nilüfer Yanya")
-        call_args = mock_pg.fetchone.call_args
-        # SQL bind parameter (positional arg #1 of fetchone) is the canonical
-        # form, not the raw input.
-        assert call_args[0][1] == "nilufer yanya"
+    @staticmethod
+    def _row(library_name: str, **overrides: object) -> dict[str, object]:
+        return {
+            "id": 1,
+            "library_name": library_name,
+            "discogs_artist_id": None,
+            "wikidata_qid": None,
+            "musicbrainz_artist_id": None,
+            "spotify_artist_id": None,
+            "apple_music_artist_id": None,
+            "bandcamp_id": None,
+            "reconciliation_status": "reconciled",
+            **overrides,
+        }
 
     @pytest.mark.asyncio
-    async def test_returns_identity_when_canonical_form_matches(self, store, mock_pg):
-        """Stored canonical row → returns Identity even when input is non-canonical."""
+    async def test_exact_match_short_circuits_other_legs(self, store, mock_pg):
+        """Verbatim input hits row on leg 1 → no further queries.
+
+        This is the dominant production path: 99.8% of stored rows are in
+        verbatim casing, so the exact-match leg handles them in one query.
+        """
         mock_pg.fetchone = AsyncMock(
-            return_value={
-                "id": 7,
-                "library_name": "nilufer yanya",
-                "discogs_artist_id": 5499521,
-                "wikidata_qid": "Q21470020",
-                "musicbrainz_artist_id": None,
-                "spotify_artist_id": None,
-                "apple_music_artist_id": None,
-                "bandcamp_id": None,
-                "reconciliation_status": "reconciled",
-            }
+            return_value=self._row("Stereolab", id=42, discogs_artist_id=2154)
         )
-        identity = await store.get_identity_canonical("Nilüfer Yanya")
+        identity = await store.resolve_library_name("Stereolab")
         assert identity is not None
-        assert identity.discogs_artist_id == 5499521
-        assert identity.wikidata_qid == "Q21470020"
+        assert identity.id == 42
+        assert identity.discogs_artist_id == 2154
+        # One query — leg 1 alone.
+        assert mock_pg.fetchone.await_count == 1
+        # First leg uses the verbatim input (NUL-stripped, otherwise unchanged).
+        assert mock_pg.fetchone.await_args_list[0][0][1] == "Stereolab"
 
     @pytest.mark.asyncio
-    async def test_returns_none_for_miss(self, store, mock_pg):
+    async def test_falls_through_to_case_insensitive_leg(self, store, mock_pg):
+        """Leg 1 misses, leg 2 (LOWER both sides) hits via case-insensitive match.
+
+        Backend posts ``"stereolab"``; stored is ``"Stereolab"``. Leg 1 misses
+        because the bind is the verbatim lowercase input. Leg 2 queries
+        ``WHERE LOWER(library_name) = LOWER('stereolab')`` and hits.
+        """
+        mock_pg.fetchone = AsyncMock(
+            side_effect=[
+                None,  # leg 1 miss
+                self._row("Stereolab", id=42, discogs_artist_id=2154),
+            ]
+        )
+        identity = await store.resolve_library_name("stereolab")
+        assert identity is not None
+        assert identity.id == 42
+        assert mock_pg.fetchone.await_count == 2
+        # Leg 2 SQL contains LOWER(...) — assert via the SQL string itself,
+        # not the bind value (the bind is still the verbatim input).
+        leg_2_sql = mock_pg.fetchone.await_args_list[1][0][0]
+        assert "lower(library_name)" in leg_2_sql.lower()
+        # Canonical leg is skipped (canonical(input) equals input).
+        # No third query.
+
+    @pytest.mark.asyncio
+    async def test_falls_through_to_canonical_leg(self, store, mock_pg):
+        """All three legs fire when the input diverges beyond case alone.
+
+        Input ``"Nilüfer Yanya"`` (diacritic) against a stored canonical
+        row ``"nilufer yanya"``:
+        - Leg 1 (verbatim ``"Nilüfer Yanya"``) misses
+        - Leg 2 (`LOWER(library_name) = LOWER("Nilüfer Yanya")`) misses
+          (`"Nilüfer Yanya".lower()` keeps the umlaut)
+        - Leg 3 (canonical ``"nilufer yanya"``) hits
+        """
+        mock_pg.fetchone = AsyncMock(
+            side_effect=[
+                None,  # leg 1
+                None,  # leg 2
+                self._row("nilufer yanya", id=7, discogs_artist_id=5499521),
+            ]
+        )
+        identity = await store.resolve_library_name("Nilüfer Yanya")
+        assert identity is not None
+        assert identity.id == 7
+        assert mock_pg.fetchone.await_count == 3
+        # Leg 3 uses the canonical form.
+        assert mock_pg.fetchone.await_args_list[2][0][1] == "nilufer yanya"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_all_legs_miss(self, store, mock_pg):
+        """Input with diacritic forces all three legs (canonical ≠ verbatim.lower)."""
         mock_pg.fetchone = AsyncMock(return_value=None)
-        identity = await store.get_identity_canonical("Some Artist")
+        identity = await store.resolve_library_name("Nilüfer Yanya")
         assert identity is None
+        assert mock_pg.fetchone.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_lowercase_input_runs_legs_1_and_2_only(self, store, mock_pg):
+        """Already-lowercase input → leg 1 (verbatim) + leg 2 (LOWER) only.
+
+        Backend posts ``"stereolab"``. Leg 1's `WHERE library_name =
+        'stereolab'` misses if storage is mixed-case; leg 2's
+        `WHERE LOWER(library_name) = LOWER('stereolab')` catches it. Leg 3's
+        canonical form is also ``"stereolab"`` — that bind equals
+        ``verbatim.lower()`` so leg 2's superset already covered it. Skip.
+        """
+        mock_pg.fetchone = AsyncMock(return_value=None)
+        await store.resolve_library_name("stereolab")
+        assert mock_pg.fetchone.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_mixed_case_ascii_skips_canonical_leg(self, store, mock_pg):
+        """Mixed-case ASCII input with no normalization differences → 2 queries.
+
+        Input ``"Stereolab"``: leg 1 verbatim, leg 2 case-insensitive,
+        leg 3 canonical form is ``"stereolab"`` which equals
+        ``verbatim.lower()`` — leg 2 already covers it.
+        """
+        mock_pg.fetchone = AsyncMock(return_value=None)
+        await store.resolve_library_name("Stereolab")
+        assert mock_pg.fetchone.await_count == 2
 
 
 class TestUpdateStatus:
