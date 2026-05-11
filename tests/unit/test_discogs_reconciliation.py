@@ -368,13 +368,20 @@ class TestNormalizationAsymmetryGuard:
         await reconciler.reconcile_batch(["The Microphones"])
         first_call_args = mock_pg.fetchall.await_args_list[0].args
         _, names_arg = first_call_args
-        assert "the microphones" in names_arg, (
+        # `names_arg` is a list of normalized name strings the reconciler
+        # passes to the SQL `ANY` clause. The `in` checks below assume
+        # list/set membership (each element is a full name), NOT substring
+        # match — if a future refactor flattens to a single joined string,
+        # these assertions break in a non-obvious way. `list(...)` makes
+        # the contract explicit.
+        names_list = list(names_arg)
+        assert "the microphones" in names_list, (
             "Stage 1 input must preserve the leading article so the input matches "
             "the discogs-cache column form. If this fails, the reconciler has been "
             "swapped to to_identity_match_form before the PG analog landed — "
             "see #262 deferred-swap note."
         )
-        assert "microphones" not in names_arg, (
+        assert "microphones" not in names_list, (
             "If 'microphones' (article-stripped) is in the input batch, the reconciler "
             "is using to_identity_match_form. Revert until the PG analog ships."
         )
@@ -390,11 +397,20 @@ class TestNormalizationAsymmetryGuard:
         await reconciler.reconcile_batch(["Stereolab (Live)"])
         first_call_args = mock_pg.fetchall.await_args_list[0].args
         _, names_arg = first_call_args
+        names_list = list(names_arg)
         # to_match_form lowercases but preserves the paren; the cache-side
         # `lower(f_unaccent("Stereolab (Live)"))` would equal "stereolab (live)".
-        assert "stereolab (live)" in names_arg, (
+        assert "stereolab (live)" in names_list, (
             "Stage 1 input must preserve the trailing paren suffix to stay symmetric "
             "with the discogs-cache column form. See #262 deferred-swap note."
+        )
+        # Negative-case symmetry with the leading-article test: if the
+        # paren-stripped form `"stereolab"` is in the input batch, the
+        # reconciler is using to_identity_match_form (which drops `(Live)`
+        # suffixes). Revert until the PG analog ships.
+        assert "stereolab" not in names_list, (
+            "If 'stereolab' (paren-stripped) is in the input batch, the reconciler "
+            "is using to_identity_match_form. Revert until the PG analog ships."
         )
 
     @pytest.mark.asyncio
