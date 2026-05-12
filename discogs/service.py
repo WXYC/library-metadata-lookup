@@ -1169,7 +1169,9 @@ class DiscogsService:
             params["release_title"] = request.track
 
         if request.label:
-            params["label"] = request.label
+            label = request.label.strip()
+            if label and label.lower() != "null":
+                params["label"] = request.label
         if request.format:
             params["format"] = request.format
 
