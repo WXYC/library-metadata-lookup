@@ -24,6 +24,10 @@ name: Set Railway env var (manual)
 #   RAILWAY_TOKEN_STAGING      project-scoped Railway token for staging
 #   <key>                      the value to set (one per supported key —
 #                              add new ones to the resolve step's case)
+#
+# Health acceptance is key-aware: DISCOGS_TOKEN rotations must restore
+# services.discogs_api=ok, while other supported keys accept the existing
+# healthy/degraded service-level status.
 
 on:
   workflow_dispatch:
@@ -138,17 +142,25 @@ jobs:
           sleep 60
           for i in 1 2 3 4 5 6; do
             if curl -sf -m 10 "$HEALTH_URL" > /tmp/health.json; then
-              status=$(python3 -c "import json,sys;print(json.load(open('/tmp/health.json'))['status'])")
-              echo "Health attempt $i: $status"
-              if [ "$status" = "healthy" ] || [ "$status" = "degraded" ]; then
-                exit 0
+              if [ "$KEY" = "DISCOGS_TOKEN" ]; then
+                probe=$(python3 -c "import json; print(json.load(open('/tmp/health.json')).get('services', {}).get('discogs_api', 'missing'))")
+                echo "Health attempt $i: discogs_api=$probe"
+                if [ "$probe" = "ok" ]; then
+                  exit 0
+                fi
+              else
+                status=$(python3 -c "import json; print(json.load(open('/tmp/health.json'))['status'])")
+                echo "Health attempt $i: $status"
+                if [ "$status" = "healthy" ] || [ "$status" = "degraded" ]; then
+                  exit 0
+                fi
               fi
             else
               echo "Health attempt $i: HTTP error"
             fi
             sleep 10
           done
-          echo "::error::Service did not return healthy/degraded after 6 attempts"
+          echo "::error::Service did not return acceptable health after 6 attempts"
           exit 1
 
       - name: Summary
