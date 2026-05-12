@@ -21,8 +21,8 @@ jobs:
     name: Lint & Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: 'pip'
@@ -38,8 +38,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: 'pip'
@@ -57,8 +57,8 @@ jobs:
     name: Type Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: 'pip'
@@ -71,8 +71,8 @@ jobs:
     name: Default Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: 'pip'
@@ -82,9 +82,9 @@ jobs:
       # tests/e2e/. Infra-tagged tests run in their own jobs (`pg`, `external_api`).
       - run: pytest -v --cov=. --cov-report=xml
       - name: Upload coverage reports
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
-          file: ./coverage.xml
+          files: ./coverage.xml
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
@@ -93,8 +93,8 @@ jobs:
     name: External API Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: 'pip'
@@ -125,8 +125,8 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: 'pip'
@@ -158,7 +158,7 @@ jobs:
     # deploy chain. See WXYC/library-metadata-lookup#208.
     needs: [lint, typecheck, test, pg]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Railway CLI
         run: npm install -g @railway/cli
       - name: Deploy to Railway
@@ -201,7 +201,7 @@ jobs:
     # external_api is intentionally NOT a deploy gate — see deploy-staging for the rationale.
     needs: [lint, typecheck, test, pg]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Railway CLI
         run: npm install -g @railway/cli
       - name: Deploy to Railway
