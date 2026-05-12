@@ -142,11 +142,12 @@ jobs:
 
   marker-sync:
     name: CI Marker Sync
-    uses: WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@main
+    uses: WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@gha/v1
     with:
       repo-path: "."
       workflows-dir: ".github/workflows"
       tests-dir: "tests"
+      wxyc-etl-ref: gha/v1
 
   deploy-staging:
     name: Deploy to Staging
