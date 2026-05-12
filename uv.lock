@@ -542,7 +542,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.6" },
     { name = "uvicorn", specifier = ">=0.24.0" },
     { name = "wxyc-etl", specifier = ">=0.4.0" },
-    { name = "wxyc-fastapi", extras = ["posthog"], specifier = ">=0.3.0,<0.4.0" },
+    { name = "wxyc-fastapi", extras = ["posthog"], specifier = ">=1.0.0,<2.0.0" },
 ]
 provides-extras = ["dev"]
 
@@ -1267,16 +1267,16 @@ wheels = [
 
 [[package]]
 name = "wxyc-fastapi"
-version = "0.3.0"
+version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "sentry-sdk", extra = ["fastapi"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bb/06/ae2adde73b3e5d200161ecccd841c70fecb23522ac84ca8547d76321b3e0/wxyc_fastapi-0.3.0.tar.gz", hash = "sha256:812bac193b19abdd7dc359c76b998a5a84778cf2fd19e17ed060c0e61da6f8ec", size = 15462, upload-time = "2026-05-12T14:28:26.597Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/61/54/83a5e827e9bcc88f532f1a530dea94a794ebf8577dd9d2e9ac5c9f165162/wxyc_fastapi-1.0.0.tar.gz", hash = "sha256:628f70fa908717caa2a3122c446ed28e427f09814383056955b65c757f403ecd", size = 16805, upload-time = "2026-05-12T14:31:53.719Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6f/02/c0fef6da05963f28c8b1ca13f9929e39f3fd42f79f9a9bd14719743268de/wxyc_fastapi-0.3.0-py3-none-any.whl", hash = "sha256:f9a7a71aba58c6a1d421c40b57cd5e1b78ca66e58ff59279f589679a17e3bc1b", size = 17268, upload-time = "2026-05-12T14:28:25.403Z" },
+    { url = "https://files.pythonhosted.org/packages/69/b1/bcf58cc0ff027e0de5465d83b3ef3e5e520733e8d078c902e12a62a78323/wxyc_fastapi-1.0.0-py3-none-any.whl", hash = "sha256:47d7ea841a365400619afaec20e07d5d2051fff12761c88fab29cadbd532c239", size = 19224, upload-time = "2026-05-12T14:31:52.37Z" },
 ]
 
 [package.optional-dependencies]
