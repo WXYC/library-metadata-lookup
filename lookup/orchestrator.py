@@ -341,10 +341,25 @@ async def search_library_with_fallback(
 
         if all_results:
             primary_album_lower = albums[0].lower()
-            all_results.sort(
-                key=lambda r: primary_album_lower in (r.title or "").lower(),
-                reverse=True,
-            )
+            song_lower = (parsed.song or "").lower()
+
+            # When the request specifies a song, prefer a candidate whose title
+            # matches the song name (the title-album beats a same-artist
+            # compilation that also contains the track). albums[0] is whatever
+            # the upstream Discogs track-lookup returned first, which is
+            # non-deterministic when several releases tie on track-title
+            # similarity in the PG cache; the song key forces a deterministic,
+            # semantically correct order. albums[0] is kept as a secondary
+            # tiebreak so album-only requests (parsed.song unset) preserve the
+            # existing primary-album order.
+            def sort_key(r: LibraryItem) -> tuple[bool, bool]:
+                title_lower = (r.title or "").lower()
+                return (
+                    bool(song_lower) and song_lower in title_lower,
+                    primary_album_lower in title_lower,
+                )
+
+            all_results.sort(key=sort_key, reverse=True)
             return all_results, False
 
         # When Discogs found albums but none matched the library, fall through to

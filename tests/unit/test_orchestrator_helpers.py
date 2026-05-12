@@ -627,6 +627,62 @@ class TestSearchLibraryWithFallback:
         assert mock_library_db.search.call_count == 2
 
     @pytest.mark.asyncio
+    async def test_song_title_match_beats_primary_album_for_ranking(self, mock_library_db):
+        """When Discogs returns multiple albums for a track and one library
+        candidate's title matches the requested song, that candidate sorts
+        first regardless of which album Discogs returned first.
+
+        Reproducer: "Meet Me in the City by Junior Kimbrough". The PG cache
+        ranks both Discogs releases at similarity 1.0 (both contain a track
+        literally named "Meet Me in the City"); the physical-row tiebreak is
+        non-deterministic, so the compilation may arrive first in `albums`.
+        Sorting by `albums[0] in title` alone would let the compilation win
+        even though the library has an album whose title is the song name.
+        """
+        meet_me_album = make_library_item(
+            id=51752,
+            artist="Junior Kimbrough",
+            title="Meet Me in the City",
+            call_letters="KI",
+            artist_call_number=6,
+            release_call_number=4,
+        )
+        you_better_run = make_library_item(
+            id=51753,
+            artist="Junior Kimbrough",
+            title="You Better Run (The essential Junior Kimbrough)",
+            call_letters="KI",
+            artist_call_number=6,
+            release_call_number=5,
+        )
+        # albums[0] is the compilation: per-album search for "You Better Run..."
+        # returns the comp; per-album search for "Meet Me in the City" returns
+        # the title-match album. This is the bug-triggering arrival order.
+        mock_library_db.search.side_effect = [[you_better_run], [meet_me_album]]
+
+        parsed = ParsedRequest(
+            song="Meet Me in the City",
+            artist="Junior Kimbrough",
+            raw_message="Meet Me in the City Junior Kimbrough",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        results, fallback = await search_library_with_fallback(
+            mock_library_db,
+            parsed,
+            [
+                "You Better Run (The essential Junior Kimbrough)",
+                "Meet Me in the City",
+            ],
+        )
+
+        assert [r.title for r in results] == [
+            "Meet Me in the City",
+            "You Better Run (The essential Junior Kimbrough)",
+        ]
+        assert fallback is False
+
+    @pytest.mark.asyncio
     async def test_album_only_search_when_no_artist(self, mock_library_db):
         """When parser extracts album but no artist, search by album title alone.
 
