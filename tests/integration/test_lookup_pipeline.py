@@ -217,6 +217,112 @@ class TestTrackValidationFiltering:
         assert body["song_not_found"] is False
 
 
+class TestSongTitleRanking:
+    """When several library candidates by the same artist all contain the
+    requested track, the album whose title matches the song name must rank
+    first — regardless of which album the upstream Discogs track-lookup
+    happened to return first."""
+
+    @pytest.mark.asyncio
+    async def test_title_album_beats_compilation_when_both_contain_song(self, library_db):
+        """'Meet Me in the City' by Junior Kimbrough should return the album
+        of that name (KI 6/4) ahead of the 'You Better Run' essentials comp
+        (KI 6/5), even when Discogs returned the comp first.
+
+        Seed data:
+        - (51752, "Meet Me in the City", "Junior Kimbrough")
+        - (51753, "You Better Run (The essential Junior Kimbrough)", "Junior Kimbrough")
+
+        Both albums contain "Meet Me in the City"; both pass track validation.
+        Sorting by `albums[0]` from the upstream Discogs track lookup is
+        non-deterministic when several releases tie on track-title similarity
+        in the PG cache, so the title-matching album must be promoted by the
+        song key.
+        """
+        from wxyc_fastapi.observability import init_cache_stats
+
+        from lookup.models import LookupRequest
+        from lookup.orchestrator import perform_lookup
+        from tests.conftest import make_lml_telemetry
+        from tests.factories import make_discogs_result
+
+        init_cache_stats()
+
+        mock_service = AsyncMock(
+            spec_set=[
+                "search_releases_by_track",
+                "validate_track_on_release",
+                "search",
+                "get_release",
+                "cache_service",
+            ]
+        )
+        mock_service.cache_service = None
+
+        meet_me_discogs = make_discogs_result(
+            release_id=8001, album="Meet Me in the City", artist="Junior Kimbrough"
+        )
+        you_better_run_discogs = make_discogs_result(
+            release_id=8002,
+            album="You Better Run: The Essential Junior Kimbrough",
+            artist="Junior Kimbrough",
+        )
+
+        async def mock_search(request):
+            album = (request.album if hasattr(request, "album") else "") or ""
+            album_lower = album.lower()
+            if "meet me in the city" in album_lower:
+                return DiscogsSearchResponse(results=[meet_me_discogs])
+            if "you better run" in album_lower or "essential" in album_lower:
+                return DiscogsSearchResponse(results=[you_better_run_discogs])
+            return DiscogsSearchResponse(results=[])
+
+        mock_service.search = AsyncMock(side_effect=mock_search)
+        # The track is genuinely on both releases — neither should be filtered.
+        mock_service.validate_track_on_release = AsyncMock(return_value=True)
+        mock_service.get_release = AsyncMock(return_value=None)
+        mock_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Meet Me in the City",
+                artist="Junior Kimbrough",
+                releases=[],
+                total=0,
+                cached=False,
+            )
+        )
+
+        request = LookupRequest(
+            artist="Junior Kimbrough",
+            song="Meet Me in the City",
+            raw_message="Meet Me in the City Junior Kimbrough",
+        )
+
+        # Bug-triggering Discogs order: comp first, title-match album second.
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[
+                ("Junior Kimbrough", "You Better Run: The Essential Junior Kimbrough"),
+                ("Junior Kimbrough", "Meet Me in the City"),
+            ],
+        ):
+            response = await perform_lookup(
+                request,
+                library_db,
+                mock_service,
+                make_lml_telemetry(),
+            )
+
+        titles = [r.library_item.title for r in response.results]
+        assert titles[0] == "Meet Me in the City", (
+            f"Title-matching album should rank first; got: {titles}"
+        )
+        assert "You Better Run (The essential Junior Kimbrough)" in titles, (
+            f"Comp should still appear (track is on it too); got: {titles}"
+        )
+        assert response.song_not_found is False
+
+
 class TestQuotedArtistNameValidation:
     """Test that Discogs-formatted quoted artist names don't cause false positives."""
 
