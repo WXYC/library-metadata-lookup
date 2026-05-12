@@ -82,10 +82,12 @@ class TestSearchAlbumsByTrackTitlePg:
         SQL machinery is broken).
 
         Caveat: if a cache snapshot doesn't include the specific releases
-        used here, this test will produce zero rows and fail. That's the
-        signal: track-by-title search needs cache data to be useful. The
-        skip path above guards against the empty-cache case (count == 0);
-        partial caches are a known limitation.
+        used here, this test self-skips with a clear reason — track-by-title
+        search needs cache data to be useful. The fixture-level skip guards
+        against the empty-``release_track`` case (``count == 0``); the
+        inner skip guards against the partial-cache case where the table
+        is populated but doesn't happen to contain the canonical query
+        target.
         """
         rows = await cache_with_release_track.search_albums_by_track_title("VI Scose Poise")
 
@@ -157,6 +159,41 @@ class TestSearchAlbumsByTrackTitlePg:
             "qzx8wpvnlfrugmkj nothing matches this", score_threshold=0.5
         )
         assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_collab_artist_is_deterministic(self, cache_with_release_track):
+        """For collab releases (multiple ``extra=0`` rows), the surviving
+        ``release_artist`` must be alphabetically first. Running the same
+        query twice must produce the same artist for the same release_id —
+        without the ``ra.artist_name ASC`` tiebreaker, the result is
+        storage-order-dependent.
+
+        Uses "In a Sentimental Mood" because the cache typically has the
+        Duke Ellington & John Coltrane duo album (Discogs `release_artist`
+        rows for both, both `extra=0`).
+        """
+        first = await cache_with_release_track.search_albums_by_track_title(
+            "In a Sentimental Mood", limit=100
+        )
+        if not first:
+            pytest.skip("Cache does not contain 'In a Sentimental Mood' data.")
+        second = await cache_with_release_track.search_albums_by_track_title(
+            "In a Sentimental Mood", limit=100
+        )
+        # Map release_id -> release_artist must agree across the two runs.
+        first_map = {r["release_id"]: r["release_artist"] for r in first}
+        second_map = {r["release_id"]: r["release_artist"] for r in second}
+        # Limit to release_ids present in both (LIMIT could in principle
+        # have selected different sets at the score boundary; in practice
+        # the same query with the same data produces the same set).
+        shared = set(first_map) & set(second_map)
+        assert shared, "expected at least one release_id common to both runs"
+        for rid in shared:
+            assert first_map[rid] == second_map[rid], (
+                f"release_artist for release_id={rid} differs across runs: "
+                f"{first_map[rid]!r} vs {second_map[rid]!r}. The ORDER BY tiebreaker "
+                f"`ra.artist_name ASC` should make this deterministic."
+            )
 
     @pytest.mark.asyncio
     async def test_dedupes_by_release_id(self, cache_with_release_track):

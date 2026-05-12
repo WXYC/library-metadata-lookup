@@ -280,6 +280,18 @@ class DiscogsCacheService:
             CacheUnavailableError: If the database is unreachable.
         """
         try:
+            # The explicit `similarity(...) >= $2` clause is defense-in-depth:
+            # we also bind `pg_trgm.similarity_threshold` to $2 below so the `%`
+            # operator floors at the same value. The duplicated predicate
+            # protects against a broken transaction (where the SET LOCAL might
+            # not have taken effect) — the planner short-circuits one when the
+            # other is satisfied, so the redundancy is essentially free.
+            #
+            # `ra.artist_name ASC` is the tiebreaker on the DISTINCT ON. For
+            # collab releases (Duke Ellington & John Coltrane, Various
+            # Artists compilations with multi-artist credits), without this
+            # the surviving artist row is storage-order-dependent and the
+            # same query can return different artists across runs.
             query = """
                 SELECT *
                 FROM (
@@ -303,7 +315,7 @@ class DiscogsCacheService:
                             lower(f_unaccent(rt.title)),
                             lower(f_unaccent($1))
                           ) >= $2
-                    ORDER BY rt.release_id, score DESC
+                    ORDER BY rt.release_id, score DESC, ra.artist_name ASC
                 ) deduped
                 ORDER BY score DESC, release_id
                 LIMIT $3

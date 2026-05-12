@@ -225,6 +225,36 @@ class TestSearchAlbumsByTrackTitle:
             await svc.search_albums_by_track_title("anything")
         assert "connection refused" in str(exc_info.value)
 
+    @pytest.mark.asyncio
+    async def test_collab_release_artist_is_alphabetically_first(self):
+        """``DISTINCT ON (rt.release_id)`` plus ``ORDER BY rt.release_id,
+        score DESC, ra.artist_name ASC`` must make collab-album results
+        deterministic. Without the alphabetical tiebreaker, the surviving
+        ``release_artist`` depends on PG's storage-order encounter for the
+        ``release_artist`` JOIN — same query, same data could yield "Duke
+        Ellington" one run and "John Coltrane" another (after vacuum, after
+        an index rebuild, after a different join order chosen by the
+        planner).
+
+        We assert the SQL the cache method emits orders by
+        ``ra.artist_name ASC`` as the final tiebreaker. The pg-integration
+        test pins the end-to-end behavior.
+        """
+        svc, conn = _make_cache_svc([])
+        await svc.search_albums_by_track_title("anything")
+        # `conn.fetch` is called with (sql, query, threshold, limit). Assert
+        # the SQL contains the alphabetical tiebreaker — implementation
+        # detail, but the alternative (matching against actual PG output)
+        # would require the integration suite and we want a unit-level
+        # regression guard.
+        sql = conn.fetch.await_args.args[0]
+        # Look for the tiebreaker in the inner DISTINCT ON ordering.
+        assert "ra.artist_name asc" in sql.lower(), (
+            "Expected `ra.artist_name ASC` as the final ORDER BY clause inside "
+            "DISTINCT ON to make collab-album results deterministic. Without it, "
+            "the surviving artist row is storage-order-dependent."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Endpoint: GET /api/v1/discogs/search-by-track
@@ -361,13 +391,14 @@ class TestSearchByTrackEndpoint:
 
     @pytest.mark.asyncio
     async def test_threshold_out_of_range_returns_422(self, app_with_cache):
-        # FastAPI's Query(ge=0, le=1) validation.
+        # FastAPI's Query(ge=0, le=1) validation. Use a valid-length q so
+        # the 422 is unambiguously about the threshold, not min_length.
         async with AsyncClient(
             transport=ASGITransport(app=app_with_cache), base_url="http://test"
         ) as client:
             resp = await client.get(
                 "/api/v1/discogs/search-by-track",
-                params={"q": "t", "score_threshold": 1.5},
+                params={"q": "track", "score_threshold": 1.5},
             )
         assert resp.status_code == 422
 
@@ -430,13 +461,82 @@ class TestSearchByTrackEndpoint:
         ) as client:
             resp = await client.get(
                 "/api/v1/discogs/search-by-track",
-                params={"q": "t", "score_threshold": 0.1},
+                params={"q": "track", "score_threshold": 0.1},
             )
 
         assert resp.status_code == 200
         mock_cache.search_albums_by_track_title.assert_called_once_with(
-            "t", limit=50, score_threshold=0.1
+            "track", limit=50, score_threshold=0.1
         )
+
+    @pytest.mark.asyncio
+    async def test_q_is_trimmed_before_reaching_cache(self, app_with_cache, mock_cache):
+        """Whitespace padding on the query is stripped at the route layer
+        before calling the cache. Trigram comparison is whitespace-resilient,
+        but trimming keeps the projected ``query`` field tidy and removes a
+        no-op-but-confusing input variant."""
+        mock_cache.search_albums_by_track_title = AsyncMock(return_value=[])
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_cache), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/search-by-track",
+                params={"q": "  vi scose poise  "},
+            )
+
+        assert resp.status_code == 200
+        # Trimmed before the cache call.
+        mock_cache.search_albums_by_track_title.assert_called_once_with(
+            "vi scose poise", limit=50, score_threshold=0.3
+        )
+        # And the response echoes the trimmed query, not the original.
+        assert resp.json()["query"] == "vi scose poise"
+
+    @pytest.mark.asyncio
+    async def test_empty_query_returns_422(self, app_with_cache):
+        """Empty string ``q`` is rejected. The trigram operator on an empty
+        string is meaningless; without a minimum length, callers could submit
+        ``q=""`` with low ``score_threshold`` and pull a massive scan. The
+        route's ``min_length`` validator catches this at the API layer."""
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_cache), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/search-by-track",
+                params={"q": ""},
+            )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_query_shorter_than_min_length_returns_422(self, app_with_cache):
+        """``q`` shorter than 3 characters is rejected. Trigrams (3-char
+        substrings) lose their selectivity below this length — a 1- or 2-char
+        query matches a large fraction of any tracklist, so allowing it
+        creates a cheap DOS vector against the cache. The auth gate
+        (``LML_API_KEY``) is a secondary defense; the min-length enforcement
+        is the first line."""
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_cache), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/search-by-track",
+                params={"q": "vi"},
+            )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_query_returns_422(self, app_with_cache):
+        """A whitespace-only query trims to empty, hitting the min-length
+        rejection. The route trims FIRST, then validates."""
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_cache), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/search-by-track",
+                params={"q": "   "},
+            )
+        assert resp.status_code == 422
 
     @pytest.mark.asyncio
     async def test_cache_error_returns_empty_results_not_500(self, app_with_cache, mock_cache):

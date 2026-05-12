@@ -77,7 +77,9 @@ Requires `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` for Spotify checks. Oth
 
 Returns one row per `release_id`. Multiple pressings of the same album appear as distinct rows (each has its own `release_id` and shares a `master_id`); callers handle cross-pressing dedupe via their own library lookup. The default `score_threshold` of 0.3 (pg_trgm's default similarity threshold) catches partial-title queries (`"scose poise"` → `"VI Scose Poise"` at ~0.78); raise to 0.5+ for near-exact matches.
 
-Implementation in `discogs/cache_service.py:search_albums_by_track_title()` (the SQL primitive) + `discogs/router.py:search_by_track()` (the route). Tests at `tests/unit/test_search_by_track.py` (unit, mocked cache) + `tests/integration/test_search_by_track_pg.py` (pg-marked smoke, self-skips when `release_track` is absent or empty).
+`q` is trimmed before lookup and must be at least 3 characters after trimming (422 otherwise). Below 3 chars, trigrams lose selectivity and a low `score_threshold` would scan a large fraction of the cache. `LML_API_KEY` gates abuse but the min-length is the first defense.
+
+For collab releases (Duke Ellington & John Coltrane, V/A compilations), the SQL's `ORDER BY ... ra.artist_name ASC` tiebreaker makes `release_artist` deterministic across runs — without it, the surviving artist row depends on storage order. Implementation in `discogs/cache_service.py:search_albums_by_track_title()` (the SQL primitive) + `discogs/router.py:search_by_track()` (the route). Tests at `tests/unit/test_search_by_track.py` (unit, mocked cache) + `tests/integration/test_search_by_track_pg.py` (pg-marked smoke, self-skips when `release_track` is absent or empty).
 
 ### Release Resolve Endpoint
 

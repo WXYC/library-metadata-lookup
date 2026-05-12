@@ -174,13 +174,26 @@ async def resolve_entity(
     """,
     responses={
         200: {"description": "Matched releases returned (may be empty on cache error)"},
-        422: {"description": "Missing required q parameter"},
+        422: {"description": "Missing or invalid q parameter (e.g. < 3 chars after trim)"},
         503: {"description": "Discogs cache not available"},
     },
 )
 async def search_by_track(
-    q: str = Query(..., description="Track title query (need not be exact)"),
-    limit: int = Query(50, ge=1, le=200, description="Maximum number of results"),
+    q: str = Query(
+        ...,
+        description=(
+            "Track title query (need not be exact). Trimmed before lookup. "
+            "Must be at least 3 chars after trimming — trigrams (3-char "
+            "substrings) lose selectivity below this length, so a 1- or "
+            "2-char query would scan a large fraction of the cache."
+        ),
+    ),
+    limit: int = Query(
+        50,
+        ge=1,
+        le=200,
+        description="Maximum number of distinct release_ids returned",
+    ),
     score_threshold: float = Query(
         0.3,
         ge=0,
@@ -196,18 +209,30 @@ async def search_by_track(
             detail="Discogs cache is not available. Set DATABASE_URL_DISCOGS.",
         )
 
+    # Trim whitespace before the min-length check so " vi " doesn't sneak
+    # through as a 4-char query that's really 2 chars of signal.
+    q_trimmed = q.strip()
+    if len(q_trimmed) < 3:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "q must be at least 3 characters after trimming. Shorter "
+                "queries lose trigram selectivity and risk a broad scan."
+            ),
+        )
+
     try:
         rows = await cache.search_albums_by_track_title(
-            q, limit=limit, score_threshold=score_threshold
+            q_trimmed, limit=limit, score_threshold=score_threshold
         )
     except CacheUnavailableError:
         logger.warning("Cache error during search-by-track, returning empty results")
-        return SearchByTrackResponse(results=[], total=0, query=q)
+        return SearchByTrackResponse(results=[], total=0, query=q_trimmed)
 
     return SearchByTrackResponse(
         results=[SearchByTrackResult(**r) for r in rows],
         total=len(rows),
-        query=q,
+        query=q_trimmed,
     )
 
 
