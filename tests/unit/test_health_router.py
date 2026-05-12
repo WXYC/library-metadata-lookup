@@ -1,6 +1,18 @@
-"""Unit tests for routers/health.py."""
+"""Unit tests for routers/health.py.
 
-from unittest.mock import AsyncMock, patch
+The health route is a thin local handler that uses ``wxyc_fastapi.healthcheck``
+primitives (``Check`` dataclass + ``DEFAULT_TIMEOUT_SECONDS``) but preserves
+LML's contracted response shape:
+
+* URL stays ``GET /health`` (Railway healthcheck depends on it).
+* Response body carries ``version`` (operator-facing).
+* ``services.discogs_api`` may carry granular values like ``"auth-error"``,
+  ``"rate-limited"``, ``"upstream-error"`` — see ``DiscogsApiCheckResult``.
+  The shared ``readiness_router`` flattens those to ``"unavailable"``, which is
+  why we don't mount it directly.
+"""
+
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -11,12 +23,11 @@ from routers.health import (
     _check_database,
     _check_discogs_api,
     _check_discogs_cache,
-    _run_check,
 )
 from tests.unit.conftest import override_deps
 
 # ---------------------------------------------------------------------------
-# Helper functions
+# Probe helpers (still local — they encode LML-specific contract values)
 # ---------------------------------------------------------------------------
 
 
@@ -85,27 +96,6 @@ class TestCheckDiscogsCache:
         assert await _check_discogs_cache(svc) == "unavailable"
 
 
-class TestRunCheck:
-    @pytest.mark.asyncio
-    async def test_success(self):
-        async def ok_check():
-            return "ok"
-
-        assert await _run_check(ok_check()) == "ok"
-
-    @pytest.mark.asyncio
-    async def test_timeout(self):
-        import asyncio
-
-        async def slow_check():
-            await asyncio.sleep(100)
-            return "ok"
-
-        with patch("routers.health.CHECK_TIMEOUT", 0.01):
-            result = await _run_check(slow_check())
-        assert result == "timeout"
-
-
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -151,10 +141,19 @@ class TestHealthEndpoint:
         assert body["status"] == "healthy"
         assert "version" in body
         assert body["services"]["database"] == "ok"
+        assert body["services"]["discogs_api"] == "ok"
+        assert body["services"]["discogs_cache"] == "ok"
 
     @pytest.mark.asyncio
-    async def test_degraded(self, mock_db, mock_settings):
-        """Core (database) ok but optional service erroring -> degraded."""
+    async def test_degraded_preserves_granular_discogs_value(self, mock_db, mock_settings):
+        """Core (database) ok but optional service erroring -> degraded.
+
+        The granular DiscogsApiCheckResult value (``auth-error``) must round-trip
+        to the response body verbatim — operators rely on it to distinguish
+        token rotation from rate limiting from upstream outages. The shared
+        readiness_router would flatten this to ``unavailable``; the local
+        handler must not.
+        """
         from config.settings import get_settings
         from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
         from main import app
@@ -182,6 +181,7 @@ class TestHealthEndpoint:
         body = resp.json()
         assert body["status"] == "degraded"
         assert body["services"]["discogs_api"] == "auth-error"
+        assert body["services"]["discogs_cache"] == "error"
 
     @pytest.mark.asyncio
     async def test_unhealthy_returns_503(self, mock_settings):
@@ -210,3 +210,39 @@ class TestHealthEndpoint:
         assert resp.status_code == 503
         body = resp.json()
         assert body["status"] == "unhealthy"
+        assert body["services"]["database"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_uses_shared_check_dataclass(self):
+        """The route declares its probes as ``wxyc_fastapi.healthcheck.Check``s.
+
+        Locks in the shared-primitive contract: future drift back to bespoke
+        local types should be flagged here.
+        """
+        from wxyc_fastapi.healthcheck import Check
+
+        from routers.health import _build_checks
+
+        db = AsyncMock(spec=LibraryDB)
+        svc = AsyncMock(spec=DiscogsService)
+        checks = _build_checks(db=db, discogs_service=svc)
+        assert len(checks) == 3
+        assert all(isinstance(c, Check) for c in checks)
+        assert [c.name for c in checks] == ["database", "discogs_api", "discogs_cache"]
+        assert checks[0].required is True  # database is core
+        assert checks[1].required is False  # discogs_api is optional
+        assert checks[2].required is False  # discogs_cache is optional
+
+    @pytest.mark.asyncio
+    async def test_local_helpers_removed(self):
+        """``_run_check`` and ``CHECK_TIMEOUT`` were deleted in favour of the
+        shared ``DEFAULT_TIMEOUT_SECONDS`` constant."""
+        import routers.health as health_module
+
+        assert not hasattr(health_module, "_run_check"), (
+            "_run_check should have been removed; use shared primitives instead"
+        )
+        assert not hasattr(health_module, "CHECK_TIMEOUT"), (
+            "CHECK_TIMEOUT should have been removed; "
+            "use wxyc_fastapi.healthcheck.DEFAULT_TIMEOUT_SECONDS"
+        )
