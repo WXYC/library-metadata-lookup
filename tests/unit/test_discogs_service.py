@@ -914,6 +914,13 @@ class TestBuildSearchParams:
         )
         assert "label" not in params
 
+    @pytest.mark.parametrize("label", ["NULL", "null", ""])
+    def test_omits_missing_label_sentinel_values(self, service, label):
+        params = service._build_search_params(
+            DiscogsSearchRequest(artist="Missy Elliott", album="Supa Dupa Fly", label=label)
+        )
+        assert "label" not in params
+
     def test_includes_format_when_provided(self, service):
         params = service._build_search_params(
             DiscogsSearchRequest(artist="Cat Power", album="Moon Pix", format="CD")
