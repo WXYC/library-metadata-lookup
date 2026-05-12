@@ -172,6 +172,12 @@ class TestGetDiscogsServicePoolRace:
     Same shape as PgSource: concurrent cold-start callers each enter the
     ``_discogs_pool is None`` branch, each ``await asyncpg.create_pool(...)``,
     and orphan all but one pool.
+
+    Post-#283 the singleton is provided by `wxyc_fastapi.http.async_singleton`,
+    which owns the double-check + `asyncio.Lock` together. The test still
+    drives `core.dependencies.get_discogs_service` end-to-end so a future
+    refactor that bypasses `async_singleton` would re-introduce the race
+    and re-fail this test.
     """
 
     @pytest.mark.asyncio
@@ -182,9 +188,11 @@ class TestGetDiscogsServicePoolRace:
         from config.settings import Settings
         from core import dependencies
 
-        # Reset module globals so we exercise cold-start init.
-        dependencies._discogs_service = None
-        dependencies._discogs_pool = None
+        # Reset module-level singletons via the public closer so the next
+        # `get_discogs_service` call drives a cold-start through the
+        # `async_singleton` factory (the underlying state lives in a closure
+        # we can't reach directly).
+        await dependencies.close_discogs_service()
 
         settings = Settings(
             discogs_token="test-token",
@@ -200,9 +208,12 @@ class TestGetDiscogsServicePoolRace:
             return AsyncMock(name="discogs-pool")
 
         try:
-            with patch(
-                "core.dependencies.asyncpg.create_pool",
-                side_effect=fake_create_pool,
+            with (
+                patch("core.dependencies.get_settings", return_value=settings),
+                patch(
+                    "core.dependencies.asyncpg.create_pool",
+                    side_effect=fake_create_pool,
+                ),
             ):
                 tasks = [
                     asyncio.create_task(dependencies.get_discogs_service(settings))
@@ -213,13 +224,12 @@ class TestGetDiscogsServicePoolRace:
                 release_event.set()
                 await asyncio.gather(*tasks)
         finally:
-            dependencies._discogs_service = None
-            dependencies._discogs_pool = None
+            await dependencies.close_discogs_service()
 
         assert len(create_calls) == 1, (
             f"asyncpg.create_pool was called {len(create_calls)} times for "
             "the discogs cache. Concurrent cold-start callers race in "
             "get_discogs_service, orphaning all but one pool — each orphan "
-            "holds up to 5 connections. Wrap the lazy init in an "
-            "asyncio.Lock (issue #241)."
+            "holds up to 5 connections. The lazy init must go through "
+            "`wxyc_fastapi.http.async_singleton` (issue #241 / #283)."
         )

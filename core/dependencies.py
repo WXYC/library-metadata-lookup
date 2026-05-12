@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 import asyncpg
 import httpx
 from fastapi import Depends
+from wxyc_fastapi.http import async_singleton
 from wxyc_fastapi.observability import get_posthog_client as _shared_posthog_client
 
 from config.settings import Settings, get_settings
@@ -23,13 +23,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# `_library_db` keeps its bespoke lazy lifecycle (sync construct + async
+# `connect()`). The only `await` happens after the module-level reference is
+# already assigned, so there is no concurrent-first-caller TOCTOU window —
+# `async_singleton` would change failure semantics around `FileNotFoundError`
+# (the missing-file path needs to leave the LibraryDB instance cached so the
+# health endpoint reports `unhealthy` instead of repeatedly retrying connect).
+# See WXYC/library-metadata-lookup#283.
 _library_db: LibraryDB | None = None
-_discogs_service: DiscogsService | None = None
-_discogs_pool: asyncpg.Pool | None = None
-_discogs_init_lock: asyncio.Lock = asyncio.Lock()
 _musicbrainz_pg: PgSource | None = None
-_apple_music_http_client: httpx.AsyncClient | None = None
-_apple_music_http_client_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryDB:
@@ -74,6 +76,65 @@ async def close_library_db() -> None:
         _library_db = None
 
 
+async def _build_discogs_pool() -> asyncpg.Pool | None:
+    """Build the asyncpg pool backing the Discogs cache.
+
+    Returns ``None`` when no DSN is configured or pool creation fails — the
+    service then runs in API-only mode. The race-free wiring lives in
+    `async_singleton` (WXYC/wxyc-fastapi#5); this factory just owns the
+    config-load + log-on-failure shape.
+    """
+    settings = get_settings()
+    if not settings.database_url_discogs:
+        return None
+    try:
+        pool = await asyncpg.create_pool(
+            settings.database_url_discogs,
+            min_size=1,
+            max_size=5,
+            timeout=10,
+        )
+        logger.info("Discogs cache pool connected")
+        return pool
+    except Exception as e:
+        logger.warning(f"Failed to create Discogs cache pool: {type(e).__name__}: {e}")
+        return None
+
+
+_get_discogs_pool, _close_discogs_pool = async_singleton(_build_discogs_pool)
+
+
+async def _build_discogs_service() -> DiscogsService | None:
+    """Build the Discogs service, attaching the cache pool when available."""
+    settings = get_settings()
+    has_token = bool(settings.discogs_token)
+    has_key_secret = bool(settings.discogs_api_key and settings.discogs_api_secret)
+    if not has_token and not has_key_secret:
+        logger.debug("No Discogs credentials set - Discogs service disabled")
+        return None
+
+    pool = await _get_discogs_pool()
+    cache_service = DiscogsCacheService(pool) if pool is not None else None
+    if cache_service is not None:
+        logger.info("Discogs cache service enabled")
+
+    if has_token:
+        service = DiscogsService(token=settings.discogs_token, cache_service=cache_service)
+    else:
+        service = DiscogsService(
+            api_key=settings.discogs_api_key,
+            api_secret=settings.discogs_api_secret,
+            cache_service=cache_service,
+        )
+    logger.info(
+        f"Discogs service initialized (cache: {'enabled' if cache_service else 'disabled'})"
+    )
+    return service
+
+
+_get_discogs_service, _close_discogs_service = async_singleton(_build_discogs_service)
+
+
 async def get_discogs_service(
     settings: Settings = Depends(get_settings),
 ) -> DiscogsService | None:
@@ -83,76 +144,25 @@ async def get_discogs_service(
     and wires up DiscogsCacheService for local caching of Discogs data.
 
     Args:
-        settings: Application settings
+        settings: Application settings (resolved via DI; the underlying
+            singleton factory reads from `get_settings()` so concurrent
+            cold-start callers see a single, race-free init).
 
     Returns:
         Optional[DiscogsService]: Discogs service if configured, None otherwise
     """
-    global _discogs_service
-    global _discogs_pool
-
-    has_token = bool(settings.discogs_token)
-    has_key_secret = bool(settings.discogs_api_key and settings.discogs_api_secret)
-    if not has_token and not has_key_secret:
-        logger.debug("No Discogs credentials set - Discogs service disabled")
-        return None
-
-    if _discogs_service is not None:
-        return _discogs_service
-
-    # Serialize concurrent first-callers so only one creates the cache pool.
-    # Without this lock, each caller passes the `is None` check, each awaits
-    # ``asyncpg.create_pool``, and all but one pool is orphaned with up to 5
-    # open connections (FDs). See issue #241.
-    async with _discogs_init_lock:
-        if _discogs_service is not None:
-            return _discogs_service
-
-        cache_service = None
-
-        if settings.database_url_discogs and _discogs_pool is None:
-            try:
-                _discogs_pool = await asyncpg.create_pool(
-                    settings.database_url_discogs,
-                    min_size=1,
-                    max_size=5,
-                    timeout=10,
-                )
-                logger.info("Discogs cache pool connected")
-            except Exception as e:
-                logger.warning(f"Failed to create Discogs cache pool: {type(e).__name__}: {e}")
-
-        if _discogs_pool is not None:
-            cache_service = DiscogsCacheService(_discogs_pool)
-            logger.info("Discogs cache service enabled")
-
-        if has_token:
-            _discogs_service = DiscogsService(
-                token=settings.discogs_token, cache_service=cache_service
-            )
-        else:
-            _discogs_service = DiscogsService(
-                api_key=settings.discogs_api_key,
-                api_secret=settings.discogs_api_secret,
-                cache_service=cache_service,
-            )
-        logger.info(
-            f"Discogs service initialized (cache: {'enabled' if cache_service else 'disabled'})"
-        )
-
-        return _discogs_service
+    return await _get_discogs_service()
 
 
 async def close_discogs_service() -> None:
     """Close Discogs service, its HTTP client, and the cache pool."""
-    global _discogs_service
-    global _discogs_pool
-    if _discogs_service:
-        await _discogs_service.close()
-        _discogs_service = None
-    if _discogs_pool:
-        await _discogs_pool.close()
-        _discogs_pool = None
+    # Service holds the outbound HTTP client; pool holds the asyncpg
+    # connections. Both are independent singletons so each gets its own
+    # teardown call. Pool is torn down last so any in-flight cache_service
+    # work the service might have in progress sees the pool until aclose
+    # returns.
+    await _close_discogs_service()
+    await _close_discogs_pool()
 
 
 async def get_discogs_cache_service(
@@ -166,15 +176,13 @@ async def get_discogs_cache_service(
     Returns:
         DiscogsCacheService if the cache pool is available, None otherwise.
     """
-    global _discogs_pool
-
-    if _discogs_pool is None:
-        await get_discogs_service(settings)
-
-    if _discogs_pool is None:
+    # Reuse the service's already-built cache wrapper so we don't construct
+    # a fresh DiscogsCacheService per call (cheap, but avoiding it keeps
+    # parity with the cached service object the API path also receives).
+    service = await _get_discogs_service()
+    if service is None:
         return None
-
-    return DiscogsCacheService(_discogs_pool)
+    return service.cache_service
 
 
 async def get_musicbrainz_pg(
@@ -214,6 +222,18 @@ async def close_musicbrainz_pg() -> None:
         _musicbrainz_pg = None
 
 
+async def _build_apple_music_http_client() -> httpx.AsyncClient:
+    """Build the process-lifetime httpx client for iTunes Search probes."""
+    client = httpx.AsyncClient(timeout=5.0)
+    logger.info("Apple Music shared HTTP client initialized")
+    return client
+
+
+_get_apple_music_http_client, _close_apple_music_http_client = async_singleton(
+    _build_apple_music_http_client
+)
+
+
 async def get_apple_music_http_client() -> httpx.AsyncClient:
     """Process-lifetime ``httpx.AsyncClient`` for the iTunes Search probe.
 
@@ -224,22 +244,12 @@ async def get_apple_music_http_client() -> httpx.AsyncClient:
     2026-05-01 (issue #241). A shared client is returned instead and
     closed on app shutdown via ``close_apple_music_http_client``.
     """
-    global _apple_music_http_client
-    if _apple_music_http_client is not None:
-        return _apple_music_http_client
-    async with _apple_music_http_client_lock:
-        if _apple_music_http_client is None:
-            _apple_music_http_client = httpx.AsyncClient(timeout=5.0)
-            logger.info("Apple Music shared HTTP client initialized")
-        return _apple_music_http_client
+    return await _get_apple_music_http_client()
 
 
 async def close_apple_music_http_client() -> None:
     """Close the shared Apple Music HTTP client on app shutdown."""
-    global _apple_music_http_client
-    if _apple_music_http_client is not None:
-        await _apple_music_http_client.aclose()
-        _apple_music_http_client = None
+    await _close_apple_music_http_client()
 
 
 def get_posthog_client(settings: Settings = Depends(get_settings)) -> Posthog | None:

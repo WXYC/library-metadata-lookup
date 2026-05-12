@@ -1,5 +1,7 @@
 """Unit tests for core/dependencies.py."""
 
+import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -16,14 +18,36 @@ from core.dependencies import (
 
 @pytest.fixture(autouse=True)
 def reset_globals():
-    """Reset module-level singleton state between tests."""
+    """Reset module-level singleton state between tests.
+
+    The Discogs service + pool singletons live inside `async_singleton`
+    closures (WXYC/library-metadata-lookup#283), so the only safe way to
+    rebuild them between tests is via their public closers. We drive the
+    coroutine with `asyncio.run` so this fixture stays sync (autouse async
+    fixtures don't work for sync tests under pytest-asyncio strict mode).
+    """
     deps_module._library_db = None
-    deps_module._discogs_service = None
-    deps_module._discogs_pool = None
+    asyncio.run(close_discogs_service())
     yield
     deps_module._library_db = None
-    deps_module._discogs_service = None
-    deps_module._discogs_pool = None
+    asyncio.run(close_discogs_service())
+
+
+def test_no_module_level_asyncio_lock_in_dependencies():
+    """LML#283: race-prone hand-rolled `asyncio.Lock()` plumbing must be
+    gone from `core/dependencies.py`. The lock + double-check belongs
+    inside `wxyc_fastapi.http.async_singleton`; reintroducing one at the
+    module level (a) duplicates the contract and (b) means a future author
+    could write a new lazy-init that re-races the FD-leak fix from #242.
+    """
+    src = Path(deps_module.__file__).read_text()
+    assert "asyncio.Lock()" not in src, (
+        "core/dependencies.py contains a module-level `asyncio.Lock()` "
+        "instance — async singletons in this module must use "
+        "`wxyc_fastapi.http.async_singleton(factory)` instead, which owns "
+        "the lock and the double-check together. See WXYC/library-metadata-lookup#283 "
+        "and WXYC/library-metadata-lookup#241."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -138,12 +162,20 @@ class TestCloseLibraryDB:
 
 
 class TestGetDiscogsService:
+    """The Discogs service factory loads its config from `get_settings()`
+    inside the `async_singleton`-wrapped factory (WXYC/library-metadata-lookup#283),
+    so each test patches `core.dependencies.get_settings` to inject the
+    desired settings shape rather than relying on the dropped per-call
+    `settings` argument.
+    """
+
     @pytest.mark.asyncio
     async def test_no_credentials_returns_none(self, mock_settings):
         mock_settings.discogs_token = None
         mock_settings.discogs_api_key = None
         mock_settings.discogs_api_secret = None
-        result = await get_discogs_service(mock_settings)
+        with patch("core.dependencies.get_settings", return_value=mock_settings):
+            result = await get_discogs_service(mock_settings)
         assert result is None
 
     @pytest.mark.asyncio
@@ -152,7 +184,8 @@ class TestGetDiscogsService:
         mock_settings.discogs_token = None
         mock_settings.discogs_api_key = "only-key"
         mock_settings.discogs_api_secret = None
-        result = await get_discogs_service(mock_settings)
+        with patch("core.dependencies.get_settings", return_value=mock_settings):
+            result = await get_discogs_service(mock_settings)
         assert result is None
 
     @pytest.mark.asyncio
@@ -160,7 +193,10 @@ class TestGetDiscogsService:
         mock_settings.discogs_token = "test-token"
         mock_settings.database_url_discogs = None
 
-        with patch("core.dependencies.DiscogsService") as mock_svc_cls:
+        with (
+            patch("core.dependencies.get_settings", return_value=mock_settings),
+            patch("core.dependencies.DiscogsService") as mock_svc_cls,
+        ):
             mock_svc = AsyncMock()
             mock_svc_cls.return_value = mock_svc
 
@@ -176,7 +212,10 @@ class TestGetDiscogsService:
         mock_settings.discogs_api_secret = "my-secret"
         mock_settings.database_url_discogs = None
 
-        with patch("core.dependencies.DiscogsService") as mock_svc_cls:
+        with (
+            patch("core.dependencies.get_settings", return_value=mock_settings),
+            patch("core.dependencies.DiscogsService") as mock_svc_cls,
+        ):
             mock_svc = AsyncMock()
             mock_svc_cls.return_value = mock_svc
 
@@ -194,7 +233,10 @@ class TestGetDiscogsService:
         mock_settings.discogs_api_secret = "my-secret"
         mock_settings.database_url_discogs = None
 
-        with patch("core.dependencies.DiscogsService") as mock_svc_cls:
+        with (
+            patch("core.dependencies.get_settings", return_value=mock_settings),
+            patch("core.dependencies.DiscogsService") as mock_svc_cls,
+        ):
             mock_svc_cls.return_value = AsyncMock()
             await get_discogs_service(mock_settings)
             # Token wins; key/secret are not passed.
@@ -208,6 +250,7 @@ class TestGetDiscogsService:
         mock_pool = AsyncMock()
 
         with (
+            patch("core.dependencies.get_settings", return_value=mock_settings),
             patch("core.dependencies.asyncpg.create_pool", new_callable=AsyncMock) as mock_create,
             patch("core.dependencies.DiscogsCacheService") as mock_cache_cls,
             patch("core.dependencies.DiscogsService") as mock_svc_cls,
@@ -230,6 +273,7 @@ class TestGetDiscogsService:
         mock_settings.database_url_discogs = "postgresql://localhost/test"
 
         with (
+            patch("core.dependencies.get_settings", return_value=mock_settings),
             patch(
                 "core.dependencies.asyncpg.create_pool",
                 new_callable=AsyncMock,
@@ -247,12 +291,21 @@ class TestGetDiscogsService:
 
     @pytest.mark.asyncio
     async def test_cached_instance(self, mock_settings):
-        mock_svc = AsyncMock()
-        deps_module._discogs_service = mock_svc
+        """A second call returns the same singleton without re-running the factory."""
         mock_settings.discogs_token = "test-token"
+        mock_settings.database_url_discogs = None
 
-        result = await get_discogs_service(mock_settings)
-        assert result is mock_svc
+        with (
+            patch("core.dependencies.get_settings", return_value=mock_settings),
+            patch("core.dependencies.DiscogsService") as mock_svc_cls,
+        ):
+            mock_svc_cls.return_value = AsyncMock()
+
+            first = await get_discogs_service(mock_settings)
+            second = await get_discogs_service(mock_settings)
+
+            assert first is second
+            mock_svc_cls.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -262,18 +315,48 @@ class TestGetDiscogsService:
 
 class TestCloseDiscogsService:
     @pytest.mark.asyncio
-    async def test_closes_service_and_pool(self):
-        mock_svc = AsyncMock()
+    async def test_closes_service_and_pool(self, mock_settings):
+        """The closer must tear down both the service (which holds the
+        outbound HTTP client) and the cache pool, in that order.
+
+        The mocks use `spec=...` to restrict their attribute surface to the
+        real classes' methods so `async_singleton`'s closer dispatches to
+        the actual teardown method (`DiscogsService.close` /
+        `asyncpg.Pool.close`) rather than to AsyncMock's auto-created
+        `aclose`. The dispatch order matters: a real `DiscogsService` has
+        only `close()`, and a real `asyncpg.Pool` has only `close()`.
+        """
+        from discogs.service import DiscogsService
+
+        mock_settings.discogs_token = "test-token"
+        mock_settings.database_url_discogs = "postgresql://localhost/test"
+
+        # `spec=DiscogsService` ensures `hasattr(svc, "aclose")` is False so
+        # the singleton's closer falls through to `close()`, matching prod.
+        mock_svc = AsyncMock(spec=DiscogsService)
+
+        # asyncpg.Pool's runtime class is private; a plain AsyncMock with
+        # `aclose` explicitly removed is sufficient and matches the public
+        # surface (`close()` returning a coroutine).
         mock_pool = AsyncMock()
-        deps_module._discogs_service = mock_svc
-        deps_module._discogs_pool = mock_pool
+        del mock_pool.aclose
 
-        await close_discogs_service()
+        with (
+            patch("core.dependencies.get_settings", return_value=mock_settings),
+            patch(
+                "core.dependencies.asyncpg.create_pool",
+                new_callable=AsyncMock,
+                return_value=mock_pool,
+            ),
+            patch("core.dependencies.DiscogsService", return_value=mock_svc),
+            patch("core.dependencies.DiscogsCacheService"),
+        ):
+            await get_discogs_service(mock_settings)
 
-        mock_svc.close.assert_called_once()
-        mock_pool.close.assert_called_once()
-        assert deps_module._discogs_service is None
-        assert deps_module._discogs_pool is None
+            await close_discogs_service()
+
+            mock_svc.close.assert_called_once()
+            mock_pool.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_noop_when_none(self):
