@@ -25,5 +25,5 @@ jobs:
     name: Flag-doc consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: bash scripts/check_cross_cache_identity_flags.sh
