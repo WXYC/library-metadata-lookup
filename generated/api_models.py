@@ -8,7 +8,15 @@ from datetime import time as time_aliased
 from enum import IntEnum, StrEnum
 from typing import Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, Field, RootModel, confloat, conint
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    confloat,
+    conint,
+)
 
 
 class ApiErrorResponse(BaseModel):
@@ -32,6 +40,34 @@ class PaginationInfo(BaseModel):
 class DateTimeEntry(BaseModel):
     day: str = Field(..., description='Day string (e.g., "Monday")')
     time: str = Field(..., description='Time string (e.g., "14:00")')
+
+
+class Status(StrEnum):
+    healthy = "healthy"
+    degraded = "degraded"
+    unhealthy = "unhealthy"
+
+
+class HealthCheckResponse(BaseModel):
+    model_config = ConfigDict(
+        extra="allow",
+    )
+    status: Status = Field(
+        ...,
+        description="Service-reported health. `healthy` = fully operational; `degraded`\n= serving but with reduced capability; `unhealthy` = should not\nreceive traffic.\n",
+    )
+
+
+class Services(StrEnum):
+    ok = "ok"
+    unavailable = "unavailable"
+    timeout = "timeout"
+
+
+class ReadinessResponse(HealthCheckResponse):
+    services: dict[str, Services] = Field(
+        ..., description="Per-dependency readiness map keyed by dependency name."
+    )
 
 
 class Genre(StrEnum):
