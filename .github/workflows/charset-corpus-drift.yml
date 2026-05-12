@@ -20,6 +20,13 @@ on:
     # Monday 08:17 UTC catches upstream bumps merged over the weekend.
     - cron: "17 8 * * 1"
 
+# Workflow-level GITHUB_TOKEN scope. The reusable workflow runs
+# `npm pack @wxyc/shared` against npm.pkg.github.com using the token
+# forwarded as `npm-token`, which needs packages:read.
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   drift:
     uses: WXYC/wxyc-shared/.github/workflows/check-charset-corpus-drift.yml@gha/v1
