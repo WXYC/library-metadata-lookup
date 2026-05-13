@@ -156,6 +156,44 @@ async def resolve_canonical_artist(
     return outcome
 
 
+def _log_album_title_fallback(
+    *,
+    album: str,
+    n_candidates: int,
+    surfaced_library_match: bool,
+    error: str | None = None,
+) -> None:
+    """Emit telemetry for the album-title fallback (#319 / #237).
+
+    Mirrors the ``_log_resolver_pre_pass`` shape. The fallback's firing
+    population grew significantly when the gate changed from ``not raw_releases``
+    to ``not results`` (see WXYC/library-metadata-lookup#322 review), so each
+    fire is recorded both as an INFO log line and as a Sentry transaction
+    ``data.album_title_fallback`` attribute. Sentry can answer "what
+    percentage of /lookup calls trigger this fallback, and what's the
+    surface rate?" without re-pulling Railway logs.
+
+    No-op when there's no active Sentry transaction. Any SDK error is
+    swallowed so observability never breaks /lookup.
+    """
+    payload: dict[str, Any] = {
+        "album": album,
+        "n_candidates": n_candidates,
+        "surfaced_library_match": surfaced_library_match,
+    }
+    if error is not None:
+        payload["error"] = error
+        logger.warning("album_title_fallback %s", payload)
+    else:
+        logger.info("album_title_fallback %s", payload)
+    try:
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is not None:
+            transaction.set_data("album_title_fallback", payload)
+    except Exception as e:
+        logger.warning("Failed to project album_title_fallback onto Sentry transaction: %s", e)
+
+
 def _log_resolver_pre_pass(outcome: ResolverOutcome, *, actual_swap: bool) -> None:
     """Emit shadow-mode telemetry for the resolver pre-pass.
 
@@ -767,6 +805,15 @@ async def search_compilations_for_track(
         # Shelley Miller"), so the artist-scoped probes now return non-empty
         # raw_releases that all get filtered out downstream. Gate on actual
         # results, not Discogs response shape. See WXYC/library-metadata-lookup#237.
+        #
+        # Trade-off: the gate is ``not results`` rather than
+        # ``len(results) < MAX_SEARCH_RESULTS``. A partial initial pass (e.g.
+        # one valid match) suppresses the fallback entirely, even when more
+        # spots are available. Conservative-by-design — the fallback's
+        # purpose is to backfill the zero-results case, not augment partial
+        # ones. Revisit if measurements show partial-result requests would
+        # benefit from supplementation.
+        pre_fallback_results_count = len(results)
         if discogs_service and not results and parsed.album and not outcome.swapped:
             try:
                 fallback_response = await discogs_service.search_releases_by_album_title(
@@ -798,8 +845,18 @@ async def search_compilations_for_track(
                         break
                 if fallback_releases:
                     discogs_found_releases = True
+                _log_album_title_fallback(
+                    album=parsed.album,
+                    n_candidates=len(fallback_releases),
+                    surfaced_library_match=len(results) > pre_fallback_results_count,
+                )
             except Exception as e:
-                logger.warning(f"Album-title fallback failed for '{parsed.album}': {e}")
+                _log_album_title_fallback(
+                    album=parsed.album,
+                    n_candidates=0,
+                    surfaced_library_match=False,
+                    error=str(e),
+                )
     except Exception as e:
         logger.warning(f"Failed to search for track on other releases: {e}")
 
