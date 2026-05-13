@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from generated.api_models import TrackMatchHint
 from library.db import LibraryDB
 from library.models import LibraryItem
 from services.parser import ParsedRequest
@@ -78,6 +79,11 @@ class SearchStrategyType(StrEnum):
     SONG_AS_ARTIST = "song_as_artist"
     """Fallback: try parsed song as artist when no results and no artist parsed."""
 
+    SONG_AS_TRACK = "song_as_track"
+    """Fallback: cross-reference the parsed song against Discogs and match releases
+    back to the WXYC library. Fires for song-only inputs after SONG_AS_ARTIST returns
+    empty. Load-bearing for catalog-track-search (plan §4.2)."""
+
     KEYWORD_MATCH = "keyword_match"
     """Significant word extraction search."""
 
@@ -115,6 +121,14 @@ class SearchState:
     are preserved here so perform_lookup can validate them against Discogs tracklists
     and merge any confirmed matches (e.g., the artist's own album containing the track)
     back into the final results.
+    """
+
+    matched_via_by_id: dict[int, list[TrackMatchHint]] = field(default_factory=dict)
+    """Per-library-id provenance for track-driven matches (catalog-track-search §5.1).
+
+    Populated by SONG_AS_TRACK when a track-title cross-reference surfaces a library
+    row. perform_lookup() reads this when building LookupResultItem.matched_via so
+    the API contract carries the track→release linkage back to the caller.
     """
 
 
@@ -202,6 +216,24 @@ def no_results_and_song_but_no_artist(
     return not state.results and bool(parsed.song) and not parsed.artist
 
 
+def no_results_and_song_but_no_artist_track_fallback(
+    parsed: ParsedRequest, state: SearchState, raw_message: str
+) -> bool:
+    """Condition: SONG_AS_ARTIST already ran and produced nothing.
+
+    Fires after the song-as-artist interpretation has failed, then treats the
+    song as a *track* and cross-references against Discogs to find releases
+    that contain it. Strictly downstream of SONG_AS_ARTIST so the
+    parser-misread-artist case keeps first-crack ordering.
+    """
+    return (
+        not state.results
+        and bool(parsed.song)
+        and not parsed.artist
+        and SearchStrategyType.SONG_AS_ARTIST in state.strategies_tried
+    )
+
+
 # =============================================================================
 # Strategy Registry
 # =============================================================================
@@ -212,6 +244,7 @@ def build_strategies(
     search_alternative_func: ExecuteFunc,
     search_compilations_func: ExecuteFunc,
     search_song_as_artist_func: ExecuteFunc | None = None,
+    search_song_as_track_func: ExecuteFunc | None = None,
 ) -> list[SearchStrategy]:
     """Build the list of search strategies with injected execute functions.
 
@@ -223,6 +256,8 @@ def build_strategies(
         search_alternative_func: Function implementing SWAPPED_INTERPRETATION search
         search_compilations_func: Function implementing TRACK_ON_COMPILATION search
         search_song_as_artist_func: Function implementing SONG_AS_ARTIST search
+        search_song_as_track_func: Function implementing SONG_AS_TRACK search
+            (catalog-track-search §4.2). Fires strictly after SONG_AS_ARTIST.
 
     Returns:
         List of SearchStrategy objects in execution order
@@ -254,6 +289,17 @@ def build_strategies(
                 name=SearchStrategyType.SONG_AS_ARTIST,
                 condition=no_results_and_song_but_no_artist,
                 execute=search_song_as_artist_func,
+            )
+        )
+
+    # SONG_AS_TRACK must come AFTER SONG_AS_ARTIST — its condition checks that
+    # SONG_AS_ARTIST already ran and produced nothing.
+    if search_song_as_track_func is not None:
+        strategies.append(
+            SearchStrategy(
+                name=SearchStrategyType.SONG_AS_TRACK,
+                condition=no_results_and_song_but_no_artist_track_fallback,
+                execute=search_song_as_track_func,
             )
         )
 
@@ -336,6 +382,15 @@ async def execute_search_pipeline(
                 state.results = results
                 state.song_not_found = False
 
+        elif strategy.name == SearchStrategyType.SONG_AS_TRACK:
+            # Cross-reference song against Discogs; match releases back to library.
+            # Returns (library_items, matched_via_by_id) — see plan §4.2.
+            results, matched_via_by_id = await strategy.execute(db, parsed.song)
+            if results:
+                state.results = results
+                state.song_not_found = False
+                state.matched_via_by_id = matched_via_by_id or {}
+
         # Stop if we found results (unless we're doing compilation search which can replace results)
         if state.results and strategy.name != SearchStrategyType.TRACK_ON_COMPILATION:
             # For compilation search, we continue even if we have artist-only results
@@ -371,5 +426,10 @@ def get_search_type_from_state(state: SearchState) -> str:
         return "compilation"
     elif last_strategy == SearchStrategyType.SONG_AS_ARTIST:
         return "song_as_artist"
+    elif last_strategy == SearchStrategyType.SONG_AS_TRACK:
+        # api.yaml v1.3.0 SearchType has no `song_as_track` value. Precise
+        # provenance lives on matched_via.source per plan §5.1; from the
+        # caller's lens, track-driven matches are compilation-class.
+        return "compilation"
 
     return "none"

@@ -16,6 +16,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from discogs.models import DiscogsSearchResponse
+from generated.api_models import (
+    DiscogsReleaseInfo,
+    DiscogsTrackReleasesResponse,
+    TrackMatchSource,
+)
 from library.models import LibraryItem
 from lookup.models import LookupRequest, LookupResponse
 from lookup.orchestrator import perform_lookup
@@ -190,6 +195,79 @@ class TestPerformLookupBasic:
         assert len(response.results) == 1
         assert response.results[0].library_item.artist == "Queen"
         assert response.results[0].artwork is None
+
+    @pytest.mark.asyncio
+    async def test_song_as_track_emits_matched_via_on_result_item(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Song-only query 'vi scose poise' surfaces Confield with matched_via populated.
+
+        Verifies the full wiring: SONG_AS_TRACK strategy runs after SONG_AS_ARTIST
+        returns empty, the result row's matched_via dict is plumbed through
+        SearchState into LookupResultItem.matched_via, and the TrackMatchHint
+        records source=discogs_release with the track title.
+        """
+        confield = make_library_item(id=60359, artist="Autechre", title="Confield")
+
+        # SONG_AS_ARTIST does: db.search(query=song) → []
+        # SONG_AS_TRACK does: db.search(query=album) → [confield]
+        async def search_side_effect(query, **kwargs):
+            return [confield] if query and "confield" in query.lower() else []
+
+        mock_library_db.search.side_effect = search_side_effect
+        mock_discogs_service.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="vi scose poise",
+            releases=[
+                DiscogsReleaseInfo(
+                    album="Confield",
+                    artist="Autechre",
+                    release_id=8434,
+                    release_url="https://discogs.com/release/8434",
+                    is_compilation=False,
+                )
+            ],
+            total=1,
+        )
+        # SONG_AS_ARTIST queries Discogs by artist; return empty so it falls through.
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(song="vi scose poise", raw_message="vi scose poise")
+
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert len(response.results) == 1
+        item = response.results[0]
+        assert item.library_item.artist == "Autechre"
+        assert item.library_item.title == "Confield"
+        assert item.matched_via is not None
+        assert len(item.matched_via) == 1
+        hint = item.matched_via[0]
+        assert hint.title == "vi scose poise"
+        assert hint.source == TrackMatchSource.discogs_release
+
+    @pytest.mark.asyncio
+    async def test_matched_via_absent_on_non_track_match(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """When the result came via ARTIST_PLUS_ALBUM, matched_via is None.
+
+        Guards against accidental population of matched_via on non-track-driven
+        results — the field is reserved for track-search provenance per plan §5.1.
+        """
+        mock_library_db.search.return_value = [queen_item]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="A Night at the Opera by Queen",
+        )
+
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert len(response.results) == 1
+        assert response.results[0].matched_via is None
 
 
 # ---------------------------------------------------------------------------

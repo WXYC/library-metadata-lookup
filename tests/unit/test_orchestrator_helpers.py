@@ -20,6 +20,11 @@ from discogs.models import (
     DiscogsSearchResponse,
     ReleaseMetadataResponse,
 )
+from generated.api_models import (
+    DiscogsReleaseInfo,
+    DiscogsTrackReleasesResponse,
+    TrackMatchSource,
+)
 from lookup.orchestrator import (
     artist_matches_item,
     build_context_message,
@@ -29,6 +34,7 @@ from lookup.orchestrator import (
     find_library_albums_with_cached_track,
     resolve_albums_for_track,
     search_library_with_fallback,
+    search_song_as_track,
     search_with_alternative_interpretation,
 )
 from services.parser import MessageType, ParsedRequest
@@ -1268,3 +1274,150 @@ class TestFetchArtworkFallback:
         assert len(results) == 1
         assert results[0][1] is not None
         assert results[0][1].artwork_url is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: search_song_as_track (catalog-track-search §4.2, LML#301)
+# ---------------------------------------------------------------------------
+
+
+class TestSearchSongAsTrack:
+    """SONG_AS_TRACK strategy: cross-reference song against Discogs, match
+    releases back to library, emit matched_via TrackMatchHint per row."""
+
+    @pytest.mark.asyncio
+    async def test_no_song_returns_empty(self):
+        db = AsyncMock()
+        results, matched_via = await search_song_as_track(db, None)
+        assert results == []
+        assert matched_via == {}
+        db.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_blank_song_returns_empty(self):
+        db = AsyncMock()
+        results, matched_via = await search_song_as_track(db, "")
+        assert results == []
+        assert matched_via == {}
+
+    @pytest.mark.asyncio
+    async def test_no_discogs_service_returns_empty(self):
+        """Without a Discogs service, the strategy can't run and must no-op."""
+        db = AsyncMock()
+        results, matched_via = await search_song_as_track(
+            db, "vi scose poise", discogs_service=None
+        )
+        assert results == []
+        assert matched_via == {}
+        db.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_discogs_releases_returns_empty(self):
+        db = AsyncMock()
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="vi scose poise", artist=None, releases=[], total=0
+        )
+
+        results, matched_via = await search_song_as_track(db, "vi scose poise", discogs_service=svc)
+
+        assert results == []
+        assert matched_via == {}
+        db.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_library_miss_returns_empty(self):
+        """Discogs returns releases but none match in library — empty result."""
+        db = AsyncMock()
+        db.search.return_value = []
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="unknown song",
+            releases=[
+                DiscogsReleaseInfo(
+                    album="Some Album",
+                    artist="Some Artist",
+                    release_id=999,
+                    release_url="https://discogs.com/release/999",
+                    is_compilation=False,
+                )
+            ],
+            total=1,
+        )
+
+        results, matched_via = await search_song_as_track(db, "unknown song", discogs_service=svc)
+
+        assert results == []
+        assert matched_via == {}
+
+    @pytest.mark.asyncio
+    async def test_match_emits_track_match_hint(self):
+        """Confield case: 'vi scose poise' → Autechre's Confield.
+
+        The matched row gets a TrackMatchHint with the song as title,
+        source=discogs_release, confidence at the master-cap floor (≤ 0.85
+        per plan §5.2), and no per-track position (we don't fetch tracklists).
+        """
+        confield = make_library_item(id=60359, artist="Autechre", title="Confield")
+        db = AsyncMock()
+        db.search.return_value = [confield]
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="vi scose poise",
+            releases=[
+                DiscogsReleaseInfo(
+                    album="Confield",
+                    artist="Autechre",
+                    release_id=8434,
+                    release_url="https://discogs.com/release/8434",
+                    is_compilation=False,
+                )
+            ],
+            total=1,
+        )
+
+        results, matched_via = await search_song_as_track(db, "vi scose poise", discogs_service=svc)
+
+        assert results == [confield]
+        assert 60359 in matched_via
+        hints = matched_via[60359]
+        assert len(hints) == 1
+        hint = hints[0]
+        assert hint.title == "vi scose poise"
+        assert hint.source == TrackMatchSource.discogs_release
+        assert hint.confidence is not None and hint.confidence <= 0.85
+        assert hint.position is None
+
+    @pytest.mark.asyncio
+    async def test_compilation_match_carries_artist_credit(self):
+        """For VA compilations, the hint records the per-release artist credit.
+
+        Plan §5.1: artist_credit is the per-track artist for compilations;
+        null for non-comp tracks where the release-level artist applies.
+        """
+        va_album = make_library_item(
+            id=12345,
+            artist="Various Artists",
+            title="Trax Records 20th Anniversary Collection",
+        )
+        db = AsyncMock()
+        db.search.return_value = [va_album]
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="No Way Back",
+            releases=[
+                DiscogsReleaseInfo(
+                    album="Trax Records 20th Anniversary Collection",
+                    artist="Adonis",
+                    release_id=555,
+                    release_url="https://discogs.com/release/555",
+                    is_compilation=True,
+                )
+            ],
+            total=1,
+        )
+
+        results, matched_via = await search_song_as_track(db, "No Way Back", discogs_service=svc)
+
+        assert results == [va_album]
+        assert matched_via[12345][0].artist_credit == "Adonis"
