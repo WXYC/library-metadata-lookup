@@ -504,6 +504,68 @@ class DiscogsService:
             logger.error(f"Discogs search failed: {e}")
             return TrackReleasesResponse(track=track, artist=artist, cached=False)
 
+    async def search_compilations_by_title(
+        self,
+        album: str,
+        limit: int = 10,
+    ) -> TrackReleasesResponse:
+        """Search Discogs for compilations matching ``album`` title alone.
+
+        Used as a fallback when ``search_compilations_for_track``'s parallel
+        artist-scoped probes return no usable releases — typically the
+        trio-collaboration case where no single canonical artist entity
+        exists. Builds Discogs API params::
+
+            {"type": "release", "release_title": album,
+             "format": "Compilation", "per_page": limit}
+
+        API-only — no cache leg. ``cache_service.search_releases_by_title``
+        does not filter by format, so reusing it here would either over-fetch
+        or require new SQL on the discogs-cache side; the same trade-off is
+        already accepted at ``search_releases_by_track`` for the
+        ``artist_as_keyword=True`` path. The fallback fires rarely (guarded
+        by the three-condition check in the orchestrator) so the
+        single-API-call cost per fire is acceptable.
+
+        See WXYC/library-metadata-lookup#319.
+        """
+        if not album or not album.strip():
+            return TrackReleasesResponse(track="", artist=None, cached=False)
+
+        params: dict[str, Any] = {
+            "type": "release",
+            "release_title": album,
+            "format": "Compilation",
+            "per_page": limit,
+        }
+
+        logger.info(f"Searching Discogs compilations by title: '{album}'")
+
+        releases: list[ReleaseInfo] = []
+        seen_albums: set[str] = set()
+
+        try:
+            async with timed_api():
+                response = await self._request_with_retry("GET", "/database/search", params=params)
+            if response is not None:
+                get_cache_stats_recorder().record_api_call()
+                response.raise_for_status()
+                data = response.json()
+                for result in data.get("results", []):
+                    release_info = self._process_search_result(result, seen_albums)
+                    if release_info:
+                        releases.append(release_info)
+        except Exception as e:
+            logger.warning(f"search_compilations_by_title failed for '{album}': {e}")
+
+        return TrackReleasesResponse(
+            track="",
+            artist=None,
+            releases=releases[:limit],
+            total=len(releases[:limit]),
+            cached=False,
+        )
+
     def _process_search_result(self, result: dict, seen_albums: set) -> ReleaseInfo | None:
         """Process a single search result into a ReleaseInfo.
 

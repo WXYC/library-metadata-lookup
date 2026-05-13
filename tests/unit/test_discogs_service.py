@@ -777,6 +777,68 @@ class TestGetRelease:
 
 
 # ---------------------------------------------------------------------------
+# search_compilations_by_title
+# ---------------------------------------------------------------------------
+
+
+class TestSearchCompilationsByTitle:
+    """Unit tests for the album-title compilation fallback (#319).
+
+    Asserts that the new method dispatches to the Discogs API with the
+    expected params, parses results through the shared ``_process_search_result``
+    pipeline, and gracefully handles edge cases (blank input, API error).
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatches_with_compilation_format_and_release_title(self, service):
+        captured: dict = {}
+
+        async def fake_request(method, path, params=None, **kwargs):
+            captured["method"] = method
+            captured["path"] = path
+            captured["params"] = params
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.raise_for_status = MagicMock()
+            mock_resp.json.return_value = {
+                "results": [
+                    {"title": "Various - Some Comp", "id": 999},
+                ]
+            }
+            return mock_resp
+
+        with patch.object(service, "_request_with_retry", new=fake_request):
+            result = await service.search_compilations_by_title("Some Comp", limit=5)
+
+        assert captured["method"] == "GET"
+        assert captured["path"] == "/database/search"
+        assert captured["params"]["release_title"] == "Some Comp"
+        assert captured["params"]["format"] == "Compilation"
+        assert captured["params"]["type"] == "release"
+        assert captured["params"]["per_page"] == 5
+        assert isinstance(result, TrackReleasesResponse)
+        assert len(result.releases or []) == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_for_blank_album(self, service):
+        result = await service.search_compilations_by_title("   ")
+        assert isinstance(result, TrackReleasesResponse)
+        assert result.releases == [] or not result.releases
+
+    @pytest.mark.asyncio
+    async def test_api_exception_returns_empty_response(self, service):
+        with patch.object(
+            service,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            side_effect=Exception("network down"),
+        ):
+            result = await service.search_compilations_by_title("Some Comp")
+        assert isinstance(result, TrackReleasesResponse)
+        assert result.releases == [] or not result.releases
+
+
+# ---------------------------------------------------------------------------
 # search
 # ---------------------------------------------------------------------------
 
