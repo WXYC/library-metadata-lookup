@@ -134,6 +134,10 @@ class FlowsheetEntryResponse(FlowsheetEntryBase):
     soundcloud_url: str | None = None
     artist_bio: str | None = None
     artist_wikipedia_url: str | None = None
+    track_position: str | None = Field(
+        None,
+        description='Track position on the release (e.g., "A1", "B2", "5"). Populated when the flowsheet entry was created via the dj-site picker after release selection (catalog-track-search plan §5.3 / Track 3). String-typed to match Discogs\'s `release_track.position`. Null for free-text entries and legacy rows.\n',
+    )
 
 
 class FlowsheetSongEntry(FlowsheetEntryBase):
@@ -147,6 +151,10 @@ class FlowsheetSongEntry(FlowsheetEntryBase):
     album_id: int | None = None
     rotation_id: int | None = None
     rotation_bin: RotationBin | None = None
+    track_position: str | None = Field(
+        None,
+        description='Track position on the release (e.g., "A1", "B2", "5"). Optional; populated by the dj-site picker when a release with a resolvable tracklist is chosen (catalog-track-search plan §5.3 / Track 3). Free-text `track_title` remains the source of truth; this field is additive metadata for future enrichment + analytics.\n',
+    )
 
 
 class FlowsheetShowBlockEntry(FlowsheetEntryBase, DateTimeEntry):
@@ -475,42 +483,6 @@ class Album(BaseModel):
     )
 
 
-class AlbumSearchResult(BaseModel):
-    id: int
-    add_date: AwareDatetime
-    album_title: str
-    artist_name: str
-    code_letters: str
-    code_number: int
-    code_artist_number: int
-    format_name: str
-    genre_name: str
-    label: str
-    label_id: int | None = None
-    album_dist: float | None = None
-    artist_dist: float | None = None
-    rotation_bin: RotationBin | None = None
-    rotation_id: int | None = None
-    plays: int | None = None
-    on_streaming: bool | None = Field(
-        None,
-        description="True if this release is available on at least one streaming service. False means only available in the WXYC physical library. Null if unknown.",
-    )
-    album_artist: str | None = Field(None, description="Credited album artist for compilations.")
-    date_lost: AwareDatetime | None = Field(
-        None,
-        description="When the release was marked missing from the physical library. Null if in library.",
-    )
-    date_found: AwareDatetime | None = Field(
-        None,
-        description="When a previously missing release was found. Null if never lost.",
-    )
-    artwork_url: str | None = Field(
-        None,
-        description="Album cover artwork URL from Discogs. Null if artwork has not been fetched yet or is unavailable.",
-    )
-
-
 class AddAlbumRequest(BaseModel):
     album_title: str
     artist_name: str | None = None
@@ -794,20 +766,6 @@ class MatchType(StrEnum):
     partial = "partial"
 
 
-class LibraryMatch(BaseModel):
-    album: AlbumSearchResult
-    confidence: confloat(ge=0.0, le=1.0)
-    matchType: MatchType
-    reasoning: str | None = None
-
-
-class EnhancedRequest(SongRequest):
-    parsed: ParsedSongRequest | None = None
-    matches: list[LibraryMatch] | None = None
-    artwork_url: str | None = None
-    discogs_url: str | None = None
-
-
 class DeviceRegistration(BaseModel):
     device_id: str
     registered_at: AwareDatetime
@@ -1002,12 +960,6 @@ class DiscogsMatchResult(BaseModel):
     youtube_music_url: str | None = Field(None, description="YouTube Music search URL")
     bandcamp_url: str | None = Field(None, description="Bandcamp album URL")
     soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
-
-
-class LookupResultItem(BaseModel):
-    library_item: LibraryCatalogItem
-    artwork: DiscogsMatchResult | None = None
-    reconciled_identity: ReconciledIdentity | None = None
 
 
 class CacheStats(BaseModel):
@@ -1288,6 +1240,30 @@ class DiscogsTrackReleasesResponse(BaseModel):
     cached: bool | None = False
 
 
+class TrackMatchSource(StrEnum):
+    cta = "cta"
+    discogs_release = "discogs_release"
+    discogs_master = "discogs_master"
+    library_identity = "library_identity"
+
+
+class TrackMatchHint(BaseModel):
+    title: str = Field(..., description="The track title as stored in the source.")
+    artist_credit: str | None = Field(
+        None,
+        description="Per-track artist credit (for compilations, where each track may credit a distinct artist). Null for non-comp tracks where the release-level artist applies.\n",
+    )
+    position: str | None = Field(
+        None,
+        description='Track position on the release as stored in the source (e.g., "A1", "B2", "5"). String-typed to match Discogs\'s `release_track.position` shape, which uses vinyl-side notation for LP releases. Null when position is unknown or inapplicable (e.g., CTA-derived matches, since `compilation_track_artist` has no position column).\n',
+    )
+    confidence: confloat(ge=0.0, le=1.0) | None = Field(
+        None,
+        description="Confidence score for the underlying identity match. Sourced from `library_identity.confidence` post-cross-cache-identity, from `canonical_entity_confidence` pre-cross-cache-identity, or fixed at 1.0 for `cta`-source hits (the curated VA-disambiguation data is treated as authoritative). Used by the UI to render qualitative tooltips on the chip; consumers should not assume null for `cta` source.\n",
+    )
+    source: TrackMatchSource
+
+
 class LibrarySearchItem(BaseModel):
     id: int
     title: str | None = None
@@ -1302,6 +1278,10 @@ class LibrarySearchItem(BaseModel):
     on_streaming: bool | None = None
     call_number: str | None = Field(None, description='Computed call number (e.g. "Rock CD S 1/1")')
     library_url: str | None = Field(None, description="URL to the release on wxyc.info")
+    matched_via: list[TrackMatchHint] | None = Field(
+        None,
+        description="Populated when a track-title match drove this release into the results (catalog-track-search plan §5.1). Empty or absent when the release matched on artist / title normally. Backward-compatible — existing consumers ignore the field.\n",
+    )
 
 
 class LibrarySearchResponse(BaseModel):
@@ -1404,6 +1384,70 @@ class SpotifyTrackResponse(BaseModel):
     artist: str = Field(..., description="Primary artist name")
     album: str = Field(..., description="Album name")
     artworkUrl: str | None = Field(None, description="Album artwork URL from Spotify")
+
+
+class AlbumSearchResult(BaseModel):
+    id: int
+    add_date: AwareDatetime
+    album_title: str
+    artist_name: str
+    code_letters: str
+    code_number: int
+    code_artist_number: int
+    format_name: str
+    genre_name: str
+    label: str
+    label_id: int | None = None
+    album_dist: float | None = None
+    artist_dist: float | None = None
+    rotation_bin: RotationBin | None = None
+    rotation_id: int | None = None
+    plays: int | None = None
+    on_streaming: bool | None = Field(
+        None,
+        description="True if this release is available on at least one streaming service. False means only available in the WXYC physical library. Null if unknown.",
+    )
+    album_artist: str | None = Field(None, description="Credited album artist for compilations.")
+    date_lost: AwareDatetime | None = Field(
+        None,
+        description="When the release was marked missing from the physical library. Null if in library.",
+    )
+    date_found: AwareDatetime | None = Field(
+        None,
+        description="When a previously missing release was found. Null if never lost.",
+    )
+    artwork_url: str | None = Field(
+        None,
+        description="Album cover artwork URL from Discogs. Null if artwork has not been fetched yet or is unavailable.",
+    )
+    matched_via: list[TrackMatchHint] | None = Field(
+        None,
+        description="Populated by Backend's catalog `/library/` search when a track-title match (CTA or LML proxy fallback) drove this release into the results, per catalog-track-search plan §5.1. Empty or absent on normal artist/album hits. Backward-compatible — existing consumers ignore the field.\n",
+    )
+
+
+class LibraryMatch(BaseModel):
+    album: AlbumSearchResult
+    confidence: confloat(ge=0.0, le=1.0)
+    matchType: MatchType
+    reasoning: str | None = None
+
+
+class EnhancedRequest(SongRequest):
+    parsed: ParsedSongRequest | None = None
+    matches: list[LibraryMatch] | None = None
+    artwork_url: str | None = None
+    discogs_url: str | None = None
+
+
+class LookupResultItem(BaseModel):
+    library_item: LibraryCatalogItem
+    artwork: DiscogsMatchResult | None = None
+    reconciled_identity: ReconciledIdentity | None = None
+    matched_via: list[TrackMatchHint] | None = Field(
+        None,
+        description="Populated when a track-title match (LML's new SONG_AS_TRACK strategy) drove this release into the results, per catalog-track-search plan §5.1. Empty or absent when the release matched via artist/album strategies. Backward-compatible — existing consumers ignore the field.\n",
+    )
 
 
 class LookupResponse(BaseModel):
