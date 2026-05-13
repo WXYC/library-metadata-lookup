@@ -192,12 +192,19 @@ class TestAlbumTitleFallback:
         service.search_compilations_by_title.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_trio_release_surfaces_through_fallback(self):
-        """Self-named-album release (album == artist) returned by the fallback
-        must NOT be skipped by ``process_release``'s ``album == artist`` guard."""
+    async def test_trio_release_surfaces_through_fallback_with_mismatching_library_artist(
+        self,
+    ):
+        """The realistic trio case: the WXYC library row's artist string lists
+        the trio members in catalog form (``"Orcutt, Bill / Shelley, Chris / Miller, Mette"``),
+        which does NOT prefix-match the user-typed ``"Orcutt Shelley Miller"``.
+        With ``skip_artist_match_filter=True`` on the fallback path, the library
+        match should still reach ``validate_track_on_release`` (PR #236's fuzzy
+        token-set-ratio validator), and the release should surface.
+        """
         item = make_library_item(
             id=34993109,
-            artist="Orcutt Shelley Miller",
+            artist="Orcutt, Bill / Shelley, Chris / Miller, Mette",
             title="Orcutt Shelley Miller",
         )
         db = AsyncMock()
@@ -208,6 +215,9 @@ class TestAlbumTitleFallback:
         service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
         service.search_releases_by_track = AsyncMock(return_value=_empty_response())
         service.search_compilations_by_title = AsyncMock(return_value=_trio_response())
+        # validate_track_on_release stands in for PR #236's fuzzy validator —
+        # the realistic trio credit ('Bill Orcutt, Corsano, Miller') passes via
+        # rapidfuzz.token_set_ratio against parsed.artist.
         service.validate_track_on_release = AsyncMock(return_value=True)
 
         parsed = ParsedRequest(
@@ -226,4 +236,49 @@ class TestAlbumTitleFallback:
                 db, parsed, discogs_service=service
             )
 
-        assert any(r.id == 34993109 for r in results)
+        assert any(r.id == 34993109 for r in results), (
+            "Expected release 34993109 to surface via the fallback even when "
+            "library artist string ('Orcutt, Bill / Shelley, Chris / Miller, "
+            "Mette') does not prefix-match parsed.artist ('Orcutt Shelley Miller'). "
+            "skip_artist_match_filter=True defers artist gating to "
+            "validate_track_on_release."
+        )
+        service.validate_track_on_release.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fallback_release_still_rejected_when_validate_track_returns_false(self):
+        """Even with skip_artist_match_filter=True, validate_track_on_release
+        is the last line of defense — if the Discogs-side fuzzy validator says
+        the track or artist doesn't match, the release does NOT surface."""
+        item = make_library_item(
+            id=34993109,
+            artist="Orcutt, Bill / Shelley, Chris / Miller, Mette",
+            title="Orcutt Shelley Miller",
+        )
+        db = AsyncMock()
+        db.search = AsyncMock(return_value=[item])
+
+        service = AsyncMock()
+        service.cache_service = AsyncMock()
+        service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
+        service.search_releases_by_track = AsyncMock(return_value=_empty_response())
+        service.search_compilations_by_title = AsyncMock(return_value=_trio_response())
+        service.validate_track_on_release = AsyncMock(return_value=False)
+
+        parsed = ParsedRequest(
+            artist="Orcutt Shelley Miller",
+            album="Orcutt Shelley Miller",
+            song="A Star Is Born",
+            raw_message="Orcutt Shelley Miller - A Star Is Born",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            results, _titles = await search_compilations_for_track(
+                db, parsed, discogs_service=service
+            )
+
+        assert not any(r.id == 34993109 for r in results)

@@ -680,6 +680,7 @@ async def search_compilations_for_track(
             release_info: ReleaseInfo,
             *,
             skip_self_named_album: bool = True,
+            skip_artist_match_filter: bool = False,
         ) -> list[tuple[LibraryItem, str]]:
             """Process one Discogs release: library search, filter, validate.
 
@@ -687,6 +688,15 @@ async def search_compilations_for_track(
             for callers that arrived via artist-scoped probes. The album-title
             fallback (WXYC/library-metadata-lookup#319) passes False because the
             trio-collaboration case has ``album == artist`` by design.
+
+            ``skip_artist_match_filter`` defaults False. When True, the
+            library-side ``artist_matches_item`` prefix-filter is skipped and
+            artist gating is deferred to ``validate_track_on_release``'s fuzzy
+            ``rapidfuzz.token_set_ratio`` (PR #236). The fallback path passes
+            True because the library row's artist string for trio/collaborative
+            releases (e.g. ``"Orcutt, Bill / Shelley, Chris / Miller, Mette"``)
+            won't prefix-match a user-typed ``"Orcutt Shelley Miller"``, but the
+            fuzzy validator on the Discogs side does accept it.
             """
             release_album = release_info.album
 
@@ -712,7 +722,7 @@ async def search_compilations_for_track(
             if not matches and release_info.is_compilation:
                 matches = await search_album_fuzzy(db, f"Various {release_album}")
 
-            if matches and parsed.artist:
+            if matches and parsed.artist and not skip_artist_match_filter:
                 from rapidfuzz import fuzz as _fuzz
 
                 filtered_matches = []
@@ -760,6 +770,7 @@ async def search_compilations_for_track(
                 process_release(
                     ri,
                     skip_self_named_album=ri.release_id not in fallback_release_ids,
+                    skip_artist_match_filter=ri.release_id in fallback_release_ids,
                 )
                 for ri in raw_releases
             ]
