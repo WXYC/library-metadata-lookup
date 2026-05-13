@@ -133,6 +133,12 @@ async def fetch_negative_class_close_pairs(pool: asyncpg.Pool, limit: int) -> li
     is the trigram similarity between the two distinct artists' names — the
     false-positive curve at a given threshold is the share of these whose
     score exceeds the threshold.
+
+    The trigram filter is selective in practice, but the LATERAL fan-out can
+    explode on cache sizes >1M artists. Cap the per-seed neighbor count at 10
+    so the worst case stays bounded at ``limit * 10`` rows regardless of cache
+    growth — the FP curve shape is dominated by the highest-scoring neighbors
+    anyway, so the cap doesn't bias the threshold sweep.
     """
     query = """
         WITH sample AS (
@@ -144,22 +150,28 @@ async def fetch_negative_class_close_pairs(pool: asyncpg.Pool, limit: int) -> li
         SELECT
             s.id AS id_a,
             s.name AS name_a,
-            a.id AS id_b,
-            a.name AS name_b,
-            similarity(lower(f_unaccent(s.name)), lower(f_unaccent(a.name))) AS score
+            top.id AS id_b,
+            top.name AS name_b,
+            top.score
         FROM sample s
-        JOIN artist a
-          ON a.id != s.id
-         AND lower(f_unaccent(a.name)) % lower(f_unaccent(s.name))
-         AND similarity(lower(f_unaccent(s.name)), lower(f_unaccent(a.name))) >= 0.4
+        JOIN LATERAL (
+            SELECT a.id, a.name,
+                   similarity(lower(f_unaccent(a.name)), lower(f_unaccent(s.name))) AS score
+            FROM artist a
+            WHERE a.id != s.id
+              AND lower(f_unaccent(a.name)) % lower(f_unaccent(s.name))
+              AND similarity(lower(f_unaccent(s.name)), lower(f_unaccent(a.name))) >= 0.4
+            ORDER BY score DESC
+            LIMIT 10
+        ) top ON true
     """
     rows = await pool.fetch(query, limit)
     return [
         CandidateScore(
             query_name=r["name_a"],
-            top_name=r["name_b"],
+            top_name=r["name_b"] or r["name_a"],
             top_id=r["id_b"],
-            score=float(r["score"]),
+            score=float(r["score"] or 0.0),
             is_positive=False,
         )
         for r in rows

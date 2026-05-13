@@ -17,8 +17,9 @@ import httpx
 import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
-from wxyc_fastapi.observability import RequestTelemetry
+from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats_recorder
 
+from config.settings import get_settings
 from core.search import (
     build_strategies,
     execute_search_pipeline,
@@ -120,12 +121,14 @@ async def resolve_canonical_artist(
     if not should_skip_cache():
         cached = _resolver_cache.get(cache_key)
         if cached is not None:
+            get_cache_stats_recorder().record_memory_cache_hit()
             return ResolverOutcome(
                 original=original,
                 canonical=cached.canonical,
                 score=cached.score,
                 swapped=cached.swapped,
             )
+        get_cache_stats_recorder().record_memory_cache_miss()
 
     try:
         candidates = await cache_service.search_artists_by_name(original, limit=5)
@@ -153,12 +156,19 @@ async def resolve_canonical_artist(
     return outcome
 
 
-def _log_resolver_pre_pass(outcome: ResolverOutcome) -> None:
+def _log_resolver_pre_pass(outcome: ResolverOutcome, *, actual_swap: bool) -> None:
     """Emit shadow-mode telemetry for the resolver pre-pass.
 
     Runs unconditionally — regardless of the enforcement flag — so the
     queryable shadow dataset accumulates in production from day one and the
     floor can be re-calibrated against real traffic without a code change.
+
+    ``actual_swap`` is what the orchestrator actually did this request
+    (``outcome.swapped AND lml_resolve_artist_canonical``). ``would_swap`` is
+    the resolver's recommendation independent of the flag — what the swap
+    decision *would* be if the flag were enabled. Filtering Sentry traces on
+    ``data.resolver_pre_pass.would_swap=true`` while the flag is off is the
+    shadow dataset; ``swapped`` is non-zero only after the flag flips.
 
     Two surfaces:
 
@@ -170,13 +180,12 @@ def _log_resolver_pre_pass(outcome: ResolverOutcome) -> None:
     """
     if not outcome.original.strip():
         return
-    would_swap = outcome.swapped or outcome.score >= CANONICAL_ARTIST_SIMILARITY_FLOOR
     payload = {
         "original": outcome.original,
         "candidate": outcome.canonical,
         "score": outcome.score,
-        "swapped": outcome.swapped,
-        "would_swap": would_swap,
+        "swapped": actual_swap,
+        "would_swap": outcome.swapped,
     }
     logger.info("resolver_pre_pass %s", payload)
     try:
@@ -602,16 +611,10 @@ async def search_compilations_for_track(
         # See WXYC/library-metadata-lookup#318.
         cache_service = getattr(discogs_service, "cache_service", None)
         outcome = await resolve_canonical_artist(parsed.artist, cache_service=cache_service)
-        _log_resolver_pre_pass(outcome)
-        try:
-            from config.settings import get_settings
-
-            enforce_swap = bool(get_settings().lml_resolve_artist_canonical)
-        except Exception:
-            enforce_swap = False
-        artist_for_probes = (
-            outcome.canonical if (outcome.swapped and enforce_swap) else parsed.artist
-        )
+        enforce_swap = bool(get_settings().lml_resolve_artist_canonical)
+        actual_swap = outcome.swapped and enforce_swap
+        _log_resolver_pre_pass(outcome, actual_swap=actual_swap)
+        artist_for_probes = outcome.canonical if actual_swap else parsed.artist
 
         # Get raw releases from Discogs without per-release validation.
         # We search the library first and only validate releases that match,
