@@ -81,9 +81,11 @@ class TestResolveCanonicalArtist:
         assert outcome.swapped is False
 
     @pytest.mark.asyncio
-    async def test_short_circuits_on_exact_match(self, cache):
-        """High score with identical-modulo-case input → ``swapped`` is True but the
-        canonical equals the input (no behavior change downstream)."""
+    async def test_high_score_exact_match_yields_swap_to_canonical_form(self, cache):
+        """When the cache's top hit equals the input modulo case/diacritics but
+        scores at/above the floor, the outcome records the canonical-cased form
+        and ``swapped=True``. Downstream code paths use ``canonical`` directly,
+        so case fixups (e.g. ``stereolab`` → ``Stereolab``) flow through."""
         cache.search_artists_by_name.return_value = [
             {"id": 1, "name": "Stereolab", "score": 0.99},
         ]
@@ -212,6 +214,58 @@ class TestResolverPrePassCallSite:
             if artist_arg is None and len(call.args) >= 2:
                 artist_arg = call.args[1]
             assert artist_arg == "Alexander Robotnick"
+
+    @pytest.mark.asyncio
+    async def test_shadow_mode_does_not_swap_even_when_resolver_recommends(self):
+        """Flag default is False (shadow mode). Even with a high-confidence
+        canonical, the original artist must reach both probes — the resolver's
+        recommendation only feeds telemetry until the flag flips."""
+        from config.settings import get_settings
+
+        get_settings.cache_clear()  # ensure no stale env from another test
+        try:
+            db = AsyncMock()
+            db.search = AsyncMock(return_value=[])
+
+            service = AsyncMock()
+            cache_service = AsyncMock()
+            cache_service.search_artists_by_name = AsyncMock(
+                return_value=[
+                    {
+                        "id": 1,
+                        "name": "Alexander Robotnick",
+                        "score": CANONICAL_ARTIST_SIMILARITY_FLOOR + 0.10,
+                    }
+                ]
+            )
+            service.cache_service = cache_service
+            service.search_releases_by_track = AsyncMock(
+                return_value=TrackReleasesResponse(
+                    track="Problemes damour", artist=None, releases=[], total=0
+                )
+            )
+
+            parsed = ParsedRequest(
+                artist="Alexander Robotnik",
+                song="Problemes damour",
+                raw_message="Alexander Robotnik - Problemes damour",
+            )
+
+            with patch(
+                "lookup.orchestrator.lookup_releases_by_track",
+                new_callable=AsyncMock,
+                return_value=[],
+            ):
+                await search_compilations_for_track(db, parsed, discogs_service=service)
+
+            assert service.search_releases_by_track.await_count == 2
+            for call in service.search_releases_by_track.await_args_list:
+                artist_arg = call.kwargs.get("artist")
+                if artist_arg is None and len(call.args) >= 2:
+                    artist_arg = call.args[1]
+                assert artist_arg == "Alexander Robotnik"
+        finally:
+            get_settings.cache_clear()
 
     @pytest.mark.asyncio
     async def test_original_name_flows_when_score_below_floor(self):
