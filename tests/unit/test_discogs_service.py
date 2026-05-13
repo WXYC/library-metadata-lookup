@@ -777,12 +777,12 @@ class TestGetRelease:
 
 
 # ---------------------------------------------------------------------------
-# search_compilations_by_title
+# search_releases_by_album_title
 # ---------------------------------------------------------------------------
 
 
-class TestSearchCompilationsByTitle:
-    """Unit tests for the album-title compilation fallback (#319).
+class TestSearchReleasesByAlbumTitle:
+    """Unit tests for the album-title fallback (#319).
 
     Asserts that the new method dispatches to the Discogs API with the
     expected params, parses results through the shared ``_process_search_result``
@@ -790,7 +790,10 @@ class TestSearchCompilationsByTitle:
     """
 
     @pytest.mark.asyncio
-    async def test_dispatches_with_compilation_format_and_release_title(self, service):
+    async def test_dispatches_with_release_title_and_no_format_filter(self, service):
+        """No ``format=Compilation`` constraint — release 34993109 (the trio
+        case from #237) is not classified as a compilation in Discogs, so
+        filtering by format would exclude the motivating target."""
         captured: dict = {}
 
         async def fake_request(method, path, params=None, **kwargs):
@@ -808,20 +811,48 @@ class TestSearchCompilationsByTitle:
             return mock_resp
 
         with patch.object(service, "_request_with_retry", new=fake_request):
-            result = await service.search_compilations_by_title("Some Comp", limit=5)
+            result = await service.search_releases_by_album_title("Some Comp", limit=5)
 
         assert captured["method"] == "GET"
         assert captured["path"] == "/database/search"
         assert captured["params"]["release_title"] == "Some Comp"
-        assert captured["params"]["format"] == "Compilation"
         assert captured["params"]["type"] == "release"
         assert captured["params"]["per_page"] == 5
+        assert "format" not in captured["params"]
         assert isinstance(result, TrackReleasesResponse)
         assert len(result.releases or []) == 1
 
     @pytest.mark.asyncio
+    async def test_different_pressings_of_same_album_are_kept_distinct(self, service):
+        """Discogs commonly returns multiple release IDs for the same album title
+        (different pressings, regions, formats). The fallback must keep them all
+        as candidates — the orchestrator's library + track validation picks the
+        right one. The trio repro from #237 has five such releases titled
+        ``Orcutt Shelley Miller``; if we dedupe by album, the target (34993109)
+        is silently dropped because it sorts after another pressing."""
+
+        async def fake_request(method, path, params=None, **kwargs):
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.raise_for_status = MagicMock()
+            mock_resp.json.return_value = {
+                "results": [
+                    {"title": "Same Artist - Same Album", "id": 1},
+                    {"title": "Same Artist - Same Album", "id": 2},
+                    {"title": "Same Artist - Same Album", "id": 3},
+                ]
+            }
+            return mock_resp
+
+        with patch.object(service, "_request_with_retry", new=fake_request):
+            result = await service.search_releases_by_album_title("Same Album", limit=10)
+
+        ids = sorted(r.release_id for r in (result.releases or []))
+        assert ids == [1, 2, 3], f"Expected all three pressings to survive; got release_ids={ids}"
+
+    @pytest.mark.asyncio
     async def test_returns_empty_for_blank_album(self, service):
-        result = await service.search_compilations_by_title("   ")
+        result = await service.search_releases_by_album_title("   ")
         assert isinstance(result, TrackReleasesResponse)
         assert result.releases == [] or not result.releases
 
@@ -833,7 +864,7 @@ class TestSearchCompilationsByTitle:
             new_callable=AsyncMock,
             side_effect=Exception("network down"),
         ):
-            result = await service.search_compilations_by_title("Some Comp")
+            result = await service.search_releases_by_album_title("Some Comp")
         assert isinstance(result, TrackReleasesResponse)
         assert result.releases == [] or not result.releases
 

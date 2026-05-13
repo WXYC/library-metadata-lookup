@@ -504,28 +504,38 @@ class DiscogsService:
             logger.error(f"Discogs search failed: {e}")
             return TrackReleasesResponse(track=track, artist=artist, cached=False)
 
-    async def search_compilations_by_title(
+    async def search_releases_by_album_title(
         self,
         album: str,
         limit: int = 10,
     ) -> TrackReleasesResponse:
-        """Search Discogs for compilations matching ``album`` title alone.
+        """Search Discogs for releases matching ``album`` title alone.
 
         Used as a fallback when ``search_compilations_for_track``'s parallel
-        artist-scoped probes return no usable releases — typically the
-        trio-collaboration case where no single canonical artist entity
-        exists. Builds Discogs API params::
+        artist-scoped probes return no usable releases — typically because
+        the inbound artist string can't be canonicalized to a single Discogs
+        entity (trio collaborations, mid-typed names, etc.). Builds Discogs
+        API params::
 
-            {"type": "release", "release_title": album,
-             "format": "Compilation", "per_page": limit}
+            {"type": "release", "release_title": album, "per_page": limit}
+
+        Title-only — no ``format`` filter. Earlier revisions of this method
+        constrained ``format=Compilation`` on the assumption that the
+        motivating cases were all Various-Artists releases, but the trio
+        repro from #237 (release 34993109) is *not* classified as a
+        compilation in Discogs, so the format filter was excluding the
+        target. The orchestrator's downstream pipeline already gates
+        candidates by (a) library album presence via ``search_album_fuzzy``
+        and (b) per-release ``validate_track_on_release`` (PR #236's fuzzy
+        token-set-ratio validator), so over-fetching from this method is
+        bounded — only candidates that match the library catalog cost an
+        API call to validate.
 
         API-only — no cache leg. ``cache_service.search_releases_by_title``
-        does not filter by format, so reusing it here would either over-fetch
-        or require new SQL on the discogs-cache side; the same trade-off is
-        already accepted at ``search_releases_by_track`` for the
-        ``artist_as_keyword=True`` path. The fallback fires rarely (guarded
-        by the three-condition check in the orchestrator) so the
-        single-API-call cost per fire is acceptable.
+        exists but has no analogous gating on the downstream library/library
+        match, and would require additional SQL to compose. The fallback
+        fires rarely (guarded by a three-condition check in the orchestrator)
+        so the single-API-call cost per fire is acceptable.
 
         See WXYC/library-metadata-lookup#319.
         """
@@ -535,15 +545,22 @@ class DiscogsService:
         params: dict[str, Any] = {
             "type": "release",
             "release_title": album,
-            "format": "Compilation",
             "per_page": limit,
         }
 
-        logger.info(f"Searching Discogs compilations by title: '{album}'")
+        logger.info(f"Searching Discogs releases by album title: '{album}'")
 
+        # Different pressings of the same album are distinct candidates here —
+        # the trio repro from #237 has five releases titled "Orcutt Shelley
+        # Miller", and Discogs ordering means the canonical target (34993109)
+        # isn't the first one returned. Dedupe by release_id (defensive) but
+        # NOT by album title — the orchestrator's downstream library + track
+        # validation will pick the right one, and de-duping by title here
+        # silently drops the target.
         releases: list[ReleaseInfo] = []
-        seen_albums: set[str] = set()
-
+        seen_release_ids: set[int] = set()
+        # Fresh per-result set means ``_process_search_result``'s album-dedup
+        # branch never triggers across iterations.
         try:
             async with timed_api():
                 response = await self._request_with_retry("GET", "/database/search", params=params)
@@ -552,11 +569,12 @@ class DiscogsService:
                 response.raise_for_status()
                 data = response.json()
                 for result in data.get("results", []):
-                    release_info = self._process_search_result(result, seen_albums)
-                    if release_info:
+                    release_info = self._process_search_result(result, set())
+                    if release_info and release_info.release_id not in seen_release_ids:
                         releases.append(release_info)
+                        seen_release_ids.add(release_info.release_id)
         except Exception as e:
-            logger.warning(f"search_compilations_by_title failed for '{album}': {e}")
+            logger.warning(f"search_releases_by_album_title failed for '{album}': {e}")
 
         return TrackReleasesResponse(
             track="",

@@ -661,7 +661,9 @@ async def search_compilations_for_track(
         fallback_release_ids: set[int] = set()
         if discogs_service and not raw_releases and parsed.album and not outcome.swapped:
             try:
-                fallback_response = await discogs_service.search_compilations_by_title(parsed.album)
+                fallback_response = await discogs_service.search_releases_by_album_title(
+                    parsed.album
+                )
                 fallback_releases = list(fallback_response.releases or [])
                 raw_releases.extend(fallback_releases)
                 fallback_release_ids = {r.release_id for r in fallback_releases}

@@ -29,11 +29,11 @@ pytestmark = [
 
 
 @pytest.mark.asyncio
-async def test_search_compilations_by_title_finds_orcutt_shelley_miller():
+async def test_search_releases_by_album_title_finds_orcutt_shelley_miller():
     """The new service method must surface release 34993109 when queried with
     its album title alone."""
     service = DiscogsService(token=DISCOGS_TOKEN)
-    response = await service.search_compilations_by_title("Orcutt Shelley Miller", limit=20)
+    response = await service.search_releases_by_album_title("Orcutt Shelley Miller", limit=20)
 
     release_ids = [r.release_id for r in (response.releases or [])]
     assert 34993109 in release_ids, (

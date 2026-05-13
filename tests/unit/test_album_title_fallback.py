@@ -50,7 +50,7 @@ def _trio_response() -> TrackReleasesResponse:
 class TestAlbumTitleFallback:
     @pytest.mark.asyncio
     async def test_fallback_fires_when_results_empty_album_present_no_swap(self):
-        """All three guard conditions met → ``search_compilations_by_title`` runs."""
+        """All three guard conditions met → ``search_releases_by_album_title`` runs."""
         db = AsyncMock()
         db.search = AsyncMock(return_value=[])
 
@@ -58,7 +58,7 @@ class TestAlbumTitleFallback:
         service.cache_service = AsyncMock()
         service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
         service.search_releases_by_track = AsyncMock(return_value=_empty_response())
-        service.search_compilations_by_title = AsyncMock(return_value=_empty_response())
+        service.search_releases_by_album_title = AsyncMock(return_value=_empty_response())
         service.validate_track_on_release = AsyncMock(return_value=True)
 
         parsed = ParsedRequest(
@@ -75,8 +75,8 @@ class TestAlbumTitleFallback:
         ):
             await search_compilations_for_track(db, parsed, discogs_service=service)
 
-        service.search_compilations_by_title.assert_awaited_once()
-        called_album = service.search_compilations_by_title.await_args.args[0]
+        service.search_releases_by_album_title.assert_awaited_once()
+        called_album = service.search_releases_by_album_title.await_args.args[0]
         assert called_album == "Orcutt Shelley Miller"
 
     @pytest.mark.asyncio
@@ -88,7 +88,7 @@ class TestAlbumTitleFallback:
         service.cache_service = AsyncMock()
         service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
         service.search_releases_by_track = AsyncMock(return_value=_empty_response())
-        service.search_compilations_by_title = AsyncMock(return_value=_empty_response())
+        service.search_releases_by_album_title = AsyncMock(return_value=_empty_response())
 
         parsed = ParsedRequest(
             artist="Orcutt Shelley Miller",
@@ -103,7 +103,7 @@ class TestAlbumTitleFallback:
         ):
             await search_compilations_for_track(db, parsed, discogs_service=service)
 
-        service.search_compilations_by_title.assert_not_called()
+        service.search_releases_by_album_title.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_fallback_skipped_when_resolver_swapped(self, monkeypatch):
@@ -129,7 +129,7 @@ class TestAlbumTitleFallback:
             ]
         )
         service.search_releases_by_track = AsyncMock(return_value=_empty_response())
-        service.search_compilations_by_title = AsyncMock(return_value=_empty_response())
+        service.search_releases_by_album_title = AsyncMock(return_value=_empty_response())
 
         parsed = ParsedRequest(
             artist="Some Typoed Artist",
@@ -145,7 +145,7 @@ class TestAlbumTitleFallback:
         ):
             await search_compilations_for_track(db, parsed, discogs_service=service)
 
-        service.search_compilations_by_title.assert_not_called()
+        service.search_releases_by_album_title.assert_not_called()
         get_settings.cache_clear()
 
     @pytest.mark.asyncio
@@ -172,7 +172,7 @@ class TestAlbumTitleFallback:
                 total=1,
             )
         )
-        service.search_compilations_by_title = AsyncMock(return_value=_empty_response())
+        service.search_releases_by_album_title = AsyncMock(return_value=_empty_response())
         service.validate_track_on_release = AsyncMock(return_value=True)
 
         parsed = ParsedRequest(
@@ -189,7 +189,7 @@ class TestAlbumTitleFallback:
         ):
             await search_compilations_for_track(db, parsed, discogs_service=service)
 
-        service.search_compilations_by_title.assert_not_called()
+        service.search_releases_by_album_title.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_trio_release_surfaces_through_fallback_with_mismatching_library_artist(
@@ -214,7 +214,7 @@ class TestAlbumTitleFallback:
         service.cache_service = AsyncMock()
         service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
         service.search_releases_by_track = AsyncMock(return_value=_empty_response())
-        service.search_compilations_by_title = AsyncMock(return_value=_trio_response())
+        service.search_releases_by_album_title = AsyncMock(return_value=_trio_response())
         # validate_track_on_release stands in for PR #236's fuzzy validator —
         # the realistic trio credit ('Bill Orcutt, Corsano, Miller') passes via
         # rapidfuzz.token_set_ratio against parsed.artist.
@@ -262,7 +262,7 @@ class TestAlbumTitleFallback:
         service.cache_service = AsyncMock()
         service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
         service.search_releases_by_track = AsyncMock(return_value=_empty_response())
-        service.search_compilations_by_title = AsyncMock(return_value=_trio_response())
+        service.search_releases_by_album_title = AsyncMock(return_value=_trio_response())
         service.validate_track_on_release = AsyncMock(return_value=False)
 
         parsed = ParsedRequest(
