@@ -530,13 +530,10 @@ async def search_song_as_track(
 
         for item in matches:
             if release.is_compilation and is_compilation_artist(item.artist or ""):
-                accept = True
+                pass
             elif item.artist and artist_matches_item(item, release.artist):
-                accept = True
+                pass
             else:
-                continue
-
-            if not accept:
                 continue
 
             hint = TrackMatchHint(
