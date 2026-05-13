@@ -9,6 +9,8 @@ from httpx import ASGITransport, AsyncClient
 from discogs.models import (
     ArtistDetails,
     ArtistRef,
+    DiscogsSearchResponse,
+    DiscogsSearchResult,
     MasterRelease,
     MemberRef,
     ReleaseMetadataResponse,
@@ -147,10 +149,14 @@ class TestGetRelease:
 
 
 class TestSearchReleasesRemoved:
-    """The /discogs/search endpoint has been removed. All callers use /lookup instead."""
+    """The legacy POST /discogs/search endpoint remains removed.
+
+    Replaced by GET /discogs/resolve-release (see TestResolveRelease below).
+    Kept as a guard against accidental re-introduction of the POST shape.
+    """
 
     @pytest.mark.asyncio
-    async def test_endpoint_returns_404(self, app_with_discogs):
+    async def test_post_endpoint_returns_404(self, app_with_discogs):
         async with AsyncClient(
             transport=ASGITransport(app=app_with_discogs), base_url="http://test"
         ) as client:
@@ -160,6 +166,163 @@ class TestSearchReleasesRemoved:
             )
 
         assert resp.status_code == 404 or resp.status_code == 405
+
+
+# ---------------------------------------------------------------------------
+# GET /discogs/resolve-release
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRelease:
+    """Tests for GET /api/v1/discogs/resolve-release.
+
+    Replaces the removed POST /api/v1/discogs/search for the (artist, album)
+    -> release_id resolution case used by tubafrenzy's library release
+    tracklist page (WXYC/tubafrenzy#546, WXYC/library-metadata-lookup#315).
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_top_result(self, app_with_discogs, mock_discogs):
+        mock_discogs.search = AsyncMock(
+            return_value=DiscogsSearchResponse(
+                results=[
+                    DiscogsSearchResult(
+                        album="Disco Not Disco, Vol. 2",
+                        artist="Various",
+                        release_id=12345,
+                        release_url="https://www.discogs.com/release/12345",
+                        confidence=0.91,
+                    ),
+                    DiscogsSearchResult(
+                        album="Disco Not Disco",
+                        artist="Various",
+                        release_id=999,
+                        release_url="https://www.discogs.com/release/999",
+                        confidence=0.62,
+                    ),
+                ],
+                total=2,
+                cached=True,
+            )
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_discogs), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/resolve-release",
+                params={"album": "Disco Not Disco, Vol. 2", "artist": "Various"},
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["release_id"] == 12345
+        assert data["title"] == "Disco Not Disco, Vol. 2"
+        assert data["artist"] == "Various"
+        assert data["release_url"] == "https://www.discogs.com/release/12345"
+        assert data["confidence"] == pytest.approx(0.91)
+
+    @pytest.mark.asyncio
+    async def test_empty_results_returns_404(self, app_with_discogs, mock_discogs):
+        mock_discogs.search = AsyncMock(
+            return_value=DiscogsSearchResponse(results=[], total=0, cached=False)
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_discogs), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/resolve-release",
+                params={"album": "Nonexistent Album", "artist": "Nobody"},
+            )
+
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_missing_album_returns_422(self, app_with_discogs):
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_discogs), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/resolve-release", params={"artist": "Stereolab"}
+            )
+
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_no_service_returns_503(self, app_without_discogs):
+        async with AsyncClient(
+            transport=ASGITransport(app=app_without_discogs), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/resolve-release",
+                params={"album": "Some Album"},
+            )
+
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_artist_optional(self, app_with_discogs, mock_discogs):
+        """Artist is optional: tubafrenzy omits it for Various Artists releases."""
+        mock_discogs.search = AsyncMock(
+            return_value=DiscogsSearchResponse(
+                results=[
+                    DiscogsSearchResult(
+                        album="Disco Not Disco, Vol. 2",
+                        artist="Various",
+                        release_id=12345,
+                        release_url="https://www.discogs.com/release/12345",
+                        confidence=0.85,
+                    ),
+                ],
+                total=1,
+                cached=True,
+            )
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_discogs), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/resolve-release",
+                params={"album": "Disco Not Disco, Vol. 2"},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["release_id"] == 12345
+        # The DiscogsSearchRequest passed to .search() should have artist=None.
+        call_args = mock_discogs.search.call_args
+        request = call_args.args[0] if call_args.args else call_args.kwargs["request"]
+        assert request.artist is None
+        assert request.album == "Disco Not Disco, Vol. 2"
+
+    @pytest.mark.asyncio
+    async def test_limit_passed_through(self, app_with_discogs, mock_discogs):
+        mock_discogs.search = AsyncMock(
+            return_value=DiscogsSearchResponse(
+                results=[
+                    DiscogsSearchResult(
+                        release_id=1,
+                        release_url="https://www.discogs.com/release/1",
+                        confidence=0.5,
+                    )
+                ],
+                total=1,
+                cached=True,
+            )
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_discogs), base_url="http://test"
+        ) as client:
+            resp = await client.get(
+                "/api/v1/discogs/resolve-release",
+                params={"album": "X", "limit": 10},
+            )
+
+        assert resp.status_code == 200
+        call_kwargs = mock_discogs.search.call_args.kwargs
+        assert call_kwargs.get("limit") == 10
 
 
 # ---------------------------------------------------------------------------

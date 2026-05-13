@@ -850,6 +850,22 @@ class DiscogsSearchResult(BaseModel):
     type: Type
 
 
+class DiscogsResolveReleaseResponse(BaseModel):
+    release_id: int = Field(..., description="Discogs release ID of the best match.")
+    title: str | None = Field(
+        None,
+        description="Release title as returned by Discogs (may differ from the query).",
+    )
+    artist: str | None = Field(None, description="Primary artist name as returned by Discogs.")
+    release_url: str = Field(
+        ...,
+        description="Canonical Discogs URL, e.g. `https://www.discogs.com/release/12345`.",
+    )
+    confidence: confloat(ge=0.0, le=1.0) | None = Field(
+        0, description="Match confidence from LML's ranker (0.0 - 1.0)."
+    )
+
+
 class DiscogsArtistRef(BaseModel):
     name: str
     id: int

@@ -230,6 +230,23 @@ class DiscogsSearchResponse(BaseModel):
     cached: bool = False
 
 
+class DiscogsResolveReleaseResponse(BaseModel):
+    """Response for GET /api/v1/discogs/resolve-release.
+
+    A flat envelope around the top-confidence release match for an
+    (artist, album) pair. Replaces the legacy POST /api/v1/discogs/search
+    response (which wrapped the same data in a `results` array) for the
+    single-best-match use case driving tubafrenzy's library release tracklist
+    page (WXYC/tubafrenzy#546).
+    """
+
+    release_id: int
+    title: str | None = None
+    artist: str | None = None
+    release_url: str
+    confidence: float = 0.0
+
+
 class EnrichedDiscogsMatchResult(_GeneratedDiscogsMatchResult):
     """Extends the generated DiscogsMatchResult with enriched metadata fields.
 

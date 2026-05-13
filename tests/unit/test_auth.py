@@ -136,6 +136,7 @@ class TestProtectedRouteRegistration:
         ("GET", "/api/v1/discogs/artist/{artist_id}"),
         ("GET", "/api/v1/discogs/entity/{entity_type}/{entity_id}"),
         ("GET", "/api/v1/discogs/tracks/autocomplete"),
+        ("GET", "/api/v1/discogs/resolve-release"),
     ]
 
     EXPECTED_UNPROTECTED = [

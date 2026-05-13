@@ -9,6 +9,8 @@ from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.markup_parser import DiscogsServiceResolver, parse_async
 from discogs.models import (
     ArtistDetails,
+    DiscogsResolveReleaseResponse,
+    DiscogsSearchRequest,
     EntityResolveResponse,
     EntityType,
     ReleaseMetadataResponse,
@@ -150,6 +152,60 @@ async def resolve_entity(
         if master is None:
             raise HTTPException(status_code=404, detail=f"Master {entity_id} not found")
         return EntityResolveResponse(name=master.title, type=entity_type, id=entity_id)
+
+
+@router.get(
+    "/resolve-release",
+    response_model=DiscogsResolveReleaseResponse,
+    summary="Resolve a Discogs release ID from (artist, album)",
+    responses={
+        200: {"description": "Top-confidence release match returned"},
+        404: {"description": "No matching release found"},
+        422: {"description": "Missing required album parameter"},
+        503: {"description": "Discogs service not configured"},
+    },
+)
+async def resolve_release(
+    album: str = Query(..., description="Album / release title (required)"),
+    artist: str | None = Query(
+        None,
+        description=(
+            "Artist name. Optional — omit for Various Artists / compilation releases "
+            "to avoid polluting fuzzy matching."
+        ),
+    ),
+    limit: int = Query(
+        5,
+        ge=1,
+        le=50,
+        description="Maximum number of underlying search results to rank (only the top one is returned).",
+    ),
+    service: DiscogsService | None = Depends(get_discogs_service),
+) -> DiscogsResolveReleaseResponse:
+    """Resolve an (artist, album) pair to a Discogs release ID.
+
+    Replaces the legacy POST /api/v1/discogs/search endpoint (removed in
+    c5f1e65) for the single-best-match use case driving tubafrenzy's library
+    release tracklist page (WXYC/tubafrenzy#546).
+    """
+    svc = _require_service(service)
+    request = DiscogsSearchRequest(artist=artist, album=album)
+    response = await svc.search(request, limit=limit)
+
+    if not response.results:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No matching release for artist={artist!r}, album={album!r}",
+        )
+
+    top = response.results[0]
+    return DiscogsResolveReleaseResponse(
+        release_id=top.release_id,
+        title=top.album,
+        artist=top.artist,
+        release_url=top.release_url,
+        confidence=top.confidence,
+    )
 
 
 @router.get(
