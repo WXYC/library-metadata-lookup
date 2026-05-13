@@ -149,14 +149,99 @@ class TestAlbumTitleFallback:
         get_settings.cache_clear()
 
     @pytest.mark.asyncio
-    async def test_fallback_skipped_when_results_present(self):
+    async def test_fallback_fires_when_artist_probe_returns_releases_but_library_filters_them_all(
+        self,
+    ):
+        """Staging regression from 2026-05-13 (#237 follow-up).
+
+        Discogs has since added a canonical "Orcutt Shelley Miller" artist
+        entity, so the artist-scoped probe in search_releases_by_track now
+        DOES return the trio's 5 pressings. raw_releases is non-empty —
+        which silenced the original `not raw_releases` fallback gate — and
+        process_release rejects all 5 via the album==artist self-named
+        guard (the library row's title 'Orcutt-Shelley-Miller' has an
+        artist of 'Bill Orcutt', not the trio). End state: zero results.
+
+        After the fix the gate fires on "no library results produced" so
+        the fallback runs as a second pass with skip_self_named_album=False
+        and skip_artist_match_filter=True, finds the library row, and
+        validate_track_on_release confirms it.
+        """
+        # Library returns the trio album (matched by title — note the
+        # hyphens in the actual library title) for any of these queries.
+        library_item = make_library_item(
+            id=72142,
+            artist="Bill Orcutt",
+            title="Orcutt-Shelley-Miller",
+        )
         db = AsyncMock()
-        db.search = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[library_item])
+
+        # Five pressings of the trio release returned by both probes.
+        # is_compilation=False (Discogs lists this under format=Vinyl) and
+        # album == parsed.artist, which trips the self-named-album guard
+        # in the default process_release path.
+        trio_pressings_response = TrackReleasesResponse(
+            track="A Star Is Born",
+            artist="Orcutt Shelley Miller",
+            releases=[
+                ReleaseInfo(
+                    album="Orcutt Shelley Miller",
+                    artist="Orcutt Shelley Miller",
+                    release_id=rid,
+                    release_url=f"https://www.discogs.com/release/{rid}",
+                    is_compilation=False,
+                )
+                for rid in (35017901, 35220253, 34993109, 34998866, 34993607)
+            ],
+            total=5,
+        )
 
         service = AsyncMock()
         service.cache_service = AsyncMock()
         service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
-        # First probe returns a non-empty result so the fallback shouldn't fire.
+        service.search_releases_by_track = AsyncMock(return_value=trio_pressings_response)
+        service.search_releases_by_album_title = AsyncMock(return_value=_trio_response())
+        service.validate_track_on_release = AsyncMock(return_value=True)
+
+        parsed = ParsedRequest(
+            artist="Orcutt Shelley Miller",
+            album="Orcutt Shelley Miller",
+            song="A Star Is Born",
+            raw_message="Orcutt Shelley Miller - A Star Is Born",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            results, _titles = await search_compilations_for_track(
+                db, parsed, discogs_service=service
+            )
+
+        service.search_releases_by_album_title.assert_awaited_once()
+        assert any(r.id == 72142 for r in results), (
+            "Expected library row 72142 to surface via the album-title fallback "
+            "after the artist-scoped probes' candidates were all filtered out by "
+            "process_release's default guards. Got: "
+            f"{[(r.id, r.title) for r in results]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_skipped_when_library_match_already_found(self):
+        """The gate fires on ``not results`` (no library matches were
+        produced), not ``not raw_releases``. When the artist-scoped probes'
+        candidates DO turn into a library match via the existing pipeline,
+        the fallback adds no value and should not fire — its cost is one
+        extra Discogs API call per fire."""
+        library_item = make_library_item(id=42, artist="A Real Artist", title="An Album")
+        db = AsyncMock()
+        db.search = AsyncMock(return_value=[library_item])
+
+        service = AsyncMock()
+        service.cache_service = AsyncMock()
+        service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
         service.search_releases_by_track = AsyncMock(
             return_value=TrackReleasesResponse(
                 track="A Song",
@@ -187,8 +272,9 @@ class TestAlbumTitleFallback:
             new_callable=AsyncMock,
             return_value=[],
         ):
-            await search_compilations_for_track(db, parsed, discogs_service=service)
+            results, _ = await search_compilations_for_track(db, parsed, discogs_service=service)
 
+        assert any(r.id == 42 for r in results)
         service.search_releases_by_album_title.assert_not_called()
 
     @pytest.mark.asyncio
