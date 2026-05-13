@@ -30,7 +30,12 @@ from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
 from discogs.memory_cache import create_ttl_cache, should_skip_cache
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult, ReleaseInfo
 from discogs.service import DiscogsService
-from generated.api_models import LibraryCatalogItem, ReconciledIdentity
+from generated.api_models import (
+    LibraryCatalogItem,
+    ReconciledIdentity,
+    TrackMatchHint,
+    TrackMatchSource,
+)
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
 from lookup.external_search import (
@@ -459,6 +464,107 @@ async def search_song_as_artist(
         )
 
     return limit_results(results), None
+
+
+SONG_AS_TRACK_CONFIDENCE: float = 0.85
+"""Default confidence floor for SONG_AS_TRACK matches.
+
+Pinned at the master-cap value from catalog-track-search plan §5.2. The
+underlying ``search_releases_by_track`` cache path doesn't currently distinguish
+release- vs master-level matches, so we conservatively report the master cap.
+When LML graduates onto ``library_identity`` per cross-cache-identity (#25),
+this floor is replaced with ``library_identity.confidence`` per row.
+"""
+
+
+async def search_song_as_track(
+    db: LibraryDB,
+    song: str | None,
+    discogs_service: DiscogsService | None = None,
+) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
+    """Cross-reference song against Discogs and match releases back to library.
+
+    Catalog-track-search §4.2 / LML#301: when SONG_AS_ARTIST returns empty for a
+    song-only query, treat the song as a *track* — find Discogs releases that
+    contain it, then fuzzy-match those releases against the WXYC library. Each
+    surviving row carries a TrackMatchHint recording the track→release linkage.
+
+    Args:
+        db: Library database for album fuzzy search.
+        song: The track title from the user query.
+        discogs_service: Required. Without it, this strategy no-ops.
+
+    Returns:
+        Tuple of (library_items, matched_via_by_id). matched_via_by_id maps
+        each library row's id to one-or-more TrackMatchHint entries — multiple
+        hints accumulate when the same WXYC row is referenced by multiple
+        Discogs releases (different pressings, etc.).
+    """
+    if not song or not discogs_service:
+        return [], {}
+
+    response = await discogs_service.search_releases_by_track(song, artist=None)
+    raw_releases = list(response.releases or [])
+    if not raw_releases:
+        logger.info(f"SONG_AS_TRACK: no Discogs releases for '{song}'")
+        return [], {}
+
+    logger.info(
+        f"SONG_AS_TRACK: {len(raw_releases)} Discogs releases for '{song}', "
+        "matching against library"
+    )
+
+    seen_ids: set[int] = set()
+    matched_items: list[LibraryItem] = []
+    matched_via_by_id: dict[int, list[TrackMatchHint]] = {}
+
+    for release in raw_releases:
+        if not release.album or len(release.album.strip()) < 3:
+            continue
+
+        matches = await search_album_fuzzy(db, release.album)
+        if not matches and release.is_compilation:
+            matches = await search_album_fuzzy(db, f"Various {release.album}")
+        if not matches:
+            continue
+
+        for item in matches:
+            if release.is_compilation and is_compilation_artist(item.artist or ""):
+                accept = True
+            elif item.artist and artist_matches_item(item, release.artist):
+                accept = True
+            else:
+                continue
+
+            if not accept:
+                continue
+
+            hint = TrackMatchHint(
+                title=song,
+                artist_credit=release.artist if release.is_compilation else None,
+                position=None,
+                confidence=SONG_AS_TRACK_CONFIDENCE,
+                source=TrackMatchSource.discogs_release,
+            )
+
+            if item.id in seen_ids:
+                matched_via_by_id[item.id].append(hint)
+                continue
+
+            seen_ids.add(item.id)
+            matched_items.append(item)
+            matched_via_by_id[item.id] = [hint]
+            logger.info(
+                f"SONG_AS_TRACK: matched '{item.artist} - {item.title}' "
+                f"via release '{release.album}'"
+            )
+
+            if len(matched_items) >= MAX_SEARCH_RESULTS:
+                break
+        if len(matched_items) >= MAX_SEARCH_RESULTS:
+            break
+
+    return matched_items, matched_via_by_id
 
 
 async def search_library_with_fallback(
@@ -1477,6 +1583,9 @@ async def perform_lookup(
             search_song_as_artist_func=partial(
                 search_song_as_artist, discogs_service=discogs_service
             ),
+            search_song_as_track_func=partial(
+                search_song_as_track, discogs_service=discogs_service
+            ),
         )
 
         search_state = await execute_search_pipeline(
@@ -1582,6 +1691,7 @@ async def perform_lookup(
         return identities_by_artist.get(item.artist)
 
     # Build response (convert internal models to API contract models)
+    matched_via_by_id = search_state.matched_via_by_id
     result_items = []
     if items_with_artwork:
         for item, artwork in items_with_artwork:
@@ -1590,6 +1700,7 @@ async def perform_lookup(
                     library_item=item.to_catalog_item(),
                     artwork=artwork.to_match_result() if artwork else None,
                     reconciled_identity=_identity_for(item),
+                    matched_via=matched_via_by_id.get(item.id),
                 )
             )
     elif library_results:
@@ -1598,6 +1709,7 @@ async def perform_lookup(
                 LookupResultItem(
                     library_item=item.to_catalog_item(),
                     reconciled_identity=_identity_for(item),
+                    matched_via=matched_via_by_id.get(item.id),
                 )
             )
 
