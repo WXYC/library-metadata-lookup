@@ -167,7 +167,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install Railway CLI
-        run: npm install -g @railway/cli
+        run: npm install -g @railway/cli@4.58.0
       - name: Deploy to Railway
         run: railway up --service library-metadata-lookup
         env:
@@ -210,7 +210,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install Railway CLI
-        run: npm install -g @railway/cli
+        run: npm install -g @railway/cli@4.58.0
       - name: Deploy to Railway
         run: railway up --service library-metadata-lookup
         env:
