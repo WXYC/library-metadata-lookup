@@ -131,6 +131,19 @@ class Settings(BaseSettings):
             "flip to True after all callers send the bearer header."
         ),
     )
+    lml_resolve_artist_canonical: bool = Field(
+        default=False,
+        description=(
+            "When True, swap inbound artist names for the canonical Discogs form "
+            "when trigram similarity >= CANONICAL_ARTIST_SIMILARITY_FLOOR before "
+            "search_releases_by_track probes. When False, the resolver still runs "
+            "in shadow mode (logs candidate + score on every lookup; emits "
+            "set_data('resolver_pre_pass', ...) on the active Sentry transaction) "
+            "but does not swap. Set True in Railway after the calibration sweep "
+            "confirms the chosen floor's FP-rate is <= 0.5%. "
+            "See WXYC/library-metadata-lookup#318."
+        ),
+    )
 
     # Streaming Webhook Configuration
     streaming_webhook_urls: str | None = Field(

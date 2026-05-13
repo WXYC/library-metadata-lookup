@@ -201,6 +201,7 @@ Optional:
 - `ETL_NOTIFY_KEY` -- Bearer token used by LML when *pushing* the streaming-status webhook to tubafrenzy
 - `LML_API_KEY` -- Bearer token required from tubafrenzy / Backend-Service callers (see "Inbound Auth" below)
 - `LML_REQUIRE_AUTH` -- When `true`, enforce `LML_API_KEY` on protected endpoints. Default `false` (see rollout phasing in `core/auth.py`)
+- `LML_RESOLVE_ARTIST_CANONICAL` -- When `true`, the canonical-artist resolver pre-pass in `search_compilations_for_track` swaps the inbound artist name for the top trigram match in `discogs-cache` when the similarity score >= `CANONICAL_ARTIST_SIMILARITY_FLOOR` (`lookup/orchestrator.py`). Default `false`. The pre-pass *always* runs in shadow mode (emits an INFO log line and a `resolver_pre_pass` Sentry transaction data attribute on every lookup) regardless of the flag, so the floor can be calibrated against real traffic before enforcement is enabled. Flip to `true` in Railway after `scripts.resolver_calibration` reports an FP-rate ≤ 0.5% for the chosen floor. See WXYC/library-metadata-lookup#318.
 
 ### Cross-cache-identity feature flags
 
@@ -411,6 +412,26 @@ python -m scripts.bandcamp_pipeline [--phase {search,lookup,both}] [--include-st
 Options: `--phase` (default: both, runs concurrently), `--include-streaming` (search all artists, not just not-on-streaming), `--artist-fallback` (write artist-level URL when no album match), `--dry-run` (report what would happen without changes), `--limit N` (max artists/slugs to process).
 
 Uses `BandcampClient` (`scripts/bandcamp_client.py`) extending `BaseStreamingClient` with rate limiting (1 req/s, semaphore 2) and 429 retry with exponential backoff. Optionally loads Wikidata slugs via `DATABASE_URL_WIKIDATA`.
+
+### Resolver Calibration (`scripts/resolver_calibration/`)
+
+Sweeps the trigram-similarity floor used by `lookup/orchestrator.resolve_canonical_artist` (the pre-pass for `search_compilations_for_track` — see WXYC/library-metadata-lookup#318). Builds three labeled datasets — positives from `artist_name_variation` and `entity.identity`, negatives from sampled close-but-distinct `artist` pairs — and writes a precision/recall sweep + a borderline-band CSV.
+
+**Output** (defaults to `docs/resolver-calibration/`):
+- `calibration_sweep.csv` — threshold, TP rate, FP rate, sample sizes, swap count.
+- `borderline.csv` — pairs whose score sits in `[chosen_floor − 0.05, chosen_floor + 0.05]`, sorted by score, for eyeball QA of the decision boundary.
+
+After running, update `CANONICAL_ARTIST_SIMILARITY_FLOOR` in `lookup/orchestrator.py` if the chosen floor differs from the in-tree value, and commit the CSVs alongside a one-page `docs/resolver-calibration/README.md` documenting the FP-rate tolerance that drove the choice. The same script is used to re-validate after large discogs-cache refreshes; commit fresh CSVs each run so the calibration history stays in version control.
+
+**Usage:**
+```bash
+DATABASE_URL_DISCOGS=postgresql://... \
+  uv run python -m scripts.resolver_calibration \
+    --output-dir docs/resolver-calibration/ \
+    --positive-sample-size 5000 \
+    --negative-sample-size 5000 \
+    --fp-rate-target 0.005
+```
 
 ### Artist Name Variation Audit (`scripts/variation_audit/`)
 

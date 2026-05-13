@@ -8,11 +8,13 @@ track validation -> artwork fetch -> metadata enrichment -> context message.
 import asyncio
 import logging
 import re
+from dataclasses import dataclass
 from functools import partial
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 from wxyc_fastapi.observability import RequestTelemetry
@@ -24,6 +26,7 @@ from core.search import (
 )
 from discogs.cache_service import DiscogsCacheService
 from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
+from discogs.memory_cache import create_ttl_cache, should_skip_cache
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult, ReleaseInfo
 from discogs.service import DiscogsService
 from generated.api_models import LibraryCatalogItem, ReconciledIdentity
@@ -46,6 +49,142 @@ MAX_SEARCH_RESULTS = 5
 
 SELF_TITLED_PATTERNS = frozenset({"s/t", "s.t.", "self-titled", "self titled"})
 """Common abbreviations for self-titled albums (case-insensitive exact match)."""
+
+CANONICAL_ARTIST_SIMILARITY_FLOOR: float = 0.70
+"""Trigram-similarity floor for swapping an inbound artist name with its canonical
+Discogs form.
+
+Provisional. Replaced by the offline calibration sweep produced by
+``scripts.resolver_calibration`` against the WXYC discogs-cache; see
+``docs/resolver-calibration/README.md`` for the chosen value and its FP-rate
+tolerance (target ≤ 0.5%). See WXYC/library-metadata-lookup#318.
+"""
+
+_resolver_cache = create_ttl_cache(maxsize=512, ttl=300)
+"""TTL cache for ``resolve_canonical_artist``. Keyed on the diacritic-stripped,
+lowercased input so equivalent strings within a burst share one PG round-trip.
+Registered with the global cache registry so ``clear_all_caches()`` resets it.
+"""
+
+
+@dataclass(frozen=True)
+class ResolverOutcome:
+    """Result of the canonical-artist resolver pre-pass.
+
+    Attributes:
+        original: The input artist string as received from the caller.
+        canonical: The canonical Discogs artist name when ``swapped`` is True;
+            otherwise identical to ``original``.
+        score: Trigram similarity score of the top cache candidate (0.0-1.0).
+            ``0.0`` when no candidate was found.
+        swapped: Whether ``canonical`` differs from ``original`` and met the
+            similarity floor. Callers use this to decide whether to forward
+            ``canonical`` into downstream Discogs probes.
+    """
+
+    original: str
+    canonical: str
+    score: float
+    swapped: bool
+
+
+async def resolve_canonical_artist(
+    artist: str,
+    *,
+    cache_service: DiscogsCacheService | None,
+) -> ResolverOutcome:
+    """Resolve ``artist`` to the canonical Discogs name when confidence allows.
+
+    Runs a trigram fuzzy search against ``artist`` + ``artist_name_variation``
+    in the discogs-cache PG database. When the top score meets
+    ``CANONICAL_ARTIST_SIMILARITY_FLOOR``, returns a ``ResolverOutcome`` with
+    ``swapped=True`` and the canonical name; otherwise returns the original
+    input with ``swapped=False``. Results are memoized in-process keyed on the
+    diacritic-stripped lowercased input.
+
+    Failure modes (no cache, empty input, PG error) all degrade to
+    ``swapped=False`` so the resolver never breaks /lookup.
+
+    See WXYC/library-metadata-lookup#318.
+    """
+    original = artist or ""
+
+    if not original.strip():
+        return ResolverOutcome(original=original, canonical=original, score=0.0, swapped=False)
+
+    if cache_service is None:
+        return ResolverOutcome(original=original, canonical=original, score=0.0, swapped=False)
+
+    cache_key = normalize_for_comparison(original)
+
+    if not should_skip_cache():
+        cached = _resolver_cache.get(cache_key)
+        if cached is not None:
+            return ResolverOutcome(
+                original=original,
+                canonical=cached.canonical,
+                score=cached.score,
+                swapped=cached.swapped,
+            )
+
+    try:
+        candidates = await cache_service.search_artists_by_name(original, limit=5)
+    except Exception as e:
+        logger.warning("resolver_pre_pass cache lookup failed for %r: %s", original, e)
+        return ResolverOutcome(original=original, canonical=original, score=0.0, swapped=False)
+
+    if not candidates:
+        outcome = ResolverOutcome(original=original, canonical=original, score=0.0, swapped=False)
+        _resolver_cache[cache_key] = outcome
+        return outcome
+
+    top = candidates[0]
+    score = float(top.get("score", 0.0))
+    candidate_name = top.get("name") or original
+    swapped = score >= CANONICAL_ARTIST_SIMILARITY_FLOOR
+
+    outcome = ResolverOutcome(
+        original=original,
+        canonical=candidate_name if swapped else original,
+        score=score,
+        swapped=swapped,
+    )
+    _resolver_cache[cache_key] = outcome
+    return outcome
+
+
+def _log_resolver_pre_pass(outcome: ResolverOutcome) -> None:
+    """Emit shadow-mode telemetry for the resolver pre-pass.
+
+    Runs unconditionally — regardless of the enforcement flag — so the
+    queryable shadow dataset accumulates in production from day one and the
+    floor can be re-calibrated against real traffic without a code change.
+
+    Two surfaces:
+
+    1. Structured INFO log line for log-pipeline tools.
+    2. ``set_data("resolver_pre_pass", ...)`` on the active Sentry
+       transaction, mirroring ``lookup/router._project_cache_stats_to_transaction``.
+       No-op when there is no active transaction. Any Sentry SDK error is
+       swallowed so observability cannot break /lookup.
+    """
+    if not outcome.original.strip():
+        return
+    would_swap = outcome.swapped or outcome.score >= CANONICAL_ARTIST_SIMILARITY_FLOOR
+    payload = {
+        "original": outcome.original,
+        "candidate": outcome.canonical,
+        "score": outcome.score,
+        "swapped": outcome.swapped,
+        "would_swap": would_swap,
+    }
+    logger.info("resolver_pre_pass %s", payload)
+    try:
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is not None:
+            transaction.set_data("resolver_pre_pass", payload)
+    except Exception as e:
+        logger.warning("Failed to project resolver_pre_pass onto Sentry transaction: %s", e)
 
 
 def is_self_titled(title: str) -> bool:
@@ -455,6 +594,25 @@ async def search_compilations_for_track(
             song_search = f"{parsed.song} ({remix_match.group(1)})"
             logger.info(f"Using full track name with version info: '{song_search}'")
 
+        # Resolver pre-pass: when the inbound artist string trigram-matches a
+        # canonical Discogs name with confidence >= the floor, use the canonical
+        # form for both Discogs probes. The pre-pass runs unconditionally for
+        # shadow logging; the actual swap is gated on
+        # ``settings.lml_resolve_artist_canonical`` for a controlled rollout.
+        # See WXYC/library-metadata-lookup#318.
+        cache_service = getattr(discogs_service, "cache_service", None)
+        outcome = await resolve_canonical_artist(parsed.artist, cache_service=cache_service)
+        _log_resolver_pre_pass(outcome)
+        try:
+            from config.settings import get_settings
+
+            enforce_swap = bool(get_settings().lml_resolve_artist_canonical)
+        except Exception:
+            enforce_swap = False
+        artist_for_probes = (
+            outcome.canonical if (outcome.swapped and enforce_swap) else parsed.artist
+        )
+
         # Get raw releases from Discogs without per-release validation.
         # We search the library first and only validate releases that match,
         # avoiding expensive API calls for releases not in our catalog.
@@ -462,9 +620,9 @@ async def search_compilations_for_track(
         if discogs_service:
             # Fire both searches in parallel (speculative: VA search may not be needed)
             response, va_response = await asyncio.gather(
-                discogs_service.search_releases_by_track(song_search, parsed.artist),
+                discogs_service.search_releases_by_track(song_search, artist_for_probes),
                 discogs_service.search_releases_by_track(
-                    song_search, parsed.artist, artist_as_keyword=True
+                    song_search, artist_for_probes, artist_as_keyword=True
                 ),
             )
             raw_releases = list(response.releases or [])
