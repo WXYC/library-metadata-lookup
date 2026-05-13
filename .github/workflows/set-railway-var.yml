@@ -76,7 +76,7 @@ jobs:
           fi
 
       - name: Install Railway CLI
-        run: npm install -g @railway/cli
+        run: npm install -g @railway/cli@4.58.0
 
       - name: Show CLI version
         run: railway --version
