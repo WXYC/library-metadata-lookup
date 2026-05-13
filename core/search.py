@@ -383,8 +383,9 @@ async def execute_search_pipeline(
                 state.song_not_found = False
 
         elif strategy.name == SearchStrategyType.SONG_AS_TRACK:
-            # Cross-reference song against Discogs; match releases back to library.
-            # Returns (library_items, matched_via_by_id) — see plan §4.2.
+            # Two-value unpack (unlike other branches): the strategy returns
+            # matched_via_by_id alongside the library items so SearchState can
+            # carry provenance to perform_lookup. See plan §4.2.
             results, matched_via_by_id = await strategy.execute(db, parsed.song)
             if results:
                 state.results = results
