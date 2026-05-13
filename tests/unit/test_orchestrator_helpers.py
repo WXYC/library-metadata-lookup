@@ -1421,3 +1421,115 @@ class TestSearchSongAsTrack:
 
         assert results == [va_album]
         assert matched_via[12345][0].artist_credit == "Adonis"
+
+    @pytest.mark.asyncio
+    async def test_validation_failure_skips_release(self):
+        """When validate_track_on_release returns False, the release is dropped.
+
+        Discogs's release-search index returns keyword hits that don't always
+        carry the song on their tracklist; validation rejects those before they
+        surface as false positives in the API response.
+        """
+        confield = make_library_item(id=60359, artist="Autechre", title="Confield")
+        db = AsyncMock()
+        db.search.return_value = [confield]
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="vi scose poise",
+            releases=[
+                DiscogsReleaseInfo(
+                    album="Confield",
+                    artist="Autechre",
+                    release_id=8434,
+                    release_url="https://discogs.com/release/8434",
+                    is_compilation=False,
+                )
+            ],
+            total=1,
+        )
+        svc.validate_track_on_release.return_value = False
+
+        results, matched_via = await search_song_as_track(db, "vi scose poise", discogs_service=svc)
+
+        assert results == []
+        assert matched_via == {}
+        svc.validate_track_on_release.assert_awaited_once_with(8434, "vi scose poise", "Autechre")
+
+    @pytest.mark.asyncio
+    async def test_multiple_releases_accumulate_hints_for_same_row(self):
+        """Two Discogs releases pointing at the same WXYC row accumulate hints.
+
+        A reissue/remaster pair shares the same library row but distinct
+        Discogs release IDs. matched_via_by_id[id] must list one hint per
+        release rather than collapsing to a single entry.
+        """
+        confield = make_library_item(id=60359, artist="Autechre", title="Confield")
+        db = AsyncMock()
+        db.search.return_value = [confield]
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="vi scose poise",
+            releases=[
+                DiscogsReleaseInfo(
+                    album="Confield",
+                    artist="Autechre",
+                    release_id=8434,
+                    release_url="https://discogs.com/release/8434",
+                    is_compilation=False,
+                ),
+                DiscogsReleaseInfo(
+                    album="Confield",
+                    artist="Autechre",
+                    release_id=999,
+                    release_url="https://discogs.com/release/999",
+                    is_compilation=False,
+                ),
+            ],
+            total=2,
+        )
+
+        results, matched_via = await search_song_as_track(db, "vi scose poise", discogs_service=svc)
+
+        assert results == [confield]
+        assert len(matched_via[60359]) == 2
+
+    @pytest.mark.asyncio
+    async def test_compilation_falls_back_to_various_prefix_search(self):
+        """When album-only fuzzy search misses for a compilation, retry with 'Various '.
+
+        FTS5 entries stored as "Various Artists — <title>" don't always match a
+        bare album-title query; prefixing with 'Various' helps the tokenizer.
+        """
+        va_album = make_library_item(
+            id=11111,
+            artist="Various Artists",
+            title="Trax Records 20th Anniversary Collection",
+        )
+        db = AsyncMock()
+
+        async def search_side_effect(query, **kwargs):
+            return [va_album] if query.startswith("Various ") else []
+
+        db.search.side_effect = search_side_effect
+
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="No Way Back",
+            releases=[
+                DiscogsReleaseInfo(
+                    album="Trax Records 20th Anniversary Collection",
+                    artist="Adonis",
+                    release_id=222,
+                    release_url="https://discogs.com/release/222",
+                    is_compilation=True,
+                )
+            ],
+            total=1,
+        )
+
+        results, matched_via = await search_song_as_track(db, "No Way Back", discogs_service=svc)
+
+        assert results == [va_album]
+        assert matched_via[11111][0].artist_credit == "Adonis"
+        queries = [call.kwargs["query"] for call in db.search.await_args_list]
+        assert any(q.startswith("Various ") for q in queries)

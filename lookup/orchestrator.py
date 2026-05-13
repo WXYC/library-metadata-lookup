@@ -528,14 +528,24 @@ async def search_song_as_track(
         if not matches:
             continue
 
-        for item in matches:
-            if release.is_compilation and is_compilation_artist(item.artist or ""):
-                pass
-            elif item.artist and artist_matches_item(item, release.artist):
-                pass
-            else:
-                continue
+        eligible = [m for m in matches if _release_matches_library_row(release, m)]
+        if not eligible:
+            continue
 
+        # Validate the track actually appears on this release before surfacing
+        # — Discogs's release-search index is keyword-driven and returns hits
+        # that don't always contain the track on the tracklist. Deferred until
+        # after library matching so we only pay the API cost for releases we'd
+        # actually return, mirroring search_compilations_for_track.
+        if release.release_id and not await discogs_service.validate_track_on_release(
+            release.release_id, song, release.artist
+        ):
+            logger.debug(
+                f"SONG_AS_TRACK: skipping '{release.album}' — track not validated on release"
+            )
+            continue
+
+        for item in eligible:
             hint = TrackMatchHint(
                 title=song,
                 artist_credit=release.artist if release.is_compilation else None,
@@ -551,7 +561,7 @@ async def search_song_as_track(
             seen_ids.add(item.id)
             matched_items.append(item)
             matched_via_by_id[item.id] = [hint]
-            logger.info(
+            logger.debug(
                 f"SONG_AS_TRACK: matched '{item.artist} - {item.title}' "
                 f"via release '{release.album}'"
             )
@@ -562,6 +572,22 @@ async def search_song_as_track(
             break
 
     return matched_items, matched_via_by_id
+
+
+def _release_matches_library_row(release: ReleaseInfo, item: LibraryItem) -> bool:
+    """Predicate: does ``release``'s artist credit match ``item``'s library artist?
+
+    Compilation-aware: for VA releases (``release.is_compilation``), any library
+    row whose artist field is itself a compilation marker (e.g., "Various
+    Artists - Rock - D") qualifies. For non-compilations, the library row's
+    artist must prefix-match the Discogs release artist via the existing
+    ``artist_matches_item`` rules.
+    """
+    if release.is_compilation and is_compilation_artist(item.artist or ""):
+        return True
+    if item.artist and artist_matches_item(item, release.artist):
+        return True
+    return False
 
 
 async def search_library_with_fallback(

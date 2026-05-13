@@ -390,7 +390,7 @@ async def execute_search_pipeline(
             if results:
                 state.results = results
                 state.song_not_found = False
-                state.matched_via_by_id = matched_via_by_id or {}
+                state.matched_via_by_id = matched_via_by_id
 
         # Stop if we found results (unless we're doing compilation search which can replace results)
         if state.results and strategy.name != SearchStrategyType.TRACK_ON_COMPILATION:
