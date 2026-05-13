@@ -149,9 +149,7 @@ class TestAlbumTitleFallback:
         get_settings.cache_clear()
 
     @pytest.mark.asyncio
-    async def test_fallback_fires_when_artist_probe_returns_releases_but_library_filters_them_all(
-        self,
-    ):
+    async def test_fallback_fires_after_initial_pass_filters_everything(self):
         """Staging regression from 2026-05-13 (#237 follow-up).
 
         Discogs has since added a canonical "Orcutt Shelley Miller" artist
@@ -231,10 +229,13 @@ class TestAlbumTitleFallback:
     @pytest.mark.asyncio
     async def test_fallback_skipped_when_library_match_already_found(self):
         """The gate fires on ``not results`` (no library matches were
-        produced), not ``not raw_releases``. When the artist-scoped probes'
-        candidates DO turn into a library match via the existing pipeline,
-        the fallback adds no value and should not fire — its cost is one
-        extra Discogs API call per fire."""
+        produced), not ``not raw_releases``. (The gate name changed in #322;
+        the prior incarnation tested the Discogs-response-empty condition,
+        which no longer matches reality after Discogs added a canonical
+        trio entity.) When the artist-scoped probes' candidates DO turn
+        into a library match via the existing pipeline, the fallback adds
+        no value and should not fire — its cost is one extra Discogs API
+        call per fire."""
         library_item = make_library_item(id=42, artist="A Real Artist", title="An Album")
         db = AsyncMock()
         db.search = AsyncMock(return_value=[library_item])
