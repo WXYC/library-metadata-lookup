@@ -652,29 +652,6 @@ async def search_compilations_for_track(
                 for artist, album in tuples
             ]
 
-        # Album-title fallback (#319): when both artist-scoped probes returned
-        # nothing usable AND the request supplied an album AND the resolver
-        # pre-pass did not produce a high-confidence canonical (so the existing
-        # probes already exhausted what canonicalization can offer), retry with
-        # a title-only compilation search. Trio collaborations like the
-        # "Orcutt Shelley Miller" case from #237 are the motivating example.
-        fallback_release_ids: set[int] = set()
-        if discogs_service and not raw_releases and parsed.album and not outcome.swapped:
-            try:
-                fallback_response = await discogs_service.search_releases_by_album_title(
-                    parsed.album
-                )
-                fallback_releases = list(fallback_response.releases or [])
-                raw_releases.extend(fallback_releases)
-                fallback_release_ids = {r.release_id for r in fallback_releases}
-                if fallback_releases:
-                    logger.info(
-                        f"Album-title fallback returned {len(fallback_releases)} candidates "
-                        f"for '{parsed.album}'"
-                    )
-            except Exception as e:
-                logger.warning(f"Album-title fallback failed for '{parsed.album}': {e}")
-
         logger.info(f"Found {len(raw_releases)} releases with '{song_search}' on Discogs")
         discogs_found_releases = len(raw_releases) > 0
 
@@ -767,16 +744,7 @@ async def search_compilations_for_track(
             )
             return [(match, release_album) for match in matches]
 
-        all_release_results = await asyncio.gather(
-            *[
-                process_release(
-                    ri,
-                    skip_self_named_album=ri.release_id not in fallback_release_ids,
-                    skip_artist_match_filter=ri.release_id in fallback_release_ids,
-                )
-                for ri in raw_releases
-            ]
-        )
+        all_release_results = await asyncio.gather(*[process_release(ri) for ri in raw_releases])
 
         for release_matches in all_release_results:
             for match, discogs_album in release_matches:
@@ -786,6 +754,52 @@ async def search_compilations_for_track(
                     discogs_titles[match.id] = discogs_album
             if len(results) >= MAX_SEARCH_RESULTS:
                 break
+
+        # Album-title fallback (#319 + #237): when the artist-scoped probes
+        # produced no library results AND the request supplied an album AND
+        # the resolver pre-pass did not produce a high-confidence canonical,
+        # retry with a title-only Discogs search and process those candidates
+        # with the trio-aware kwargs (no self-named-album guard, no library-
+        # side artist filter — defer artist gating to validate_track_on_release).
+        #
+        # Earlier revisions gated this on ``not raw_releases``, but Discogs has
+        # since added a canonical entity for the motivating trio ("Orcutt
+        # Shelley Miller"), so the artist-scoped probes now return non-empty
+        # raw_releases that all get filtered out downstream. Gate on actual
+        # results, not Discogs response shape. See WXYC/library-metadata-lookup#237.
+        if discogs_service and not results and parsed.album and not outcome.swapped:
+            try:
+                fallback_response = await discogs_service.search_releases_by_album_title(
+                    parsed.album
+                )
+                fallback_releases = list(fallback_response.releases or [])
+                if fallback_releases:
+                    logger.info(
+                        f"Album-title fallback returned {len(fallback_releases)} candidates "
+                        f"for '{parsed.album}'"
+                    )
+                fallback_results = await asyncio.gather(
+                    *[
+                        process_release(
+                            ri,
+                            skip_self_named_album=False,
+                            skip_artist_match_filter=True,
+                        )
+                        for ri in fallback_releases
+                    ]
+                )
+                for release_matches in fallback_results:
+                    for match, discogs_album in release_matches:
+                        if match.id not in seen_ids:
+                            results.append(match)
+                            seen_ids.add(match.id)
+                            discogs_titles[match.id] = discogs_album
+                    if len(results) >= MAX_SEARCH_RESULTS:
+                        break
+                if fallback_releases:
+                    discogs_found_releases = True
+            except Exception as e:
+                logger.warning(f"Album-title fallback failed for '{parsed.album}': {e}")
     except Exception as e:
         logger.warning(f"Failed to search for track on other releases: {e}")
 
