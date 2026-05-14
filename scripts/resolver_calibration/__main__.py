@@ -56,6 +56,7 @@ from pathlib import Path
 import asyncpg
 
 from lookup.orchestrator import CANONICAL_ARTIST_SIMILARITY_FLOOR
+from scripts.resolver_calibration.synthetic_typos import generate_typos
 
 logger = logging.getLogger("resolver_calibration")
 
@@ -173,6 +174,89 @@ async def fetch_negative_class_close_pairs(pool: asyncpg.Pool, limit: int) -> li
             top_id=r["id_b"],
             score=float(r["score"] or 0.0),
             is_positive=False,
+        )
+        for r in rows
+    ]
+
+
+async def fetch_positive_class_synthetic_typos(
+    pool: asyncpg.Pool,
+    n_artists: int,
+    typos_per_artist: int = 3,
+) -> list[CandidateScore]:
+    """Third positive class: synthetic listener-typed corruptions.
+
+    Samples ``n_artists`` random rows from ``artist`` and generates up to
+    ``typos_per_artist`` controlled corruptions per row via
+    ``generate_typos``. Each typo is then run through the same LATERAL
+    trigram match the resolver uses, and the result is recorded as a
+    true positive when the top match's id equals the sampled artist's id.
+
+    This is the only positive class that targets the actual production
+    failure mode for ``resolve_canonical_artist`` — listener-typed names
+    like "Robotnik" / "Robotnick". The ``artist_name_variation`` class
+    covers Discogs aliases (a different distribution) and
+    ``entity.identity`` covers WXYC-side name shapes.
+
+    Two queries are issued: one to sample artists, one bulk LATERAL join
+    over a typo-derived VALUES list. Per-typo round-trips would blow up
+    on n_artists=5000 × typos_per_artist=3 = 15000 queries.
+
+    Per-artist typo selection is seeded on the canonical name (``hash(name)``)
+    so the same artist always yields the same corruption set across runs.
+    Which artists are sampled is non-deterministic (``ORDER BY random()`` on
+    the SQL side), matching the other ``fetch_*_class`` functions.
+    """
+    sample_query = """
+        SELECT id, name FROM artist
+        WHERE name IS NOT NULL AND length(name) >= 4
+        ORDER BY random()
+        LIMIT $1
+    """
+    sampled = await pool.fetch(sample_query, n_artists)
+
+    typos_list: list[str] = []
+    canonical_ids: list[int] = []
+    canonical_names: list[str] = []
+    for row in sampled:
+        typos = generate_typos(row["name"], seed=hash(row["name"]), max_typos=typos_per_artist)
+        for typo in typos:
+            typos_list.append(typo)
+            canonical_ids.append(row["id"])
+            canonical_names.append(row["name"])
+
+    if not typos_list:
+        return []
+
+    bulk_query = """
+        WITH probes(typo, canonical_id, canonical_name) AS (
+            SELECT * FROM unnest($1::text[], $2::int[], $3::text[])
+        )
+        SELECT
+            p.typo,
+            p.canonical_id,
+            p.canonical_name,
+            top.id AS top_id,
+            top.name AS top_name,
+            top.score AS top_score
+        FROM probes p
+        LEFT JOIN LATERAL (
+            SELECT a.id, a.name,
+                   similarity(lower(f_unaccent(a.name)), lower(f_unaccent(p.typo))) AS score
+            FROM artist a
+            WHERE lower(f_unaccent(a.name)) % lower(f_unaccent(p.typo))
+            ORDER BY score DESC
+            LIMIT 1
+        ) top ON true
+    """
+    rows = await pool.fetch(bulk_query, typos_list, canonical_ids, canonical_names)
+    return [
+        CandidateScore(
+            query_name=r["typo"],
+            top_name=r["top_name"] or r["typo"],
+            top_id=r["top_id"],
+            score=float(r["top_score"] or 0.0),
+            is_positive=r["top_id"] == r["canonical_id"],
         )
         for r in rows
     ]
@@ -320,7 +404,20 @@ async def main_async(args: argparse.Namespace) -> int:
         positives_variation = await fetch_positive_class_variations(pool, args.positive_sample_size)
         logger.info("Pulling positive class from entity.identity (limit=%d)", args.identity_limit)
         positives_identity = await fetch_entity_identity_positives(pool, args.identity_limit)
-        positives = positives_variation + positives_identity
+        if args.synthetic_positive_size > 0:
+            logger.info(
+                "Generating synthetic-typo positive class (n_artists=%d, typos_per_artist=%d)",
+                args.synthetic_positive_size,
+                args.synthetic_typos_per_artist,
+            )
+            positives_synthetic = await fetch_positive_class_synthetic_typos(
+                pool,
+                args.synthetic_positive_size,
+                typos_per_artist=args.synthetic_typos_per_artist,
+            )
+        else:
+            positives_synthetic = []
+        positives = positives_variation + positives_identity + positives_synthetic
         logger.info(
             "Pulling negative class from close-but-distinct artist pairs (limit=%d)",
             args.negative_sample_size,
@@ -414,6 +511,21 @@ def main() -> int:
         type=int,
         default=1000,
         help="Random rows pulled from entity.identity (default: 1000)",
+    )
+    parser.add_argument(
+        "--synthetic-positive-size",
+        type=int,
+        default=0,
+        help=(
+            "Random rows sampled from artist for synthetic-typo generation "
+            "(default: 0 — disabled). Set ~1000 for a typical calibration run."
+        ),
+    )
+    parser.add_argument(
+        "--synthetic-typos-per-artist",
+        type=int,
+        default=3,
+        help="Synthetic corruptions per sampled artist (default: 3 — one per non-fold class)",
     )
     parser.add_argument(
         "--fp-rate-target",
