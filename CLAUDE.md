@@ -415,7 +415,9 @@ Uses `BandcampClient` (`scripts/bandcamp_client.py`) extending `BaseStreamingCli
 
 ### Resolver Calibration (`scripts/resolver_calibration/`)
 
-Sweeps the trigram-similarity floor used by `lookup/orchestrator.resolve_canonical_artist` (the pre-pass for `search_compilations_for_track` — see WXYC/library-metadata-lookup#318). Builds three labeled datasets — positives from `artist_name_variation` and `entity.identity`, negatives from sampled close-but-distinct `artist` pairs — and writes a precision/recall sweep + a borderline-band CSV.
+Sweeps the trigram-similarity floor used by `lookup/orchestrator.resolve_canonical_artist` (the pre-pass for `search_compilations_for_track` — see WXYC/library-metadata-lookup#318). Builds labeled datasets — positives from `artist_name_variation`, `entity.identity`, and (optionally) synthetic listener-typo corruptions; negatives from sampled close-but-distinct `artist` pairs — and writes a precision/recall sweep + a borderline-band CSV.
+
+The synthetic-typo class targets the actual production failure mode (listener-typed names like "Robotnik" → "Robotnick"). The Discogs `artist_name_variation` class covers aliases / AKAs ("Bob Dylan" / "Robert Zimmerman") which is a different distribution. Synthetic class is opt-in via `--synthetic-positive-size N` (default 0 = disabled); set ~1000 for a typical calibration run. See `scripts/resolver_calibration/synthetic_typos.py` for the four corruption classes (drop, transpose, duplicate, ASCII-fold).
 
 **Output** (defaults to `docs/resolver-calibration/`):
 - `calibration_sweep.csv` — threshold, TP rate, FP rate, sample sizes, swap count.
@@ -430,6 +432,7 @@ DATABASE_URL_DISCOGS=postgresql://... \
     --output-dir docs/resolver-calibration/ \
     --positive-sample-size 5000 \
     --negative-sample-size 5000 \
+    --synthetic-positive-size 1000 \
     --fp-rate-target 0.005
 ```
 
