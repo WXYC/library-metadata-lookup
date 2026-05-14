@@ -27,6 +27,7 @@ def _release(**overrides) -> DiscogsReleaseMetadata:
         "artist_id": 999,
         "labels": [DiscogsLabelCredit(label_id=42, name="Sonamos", catno="SON-001")],
         "release_url": "https://www.discogs.com/release/12345",
+        "cached": True,
     }
     base.update(overrides)
     return DiscogsReleaseMetadata.model_validate(base)
@@ -136,3 +137,52 @@ class TestResolveEndpoint:
         assert body["source"] == "discogs_release"
         assert body["streaming"]["on_streaming"] is True
         assert body["identifiers"]["spotify_album_id"] == "abc"
+
+    @pytest.mark.asyncio
+    async def test_matched_via_in_response_body_for_cache_hit(self, mock_settings, monkeypatch):
+        from main import app
+
+        async def fake_check(*args, **kwargs):
+            return StreamingCheckResponse(on_streaming=False, sources=StreamingCheckSources())
+
+        monkeypatch.setattr("release.orchestrator.check_streaming_availability", fake_check)
+
+        with override_deps(
+            app, {get_resolver_dependencies: _deps_with_discogs(_release(cached=True))}
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/api/v1/releases/resolve",
+                    json={"url": "https://www.discogs.com/release/12345"},
+                )
+
+        assert resp.status_code == 200
+        assert resp.json()["matched_via"] == "discogs_cache"
+
+    @pytest.mark.asyncio
+    async def test_matched_via_in_response_body_for_live_api(self, mock_settings, monkeypatch):
+        """Acceptance criterion (issue #329): the response carries a
+        ``matched_via`` field distinguishing the live-API tier from cached
+        tiers."""
+        from main import app
+
+        async def fake_check(*args, **kwargs):
+            return StreamingCheckResponse(on_streaming=False, sources=StreamingCheckSources())
+
+        monkeypatch.setattr("release.orchestrator.check_streaming_availability", fake_check)
+
+        with override_deps(
+            app, {get_resolver_dependencies: _deps_with_discogs(_release(cached=False))}
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/api/v1/releases/resolve",
+                    json={"url": "https://www.discogs.com/release/12345"},
+                )
+
+        assert resp.status_code == 200
+        assert resp.json()["matched_via"] == "discogs_live_api"

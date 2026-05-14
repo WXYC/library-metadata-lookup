@@ -63,6 +63,7 @@ def _make_release(**overrides) -> DiscogsReleaseMetadata:
         "artist_id": 999,
         "labels": [DiscogsLabelCredit(label_id=42, name="Sonamos", catno="SON-001")],
         "release_url": "https://www.discogs.com/release/12345",
+        "cached": True,
     }
     base.update(overrides)
     return DiscogsReleaseMetadata.model_validate(base)
@@ -429,3 +430,103 @@ class TestIdentityWriteBack:
             )
 
         store.upsert_identity.assert_not_called()
+
+
+class TestMatchedViaPropagation:
+    """The orchestrator must surface ``matched_via`` on ``ReleaseResolveResponse``
+    so consumers can render a "fresh from Discogs" badge vs a "from cache"
+    badge (per #329 acceptance criteria).
+    """
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_propagates_discogs_cache(self):
+        discogs = AsyncMock()
+        discogs.get_release.return_value = _make_release(cached=True)
+        deps = _deps(discogs=discogs)
+
+        with patch(
+            "release.orchestrator.check_streaming_availability",
+            new=AsyncMock(return_value=_stream()),
+        ):
+            response = await resolve_release(
+                ReleaseResolveRequest(url="https://www.discogs.com/release/12345"), deps
+            )
+
+        assert response.matched_via == "discogs_cache"
+
+    @pytest.mark.asyncio
+    async def test_live_api_hit_propagates_discogs_live_api(self):
+        discogs = AsyncMock()
+        discogs.get_release.return_value = _make_release(cached=False)
+        deps = _deps(discogs=discogs)
+
+        with patch(
+            "release.orchestrator.check_streaming_availability",
+            new=AsyncMock(return_value=_stream()),
+        ):
+            response = await resolve_release(
+                ReleaseResolveRequest(url="https://www.discogs.com/release/12345"), deps
+            )
+
+        assert response.matched_via == "discogs_live_api"
+
+    @pytest.mark.asyncio
+    async def test_miss_leaves_matched_via_none(self):
+        discogs = AsyncMock()
+        discogs.get_release.return_value = None
+        deps = _deps(discogs=discogs)
+
+        response = await resolve_release(
+            ReleaseResolveRequest(url="https://www.discogs.com/release/12345"), deps
+        )
+
+        assert response.matched_via is None
+
+    @pytest.mark.asyncio
+    async def test_master_url_leaves_matched_via_none(self):
+        discogs = AsyncMock()
+        deps = _deps(discogs=discogs)
+
+        response = await resolve_release(
+            ReleaseResolveRequest(url="https://www.discogs.com/master/789"), deps
+        )
+
+        assert response.matched_via is None
+
+    @pytest.mark.asyncio
+    async def test_bandcamp_branch_leaves_matched_via_none(self):
+        # Bandcamp resolution is not yet a Discogs tier; matched_via stays None.
+        bandcamp = MagicMock()
+        with (
+            patch(
+                "release.orchestrator.resolve_bandcamp_album",
+                new=AsyncMock(),
+            ) as mock_resolve,
+            patch(
+                "release.orchestrator.check_streaming_availability",
+                new=AsyncMock(return_value=_stream()),
+            ),
+        ):
+            from release.bandcamp_resolver import BandcampResolveResult
+            from release.models import CanonicalRelease, ReleaseIdentifiers
+
+            url = "https://juana-molina.bandcamp.com/album/doga"
+            mock_resolve.return_value = BandcampResolveResult(
+                canonical=CanonicalRelease(artist="Juana Molina", title="DOGA"),
+                identifiers=ReleaseIdentifiers(bandcamp_album_url=url),
+                warnings=[],
+            )
+            response = await resolve_release(
+                ReleaseResolveRequest(url=url), _deps(bandcamp=bandcamp)
+            )
+
+        assert response.matched_via is None
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_url_leaves_matched_via_none(self):
+        deps = _deps()
+        with patch("release.orchestrator.check_streaming_availability"):
+            response = await resolve_release(
+                ReleaseResolveRequest(url="https://example.com/foo"), deps
+            )
+        assert response.matched_via is None
