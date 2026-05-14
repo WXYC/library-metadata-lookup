@@ -1162,7 +1162,8 @@ class DiscogsService:
             if track_lower not in item_title and item_title not in track_lower:
                 continue
 
-            # Check per-track artists first (for compilations)
+            # Per-track credits first (compilations, or tracks crediting the
+            # writers/performers). A positive hit short-circuits.
             if item.artists:
                 for track_artist in item.artists:
                     track_artist_lower = normalize_artist_for_validation(track_artist)
@@ -1184,25 +1185,26 @@ class DiscogsService:
                         f"Validated (fuzzy): '{track}' by '{artist}' on release {release_id}"
                     )
                     return True
-            else:
-                # For single-artist releases, check release artist
-                release_artist = normalize_artist_for_validation(release.artist)
 
-                if artist_lower in release_artist or release_artist in artist_lower:
-                    logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")
-                    return True
-
-                # Fuzzy fallback for the same trio scenario (LML#210), but where
-                # all members are listed in the single release-artist string.
-                if (
-                    release_artist
-                    and fuzz.token_set_ratio(artist_lower, release_artist)
-                    >= _ARTIST_FUZZY_MATCH_THRESHOLD
-                ):
-                    logger.info(
-                        f"Validated (fuzzy): '{track}' by '{artist}' on release {release_id}"
-                    )
-                    return True
+            # Release-level artist. Always consulted when per-track credits
+            # haven't already matched — per-track credits often list band
+            # members / producers / writers rather than the band itself (e.g.,
+            # The Orb's "Towers Of Dub" on Live 93 is credited to Paterson /
+            # Weston / Fehlmann), so the release-level credit is the last
+            # word on "is this track by this artist."
+            release_artist = normalize_artist_for_validation(release.artist)
+            if release_artist and (
+                artist_lower in release_artist or release_artist in artist_lower
+            ):
+                logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")
+                return True
+            if (
+                release_artist
+                and fuzz.token_set_ratio(artist_lower, release_artist)
+                >= _ARTIST_FUZZY_MATCH_THRESHOLD
+            ):
+                logger.info(f"Validated (fuzzy): '{track}' by '{artist}' on release {release_id}")
+                return True
 
         logger.info(f"Track '{track}' by '{artist}' NOT found on release {release_id}")
         return False

@@ -793,6 +793,58 @@ class TestValidateTrackOnRelease:
         with pytest.raises(CacheUnavailableError):
             await cache_service.validate_track_on_release(1, "Song", "Artist")
 
+    @pytest.mark.asyncio
+    async def test_per_track_credits_fall_back_to_release_artist(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """Per-track credits list members/producers, not the band itself.
+
+        Live 93 by The Orb has Towers Of Dub credited to the band members
+        (Alex Paterson, Kris Weston, Thomas Fehlmann). The discogs-cache
+        release_track_artist table stores those credits without a role
+        distinction, so a request for "Towers Of Dub by The Orb" must
+        still validate by falling back to the release-level artist.
+        """
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=True)
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[
+                    {"track_sequence": 5, "artist_name": "Alex Paterson"},
+                    {"track_sequence": 5, "artist_name": "Kris Weston"},
+                    {"track_sequence": 5, "artist_name": "Thomas Fehlmann"},
+                ],
+                release_track=[{"sequence": 5, "title": "Towers Of Dub"}],
+            )
+        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "The Orb"})
+        result = await cache_service.validate_track_on_release(13938, "Towers of Dub", "The Orb")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_per_track_credits_release_artist_fallback_still_rejects_unrelated(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """Release-level fallback must not bleed into unrelated-artist matches.
+
+        Requesting "Towers Of Dub by Stereolab" against the same Live 93
+        cache row must return False even though we now consult the
+        release-level artist after per-track credits fail.
+        """
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=True)
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[
+                    {"track_sequence": 5, "artist_name": "Alex Paterson"},
+                    {"track_sequence": 5, "artist_name": "Kris Weston"},
+                    {"track_sequence": 5, "artist_name": "Thomas Fehlmann"},
+                ],
+                release_track=[{"sequence": 5, "title": "Towers Of Dub"}],
+            )
+        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "The Orb"})
+        result = await cache_service.validate_track_on_release(13938, "Towers of Dub", "Stereolab")
+        assert result is False
+
 
 # ---------------------------------------------------------------------------
 # Artist detail caching

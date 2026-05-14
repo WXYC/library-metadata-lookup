@@ -12,6 +12,8 @@ The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 import asyncio
 import logging
 
+from rapidfuzz import fuzz
+
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.models import (
     ArtistCredit,
@@ -32,6 +34,13 @@ class CacheUnavailableError(Exception):
     """Raised when the PostgreSQL cache is unreachable."""
 
     pass
+
+
+# Mirrors ``_ARTIST_FUZZY_MATCH_THRESHOLD`` in ``discogs/service.py`` — the
+# release-level fuzzy fallback used here must score the same way the API path
+# does so cache hits and cache misses can't disagree about whether a track is
+# on a release. Tied to that constant by intent, not duplicated by accident.
+_ARTIST_FUZZY_MATCH_THRESHOLD = 70
 
 
 class DiscogsCacheService:
@@ -985,6 +994,8 @@ class DiscogsCacheService:
             track_lower = normalize_for_track_comparison(track)
             artist_lower = normalize_artist_for_validation(artist)
 
+            release_artist_clean = normalize_artist_for_validation(primary_artist)
+
             for row in track_rows:
                 item_title = normalize_for_track_comparison(row["title"])
 
@@ -998,10 +1009,32 @@ class DiscogsCacheService:
                         track_artist_lower = normalize_artist_for_validation(track_artist)
                         if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
                             return True
-                else:
-                    release_artist_clean = normalize_artist_for_validation(primary_artist)
-                    if artist_lower in release_artist_clean or release_artist_clean in artist_lower:
+                    joined = normalize_artist_for_validation(" ".join(artists_for_track))
+                    if (
+                        joined
+                        and fuzz.token_set_ratio(artist_lower, joined)
+                        >= _ARTIST_FUZZY_MATCH_THRESHOLD
+                    ):
                         return True
+
+                # Release-level artist. Always consulted when per-track
+                # credits haven't matched — ``release_track_artist`` has no
+                # role column, so writer / producer / member credits land
+                # alongside main-artist credits (e.g., Live 93 by The Orb
+                # credits Paterson / Weston / Fehlmann on every track), and
+                # the release-level credit is the last word on "is this
+                # track by this artist." Mirrors the API path in
+                # ``discogs/service.py``.
+                if release_artist_clean and (
+                    artist_lower in release_artist_clean or release_artist_clean in artist_lower
+                ):
+                    return True
+                if (
+                    release_artist_clean
+                    and fuzz.token_set_ratio(artist_lower, release_artist_clean)
+                    >= _ARTIST_FUZZY_MATCH_THRESHOLD
+                ):
+                    return True
 
             return False
 
