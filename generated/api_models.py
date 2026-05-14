@@ -1484,3 +1484,10 @@ class BulkResolveLibrariesRequest(BaseModel):
         max_length=1000,
         min_length=1,
     )
+
+
+class LibraryQueryResponse(BaseModel):
+    results: list[AlbumSearchResult]
+    total: int
+    page: int
+    totalPages: int
