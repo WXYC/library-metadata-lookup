@@ -90,9 +90,12 @@ Response:
   "canonical": { "artist": "Juana Molina", "title": "DOGA", "label": "Sonamos", "catno": "SON-001", "year": 2024, "country": null, "formats": [] },
   "identifiers": { "discogs_release_id": 12345, "discogs_artist_id": 999, "spotify_album_id": "abc...", "bandcamp_album_url": null, ... },
   "streaming": { "on_streaming": true, "sources": { ... } },
+  "matched_via": "discogs_cache",
   "warnings": []
 }
 ```
+
+`matched_via` (per WXYC/library-metadata-lookup#329) tags the provenance tier for the canonical metadata so callers can label results "fresh from Discogs" vs "from cache". Values: `discogs_cache` (served from the local discogs-cache PG), `discogs_live_api` (local cache missed, fell through to the live Discogs API — the result is then written back to PG so the next request for the same release is free), or `null` (no canonical metadata was produced — rate-limit, not-found, non-Discogs source, or unrecognized URL). Live-tier hits also bump an ad-hoc `discogs_live_release_hit` counter on the request's cache_stats recorder so freshness-gap impact is visible in PostHog / Sentry. The cache write-back, rate-limit handling (60 req/min token bucket + concurrency semaphore in `discogs/ratelimit.py`), exponential backoff with jitter on 429s, and graceful degradation to `null` on quota exhaustion are all inherited from `DiscogsService.get_release`; the resolver is just a thin projection on top.
 
 Implementation lives in `release/`:
 - `url_parser.py` — pure URL → `(source, id)` parser. Supports Discogs `/release/<id>` and `/master/<id>` (with locale prefixes and slugs) and Bandcamp `<artist>.bandcamp.com/album/<slug>`.

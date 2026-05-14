@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Literal
 
 from discogs.service import DiscogsService
 from release.bandcamp_resolver import resolve_bandcamp_album
@@ -103,16 +104,22 @@ async def resolve_release(
         )
 
     # Dispatch to the right resolver.
+    # matched_via is the provenance tier for the canonical metadata (per #329):
+    # only Discogs sources populate it today. Bandcamp leaves it None — when /
+    # if we add a Bandcamp cache layer it can grow new tier values.
+    matched_via: Literal["discogs_cache", "discogs_live_api"] | None = None
     if parsed.source == "discogs_release":
         discogs_result = await resolve_discogs_release(deps.discogs, parsed.identifier)
         canonical = discogs_result.canonical
         identifiers = discogs_result.identifiers
         warnings = list(discogs_result.warnings)
+        matched_via = discogs_result.matched_via
     elif parsed.source == "discogs_master":
         master_result = await resolve_discogs_master(deps.discogs, parsed.identifier)
         canonical = master_result.canonical
         identifiers = master_result.identifiers
         warnings = list(master_result.warnings)
+        matched_via = master_result.matched_via
     else:  # bandcamp
         bandcamp_result = await resolve_bandcamp_album(deps.bandcamp, parsed.identifier)
         canonical = bandcamp_result.canonical
@@ -136,6 +143,7 @@ async def resolve_release(
         canonical=canonical or CanonicalRelease(artist="", title=""),
         identifiers=identifiers,
         streaming=streaming,
+        matched_via=matched_via,
         warnings=warnings,
     )
 

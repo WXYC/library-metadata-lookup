@@ -13,17 +13,37 @@ Discogs master URLs are not yet supported. Pasting a master URL returns a
 warning suggesting the user paste a release URL instead — masters require
 an extra API hop (``/masters/<id>`` → ``main_release``) that's not worth the
 rate-limit budget for v1 of this endpoint.
+
+Provenance (per #329): every successful resolution carries a ``matched_via``
+tag. ``discogs_cache`` means the row came from the local PostgreSQL cache;
+``discogs_live_api`` means the local cache missed and we fell through to
+the live Discogs API (which then writes the row back into the cache, so the
+next request for the same release is free). Live-tier hits also increment
+an ad-hoc ``discogs_live_release_hit`` counter on the request's cache_stats
+recorder so freshness-gap impact is visible in PostHog / Sentry.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Literal
+
+from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from discogs.service import DiscogsService
 from release.models import CanonicalRelease, ReleaseIdentifiers
 
 logger = logging.getLogger(__name__)
+
+# Per #329: the provenance tier values are a closed set. New tiers (e.g.
+# ``library_identity`` or ``musicbrainz_cache``) should be added here so
+# downstream consumers can switch on Literal exhaustiveness.
+MatchedVia = Literal["discogs_cache", "discogs_live_api"]
+
+# Cache-stats key for the live-tier counter. Defined here so tests can import
+# the same symbol the production code records under.
+LIVE_RELEASE_METRIC_KEY = "discogs_live_release_hit"
 
 
 @dataclass
@@ -33,6 +53,7 @@ class DiscogsResolveResult:
     canonical: CanonicalRelease | None
     identifiers: ReleaseIdentifiers
     warnings: list[str]
+    matched_via: MatchedVia | None = None
 
 
 async def resolve_discogs_release(service: DiscogsService, release_id: str) -> DiscogsResolveResult:
@@ -96,7 +117,30 @@ async def resolve_discogs_release(service: DiscogsService, release_id: str) -> D
         discogs_artist_id=release.artist_id,
     )
 
-    return DiscogsResolveResult(canonical=canonical, identifiers=identifiers, warnings=warnings)
+    # The cache_service.get_release() projection sets cached=True on a PG
+    # cache hit; the DiscogsService.get_release() API branch sets cached=False
+    # when it falls through to the live Discogs API and writes back into PG.
+    # That single bool is the source of truth for the live-vs-cached tier
+    # surfaced by #329. ``cached`` is ``bool | None`` in the generated schema —
+    # treat None the same as False (the API branch never produces None, only
+    # legacy fixtures might).
+    matched_via: MatchedVia = "discogs_cache" if release.cached else "discogs_live_api"
+    if matched_via == "discogs_live_api":
+        # Ad-hoc counter; the recorder permits undeclared keys (see
+        # wxyc-fastapi CacheStatsRecorder.record docstring). Wrapped in a
+        # try/except so a misconfigured request context never blocks the
+        # actual release lookup — the metric is observability, not contract.
+        try:
+            get_cache_stats_recorder().record(LIVE_RELEASE_METRIC_KEY)
+        except Exception:
+            logger.debug("Failed to record live-release metric", exc_info=True)
+
+    return DiscogsResolveResult(
+        canonical=canonical,
+        identifiers=identifiers,
+        warnings=warnings,
+        matched_via=matched_via,
+    )
 
 
 async def resolve_discogs_master(_service: DiscogsService, master_id: str) -> DiscogsResolveResult:

@@ -102,6 +102,18 @@ class ReleaseResolveResponse(BaseModel):
             "configured services failed)."
         ),
     )
+    matched_via: Literal["discogs_cache", "discogs_live_api"] | None = Field(
+        None,
+        description=(
+            "Provenance tier for the canonical metadata (per #329). "
+            "``discogs_cache`` — served from the local discogs-cache PG. "
+            "``discogs_live_api`` — local cache missed, fell through to the "
+            "live Discogs API (and the result was written back to the cache so "
+            "the next request for the same release is free). Null when no "
+            "canonical metadata was produced (rate-limit / not-found / "
+            "non-Discogs source / unrecognized URL)."
+        ),
+    )
     warnings: list[str] = Field(
         default_factory=list,
         description=(

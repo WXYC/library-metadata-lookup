@@ -3,7 +3,7 @@ output to CanonicalRelease + ReleaseIdentifiers, with warnings on failure."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -19,7 +19,11 @@ from release.discogs_resolver import (
 
 
 def _make_release(**overrides) -> DiscogsReleaseMetadata:
-    """Produce a minimal valid release for projection tests."""
+    """Produce a minimal valid release for projection tests.
+
+    ``cached`` defaults to True (the dominant production path); pass
+    ``cached=False`` to simulate a live-API miss.
+    """
     base = {
         "release_id": 12345,
         "title": "DOGA",
@@ -29,6 +33,7 @@ def _make_release(**overrides) -> DiscogsReleaseMetadata:
         "artist_id": 999,
         "labels": [DiscogsLabelCredit(label_id=42, name="Sonamos", catno="SON-001")],
         "release_url": "https://www.discogs.com/release/12345",
+        "cached": True,
     }
     base.update(overrides)
     return DiscogsReleaseMetadata.model_validate(base)
@@ -124,3 +129,82 @@ class TestResolveDiscogsMaster:
         assert len(result.warnings) == 1
         assert "master" in result.warnings[0].lower()
         mock_service.get_release.assert_not_called()
+
+
+class TestMatchedViaProvenance:
+    """Per #329: the resolver must surface a `matched_via` tier so consumers
+    can tell whether the release came from the local cache or the live
+    Discogs API. The bool ``ReleaseMetadataResponse.cached`` is the
+    authoritative signal — cache_service.get_release() sets cached=True,
+    DiscogsService.get_release()'s API branch sets cached=False.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_reports_discogs_cache(self, mock_service):
+        mock_service.get_release.return_value = _make_release(cached=True)
+
+        result = await resolve_discogs_release(mock_service, "12345")
+
+        assert result.matched_via == "discogs_cache"
+
+    @pytest.mark.asyncio
+    async def test_live_api_hit_reports_discogs_live_api(self, mock_service):
+        mock_service.get_release.return_value = _make_release(cached=False)
+
+        result = await resolve_discogs_release(mock_service, "12345")
+
+        assert result.matched_via == "discogs_live_api"
+
+    @pytest.mark.asyncio
+    async def test_miss_reports_none(self, mock_service):
+        # Cache miss + API failure: matched_via stays None.
+        mock_service.get_release.return_value = None
+
+        result = await resolve_discogs_release(mock_service, "12345")
+
+        assert result.matched_via is None
+
+    @pytest.mark.asyncio
+    async def test_exception_reports_none(self, mock_service):
+        mock_service.get_release.side_effect = RuntimeError("network exploded")
+
+        result = await resolve_discogs_release(mock_service, "12345")
+
+        assert result.matched_via is None
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_id_reports_none(self, mock_service):
+        result = await resolve_discogs_release(mock_service, "not-a-number")
+
+        assert result.matched_via is None
+
+    @pytest.mark.asyncio
+    async def test_live_api_hit_records_metric(self, mock_service):
+        """The live-tier metric is the only way to see freshness gap impact."""
+        mock_service.get_release.return_value = _make_release(cached=False)
+
+        with patch("release.discogs_resolver.get_cache_stats_recorder") as recorder_factory:
+            recorder = recorder_factory.return_value
+            await resolve_discogs_release(mock_service, "12345")
+
+        recorder.record.assert_called_once_with("discogs_live_release_hit")
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_does_not_record_live_metric(self, mock_service):
+        mock_service.get_release.return_value = _make_release(cached=True)
+
+        with patch("release.discogs_resolver.get_cache_stats_recorder") as recorder_factory:
+            recorder = recorder_factory.return_value
+            await resolve_discogs_release(mock_service, "12345")
+
+        recorder.record.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_miss_does_not_record_live_metric(self, mock_service):
+        mock_service.get_release.return_value = None
+
+        with patch("release.discogs_resolver.get_cache_stats_recorder") as recorder_factory:
+            recorder = recorder_factory.return_value
+            await resolve_discogs_release(mock_service, "12345")
+
+        recorder.record.assert_not_called()
