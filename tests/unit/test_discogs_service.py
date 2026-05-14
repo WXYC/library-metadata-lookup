@@ -1236,6 +1236,53 @@ class TestValidateTrackOnRelease:
         assert result is True
 
     @pytest.mark.asyncio
+    async def test_per_track_credits_fall_back_to_release_artist(self, service):
+        """Per-track credits list members/producers, not the band itself.
+
+        Live 93 by The Orb has Towers Of Dub credited to the band members
+        (Alex Paterson, Kris Weston, Thomas Fehlmann). When the Discogs API
+        surfaces those names under ``track.artists`` (as the cache equivalent
+        ``release_track_artist`` does), the validator must still confirm the
+        track by falling back to the release-level artist.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=674529,
+            title="Live 93",
+            artist="The Orb",
+            release_url="https://discogs.com/release/674529",
+            tracklist=[
+                TrackItem(
+                    position="5",
+                    title="Towers Of Dub",
+                    artists=["Alex Paterson", "Kris Weston", "Thomas Fehlmann"],
+                ),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(674529, "Towers of Dub", "The Orb")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_per_track_credits_release_fallback_still_rejects_unrelated(self, service):
+        """The release-artist fallback must not match an unrelated artist."""
+        release = ReleaseMetadataResponse(
+            release_id=674529,
+            title="Live 93",
+            artist="The Orb",
+            release_url="https://discogs.com/release/674529",
+            tracklist=[
+                TrackItem(
+                    position="5",
+                    title="Towers Of Dub",
+                    artists=["Alex Paterson", "Kris Weston", "Thomas Fehlmann"],
+                ),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(674529, "Towers of Dub", "Stereolab")
+        assert result is False
+
+    @pytest.mark.asyncio
     async def test_cache_validated(self, service_with_cache):
         service_with_cache.cache_service.validate_track_on_release = AsyncMock(return_value=True)
 
