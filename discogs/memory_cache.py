@@ -64,13 +64,41 @@ def make_cache_key(func_name: str, *args, **kwargs) -> str:
     return hashlib.md5(key_string.encode()).hexdigest()
 
 
+def _normalize_for_cache_key(value):
+    """Recursively normalize a value for cache-key hashing.
+
+    Strings flow through `to_match_form` (the resolver pre-pass normalizer).
+    Pydantic models are dumped to dicts and recursed into. Dicts, lists, and
+    tuples are walked element-wise. Everything else passes through unchanged,
+    preserving type distinctions (an int 12345 hashes differently from the
+    string "12345").
+
+    Exported as a private module-level helper so unit tests can target the
+    recursion directly if the input shape grows.
+    """
+    if isinstance(value, str):
+        return normalize_for_comparison(value)
+    if isinstance(value, BaseModel):
+        # `model_dump` produces plain Python types; recurse to fold the
+        # model's string fields. Order is preserved because pydantic v2
+        # emits dict in field-declaration order, which keeps `make_cache_key`'s
+        # `sort_keys=True` JSON dump deterministic.
+        return _normalize_for_cache_key(value.model_dump())
+    if isinstance(value, dict):
+        return {k: _normalize_for_cache_key(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_normalize_for_cache_key(v) for v in value)
+    return value
+
+
 def make_normalized_cache_key(func_name: str, *args, **kwargs) -> str:
-    """Like `make_cache_key`, but runs string args/kwargs through
-    `to_match_form` (the resolver pre-pass normalizer) before hashing.
+    """Like `make_cache_key`, but recursively folds string-valued fields
+    inside the args (including those nested in Pydantic models, dicts, and
+    lists) through `to_match_form` before hashing.
 
     Diacritic and case variations of the same user-typed query collapse to
     the same key, so the in-process @async_cached caches don't end up with
-    a separate entry for each spelling (LML#342 / A5). Non-string args
+    a separate entry for each spelling (LML#342 / A5). Non-string scalars
     pass through unchanged so the cache key still differentiates by type.
 
     The `func_name` is identity-preserved — it's an internal identifier, not
@@ -78,18 +106,15 @@ def make_normalized_cache_key(func_name: str, *args, **kwargs) -> str:
 
     Args:
         func_name: Name of the function being cached.
-        *args: Positional arguments. Strings are normalized; others pass through.
+        *args: Positional arguments. Strings, BaseModels, dicts, and lists
+            are recursively normalized; other scalars pass through.
         **kwargs: Keyword arguments. Same per-value normalization as positional.
 
     Returns:
         MD5 hash of the serialized normalized arguments.
     """
-
-    def _normalize(value):
-        return normalize_for_comparison(value) if isinstance(value, str) else value
-
-    norm_args = tuple(_normalize(a) for a in args)
-    norm_kwargs = {k: _normalize(v) for k, v in kwargs.items()}
+    norm_args = tuple(_normalize_for_cache_key(a) for a in args)
+    norm_kwargs = {k: _normalize_for_cache_key(v) for k, v in kwargs.items()}
     return make_cache_key(func_name, *norm_args, **norm_kwargs)
 
 
