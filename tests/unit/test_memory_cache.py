@@ -121,6 +121,50 @@ class TestMakeNormalizedCacheKey:
         k2 = make_normalized_cache_key("get_release", "x")
         assert k1 != k2
 
+    def test_punctuation_distinguishes_distinct_artists(self):
+        # `to_match_form` does NOT strip punctuation, so two real-world artists
+        # whose names differ only by punctuation must still hash to distinct
+        # keys. Pins the safety property that the resolver pre-pass's
+        # normalization layer guarantees so a future change to `to_match_form`
+        # in wxyc-etl can't silently collapse them.
+        k1 = make_normalized_cache_key("search", "Felt")
+        k2 = make_normalized_cache_key("search", "Felt.")
+        assert k1 != k2
+
+    def test_pydantic_model_string_fields_are_normalized(self):
+        # @async_cached decorates DiscogsService methods that take pydantic
+        # models like DiscogsSearchRequest as their argument. Without
+        # recursing into the model, two requests with the same logical
+        # artist but different spellings (e.g. "Sonido Dueñez" vs
+        # "Sonido Duenez") hash differently because the model's repr
+        # carries the un-normalized strings. Pin recursion into BaseModel
+        # so the search() cache path actually delivers #342's win.
+        from discogs.models import DiscogsSearchRequest
+
+        req_diacritic = DiscogsSearchRequest(artist="Sonido Dueñez", album="X")
+        req_ascii = DiscogsSearchRequest(artist="Sonido Duenez", album="X")
+        k1 = make_normalized_cache_key("search", req_diacritic)
+        k2 = make_normalized_cache_key("search", req_ascii)
+        assert k1 == k2
+
+    def test_pydantic_model_passes_through_meaningful_distinctions(self):
+        # Same recursion, opposite direction: if two requests differ in a
+        # meaningful field, they MUST still hash differently after recursion.
+        from discogs.models import DiscogsSearchRequest
+
+        req_base = DiscogsSearchRequest(artist="Sonido Duenez", track="Cumbia")
+        req_remix = DiscogsSearchRequest(artist="Sonido Duenez", track="Cumbia (Remix)")
+        k1 = make_normalized_cache_key("search", req_base)
+        k2 = make_normalized_cache_key("search", req_remix)
+        assert k1 != k2
+
+    def test_dict_argument_recurses_into_string_values(self):
+        # General dict recursion (not just pydantic models). Future callers
+        # that pass plain dicts get the same collapse behavior.
+        k1 = make_normalized_cache_key("search", {"artist": "Björk"})
+        k2 = make_normalized_cache_key("search", {"artist": "bjork"})
+        assert k1 == k2
+
 
 class TestAsyncCachedNormalization:
     """End-to-end: @async_cached should serve diacritic/case variants from the
@@ -161,6 +205,53 @@ class TestAsyncCachedNormalization:
         # Different normalized keys — no false collapse.
         assert call_count == 2
         assert len(cache) == 2
+
+    @pytest.mark.asyncio
+    async def test_skip_cache_still_bypasses_with_diacritic_arg(self):
+        # The skip_cache flag must short-circuit BEFORE normalization runs —
+        # otherwise the bypass branch would still pay the to_match_form cost
+        # for diacritic-bearing args. Regression coverage for the order of
+        # operations after A5.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+
+        @async_cached(cache)
+        async def search(artist):
+            nonlocal call_count
+            call_count += 1
+            return artist
+
+        set_skip_cache(True)
+        try:
+            await search("Sonido Dueñez")
+            await search("Sonido Dueñez")
+            assert call_count == 2  # every call goes through to the function
+            assert len(cache) == 0
+        finally:
+            set_skip_cache(False)
+
+    @pytest.mark.asyncio
+    async def test_self_stripping_still_works_with_diacritic_args(self):
+        # `self` is stripped from cache_args BEFORE the per-arg normalization
+        # pass runs. Pins the order so two instances calling the same method
+        # with the same diacritic-bearing arg share a single cache entry.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+
+        class MyService:
+            @async_cached(cache)
+            async def method(self, arg):
+                return arg
+
+        svc1 = MyService()
+        svc2 = MyService()
+
+        result1 = await svc1.method("Sonido Dueñez")
+        result2 = await svc2.method("Sonido Duenez")
+        # Same normalized key across instances — both `self` strip and arg
+        # normalization apply, leaving identical hashes.
+        assert result1 == "Sonido Dueñez"
+        assert result2 == "Sonido Dueñez"  # served from cache
+        assert len(cache) == 1
 
 
 # ---------------------------------------------------------------------------
