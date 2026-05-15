@@ -144,6 +144,8 @@ uvicorn main:app --reload
 - **`main`** -- Development. Push here to deploy to **staging**.
 - **`prod`** -- Production. Push here to deploy to **production**.
 
+**Autoclose gotcha:** GitHub's `Closes #N` / `Fixes #N` keyword in a PR body only triggers issue-autoclose when the PR merges into the repo's **default branch**. LML's default is `main`, but most feature/fix PRs target `prod` (the deploy branch), so referenced issues stay open after merge. Close them manually with `gh issue close N --reason completed --comment "shipped via #PR"` when merging into `prod`. We've discussed flipping the default to `prod` or wiring a tiny "close issues on prod merge" workflow; neither has shipped yet. Until then: close by hand.
+
 ## Testing
 
 ### Unit Tests
