@@ -173,6 +173,10 @@ class FlowsheetBreakpointEntry(FlowsheetMessageEntry, DateTimeEntry):
 class FlowsheetCreateSongFromCatalog(BaseModel):
     album_id: int
     track_title: str
+    track_position: str | None = Field(
+        None,
+        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Written by the dj-site flowsheet picker (catalog-track-search plan §5.3 / Track 3) when the DJ selects a track from the resolved release. Omitted when the DJ enters a free-text track_title without a tracklist lookup or when the release has no resolvable identity. String-typed to match Discogs\'s `release_track.position` (vinyl side notation, multi-disc prefixes).\n',
+    )
     rotation_id: int | None = None
     request_flag: bool
     segue: bool | None = None
@@ -205,6 +209,10 @@ class FlowsheetCreateMessage(BaseModel):
 
 class FlowsheetUpdateRequest(BaseModel):
     track_title: str | None = None
+    track_position: str | None = Field(
+        None,
+        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Set when re-picking a track via the flowsheet picker; cleared (omitted) when a DJ edits the entry to a free-text track_title. String-typed to match Discogs\'s `release_track.position`.\n',
+    )
     artist_name: str | None = None
     album_title: str | None = None
     record_label: str | None = None
@@ -288,6 +296,10 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
     artist_name: str | None = None
     album_title: str | None = None
     track_title: str | None = None
+    track_position: str | None = Field(
+        None,
+        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Set by the dj-site flowsheet picker (catalog-track-search plan §5.3 / Track 3) when the DJ selected a track from the resolved release; null when the track_title was entered free-form or the release had no resolvable identity. String-typed to match Discogs\'s `release_track.position`.\n',
+    )
     record_label: str | None = None
     request_flag: bool
     segue: bool | None = None
