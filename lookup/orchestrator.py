@@ -27,8 +27,20 @@ from core.search import (
 )
 from discogs.cache_service import DiscogsCacheService
 from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
+from discogs.markup_parser import (
+    CachedOnlyResolver,
+    DiscogsServiceResolver,
+    parse_async,
+)
 from discogs.memory_cache import create_ttl_cache, should_skip_cache
-from discogs.models import DiscogsSearchRequest, DiscogsSearchResult, ReleaseInfo
+from discogs.models import (
+    ArtistDetails,
+    DiscogsSearchRequest,
+    DiscogsSearchResult,
+    ReleaseInfo,
+    ReleaseMetadataResponse,
+    ResolvedToken,
+)
 from discogs.service import DiscogsService
 from generated.api_models import (
     LibraryCatalogItem,
@@ -1345,6 +1357,10 @@ async def enrich_artwork_results(
     song: str | None = None,
     library_db: LibraryDB | None = None,
     http_client: httpx.AsyncClient | None = None,
+    *,
+    extended: bool = False,
+    warm_cache: bool = False,
+    discogs_cache: "DiscogsCacheService | None" = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
@@ -1354,62 +1370,107 @@ async def enrich_artwork_results(
     ``http_client`` is the shared ``httpx.AsyncClient`` used for the iTunes
     Search probe. Passing ``None`` skips the Apple Music lookup — the
     orchestrator never instantiates its own client (issue #241).
+
+    Release/artist details (year, bio, wikipedia URL) are fetched only for
+    ``items_with_artwork[0]`` — BS/iOS only consume the top-1 result, so
+    paying N round-trips of Discogs cache (and on miss, API) latency for
+    non-top-1 items was waste. Streaming-URL fallbacks stay per-result
+    (cheap; no I/O).
+
+    ``extended=True`` additionally populates the new DiscogsMatchResult
+    fields LML already loaded during the release+artist fetches:
+    ``discogs_artist_id``, ``tracklist``, ``genres``, ``styles``, ``label``,
+    ``full_release_date``, ``artist_image_url``, ``profile_tokens``. Bio
+    parsing uses a cache-only resolver — refs that miss fall through as
+    plain text, never trigger an inline Discogs API call.
+
+    ``warm_cache=True`` schedules an ``asyncio.create_task`` after the
+    response is composed that runs the *deep* async parse against the
+    API-capable resolver, warming the PG cache for referenced entities so
+    subsequent read-path lookups render richer. The task is not awaited —
+    write-path callers (Backend-Service's flowsheet-linkage service) pay
+    zero added latency. The task wraps its body in try/except and logs
+    failures via ``logger.exception`` so a stuck warm doesn't go silent.
     """
-    if not discogs_service:
+    if not discogs_service or not items_with_artwork:
         return items_with_artwork
 
+    # Top-1-only expensive enrichment. fetch_release_details runs once;
+    # non-top-1 items reuse the same per-result streaming-URL build.
+    async def fetch_top1_release_details() -> tuple[
+        int | None,
+        str | None,
+        str | None,
+        "ReleaseMetadataResponse | None",
+        "ArtistDetails | None",
+    ]:
+        """Returns (year, artist_bio, wikipedia_url, release, details) for the top-1 result.
+
+        Returns the release + artist payloads alongside the legacy three
+        scalars so the extended-field population can pluck additional
+        fields without re-fetching.
+        """
+        top_artwork = items_with_artwork[0][1]
+        if top_artwork is None:
+            return None, None, None, None, None
+        try:
+            release = await discogs_service.get_release(top_artwork.release_id)
+            if not release:
+                return None, None, None, None, None
+
+            year = release.year if isinstance(release.year, int) else None
+            artist_id = release.artist_id
+            if not isinstance(artist_id, int) or artist_id <= 0:
+                return year, None, None, release, None
+
+            details = await discogs_service.get_artist_details(artist_id)
+            if not details:
+                return year, None, None, release, None
+
+            bio = details.profile if isinstance(details.profile, str) else None
+            wiki = next(
+                (url for url in details.urls if isinstance(url, str) and "wikipedia.org" in url),
+                None,
+            )
+            return year, bio, wiki, release, details
+        except Exception:
+            return None, None, None, None, None
+
+    top1_year, top1_bio, top1_wiki, top1_release, top1_details = await fetch_top1_release_details()
+
+    # Cache-only deep parse of the top-1 bio for the extended path. Refs
+    # that miss the cache fall through; we never fire a new API call here.
+    top1_profile_tokens: list[ResolvedToken] | None = None
+    if extended and top1_bio and discogs_cache is not None:
+        try:
+            top1_profile_tokens = await parse_async(top1_bio, CachedOnlyResolver(discogs_cache))
+        except Exception:
+            logger.exception("Cache-only bio parse failed; falling back to no tokens")
+            top1_profile_tokens = None
+
     async def enrich_one(
-        item: LibraryItem, artwork: DiscogsSearchResult | None
+        item: LibraryItem,
+        artwork: DiscogsSearchResult | None,
+        *,
+        is_top1: bool,
     ) -> tuple[LibraryItem, DiscogsSearchResult | None]:
         if not artwork:
             return (item, artwork)
 
         artist = item.alternate_artist_name or item.artist or ""
         search_term = song or item.title or ""
-        release_id = artwork.release_id
 
-        async def fetch_release_details() -> tuple[int | None, str | None, str | None]:
-            """Returns (year, artist_bio, wikipedia_url) from Discogs release + artist."""
-            try:
-                release = await discogs_service.get_release(release_id)
-                if not release:
-                    return None, None, None
-
-                year = release.year if isinstance(release.year, int) else None
-
-                # Fetch artist details if we have an artist_id
-                artist_id = release.artist_id
-                if not isinstance(artist_id, int) or artist_id <= 0:
-                    return year, None, None
-
-                details = await discogs_service.get_artist_details(artist_id)
-                if not details:
-                    return year, None, None
-
-                bio = details.profile if isinstance(details.profile, str) else None
-                wiki = next(
-                    (
-                        url
-                        for url in details.urls
-                        if isinstance(url, str) and "wikipedia.org" in url
-                    ),
-                    None,
-                )
-                return year, bio, wiki
-            except Exception:
-                return None, None, None
-
-        async def fetch_apple_music() -> str | None:
-            if not artist or not search_term:
-                return None
-            return await _fetch_apple_music_url(artist, search_term, http_client=http_client)
-
-        release_details_result, apple_music_result = await asyncio.gather(
-            fetch_release_details(),
-            fetch_apple_music(),
+        apple_music_result = (
+            await _fetch_apple_music_url(artist, search_term, http_client=http_client)
+            if (artist and search_term)
+            else None
         )
 
-        year_result, artist_bio, wikipedia_url = release_details_result
+        # Top-1 scalars; non-top-1 leaves these as None and renders with
+        # streaming-URL fallbacks only.
+        year_result = top1_year if is_top1 else None
+        artist_bio = top1_bio if is_top1 else None
+        wikipedia_url = top1_wiki if is_top1 else None
 
         # Get streaming URLs: prefer direct links from DB, fall back to search URLs
         spotify_url = None
@@ -1449,24 +1510,70 @@ async def enrich_artwork_results(
                     "https://soundcloud.com/search?q=", artist, search_term
                 )
 
-        updated = artwork.model_copy(
-            update={
-                "release_year": year_result,
-                "artist_bio": artist_bio,
-                "wikipedia_url": wikipedia_url,
-                "spotify_url": spotify_url,
-                "apple_music_url": apple_music_override or apple_music_result or None,
-                "youtube_music_url": youtube_music_url,
-                "bandcamp_url": bandcamp_url,
-                "soundcloud_url": soundcloud_url,
-            }
-        )
-        return (item, updated)
+        update: dict = {
+            "release_year": year_result,
+            "artist_bio": artist_bio,
+            "wikipedia_url": wikipedia_url,
+            "spotify_url": spotify_url,
+            "apple_music_url": apple_music_override or apple_music_result or None,
+            "youtube_music_url": youtube_music_url,
+            "bandcamp_url": bandcamp_url,
+            "soundcloud_url": soundcloud_url,
+        }
+
+        # Extended fields land on the top-1 result only. The non-top-1
+        # items keep their lean shape so non-iOS lookup callers (request
+        # line, dj-site proxy, BS catalog) don't pay payload bloat for
+        # results they ignore.
+        if extended and is_top1:
+            if top1_release is not None:
+                update["discogs_artist_id"] = top1_release.artist_id
+                update["tracklist"] = (
+                    list(top1_release.tracklist) if top1_release.tracklist else None
+                )
+                update["genres"] = list(top1_release.genres) if top1_release.genres else None
+                update["styles"] = list(top1_release.styles) if top1_release.styles else None
+                update["label"] = top1_release.label
+                update["full_release_date"] = top1_release.released
+            update["artist_image_url"] = (
+                top1_details.image_url if top1_details is not None else None
+            )
+            update["profile_tokens"] = top1_profile_tokens
+
+        return (item, artwork.model_copy(update=update))
 
     enriched = await asyncio.gather(
-        *[enrich_one(item, artwork) for item, artwork in items_with_artwork]
+        *[
+            enrich_one(item, artwork, is_top1=(idx == 0))
+            for idx, (item, artwork) in enumerate(items_with_artwork)
+        ]
     )
+
+    # Write-path warm: fire-and-forget deep async parse of the top-1 bio
+    # using the API-capable resolver, so the PG cache gets populated for
+    # `[a…]`/`[r…]`/`[m…]` references. The task is intentionally not
+    # awaited — read-path latency is unaffected.
+    if warm_cache and top1_bio:
+        asyncio.create_task(_warm_bio_cache(top1_bio, discogs_service))
+
     return list(enriched)
+
+
+async def _warm_bio_cache(bio: str, discogs_service: "DiscogsService") -> None:
+    """Background task: deep-async parse of an artist bio to warm caches.
+
+    Resolves every `[a<id>]` / `[r<id>]` / `[m<id>]` reference through
+    ``DiscogsServiceResolver`` (cache → API → cache write-back), so
+    subsequent ``parse_async(..., CachedOnlyResolver)`` calls on this bio
+    return typed tokens instead of plain text. Errors are logged and
+    swallowed — the task must never propagate to the event loop.
+    """
+    try:
+        await parse_async(bio, DiscogsServiceResolver(discogs_service))
+        sentry_sdk.set_tag("lml.lookup.cache_warm_status", "success")
+    except Exception:
+        sentry_sdk.set_tag("lml.lookup.cache_warm_status", "error")
+        logger.exception("Background bio cache-warm failed")
 
 
 def build_context_message(
@@ -1693,7 +1800,22 @@ async def perform_lookup(
                 song=parsed.song,
                 library_db=db,
                 http_client=http_client,
+                extended=bool(request.extended),
+                warm_cache=bool(request.warm_cache),
+                discogs_cache=discogs_cache,
             )
+
+    # Project the request-side flags onto the active Sentry transaction so
+    # the trace can be filtered by request mode (lml.lookup.extended,
+    # lml.lookup.warm_cache).
+    try:
+        scope = sentry_sdk.get_current_scope()
+        if scope.transaction is not None:
+            scope.transaction.set_data("lml.lookup.extended", bool(request.extended))
+            scope.transaction.set_data("lml.lookup.warm_cache", bool(request.warm_cache))
+    except Exception:
+        # Observability must not break the request path.
+        pass
 
     # Step 5: Build context message
     context = build_context_message(

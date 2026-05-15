@@ -442,3 +442,40 @@ class DiscogsServiceResolver:
             return master.title if master else None
         except Exception:
             return None
+
+
+class CachedOnlyResolver:
+    """EntityResolver that consults the PG cache only — never the Discogs API.
+
+    Used on the lookup read path so bio tokenization can't blow up tail
+    latency when an artist's profile mentions many entities. Refs that
+    miss the cache fall through as unresolved tokens (dropped by ``resolve``),
+    yielding plain-text spans in the rendered bio. The companion write-path
+    flag ``warm_cache=true`` on /lookup uses ``DiscogsServiceResolver`` (above)
+    to fetch-and-cache misses opportunistically, so subsequent reads render
+    progressively richer.
+
+    The cache_service is the same ``DiscogsCacheService`` instance the
+    orchestrator already holds. Master IDs always resolve to None: the cache
+    has no masters table today.
+    """
+
+    def __init__(self, cache_service) -> None:
+        self._cache = cache_service
+
+    async def resolve_artist(self, id: int) -> str | None:
+        try:
+            details = await self._cache.get_artist_details(id)
+            return details.name if details else None
+        except Exception:
+            return None
+
+    async def resolve_release(self, id: int) -> str | None:
+        try:
+            release = await self._cache.get_release(id)
+            return release.title if release else None
+        except Exception:
+            return None
+
+    async def resolve_master(self, id: int) -> str | None:
+        return None

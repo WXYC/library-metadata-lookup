@@ -918,6 +918,14 @@ class LookupRequest(BaseModel):
         False,
         description="Per cross-cache-identity plan §3.2.2 (E2-LML write contract). When true, the response carries an additional `identity` block (the §3.2.5 cascade's per-source resolution detail), and `api_version` is set to 2. When false (the default), the response is byte-identical to v0.5.0 — `identity` is absent and `api_version` is omitted. Backend's `library-identity-writer.ts` (E2-BS) sets this to true on every call; other consumers (catalog search, dj-site proxy, iOS apps) leave it false.\n",
     )
+    extended: bool | None = Field(
+        None,
+        description="When true, the top-1 result's `artwork` block is populated with additional fields LML already fetches during enrichment but normally discards: `discogs_artist_id`, `tracklist`, `genres`, `styles`, `label`, `full_release_date`, `artist_image_url`, and `profile_tokens` (cache-only deep parse of the artist's profile markup). Lets a caller obtain a full playcut metadata payload in a single `/lookup` call instead of following up with separate `/discogs/release/{id}` and `/discogs/artist/{id}` requests. Absent or false leaves the response shape unchanged.\n",
+    )
+    warm_cache: bool | None = Field(
+        None,
+        description="When true, LML schedules a fire-and-forget background task after the response is built that runs a *deep* async parse of the top-1 artist's bio. The task resolves all `[a…]`/`[r…]`/`[m…]` references against the Discogs API where the local cache misses, warming the PG cache so subsequent reads of the same artist render richer bio tokens. Intended for write-path callers (e.g. Backend-Service's flowsheet-linkage service committing a new DJ entry); read-path callers should leave this absent/false to avoid doubling the Discogs-API load per request.\n",
+    )
 
 
 class LibraryCatalogItem(BaseModel):
@@ -943,23 +951,6 @@ class LibraryCatalogItem(BaseModel):
         None,
         description="True if this release is available on at least one streaming service. False means only available in the WXYC physical library. Null if unknown.",
     )
-
-
-class DiscogsMatchResult(BaseModel):
-    album: str | None = Field(None, description="Release title")
-    artist: str | None = Field(None, description="Release artist")
-    release_id: int = Field(..., description="Discogs release ID")
-    release_url: str = Field(..., description="URL to the release on Discogs")
-    artwork_url: str | None = Field(None, description="Artwork image URL")
-    confidence: confloat(ge=0.0, le=1.0) | None = Field(0, description="Match confidence score")
-    release_year: int | None = Field(None, description="Release year from Discogs")
-    artist_bio: str | None = Field(None, description="Artist biography from Discogs profile")
-    wikipedia_url: str | None = Field(None, description="Wikipedia URL for the artist")
-    spotify_url: str | None = Field(None, description="Spotify album URL")
-    apple_music_url: str | None = Field(None, description="Apple Music album URL")
-    youtube_music_url: str | None = Field(None, description="YouTube Music search URL")
-    bandcamp_url: str | None = Field(None, description="Bandcamp album URL")
-    soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
 
 
 class CacheStats(BaseModel):
@@ -1438,6 +1429,55 @@ class EnhancedRequest(SongRequest):
     matches: list[LibraryMatch] | None = None
     artwork_url: str | None = None
     discogs_url: str | None = None
+
+
+class DiscogsMatchResult(BaseModel):
+    album: str | None = Field(None, description="Release title")
+    artist: str | None = Field(None, description="Release artist")
+    release_id: int = Field(..., description="Discogs release ID")
+    release_url: str = Field(..., description="URL to the release on Discogs")
+    artwork_url: str | None = Field(None, description="Artwork image URL")
+    confidence: confloat(ge=0.0, le=1.0) | None = Field(0, description="Match confidence score")
+    release_year: int | None = Field(None, description="Release year from Discogs")
+    artist_bio: str | None = Field(None, description="Artist biography from Discogs profile")
+    wikipedia_url: str | None = Field(None, description="Wikipedia URL for the artist")
+    spotify_url: str | None = Field(None, description="Spotify album URL")
+    apple_music_url: str | None = Field(None, description="Apple Music album URL")
+    youtube_music_url: str | None = Field(None, description="YouTube Music search URL")
+    bandcamp_url: str | None = Field(None, description="Bandcamp album URL")
+    soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
+    discogs_artist_id: int | None = Field(
+        None,
+        description="Discogs artist ID for this release. Populated only when the originating `LookupRequest.extended` is true. Lets a caller key an artist-metadata cache without a follow-up release fetch.\n",
+    )
+    tracklist: list[DiscogsTrackItem] | None = Field(
+        None,
+        description="Release tracklist with per-track artist credits where available. Populated only when `extended` is true.\n",
+    )
+    genres: list[str] | None = Field(
+        None,
+        description='Discogs genre tags (e.g. "Rock", "Electronic"). Populated only when `extended` is true.\n',
+    )
+    styles: list[str] | None = Field(
+        None,
+        description='Discogs style tags (finer-grained than genres; e.g. "Indie Rock", "Ambient"). Populated only when `extended` is true.\n',
+    )
+    label: str | None = Field(
+        None,
+        description="Primary record-label name from the Discogs release. Distinct from `LibraryCatalogItem.label` (which comes from the WXYC catalog's rotation-release join). Populated only when `extended` is true.\n",
+    )
+    full_release_date: str | None = Field(
+        None,
+        description='Release date as an ISO string (e.g. "1997-09-22"). May be year-only ("1997") or year-month ("1997-09") if Discogs lacks the full date. Populated only when `extended` is true.\n',
+    )
+    artist_image_url: str | None = Field(
+        None,
+        description="Primary artist image URL from Discogs (the artist's profile photo, not the release artwork). Populated only when `extended` is true.\n",
+    )
+    profile_tokens: list[DiscogsResolvedToken] | None = Field(
+        None,
+        description="Pre-parsed structured tokens from the artist's `profile` markup, using a cache-only resolver — references to entities not in the local PG cache fall through as plain-text tokens (no inline Discogs API calls on the read path). Populated only when `extended` is true. Field name matches `DiscogsArtistDetails.profile_tokens` so callers can share rendering code across the two payloads. Pair with `LookupRequest.warm_cache=true` on write-path calls to progressively populate the cache so subsequent reads render richer.\n",
+    )
 
 
 class LookupResultItem(BaseModel):

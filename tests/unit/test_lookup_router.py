@@ -138,6 +138,69 @@ class TestHandleLookup:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_extended_flag_forwarded_to_perform_lookup(self, app_client):
+        """When the request body sets extended=true, the LookupRequest carried
+        into perform_lookup must reflect that. The router is a thin layer;
+        if the flag is dropped here the orchestrator's extended-path branch
+        is unreachable and the BS single-call optimization silently degrades.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json={**LOOKUP_BODY, "extended": True})
+
+        assert resp.status_code == 200
+        # First positional/keyword arg is the LookupRequest.
+        forwarded = mock_lookup.await_args.kwargs.get("request") or mock_lookup.await_args.args[0]
+        assert forwarded.extended is True
+
+    @pytest.mark.asyncio
+    async def test_warm_cache_flag_forwarded_to_perform_lookup(self, app_client):
+        """When the request body sets warm_cache=true, the LookupRequest must
+        carry it into perform_lookup so the orchestrator can schedule the
+        fire-and-forget bio warm.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json={**LOOKUP_BODY, "warm_cache": True})
+
+        assert resp.status_code == 200
+        forwarded = mock_lookup.await_args.kwargs.get("request") or mock_lookup.await_args.args[0]
+        assert forwarded.warm_cache is True
+
+    @pytest.mark.asyncio
+    async def test_extended_and_warm_cache_default_false(self, app_client):
+        """Requests that omit the new flags must keep the legacy behavior:
+        extended=False, warm_cache=False on the orchestrator side. Existing
+        callers (request-o-matic, dj-site proxy) leave the flags off.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        forwarded = mock_lookup.await_args.kwargs.get("request") or mock_lookup.await_args.args[0]
+        # The generated model uses Field(False, ...) so the default surfaces
+        # as either False or None depending on whether the client omits the
+        # field. Treat both as "off".
+        assert not forwarded.extended
+        assert not forwarded.warm_cache
+
+    @pytest.mark.asyncio
     async def test_skip_cache_flag(self, app_client):
         response = LookupResponse(results=[], search_type="direct")
 
