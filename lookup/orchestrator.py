@@ -41,6 +41,7 @@ from discogs.models import (
     ReleaseInfo,
     ReleaseMetadataResponse,
     ResolvedToken,
+    TrackReleasesResponse,
 )
 from discogs.service import DiscogsService
 from generated.api_models import (
@@ -825,14 +826,45 @@ async def search_compilations_for_track(
         # We search the library first and only validate releases that match,
         # avoiding expensive API calls for releases not in our catalog.
         raw_releases: list[ReleaseInfo] = []
+        # The album-title fallback's preconditions (`parsed.album` set, no
+        # resolver swap) are decidable here, so its probe joins the same
+        # `asyncio.gather` as the two artist-scoped probes (WXYC/library-
+        # metadata-lookup#339). Cold-cache wall time drops from A+B+C to
+        # max(A,B,C); the cost is one speculative API call when Wave A
+        # already succeeds — that call warms the cache.
+        album_fallback_should_fire = (
+            discogs_service is not None and bool(parsed.album) and not outcome.swapped
+        )
+        album_fallback_response: TrackReleasesResponse | None = None
+        album_fallback_error: str | None = None
+
+        async def _album_title_probe_safe() -> tuple[TrackReleasesResponse | None, str | None]:
+            """Catch-and-return wrapper so a Discogs failure on the album-title
+            probe doesn't take down the artist-scoped probes in the same gather.
+            Mirrors the existing fallback's try/except, which logs via
+            `_log_album_title_fallback(..., error=str(e))`."""
+            assert discogs_service is not None  # narrow for type-checker
+            assert parsed.album is not None
+            try:
+                resp = await discogs_service.search_releases_by_album_title(parsed.album)
+                return resp, None
+            except Exception as exc:
+                return None, str(exc)
+
         if discogs_service:
-            # Fire both searches in parallel (speculative: VA search may not be needed)
-            response, va_response = await asyncio.gather(
+            probes: list[Any] = [
                 discogs_service.search_releases_by_track(song_search, artist_for_probes),
                 discogs_service.search_releases_by_track(
                     song_search, artist_for_probes, artist_as_keyword=True
                 ),
-            )
+            ]
+            if album_fallback_should_fire:
+                probes.append(_album_title_probe_safe())
+
+            gathered = await asyncio.gather(*probes)
+            response, va_response = gathered[0], gathered[1]
+            if album_fallback_should_fire:
+                album_fallback_response, album_fallback_error = gathered[2]
             raw_releases = list(response.releases or [])
 
             # Only merge VA results if the artist-scoped search found no compilations
@@ -963,15 +995,14 @@ async def search_compilations_for_track(
         # Album-title fallback (#319 + #237): when the artist-scoped probes
         # produced no library results AND the request supplied an album AND
         # the resolver pre-pass did not produce a high-confidence canonical,
-        # retry with a title-only Discogs search and process those candidates
-        # with the trio-aware kwargs (no self-named-album guard, no library-
-        # side artist filter — defer artist gating to validate_track_on_release).
+        # process the title-only Discogs candidates with the trio-aware
+        # kwargs (no self-named-album guard, no library-side artist filter —
+        # defer artist gating to validate_track_on_release).
         #
-        # Earlier revisions gated this on ``not raw_releases``, but Discogs has
-        # since added a canonical entity for the motivating trio ("Orcutt
-        # Shelley Miller"), so the artist-scoped probes now return non-empty
-        # raw_releases that all get filtered out downstream. Gate on actual
-        # results, not Discogs response shape. See WXYC/library-metadata-lookup#237.
+        # The probe itself was fired speculatively in the same `asyncio.gather`
+        # as the artist-scoped probes above (#339). When it returned results
+        # we already paid the Discogs API cost; here we just decide whether
+        # to *consume* those candidates, gated on `not results` from Wave A.
         #
         # Trade-off: the gate is ``not results`` rather than
         # ``len(results) < MAX_SEARCH_RESULTS``. A partial initial pass (e.g.
@@ -981,49 +1012,55 @@ async def search_compilations_for_track(
         # ones. Revisit if measurements show partial-result requests would
         # benefit from supplementation.
         pre_fallback_results_count = len(results)
-        if discogs_service and not results and parsed.album and not outcome.swapped:
-            try:
-                fallback_response = await discogs_service.search_releases_by_album_title(
-                    parsed.album
+        # `album_fallback_should_fire` implies `parsed.album is not None`
+        # (see the precondition where the flag is set); the `assert` here
+        # narrows the type for both branches below.
+        if album_fallback_should_fire:
+            assert parsed.album is not None
+
+        if album_fallback_should_fire and album_fallback_error is not None:
+            # The probe ran but raised; mirror the pre-#339 behavior of
+            # logging via `_log_album_title_fallback(..., error=...)`.
+            assert parsed.album is not None
+            _log_album_title_fallback(
+                album=parsed.album,
+                n_candidates=0,
+                surfaced_library_match=False,
+                error=album_fallback_error,
+            )
+        elif album_fallback_should_fire and not results and album_fallback_response is not None:
+            assert parsed.album is not None
+            fallback_releases = list(album_fallback_response.releases or [])
+            if fallback_releases:
+                logger.info(
+                    f"Album-title fallback returned {len(fallback_releases)} candidates "
+                    f"for '{parsed.album}'"
                 )
-                fallback_releases = list(fallback_response.releases or [])
-                if fallback_releases:
-                    logger.info(
-                        f"Album-title fallback returned {len(fallback_releases)} candidates "
-                        f"for '{parsed.album}'"
+            fallback_results = await asyncio.gather(
+                *[
+                    process_release(
+                        ri,
+                        skip_self_named_album=False,
+                        skip_artist_match_filter=True,
                     )
-                fallback_results = await asyncio.gather(
-                    *[
-                        process_release(
-                            ri,
-                            skip_self_named_album=False,
-                            skip_artist_match_filter=True,
-                        )
-                        for ri in fallback_releases
-                    ]
-                )
-                for release_matches in fallback_results:
-                    for match, discogs_album in release_matches:
-                        if match.id not in seen_ids:
-                            results.append(match)
-                            seen_ids.add(match.id)
-                            discogs_titles[match.id] = discogs_album
-                    if len(results) >= MAX_SEARCH_RESULTS:
-                        break
-                if fallback_releases:
-                    discogs_found_releases = True
-                _log_album_title_fallback(
-                    album=parsed.album,
-                    n_candidates=len(fallback_releases),
-                    surfaced_library_match=len(results) > pre_fallback_results_count,
-                )
-            except Exception as e:
-                _log_album_title_fallback(
-                    album=parsed.album,
-                    n_candidates=0,
-                    surfaced_library_match=False,
-                    error=str(e),
-                )
+                    for ri in fallback_releases
+                ]
+            )
+            for release_matches in fallback_results:
+                for match, discogs_album in release_matches:
+                    if match.id not in seen_ids:
+                        results.append(match)
+                        seen_ids.add(match.id)
+                        discogs_titles[match.id] = discogs_album
+                if len(results) >= MAX_SEARCH_RESULTS:
+                    break
+            if fallback_releases:
+                discogs_found_releases = True
+            _log_album_title_fallback(
+                album=parsed.album,
+                n_candidates=len(fallback_releases),
+                surfaced_library_match=len(results) > pre_fallback_results_count,
+            )
     except Exception as e:
         logger.warning(f"Failed to search for track on other releases: {e}")
 
