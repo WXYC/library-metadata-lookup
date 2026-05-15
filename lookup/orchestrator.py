@@ -8,6 +8,7 @@ track validation -> artwork fetch -> metadata enrichment -> context message.
 import asyncio
 import logging
 import re
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -83,6 +84,17 @@ refs each still leave headroom for the read path.
 
 _warm_cache_semaphore: asyncio.Semaphore | None = None
 """Lazily-constructed (needs a running event loop). Re-bind on the first call."""
+
+_ProbeResult = TrackReleasesResponse | tuple[TrackReleasesResponse | None, str | None]
+"""Heterogeneous return type for the gathered probes in ``search_compilations_for_track``.
+
+The two artist-scoped probes return ``TrackReleasesResponse`` directly; the
+optional album-title probe returns ``tuple[TrackReleasesResponse | None,
+str | None]`` (response, error_str) via its catch-and-return wrapper. The
+gather sees the union; element-by-element narrowing happens via isinstance
+asserts at the call site.
+"""
+
 
 _background_tasks: set[asyncio.Task] = set()
 """References to fire-and-forget tasks scheduled by ``enrich_artwork_results``.
@@ -852,7 +864,10 @@ async def search_compilations_for_track(
                 return None, str(exc)
 
         if discogs_service:
-            probes: list[Any] = [
+            # Two artist-scoped probes return TrackReleasesResponse; the optional
+            # album-title probe returns tuple[TrackReleasesResponse | None, str | None].
+            # _ProbeResult (module-scope alias) captures the heterogeneous shape.
+            probes: list[Coroutine[Any, Any, _ProbeResult]] = [
                 discogs_service.search_releases_by_track(song_search, artist_for_probes),
                 discogs_service.search_releases_by_track(
                     song_search, artist_for_probes, artist_as_keyword=True
@@ -862,9 +877,15 @@ async def search_compilations_for_track(
                 probes.append(_album_title_probe_safe())
 
             gathered = await asyncio.gather(*probes)
+            # gathered[0] / gathered[1] are TrackReleasesResponse by construction
+            # (the order matches the `probes` list above); narrow via assert.
+            assert isinstance(gathered[0], TrackReleasesResponse)
+            assert isinstance(gathered[1], TrackReleasesResponse)
             response, va_response = gathered[0], gathered[1]
             if album_fallback_should_fire:
-                album_fallback_response, album_fallback_error = gathered[2]
+                probe_tuple = gathered[2]
+                assert isinstance(probe_tuple, tuple)
+                album_fallback_response, album_fallback_error = probe_tuple
             raw_releases = list(response.releases or [])
 
             # Only merge VA results if the artist-scoped search found no compilations
@@ -1013,11 +1034,8 @@ async def search_compilations_for_track(
         # benefit from supplementation.
         pre_fallback_results_count = len(results)
         # `album_fallback_should_fire` implies `parsed.album is not None`
-        # (see the precondition where the flag is set); the `assert` here
-        # narrows the type for both branches below.
-        if album_fallback_should_fire:
-            assert parsed.album is not None
-
+        # (see the precondition where the flag is set); each branch below
+        # re-asserts to narrow the type locally for the type-checker.
         if album_fallback_should_fire and album_fallback_error is not None:
             # The probe ran but raised; mirror the pre-#339 behavior of
             # logging via `_log_album_title_fallback(..., error=...)`.
