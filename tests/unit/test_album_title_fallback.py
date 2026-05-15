@@ -438,6 +438,75 @@ class TestAlbumTitleProbeConcurrency:
         )
 
     @pytest.mark.asyncio
+    async def test_speculative_probe_error_logged_even_when_wave_a_succeeds(self):
+        """New behavior introduced by #339: because the album-title probe now
+        fires speculatively in the same `asyncio.gather` as the artist-scoped
+        probes, a Discogs failure on the speculative probe is now observable
+        even when Wave A succeeded and the consume-gate would have skipped it.
+
+        Pre-#339 the fallback never ran in this scenario (the `not results`
+        gate suppressed both fire and log), so no error was visible. Post-#339
+        the probe DID run and DID raise, so the error path must call
+        `_log_album_title_fallback(..., error=...)` to surface it.
+        """
+        library_item = make_library_item(id=42, artist="A Real Artist", title="An Album")
+        db = AsyncMock()
+        db.search = AsyncMock(return_value=[library_item])
+
+        service = AsyncMock()
+        service.cache_service = AsyncMock()
+        service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
+        # Wave A succeeds — the library row id=42 is surfaced.
+        service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="A Song",
+                artist="A Real Artist",
+                releases=[
+                    ReleaseInfo(
+                        album="An Album",
+                        artist="A Real Artist",
+                        release_id=42,
+                        release_url="https://www.discogs.com/release/42",
+                    )
+                ],
+                total=1,
+            )
+        )
+        # The speculative album-title probe raises mid-gather.
+        service.search_releases_by_album_title = AsyncMock(
+            side_effect=RuntimeError("simulated Discogs failure")
+        )
+        service.validate_track_on_release = AsyncMock(return_value=True)
+
+        parsed = ParsedRequest(
+            artist="A Real Artist",
+            album="An Album",
+            song="A Song",
+            raw_message="A Real Artist - A Song",
+        )
+
+        with (
+            patch(
+                "lookup.orchestrator.lookup_releases_by_track",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch("lookup.orchestrator._log_album_title_fallback") as mock_log,
+        ):
+            results, _ = await search_compilations_for_track(db, parsed, discogs_service=service)
+
+        # Wave A's library row still surfaces (the speculative-probe failure
+        # must not affect the artist-scoped path).
+        assert any(r.id == 42 for r in results)
+        # The error path fires `_log_album_title_fallback(..., error=...)`.
+        mock_log.assert_called_once()
+        call_kwargs = mock_log.call_args.kwargs
+        assert call_kwargs["album"] == "An Album"
+        assert call_kwargs["n_candidates"] == 0
+        assert call_kwargs["surfaced_library_match"] is False
+        assert "simulated Discogs failure" in call_kwargs["error"]
+
+    @pytest.mark.asyncio
     async def test_album_title_probe_does_not_run_when_album_missing(self):
         """When ``parsed.album`` is None, peak concurrency is 2 — the album-title
         probe must not fire (no album to search by) and must not appear in the
