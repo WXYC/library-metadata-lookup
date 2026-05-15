@@ -6,16 +6,95 @@ Each strategy has explicit trigger conditions and can be easily tested in isolat
 Strategies are executed in array order until results are found.
 """
 
+import logging
+import os
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+import sentry_sdk
+
 from generated.api_models import TrackMatchHint
 from library.db import LibraryDB
 from library.models import LibraryItem
 from services.parser import ParsedRequest
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_SEARCH_BUDGET_MS = 4000
+"""Wall-clock budget for ``execute_search_pipeline``, in milliseconds.
+
+Leaves ~1s headroom under Backend-Service's current 5s LML runtime timeout
+(BS#873). Once WXYC/Backend-Service#876 (single coordinator) lands and the
+BS timeout normalizes, this value should move; in the meantime,
+``LML_SEARCH_BUDGET_MS`` overrides without a deploy.
+"""
+
+SEARCH_BUDGET_ENV_VAR = "LML_SEARCH_BUDGET_MS"
+
+
+def resolve_search_budget_ms() -> int:
+    """Return the active search budget in ms, honoring ``LML_SEARCH_BUDGET_MS``.
+
+    Unparseable or negative values fall back to :data:`DEFAULT_SEARCH_BUDGET_MS`
+    with a WARN — operator typos should not 500 every /lookup. Read per-call
+    (not at import) so tests can monkeypatch the env var without reaching into
+    module state.
+    """
+    raw = os.environ.get(SEARCH_BUDGET_ENV_VAR)
+    if raw is None:
+        return DEFAULT_SEARCH_BUDGET_MS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; falling back to %d",
+            SEARCH_BUDGET_ENV_VAR,
+            raw,
+            DEFAULT_SEARCH_BUDGET_MS,
+        )
+        return DEFAULT_SEARCH_BUDGET_MS
+    if value < 0:
+        logger.warning(
+            "%s=%d is negative; falling back to %d",
+            SEARCH_BUDGET_ENV_VAR,
+            value,
+            DEFAULT_SEARCH_BUDGET_MS,
+        )
+        return DEFAULT_SEARCH_BUDGET_MS
+    return value
+
+
+def _log_search_budget_exceeded(
+    *, elapsed_ms: float, skipped: list["SearchStrategyType"], budget_ms: int
+) -> None:
+    """Project a budget breach onto the active Sentry transaction.
+
+    Mirrors ``_log_album_title_fallback`` / ``_log_resolver_pre_pass`` in
+    ``lookup/orchestrator``: structured INFO log line plus two ``set_data``
+    keys on the active transaction so trace explorer can filter on
+    ``search_budget_exceeded:true`` without re-pulling Railway logs.
+
+    No-op when there is no active transaction. Any SDK error is swallowed so
+    observability cannot break /lookup.
+    """
+    payload = {
+        "elapsed_ms": round(elapsed_ms, 2),
+        "budget_ms": budget_ms,
+        "skipped": [s.value for s in skipped],
+    }
+    logger.info("search_budget_exceeded %s", payload)
+    try:
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is None:
+            return
+        transaction.set_data("search_budget_exceeded", True)
+        transaction.set_data("search_strategies_skipped", payload["skipped"])
+    except Exception as e:
+        logger.warning("Failed to project search_budget_exceeded onto Sentry transaction: %s", e)
 
 
 def detect_ambiguous_format(raw_message: str) -> tuple[str, str] | None:
@@ -334,7 +413,25 @@ async def execute_search_pipeline(
         song_not_found=song_not_found,
     )
 
-    for strategy in strategies:
+    budget_ms = resolve_search_budget_ms()
+    start = time.monotonic()
+
+    for idx, strategy in enumerate(strategies):
+        # Wall-clock gate. Two clauses, both load-bearing:
+        #   1. elapsed_ms > budget — we've spent more time than the caller is
+        #      willing to wait.
+        #   2. state.results is non-empty — we have *something* to return.
+        # When the second clause is false we keep grinding: the user gets
+        # "nothing" either way, and the next strategy might surface results.
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if elapsed_ms > budget_ms and state.results:
+            _log_search_budget_exceeded(
+                elapsed_ms=elapsed_ms,
+                skipped=[s.name for s in strategies[idx:]],
+                budget_ms=budget_ms,
+            )
+            break
+
         # Check if strategy should run
         if not strategy.condition(parsed, state, raw_message):
             continue
