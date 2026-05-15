@@ -520,3 +520,112 @@ class TestResolve:
         tokens = tokenize("[a41]")
         resolved = resolve(tokens)
         assert len(resolved) == 0
+
+
+# MARK: - CachedOnlyResolver Tests
+
+
+class TestCachedOnlyResolver:
+    """Adapter that consults DiscogsCacheService and never the API.
+
+    Used on the lookup read path so bio tokenization can't blow up tail
+    latency when an artist's profile mentions many entities. Cache misses
+    must surface as None (never raise) so parse_async drops the unresolved
+    token. Master IDs always resolve to None — the cache has no masters
+    table.
+    """
+
+    @pytest.mark.asyncio
+    async def test_resolves_artist_from_cache(self):
+        from unittest.mock import AsyncMock
+
+        from discogs.markup_parser import CachedOnlyResolver
+        from discogs.models import ArtistDetails
+
+        cache = AsyncMock()
+        cache.get_artist_details.return_value = ArtistDetails(artist_id=42, name="Stereolab")
+
+        resolver = CachedOnlyResolver(cache)
+        assert await resolver.resolve_artist(42) == "Stereolab"
+
+    @pytest.mark.asyncio
+    async def test_resolves_release_from_cache(self):
+        from unittest.mock import AsyncMock
+
+        from discogs.markup_parser import CachedOnlyResolver
+        from discogs.models import ReleaseMetadataResponse
+
+        cache = AsyncMock()
+        cache.get_release.return_value = ReleaseMetadataResponse(
+            release_id=10154369,
+            title="Aluminum Tunes",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/10154369",
+        )
+
+        resolver = CachedOnlyResolver(cache)
+        assert await resolver.resolve_release(10154369) == "Aluminum Tunes"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_cache_miss(self):
+        from unittest.mock import AsyncMock
+
+        from discogs.markup_parser import CachedOnlyResolver
+
+        cache = AsyncMock()
+        cache.get_artist_details.return_value = None
+        cache.get_release.return_value = None
+
+        resolver = CachedOnlyResolver(cache)
+        assert await resolver.resolve_artist(999) is None
+        assert await resolver.resolve_release(999) is None
+
+    @pytest.mark.asyncio
+    async def test_swallows_cache_exceptions(self):
+        """Observability-grade resilience: a cache outage on the read path
+        cannot raise. The bio just renders without resolved entity links.
+        """
+        from unittest.mock import AsyncMock
+
+        from discogs.markup_parser import CachedOnlyResolver
+
+        cache = AsyncMock()
+        cache.get_artist_details.side_effect = RuntimeError("PG connection lost")
+        cache.get_release.side_effect = RuntimeError("PG connection lost")
+
+        resolver = CachedOnlyResolver(cache)
+        assert await resolver.resolve_artist(42) is None
+        assert await resolver.resolve_release(99) is None
+
+    @pytest.mark.asyncio
+    async def test_master_always_none(self):
+        """The discogs-cache has no masters table; always return None."""
+        from unittest.mock import AsyncMock
+
+        from discogs.markup_parser import CachedOnlyResolver
+
+        cache = AsyncMock()
+        resolver = CachedOnlyResolver(cache)
+        assert await resolver.resolve_master(12345) is None
+        # And must not have consulted the cache for masters either.
+        cache.get_release.assert_not_called()
+        cache.get_artist_details.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_integrates_with_parse_async(self):
+        """End-to-end: parse_async with CachedOnlyResolver produces typed
+        tokens for cache hits and drops cache misses."""
+        from unittest.mock import AsyncMock
+
+        from discogs.markup_parser import CachedOnlyResolver, parse_async
+        from discogs.models import ArtistDetails
+
+        cache = AsyncMock()
+        cache.get_artist_details.return_value = ArtistDetails(artist_id=42, name="Stereolab")
+        cache.get_release.return_value = None  # unknown
+
+        tokens = await parse_async("Featuring [a42] from [r999999]", CachedOnlyResolver(cache))
+
+        kinds = [type(t).__name__ for t in tokens]
+        assert "ArtistLinkToken" in kinds
+        assert "ReleaseLinkToken" not in kinds

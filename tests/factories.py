@@ -45,7 +45,13 @@ def make_catalog_item(id=1, artist="Stereolab", title="Aluminum Tunes", **kwargs
 
 
 def make_match_result(release_id=123, **kwargs):
-    """Build a DiscogsMatchResult (API contract model) with sensible defaults."""
+    """Build a DiscogsMatchResult (API contract model) with sensible defaults.
+
+    Extended-metadata fields (discogs_artist_id, tracklist, genres, styles,
+    label, full_release_date, artist_image_url, profile_tokens) default to
+    None — the API contract treats them as opt-in for `extended=true`
+    lookups. Pass them through ``kwargs`` to assert on their shape.
+    """
     defaults = {
         "release_url": f"https://discogs.com/release/{release_id}",
         "album": "Aluminum Tunes",

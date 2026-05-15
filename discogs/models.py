@@ -201,6 +201,18 @@ class DiscogsSearchResult(BaseModel):
     youtube_music_url: str | None = None
     bandcamp_url: str | None = None
     soundcloud_url: str | None = None
+    # Extended fields (populated only when LookupRequest.extended=True). LML
+    # already loads release + artist details during the streaming-URL
+    # enrichment pass; these stash the rest of the payload so the response
+    # can carry a full playcut metadata blob without a follow-up call.
+    discogs_artist_id: int | None = None
+    tracklist: list[DiscogsTrackItem] | None = None
+    genres: list[str] | None = None
+    styles: list[str] | None = None
+    label: str | None = None
+    full_release_date: str | None = None
+    artist_image_url: str | None = None
+    profile_tokens: list[ResolvedToken] | None = None
 
     def to_match_result(self) -> EnrichedDiscogsMatchResult:
         """Convert to the enriched API contract model."""
@@ -219,6 +231,14 @@ class DiscogsSearchResult(BaseModel):
             youtube_music_url=self.youtube_music_url,
             bandcamp_url=self.bandcamp_url,
             soundcloud_url=self.soundcloud_url,
+            discogs_artist_id=self.discogs_artist_id,
+            tracklist=self.tracklist,
+            genres=self.genres,
+            styles=self.styles,
+            label=self.label,
+            full_release_date=self.full_release_date,
+            artist_image_url=self.artist_image_url,
+            profile_tokens=self.profile_tokens,
         )
 
 
@@ -235,6 +255,12 @@ class EnrichedDiscogsMatchResult(_GeneratedDiscogsMatchResult):
 
     Subclasses the generated model so it passes Pydantic validation wherever
     DiscogsMatchResult is expected (e.g., LookupResultItem.artwork).
+
+    ``profile_tokens`` is narrowed from the generated permissive
+    ``DiscogsResolvedToken`` (single class, all-optional fields) to the
+    local ``ResolvedToken`` discriminated union so per-variant access stays
+    type-safe. Wire JSON is identical — both serialize with only the
+    populated per-variant fields.
     """
 
     release_year: int | None = None
@@ -245,3 +271,7 @@ class EnrichedDiscogsMatchResult(_GeneratedDiscogsMatchResult):
     youtube_music_url: str | None = None
     bandcamp_url: str | None = None
     soundcloud_url: str | None = None
+    # Intentional narrowing from the generated permissive DiscogsResolvedToken
+    # (flat class, all-optional fields) to the local discriminated union, for
+    # type-safe per-variant access. Wire JSON is identical.
+    profile_tokens: list[ResolvedToken] | None = None  # type: ignore[assignment]
