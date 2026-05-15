@@ -42,8 +42,8 @@ All strategy implementations live in `lookup/orchestrator.py`.
 - `lookup/router.py` -- `POST /lookup` endpoint
 - `library/db.py` -- SQLite FTS5 search with LIKE + fuzzy fallback chain. Detects `compilation_track_artist` table at connect time; when present, artist searches include compilations featuring that artist via JOIN/UNION.
 - `discogs/service.py` -- Discogs API client with optional PostgreSQL cache
-- `discogs/cache_service.py` -- PostgreSQL cache (asyncpg + pg_trgm)
-- `discogs/memory_cache.py` -- In-memory TTL cache (cachetools)
+- `discogs/cache_service.py` -- PostgreSQL cache (asyncpg + pg_trgm). Tier 5 in the [org cache-hierarchy reference](https://github.com/WXYC/wiki/blob/main/architecture/cache-hierarchy.md).
+- `discogs/memory_cache.py` -- In-memory TTL cache (cachetools). Tier 4 in the [org cache-hierarchy reference](https://github.com/WXYC/wiki/blob/main/architecture/cache-hierarchy.md); per-cache TTLs + maxsizes documented there with the upstream and downstream tiers in context.
 - `core/search.py` -- Declarative search strategy pattern + ambiguous format detection
 - `discogs/markup_parser.py` -- Discogs markup parser: tokenize/resolve `[a=Name]`, `[a12345]`, `[b]...[/b]`, etc. into structured `ResolvedToken` models. Includes `EntityResolver` protocol and `DiscogsServiceResolver` adapter for async ID resolution. Translated from iOS `DiscogsMarkupParser.swift`.
 - `discogs/matching.py` -- Discogs-specific normalization (strip_discogs_suffix, normalize_for_track_comparison, normalize_artist_for_validation)
