@@ -15,6 +15,7 @@ intentionally has matching artist and album strings.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -227,15 +228,14 @@ class TestAlbumTitleFallback:
         )
 
     @pytest.mark.asyncio
-    async def test_fallback_skipped_when_library_match_already_found(self):
-        """The gate fires on ``not results`` (no library matches were
-        produced), not ``not raw_releases``. (The gate name changed in #322;
-        the prior incarnation tested the Discogs-response-empty condition,
-        which no longer matches reality after Discogs added a canonical
-        trio entity.) When the artist-scoped probes' candidates DO turn
-        into a library match via the existing pipeline, the fallback adds
-        no value and should not fire — its cost is one extra Discogs API
-        call per fire."""
+    async def test_fallback_not_consumed_when_library_match_already_found(self):
+        """The consume-gate fires on ``not results`` (no library matches were
+        produced from the artist-scoped probes). Since #339 the album-title
+        probe runs *speculatively* in the same `asyncio.gather` as the
+        artist-scoped probes — paying its API cost up front to save the
+        sequential-wait latency. The library match here is found by Wave A,
+        so the fallback's *results* must not surface, even though its API
+        call was made."""
         library_item = make_library_item(id=42, artist="A Real Artist", title="An Album")
         db = AsyncMock()
         db.search = AsyncMock(return_value=[library_item])
@@ -276,7 +276,9 @@ class TestAlbumTitleFallback:
             results, _ = await search_compilations_for_track(db, parsed, discogs_service=service)
 
         assert any(r.id == 42 for r in results)
-        service.search_releases_by_album_title.assert_not_called()
+        # The probe IS called speculatively (#339); the consume-gate, not the
+        # fire-gate, is what prevents its (empty) result from surfacing.
+        service.search_releases_by_album_title.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_trio_release_surfaces_through_fallback_with_mismatching_library_artist(
@@ -369,3 +371,110 @@ class TestAlbumTitleFallback:
             )
 
         assert not any(r.id == 34993109 for r in results)
+
+
+class TestAlbumTitleProbeConcurrency:
+    """Acceptance check for WXYC/library-metadata-lookup#339 (A2).
+
+    The album-title probe must fire in the same ``asyncio.gather`` as the
+    two artist-scoped probes when its preconditions (``parsed.album`` set
+    and resolver did not swap) are met — otherwise cold-cache wall time
+    is ``A + B + C`` instead of ``max(A, B, C)``. The trade-off is one
+    speculative API call when Wave A succeeds; that call warms LML's
+    cache and is counted as cheap.
+    """
+
+    @pytest.mark.asyncio
+    async def test_album_title_probe_runs_in_parallel_with_track_probes(self):
+        """All three Discogs probes are in-flight concurrently."""
+        active = {"count": 0, "peak": 0}
+
+        def make_probe_mock(response: TrackReleasesResponse):
+            async def _probe(*_args, **_kwargs):
+                active["count"] += 1
+                active["peak"] = max(active["peak"], active["count"])
+                # Yield twice so the other gathered coroutines get scheduled
+                # before this one returns. One ``sleep(0)`` is enough for the
+                # second sibling to enter; the second ``sleep(0)`` covers the
+                # third (the album-title probe).
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                active["count"] -= 1
+                return response
+
+            return _probe
+
+        db = AsyncMock()
+        db.search = AsyncMock(return_value=[])
+
+        service = AsyncMock()
+        service.cache_service = AsyncMock()
+        service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
+        service.search_releases_by_track = AsyncMock(side_effect=make_probe_mock(_empty_response()))
+        service.search_releases_by_album_title = AsyncMock(
+            side_effect=make_probe_mock(_empty_response())
+        )
+        service.validate_track_on_release = AsyncMock(return_value=True)
+
+        parsed = ParsedRequest(
+            artist="Obscure Artist",
+            album="An Album",
+            song="A Song",
+            raw_message="Obscure Artist - A Song",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            await search_compilations_for_track(db, parsed, discogs_service=service)
+
+        assert active["peak"] == 3, (
+            "Expected all three probes (two artist-scoped + album-title fallback) "
+            f"to be in-flight concurrently, but peak concurrency was {active['peak']}. "
+            "If this is 2, the album-title probe is still sequential and the "
+            "A2 optimization didn't land."
+        )
+
+    @pytest.mark.asyncio
+    async def test_album_title_probe_does_not_run_when_album_missing(self):
+        """When ``parsed.album`` is None, peak concurrency is 2 — the album-title
+        probe must not fire (no album to search by) and must not appear in the
+        gather."""
+        active = {"count": 0, "peak": 0}
+
+        async def _probe(*_args, **_kwargs):
+            active["count"] += 1
+            active["peak"] = max(active["peak"], active["count"])
+            await asyncio.sleep(0)
+            active["count"] -= 1
+            return _empty_response()
+
+        db = AsyncMock()
+        db.search = AsyncMock(return_value=[])
+
+        service = AsyncMock()
+        service.cache_service = AsyncMock()
+        service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
+        service.search_releases_by_track = AsyncMock(side_effect=_probe)
+        service.search_releases_by_album_title = AsyncMock(side_effect=_probe)
+
+        parsed = ParsedRequest(
+            artist="Obscure Artist",
+            song="A Song",
+            raw_message="Obscure Artist - A Song",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            await search_compilations_for_track(db, parsed, discogs_service=service)
+
+        assert active["peak"] == 2, (
+            "When parsed.album is missing, only the two artist-scoped probes "
+            f"should fire (peak == 2), but observed peak {active['peak']}."
+        )
+        service.search_releases_by_album_title.assert_not_called()
