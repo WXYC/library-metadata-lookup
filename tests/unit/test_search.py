@@ -559,6 +559,28 @@ class TestSearchBudget:
         monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "not-a-number")
         assert resolve_search_budget_ms() == DEFAULT_SEARCH_BUDGET_MS
 
+    def test_resolve_search_budget_ms_negative_falls_back(self, monkeypatch):
+        """Negative values fall back to the default with a WARN.
+
+        A negative budget would make `elapsed_ms > budget_ms` true on the very
+        first iteration, short-circuiting every request that produced results
+        from strategy 1 — almost certainly not what the operator intended.
+        """
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "-500")
+        assert resolve_search_budget_ms() == DEFAULT_SEARCH_BUDGET_MS
+
+    def test_resolve_search_budget_ms_zero_falls_back(self, monkeypatch):
+        """Zero is also a misconfiguration; falls back to the default.
+
+        With budget=0 the gate fires on the second iteration after any prior
+        strategy returned results, because `elapsed_ms > 0` after any await.
+        Operators reaching for `0` typically mean "disable" — we redirect to
+        the default and WARN. Disabling for real means setting the budget
+        well above the request timeout.
+        """
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "0")
+        assert resolve_search_budget_ms() == DEFAULT_SEARCH_BUDGET_MS
+
     @pytest.mark.asyncio
     async def test_budget_exceeded_skips_remaining_strategies(self, monkeypatch):
         """Slow strategy + prior results → subsequent strategies skipped, telemetry set.
@@ -739,6 +761,49 @@ class TestSearchBudget:
         mock_scope.transaction = None  # no active transaction
 
         with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
+            state = await execute_search_pipeline(
+                parsed,
+                AsyncMock(),
+                "Stereolab - Miss Modular",
+                strategies,
+                song_not_found=True,
+            )
+
+        # No crash; pipeline still surfaces the prior strategy's results.
+        assert state.results == [first_hit]
+
+    @pytest.mark.asyncio
+    async def test_budget_breach_swallows_sentry_sdk_errors(self, monkeypatch):
+        """Sentry SDK raising inside the projection path doesn't break /lookup.
+
+        The docstring on `_log_search_budget_exceeded` promises any SDK error
+        is swallowed. Pin that promise: if `get_current_scope` itself raises,
+        the pipeline still returns prior results normally.
+        """
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "1")
+
+        first_hit = _item(id=1, artist="Stereolab", title="Dots and Loops")
+
+        async def slow_first(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            return ([first_hit], False)
+
+        search_lib = AsyncMock(side_effect=slow_first)
+        search_alt = AsyncMock(return_value=([], None))
+        search_comp = AsyncMock(return_value=([], {}))
+
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Stereolab",
+            song="Miss Modular",
+            raw_message="Stereolab - Miss Modular",
+        )
+
+        with patch(
+            "core.search.sentry_sdk.get_current_scope",
+            side_effect=RuntimeError("sentry exploded"),
+        ):
             state = await execute_search_pipeline(
                 parsed,
                 AsyncMock(),

@@ -57,9 +57,15 @@ def resolve_search_budget_ms() -> int:
             DEFAULT_SEARCH_BUDGET_MS,
         )
         return DEFAULT_SEARCH_BUDGET_MS
-    if value < 0:
+    if value <= 0:
+        # Zero is treated as a misconfiguration alongside negatives: with budget=0
+        # the gate fires after the first strategy that returns results, no matter
+        # how fast it ran, because `elapsed_ms > 0` after any await. Operators
+        # reaching for 0 typically mean "disable" — neither behavior is what they
+        # want, so we fall back to the default and WARN. To disable in practice,
+        # set the budget far above the request timeout (e.g. 60000).
         logger.warning(
-            "%s=%d is negative; falling back to %d",
+            "%s=%d is not positive; falling back to %d",
             SEARCH_BUDGET_ENV_VAR,
             value,
             DEFAULT_SEARCH_BUDGET_MS,
