@@ -5,9 +5,12 @@ Covers: artist links, bold/italic/underline formatting, label links,
 URL links, release/master links, edge cases, async entity resolution.
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from discogs.markup_parser import (
+    CachedOnlyResolver,
     _ArtistId,
     _ArtistName,
     _PlainText,
@@ -18,6 +21,7 @@ from discogs.markup_parser import (
     tokenize,
 )
 from discogs.models import (
+    ArtistDetails,
     ArtistLinkToken,
     BoldToken,
     ItalicToken,
@@ -25,6 +29,7 @@ from discogs.models import (
     MasterLinkToken,
     PlainTextToken,
     ReleaseLinkToken,
+    ReleaseMetadataResponse,
     ResolvedToken,
     UnderlineToken,
     UrlLinkToken,
@@ -537,11 +542,6 @@ class TestCachedOnlyResolver:
 
     @pytest.mark.asyncio
     async def test_resolves_artist_from_cache(self):
-        from unittest.mock import AsyncMock
-
-        from discogs.markup_parser import CachedOnlyResolver
-        from discogs.models import ArtistDetails
-
         cache = AsyncMock()
         cache.get_artist_details.return_value = ArtistDetails(artist_id=42, name="Stereolab")
 
@@ -550,11 +550,6 @@ class TestCachedOnlyResolver:
 
     @pytest.mark.asyncio
     async def test_resolves_release_from_cache(self):
-        from unittest.mock import AsyncMock
-
-        from discogs.markup_parser import CachedOnlyResolver
-        from discogs.models import ReleaseMetadataResponse
-
         cache = AsyncMock()
         cache.get_release.return_value = ReleaseMetadataResponse(
             release_id=10154369,
@@ -568,10 +563,6 @@ class TestCachedOnlyResolver:
 
     @pytest.mark.asyncio
     async def test_returns_none_on_cache_miss(self):
-        from unittest.mock import AsyncMock
-
-        from discogs.markup_parser import CachedOnlyResolver
-
         cache = AsyncMock()
         cache.get_artist_details.return_value = None
         cache.get_release.return_value = None
@@ -585,10 +576,6 @@ class TestCachedOnlyResolver:
         """Observability-grade resilience: a cache outage on the read path
         cannot raise. The bio just renders without resolved entity links.
         """
-        from unittest.mock import AsyncMock
-
-        from discogs.markup_parser import CachedOnlyResolver
-
         cache = AsyncMock()
         cache.get_artist_details.side_effect = RuntimeError("PG connection lost")
         cache.get_release.side_effect = RuntimeError("PG connection lost")
@@ -600,10 +587,6 @@ class TestCachedOnlyResolver:
     @pytest.mark.asyncio
     async def test_master_always_none(self):
         """The discogs-cache has no masters table; always return None."""
-        from unittest.mock import AsyncMock
-
-        from discogs.markup_parser import CachedOnlyResolver
-
         cache = AsyncMock()
         resolver = CachedOnlyResolver(cache)
         assert await resolver.resolve_master(12345) is None
@@ -615,11 +598,6 @@ class TestCachedOnlyResolver:
     async def test_integrates_with_parse_async(self):
         """End-to-end: parse_async with CachedOnlyResolver produces typed
         tokens for cache hits and drops cache misses."""
-        from unittest.mock import AsyncMock
-
-        from discogs.markup_parser import CachedOnlyResolver, parse_async
-        from discogs.models import ArtistDetails
-
         cache = AsyncMock()
         cache.get_artist_details.return_value = ArtistDetails(artist_id=42, name="Stereolab")
         cache.get_release.return_value = None  # unknown

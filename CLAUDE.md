@@ -13,7 +13,13 @@ Library Metadata Lookup is a FastAPI service for WXYC radio that searches the li
 3. **Search Pipeline**: Execute strategies in order until results are found (see below)
 4. **Track Validation**: If fallback returned all artist albums, validate each against Discogs tracklists. When validation can't confirm any candidate AND we're showing artist-fallback results, `find_library_albums_with_cached_track()` consults the local PG cache directly ("releases by this artist whose tracklist contains this song") and promotes any matching library album over the unrelated fallback. Cache-only — never falls back to the API.
 5. **Artwork Fetch**: Fetch album art from Discogs for each result
-6. **Context Message**: Generate context string for the caller
+6. **Metadata Enrichment**: Populate `release_year`, `artist_bio`, `wikipedia_url`, streaming URLs. Release/artist details are fetched only for `items_with_artwork[0]` — BS/iOS only consume the top-1 result, so paying N Discogs round-trips for non-top-1 items is waste. Streaming-URL fallbacks stay per-result. Gating is *positional*: if the top-1 entry has `artwork=None`, no item carries release-year/bio/wiki, even if items further down have artwork. The lookup pipeline guarantees the strongest match is in position 0, so this is fine in practice. See `enrich_artwork_results()` in `lookup/orchestrator.py`.
+7. **Context Message**: Generate context string for the caller
+
+#### `LookupRequest` opt-in flags
+
+- `extended: bool` (default `false`) — When true, the top-1 result's `artwork` block carries additional fields LML already loads during enrichment but normally discards: `discogs_artist_id`, `tracklist`, `genres`, `styles`, `label`, `full_release_date`, `artist_image_url`, `profile_tokens`. Bio parsing uses `CachedOnlyResolver` (cache-only deep parse) when `DATABASE_URL_DISCOGS` is set; falls back to sync `parse()` otherwise. Designed to let Backend-Service collapse `/proxy/metadata/album` to one LML call, eliminating the follow-up `/discogs/release/{id}` and `/discogs/artist/{id}` round-trips.
+- `warm_cache: bool` (default `false`) — When true, schedules a fire-and-forget `asyncio.create_task` after the response is composed that runs the *deep* async parse (API-capable resolver) on the top-1 bio. Warms the PG cache for `[a…]`/`[r…]`/`[m…]` references so subsequent reads render richer. Bounded process-wide by `_WARM_CACHE_CONCURRENCY` (currently 4) to cap Discogs API amplification. Read-path callers leave this `false`; write-path callers (Backend-Service's `flowsheet-linkage.service.ts` on flowsheet-entry creation) set it `true`.
 
 ### Search Strategy Pipeline
 

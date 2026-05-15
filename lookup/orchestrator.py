@@ -30,6 +30,7 @@ from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
 from discogs.markup_parser import (
     CachedOnlyResolver,
     DiscogsServiceResolver,
+    parse,
     parse_async,
 )
 from discogs.memory_cache import create_ttl_cache, should_skip_cache
@@ -67,6 +68,31 @@ MAX_SEARCH_RESULTS = 5
 
 SELF_TITLED_PATTERNS = frozenset({"s/t", "s.t.", "self-titled", "self titled"})
 """Common abbreviations for self-titled albums (case-insensitive exact match)."""
+
+_WARM_CACHE_CONCURRENCY: int = 4
+"""Process-wide cap on concurrent bio cache-warm tasks.
+
+A single warm task can fan out to many Discogs API calls (one per
+unresolved `[a…]`/`[r…]`/`[m…]` ref the local cache misses). The semaphore
+bounds the total in-flight API load when several flowsheet entries get
+committed in quick succession. 4 is conservative — Discogs's published
+rate limit is 60 RPM authenticated; warm bursts at 4 concurrent × a few
+refs each still leave headroom for the read path.
+"""
+
+_warm_cache_semaphore: asyncio.Semaphore | None = None
+"""Lazily-constructed (needs a running event loop). Re-bind on the first call."""
+
+_background_tasks: set[asyncio.Task] = set()
+"""References to fire-and-forget tasks scheduled by ``enrich_artwork_results``.
+
+`asyncio.create_task` returns weak references — without anchoring the
+task somewhere strong, the GC can reap it mid-execution and the warm
+silently drops. The standard pattern is a module-level set; each task
+removes itself in a done_callback. See
+https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+"""
+
 
 CANONICAL_ARTIST_SIMILARITY_FLOOR: float = 0.70
 """Trigram-similarity floor for swapping an inbound artist name with its canonical
@@ -1360,7 +1386,7 @@ async def enrich_artwork_results(
     *,
     extended: bool = False,
     warm_cache: bool = False,
-    discogs_cache: "DiscogsCacheService | None" = None,
+    discogs_cache: DiscogsCacheService | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
@@ -1371,26 +1397,38 @@ async def enrich_artwork_results(
     Search probe. Passing ``None`` skips the Apple Music lookup — the
     orchestrator never instantiates its own client (issue #241).
 
-    Release/artist details (year, bio, wikipedia URL) are fetched only for
-    ``items_with_artwork[0]`` — BS/iOS only consume the top-1 result, so
-    paying N round-trips of Discogs cache (and on miss, API) latency for
-    non-top-1 items was waste. Streaming-URL fallbacks stay per-result
-    (cheap; no I/O).
+    **Behavior change vs. v0.5.0:** release/artist details (release_year,
+    artist_bio, wikipedia_url) are fetched only for ``items_with_artwork[0]``.
+    BS/iOS only consume the top-1 result, so paying N round-trips of Discogs
+    cache (and on miss, API) latency for non-top-1 items was waste. The
+    streaming-URL fallback build still runs per-result (cheap; no I/O).
+    Gating is *positional*: a top-1 entry with ``artwork=None`` means no
+    item in the response carries release-year/bio/wiki, even when items
+    further down have artwork. BS/iOS only ever read ``results[0]`` so
+    this is fine in practice; the lookup pipeline guarantees the strongest
+    match is in position 0.
 
     ``extended=True`` additionally populates the new DiscogsMatchResult
     fields LML already loaded during the release+artist fetches:
     ``discogs_artist_id``, ``tracklist``, ``genres``, ``styles``, ``label``,
     ``full_release_date``, ``artist_image_url``, ``profile_tokens``. Bio
-    parsing uses a cache-only resolver — refs that miss fall through as
-    plain text, never trigger an inline Discogs API call.
+    parsing uses ``CachedOnlyResolver`` when ``discogs_cache`` is provided
+    — refs that miss the cache fall through as plain text, never trigger
+    an inline Discogs API call. When ``discogs_cache`` is None (LML
+    deployed without ``DATABASE_URL_DISCOGS``), bio parsing falls back to
+    sync ``parse()`` which strips ID-based refs but keeps name-based and
+    formatting tokens, so ``profile_tokens`` is still non-None for
+    consistent client-side rendering.
 
-    ``warm_cache=True`` schedules an ``asyncio.create_task`` after the
-    response is composed that runs the *deep* async parse against the
-    API-capable resolver, warming the PG cache for referenced entities so
-    subsequent read-path lookups render richer. The task is not awaited —
-    write-path callers (Backend-Service's flowsheet-linkage service) pay
-    zero added latency. The task wraps its body in try/except and logs
-    failures via ``logger.exception`` so a stuck warm doesn't go silent.
+    ``warm_cache=True`` schedules a fire-and-forget ``asyncio.create_task``
+    after the response is composed that runs the *deep* async parse
+    against the API-capable resolver, warming the PG cache for referenced
+    entities so subsequent read-path lookups render richer. The task is
+    not awaited — write-path callers (Backend-Service's flowsheet-linkage
+    service) pay zero added latency. Concurrent warm tasks are bounded by
+    ``_WARM_CACHE_CONCURRENCY`` to cap Discogs API amplification under
+    burst load. Failures are logged via ``logger.exception`` so a stuck
+    warm doesn't go silent.
     """
     if not discogs_service or not items_with_artwork:
         return items_with_artwork
@@ -1401,8 +1439,8 @@ async def enrich_artwork_results(
         int | None,
         str | None,
         str | None,
-        "ReleaseMetadataResponse | None",
-        "ArtistDetails | None",
+        ReleaseMetadataResponse | None,
+        ArtistDetails | None,
     ]:
         """Returns (year, artist_bio, wikipedia_url, release, details) for the top-1 result.
 
@@ -1440,13 +1478,19 @@ async def enrich_artwork_results(
 
     # Cache-only deep parse of the top-1 bio for the extended path. Refs
     # that miss the cache fall through; we never fire a new API call here.
+    # When the PG cache is unavailable (no DATABASE_URL_DISCOGS), fall
+    # back to sync parse() — drops ID-based refs but keeps name and
+    # formatting tokens, so clients still get structured rendering.
     top1_profile_tokens: list[ResolvedToken] | None = None
-    if extended and top1_bio and discogs_cache is not None:
-        try:
-            top1_profile_tokens = await parse_async(top1_bio, CachedOnlyResolver(discogs_cache))
-        except Exception:
-            logger.exception("Cache-only bio parse failed; falling back to no tokens")
-            top1_profile_tokens = None
+    if extended and top1_bio:
+        if discogs_cache is not None:
+            try:
+                top1_profile_tokens = await parse_async(top1_bio, CachedOnlyResolver(discogs_cache))
+            except Exception:
+                logger.exception("Cache-only bio parse failed; falling back to sync parse")
+                top1_profile_tokens = parse(top1_bio)
+        else:
+            top1_profile_tokens = parse(top1_bio)
 
     async def enrich_one(
         item: LibraryItem,
@@ -1510,7 +1554,7 @@ async def enrich_artwork_results(
                     "https://soundcloud.com/search?q=", artist, search_term
                 )
 
-        update: dict = {
+        update: dict[str, Any] = {
             "release_year": year_result,
             "artist_bio": artist_bio,
             "wikipedia_url": wikipedia_url,
@@ -1552,27 +1596,37 @@ async def enrich_artwork_results(
     # Write-path warm: fire-and-forget deep async parse of the top-1 bio
     # using the API-capable resolver, so the PG cache gets populated for
     # `[a…]`/`[r…]`/`[m…]` references. The task is intentionally not
-    # awaited — read-path latency is unaffected.
+    # awaited — read-path latency is unaffected. The task reference is
+    # parked in ``_background_tasks`` so the GC can't reap it mid-flight
+    # (asyncio holds only weak refs to tasks).
     if warm_cache and top1_bio:
-        asyncio.create_task(_warm_bio_cache(top1_bio, discogs_service))
+        task = asyncio.create_task(_warm_bio_cache(top1_bio, discogs_service))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     return list(enriched)
 
 
-async def _warm_bio_cache(bio: str, discogs_service: "DiscogsService") -> None:
+async def _warm_bio_cache(bio: str, discogs_service: DiscogsService) -> None:
     """Background task: deep-async parse of an artist bio to warm caches.
 
     Resolves every `[a<id>]` / `[r<id>]` / `[m<id>]` reference through
     ``DiscogsServiceResolver`` (cache → API → cache write-back), so
     subsequent ``parse_async(..., CachedOnlyResolver)`` calls on this bio
-    return typed tokens instead of plain text. Errors are logged and
-    swallowed — the task must never propagate to the event loop.
+    return typed tokens instead of plain text. Bounded by the module-level
+    semaphore to cap concurrent Discogs API amplification under burst
+    load. Errors are logged and swallowed — the task must never propagate
+    to the event loop. No Sentry tag is set here: the request scope has
+    long since closed by the time this runs, so a tag on the active scope
+    would land on whatever unrelated request is running next.
     """
+    global _warm_cache_semaphore
+    if _warm_cache_semaphore is None:
+        _warm_cache_semaphore = asyncio.Semaphore(_WARM_CACHE_CONCURRENCY)
     try:
-        await parse_async(bio, DiscogsServiceResolver(discogs_service))
-        sentry_sdk.set_tag("lml.lookup.cache_warm_status", "success")
+        async with _warm_cache_semaphore:
+            await parse_async(bio, DiscogsServiceResolver(discogs_service))
     except Exception:
-        sentry_sdk.set_tag("lml.lookup.cache_warm_status", "error")
         logger.exception("Background bio cache-warm failed")
 
 
@@ -1791,6 +1845,12 @@ async def perform_lookup(
                 library_results, discogs_service, discogs_titles
             )
 
+    # The generated LookupRequest models these as bool | None (api.yaml
+    # describes them with `default: false` but the field is not in the
+    # required set, so callers can omit them). Coerce once and reuse.
+    extended_mode = bool(request.extended)
+    warm_cache_mode = bool(request.warm_cache)
+
     # Step 4b: Enrich with release year, artist details, streaming links
     with telemetry.track_step("metadata_enrichment"):
         if items_with_artwork:
@@ -1800,8 +1860,8 @@ async def perform_lookup(
                 song=parsed.song,
                 library_db=db,
                 http_client=http_client,
-                extended=bool(request.extended),
-                warm_cache=bool(request.warm_cache),
+                extended=extended_mode,
+                warm_cache=warm_cache_mode,
                 discogs_cache=discogs_cache,
             )
 
@@ -1811,8 +1871,8 @@ async def perform_lookup(
     try:
         scope = sentry_sdk.get_current_scope()
         if scope.transaction is not None:
-            scope.transaction.set_data("lml.lookup.extended", bool(request.extended))
-            scope.transaction.set_data("lml.lookup.warm_cache", bool(request.warm_cache))
+            scope.transaction.set_data("lml.lookup.extended", extended_mode)
+            scope.transaction.set_data("lml.lookup.warm_cache", warm_cache_mode)
     except Exception:
         # Observability must not break the request path.
         pass
