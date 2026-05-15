@@ -486,6 +486,168 @@ class TestEnrichArtworkResultsExtended:
         assert results == []
 
     @pytest.mark.asyncio
+    async def test_warm_cache_with_empty_bio_does_not_schedule(self):
+        """warm_cache=True must not schedule the task when the top-1 bio is
+        empty/None. Otherwise the warm task fires `parse_async("", …)` which
+        wastes a coroutine creation and amplifies nothing.
+        """
+        item = make_library_item()
+        artwork = make_discogs_result()
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=123,
+            title="x",
+            artist="x",
+            year=2020,
+            artist_id=42,
+            release_url="https://discogs.com/release/123",
+        )
+        # Artist details with no profile bio — top1_bio resolves to None.
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=42, name="x", profile=None
+        )
+
+        scheduled: list[asyncio.Task] = []
+        original_create_task = asyncio.create_task
+
+        def spy_create_task(coro, *args, **kwargs):
+            task = original_create_task(coro, *args, **kwargs)
+            scheduled.append(task)
+            return task
+
+        with (
+            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
+            patch("lookup.orchestrator.asyncio.create_task", side_effect=spy_create_task),
+        ):
+            await enrich_artwork_results(
+                [(item, artwork)], discogs_service, extended=True, warm_cache=True
+            )
+
+        assert len(scheduled) == 0
+
+    @pytest.mark.asyncio
+    async def test_warm_task_anchored_so_gc_cannot_reap_it(self):
+        """asyncio.create_task returns a weak reference. The orchestrator
+        must park the task in a strong-ref container until it completes,
+        or the GC can drop the warm mid-execution. Verify the task lands
+        in the module-level set and is removed via the done_callback.
+        """
+        from lookup.orchestrator import _background_tasks
+
+        item = make_library_item()
+        artwork = make_discogs_result()
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=123,
+            title="x",
+            artist="x",
+            year=2020,
+            artist_id=42,
+            release_url="https://discogs.com/release/123",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=42, name="x", profile="Bio."
+        )
+
+        snapshot_before = set(_background_tasks)
+
+        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
+            await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                extended=True,
+                warm_cache=True,
+            )
+
+        # The task is anchored in _background_tasks at scheduling time.
+        added = _background_tasks - snapshot_before
+        assert len(added) == 1
+        # Drain so the done_callback runs and the task is removed.
+        await asyncio.gather(*added, return_exceptions=True)
+        # After completion, the set must shrink back — leaving no leak.
+        assert (_background_tasks - snapshot_before) == set()
+
+    @pytest.mark.asyncio
+    async def test_extended_falls_back_to_sync_parse_without_cache(self):
+        """When discogs_cache is None (LML deployed without
+        DATABASE_URL_DISCOGS), bio parsing falls back to sync parse() so
+        profile_tokens is non-None and consistent for client rendering.
+        Sync parse() drops ID-based refs but keeps name and formatting
+        tokens.
+        """
+        item = make_library_item()
+        artwork = make_discogs_result()
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=123,
+            title="x",
+            artist="x",
+            year=2020,
+            artist_id=42,
+            release_url="https://discogs.com/release/123",
+        )
+        # Bio with both name-based ([a=Name], renders) and id-based ([a42],
+        # dropped) refs plus a bold span (kept).
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=42,
+            name="Stereolab",
+            profile="Members [a=Tim Gane] and [a42]. [b]Active since 1990.[/b]",
+        )
+
+        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                extended=True,
+                discogs_cache=None,  # Explicit: no cache available
+            )
+
+        _, enriched = results[0]
+        assert enriched.profile_tokens is not None
+        kinds = [type(t).__name__ for t in enriched.profile_tokens]
+        # Name-based artist ref kept; id-based ref dropped (sync parse).
+        assert kinds.count("ArtistLinkToken") == 1
+        # Bold formatting kept.
+        assert "BoldToken" in kinds
+
+    @pytest.mark.asyncio
+    async def test_top1_with_no_artwork_leaves_all_release_year_none(self):
+        """Top-1 gating is *positional*. If items_with_artwork[0][1] is
+        None, no item gets release-year enrichment — even items further
+        down that have artwork. BS/iOS only consume results[0] so this is
+        fine in practice; documented in the function's docstring.
+        """
+        items_with_artwork = [
+            (make_library_item(id=1), None),
+            (make_library_item(id=2), make_discogs_result(release_id=2)),
+        ]
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=2,
+            title="x",
+            artist="x",
+            year=2020,
+            artist_id=None,
+            release_url="https://discogs.com/release/2",
+        )
+
+        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
+            results = await enrich_artwork_results(items_with_artwork, discogs_service)
+
+        # Position 0 stays None-artwork; position 1 gets streaming URLs
+        # but NOT release_year — the gate skipped it.
+        assert results[0][1] is None
+        assert results[1][1] is not None
+        assert results[1][1].release_year is None
+        # No release fetch fired — fetch_top1_release_details short-circuits
+        # when top-1's artwork is None.
+        discogs_service.get_release.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_to_match_result_includes_enriched_fields(self):
         result = DiscogsSearchResult(
             release_id=123,
