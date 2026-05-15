@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 
 from cachetools import TTLCache  # type: ignore[import-untyped]
 from pydantic import BaseModel
+from wxyc_etl.text import to_match_form as normalize_for_comparison
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,35 @@ def make_cache_key(func_name: str, *args, **kwargs) -> str:
     }
     key_string = json.dumps(key_data, sort_keys=True, default=str)
     return hashlib.md5(key_string.encode()).hexdigest()
+
+
+def make_normalized_cache_key(func_name: str, *args, **kwargs) -> str:
+    """Like `make_cache_key`, but runs string args/kwargs through
+    `to_match_form` (the resolver pre-pass normalizer) before hashing.
+
+    Diacritic and case variations of the same user-typed query collapse to
+    the same key, so the in-process @async_cached caches don't end up with
+    a separate entry for each spelling (LML#342 / A5). Non-string args
+    pass through unchanged so the cache key still differentiates by type.
+
+    The `func_name` is identity-preserved — it's an internal identifier, not
+    a user-supplied string, so case-sensitive comparison is correct.
+
+    Args:
+        func_name: Name of the function being cached.
+        *args: Positional arguments. Strings are normalized; others pass through.
+        **kwargs: Keyword arguments. Same per-value normalization as positional.
+
+    Returns:
+        MD5 hash of the serialized normalized arguments.
+    """
+
+    def _normalize(value):
+        return normalize_for_comparison(value) if isinstance(value, str) else value
+
+    norm_args = tuple(_normalize(a) for a in args)
+    norm_kwargs = {k: _normalize(v) for k, v in kwargs.items()}
+    return make_cache_key(func_name, *norm_args, **norm_kwargs)
 
 
 def create_ttl_cache(maxsize: int, ttl: int) -> TTLCache:
@@ -143,7 +173,10 @@ def async_cached(cache: TTLCache) -> Callable[[Callable[..., T]], Callable[..., 
             if args and hasattr(args[0], func.__name__):
                 cache_args = args[1:]
 
-            key = make_cache_key(func.__name__, *cache_args, **kwargs)
+            # `make_normalized_cache_key` collapses diacritic/case variants of
+            # user-typed strings to a single entry (LML#342 / A5). Non-string
+            # arguments are unchanged. The function name is identity-preserved.
+            key = make_normalized_cache_key(func.__name__, *cache_args, **kwargs)
 
             # Check cache
             if key in cache:

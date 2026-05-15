@@ -13,6 +13,7 @@ from discogs.memory_cache import (
     get_search_cache,
     get_track_cache,
     make_cache_key,
+    make_normalized_cache_key,
     set_skip_cache,
     should_skip_cache,
 )
@@ -58,6 +59,108 @@ class TestMakeCacheKey:
         k1 = make_cache_key("f", x=1, y=2)
         k2 = make_cache_key("f", y=2, x=1)
         assert k1 == k2
+
+
+# ---------------------------------------------------------------------------
+# make_normalized_cache_key (LML#342 / A5)
+# ---------------------------------------------------------------------------
+
+
+class TestMakeNormalizedCacheKey:
+    """The normalized variant runs string args through `to_match_form` (the same
+    helper the resolver pre-pass uses) before hashing, so cache hits collapse
+    diacritic and case variations that Discogs returns the same data for. Pins
+    the contract that the in-process @async_cached decorators rely on (#342)."""
+
+    def test_diacritic_variants_collapse_to_same_key(self):
+        # Same artist with and without the eñe — both should serve from the
+        # same cache entry. This is the bug #342 was filed to fix.
+        k1 = make_normalized_cache_key("search", "Sonido Dueñez")
+        k2 = make_normalized_cache_key("search", "Sonido Duenez")
+        assert k1 == k2
+
+    def test_case_variants_collapse_to_same_key(self):
+        # Lowercase / uppercase / mixed — `to_match_form` lowercases, so all
+        # three normalize to the same string and hash to the same key.
+        k1 = make_normalized_cache_key("search", "Stereolab")
+        k2 = make_normalized_cache_key("search", "stereolab")
+        k3 = make_normalized_cache_key("search", "STEREOLAB")
+        assert k1 == k2 == k3
+
+    def test_parens_preserved_no_false_collapse(self):
+        # `(Remix)` carries meaning; `to_match_form` does not strip it. The
+        # base track and the remix MUST hash to distinct keys so the cache
+        # never serves a remix's data when asked for the base track.
+        k1 = make_normalized_cache_key("search", "Felt")
+        k2 = make_normalized_cache_key("search", "Felt (Remix)")
+        assert k1 != k2
+
+    def test_non_string_args_pass_through(self):
+        # Integers, bools, Nones flow through unchanged — only strings get the
+        # normalization pass. Two int-keyed calls with the same int hash
+        # identically; an int vs the same number as a string still differ
+        # because the type information is part of the hash.
+        k_int = make_normalized_cache_key("get_release", 12345)
+        k_int_again = make_normalized_cache_key("get_release", 12345)
+        k_str = make_normalized_cache_key("get_release", "12345")
+        assert k_int == k_int_again
+        assert k_int != k_str
+
+    def test_normalizes_kwargs_too(self):
+        # The pre-pass runs over kwargs as well as positional args so a
+        # function called with keyword arguments gets the same key collapse.
+        k1 = make_normalized_cache_key("search", artist="Sonido Dueñez")
+        k2 = make_normalized_cache_key("search", artist="Sonido Duenez")
+        assert k1 == k2
+
+    def test_funcname_not_normalized(self):
+        # The function-name argument is identity-preserved — case-sensitive,
+        # not diacritic-folded — because it's an internal identifier not a
+        # user-supplied string.
+        k1 = make_normalized_cache_key("get_Release", "x")
+        k2 = make_normalized_cache_key("get_release", "x")
+        assert k1 != k2
+
+
+class TestAsyncCachedNormalization:
+    """End-to-end: @async_cached should serve diacritic/case variants from the
+    same cache entry, the way #342's user-typed search inputs flow through
+    DiscogsService methods at runtime."""
+
+    @pytest.mark.asyncio
+    async def test_decorator_collapses_diacritic_variants(self):
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+
+        @async_cached(cache)
+        async def search(artist):
+            nonlocal call_count
+            call_count += 1
+            return {"data": artist, "cached": False}
+
+        await search("Sonido Dueñez")
+        result2 = await search("Sonido Duenez")
+        # Same call site, same normalized key — second call must hit the cache.
+        assert call_count == 1
+        assert result2["cached"] is True
+        assert len(cache) == 1
+
+    @pytest.mark.asyncio
+    async def test_decorator_keeps_meaningful_variants_distinct(self):
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+
+        @async_cached(cache)
+        async def search(track):
+            nonlocal call_count
+            call_count += 1
+            return {"data": track, "cached": False}
+
+        await search("Felt")
+        await search("Felt (Remix)")
+        # Different normalized keys — no false collapse.
+        assert call_count == 2
+        assert len(cache) == 2
 
 
 # ---------------------------------------------------------------------------
