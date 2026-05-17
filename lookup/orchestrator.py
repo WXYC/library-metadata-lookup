@@ -1763,6 +1763,7 @@ async def perform_lookup(
     discogs_cache: DiscogsCacheService | None = None,
     mb_pg: PgSourceProtocol | None = None,
     http_client: httpx.AsyncClient | None = None,
+    caller_budget_ms: int | None = None,
 ) -> LookupResponse:
     """Orchestrate the full lookup pipeline.
 
@@ -1834,6 +1835,7 @@ async def perform_lookup(
             strategies=strategies,
             albums_for_search=albums_for_search,
             song_not_found=song_not_found,
+            caller_budget_ms=caller_budget_ms,
         )
 
         library_results = limit_results(search_state.results)

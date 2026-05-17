@@ -138,6 +138,48 @@ class TestHandleLookup:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_caller_budget_header_forwarded_to_perform_lookup(self, app_client):
+        """X-Caller-Budget-Ms (A8 / LML#345) flows from the HTTP header into
+        perform_lookup's caller_budget_ms kwarg. The router is a thin layer;
+        if the header is dropped here the search pipeline's effective-budget
+        computation can't see it and BS#345's caller-supplied budgets become
+        no-ops. Pins both the header→arg path and the kwarg name.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/api/v1/lookup",
+                    json=LOOKUP_BODY,
+                    headers={"X-Caller-Budget-Ms": "3000"},
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_args.kwargs.get("caller_budget_ms") == 3000
+
+    @pytest.mark.asyncio
+    async def test_caller_budget_header_absent_forwards_none(self, app_client):
+        """When the caller doesn't send the header, perform_lookup receives
+        caller_budget_ms=None so the orchestrator can distinguish "no opinion"
+        from a numeric value and fall through to the env-default contract.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_args.kwargs.get("caller_budget_ms") is None
+
+    @pytest.mark.asyncio
     async def test_extended_flag_forwarded_to_perform_lookup(self, app_client):
         """When the request body sets extended=true, the LookupRequest carried
         into perform_lookup must reflect that. The router is a thin layer;
