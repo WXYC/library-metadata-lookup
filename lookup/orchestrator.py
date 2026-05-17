@@ -7,7 +7,9 @@ track validation -> artwork fetch -> metadata enrichment -> context message.
 
 import asyncio
 import logging
+import random
 import re
+import time
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from functools import partial
@@ -248,6 +250,64 @@ def _log_album_title_fallback(
             transaction.set_data("album_title_fallback", payload)
     except Exception as e:
         logger.warning("Failed to project album_title_fallback onto Sentry transaction: %s", e)
+
+
+def _log_track_validation(
+    *,
+    source: str,
+    release_id: int,
+    song: str,
+    artist: str | None,
+    verdict: bool,
+    latency_ms: float,
+    sample_rate: float = 0.01,
+) -> None:
+    """Audit instrumentation for ``DiscogsService.validate_track_on_release`` (A7 / LML#344).
+
+    The cascade has two validation call sites: the inline check inside
+    ``TRACK_ON_COMPILATION``'s ``process_release`` and the post-cascade
+    sweep in ``filter_results_by_track_validation``. The audit ticket wants
+    to know how often the second call runs after the first already vetted
+    the same release, and how often the two verdicts disagree.
+
+    This helper records each call with a ``source`` label so downstream
+    Sentry analysis can split (release_id, verdict) pairs by source.
+    Two surfaces:
+
+    - **Sentry breadcrumb on every call** — trace explorer queries against
+      ``category:track_validation`` to count divergences without log-pipeline
+      tooling. Always-on; cost is microseconds per call.
+    - **Structured INFO log on a 1% sample** — cheap Railway-log grep target
+      for spot-checking. The full population is too large to log at INFO,
+      so the sample is randomized per call.
+
+    Both surfaces are non-essential; any SDK exception is swallowed and the
+    request proceeds. Same swallow pattern as :func:`_log_album_title_fallback`
+    / :func:`_log_resolver_pre_pass`.
+
+    The acceptance criterion from #344 is "7 days of data" — this helper
+    ships the instrumentation; the decision about whether to delete one of
+    the call sites is a follow-up after the data is in.
+    """
+    payload: dict[str, Any] = {
+        "source": source,
+        "release_id": release_id,
+        "song": song,
+        "artist": artist,
+        "verdict": verdict,
+        "latency_ms": round(latency_ms, 2),
+    }
+    try:
+        sentry_sdk.add_breadcrumb(
+            category="track_validation",
+            level="info",
+            data=payload,
+        )
+    except Exception as e:
+        logger.warning("Failed to add track_validation breadcrumb: %s", e)
+
+    if random.random() < sample_rate:
+        logger.info("track_validation %s", payload)
 
 
 def _log_resolver_pre_pass(outcome: ResolverOutcome, *, actual_swap: bool) -> None:
@@ -588,13 +648,24 @@ async def search_song_as_track(
         # that don't always contain the track on the tracklist. Deferred until
         # after library matching so we only pay the API cost for releases we'd
         # actually return, mirroring search_compilations_for_track.
-        if release.release_id and not await discogs_service.validate_track_on_release(
-            release.release_id, song, release.artist
-        ):
-            logger.debug(
-                f"SONG_AS_TRACK: skipping '{release.album}' — track not validated on release"
+        if release.release_id:
+            _validation_start = time.monotonic()
+            is_valid = await discogs_service.validate_track_on_release(
+                release.release_id, song, release.artist
             )
-            continue
+            _log_track_validation(
+                source="song_as_track",
+                release_id=release.release_id,
+                song=song,
+                artist=release.artist,
+                verdict=is_valid,
+                latency_ms=(time.monotonic() - _validation_start) * 1000,
+            )
+            if not is_valid:
+                logger.debug(
+                    f"SONG_AS_TRACK: skipping '{release.album}' — track not validated on release"
+                )
+                continue
 
         for item in eligible:
             hint = TrackMatchHint(
@@ -987,8 +1058,17 @@ async def search_compilations_for_track(
             # Deferred until after library matching so we only validate
             # releases we might actually return — saving API calls.
             if discogs_service and release_info.release_id and parsed.artist:
+                _validation_start = time.monotonic()
                 is_valid = await discogs_service.validate_track_on_release(
                     release_info.release_id, song_search, parsed.artist
+                )
+                _log_track_validation(
+                    source="compilation_inline",
+                    release_id=release_info.release_id,
+                    song=song_search,
+                    artist=parsed.artist,
+                    verdict=is_valid,
+                    latency_ms=(time.monotonic() - _validation_start) * 1000,
                 )
                 if not is_valid:
                     logger.info(
@@ -1252,8 +1332,17 @@ async def filter_results_by_track_validation(
                     )
                     return None
 
+                _validation_start = time.monotonic()
                 is_valid = await discogs_service.validate_track_on_release(
                     best_result.release_id, song, artist
+                )
+                _log_track_validation(
+                    source="step_3b",
+                    release_id=best_result.release_id,
+                    song=song,
+                    artist=artist,
+                    verdict=is_valid,
+                    latency_ms=(time.monotonic() - _validation_start) * 1000,
                 )
                 if is_valid:
                     logger.info(
