@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 import sentry_sdk
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats, init_cache_stats
 
 from core.dependencies import (
@@ -99,6 +99,16 @@ async def handle_lookup(
     posthog_client: Posthog | None = Depends(get_posthog_client),
     http_client: httpx.AsyncClient = Depends(get_apple_music_http_client),
     skip_cache: bool = False,
+    x_caller_budget_ms: int | None = Header(
+        default=None,
+        alias="X-Caller-Budget-Ms",
+        description=(
+            "Optional per-request budget in ms (A8 / LML#345). When set, the search "
+            "pipeline uses min(header − transport overhead, LML_SEARCH_BUDGET_MS) "
+            "as its wall-clock cutoff so LML returns slightly before the caller "
+            "times out. Non-positive values fall back to the env default."
+        ),
+    ),
 ):
     """Process a lookup request."""
     init_cache_stats()
@@ -120,6 +130,7 @@ async def handle_lookup(
             discogs_cache=discogs_cache,
             mb_pg=mb_pg,
             http_client=http_client,
+            caller_budget_ms=x_caller_budget_ms,
         )
 
         # Attach cache stats. wxyc-shared#86 has shipped the typed CacheStats

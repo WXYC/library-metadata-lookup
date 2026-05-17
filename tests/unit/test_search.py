@@ -7,6 +7,7 @@ import pytest
 
 from core.search import (
     DEFAULT_SEARCH_BUDGET_MS,
+    TRANSPORT_OVERHEAD_MS,
     SearchState,
     SearchStrategyType,
     build_strategies,
@@ -16,6 +17,7 @@ from core.search import (
     no_results_and_ambiguous_format,
     no_results_and_song_but_no_artist,
     no_results_and_song_but_no_artist_track_fallback,
+    resolve_effective_search_budget_ms,
     resolve_search_budget_ms,
     song_not_found_with_artist_and_song,
 )
@@ -814,3 +816,165 @@ class TestSearchBudget:
 
         # No crash; pipeline still surfaces the prior strategy's results.
         assert state.results == [first_hit]
+
+
+# ---------------------------------------------------------------------------
+# Caller-budget header — A8 / LML#345
+# ---------------------------------------------------------------------------
+
+
+class TestCallerBudget:
+    """Per-request caller budget via the X-Caller-Budget-Ms header.
+
+    BS aborts at 5s; LML's env-default budget is 4s. A request that knows it
+    has only 3s left (BS retry, fast-path caller, etc.) should be able to
+    say "I'm going to give up at 3s — don't grind past 2.8s." The header
+    plus the TRANSPORT_OVERHEAD_MS slack lets LML return slightly before
+    the caller times out.
+
+    Contract (per LML#345):
+      - Header absent or zero/negative → env default (unchanged from A3).
+      - Header present and < env default → effective = header − transport overhead.
+      - Header present and >= env default → effective = env default (clamp).
+    """
+
+    def test_resolve_effective_budget_no_caller_header(self, monkeypatch):
+        """No caller header → env default; same as the A3 contract."""
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+        assert resolve_effective_search_budget_ms(None) == DEFAULT_SEARCH_BUDGET_MS
+
+    def test_resolve_effective_budget_caller_smaller_than_env(self, monkeypatch):
+        """Caller budget tighter than env → effective = caller − transport overhead."""
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+        # Caller says "3000ms"; LML must return ~200ms earlier so the caller
+        # sees the response before its own timeout fires.
+        assert resolve_effective_search_budget_ms(3000) == 3000 - TRANSPORT_OVERHEAD_MS
+
+    def test_resolve_effective_budget_caller_larger_than_env_clamps(self, monkeypatch):
+        """Caller budget looser than env → clamp to env (don't grant more than the operator gave)."""
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "2000")
+        # Caller says "10000ms" but operator capped at 2000ms; we keep the cap.
+        assert resolve_effective_search_budget_ms(10000) == 2000
+
+    def test_resolve_effective_budget_caller_equal_to_env_returns_env(self, monkeypatch):
+        """When caller − overhead equals env, the tighter one wins (still env-minus-zero)."""
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "4000")
+        # Caller header equals env; effective is min(4000-200, 4000) = 3800.
+        assert resolve_effective_search_budget_ms(4000) == 4000 - TRANSPORT_OVERHEAD_MS
+
+    def test_resolve_effective_budget_caller_zero_or_negative_falls_back(self, monkeypatch):
+        """Caller header <= 0 is treated as misconfiguration; fall back to env."""
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+        assert resolve_effective_search_budget_ms(0) == DEFAULT_SEARCH_BUDGET_MS
+        assert resolve_effective_search_budget_ms(-500) == DEFAULT_SEARCH_BUDGET_MS
+
+    def test_resolve_effective_budget_caller_below_transport_overhead(self, monkeypatch):
+        """If caller − overhead would be negative, fall back to env.
+
+        A caller advertising a 100ms budget when transport overhead is 200ms
+        is asking for a negative budget. That short-circuits the safety
+        branch of the budget gate (`elapsed_ms > budget AND state.results`
+        is always true after the first strategy completes). Treat as
+        misconfiguration; fall back so the request stays alive.
+        """
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+        assert resolve_effective_search_budget_ms(150) == DEFAULT_SEARCH_BUDGET_MS
+        assert resolve_effective_search_budget_ms(TRANSPORT_OVERHEAD_MS) == DEFAULT_SEARCH_BUDGET_MS
+
+    @pytest.mark.asyncio
+    async def test_pipeline_honors_caller_budget(self, monkeypatch):
+        """Caller-budget arg, when small enough to fire, projects telemetry + skips strategies.
+
+        Mirrors `test_budget_exceeded_skips_remaining_strategies` from the A3
+        test class but with the budget flowing through the caller arg rather
+        than env. Confirms the wiring: `execute_search_pipeline(..., caller_budget_ms=X)`
+        produces the same gate behavior as `LML_SEARCH_BUDGET_MS=X-200`.
+        """
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+
+        first_hit = _item(id=1, artist="Stereolab", title="Dots and Loops")
+
+        async def slow_first(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            return ([first_hit], False)
+
+        must_not_run_compilation = AsyncMock(
+            side_effect=AssertionError("compilation strategy should be skipped by budget")
+        )
+
+        search_lib = AsyncMock(side_effect=slow_first)
+        search_alt = AsyncMock(return_value=([], None))
+        search_comp = must_not_run_compilation
+
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Stereolab",
+            song="Miss Modular",
+            raw_message="Stereolab - Miss Modular",
+        )
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        # caller_budget_ms = 201 → effective budget = 1 (201 - TRANSPORT_OVERHEAD_MS).
+        # Tightest valid effective budget; any await trips the gate.
+        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
+            state = await execute_search_pipeline(
+                parsed,
+                AsyncMock(),
+                "Stereolab - Miss Modular",
+                strategies,
+                song_not_found=True,
+                caller_budget_ms=TRANSPORT_OVERHEAD_MS + 1,
+            )
+
+        search_comp.assert_not_awaited()
+        assert state.results == [first_hit]
+        # Telemetry pins both the budget-exceeded flag AND the caller-budget value,
+        # so trace explorer queries can distinguish header-driven from env-driven cutoffs.
+        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        assert calls.get("search_budget_exceeded") is True
+        assert calls.get("lml.caller_budget_ms") == TRANSPORT_OVERHEAD_MS + 1
+
+    @pytest.mark.asyncio
+    async def test_pipeline_no_caller_budget_does_not_set_caller_attr(self, monkeypatch):
+        """When the caller doesn't send the header, the lml.caller_budget_ms attr is not set.
+
+        Sentry attribute hygiene: only set the attribute on traces where the
+        caller actually opted into the contract. Saves trace-explorer noise.
+        """
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "10000")
+
+        first_hit = _item(id=1, artist="Stereolab", title="Dots and Loops")
+
+        async def fast_first(*args, **kwargs):
+            return ([first_hit], False)
+
+        search_lib = AsyncMock(side_effect=fast_first)
+        search_alt = AsyncMock(return_value=([], None))
+        search_comp = AsyncMock(return_value=([], {}))
+
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Stereolab",
+            song="Miss Modular",
+            raw_message="Stereolab - Miss Modular",
+        )
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
+            await execute_search_pipeline(
+                parsed,
+                AsyncMock(),
+                "Stereolab - Miss Modular",
+                strategies,
+                song_not_found=True,
+                # caller_budget_ms not passed.
+            )
+
+        keys = {c.args[0] for c in mock_transaction.set_data.call_args_list}
+        assert "lml.caller_budget_ms" not in keys

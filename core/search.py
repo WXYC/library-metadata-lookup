@@ -35,6 +35,17 @@ BS timeout normalizes, this value should move; in the meantime,
 
 SEARCH_BUDGET_ENV_VAR = "LML_SEARCH_BUDGET_MS"
 
+TRANSPORT_OVERHEAD_MS = 200
+"""Approximate round-trip overhead between LML and a caller (Backend-Service).
+
+When a caller advertises its own remaining budget via ``X-Caller-Budget-Ms``
+(A8 / LML#345), LML uses ``caller_budget - TRANSPORT_OVERHEAD_MS`` as the
+effective pipeline budget so the response can hit the wire and reach the
+caller before the caller's own timeout fires. 200 ms covers a typical
+loopback-to-Railway-edge round-trip with margin; if measurements ever show
+a tighter bound, narrow this constant rather than the caller-side header.
+"""
+
 
 def resolve_search_budget_ms() -> int:
     """Return the active search budget in ms, honoring ``LML_SEARCH_BUDGET_MS``.
@@ -72,6 +83,44 @@ def resolve_search_budget_ms() -> int:
         )
         return DEFAULT_SEARCH_BUDGET_MS
     return value
+
+
+def resolve_effective_search_budget_ms(caller_budget_ms: int | None) -> int:
+    """Return the effective pipeline budget given an optional caller-supplied budget.
+
+    Combines the env-var/default budget (:func:`resolve_search_budget_ms`) with
+    the caller's ``X-Caller-Budget-Ms`` header (A8 / LML#345). The contract:
+
+    - Caller header absent or non-positive → return the env-var budget (the A3
+      contract is unchanged for callers that don't opt in).
+    - Caller header below ``TRANSPORT_OVERHEAD_MS`` → treat as misconfiguration
+      (effective budget would be ≤ 0 and the gate would short-circuit the first
+      iteration). Fall back to the env-var budget.
+    - Caller header otherwise → effective = min(caller − overhead, env). The
+      ``min`` clamps so callers cannot claim more time than the operator has
+      authorized via the env var.
+
+    The transport-overhead subtraction is a one-way courtesy: LML stops slightly
+    before the caller would, so the response can hit the wire in time. See
+    :data:`TRANSPORT_OVERHEAD_MS` for the rationale.
+    """
+    env_budget = resolve_search_budget_ms()
+    if caller_budget_ms is None or caller_budget_ms <= 0:
+        return env_budget
+    caller_effective = caller_budget_ms - TRANSPORT_OVERHEAD_MS
+    if caller_effective <= 0:
+        # A caller asking for a budget below the transport overhead is
+        # effectively asking for zero or negative. The pipeline can't run
+        # meaningfully with a non-positive budget; fall back to env so the
+        # request stays alive rather than short-circuiting at strategy 1.
+        logger.warning(
+            "caller_budget_ms=%d is below TRANSPORT_OVERHEAD_MS=%d; falling back to env budget %d",
+            caller_budget_ms,
+            TRANSPORT_OVERHEAD_MS,
+            env_budget,
+        )
+        return env_budget
+    return min(caller_effective, env_budget)
 
 
 def _log_search_budget_exceeded(
@@ -398,6 +447,7 @@ async def execute_search_pipeline(
     strategies: list[SearchStrategy],
     albums_for_search: list[str] | None = None,
     song_not_found: bool = False,
+    caller_budget_ms: int | None = None,
 ) -> SearchState:
     """Execute strategies in array order until results found.
 
@@ -419,7 +469,19 @@ async def execute_search_pipeline(
         song_not_found=song_not_found,
     )
 
-    budget_ms = resolve_search_budget_ms()
+    budget_ms = resolve_effective_search_budget_ms(caller_budget_ms)
+    # Project the caller-budget value when present so Sentry trace explorer can
+    # split header-driven vs env-driven cutoffs (A8 / LML#345). The
+    # effective-budget computation already clamps to env, so we record the raw
+    # header value the caller sent — that's the diagnostic that matters
+    # (mismatched expectations between caller and LML).
+    if caller_budget_ms is not None:
+        try:
+            transaction = sentry_sdk.get_current_scope().transaction
+            if transaction is not None:
+                transaction.set_data("lml.caller_budget_ms", caller_budget_ms)
+        except Exception as e:
+            logger.warning("Failed to project lml.caller_budget_ms onto Sentry transaction: %s", e)
     start = time.monotonic()
 
     for idx, strategy in enumerate(strategies):
