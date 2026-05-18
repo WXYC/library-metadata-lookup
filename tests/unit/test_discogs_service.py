@@ -522,6 +522,10 @@ class TestSearchReleasesByTrack:
                 )
             ]
         )
+        # The negative cache is consulted in every path now (A4); pin its
+        # return so this test still exercises the API leg.
+        service_with_cache.cache_service.lookup_negative_hit = AsyncMock(return_value=False)
+        service_with_cache.cache_service.record_lookup_negative = AsyncMock()
 
         # Set up API to return the VA compilation we actually want
         mock_resp = MagicMock()
@@ -552,6 +556,127 @@ class TestSearchReleasesByTrack:
         assert len(result.releases) >= 1
         assert result.releases[0].is_compilation is True
         assert result.cached is False
+
+    @pytest.mark.asyncio
+    async def test_negative_cache_hit_short_circuits_api(self, service_with_cache):
+        """A pre-existing negative-cache entry must skip the Discogs API entirely (LML#341 / A4)."""
+        service_with_cache.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+        service_with_cache.cache_service.lookup_negative_hit = AsyncMock(return_value=True)
+        service_with_cache.cache_service.record_lookup_negative = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+        ) as mock_request:
+            result = await service_with_cache.search_releases_by_track(
+                "Imaginary Track", "Imaginary Artist"
+            )
+
+        assert result.releases == []
+        assert result.cached is True
+        # The whole point: zero API calls fired.
+        mock_request.assert_not_called()
+        # Write-on-empty must NOT fire when the empty came from the cache.
+        service_with_cache.cache_service.record_lookup_negative.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_negative_cache_miss_falls_through_to_api(self, service_with_cache):
+        """When the negative cache says no, the API is hit normally."""
+        service_with_cache.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+        service_with_cache.cache_service.lookup_negative_hit = AsyncMock(return_value=False)
+        service_with_cache.cache_service.record_lookup_negative = AsyncMock()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "results": [{"title": "Stereolab - Aluminum Tunes", "id": 1}]
+        }
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ):
+            result = await service_with_cache.search_releases_by_track("Fuses", "Stereolab")
+
+        service_with_cache.cache_service.lookup_negative_hit.assert_called_once()
+        assert len(result.releases) >= 1
+        # Non-empty API response — negative-cache write must NOT fire.
+        service_with_cache.cache_service.record_lookup_negative.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_api_response_writes_negative_cache(self, service_with_cache):
+        """An API response with zero results must persist the negative verdict (LML#341 / A4)."""
+        service_with_cache.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+        service_with_cache.cache_service.lookup_negative_hit = AsyncMock(return_value=False)
+        service_with_cache.cache_service.record_lookup_negative = AsyncMock()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"results": []}
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ):
+            result = await service_with_cache.search_releases_by_track(
+                "Definitely Not A Real Track", "Definitely Not A Real Artist"
+            )
+
+        assert result.releases == []
+        service_with_cache.cache_service.record_lookup_negative.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_api_exception_does_not_write_negative_cache(self, service_with_cache):
+        """A 5xx or network failure is not a 'we asked, nothing' verdict — don't persist it."""
+        service_with_cache.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+        service_with_cache.cache_service.lookup_negative_hit = AsyncMock(return_value=False)
+        service_with_cache.cache_service.record_lookup_negative = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            side_effect=Exception("Discogs 502"),
+        ):
+            result = await service_with_cache.search_releases_by_track("X", "Y")
+
+        assert result.releases == []
+        service_with_cache.cache_service.record_lookup_negative.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_negative_cache_consulted_for_artist_as_keyword(self, service_with_cache):
+        """The negative cache also covers the keyword path — its key dimension distinguishes shapes."""
+        service_with_cache.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+        service_with_cache.cache_service.lookup_negative_hit = AsyncMock(return_value=True)
+        service_with_cache.cache_service.record_lookup_negative = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+        ) as mock_request:
+            result = await service_with_cache.search_releases_by_track(
+                "track", "artist", artist_as_keyword=True
+            )
+
+        # Positive-cache path was bypassed (artist_as_keyword=True), but the
+        # negative-cache path was still consulted with artist_as_keyword=True
+        # passed through.
+        service_with_cache.cache_service.search_releases_by_track.assert_not_called()
+        service_with_cache.cache_service.lookup_negative_hit.assert_called_once()
+        call_args = service_with_cache.cache_service.lookup_negative_hit.call_args
+        assert call_args.args[2] is True or call_args.kwargs.get("artist_as_keyword") is True
+        # And the negative hit prevented any API call.
+        assert result.releases == []
+        assert result.cached is True
+        mock_request.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

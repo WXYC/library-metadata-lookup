@@ -10,9 +10,11 @@ The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 """
 
 import asyncio
+import hashlib
 import logging
 
 from rapidfuzz import fuzz
+from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.models import (
@@ -42,6 +44,33 @@ class CacheUnavailableError(Exception):
 # on a release. Tied to that constant by intent, not duplicated by accident.
 _ARTIST_FUZZY_MATCH_THRESHOLD = 70
 
+# Default TTL for a negative-cache entry (7 days, matching the
+# migration's column default). 7 days is conservative: tracks that
+# eventually land on Discogs (new releases) shouldn't be pinned negative
+# forever, but most rare-artist lookups span >24 h between repeats, so the
+# cross-deploy savings outweigh the catch-up lag. Per WXYC/library-
+# metadata-lookup#341.
+_NEGATIVE_CACHE_DEFAULT_TTL_SECONDS = 604_800
+
+
+def _negative_cache_key_hash(artist: str | None, track: str, artist_as_keyword: bool) -> bytes:
+    """Hash the (artist, track, artist_as_keyword) tuple into a stable 32-byte key.
+
+    Strings flow through `to_match_form` — the same normalizer used by
+    `make_normalized_cache_key` in `discogs/memory_cache.py` (per A5 / LML#272)
+    — so diacritic and case variations of the same user-typed query
+    collapse to one key. The `artist_as_keyword` boolean is part of the
+    key because it picks a different Discogs API call shape
+    (`params["q"]` + `format=Compilation` vs. `params["artist"]`), and a
+    negative answer on one shape doesn't transfer to the other.
+
+    Returned as bytes for direct binding to the bytea PK column.
+    """
+    norm_artist = normalize_for_comparison(artist or "")
+    norm_track = normalize_for_comparison(track)
+    payload = f"{norm_artist}\x1f{norm_track}\x1f{int(bool(artist_as_keyword))}"
+    return hashlib.sha256(payload.encode("utf-8")).digest()
+
 
 class DiscogsCacheService:
     """Service for querying and updating the local Discogs cache.
@@ -66,6 +95,92 @@ class DiscogsCacheService:
         except Exception as e:
             logger.warning(f"Cache health check failed: {e}")
             return False
+
+    async def lookup_negative_hit(
+        self, artist: str | None, track: str, artist_as_keyword: bool
+    ) -> bool:
+        """Return True if a non-expired negative-cache entry exists for this query.
+
+        Used by `discogs/service.py:search_releases_by_track` to short-circuit
+        the Discogs API on queries we've already asked and got nothing for.
+        TTL is enforced inline by the query (`now() < attempted_at +
+        ttl_seconds * interval '1 second'`) so callers don't need to
+        re-check expiration.
+
+        Best-effort: any pool error returns False so the caller falls
+        through to the API path exactly as if the negative cache said
+        "no entry." Errors are logged at warning level.
+
+        Args:
+            artist: Artist name (None when LML's `q=` keyword search ran).
+            track: Track title.
+            artist_as_keyword: True when this corresponds to the API
+                `params["q"]` + `format=Compilation` path; False for
+                `params["artist"]` field filter.
+
+        Returns:
+            True on hit (the API would return empty), False otherwise.
+        """
+        key_hash = _negative_cache_key_hash(artist, track, artist_as_keyword)
+        try:
+            row = await self.pool.fetchval(
+                """
+                SELECT 1
+                FROM lookup_negative
+                WHERE key_hash = $1
+                  AND now() < attempted_at + (ttl_seconds * interval '1 second')
+                LIMIT 1
+                """,
+                key_hash,
+            )
+            return row is not None
+        except Exception as e:
+            logger.warning(f"lookup_negative_hit failed (treating as miss): {e}")
+            return False
+
+    async def record_lookup_negative(
+        self,
+        artist: str | None,
+        track: str,
+        artist_as_keyword: bool,
+        ttl_seconds: int = _NEGATIVE_CACHE_DEFAULT_TTL_SECONDS,
+    ) -> None:
+        """Record a negative verdict so the next process can short-circuit.
+
+        Upserts on conflict so a re-write resets `attempted_at` (the TTL
+        clock starts fresh on every confirmation that the answer is still
+        "nothing"). Best-effort: pool errors are swallowed at warning
+        level — at worst we miss the write and the next request pays the
+        API cost again, identical to today's behavior pre-A4.
+
+        Args:
+            artist: Artist name (None when LML's `q=` keyword search ran).
+            track: Track title.
+            artist_as_keyword: Distinguishes the API call shape (see
+                `lookup_negative_hit`).
+            ttl_seconds: Per-row TTL override. Defaults to 7 days; the
+                table column also defaults to 604800 so the override is
+                only useful for shorter (e.g. test-driven) windows.
+        """
+        key_hash = _negative_cache_key_hash(artist, track, artist_as_keyword)
+        try:
+            await self.pool.execute(
+                """
+                INSERT INTO lookup_negative
+                  (key_hash, artist, track, artist_as_keyword, ttl_seconds)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (key_hash) DO UPDATE SET
+                  attempted_at = now(),
+                  ttl_seconds = EXCLUDED.ttl_seconds
+                """,
+                key_hash,
+                artist,
+                track,
+                artist_as_keyword,
+                ttl_seconds,
+            )
+        except Exception as e:
+            logger.warning(f"record_lookup_negative failed (best-effort write): {e}")
 
     async def search_releases_by_track(
         self, track: str, artist: str | None = None, limit: int = 20
