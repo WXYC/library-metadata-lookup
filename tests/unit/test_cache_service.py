@@ -992,3 +992,97 @@ class TestSearchTracksByTitle:
         mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn lost"))
         with pytest.raises(CacheUnavailableError):
             await cache_service.search_tracks_by_title("anything")
+
+
+# ---------------------------------------------------------------------------
+# Negative-result cache (LML#341 / A4)
+# ---------------------------------------------------------------------------
+
+
+class TestLookupNegativeHit:
+    @pytest.mark.asyncio
+    async def test_hit_returns_true_for_non_expired_row(self, cache_service, mock_asyncpg_pool):
+        # Non-NULL fetchval means "found a non-expired row".
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=1)
+        result = await cache_service.lookup_negative_hit("Stereolab", "Fuses", False)
+        assert result is True
+        # The lookup query must select the table and gate on TTL inline.
+        sql = mock_asyncpg_pool.fetchval.call_args.args[0]
+        assert "lookup_negative" in sql
+        assert "attempted_at" in sql
+        assert "ttl_seconds" in sql
+
+    @pytest.mark.asyncio
+    async def test_miss_returns_false_when_no_row(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=None)
+        result = await cache_service.lookup_negative_hit("Stereolab", "Fuses", False)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_distinguishes_artist_as_keyword_dimension(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        # The cache key must include `artist_as_keyword` so that
+        # `q=Stereolab` (compilation search) does NOT hit a negative entry
+        # written for the `artist=Stereolab` (field-filter) path. Verify
+        # the two key_hashes differ.
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=None)
+        await cache_service.lookup_negative_hit("Stereolab", "Fuses", False)
+        await cache_service.lookup_negative_hit("Stereolab", "Fuses", True)
+        # Both calls used key_hash as the WHERE-bound parameter (args[1]).
+        keys = [call.args[1] for call in mock_asyncpg_pool.fetchval.call_args_list]
+        assert keys[0] != keys[1], "artist_as_keyword must change the key_hash"
+
+    @pytest.mark.asyncio
+    async def test_normalized_for_case_and_diacritics(self, cache_service, mock_asyncpg_pool):
+        # Two queries that differ only by case/diacritics on artist or track
+        # should hash to the same key. Mirrors the existing
+        # `make_normalized_cache_key` semantics used by the @async_cached
+        # decorators (A5 / LML#272) so the negative cache lines up with
+        # what the in-memory cache treats as "the same query."
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=None)
+        await cache_service.lookup_negative_hit("Nilüfer Yanya", "Heavyweight Champion", False)
+        await cache_service.lookup_negative_hit("nilufer yanya", "heavyweight champion", False)
+        keys = [call.args[1] for call in mock_asyncpg_pool.fetchval.call_args_list]
+        assert keys[0] == keys[1], "diacritic + case-only variations must collapse to one key"
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_pool_error_does_not_raise(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        # The negative cache is best-effort. A connection blip must NOT
+        # block the request — fall through to the API as if the cache
+        # said "no entry" rather than propagate the error.
+        mock_asyncpg_pool.fetchval = AsyncMock(side_effect=RuntimeError("conn lost"))
+        result = await cache_service.lookup_negative_hit("anything", "anywhere", False)
+        assert result is False
+
+
+class TestRecordLookupNegative:
+    @pytest.mark.asyncio
+    async def test_inserts_row_with_default_ttl(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.execute = AsyncMock(return_value="INSERT 0 1")
+        await cache_service.record_lookup_negative("Stereolab", "Fuses", False)
+        call = mock_asyncpg_pool.execute.call_args
+        sql = call.args[0]
+        assert "INSERT INTO lookup_negative" in sql
+        # ON CONFLICT to refresh attempted_at on re-write so the TTL is reset.
+        assert "ON CONFLICT" in sql.upper()
+        # Default ttl_seconds=604800 (7 days).
+        assert 604800 in call.args[1:], f"expected ttl_seconds=604800 among bound args: {call.args}"
+
+    @pytest.mark.asyncio
+    async def test_accepts_custom_ttl(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.execute = AsyncMock(return_value="INSERT 0 1")
+        await cache_service.record_lookup_negative("X", "Y", False, ttl_seconds=3600)
+        call = mock_asyncpg_pool.execute.call_args
+        assert 3600 in call.args[1:]
+
+    @pytest.mark.asyncio
+    async def test_swallows_pool_error_does_not_raise(self, cache_service, mock_asyncpg_pool):
+        # Write is best-effort. A pool blip must NOT surface to the caller
+        # — at worst we miss the negative-cache write and the next request
+        # for the same query pays the API cost again, exactly like today.
+        mock_asyncpg_pool.execute = AsyncMock(side_effect=RuntimeError("conn lost"))
+        # Should not raise.
+        await cache_service.record_lookup_negative("anything", "anywhere", False)

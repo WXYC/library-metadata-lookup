@@ -424,6 +424,33 @@ class DiscogsService:
                 logger.warning(f"Cache lookup failed, falling back to API: {e}")
                 add_discogs_breadcrumb("cache_error", {"error": str(e)}, level="warning")
 
+        # Negative-result cache check (LML#341 / A4). Consulted on every
+        # query, not just non-keyword paths, because its key includes the
+        # `artist_as_keyword` dimension so a negative answer on one shape
+        # doesn't poison the other. Always best-effort — `lookup_negative_hit`
+        # returns False on pool errors so we fall through to the API.
+        if self.cache_service and not should_skip_cache():
+            try:
+                if await self.cache_service.lookup_negative_hit(artist, track, artist_as_keyword):
+                    logger.info(
+                        f"Negative-cache hit for track '{track}' artist '{artist}' "
+                        f"(artist_as_keyword={artist_as_keyword}); short-circuiting Discogs API"
+                    )
+                    get_cache_stats_recorder().record("pg_negative_hits")
+                    add_discogs_breadcrumb(
+                        "negative_cache_hit",
+                        {"track": track, "artist": artist, "artist_as_keyword": artist_as_keyword},
+                    )
+                    return TrackReleasesResponse(
+                        track=track, artist=artist, releases=[], total=0, cached=True
+                    )
+                get_cache_stats_recorder().record("pg_negative_misses")
+            except Exception as e:
+                # lookup_negative_hit already swallows pool errors; this catch
+                # is for defense-in-depth against an unexpected programming
+                # error so the request never dies in the negative-cache leg.
+                logger.warning(f"Negative-cache check failed (continuing to API): {e}")
+
         # Fall back to Discogs API
         releases: list[ReleaseInfo] = []
         seen_albums: set = set()
@@ -491,6 +518,23 @@ class DiscogsService:
                             releases.append(release_info)
 
                     logger.info(f"After keyword search: {len(releases)} total releases")
+
+            # On a confirmed-empty Discogs response, record the negative
+            # verdict so the next process restart (Railway redeploy) doesn't
+            # repeat the full cascade. Skipped on exception path below — a
+            # 5xx or rate-limit isn't a "we asked, nothing" verdict; it's
+            # "we couldn't ask, try later." Best-effort write.
+            if not releases and self.cache_service and not should_skip_cache():
+                try:
+                    await self.cache_service.record_lookup_negative(
+                        artist, track, artist_as_keyword
+                    )
+                    add_discogs_breadcrumb(
+                        "negative_cache_write",
+                        {"track": track, "artist": artist, "artist_as_keyword": artist_as_keyword},
+                    )
+                except Exception as e:
+                    logger.warning(f"Negative-cache write failed (best-effort): {e}")
 
             return TrackReleasesResponse(
                 track=track,
