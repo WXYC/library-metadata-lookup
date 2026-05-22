@@ -17,6 +17,7 @@ from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
+from discogs.memory_cache import async_cached, create_ttl_cache
 from discogs.models import (
     ArtistCredit,
     ArtistDetails,
@@ -51,6 +52,18 @@ _ARTIST_FUZZY_MATCH_THRESHOLD = 70
 # cross-deploy savings outweigh the catch-up lag. Per WXYC/library-
 # metadata-lookup#341.
 _NEGATIVE_CACHE_DEFAULT_TTL_SECONDS = 604_800
+
+# In-process TTL cache for ``search_artists_by_name``. The trigram scan over
+# UNION(artist, artist_name_variation) was the dominant DB chokepoint in prod
+# (p50 = 303 ms × ~1k calls/day, ~317 s aggregate DB time per 24 h). The
+# resolver pre-pass in ``lookup.orchestrator.resolve_canonical_artist`` runs on
+# every inbound lookup regardless of ``LML_RESOLVE_ARTIST_CANONICAL``, so the
+# query is paid even when the canonical-swap behaviour is disabled. The WXYC
+# catalog input space is bounded (~30k library artists), so a 2k-entry LRU +
+# 1h TTL covers the working set after warmup. Registered with
+# ``create_ttl_cache`` so ``clear_all_caches()`` resets it alongside the
+# Discogs API memory caches. Per WXYC/library-metadata-lookup#359.
+_ARTIST_SEARCH_CACHE = create_ttl_cache(maxsize=2000, ttl=3600)
 
 
 def _negative_cache_key_hash(artist: str | None, track: str, artist_as_keyword: bool) -> bytes:
@@ -260,6 +273,7 @@ class DiscogsCacheService:
             logger.error(f"Cache search failed: {e}")
             raise CacheUnavailableError(f"Cache search failed: {e}") from e
 
+    @async_cached(_ARTIST_SEARCH_CACHE)
     async def search_artists_by_name(self, name: str, *, limit: int = 5) -> list[dict]:
         """Fuzzy-match an artist name against ``artist`` and ``artist_name_variation``.
 
@@ -267,6 +281,13 @@ class DiscogsCacheService:
         endpoint. Trigram similarity over diacritic-stripped lowercased
         names; the canonical ``artist.name`` is returned even when the
         match comes via ``artist_name_variation``.
+
+        Wrapped in ``_ARTIST_SEARCH_CACHE`` (TTLCache, maxsize=2000, ttl=1h)
+        because this query is the dominant DB chokepoint — see WXYC/library-
+        metadata-lookup#359. The cache key collapses to ``(name, limit)``
+        via the existing ``make_normalized_cache_key`` (case + diacritics
+        folded). The 1h TTL is conservative against the monthly discogs-cache
+        rebuild; intra-day staleness from incremental updates is acceptable.
 
         Args:
             name: Artist name (or skeleton) to search for.

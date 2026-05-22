@@ -921,6 +921,97 @@ class TestWriteArtistDetails:
         assert any("artist_url" in sql for sql in all_sql)
 
 
+class TestSearchArtistsByName:
+    @pytest.mark.asyncio
+    async def test_returns_canonical_artist(self, cache_service, mock_asyncpg_pool):
+        """Trigram hit returns the canonical artist row."""
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[
+                {"id": 9001, "name": "Stereolab", "score": 0.93},
+            ]
+        )
+        results = await cache_service.search_artists_by_name("Stereolab")
+        assert results == [{"id": 9001, "name": "Stereolab", "score": 0.93}]
+
+    @pytest.mark.asyncio
+    async def test_query_unions_artist_and_variation_tables(self, cache_service, mock_asyncpg_pool):
+        """The SQL must use the trigram operator and union the variation table."""
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        await cache_service.search_artists_by_name("Juana Molina", limit=3)
+        call = mock_asyncpg_pool.fetch.call_args
+        sql = call.args[0]
+        assert "artist" in sql
+        assert "artist_name_variation" in sql
+        assert "f_unaccent" in sql
+        assert "%" in sql  # trigram operator
+        assert call.args[1] == "Juana Molina"
+        assert call.args[2] == 3
+
+    @pytest.mark.asyncio
+    async def test_raises_cache_unavailable_on_pool_error(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn lost"))
+        with pytest.raises(CacheUnavailableError):
+            await cache_service.search_artists_by_name("anything")
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_skips_db(self, cache_service, mock_asyncpg_pool):
+        """Repeated call with same args must not re-issue the underlying PG query.
+
+        WXYC/library-metadata-lookup#359: ``search_artists_by_name`` is the
+        dominant DB chokepoint (p50 = 303ms × ~1k calls/day). A per-process
+        TTL cache keyed by (name, limit) collapses repeat lookups to a hash.
+        """
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[{"id": 1, "name": "Stereolab", "score": 0.91}]
+        )
+
+        first = await cache_service.search_artists_by_name("Stereolab")
+        second = await cache_service.search_artists_by_name("Stereolab")
+
+        assert first == second == [{"id": 1, "name": "Stereolab", "score": 0.91}]
+        assert mock_asyncpg_pool.fetch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_different_name_hits_db(self, cache_service, mock_asyncpg_pool):
+        """Different names produce different cache entries — each hits PG once."""
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=[
+                [{"id": 1, "name": "Stereolab", "score": 0.91}],
+                [{"id": 2, "name": "Cat Power", "score": 0.88}],
+            ]
+        )
+
+        await cache_service.search_artists_by_name("Stereolab")
+        await cache_service.search_artists_by_name("Cat Power")
+
+        assert mock_asyncpg_pool.fetch.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_different_limit_hits_db(self, cache_service, mock_asyncpg_pool):
+        """The cache key includes ``limit``: same name + different limit is a miss."""
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[{"id": 1, "name": "Stereolab", "score": 0.91}]
+        )
+
+        await cache_service.search_artists_by_name("Stereolab", limit=5)
+        await cache_service.search_artists_by_name("Stereolab", limit=10)
+
+        assert mock_asyncpg_pool.fetch.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_result_not_cached(self, cache_service, mock_asyncpg_pool):
+        """An empty list is falsy but distinct from None — keep the behaviour with
+        ``async_cached``: only ``None`` is uncacheable, ``[]`` is a real answer that
+        should be cached to avoid re-running the trigram scan."""
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+
+        await cache_service.search_artists_by_name("Nonexistent")
+        await cache_service.search_artists_by_name("Nonexistent")
+
+        # Empty list is a legitimate result — cache it so the next call is free.
+        assert mock_asyncpg_pool.fetch.await_count == 1
+
+
 class TestSearchReleasesByTitle:
     @pytest.mark.asyncio
     async def test_returns_release_with_canonical_artist(self, cache_service, mock_asyncpg_pool):
