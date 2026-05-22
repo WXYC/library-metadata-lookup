@@ -82,6 +82,25 @@ _MAX_RETRY_DELAY_SECONDS = 60.0
 _ARTIST_FUZZY_MATCH_THRESHOLD = 70
 
 
+def _approx_semaphore_queue_depth(semaphore: asyncio.Semaphore) -> int:
+    """Return an approximate count of waiters queued behind ``semaphore``.
+
+    Used only for Sentry-span observability (see WXYC/library-metadata-lookup#358).
+    The value is read *before* the awaiting caller takes a permit, so it reflects
+    pre-acquire backlog rather than steady-state utilisation.
+
+    Inspects ``asyncio.Semaphore._waiters`` — a private CPython attribute, but the
+    only way to see queued tasks without acquiring a permit ourselves. If the
+    attribute is missing on a future CPython release, the helper returns ``-1``
+    so the metric is identifiable as "unknown" rather than silently misleading.
+    """
+    try:
+        waiters = semaphore._waiters  # type: ignore[attr-defined]
+        return len(waiters) if waiters else 0
+    except AttributeError:
+        return -1
+
+
 def _compute_retry_delay(attempt: int, retry_after_header: str | None) -> float:
     """Compute how long to sleep before the next retry of a 429-rate-limited request.
 
@@ -324,9 +343,18 @@ class DiscogsService:
         semaphore = get_semaphore()
         rate_limiter = get_rate_limiter()
 
-        async with semaphore:
+        # Explicit acquire/release (not `async with semaphore:`) so the wait
+        # is wrapped in a Sentry span. The 5-permit semaphore is the dominant
+        # source of pre-request dark time on backfill cascades — sampling the
+        # queue depth right before the await gives the trace explorer a
+        # relative-load signal per call. See WXYC/library-metadata-lookup#358.
+        with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
+            span.set_data("lml.semaphore.queue_depth", _approx_semaphore_queue_depth(semaphore))
+            await semaphore.acquire()
+        try:
             for attempt in range(max_retries + 1):
-                await rate_limiter.acquire()
+                with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.rate_limiter"):
+                    await rate_limiter.acquire()
 
                 try:
                     response = await client.request(method, path, params=params)
@@ -356,6 +384,8 @@ class DiscogsService:
                 except httpx.RequestError as e:
                     logger.error(f"Discogs request failed: {e}")
                     return None
+        finally:
+            semaphore.release()
 
         return None
 
