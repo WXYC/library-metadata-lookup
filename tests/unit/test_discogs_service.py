@@ -356,6 +356,149 @@ class TestRequestWithRetry:
 
 
 # ---------------------------------------------------------------------------
+# _request_with_retry: Sentry span instrumentation for acquire waits
+# ---------------------------------------------------------------------------
+
+
+class TestRequestWithRetrySpans:
+    """Sentry-span coverage for the chokepoints that produce RCA dark time.
+
+    The 85% un-instrumented dark time on `/api/v1/lookup` slow-path requests
+    (24h prod data, Sentry trace explorer) is the queue wait *before* the 5-permit
+    semaphore is acquired and the token-bucket wait inside the retry loop. These
+    tests pin both `sentry_sdk.start_span` invocations so a future refactor can't
+    silently drop the observability. See WXYC/library-metadata-lookup#358.
+    """
+
+    @pytest.mark.asyncio
+    async def test_emits_semaphore_acquire_span(self, service):
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_client.request = AsyncMock(return_value=mock_resp)
+        service._client = mock_client
+
+        with patch("discogs.service.sentry_sdk") as mock_sdk:
+            mock_sdk.start_span.return_value.__enter__.return_value = MagicMock()
+            mock_sdk.start_span.return_value.__exit__.return_value = False
+            await service._request_with_retry("GET", "/test", max_retries=0)
+
+        span_names = [call.kwargs.get("name") for call in mock_sdk.start_span.call_args_list]
+        assert "lml.discogs.semaphore" in span_names, (
+            f"expected lml.discogs.semaphore span, got: {span_names}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_emits_rate_limiter_acquire_span(self, service):
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_client.request = AsyncMock(return_value=mock_resp)
+        service._client = mock_client
+
+        with patch("discogs.service.sentry_sdk") as mock_sdk:
+            mock_sdk.start_span.return_value.__enter__.return_value = MagicMock()
+            mock_sdk.start_span.return_value.__exit__.return_value = False
+            await service._request_with_retry("GET", "/test", max_retries=0)
+
+        span_names = [call.kwargs.get("name") for call in mock_sdk.start_span.call_args_list]
+        assert "lml.discogs.rate_limiter" in span_names, (
+            f"expected lml.discogs.rate_limiter span, got: {span_names}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_semaphore_span_carries_queue_depth(self, service):
+        """The semaphore span must carry an `lml.semaphore.queue_depth` attribute.
+
+        Sentry trace explorer uses this to surface backlog magnitude per call
+        — distinguishing "first-in-line, paid full Discogs round-trip" from
+        "queued behind N peers." Read approximate queue depth *before* the
+        await so the value reflects pre-acquire load.
+        """
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_client.request = AsyncMock(return_value=mock_resp)
+        service._client = mock_client
+
+        captured_spans: dict[str, MagicMock] = {}
+
+        def _start_span(*, op: str, name: str, **kwargs):
+            ctx = MagicMock()
+            span = MagicMock()
+            ctx.__enter__.return_value = span
+            ctx.__exit__.return_value = False
+            captured_spans[name] = span
+            return ctx
+
+        with patch("discogs.service.sentry_sdk") as mock_sdk:
+            mock_sdk.start_span.side_effect = _start_span
+            await service._request_with_retry("GET", "/test", max_retries=0)
+
+        sem_span = captured_spans.get("lml.discogs.semaphore")
+        assert sem_span is not None, (
+            f"expected a captured semaphore span, got names: {list(captured_spans)}"
+        )
+        data_keys = {call.args[0] for call in sem_span.set_data.call_args_list}
+        assert "lml.semaphore.queue_depth" in data_keys, (
+            f"expected lml.semaphore.queue_depth set_data, got: {data_keys}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_semaphore_released_after_exception(self, service):
+        """The acquire/release pair must survive an exception inside the request.
+
+        Rewriting `async with semaphore:` to explicit acquire/release is the
+        instrumentation hook point, but it also takes ownership of the cleanup
+        contract — a permit must not leak when the request body raises.
+        """
+        from discogs.ratelimit import get_semaphore, reset_rate_limiting
+
+        reset_rate_limiting()
+
+        mock_client = AsyncMock()
+        # httpx.RequestError is caught inside _request_with_retry, so use a
+        # non-handled exception class to force the try/finally to do the work.
+        mock_client.request = AsyncMock(side_effect=RuntimeError("kaboom"))
+        service._client = mock_client
+
+        sem = get_semaphore()
+        baseline = sem._value
+
+        with pytest.raises(RuntimeError):
+            await service._request_with_retry("GET", "/test", max_retries=0)
+
+        assert sem._value == baseline, (
+            f"semaphore leaked permits: baseline={baseline}, after={sem._value}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_semaphore_span_op_is_lock_acquire(self, service):
+        """Both spans are tagged op='lock.acquire' so they roll up cleanly."""
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_client.request = AsyncMock(return_value=mock_resp)
+        service._client = mock_client
+
+        with patch("discogs.service.sentry_sdk") as mock_sdk:
+            mock_sdk.start_span.return_value.__enter__.return_value = MagicMock()
+            mock_sdk.start_span.return_value.__exit__.return_value = False
+            await service._request_with_retry("GET", "/test", max_retries=0)
+
+        ops_by_name = {
+            call.kwargs.get("name"): call.kwargs.get("op")
+            for call in mock_sdk.start_span.call_args_list
+        }
+        assert ops_by_name.get("lml.discogs.semaphore") == "lock.acquire"
+        assert ops_by_name.get("lml.discogs.rate_limiter") == "lock.acquire"
+
+
+# ---------------------------------------------------------------------------
 # _parse_title
 # ---------------------------------------------------------------------------
 
