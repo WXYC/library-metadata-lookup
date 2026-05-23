@@ -403,16 +403,43 @@ def limit_results(results: list) -> list:
     return results[:MAX_SEARCH_RESULTS]
 
 
+_LEADING_ARTICLE_RE = re.compile(r"^(the|a|an)\s+")
+
+
+def _strip_leading_article(normalized: str) -> str:
+    """Strip a leading English article from a lowercase-normalized name.
+
+    Operates on the output of ``normalize_for_comparison`` (already
+    lowercased and trimmed), so the article check can be anchored and
+    case-blind.
+    """
+    return _LEADING_ARTICLE_RE.sub("", normalized, count=1)
+
+
 def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     """Check if a library item matches the given artist name.
 
-    Checks both the primary artist and alternate_artist_name fields.
+    Compares against both ``item.artist`` and ``item.alternate_artist_name``.
+    Tolerates a leading-article asymmetry between query and catalog —
+    library catalogers commonly file "The Black Dog" as "Black Dog
+    Productions" while user input and Discogs credits keep the article,
+    and the reverse ("Beatles" vs "The Beatles") also occurs. Both sides
+    are compared as-is first; on miss, both are also compared with the
+    leading article stripped. The stripped path is skipped when the query
+    reduces to an empty string so a bare "The" doesn't match arbitrary rows.
     """
     artist_normalized = normalize_for_comparison(artist)
-    if normalize_for_comparison(item.artist).startswith(artist_normalized):
-        return True
-    if item.alternate_artist_name:
-        if normalize_for_comparison(item.alternate_artist_name).startswith(artist_normalized):
+    artist_no_article = _strip_leading_article(artist_normalized)
+
+    for candidate in (item.artist, item.alternate_artist_name):
+        if not candidate:
+            continue
+        cand_normalized = normalize_for_comparison(candidate)
+        if cand_normalized.startswith(artist_normalized):
+            return True
+        if artist_no_article and _strip_leading_article(cand_normalized).startswith(
+            artist_no_article
+        ):
             return True
     return False
 

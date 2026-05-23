@@ -203,6 +203,51 @@ class TestArtistMatchesItem:
         )
         assert artist_matches_item(item, "plug") is True
 
+    # ------------------------------------------------------------------
+    # Leading-article tolerance — bidirectional.
+    #
+    # Library catalogers commonly file bands without the leading "The"
+    # ("Black Dog Productions" rather than "The Black Dog"). User input
+    # and Discogs credits often include it. The matcher must accept the
+    # asymmetry in either direction so requests like "Psil-cosyin by The
+    # Black Dog" surface the catalog row.
+    # ------------------------------------------------------------------
+
+    def test_leading_the_in_query_matches_article_less_artist(self):
+        """Query 'The Black Dog' matches library row stored as 'Black Dog Productions'."""
+        item = make_library_item(id=274, artist="Black Dog Productions", title="Spanners")
+        assert artist_matches_item(item, "The Black Dog") is True
+
+    def test_leading_the_in_query_matches_article_less_alternate(self):
+        """Query 'The Black Dog' matches library row whose alternate is 'Black Dog'."""
+        item = make_library_item(
+            id=68523,
+            artist="Black Dog Productions",
+            title="Further Vexations",
+            alternate_artist_name="Black Dog",
+        )
+        assert artist_matches_item(item, "The Black Dog") is True
+
+    def test_article_less_query_matches_leading_the_artist(self):
+        """Reverse direction: query 'Beatles' matches library row stored as 'The Beatles'."""
+        item = make_library_item(id=1, artist="The Beatles", title="Revolver")
+        assert artist_matches_item(item, "Beatles") is True
+
+    def test_leading_a_in_query_matches_article_less_artist(self):
+        """Query 'A Tribe Called Quest' matches library row stored as 'Tribe Called Quest'."""
+        item = make_library_item(id=1, artist="Tribe Called Quest", title="Midnight Marauders")
+        assert artist_matches_item(item, "A Tribe Called Quest") is True
+
+    def test_no_match_when_only_article_remains(self):
+        """Degenerate input of just 'The' must not match arbitrary rows after stripping."""
+        item = make_library_item(id=1, artist="Stereolab", title="Aluminum Tunes")
+        assert artist_matches_item(item, "The") is False
+
+    def test_article_tolerance_does_not_create_false_positive(self):
+        """Article-stripping must not collapse different artists into a match."""
+        item = make_library_item(id=1, artist="The Beatles", title="Revolver")
+        assert artist_matches_item(item, "The Black Dog") is False
+
 
 # ---------------------------------------------------------------------------
 # Tests: build_context_message
