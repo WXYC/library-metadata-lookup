@@ -238,6 +238,16 @@ class TestArtistMatchesItem:
         item = make_library_item(id=1, artist="Tribe Called Quest", title="Midnight Marauders")
         assert artist_matches_item(item, "A Tribe Called Quest") is True
 
+    def test_leading_an_in_query_matches_article_less_artist(self):
+        """Query 'An Albatross' matches library row stored as 'Albatross'."""
+        item = make_library_item(id=1, artist="Albatross", title="Eat Lightning Shit Thunder")
+        assert artist_matches_item(item, "An Albatross") is True
+
+    def test_different_articles_on_each_side_match(self):
+        """Both sides carrying *different* articles still match after symmetric strip."""
+        item = make_library_item(id=1, artist="The Microphones", title="The Glow Pt. 2")
+        assert artist_matches_item(item, "A Microphones") is True
+
     def test_no_match_when_only_article_remains(self):
         """Degenerate input of just 'The' must not match arbitrary rows after stripping."""
         item = make_library_item(id=1, artist="Stereolab", title="Aluminum Tunes")
