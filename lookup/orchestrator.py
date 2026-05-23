@@ -403,7 +403,7 @@ def limit_results(results: list) -> list:
     return results[:MAX_SEARCH_RESULTS]
 
 
-_LEADING_ARTICLE_RE = re.compile(r"^(the|a|an)\s+")
+_LEADING_ARTICLE_RE = re.compile(r"^(the|a|an)(\s+|$)")
 
 
 def _strip_leading_article(normalized: str) -> str:
@@ -425,8 +425,8 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     Productions" while user input and Discogs credits keep the article,
     and the reverse ("Beatles" vs "The Beatles") also occurs. Both sides
     are compared as-is first; on miss, both are also compared with the
-    leading article stripped. The stripped path is skipped when the query
-    reduces to an empty string so a bare "The" doesn't match arbitrary rows.
+    leading article stripped. The stripped path is skipped when stripping
+    leaves the query empty so a bare "The" doesn't match arbitrary rows.
     """
     artist_normalized = normalize_for_comparison(artist)
     artist_no_article = _strip_leading_article(artist_normalized)
