@@ -88,3 +88,83 @@ class TestAlternateArtistIntegration:
         results = await db.search(query="Luke Vibert")
         filtered = filter_results_by_artist(results, "Luke Vibert")
         assert len(filtered) == 2
+
+
+class TestLeadingArticleIntegration:
+    """End-to-end test that mirrors the real WXYC Black Dog catalog rows.
+
+    Library row 274 (Spanners) is stored as artist="Black Dog Productions"
+    with no alternate, while newer rows for the same artist carry
+    alternate_artist_name="Black Dog". A user request "by The Black Dog"
+    must surface both.
+    """
+
+    @pytest_asyncio.fixture
+    async def db_with_black_dog(self, tmp_path):
+        db_file = tmp_path / "test_library.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT,
+                alternate_artist_name TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist, alternate_artist_name,
+                content='library', content_rowid='id'
+            )
+        """)
+        # Mirrors prod rows 273/274: older Warp-era filings with no alternate.
+        conn.execute(
+            "INSERT INTO library VALUES "
+            "(274, 'Spanners', 'Black Dog Productions', 'Bl', 11, 2, 'Electronic', 'CD', NULL)"
+        )
+        conn.execute(
+            "INSERT INTO library_fts(rowid, title, artist, alternate_artist_name) "
+            "VALUES (274, 'Spanners', 'Black Dog Productions', NULL)"
+        )
+        # Mirrors prod rows 68523-68526: newer filings that carry the alternate.
+        conn.execute(
+            "INSERT INTO library VALUES "
+            "(68523, 'Further Vexations', 'Black Dog Productions', 'Bl', 11, 3, "
+            "'Electronic', 'CD', 'Black Dog')"
+        )
+        conn.execute(
+            "INSERT INTO library_fts(rowid, title, artist, alternate_artist_name) "
+            "VALUES (68523, 'Further Vexations', 'Black Dog Productions', 'Black Dog')"
+        )
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        yield db
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_query_with_leading_the_finds_article_less_row(self, db_with_black_dog):
+        """'The Black Dog' must surface row 274 even though the catalog drops 'The'."""
+        results = await db_with_black_dog.search(query="Spanners")
+        filtered = filter_results_by_artist(results, "The Black Dog")
+
+        assert any(r.id == 274 for r in filtered), (
+            f"Expected row 274 (Spanners) in {[r.id for r in filtered]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_query_with_leading_the_finds_alternate_match(self, db_with_black_dog):
+        """'The Black Dog' must also match rows whose alternate is 'Black Dog'."""
+        results = await db_with_black_dog.search(query="Further Vexations")
+        filtered = filter_results_by_artist(results, "The Black Dog")
+
+        assert any(r.id == 68523 for r in filtered), (
+            f"Expected row 68523 in {[r.id for r in filtered]}"
+        )
