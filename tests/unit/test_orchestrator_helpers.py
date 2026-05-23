@@ -229,9 +229,9 @@ class TestArtistMatchesItem:
         assert artist_matches_item(item, "The Black Dog") is True
 
     def test_article_less_query_matches_leading_the_artist(self):
-        """Reverse direction: query 'Beatles' matches library row stored as 'The Beatles'."""
-        item = make_library_item(id=1, artist="The Beatles", title="Revolver")
-        assert artist_matches_item(item, "Beatles") is True
+        """Reverse direction: query 'Microphones' matches library row stored as 'The Microphones'."""
+        item = make_library_item(id=1, artist="The Microphones", title="The Glow Pt. 2")
+        assert artist_matches_item(item, "Microphones") is True
 
     def test_leading_a_in_query_matches_article_less_artist(self):
         """Query 'A Tribe Called Quest' matches library row stored as 'Tribe Called Quest'."""
@@ -245,7 +245,7 @@ class TestArtistMatchesItem:
 
     def test_article_tolerance_does_not_create_false_positive(self):
         """Article-stripping must not collapse different artists into a match."""
-        item = make_library_item(id=1, artist="The Beatles", title="Revolver")
+        item = make_library_item(id=1, artist="The Microphones", title="The Glow Pt. 2")
         assert artist_matches_item(item, "The Black Dog") is False
 
 
