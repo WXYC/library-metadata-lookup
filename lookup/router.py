@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections import Counter
 from typing import TYPE_CHECKING
 
 import httpx
@@ -45,15 +46,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["lookup"])
 
-# LML#368: bulk endpoint accepts 1-100 items per request. Above the cap we
-# return 400 (per the ticket's acceptance criteria — not 413, which the
-# `/identity/bulk-resolve-libraries` precedent uses for its 1000-cap). The
-# cap is constant; if it needs to grow we change it here.
+# 400 (not 413) for oversize is the endpoint's contract; sibling
+# `/identity/bulk-resolve-libraries` chose 413 — keep them separate.
 _BULK_LOOKUP_INPUT_CAP = 100
 
-# Default in-flight concurrency cap for bulk items. Tunable via env so we can
-# react to per-deploy hardware without a code change. Bounded at the floor so
-# accidental `0` or negative values can't hang the request.
 _BULK_LOOKUP_DEFAULT_CONCURRENCY = 10
 
 
@@ -193,9 +189,13 @@ async def handle_lookup(
 
 
 def _max_concurrency_from_env() -> int:
-    """Resolve the bulk-item concurrency cap from env, floored at 1."""
+    """Resolve LML_BULK_MAX_CONCURRENT, floored at 1 to keep a misconfigured 0 from hanging.
+
+    Read at request time (not via `Settings`) to mirror `LML_SEARCH_BUDGET_MS`
+    in `core/search.py:resolve_search_budget_ms` — both are runtime knobs.
+    """
     raw = os.getenv("LML_BULK_MAX_CONCURRENT")
-    if raw is None or raw == "":
+    if not raw:
         return _BULK_LOOKUP_DEFAULT_CONCURRENCY
     try:
         return max(1, int(raw))
@@ -248,8 +248,7 @@ async def handle_bulk_lookup(
     ),
 ) -> BulkLookupResponse:
     """Bulk lookup. See route docstring for protocol."""
-    # Manual parse + cap-check so oversize gets 400 (per LML#368 acceptance
-    # criteria) rather than the 422 Pydantic would emit via max_length.
+    # Manual cap-check: 400 (not Pydantic's 422) for oversize batches.
     try:
         body = await http_request.json()
     except (ValueError, TypeError) as e:
@@ -272,16 +271,24 @@ async def handle_bulk_lookup(
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors()) from None
 
-    # One cache_stats context for the whole batch — the in-process caches are
-    # shared, so cumulative hit/miss counters reflect the batch's aggregate
-    # behavior (the property that motivates this endpoint).
+    # One cache_stats context for the whole batch: the in-process caches are
+    # shared, so aggregate counters reflect the batch's behavior — the property
+    # that motivates this endpoint.
     init_cache_stats()
 
     max_concurrent = _max_concurrency_from_env()
     semaphore = asyncio.Semaphore(max_concurrent)
+    batch_telemetry = RequestTelemetry(
+        api_call_keys=["discogs"],
+        distinct_id="library-metadata-lookup-service",
+        event_prefix="lookup.bulk",
+    )
 
     async def _run_one(index: int, item: LookupRequest) -> BulkLookupResultItem:
         async with semaphore:
+            # Per-item telemetry instance: required by perform_lookup's signature
+            # and avoids the `_current_step` race that would happen with a shared
+            # instance across concurrent items.
             telemetry = RequestTelemetry(
                 api_call_keys=["discogs"],
                 distinct_id="library-metadata-lookup-service",
@@ -302,8 +309,6 @@ async def handle_bulk_lookup(
                     )
             except Exception as e:
                 # Per-item isolation: one failure must not poison siblings.
-                # Log the traceback for observability but surface only the
-                # exception class + message to the caller — no internals.
                 logger.exception("bulk lookup item %d failed", index)
                 return BulkLookupResultItem(
                     index=index,
@@ -311,43 +316,30 @@ async def handle_bulk_lookup(
                     lookup=None,
                     message=f"{type(e).__name__}: {e}",
                 )
-            has_results = bool(lookup_response.results)
             return BulkLookupResultItem(
                 index=index,
-                status="match" if has_results else "no_match",
+                status="match" if lookup_response.results else "no_match",
                 lookup=lookup_response,
             )
 
     with sentry_sdk.start_span(op="lml.bulk.batch", name=f"{len(request.items)} items") as span:
-        if span is not None:
-            span.set_data("lml.bulk.size", len(request.items))
-            span.set_data("lml.bulk.max_concurrent", max_concurrent)
+        span.set_data("lml.bulk.size", len(request.items))
+        span.set_data("lml.bulk.max_concurrent", max_concurrent)
         results = await asyncio.gather(*(_run_one(i, item) for i, item in enumerate(request.items)))
 
-    # Project the batch's aggregate cache_stats onto the active Sentry
-    # transaction so the join against the trace works the same as per-item
-    # /lookup. Sentry SDK errors must not break the request path.
-    stats = get_cache_stats()
-    _project_cache_stats_to_transaction(stats)
+    _project_cache_stats_to_transaction(get_cache_stats())
 
-    # Telemetry: one PostHog event for the batch summarizing per-item outcomes.
     if posthog_client:
-        match_count = sum(1 for r in results if r.status == "match")
-        no_match_count = sum(1 for r in results if r.status == "no_match")
-        error_count = sum(1 for r in results if r.status == "error")
-        try:
-            posthog_client.capture(
-                "lookup.bulk",
-                distinct_id="library-metadata-lookup-service",
-                properties={
-                    "batch_size": len(request.items),
-                    "match_count": match_count,
-                    "no_match_count": no_match_count,
-                    "error_count": error_count,
-                    "max_concurrent": max_concurrent,
-                },
-            )
-        except Exception:
-            logger.warning("PostHog capture failed for lookup.bulk", exc_info=True)
+        counts = Counter(r.status for r in results)
+        batch_telemetry.send_to_posthog(
+            posthog_client,
+            {
+                "batch_size": len(request.items),
+                "match_count": counts["match"],
+                "no_match_count": counts["no_match"],
+                "error_count": counts["error"],
+                "max_concurrent": max_concurrent,
+            },
+        )
 
     return BulkLookupResponse(results=results)
