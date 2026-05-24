@@ -237,13 +237,15 @@ async def handle_bulk_lookup(
     entity_store: EntityStore | None = Depends(get_entity_store),
     posthog_client: Posthog | None = Depends(get_posthog_client),
     http_client: httpx.AsyncClient = Depends(get_apple_music_http_client),
+    skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
         default=None,
         alias="X-Caller-Budget-Ms",
         description=(
             "Optional per-request budget in ms. Forwarded to each item's "
             "perform_lookup call; the per-item budget is independent of the "
-            "batch (each item sees the same caller-supplied ceiling)."
+            "batch (each item sees the same caller-supplied ceiling). The "
+            "`LML#345 follow-up will redefine this as a batch-level budget."
         ),
     ),
 ) -> BulkLookupResponse:
@@ -270,6 +272,12 @@ async def handle_bulk_lookup(
         request = BulkLookupRequest.model_validate(body)
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors()) from None
+
+    # Honor the same `skip_cache` query flag the per-item route accepts. Backed
+    # by a ContextVar, so setting once at the batch top propagates into each
+    # `_run_one` task via the inherited task context.
+    if skip_cache:
+        set_skip_cache(True)
 
     # One cache_stats context for the whole batch: the in-process caches are
     # shared, so aggregate counters reflect the batch's behavior — the property
@@ -309,12 +317,17 @@ async def handle_bulk_lookup(
                     )
             except Exception as e:
                 # Per-item isolation: one failure must not poison siblings.
+                # The error class is surfaced for caller-side classification,
+                # but the exception's str() may include SQL fragments, file
+                # paths, or upstream error bodies — strip to the class name to
+                # keep internals out of the response. Full traceback lands in
+                # Sentry via `logger.exception`.
                 logger.exception("bulk lookup item %d failed", index)
                 return BulkLookupResultItem(
                     index=index,
                     status="error",
                     lookup=None,
-                    message=f"{type(e).__name__}: {e}",
+                    message=type(e).__name__,
                 )
             return BulkLookupResultItem(
                 index=index,
