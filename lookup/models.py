@@ -17,7 +17,7 @@ existing callers see no behavior change.
 
 from typing import Literal
 
-from pydantic import Field, SerializeAsAny
+from pydantic import BaseModel, Field, SerializeAsAny
 
 from generated.api_models import (
     DiscogsMatchResult,
@@ -76,7 +76,43 @@ class LookupResponse(_GeneratedLookupResponse):
     )
 
 
+BulkLookupResultStatus = Literal["match", "no_match", "error"]
+
+
+class BulkLookupResultItem(BaseModel):
+    """Per-item verdict for the bulk lookup endpoint.
+
+    ``lookup`` carries the full per-item ``LookupResponse`` so callers see the
+    same shape as the single-item endpoint when the lookup completed, regardless
+    of whether it produced results. ``status`` is a fast signal:
+
+    - ``match``    — ``lookup.results`` is non-empty
+    - ``no_match`` — ``lookup.results`` is empty (search ran, found nothing)
+    - ``error``    — ``perform_lookup`` raised; ``lookup`` is None, ``message`` set
+    """
+
+    index: int = Field(..., description="Zero-based index into the request `items` array.")
+    status: BulkLookupResultStatus
+    lookup: LookupResponse | None = None
+    message: str | None = None
+
+
+class BulkLookupRequest(BaseModel):
+    """Bulk variant of ``LookupRequest``. Items run concurrently under a
+    bounded semaphore; results return in input order."""
+
+    items: list[LookupRequest] = Field(..., min_length=1)
+
+
+class BulkLookupResponse(BaseModel):
+    results: list[BulkLookupResultItem]
+
+
 __all__ = [
+    "BulkLookupRequest",
+    "BulkLookupResponse",
+    "BulkLookupResultItem",
+    "BulkLookupResultStatus",
     "DiscogsMatchResult",
     "LibraryCatalogItem",
     "LookupRequest",
