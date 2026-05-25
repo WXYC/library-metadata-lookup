@@ -6,6 +6,7 @@ Each strategy has explicit trigger conditions and can be easily tested in isolat
 Strategies are executed in array order until results are found.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -34,6 +35,23 @@ BS timeout normalizes, this value should move; in the meantime,
 """
 
 SEARCH_BUDGET_ENV_VAR = "LML_SEARCH_BUDGET_MS"
+
+DEFAULT_SEARCH_HARD_TIMEOUT_MS = 25000
+"""Hard ceiling on ``execute_search_pipeline`` wall time, in milliseconds.
+
+Unlike :data:`DEFAULT_SEARCH_BUDGET_MS` (which only short-circuits when
+``state.results`` is non-empty — by design, so the all-empty cascade keeps
+grinding for a better answer), this cap fires *regardless* of results to
+bound cascade-exhaustion tail latency. 25 s leaves ~5 s headroom under
+Backend-Service's 30 s ``AbortController`` (BS#873). The 2026-05-24
+outliers (414 s server-side span on a /lookup BS had already abandoned at
+30 s) are the receipt for needing this.
+
+``LML_SEARCH_HARD_TIMEOUT_MS`` overrides without a deploy. To effectively
+disable, set the cap well above the request timeout (e.g. 600000).
+"""
+
+SEARCH_HARD_TIMEOUT_ENV_VAR = "LML_SEARCH_HARD_TIMEOUT_MS"
 
 TRANSPORT_OVERHEAD_MS = 200
 """Approximate round-trip overhead between LML and a caller (Backend-Service).
@@ -82,6 +100,46 @@ def resolve_search_budget_ms() -> int:
             DEFAULT_SEARCH_BUDGET_MS,
         )
         return DEFAULT_SEARCH_BUDGET_MS
+    return value
+
+
+def resolve_search_hard_timeout_ms() -> int:
+    """Return the hard timeout ceiling in ms, honoring ``LML_SEARCH_HARD_TIMEOUT_MS``.
+
+    Unlike :func:`resolve_effective_search_budget_ms`, this resolver is
+    env-var-only; callers cannot override the hard cap via HTTP header. The
+    hard cap is a safety floor, not a per-request budget — letting callers
+    raise it would defeat its purpose. Unparseable, zero, or negative values
+    fall back to :data:`DEFAULT_SEARCH_HARD_TIMEOUT_MS` with a WARN — operator
+    typos should not 500 every /lookup. Read per-call (not at import) so tests
+    can monkeypatch the env var without reaching into module state.
+    """
+    raw = os.environ.get(SEARCH_HARD_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return DEFAULT_SEARCH_HARD_TIMEOUT_MS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; falling back to %d",
+            SEARCH_HARD_TIMEOUT_ENV_VAR,
+            raw,
+            DEFAULT_SEARCH_HARD_TIMEOUT_MS,
+        )
+        return DEFAULT_SEARCH_HARD_TIMEOUT_MS
+    if value <= 0:
+        # Zero or negative is treated as misconfiguration. With cap<=0 the
+        # gate fires on the very first iteration before any strategy runs.
+        # Operators reaching for these values typically mean "disable" — to
+        # actually disable, set the cap well above the request timeout
+        # (e.g. 600000). Falling back to the default with a WARN.
+        logger.warning(
+            "%s=%d is not positive; falling back to %d",
+            SEARCH_HARD_TIMEOUT_ENV_VAR,
+            value,
+            DEFAULT_SEARCH_HARD_TIMEOUT_MS,
+        )
+        return DEFAULT_SEARCH_HARD_TIMEOUT_MS
     return value
 
 
@@ -150,6 +208,37 @@ def _log_search_budget_exceeded(
         transaction.set_data("search_strategies_skipped", payload["skipped"])
     except Exception as e:
         logger.warning("Failed to project search_budget_exceeded onto Sentry transaction: %s", e)
+
+
+def _log_hard_cap_fired(
+    *, elapsed_ms: float, skipped: list["SearchStrategyType"], hard_cap_ms: int
+) -> None:
+    """Project a hard-cap breach onto the active Sentry transaction (LML#370).
+
+    Sibling of :func:`_log_search_budget_exceeded`. The hard cap fires when
+    the cascade has spent more wall time than the safety floor allows,
+    regardless of ``state.results``. ``lml.hard_cap_fired:true`` on the
+    trace lets Sentry trace explorer filter cap-firing requests without
+    re-pulling Railway logs.
+
+    No-op when there is no active transaction. Any SDK error is swallowed
+    so observability cannot break /lookup.
+    """
+    payload = {
+        "elapsed_ms": round(elapsed_ms, 2),
+        "hard_cap_ms": hard_cap_ms,
+        "skipped": [s.value for s in skipped],
+    }
+    logger.info("lml.hard_cap_fired %s", payload)
+    try:
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is None:
+            return
+        transaction.set_data("lml.hard_cap_fired", True)
+        transaction.set_data("hard_cap_skipped_strategies", payload["skipped"])
+        transaction.set_data("hard_cap_elapsed_ms", payload["elapsed_ms"])
+    except Exception as e:
+        logger.warning("Failed to project lml.hard_cap_fired onto Sentry transaction: %s", e)
 
 
 def detect_ambiguous_format(raw_message: str) -> tuple[str, str] | None:
@@ -263,6 +352,22 @@ class SearchState:
     Populated by SONG_AS_TRACK when a track-title cross-reference surfaces a library
     row. perform_lookup() reads this when building LookupResultItem.matched_via so
     the API contract carries the track→release linkage back to the caller.
+    """
+
+    timed_out: bool = False
+    """True when the LML#370 hard cap fired and the pipeline was abandoned.
+
+    Projected into ``LookupResponse.timeout`` so callers can distinguish
+    "no match" (empty ``results``, ``timed_out: False``) from "ran out of
+    time" (``results`` may be empty, ``timed_out: True``).
+    """
+
+    strategies_timed_out: list[SearchStrategyType] = field(default_factory=list)
+    """Strategies whose ``asyncio.wait_for`` ceiling fired (LML#370).
+
+    Distinct from ``strategies_tried``: a strategy that timed out *was*
+    tried, just abandoned mid-execution. Carried for telemetry, not
+    consumed by callers.
     """
 
 
@@ -470,6 +575,7 @@ async def execute_search_pipeline(
     )
 
     budget_ms = resolve_effective_search_budget_ms(caller_budget_ms)
+    hard_cap_ms = resolve_search_hard_timeout_ms()
     # Project the caller-budget value when present so Sentry trace explorer can
     # split header-driven vs env-driven cutoffs (A8 / LML#345). The
     # effective-budget computation already clamps to env, so we record the raw
@@ -485,13 +591,29 @@ async def execute_search_pipeline(
     start = time.monotonic()
 
     for idx, strategy in enumerate(strategies):
-        # Wall-clock gate. Two clauses, both load-bearing:
+        elapsed_ms = (time.monotonic() - start) * 1000
+
+        # Hard cap (LML#370). Fires regardless of state.results — the safety
+        # floor that bounds cascade-exhaustion tail latency. Layered ABOVE
+        # the soft-budget gate so that when both would fire, we record the
+        # cap (the more severe condition) and skip the budget telemetry.
+        if elapsed_ms > hard_cap_ms:
+            state.timed_out = True
+            _log_hard_cap_fired(
+                elapsed_ms=elapsed_ms,
+                skipped=[s.name for s in strategies[idx:]],
+                hard_cap_ms=hard_cap_ms,
+            )
+            break
+
+        # Soft-budget gate (LML#340). Two clauses, both load-bearing:
         #   1. elapsed_ms > budget — we've spent more time than the caller is
         #      willing to wait.
         #   2. state.results is non-empty — we have *something* to return.
         # When the second clause is false we keep grinding: the user gets
         # "nothing" either way, and the next strategy might surface results.
-        elapsed_ms = (time.monotonic() - start) * 1000
+        # The hard cap above catches the keep-grinding case when it grinds
+        # too long.
         if elapsed_ms > budget_ms and state.results:
             _log_search_budget_exceeded(
                 elapsed_ms=elapsed_ms,
@@ -506,56 +628,95 @@ async def execute_search_pipeline(
 
         state.strategies_tried.append(strategy.name)
 
-        # Execute the strategy
-        if strategy.name == SearchStrategyType.ARTIST_PLUS_ALBUM:
-            results, fallback_used = await strategy.execute(db, parsed, state.albums_for_search)
-            if results:
-                state.results = results
-            if strategy.updates_song_not_found and fallback_used:
-                state.song_not_found = True
+        # Per-strategy ceiling. Caps the *currently-running* strategy at the
+        # remaining hard-cap budget, so a single slow Discogs cascade can't
+        # blow the loop-level gate (which only fires between strategies).
+        # The 0.01s floor avoids a degenerate wait_for(timeout=0) when
+        # elapsed_ms has just crossed hard_cap_ms due to scheduling jitter —
+        # the wait_for will TimeoutError immediately and the outer except
+        # records the strategy as timed out, same end state as a real cap fire.
+        remaining_budget_seconds = max(0.01, (hard_cap_ms - elapsed_ms) / 1000)
 
-        elif strategy.name == SearchStrategyType.SWAPPED_INTERPRETATION:
-            # Parse the ambiguous format
-            parts = detect_ambiguous_format(raw_message)
-            if parts:
-                part1, part2 = parts
-                results, _ = await strategy.execute(db, part1, part2)
-            else:
-                results = []
-            if results:
-                state.results = results
-                state.song_not_found = False
+        # Single try/except around the whole if/elif so the per-strategy
+        # wait_for ceiling fires uniformly regardless of which branch is
+        # dispatched. CancelledError → TimeoutError raised by wait_for
+        # propagates into in-flight asyncio.gather() probes inside the
+        # strategy, freeing the Discogs semaphore on cap-fire.
+        try:
+            # Execute the strategy
+            if strategy.name == SearchStrategyType.ARTIST_PLUS_ALBUM:
+                results, fallback_used = await asyncio.wait_for(
+                    strategy.execute(db, parsed, state.albums_for_search),
+                    timeout=remaining_budget_seconds,
+                )
+                if results:
+                    state.results = results
+                if strategy.updates_song_not_found and fallback_used:
+                    state.song_not_found = True
 
-        elif strategy.name == SearchStrategyType.TRACK_ON_COMPILATION:
-            results, discogs_titles = await strategy.execute(db, parsed)
-            if results:
-                # Save artist fallback results before replacing — perform_lookup
-                # will validate them against Discogs tracklists and merge any
-                # confirmed matches back into the final results.
-                if state.results and state.song_not_found:
-                    state.artist_fallback_results = list(state.results)
-                state.results = results
-                state.found_on_compilation = True
-                state.song_not_found = False
-                if strategy.updates_discogs_titles:
-                    state.discogs_titles = discogs_titles
+            elif strategy.name == SearchStrategyType.SWAPPED_INTERPRETATION:
+                # Parse the ambiguous format
+                parts = detect_ambiguous_format(raw_message)
+                if parts:
+                    part1, part2 = parts
+                    results, _ = await asyncio.wait_for(
+                        strategy.execute(db, part1, part2),
+                        timeout=remaining_budget_seconds,
+                    )
+                else:
+                    results = []
+                if results:
+                    state.results = results
+                    state.song_not_found = False
 
-        elif strategy.name == SearchStrategyType.SONG_AS_ARTIST:
-            # Try using the parsed song as an artist name
-            results, _ = await strategy.execute(db, parsed.song)
-            if results:
-                state.results = results
-                state.song_not_found = False
+            elif strategy.name == SearchStrategyType.TRACK_ON_COMPILATION:
+                results, discogs_titles = await asyncio.wait_for(
+                    strategy.execute(db, parsed),
+                    timeout=remaining_budget_seconds,
+                )
+                if results:
+                    # Save artist fallback results before replacing — perform_lookup
+                    # will validate them against Discogs tracklists and merge any
+                    # confirmed matches back into the final results.
+                    if state.results and state.song_not_found:
+                        state.artist_fallback_results = list(state.results)
+                    state.results = results
+                    state.found_on_compilation = True
+                    state.song_not_found = False
+                    if strategy.updates_discogs_titles:
+                        state.discogs_titles = discogs_titles
 
-        elif strategy.name == SearchStrategyType.SONG_AS_TRACK:
-            # Two-value unpack (unlike other branches): the strategy returns
-            # matched_via_by_id alongside the library items so SearchState can
-            # carry provenance to perform_lookup. See plan §4.2.
-            results, matched_via_by_id = await strategy.execute(db, parsed.song)
-            if results:
-                state.results = results
-                state.song_not_found = False
-                state.matched_via_by_id = matched_via_by_id
+            elif strategy.name == SearchStrategyType.SONG_AS_ARTIST:
+                # Try using the parsed song as an artist name
+                results, _ = await asyncio.wait_for(
+                    strategy.execute(db, parsed.song),
+                    timeout=remaining_budget_seconds,
+                )
+                if results:
+                    state.results = results
+                    state.song_not_found = False
+
+            elif strategy.name == SearchStrategyType.SONG_AS_TRACK:
+                # Two-value unpack (unlike other branches): the strategy returns
+                # matched_via_by_id alongside the library items so SearchState can
+                # carry provenance to perform_lookup. See plan §4.2.
+                results, matched_via_by_id = await asyncio.wait_for(
+                    strategy.execute(db, parsed.song),
+                    timeout=remaining_budget_seconds,
+                )
+                if results:
+                    state.results = results
+                    state.song_not_found = False
+                    state.matched_via_by_id = matched_via_by_id
+        except TimeoutError:
+            state.timed_out = True
+            state.strategies_timed_out.append(strategy.name)
+            _log_hard_cap_fired(
+                elapsed_ms=(time.monotonic() - start) * 1000,
+                skipped=[s.name for s in strategies[idx + 1 :]],
+                hard_cap_ms=hard_cap_ms,
+            )
+            break
 
         # Stop if we found results (unless we're doing compilation search which can replace results)
         if state.results and strategy.name != SearchStrategyType.TRACK_ON_COMPILATION:
