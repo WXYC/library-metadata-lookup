@@ -1527,6 +1527,10 @@ class LookupResponse(BaseModel):
     )
     cache_stats: CacheStats | None = None
     identity: LookupIdentityBlock | None = None
+    timeout: bool | None = Field(
+        False,
+        description='True when LML\'s server-side hard cap fired and the search pipeline was abandoned mid-execution (LML#370). `results` may be partial or empty in that case. Callers can use this to distinguish "no match" (empty `results`, `timeout: false`) from "ran out of time" (`results` may be empty, `timeout: true`). The hard cap is an internal LML safety floor independent of the caller\'s `X-Caller-Budget-Ms` header; see LML#338 / LML#340 / LML#370 for the cascade-budget design.\n',
+    )
 
 
 class BulkResolveLibrariesRequest(BaseModel):
