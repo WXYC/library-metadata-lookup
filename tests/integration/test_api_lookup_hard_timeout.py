@@ -38,14 +38,19 @@ class TestApiLookupHardTimeout:
             "lookup.orchestrator.search_library_with_fallback",
             side_effect=slow_empty,
         ):
+            # 5s outer wait_for: if wait_for-propagation regresses, fail
+            # fast instead of stalling CI for 10s waiting on the mock.
             start = time.monotonic()
-            resp = await app_client.post(
-                "/api/v1/lookup",
-                json={
-                    "artist": "Untraceable Artist",
-                    "song": "Untraceable Song",
-                    "raw_message": "Untraceable Artist - Untraceable Song",
-                },
+            resp = await asyncio.wait_for(
+                app_client.post(
+                    "/api/v1/lookup",
+                    json={
+                        "artist": "Untraceable Artist",
+                        "song": "Untraceable Song",
+                        "raw_message": "Untraceable Artist - Untraceable Song",
+                    },
+                ),
+                timeout=5.0,
             )
             elapsed = time.monotonic() - start
 

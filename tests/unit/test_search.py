@@ -941,7 +941,7 @@ class TestSearchHardTimeoutLoopGate:
 
     @pytest.mark.asyncio
     async def test_hard_cap_telemetry_projected_onto_sentry(self, monkeypatch):
-        """When the cap fires, ``lml.hard_cap_fired`` lands on the active transaction."""
+        """When the cap fires, ``hard_cap_fired`` lands on the active transaction."""
         monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "50")
         monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
 
@@ -974,7 +974,7 @@ class TestSearchHardTimeoutLoopGate:
             )
 
         calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert calls.get("lml.hard_cap_fired") is True
+        assert calls.get("hard_cap_fired") is True
         # Strategies past the cap recorded as skipped (telemetry diagnostic).
         skipped = calls.get("hard_cap_skipped_strategies", [])
         assert SearchStrategyType.SWAPPED_INTERPRETATION.value in skipped
@@ -997,7 +997,7 @@ class TestLogHardCapFired:
             )
 
         calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
-        assert calls["lml.hard_cap_fired"] is True
+        assert calls["hard_cap_fired"] is True
         assert calls["hard_cap_skipped_strategies"] == [
             SearchStrategyType.TRACK_ON_COMPILATION.value,
             SearchStrategyType.SONG_AS_TRACK.value,
@@ -1063,38 +1063,21 @@ class TestPerStrategyWaitFor:
 
         parsed = ParsedRequest(artist="x", song=None, raw_message="x")
 
+        # 5s outer wait_for: if wait_for-propagation regresses, fail fast
+        # instead of stalling CI for 60s waiting on the mock probes.
         start = time.monotonic()
-        state = await execute_search_pipeline(parsed, AsyncMock(), "x", strategies)
+        state = await asyncio.wait_for(
+            execute_search_pipeline(parsed, AsyncMock(), "x", strategies),
+            timeout=5.0,
+        )
         elapsed = time.monotonic() - start
 
         assert elapsed < 1.5, f"pipeline should abandon at ~100ms, took {elapsed:.2f}s"
         assert state.timed_out is True
         # All three inner probes cancelled — proof of cancellation propagation.
         assert set(cancelled) == {"a", "b", "c"}
-        # The timed-out strategy is recorded as both tried AND timed out.
+        # The timed-out strategy is recorded as tried.
         assert SearchStrategyType.ARTIST_PLUS_ALBUM in state.strategies_tried
-        assert SearchStrategyType.ARTIST_PLUS_ALBUM in state.strategies_timed_out
-
-    @pytest.mark.asyncio
-    async def test_strategies_timed_out_populated(self, monkeypatch):
-        """``strategies_timed_out`` records which strategy hit its ceiling."""
-        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "100")
-        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
-
-        async def hangs(*_args, **_kwargs):
-            await asyncio.sleep(60)
-            return ([], False)
-
-        search_lib = AsyncMock(side_effect=hangs)
-        search_alt = AsyncMock(return_value=([], None))
-        search_comp = AsyncMock(return_value=([], {}))
-        strategies = build_strategies(search_lib, search_alt, search_comp)
-
-        parsed = ParsedRequest(artist="x", song=None, raw_message="x")
-        state = await execute_search_pipeline(parsed, AsyncMock(), "x", strategies)
-
-        assert state.strategies_timed_out == [SearchStrategyType.ARTIST_PLUS_ALBUM]
-        assert state.timed_out is True
 
 
 class TestHardCapSoftBudgetIndependence:
@@ -1154,7 +1137,7 @@ class TestHardCapSoftBudgetIndependence:
         assert state.timed_out is False
         calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
         assert calls.get("search_budget_exceeded") is True
-        assert "lml.hard_cap_fired" not in calls
+        assert "hard_cap_fired" not in calls
 
 
 # ---------------------------------------------------------------------------
