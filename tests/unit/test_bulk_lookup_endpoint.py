@@ -448,3 +448,219 @@ class TestBulkLookupEndpoint:
                 )
 
         assert resp.status_code == 200
+
+
+class TestBulkLookupClientAbort:
+    """Cancel-aware gather under client disconnect (LML#372).
+
+    Under load, callers' AbortControllers fire at their per-call budget while
+    LML's gather kept draining queued items — semaphore permits stayed held,
+    queue depth grew monotonically across batches. These tests pin the fix:
+    on disconnect, the handler cancels in-flight items, releases permits, and
+    short-circuits with HTTP 499.
+
+    The disconnect-detection mechanism (``await request.receive()`` → look for
+    ``http.disconnect``) is standard Starlette; under httpx's ASGITransport the
+    receive channel doesn't emit disconnect cleanly (anyio CancelScope ↔
+    asyncio interaction), so tests patch ``_watch_disconnect`` directly to
+    simulate disconnect. The mechanism itself is exercised in production by
+    uvicorn.
+    """
+
+    @staticmethod
+    def _disconnect_after(delay_s: float = 0.05):
+        """Replacement sentinel that 'detects' disconnect after `delay_s`.
+
+        Lets the gather schedule and start items, then returns (signaling
+        disconnect) so the abort branch runs.
+        """
+        import asyncio
+
+        async def fake_sentinel(_request):
+            await asyncio.sleep(delay_s)
+            return
+
+        return fake_sentinel
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_cancels_in_flight_items(
+        self, mock_db, mock_discogs, mock_settings
+    ):
+        """Mid-batch disconnect aborts gather; not all items execute; no PostHog event.
+
+        Pins three behaviors at once:
+        1. Handler returns 499 (Nginx-style "client closed request") so the
+           abort branch is filterable in logs/Sentry.
+        2. `perform_lookup`'s await_count is strictly less than the batch size:
+           items queued behind the bulk-route semaphore never started.
+        3. The PostHog batch event is NOT emitted on abort — partial counts
+           would skew the existing batch-completion analytics.
+        """
+        import asyncio
+
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        mock_posthog = Mock()
+        mock_posthog.capture = Mock()
+
+        async def slow_lookup(request, **kwargs):
+            # Outlast the sentinel's disconnect signal (fires ~50ms after the
+            # gather starts).
+            await asyncio.sleep(5)
+            return _match_response(request.artist or "?", request.album or "?")
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: mock_posthog,
+                get_settings: mock_settings,
+            },
+        ):
+            with (
+                patch(
+                    "lookup.router.perform_lookup",
+                    new_callable=AsyncMock,
+                    side_effect=slow_lookup,
+                ) as mock_lookup,
+                patch("lookup.router._watch_disconnect", self._disconnect_after()),
+            ):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as ac:
+                    resp = await asyncio.wait_for(
+                        ac.post(
+                            "/api/v1/lookup/bulk",
+                            json={"items": [{"artist": f"a{i}", "album": "x"} for i in range(20)]},
+                        ),
+                        timeout=3.0,
+                    )
+
+        assert resp.status_code == 499, f"Expected 499 on client disconnect, got {resp.status_code}"
+        assert mock_lookup.await_count < 20, (
+            f"All {mock_lookup.await_count}/20 items completed — abort did not cancel "
+            "in-flight items"
+        )
+        mock_posthog.capture.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_releases_semaphore_permits(self, app_client, monkeypatch):
+        """Cancellation propagates into per-item tasks → semaphore permits returned.
+
+        The 5-permit Discogs semaphore in production lives in `discogs/service.py`
+        and is released in a `try/finally`. The bulk route's own bounded semaphore
+        (set via LML_BULK_MAX_CONCURRENT) gets `__aexit__`'d via `async with` for
+        each item. We pin the propagation directly: count how many items reach a
+        `finally` cleanup block. On clean cancellation, the count equals the
+        max-concurrency cap (whichever started == whichever cleaned up). If the
+        cancel doesn't propagate, started > cleaned_up — and that's the bug
+        LML#372 fixes.
+        """
+        import asyncio
+
+        monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "2")
+
+        started = 0
+        cleaned_up = 0
+
+        async def slow_lookup(request, **kwargs):
+            nonlocal started, cleaned_up
+            started += 1
+            try:
+                await asyncio.sleep(5)
+                return _match_response(request.artist or "?", request.album or "?")
+            finally:
+                cleaned_up += 1
+
+        with (
+            patch(
+                "lookup.router.perform_lookup",
+                new_callable=AsyncMock,
+                side_effect=slow_lookup,
+            ),
+            patch("lookup.router._watch_disconnect", self._disconnect_after()),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await asyncio.wait_for(
+                    ac.post(
+                        "/api/v1/lookup/bulk",
+                        json={"items": [{"artist": f"a{i}", "album": "x"} for i in range(6)]},
+                    ),
+                    timeout=3.0,
+                )
+
+        assert resp.status_code == 499
+        # Concurrency=2 ⇒ at most 2 items started before abort. They must ALL
+        # have hit `finally` (cancellation propagated into the sleep, which is
+        # CancelledError-aware). If `started > cleaned_up`, the cancel didn't
+        # reach the per-item tasks and semaphore permits leaked.
+        assert started > 0, "no items started — test mis-configured"
+        assert started == cleaned_up, (
+            f"{started - cleaned_up} item(s) started but never cleaned up — "
+            "cancellation did not propagate into per-item tasks"
+        )
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_sets_sentry_tag(self, mock_db, mock_discogs, mock_settings):
+        """`lml.client_aborted=true` lands on the active Sentry scope on abort.
+
+        Filterable in trace explorer: `lml.client_aborted:true` should return
+        the aborted-batch transactions for triage.
+        """
+        import asyncio
+
+        import sentry_sdk
+
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        captured_tags: dict[str, str] = {}
+        original_set_tag = sentry_sdk.set_tag
+
+        def capture_tag(key, value):
+            captured_tags[key] = value
+            return original_set_tag(key, value)
+
+        async def slow_lookup(request, **kwargs):
+            await asyncio.sleep(5)
+            return _match_response(request.artist or "?", request.album or "?")
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            with (
+                patch(
+                    "lookup.router.perform_lookup",
+                    new_callable=AsyncMock,
+                    side_effect=slow_lookup,
+                ),
+                patch("lookup.router._watch_disconnect", self._disconnect_after()),
+                patch("lookup.router.sentry_sdk.set_tag", side_effect=capture_tag),
+            ):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as ac:
+                    resp = await asyncio.wait_for(
+                        ac.post(
+                            "/api/v1/lookup/bulk",
+                            json={"items": [{"artist": f"a{i}", "album": "x"} for i in range(4)]},
+                        ),
+                        timeout=3.0,
+                    )
+
+        assert resp.status_code == 499
+        assert captured_tags.get("lml.client_aborted") == "true", (
+            f"Expected lml.client_aborted=true tag; got {captured_tags!r}"
+        )

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from collections import Counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import sentry_sdk
@@ -188,6 +189,29 @@ async def handle_lookup(
         raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
+async def _watch_disconnect(request: Request) -> None:
+    """Sentinel task: returns when the client closes its socket.
+
+    uvicorn does not propagate client-side socket close into the handler — the
+    handler keeps running and the in-flight `gather` keeps draining queued
+    Discogs work, holding 5-permit semaphore permits past the point any caller
+    cares about the result. We race this sentinel against the gather and cancel
+    the gather when the sentinel wins (LML#372).
+
+    Awaits ``request.receive()`` directly rather than polling
+    ``request.is_disconnected()`` — the polling helper hangs under httpx's
+    ASGITransport in tests (anyio CancelScope/asyncio interaction), and the
+    direct ``receive()`` loop is the canonical Starlette pattern anyway. By the
+    time this coroutine runs, the handler has already consumed the request
+    body via ``http_request.json()``, so the only message the receive channel
+    will emit is ``http.disconnect``.
+    """
+    while True:
+        message = await request.receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
 def _max_concurrency_from_env() -> int:
     """Resolve LML_BULK_MAX_CONCURRENT, floored at 1 to keep a misconfigured 0 from hanging.
 
@@ -338,7 +362,59 @@ async def handle_bulk_lookup(
     with sentry_sdk.start_span(op="lml.bulk.batch", name=f"{len(request.items)} items") as span:
         span.set_data("lml.bulk.size", len(request.items))
         span.set_data("lml.bulk.max_concurrent", max_concurrent)
-        results = await asyncio.gather(*(_run_one(i, item) for i, item in enumerate(request.items)))
+
+        # Race the gather against a client-disconnect sentinel (LML#372). If the
+        # client departs first (their AbortController fired, the socket closed),
+        # cancel the gather so the 5-permit Discogs semaphore frees its permits
+        # for the next caller. Without this, queue depth grows monotonically
+        # across batches and the next caller eats the wait.
+        #
+        # `asyncio.gather` returns a `_GatheringFuture` that is already scheduled
+        # — no `create_task` wrapping needed (and that wrapping would TypeError).
+        gather_future = asyncio.gather(*(_run_one(i, item) for i, item in enumerate(request.items)))
+        sentinel_task = asyncio.create_task(
+            _watch_disconnect(http_request),
+            name="lml.bulk.disconnect_sentinel",
+        )
+
+        # mypy needs help inferring the heterogeneous set as a uniform Future
+        # type — gather_future is `_GatheringFuture[Any]`, sentinel_task is
+        # `Task[None]`; both satisfy `Future`.
+        waitables: set[asyncio.Future[Any]] = {gather_future, sentinel_task}
+        try:
+            done, _pending = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            gather_future.cancel()
+            sentinel_task.cancel()
+            raise
+
+        client_aborted = sentinel_task in done and not gather_future.done()
+        span.set_data("lml.bulk.client_aborted", client_aborted)
+
+        if client_aborted:
+            # Tag is global-scope (filterable across all routes in Sentry trace
+            # explorer); span data carries the bulk-specific context. The
+            # key-name asymmetry is intentional.
+            sentry_sdk.set_tag("lml.client_aborted", "true")
+            gather_future.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await gather_future
+            logger.warning(
+                "bulk lookup aborted by client (batch size %d, max_concurrent %d)",
+                len(request.items),
+                max_concurrent,
+            )
+            # 499: Nginx-style "client closed request". The socket is already
+            # closed so the caller will never see the body — the code is for
+            # our logs/Sentry. Skip the PostHog batch event: partial counts
+            # would skew the existing batch-completion analytics.
+            raise HTTPException(status_code=499, detail="client disconnected")
+
+        # Happy path: cancel the sentinel and harvest results.
+        sentinel_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sentinel_task
+        results = gather_future.result()
 
     _project_cache_stats_to_transaction(get_cache_stats())
 
