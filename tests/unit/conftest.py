@@ -60,6 +60,16 @@ def mock_asyncpg_pool():
     conn.execute = AsyncMock()
     conn.executemany = AsyncMock()
 
+    # conn.transaction() must be a callable returning an async context manager.
+    # asyncpg's Connection.transaction() returns a Transaction object that
+    # supports `async with conn.transaction():` and propagates exceptions on
+    # __aexit__ as ROLLBACK.
+    tx_ctx = MagicMock()
+    tx_ctx.__aenter__ = AsyncMock(return_value=tx_ctx)
+    tx_ctx.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx_ctx)
+    conn._mock_tx_ctx = tx_ctx  # expose for assertions
+
     # acquire() must return an async context manager (not a coroutine).
     # asyncpg's pool.acquire() returns a PoolAcquireContext that supports
     # `async with pool.acquire() as conn:`.  Use MagicMock so the call

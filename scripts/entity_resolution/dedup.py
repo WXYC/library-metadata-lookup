@@ -85,6 +85,10 @@ class EntityDeduplicator:
         merges all external IDs from the others into it, then deletes the
         duplicates. Reconciliation log entries are reassigned to the primary.
 
+        Runs the UPDATE + N×(REASSIGN + DELETE) inside a single asyncpg
+        transaction so a mid-loop interruption leaves either fully-merged
+        or fully-untouched state — never partial. See WXYC#380.
+
         Args:
             qid: The shared Wikidata QID.
             identities: List of Identity instances to merge (must have len >= 2).
@@ -109,21 +113,22 @@ class EntityDeduplicator:
             merged_apple = merged_apple or dup.apple_music_artist_id
             merged_bandcamp = merged_bandcamp or dup.bandcamp_id
 
-        # Update the primary identity with all merged IDs
-        await self._pg.execute(
-            _UPDATE_MERGED_SQL,
-            primary.id,
-            merged_discogs,
-            merged_mb,
-            merged_spotify,
-            merged_apple,
-            merged_bandcamp,
-        )
+        async with self._pg.acquire() as conn, conn.transaction():
+            # Update the primary identity with all merged IDs
+            await conn.execute(
+                _UPDATE_MERGED_SQL,
+                primary.id,
+                merged_discogs,
+                merged_mb,
+                merged_spotify,
+                merged_apple,
+                merged_bandcamp,
+            )
 
-        # Reassign logs and delete duplicates
-        for dup in duplicates:
-            await self._pg.execute(_REASSIGN_LOGS_SQL, primary.id, dup.id)
-            await self._pg.execute(_DELETE_DUPLICATE_SQL, dup.id)
+            # Reassign logs and delete duplicates
+            for dup in duplicates:
+                await conn.execute(_REASSIGN_LOGS_SQL, primary.id, dup.id)
+                await conn.execute(_DELETE_DUPLICATE_SQL, dup.id)
 
         logger.info(
             "Merged %d identities for QID %s into identity %d (%s)",

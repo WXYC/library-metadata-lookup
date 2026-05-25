@@ -29,6 +29,8 @@ from __future__ import annotations
 import logging
 import re
 
+from wxyc_etl.text import is_compilation_artist
+
 from discogs.service import DiscogsService
 from release.bandcamp_resolver import resolve_bandcamp_album
 from release.discogs_resolver import (
@@ -126,8 +128,16 @@ async def resolve_release(
 
     # Identity write-back: any newly-discovered IDs land in entity.identity
     # for the artist. Idempotent + COALESCE-based — never clobbers existing data.
-    # Require a non-empty artist name so we never insert library_name="".
-    if canonical is not None and canonical.artist and deps.entity_store is not None:
+    # Require a non-empty, non-compilation artist name so we never insert
+    # library_name="" or pollute the matcher's lookup space with V/A rows
+    # (read-side handlers like identity/router.py already skip these, but the
+    # rows still exist if write-side never guarded). See WXYC#379.
+    if (
+        canonical is not None
+        and canonical.artist
+        and not is_compilation_artist(canonical.artist)
+        and deps.entity_store is not None
+    ):
         await _writeback_identity(deps.entity_store, canonical, identifiers, warnings)
 
     return ReleaseResolveResponse(
