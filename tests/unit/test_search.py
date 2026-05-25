@@ -1,15 +1,18 @@
 """Tests for uncovered lines in core/search.py."""
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from core.search import (
     DEFAULT_SEARCH_BUDGET_MS,
+    DEFAULT_SEARCH_HARD_TIMEOUT_MS,
     TRANSPORT_OVERHEAD_MS,
     SearchState,
     SearchStrategyType,
+    _log_hard_cap_fired,
     build_strategies,
     execute_search_pipeline,
     get_search_type_from_state,
@@ -19,6 +22,7 @@ from core.search import (
     no_results_and_song_but_no_artist_track_fallback,
     resolve_effective_search_budget_ms,
     resolve_search_budget_ms,
+    resolve_search_hard_timeout_ms,
     song_not_found_with_artist_and_song,
 )
 from generated.api_models import TrackMatchHint, TrackMatchSource
@@ -816,6 +820,341 @@ class TestSearchBudget:
 
         # No crash; pipeline still surfaces the prior strategy's results.
         assert state.results == [first_hit]
+
+
+# ---------------------------------------------------------------------------
+# Search hard timeout — LML#370
+# ---------------------------------------------------------------------------
+
+
+class TestSearchHardTimeoutResolver:
+    """Env-var resolver for the cascade-exhaustion hard cap.
+
+    The soft budget (LML#340) only short-circuits when ``state.results`` is
+    non-empty — by design, so the all-empty-cascade case keeps grinding for a
+    better answer. The 2026-05-24 outliers (tail 414s) showed that the
+    "keep grinding" branch needs a ceiling: a separate hard cap, defaulting
+    to ~25s (5s under BS's 30s AbortController), that fires regardless of
+    ``state.results``. Callers cannot raise the hard cap via header — it's a
+    safety floor, not a budget. The resolver therefore takes zero parameters,
+    unlike :func:`resolve_effective_search_budget_ms`.
+    """
+
+    def test_resolve_search_hard_timeout_ms_default(self, monkeypatch):
+        """Returns DEFAULT_SEARCH_HARD_TIMEOUT_MS when no env var set."""
+        monkeypatch.delenv("LML_SEARCH_HARD_TIMEOUT_MS", raising=False)
+        assert resolve_search_hard_timeout_ms() == DEFAULT_SEARCH_HARD_TIMEOUT_MS
+
+    def test_resolve_search_hard_timeout_ms_env_override(self, monkeypatch):
+        """LML_SEARCH_HARD_TIMEOUT_MS env var overrides the constant."""
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "15000")
+        assert resolve_search_hard_timeout_ms() == 15000
+
+    def test_resolve_search_hard_timeout_ms_invalid_falls_back(self, monkeypatch):
+        """Unparseable env value falls back to the default rather than crashing.
+
+        Operator typos shouldn't 500 every /lookup. The fallback is louder
+        than silent — surfaces should log at WARN — but the request stays
+        alive.
+        """
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "not-a-number")
+        assert resolve_search_hard_timeout_ms() == DEFAULT_SEARCH_HARD_TIMEOUT_MS
+
+    def test_resolve_search_hard_timeout_ms_negative_falls_back(self, monkeypatch):
+        """Negative values fall back to the default with a WARN.
+
+        A negative hard cap would short-circuit every request before any
+        strategy ran. Operators reaching for negative numbers almost
+        certainly meant "disable" — to actually disable, set the cap well
+        above the request timeout (e.g. 600000).
+        """
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "-500")
+        assert resolve_search_hard_timeout_ms() == DEFAULT_SEARCH_HARD_TIMEOUT_MS
+
+    def test_resolve_search_hard_timeout_ms_zero_falls_back(self, monkeypatch):
+        """Zero is also a misconfiguration; falls back to the default.
+
+        With cap=0 the gate fires on the very first iteration before any
+        strategy runs. Operators reaching for ``0`` typically mean "disable"
+        — we redirect to the default and WARN.
+        """
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "0")
+        assert resolve_search_hard_timeout_ms() == DEFAULT_SEARCH_HARD_TIMEOUT_MS
+
+
+class TestSearchHardTimeoutLoopGate:
+    """Loop-level hard-cap gate fires regardless of ``state.results`` (LML#370).
+
+    The soft-budget gate from LML#340 is gated on ``state.results`` being
+    non-empty — by design, so cascade-exhaustion queries keep grinding for a
+    better answer. The hard cap is the safety floor that catches them when
+    they grind too long.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hard_cap_fires_with_empty_results(self, monkeypatch):
+        """Every strategy returns empty + first strategy slow → loop short-circuits.
+
+        Mirrors the 2026-05-24 414s outlier shape: cascade exhaustion on a
+        query no strategy can satisfy. With a 50 ms hard cap and a 200 ms
+        first strategy, the loop should set ``timed_out=True`` and exit
+        without running the later strategies.
+        """
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "50")
+        # Keep the soft budget out of the way: large enough that it doesn't
+        # fire first, and irrelevant anyway since state.results stays empty.
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
+
+        async def slow_empty(*args, **kwargs):
+            await asyncio.sleep(0.2)  # 200ms — blows the 50ms cap
+            return ([], False)
+
+        async def must_not_run(*args, **kwargs):
+            raise AssertionError("strategy past hard cap must not run")
+
+        search_lib = AsyncMock(side_effect=slow_empty)
+        search_alt = AsyncMock(side_effect=must_not_run)
+        search_comp = AsyncMock(side_effect=must_not_run)
+
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Some Unknown Artist",
+            song="Untracked Song",
+            raw_message="Some Unknown Artist - Untracked Song",
+        )
+
+        state = await execute_search_pipeline(
+            parsed,
+            AsyncMock(),
+            "Some Unknown Artist - Untracked Song",
+            strategies,
+            song_not_found=True,
+        )
+
+        # Later strategies skipped on the empty-results path (the gate that
+        # LML#340 alone doesn't cover).
+        search_alt.assert_not_awaited()
+        search_comp.assert_not_awaited()
+        assert state.timed_out is True
+        assert state.results == []
+
+    @pytest.mark.asyncio
+    async def test_hard_cap_telemetry_projected_onto_sentry(self, monkeypatch):
+        """When the cap fires, ``lml.hard_cap_fired`` lands on the active transaction."""
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "50")
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
+
+        async def slow_empty(*args, **kwargs):
+            await asyncio.sleep(0.2)
+            return ([], False)
+
+        search_lib = AsyncMock(side_effect=slow_empty)
+        search_alt = AsyncMock(return_value=([], None))
+        search_comp = AsyncMock(return_value=([], {}))
+
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Untracked",
+            song="Song",
+            raw_message="Untracked - Song",
+        )
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
+            await execute_search_pipeline(
+                parsed,
+                AsyncMock(),
+                "Untracked - Song",
+                strategies,
+                song_not_found=True,
+            )
+
+        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        assert calls.get("lml.hard_cap_fired") is True
+        # Strategies past the cap recorded as skipped (telemetry diagnostic).
+        skipped = calls.get("hard_cap_skipped_strategies", [])
+        assert SearchStrategyType.SWAPPED_INTERPRETATION.value in skipped
+        assert SearchStrategyType.TRACK_ON_COMPILATION.value in skipped
+
+
+class TestLogHardCapFired:
+    """Sentry projection helper for the hard-cap-fired event."""
+
+    def test_projects_keys_onto_active_transaction(self):
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
+            _log_hard_cap_fired(
+                elapsed_ms=27_500.5,
+                skipped=[SearchStrategyType.TRACK_ON_COMPILATION, SearchStrategyType.SONG_AS_TRACK],
+                hard_cap_ms=25_000,
+            )
+
+        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        assert calls["lml.hard_cap_fired"] is True
+        assert calls["hard_cap_skipped_strategies"] == [
+            SearchStrategyType.TRACK_ON_COMPILATION.value,
+            SearchStrategyType.SONG_AS_TRACK.value,
+        ]
+
+    def test_noop_when_no_active_transaction(self):
+        """No transaction → silently no-op; do not raise."""
+        mock_scope = Mock()
+        mock_scope.transaction = None
+
+        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
+            # Must not raise; nothing to assert beyond that.
+            _log_hard_cap_fired(elapsed_ms=10.0, skipped=[], hard_cap_ms=25_000)
+
+    def test_swallows_sdk_errors(self):
+        """Any SDK-side exception is swallowed so observability cannot break /lookup."""
+        with patch(
+            "core.search.sentry_sdk.get_current_scope",
+            side_effect=RuntimeError("sentry exploded"),
+        ):
+            # Must not raise.
+            _log_hard_cap_fired(elapsed_ms=10.0, skipped=[], hard_cap_ms=25_000)
+
+
+class TestPerStrategyWaitFor:
+    """Per-strategy ``asyncio.wait_for`` ceiling (LML#370).
+
+    The loop-level hard cap fires *between* strategies. The per-strategy
+    wait_for fires *inside* a single strategy that's hanging too long —
+    e.g. the 414s outlier where one Discogs-cascade strategy went past the
+    cap on its own. wait_for is what propagates ``CancelledError`` into
+    in-flight ``asyncio.gather()`` probes, which is what actually frees the
+    Discogs semaphore on cap-fire.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wait_for_cancels_inflight_gather(self, monkeypatch):
+        """Load-bearing: cancellation propagates into nested asyncio.gather probes.
+
+        Without this, the fix improves per-request wall time but does not
+        free the Discogs semaphore — the queue grows monotonically under
+        concurrent load (see [[project_lml_cascade_mechanism]]).
+        """
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "100")
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
+        cancelled: list[str] = []
+
+        async def slow_probe(name: str) -> None:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.append(name)
+                raise  # re-raise so gather() sees the cancellation
+
+        async def fan_out_strategy(*_args, **_kwargs):
+            await asyncio.gather(slow_probe("a"), slow_probe("b"), slow_probe("c"))
+            return ([], False)  # unreachable
+
+        search_lib = AsyncMock(side_effect=fan_out_strategy)
+        search_alt = AsyncMock(return_value=([], None))
+        search_comp = AsyncMock(return_value=([], {}))
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(artist="x", song=None, raw_message="x")
+
+        start = time.monotonic()
+        state = await execute_search_pipeline(parsed, AsyncMock(), "x", strategies)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 1.5, f"pipeline should abandon at ~100ms, took {elapsed:.2f}s"
+        assert state.timed_out is True
+        # All three inner probes cancelled — proof of cancellation propagation.
+        assert set(cancelled) == {"a", "b", "c"}
+        # The timed-out strategy is recorded as both tried AND timed out.
+        assert SearchStrategyType.ARTIST_PLUS_ALBUM in state.strategies_tried
+        assert SearchStrategyType.ARTIST_PLUS_ALBUM in state.strategies_timed_out
+
+    @pytest.mark.asyncio
+    async def test_strategies_timed_out_populated(self, monkeypatch):
+        """``strategies_timed_out`` records which strategy hit its ceiling."""
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "100")
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
+
+        async def hangs(*_args, **_kwargs):
+            await asyncio.sleep(60)
+            return ([], False)
+
+        search_lib = AsyncMock(side_effect=hangs)
+        search_alt = AsyncMock(return_value=([], None))
+        search_comp = AsyncMock(return_value=([], {}))
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(artist="x", song=None, raw_message="x")
+        state = await execute_search_pipeline(parsed, AsyncMock(), "x", strategies)
+
+        assert state.strategies_timed_out == [SearchStrategyType.ARTIST_PLUS_ALBUM]
+        assert state.timed_out is True
+
+
+class TestHardCapSoftBudgetIndependence:
+    """The hard cap (LML#370) and soft budget (LML#340) are layered knobs.
+
+    Soft budget keeps its "have results, next strategy marginal" semantics;
+    hard cap is a separate higher safety floor. Neither subsumes the other.
+    """
+
+    @pytest.mark.asyncio
+    async def test_soft_budget_still_wins_when_results_exist(self, monkeypatch):
+        """Soft budget short-circuits with results; hard cap stays silent.
+
+        Pre-condition: hard cap is much higher than the soft budget; first
+        strategy returns results but blows the soft budget. The soft gate
+        must fire and ``timed_out`` must stay False — we're not in a
+        cascade-exhaustion scenario, just a "got an answer, skip the
+        marginal next strategy" scenario.
+        """
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "1")
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "60000")
+
+        first_hit = _item(id=1, artist="Stereolab", title="Dots and Loops")
+
+        async def slow_first(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            return ([first_hit], False)
+
+        async def must_not_run(*args, **kwargs):
+            raise AssertionError("compilation strategy should be skipped by soft budget")
+
+        search_lib = AsyncMock(side_effect=slow_first)
+        search_alt = AsyncMock(return_value=([], None))
+        search_comp = AsyncMock(side_effect=must_not_run)
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Stereolab",
+            song="Miss Modular",
+            raw_message="Stereolab - Miss Modular",
+        )
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
+            state = await execute_search_pipeline(
+                parsed,
+                AsyncMock(),
+                "Stereolab - Miss Modular",
+                strategies,
+                song_not_found=True,
+            )
+
+        # Soft budget wins; hard cap silent; results preserved; not timed out.
+        assert state.results == [first_hit]
+        assert state.timed_out is False
+        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        assert calls.get("search_budget_exceeded") is True
+        assert "lml.hard_cap_fired" not in calls
 
 
 # ---------------------------------------------------------------------------

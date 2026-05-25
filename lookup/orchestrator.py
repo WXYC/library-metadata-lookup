@@ -2149,4 +2149,5 @@ async def perform_lookup(
         context_message=context,
         corrected_artist=corrected_artist,
         external_source=external_source,
+        timeout=search_state.timed_out,
     )
