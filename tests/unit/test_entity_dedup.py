@@ -1,6 +1,6 @@
 """Unit tests for entity deduplication by shared Wikidata QID."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -10,10 +10,31 @@ from scripts.entity_resolution.store import Identity
 
 @pytest.fixture
 def mock_pg():
-    """Mock PgSource for entity store queries."""
+    """Mock PgSource for entity store queries.
+
+    Exposes both the legacy pool-level ``fetchall``/``execute`` (used by
+    ``find_duplicate_groups``) and an ``acquire()`` returning a connection
+    that supports ``conn.transaction()`` (used by ``merge_group`` per
+    WXYC/library-metadata-lookup#380).
+    """
     pg = AsyncMock()
     pg.fetchall = AsyncMock(return_value=[])
     pg.execute = AsyncMock(return_value="UPDATE 0")
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="UPDATE 0")
+
+    tx_ctx = MagicMock()
+    tx_ctx.__aenter__ = AsyncMock(return_value=tx_ctx)
+    tx_ctx.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx_ctx)
+    conn._mock_tx_ctx = tx_ctx
+
+    acq_ctx = MagicMock()
+    acq_ctx.__aenter__ = AsyncMock(return_value=conn)
+    acq_ctx.__aexit__ = AsyncMock(return_value=False)
+    pg.acquire = MagicMock(return_value=acq_ctx)
+    pg._mock_conn = conn
     return pg
 
 
@@ -90,9 +111,37 @@ class TestMergeIdentities:
         ]
         await dedup.merge_group("Q378288", identities)
 
-        # Should have executed UPDATE for the primary identity and DELETE for dupes
-        calls = [str(c) for c in mock_pg.execute.call_args_list]
-        update_call = [c for c in calls if "UPDATE" in c]
+        # Should have executed UPDATE for the primary identity and DELETE for dupes,
+        # all on the connection acquired from the pool (not the pool-level execute).
+        conn = mock_pg._mock_conn
+        calls = [str(c) for c in conn.execute.call_args_list]
+        update_call = [c for c in calls if "UPDATE entity.identity" in c]
         delete_call = [c for c in calls if "DELETE" in c]
         assert len(update_call) >= 1, "Expected UPDATE for merged identity"
         assert len(delete_call) >= 1, "Expected DELETE for duplicate identity"
+
+    @pytest.mark.asyncio
+    async def test_merge_group_runs_in_single_transaction(self, dedup, mock_pg):
+        """merge_group acquires one connection and wraps all statements in a transaction.
+
+        Without the wrapper, each pg.execute() autocommits and a mid-loop
+        interruption leaves some duplicates reassigned-but-not-deleted (eventually
+        consistent next pass, but harder to reason about). See WXYC/library-metadata-lookup#380.
+        """
+        identities = [
+            Identity(id=1, library_name="A", wikidata_qid="Q1", reconciliation_status="reconciled"),
+            Identity(id=2, library_name="a", wikidata_qid="Q1", reconciliation_status="reconciled"),
+            Identity(
+                id=3, library_name="A.", wikidata_qid="Q1", reconciliation_status="reconciled"
+            ),
+        ]
+        await dedup.merge_group("Q1", identities)
+
+        # One acquire, one transaction, all statements on the same conn.
+        mock_pg.acquire.assert_called_once()
+        conn = mock_pg._mock_conn
+        conn.transaction.assert_called_once()
+        conn._mock_tx_ctx.__aenter__.assert_awaited_once()
+        conn._mock_tx_ctx.__aexit__.assert_awaited_once()
+        # Statements should land on the connection, not the pool wrapper.
+        assert conn.execute.await_count >= 1 + 2 * 2  # UPDATE + 2×(REASSIGN+DELETE)

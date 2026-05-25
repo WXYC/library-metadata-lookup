@@ -429,3 +429,35 @@ class TestIdentityWriteBack:
             )
 
         store.upsert_identity.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "va_artist",
+        [
+            "Various",
+            "Various Artists",
+            "V.A.",
+            "V/A",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_skips_when_canonical_artist_is_compilation(self, va_artist):
+        """V/A artists must not pollute entity.identity.
+
+        Read-side V/A detection (identity/router.py, discogs/service.py) skips
+        these rows from the matcher's lookup space — but the rows still exist
+        if write-side never guarded against them. See WXYC/library-metadata-lookup#379.
+        """
+        discogs = AsyncMock()
+        discogs.get_release.return_value = _make_release(artist=va_artist)
+        store = AsyncMock()
+        deps = _deps(discogs=discogs, entity_store=store)
+
+        with patch(
+            "release.orchestrator.check_streaming_availability",
+            new=AsyncMock(return_value=_stream()),
+        ):
+            await resolve_release(
+                ReleaseResolveRequest(url="https://www.discogs.com/release/12345"), deps
+            )
+
+        store.upsert_identity.assert_not_called()

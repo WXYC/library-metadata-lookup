@@ -577,6 +577,63 @@ class TestWriteRelease:
         # Must not raise
         await cache_service.write_release(release)
 
+    @pytest.mark.asyncio
+    async def test_write_release_wraps_in_transaction(self, cache_service, mock_asyncpg_pool):
+        """write_release runs the full DELETE+INSERT cascade inside conn.transaction().
+
+        Without the wrapper, asyncpg autocommits each statement; a mid-cascade
+        cancellation leaves an artworked release with empty release_artist /
+        empty tracklist / etc. See WXYC/library-metadata-lookup#375.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="DOGA",
+            artist="Juana Molina",
+            release_url="https://discogs.com/release/1",
+            tracklist=[TrackItem(position="1", title="la paradoja")],
+        )
+
+        await cache_service.write_release(release)
+
+        conn = mock_asyncpg_pool._mock_conn
+        # Outer transaction + savepoints for optional tables (release_genre /
+        # _style / _video) means transaction() is called more than once; we
+        # only need to verify the wrap exists.
+        conn.transaction.assert_called()
+        conn._mock_tx_ctx.__aenter__.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_write_release_rolls_back_on_cancellation(self, cache_service, mock_asyncpg_pool):
+        """A cancellation mid-cascade propagates through the transaction's __aexit__
+        (which translates to ROLLBACK on a real connection) and surfaces to the caller.
+        """
+        import asyncio
+
+        conn = mock_asyncpg_pool._mock_conn
+
+        # cache_metadata UPSERT is the last write — fail before it to simulate
+        # disconnect mid-cascade. The transaction wrapper must propagate.
+        async def raise_on_cache_metadata(sql, *args):
+            if "cache_metadata" in sql:
+                raise asyncio.CancelledError()
+
+        conn.execute = AsyncMock(side_effect=raise_on_cache_metadata)
+
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="DOGA",
+            artist="Juana Molina",
+            release_url="https://discogs.com/release/1",
+        )
+
+        with pytest.raises((asyncio.CancelledError, CacheUnavailableError)):
+            await cache_service.write_release(release)
+
+        # The transaction context manager must have been entered and exited.
+        # On real asyncpg, __aexit__ with a non-None exc triggers ROLLBACK.
+        conn.transaction.assert_called()
+        conn._mock_tx_ctx.__aexit__.assert_awaited()
+
 
 # ---------------------------------------------------------------------------
 # get_release (enriched)
@@ -919,6 +976,28 @@ class TestWriteArtistDetails:
         assert any("artist_name_variation" in sql for sql in all_sql)
         assert any("artist_member" in sql for sql in all_sql)
         assert any("artist_url" in sql for sql in all_sql)
+
+    @pytest.mark.asyncio
+    async def test_write_artist_details_wraps_in_transaction(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """write_artist_details runs UPSERT + 4×DELETE+INSERT inside conn.transaction().
+
+        Without the wrapper, a mid-cascade cancellation leaves an artist row
+        with empty aliases / variations / members / urls. See WXYC/library-metadata-lookup#375.
+        """
+        details = ArtistDetails(
+            artist_id=77,
+            name="Autechre",
+            aliases=[ArtistRef(id=500, name="Gescom")],
+        )
+
+        await cache_service.write_artist_details(details)
+
+        conn = mock_asyncpg_pool._mock_conn
+        conn.transaction.assert_called()
+        conn._mock_tx_ctx.__aenter__.assert_awaited()
+        conn._mock_tx_ctx.__aexit__.assert_awaited()
 
 
 class TestSearchArtistsByName:

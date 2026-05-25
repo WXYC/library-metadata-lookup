@@ -654,7 +654,13 @@ class DiscogsCacheService:
             CacheUnavailableError: If database is unreachable
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self.pool.acquire() as conn, conn.transaction():
+                # Wrap the entire DELETE+INSERT cascade in a single transaction.
+                # Without this, asyncpg autocommits each statement and a
+                # cancellation mid-cascade leaves an artworked release with
+                # empty release_artist / release_track / etc., while
+                # cache_metadata.cached_at advances to "fresh". See WXYC#375.
+
                 # Upsert release row (including released date)
                 await conn.execute(
                     """
@@ -722,52 +728,65 @@ class DiscogsCacheService:
                         label_data,
                     )
 
-                # Delete + re-insert genres (table may not exist yet)
+                # Delete + re-insert genres (table may not exist yet).
+                # Nested conn.transaction() creates a SAVEPOINT inside the outer
+                # transaction, so a missing-table error reverts only this block
+                # without aborting the outer transaction.
                 try:
-                    await conn.execute(
-                        "DELETE FROM release_genre WHERE release_id = $1",
-                        release.release_id,
-                    )
-                    if release.genres:
-                        await conn.executemany(
-                            "INSERT INTO release_genre (release_id, genre) VALUES ($1, $2)",
-                            [(release.release_id, g) for g in release.genres],
+                    async with conn.transaction():
+                        await conn.execute(
+                            "DELETE FROM release_genre WHERE release_id = $1",
+                            release.release_id,
                         )
+                        if release.genres:
+                            await conn.executemany(
+                                "INSERT INTO release_genre (release_id, genre) VALUES ($1, $2)",
+                                [(release.release_id, g) for g in release.genres],
+                            )
                 except Exception:
                     pass
 
                 # Delete + re-insert styles (table may not exist yet)
                 try:
-                    await conn.execute(
-                        "DELETE FROM release_style WHERE release_id = $1",
-                        release.release_id,
-                    )
-                    if release.styles:
-                        await conn.executemany(
-                            "INSERT INTO release_style (release_id, style) VALUES ($1, $2)",
-                            [(release.release_id, s) for s in release.styles],
+                    async with conn.transaction():
+                        await conn.execute(
+                            "DELETE FROM release_style WHERE release_id = $1",
+                            release.release_id,
                         )
+                        if release.styles:
+                            await conn.executemany(
+                                "INSERT INTO release_style (release_id, style) VALUES ($1, $2)",
+                                [(release.release_id, s) for s in release.styles],
+                            )
                 except Exception:
                     pass
 
                 # Delete + re-insert videos (table may not exist yet)
                 try:
-                    await conn.execute(
-                        "DELETE FROM release_video WHERE release_id = $1",
-                        release.release_id,
-                    )
-                    if release.videos:
-                        await conn.executemany(
-                            """
-                            INSERT INTO release_video
-                                (release_id, sequence, src, title, duration, embed)
-                            VALUES ($1, $2, $3, $4, $5, $6)
-                            """,
-                            [
-                                (release.release_id, i + 1, v.src, v.title, v.duration, v.embed)
-                                for i, v in enumerate(release.videos)
-                            ],
+                    async with conn.transaction():
+                        await conn.execute(
+                            "DELETE FROM release_video WHERE release_id = $1",
+                            release.release_id,
                         )
+                        if release.videos:
+                            await conn.executemany(
+                                """
+                                INSERT INTO release_video
+                                    (release_id, sequence, src, title, duration, embed)
+                                VALUES ($1, $2, $3, $4, $5, $6)
+                                """,
+                                [
+                                    (
+                                        release.release_id,
+                                        i + 1,
+                                        v.src,
+                                        v.title,
+                                        v.duration,
+                                        v.embed,
+                                    )
+                                    for i, v in enumerate(release.videos)
+                                ],
+                            )
                 except Exception:
                     pass
 
@@ -996,7 +1015,11 @@ class DiscogsCacheService:
             CacheUnavailableError: If database is unreachable
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self.pool.acquire() as conn, conn.transaction():
+                # Wrap the UPSERT + 4×(DELETE+INSERT) cascade in a single
+                # transaction so a cancellation mid-write doesn't leave the
+                # artist row updated with empty child tables. See WXYC#375.
+
                 # Upsert artist row
                 await conn.execute(
                     """
