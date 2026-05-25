@@ -28,14 +28,18 @@ WHERE gid = ANY($1)\
 """
 
 _NAME_MATCH_SQL = """\
-SELECT DISTINCT lower(a.name) AS name, a.gid
-FROM mb_artist a
-WHERE lower(a.name) = ANY($1)
-UNION
-SELECT DISTINCT lower(aa.name) AS name, a.gid
-FROM mb_artist_alias aa
-JOIN mb_artist a ON aa.artist_id = a.id
-WHERE lower(aa.name) = ANY($1)\
+SELECT name, gid
+FROM (
+    SELECT DISTINCT lower(a.name) AS name, a.gid, 0 AS match_kind, a.id AS mb_id
+    FROM mb_artist a
+    WHERE lower(a.name) = ANY($1)
+    UNION ALL
+    SELECT DISTINCT lower(aa.name) AS name, a.gid, 1 AS match_kind, a.id AS mb_id
+    FROM mb_artist_alias aa
+    JOIN mb_artist a ON aa.artist_id = a.id
+    WHERE lower(aa.name) = ANY($1)
+) candidates
+ORDER BY name, match_kind ASC, mb_id ASC\
 """
 
 
@@ -95,6 +99,15 @@ class MusicBrainzReconciler:
 
         Matches against ``mb_artist.name`` and ``mb_artist_alias.name``
         (case-insensitive).
+
+        For ambiguous names (e.g. "John Williams" — composer, classical
+        guitarist, jazz bassist…), rows are sorted server-side and the first
+        survivor wins. Tiebreak order, highest priority first:
+
+        1. ``match_kind`` ASC — primary-name match (``mb_artist.name``) beats
+           alias match (``mb_artist_alias.name``).
+        2. ``mb_id`` ASC — lower ``mb_artist.id`` wins; stable across cache
+           rebuilds because MB IDs reflect insertion order.
 
         Args:
             names: Canonical artist names to look up.
