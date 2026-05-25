@@ -84,14 +84,10 @@ class TestGracefulDegradation:
 class TestNameMatchDeterministicTiebreak:
     """WXYC/library-metadata-lookup#378.
 
-    ``resolve_from_names`` must pick the same MBID every call for an
-    ambiguous-name query — the order PostgreSQL returns rows in is not a
-    stable contract, so the SQL must impose an explicit ORDER BY and the
-    Python first-wins loop must reflect that ordering.
-
-    Tiebreak rule (in priority order):
-      1. Primary-name match (mb_artist.name) beats alias match (mb_artist_alias.name)
-      2. Lower mb_artist.id wins (stable across rebuilds; reflects MB insertion order)
+    See ``MusicBrainzReconciler.resolve_from_names`` for the canonical
+    tiebreak rule. These tests pin the two pieces that have to agree for
+    determinism to hold: the SQL imposes a deterministic ORDER BY, and the
+    Python first-wins loop respects that order.
     """
 
     @pytest.mark.asyncio
@@ -105,40 +101,36 @@ class TestNameMatchDeterministicTiebreak:
 
     @pytest.mark.asyncio
     async def test_sql_orders_primary_before_alias(self, reconciler, mock_mb_pg):
-        """ORDER BY must sort primary-name matches ahead of alias matches.
-
-        The query tags each row with a ``match_kind`` (0=primary, 1=alias) so
-        the same canonical name across both arms of the UNION resolves
-        deterministically. ASC on match_kind makes primary win.
+        """The match_kind discriminator (0=primary, 1=alias) must be in the
+        ORDER BY clause itself, not just in the projection — otherwise primary
+        matches and alias matches are indistinguishable to the sort.
         """
         mock_mb_pg.fetchall = AsyncMock(return_value=[])
         await reconciler.resolve_from_names(["whatever"])
 
         sql = mock_mb_pg.fetchall.call_args.args[0]
         assert "match_kind" in sql, "Need match_kind discriminator for primary-vs-alias"
-        # match_kind belongs in the ORDER BY (primary first), not just in the projection.
+        # Substring check on the ORDER BY tail; rules out match_kind-in-projection-only.
         assert "match_kind" in sql.split("ORDER BY", 1)[1]
 
     @pytest.mark.parametrize(
-        "rows_in_order,expected_gid",
+        "input_name,rows_in_order,expected_gid",
         [
-            # Single primary match: trivially deterministic.
             (
+                "Autechre",
                 [{"name": "autechre", "gid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}],
                 "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             ),
-            # Primary match comes first (match_kind=0); alias match (match_kind=1)
-            # for the same canonical name is iterated second and skipped.
             (
+                "John Williams",
                 [
                     {"name": "john williams", "gid": "11111111-1111-1111-1111-111111111111"},
                     {"name": "john williams", "gid": "22222222-2222-2222-2222-222222222222"},
                 ],
                 "11111111-1111-1111-1111-111111111111",
             ),
-            # Three primary matches, sorted by mb_artist.id ASC server-side.
-            # First-wins on the lowest-id row.
             (
+                "John Williams",
                 [
                     {"name": "john williams", "gid": "33333333-3333-3333-3333-333333333333"},
                     {"name": "john williams", "gid": "44444444-4444-4444-4444-444444444444"},
@@ -147,17 +139,15 @@ class TestNameMatchDeterministicTiebreak:
                 "33333333-3333-3333-3333-333333333333",
             ),
         ],
-        ids=["single-match", "primary-beats-alias", "primary-stable-tiebreak"],
+        ids=["one-row", "two-rows-first-wins", "three-rows-first-wins"],
     )
     @pytest.mark.asyncio
-    async def test_deterministic_pick(self, reconciler, mock_mb_pg, rows_in_order, expected_gid):
-        """Given rows arrive in the SQL-imposed ORDER BY sequence, first-wins
-        is deterministic and matches the documented tiebreak rule.
+    async def test_first_wins_on_sql_sorted_rows(
+        self, reconciler, mock_mb_pg, input_name, rows_in_order, expected_gid
+    ):
+        """Given rows arrive in the SQL-imposed ORDER BY sequence, the Python
+        first-wins loop is deterministic.
         """
         mock_mb_pg.fetchall = AsyncMock(return_value=rows_in_order)
-        canonical = next(iter({r["name"] for r in rows_in_order}))
-        # Use the canonical form (title-cased) for the input — the reconciler
-        # round-trips through lower() for matching.
-        input_name = canonical.title()
         result = await reconciler.resolve_from_names([input_name])
         assert result[input_name] == expected_gid
