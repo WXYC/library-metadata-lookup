@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from collections import Counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import sentry_sdk
@@ -188,6 +189,37 @@ async def handle_lookup(
         raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
+async def _watch_disconnect(request: Request) -> None:
+    """Sentinel task: returns when the client closes its socket.
+
+    uvicorn does not propagate client-side socket close into the handler — the
+    handler keeps running and the in-flight `gather` keeps draining queued
+    Discogs work, holding 5-permit semaphore permits past the point any caller
+    cares about the result. We race this sentinel against the gather and cancel
+    the gather when the sentinel wins.
+
+    Awaits ``request.receive()`` directly rather than polling
+    ``request.is_disconnected()`` — the polling helper hangs under httpx's
+    ASGITransport in tests (anyio CancelScope/asyncio interaction), and the
+    direct ``receive()`` loop is the canonical Starlette pattern anyway.
+    """
+    while True:
+        message = await request.receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
+async def _cancel_and_drain(future: asyncio.Future[Any]) -> None:
+    """Cancel a future and swallow the resulting ``CancelledError``.
+
+    Used twice in the bulk handler (gather cleanup on abort + sentinel cleanup
+    on happy path) — extracted so the two branches stay symmetric.
+    """
+    future.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await future
+
+
 def _max_concurrency_from_env() -> int:
     """Resolve LML_BULK_MAX_CONCURRENT, floored at 1 to keep a misconfigured 0 from hanging.
 
@@ -338,7 +370,53 @@ async def handle_bulk_lookup(
     with sentry_sdk.start_span(op="lml.bulk.batch", name=f"{len(request.items)} items") as span:
         span.set_data("lml.bulk.size", len(request.items))
         span.set_data("lml.bulk.max_concurrent", max_concurrent)
-        results = await asyncio.gather(*(_run_one(i, item) for i, item in enumerate(request.items)))
+
+        # Race the gather against a client-disconnect sentinel. If the client
+        # departs first, cancel the gather so Discogs semaphore permits free
+        # for the next caller; without this, queue depth grows monotonically
+        # across batches.
+        #
+        # Spawning the sentinel must happen *after* `await http_request.json()`
+        # above has fully consumed the request body — _watch_disconnect awaits
+        # `request.receive()`, which would otherwise swallow `http.request`
+        # body messages the body parser needs.
+        gather_future = asyncio.gather(*(_run_one(i, item) for i, item in enumerate(request.items)))
+        sentinel_task = asyncio.create_task(
+            _watch_disconnect(http_request),
+            name="lml.bulk.disconnect_sentinel",
+        )
+        waitables: set[asyncio.Future[Any]] = {gather_future, sentinel_task}
+
+        try:
+            done, _pending = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            # Parent task cancellation must propagate to both children AND
+            # the children must be drained, not just signalled — otherwise the
+            # semaphore permits this PR exists to release are still held while
+            # the cancellation propagates asynchronously.
+            await _cancel_and_drain(gather_future)
+            await _cancel_and_drain(sentinel_task)
+            raise
+
+        client_aborted = sentinel_task in done and not gather_future.done()
+        span.set_data("lml.bulk.client_aborted", client_aborted)
+
+        if client_aborted:
+            # Tag is global-scope (filterable across all routes); span data
+            # carries the bulk-specific context. Key-name asymmetry intentional.
+            sentry_sdk.set_tag("lml.client_aborted", "true")
+            await _cancel_and_drain(gather_future)
+            logger.warning(
+                "bulk lookup aborted by client (batch size %d, max_concurrent %d)",
+                len(request.items),
+                max_concurrent,
+            )
+            # 499 = Nginx "client closed request". Skip PostHog: partial counts
+            # would skew batch-completion analytics.
+            raise HTTPException(status_code=499, detail="client disconnected")
+
+        await _cancel_and_drain(sentinel_task)
+        results = gather_future.result()
 
     _project_cache_stats_to_transaction(get_cache_stats())
 
