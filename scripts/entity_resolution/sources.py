@@ -14,6 +14,8 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Protocol, runtime_checkable
 
 import asyncpg
@@ -32,7 +34,7 @@ class PgSourceProtocol(Protocol):
     async def fetchall(self, query: str, *args: Any) -> list[dict[str, Any]]: ...
     async def fetchone(self, query: str, *args: Any) -> dict[str, Any] | None: ...
     async def execute(self, query: str, *args: Any) -> str: ...
-    def acquire(self) -> Any: ...
+    def acquire(self) -> AbstractAsyncContextManager[asyncpg.Connection]: ...
     async def close(self) -> None: ...
 
 
@@ -91,36 +93,21 @@ class PgSource:
         pool = await self._get_pool()
         return await pool.execute(query, *args)
 
-    def acquire(self) -> Any:
-        """Return an async context manager yielding a pooled connection.
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[asyncpg.Connection]:
+        """Yield a pooled connection for multi-statement transactions.
 
-        Use this when a caller needs to run multiple statements inside a
-        ``conn.transaction()`` (e.g., ``EntityDeduplicator.merge_group``). The
-        pool-level ``fetchall`` / ``fetchone`` / ``execute`` methods autocommit
-        each call and can't be grouped into a single transaction.
-
-        Returns an awaitable wrapper because ``_get_pool`` is async. Callers
-        use it as::
+        The pool-level ``fetchall`` / ``fetchone`` / ``execute`` methods
+        autocommit each call and can't be grouped, so callers needing
+        ``conn.transaction()`` semantics use this instead::
 
             async with pg.acquire() as conn:
                 async with conn.transaction():
                     await conn.execute(...)
         """
-
-        class _AcquireContext:
-            def __init__(self, source: PgSource) -> None:
-                self._source = source
-                self._ctx: Any = None
-
-            async def __aenter__(self) -> asyncpg.Connection:
-                pool = await self._source._get_pool()
-                self._ctx = pool.acquire()
-                return await self._ctx.__aenter__()
-
-            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
-                return await self._ctx.__aexit__(exc_type, exc, tb)
-
-        return _AcquireContext(self)
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            yield conn
 
     async def close(self) -> None:
         """Close the connection pool."""

@@ -48,6 +48,27 @@ def mock_settings(monkeypatch):
     )
 
 
+def make_mock_conn():
+    """Build a mock asyncpg.Connection that supports ``conn.transaction()``.
+
+    Shared across fixtures so the transaction-mock plumbing stays in one place.
+    Exposes ``_mock_tx_ctx`` for assertions on transaction entry/exit.
+    asyncpg's ``Connection.transaction()`` returns a Transaction object
+    supporting ``async with``; ``__aexit__`` with a non-None exc triggers
+    ROLLBACK on a real connection.
+    """
+    conn = AsyncMock()
+    conn.execute = AsyncMock()
+    conn.executemany = AsyncMock()
+
+    tx_ctx = MagicMock()
+    tx_ctx.__aenter__ = AsyncMock(return_value=tx_ctx)
+    tx_ctx.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx_ctx)
+    conn._mock_tx_ctx = tx_ctx
+    return conn
+
+
 @pytest.fixture
 def mock_asyncpg_pool():
     """AsyncMock mimicking asyncpg.Pool."""
@@ -56,19 +77,7 @@ def mock_asyncpg_pool():
     pool.fetchrow = AsyncMock(return_value=None)
     pool.fetchval = AsyncMock(return_value=1)
 
-    conn = AsyncMock()
-    conn.execute = AsyncMock()
-    conn.executemany = AsyncMock()
-
-    # conn.transaction() must be a callable returning an async context manager.
-    # asyncpg's Connection.transaction() returns a Transaction object that
-    # supports `async with conn.transaction():` and propagates exceptions on
-    # __aexit__ as ROLLBACK.
-    tx_ctx = MagicMock()
-    tx_ctx.__aenter__ = AsyncMock(return_value=tx_ctx)
-    tx_ctx.__aexit__ = AsyncMock(return_value=False)
-    conn.transaction = MagicMock(return_value=tx_ctx)
-    conn._mock_tx_ctx = tx_ctx  # expose for assertions
+    conn = make_mock_conn()
 
     # acquire() must return an async context manager (not a coroutine).
     # asyncpg's pool.acquire() returns a PoolAcquireContext that supports

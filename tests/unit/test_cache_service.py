@@ -1,5 +1,6 @@
 """Unit tests for discogs/cache_service.py."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -607,8 +608,6 @@ class TestWriteRelease:
         """A cancellation mid-cascade propagates through the transaction's __aexit__
         (which translates to ROLLBACK on a real connection) and surfaces to the caller.
         """
-        import asyncio
-
         conn = mock_asyncpg_pool._mock_conn
 
         # cache_metadata UPSERT is the last write — fail before it to simulate

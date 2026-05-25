@@ -6,29 +6,22 @@ import pytest
 
 from scripts.entity_resolution.dedup import EntityDeduplicator
 from scripts.entity_resolution.store import Identity
+from tests.unit.conftest import make_mock_conn
 
 
 @pytest.fixture
 def mock_pg():
-    """Mock PgSource for entity store queries.
+    """Mock PgSource exposing pool-level methods plus ``acquire()`` for transactions.
 
-    Exposes both the legacy pool-level ``fetchall``/``execute`` (used by
-    ``find_duplicate_groups``) and an ``acquire()`` returning a connection
-    that supports ``conn.transaction()`` (used by ``merge_group`` per
-    WXYC/library-metadata-lookup#380).
+    ``find_duplicate_groups`` uses the legacy pool-level ``fetchall``/``execute``;
+    ``merge_group`` (WXYC#380) uses ``acquire()`` + ``conn.transaction()``.
     """
     pg = AsyncMock()
     pg.fetchall = AsyncMock(return_value=[])
     pg.execute = AsyncMock(return_value="UPDATE 0")
 
-    conn = AsyncMock()
+    conn = make_mock_conn()
     conn.execute = AsyncMock(return_value="UPDATE 0")
-
-    tx_ctx = MagicMock()
-    tx_ctx.__aenter__ = AsyncMock(return_value=tx_ctx)
-    tx_ctx.__aexit__ = AsyncMock(return_value=False)
-    conn.transaction = MagicMock(return_value=tx_ctx)
-    conn._mock_tx_ctx = tx_ctx
 
     acq_ctx = MagicMock()
     acq_ctx.__aenter__ = AsyncMock(return_value=conn)
