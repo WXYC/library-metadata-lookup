@@ -65,82 +65,53 @@ a tighter bound, narrow this constant rather than the caller-side header.
 """
 
 
-def resolve_search_budget_ms() -> int:
-    """Return the active search budget in ms, honoring ``LML_SEARCH_BUDGET_MS``.
+def _resolve_positive_int_env(env_var: str, default: int) -> int:
+    """Read a positive integer from ``env_var``, falling back to ``default`` with a WARN.
 
-    Unparseable or negative values fall back to :data:`DEFAULT_SEARCH_BUDGET_MS`
-    with a WARN — operator typos should not 500 every /lookup. Read per-call
-    (not at import) so tests can monkeypatch the env var without reaching into
-    module state.
+    Shared by :func:`resolve_search_budget_ms` and
+    :func:`resolve_search_hard_timeout_ms`. Operator typos must not 500 every
+    /lookup, so unparseable, zero, and negative values all fall back. Zero
+    is treated as a misconfiguration alongside negatives: with the value
+    plumbed into ``elapsed_ms > threshold`` checks, ``threshold=0`` fires
+    on the first iteration after any await — almost certainly not what the
+    operator intended. To effectively disable a gate, set the value far
+    above the request timeout (e.g. ``600000``).
+
+    Read per-call (not at import) so tests can monkeypatch the env var
+    without reaching into module state.
     """
-    raw = os.environ.get(SEARCH_BUDGET_ENV_VAR)
+    raw = os.environ.get(env_var)
     if raw is None:
-        return DEFAULT_SEARCH_BUDGET_MS
+        return default
     try:
         value = int(raw)
     except ValueError:
-        logger.warning(
-            "%s=%r is not an integer; falling back to %d",
-            SEARCH_BUDGET_ENV_VAR,
-            raw,
-            DEFAULT_SEARCH_BUDGET_MS,
-        )
-        return DEFAULT_SEARCH_BUDGET_MS
+        logger.warning("%s=%r is not an integer; falling back to %d", env_var, raw, default)
+        return default
     if value <= 0:
-        # Zero is treated as a misconfiguration alongside negatives: with budget=0
-        # the gate fires after the first strategy that returns results, no matter
-        # how fast it ran, because `elapsed_ms > 0` after any await. Operators
-        # reaching for 0 typically mean "disable" — neither behavior is what they
-        # want, so we fall back to the default and WARN. To disable in practice,
-        # set the budget far above the request timeout (e.g. 60000).
-        logger.warning(
-            "%s=%d is not positive; falling back to %d",
-            SEARCH_BUDGET_ENV_VAR,
-            value,
-            DEFAULT_SEARCH_BUDGET_MS,
-        )
-        return DEFAULT_SEARCH_BUDGET_MS
+        logger.warning("%s=%d is not positive; falling back to %d", env_var, value, default)
+        return default
     return value
+
+
+def resolve_search_budget_ms() -> int:
+    """Return the active search budget in ms, honoring ``LML_SEARCH_BUDGET_MS``.
+
+    See :data:`DEFAULT_SEARCH_BUDGET_MS` for the contract.
+    """
+    return _resolve_positive_int_env(SEARCH_BUDGET_ENV_VAR, DEFAULT_SEARCH_BUDGET_MS)
 
 
 def resolve_search_hard_timeout_ms() -> int:
     """Return the hard timeout ceiling in ms, honoring ``LML_SEARCH_HARD_TIMEOUT_MS``.
 
     Unlike :func:`resolve_effective_search_budget_ms`, this resolver is
-    env-var-only; callers cannot override the hard cap via HTTP header. The
-    hard cap is a safety floor, not a per-request budget — letting callers
-    raise it would defeat its purpose. Unparseable, zero, or negative values
-    fall back to :data:`DEFAULT_SEARCH_HARD_TIMEOUT_MS` with a WARN — operator
-    typos should not 500 every /lookup. Read per-call (not at import) so tests
-    can monkeypatch the env var without reaching into module state.
+    env-var-only; callers cannot override the hard cap via HTTP header.
+    The hard cap is a safety floor, not a per-request budget — letting
+    callers raise it would defeat its purpose. See
+    :data:`DEFAULT_SEARCH_HARD_TIMEOUT_MS` for the contract.
     """
-    raw = os.environ.get(SEARCH_HARD_TIMEOUT_ENV_VAR)
-    if raw is None:
-        return DEFAULT_SEARCH_HARD_TIMEOUT_MS
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "%s=%r is not an integer; falling back to %d",
-            SEARCH_HARD_TIMEOUT_ENV_VAR,
-            raw,
-            DEFAULT_SEARCH_HARD_TIMEOUT_MS,
-        )
-        return DEFAULT_SEARCH_HARD_TIMEOUT_MS
-    if value <= 0:
-        # Zero or negative is treated as misconfiguration. With cap<=0 the
-        # gate fires on the very first iteration before any strategy runs.
-        # Operators reaching for these values typically mean "disable" — to
-        # actually disable, set the cap well above the request timeout
-        # (e.g. 600000). Falling back to the default with a WARN.
-        logger.warning(
-            "%s=%d is not positive; falling back to %d",
-            SEARCH_HARD_TIMEOUT_ENV_VAR,
-            value,
-            DEFAULT_SEARCH_HARD_TIMEOUT_MS,
-        )
-        return DEFAULT_SEARCH_HARD_TIMEOUT_MS
-    return value
+    return _resolve_positive_int_env(SEARCH_HARD_TIMEOUT_ENV_VAR, DEFAULT_SEARCH_HARD_TIMEOUT_MS)
 
 
 def resolve_effective_search_budget_ms(caller_budget_ms: int | None) -> int:
@@ -217,7 +188,7 @@ def _log_hard_cap_fired(
 
     Sibling of :func:`_log_search_budget_exceeded`. The hard cap fires when
     the cascade has spent more wall time than the safety floor allows,
-    regardless of ``state.results``. ``lml.hard_cap_fired:true`` on the
+    regardless of ``state.results``. ``hard_cap_fired:true`` on the
     trace lets Sentry trace explorer filter cap-firing requests without
     re-pulling Railway logs.
 
@@ -229,16 +200,16 @@ def _log_hard_cap_fired(
         "hard_cap_ms": hard_cap_ms,
         "skipped": [s.value for s in skipped],
     }
-    logger.info("lml.hard_cap_fired %s", payload)
+    logger.info("hard_cap_fired %s", payload)
     try:
         transaction = sentry_sdk.get_current_scope().transaction
         if transaction is None:
             return
-        transaction.set_data("lml.hard_cap_fired", True)
+        transaction.set_data("hard_cap_fired", True)
         transaction.set_data("hard_cap_skipped_strategies", payload["skipped"])
         transaction.set_data("hard_cap_elapsed_ms", payload["elapsed_ms"])
     except Exception as e:
-        logger.warning("Failed to project lml.hard_cap_fired onto Sentry transaction: %s", e)
+        logger.warning("Failed to project hard_cap_fired onto Sentry transaction: %s", e)
 
 
 def detect_ambiguous_format(raw_message: str) -> tuple[str, str] | None:
@@ -360,14 +331,6 @@ class SearchState:
     Projected into ``LookupResponse.timeout`` so callers can distinguish
     "no match" (empty ``results``, ``timed_out: False``) from "ran out of
     time" (``results`` may be empty, ``timed_out: True``).
-    """
-
-    strategies_timed_out: list[SearchStrategyType] = field(default_factory=list)
-    """Strategies whose ``asyncio.wait_for`` ceiling fired (LML#370).
-
-    Distinct from ``strategies_tried``: a strategy that timed out *was*
-    tried, just abandoned mid-execution. Carried for telemetry, not
-    consumed by callers.
     """
 
 
@@ -710,7 +673,6 @@ async def execute_search_pipeline(
                     state.matched_via_by_id = matched_via_by_id
         except TimeoutError:
             state.timed_out = True
-            state.strategies_timed_out.append(strategy.name)
             _log_hard_cap_fired(
                 elapsed_ms=(time.monotonic() - start) * 1000,
                 skipped=[s.name for s in strategies[idx + 1 :]],
