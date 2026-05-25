@@ -528,17 +528,19 @@ class TestBulkLookupClientAbort:
         mock_posthog.capture.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_client_disconnect_releases_semaphore_permits(self, app_client, monkeypatch):
-        """Cancellation propagates into per-item tasks → semaphore permits returned.
+    async def test_client_disconnect_cancels_per_item_tasks_cleanly(self, app_client, monkeypatch):
+        """Cancellation reaches per-item tasks AND each unwinds via its `finally`.
 
-        The 5-permit Discogs semaphore in production lives in `discogs/service.py`
-        and is released in a `try/finally`. The bulk route's own bounded semaphore
-        (set via LML_BULK_MAX_CONCURRENT) gets `__aexit__`'d via `async with` for
-        each item. We pin the propagation directly: count how many items reach a
-        `finally` cleanup block. On clean cancellation, the count equals the
-        max-concurrency cap (whichever started == whichever cleaned up). If the
-        cancel doesn't propagate, started > cleaned_up — and that's the bug
-        LML#372 fixes.
+        Semaphore release is a downstream consequence: the 5-permit Discogs
+        semaphore in `discogs/service.py` releases via `try/finally`, and the
+        bulk route's own bounded semaphore (set via LML_BULK_MAX_CONCURRENT)
+        releases via `async with semaphore:` __aexit__. Both unwinds run iff
+        cancellation reaches the per-item coroutine.
+
+        Proxy assertion: count `started` (each item that entered slow_lookup)
+        and `cleaned_up` (each that exited via `finally`). On clean cancellation
+        propagation, started == cleaned_up. If the cancel doesn't reach the
+        per-item tasks, started > cleaned_up — and that's the bug LML#372 fixes.
         """
         monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "2")
 

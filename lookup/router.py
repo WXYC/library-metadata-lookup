@@ -375,6 +375,11 @@ async def handle_bulk_lookup(
         # departs first, cancel the gather so Discogs semaphore permits free
         # for the next caller; without this, queue depth grows monotonically
         # across batches.
+        #
+        # Spawning the sentinel must happen *after* `await http_request.json()`
+        # above has fully consumed the request body — _watch_disconnect awaits
+        # `request.receive()`, which would otherwise swallow `http.request`
+        # body messages the body parser needs.
         gather_future = asyncio.gather(*(_run_one(i, item) for i, item in enumerate(request.items)))
         sentinel_task = asyncio.create_task(
             _watch_disconnect(http_request),
@@ -385,9 +390,12 @@ async def handle_bulk_lookup(
         try:
             done, _pending = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
         except BaseException:
-            # Parent task cancellation must propagate to both children.
-            gather_future.cancel()
-            sentinel_task.cancel()
+            # Parent task cancellation must propagate to both children AND
+            # the children must be drained, not just signalled — otherwise the
+            # semaphore permits this PR exists to release are still held while
+            # the cancellation propagates asynchronously.
+            await _cancel_and_drain(gather_future)
+            await _cancel_and_drain(sentinel_task)
             raise
 
         client_aborted = sentinel_task in done and not gather_future.done()
