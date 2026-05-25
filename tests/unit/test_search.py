@@ -11,6 +11,7 @@ from core.search import (
     DEFAULT_SEARCH_HARD_TIMEOUT_MS,
     TRANSPORT_OVERHEAD_MS,
     SearchState,
+    SearchStrategy,
     SearchStrategyType,
     _log_hard_cap_fired,
     build_strategies,
@@ -1002,6 +1003,10 @@ class TestLogHardCapFired:
             SearchStrategyType.TRACK_ON_COMPILATION.value,
             SearchStrategyType.SONG_AS_TRACK.value,
         ]
+        # Pin the elapsed-ms projection — Sentry trace explorer filtering by
+        # "how much did we overshoot the cap" is the natural diagnostic for
+        # tuning the cap value over time. Rounded to 2 decimals on emit.
+        assert calls["hard_cap_elapsed_ms"] == 27_500.5
 
     def test_noop_when_no_active_transaction(self):
         """No transaction → silently no-op; do not raise."""
@@ -1077,6 +1082,82 @@ class TestPerStrategyWaitFor:
         # All three inner probes cancelled — proof of cancellation propagation.
         assert set(cancelled) == {"a", "b", "c"}
         # The timed-out strategy is recorded as tried.
+        assert SearchStrategyType.ARTIST_PLUS_ALBUM in state.strategies_tried
+
+    @pytest.mark.asyncio
+    async def test_jitter_floor_handles_overshoot_between_gate_and_wait_for(self, monkeypatch):
+        """Plan §3c′ edge case: ``elapsed_ms`` overshoots ``hard_cap_ms`` between
+        the loop-level gate check and the ``wait_for`` call.
+
+        Concretely: the strategy's sync ``condition`` callback (or, more
+        realistically, scheduler jitter on a loaded host) advances real time
+        past the cap *after* the loop-gate check at ``core/search.py`` and
+        *before* the ``remaining_budget_seconds`` computation. ``(hard_cap
+        - elapsed)`` goes negative; the ``max(0.01, …)`` floor in the source
+        clamps ``wait_for`` to a 10ms ceiling. The strategy hangs longer
+        than 10ms, ``wait_for`` raises ``TimeoutError``, and the outer
+        ``except`` handler records the same end state as a normal cap fire
+        (no special-case path).
+
+        This pins the floor's behavior so a future refactor that removes
+        the floor (and reintroduces ``wait_for(0)`` or negative-timeout
+        surprises) fails loudly here.
+        """
+        # Hard cap = 50ms; the condition fn does a sync ``time.sleep(0.1)``
+        # right before strategy dispatch, blowing the cap by ~50ms by the
+        # time ``remaining_budget_seconds`` is computed. The loop-gate at
+        # the *top* of the iteration sees ~0ms elapsed and passes; the
+        # condition fn then sleeps; remaining computes as negative and the
+        # 0.01s floor kicks in.
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "50")
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
+
+        # Real-time sleep in the *condition* function — runs between the
+        # loop-gate elapsed_ms read and the remaining_budget calculation.
+        # SearchStrategy.condition is a sync callable in the strategy
+        # contract; sync time.sleep here directly mimics scheduler jitter.
+        def jittery_condition(parsed, state, raw_message):  # noqa: ARG001
+            time.sleep(0.1)  # 100ms blocking sleep — blows the 50ms cap
+            return True
+
+        async def slow_empty(*_args, **_kwargs):
+            # Anything > 10ms triggers the 0.01s wait_for floor's TimeoutError.
+            await asyncio.sleep(0.05)
+            return ([], False)
+
+        # Single-strategy pipeline with the jittery condition.
+        strategies = [
+            SearchStrategy(
+                name=SearchStrategyType.ARTIST_PLUS_ALBUM,
+                condition=jittery_condition,
+                execute=slow_empty,
+                updates_song_not_found=False,
+                updates_discogs_titles=False,
+            )
+        ]
+
+        parsed = ParsedRequest(
+            artist="Overshoot Artist",
+            song="Overshoot Song",
+            raw_message="Overshoot Artist - Overshoot Song",
+        )
+
+        # Outer wait_for safety net: regression must fail fast, not stall CI.
+        state = await asyncio.wait_for(
+            execute_search_pipeline(
+                parsed,
+                AsyncMock(),
+                "Overshoot Artist - Overshoot Song",
+                strategies,
+                song_not_found=True,
+            ),
+            timeout=5.0,
+        )
+
+        # Same end state as a normal cap fire: timed_out flagged, no results,
+        # strategy recorded as tried.
+        assert state.timed_out is True
+        assert state.results == []
         assert SearchStrategyType.ARTIST_PLUS_ALBUM in state.strategies_tried
 
 
