@@ -159,16 +159,21 @@ class TestIsCompilationArtist:
     @pytest.mark.parametrize(
         "artist",
         [
-            pytest.param("Various Artists", id="various-artists"),
-            pytest.param("VARIOUS", id="various-upper"),
-            pytest.param("various", id="various-lower"),
-            pytest.param("Soundtrack Collection", id="soundtrack-collection"),
-            pytest.param("soundtrack", id="soundtrack"),
-            pytest.param("A Compilation Album", id="compilation"),
+            # Leading-prefix tokens — must start the string and be followed by a
+            # non-alphanumeric boundary or end-of-string (wxyc-etl 0.5.0 contract).
+            pytest.param("Various Artists", id="various-artists-leading"),
             pytest.param("V/A", id="v-slash-a"),
             pytest.param("v/a", id="v-slash-a-lower"),
             pytest.param("V.A.", id="v-dot-a"),
             pytest.param("v.a.", id="v-dot-a-lower"),
+            pytest.param("Soundtracks", id="soundtracks-leading"),
+            # Exact-match tokens — case-insensitive equality only.
+            pytest.param("VARIOUS", id="various-upper-exact"),
+            pytest.param("various", id="various-lower-exact"),
+            pytest.param("soundtrack", id="soundtrack-exact"),
+            pytest.param("Soundtrack", id="soundtrack-exact-titlecase"),
+            pytest.param("Compilation", id="compilation-exact"),
+            pytest.param("compilation", id="compilation-exact-lower"),
         ],
     )
     def test_compilation_keywords_detected(self, artist):
@@ -181,6 +186,18 @@ class TestIsCompilationArtist:
             pytest.param("Queen", id="queen"),
             pytest.param("The National", id="the-national"),
             pytest.param("DJ Shadow", id="dj-shadow"),
+            # wxyc-etl 0.5.0 tightened is_compilation_artist from substring scan
+            # to anchored leading-prefix + exact match. "compilation" and
+            # "soundtrack" are exact-only, so embedding them in a longer string
+            # no longer flags as a compilation artist. Real bands like "The
+            # Soundtrack of Our Lives" and "Various Production" are now correctly
+            # excluded. See https://github.com/WXYC/wxyc-etl/pull/130.
+            pytest.param("A Compilation Album", id="compilation-embedded"),
+            pytest.param("Compilation Hits", id="compilation-leading-but-exact-only"),
+            pytest.param("Soundtrack Collection", id="soundtrack-embedded"),
+            pytest.param("Original Motion Picture Soundtrack", id="soundtrack-trailing-exact-only"),
+            pytest.param("The Soundtrack of Our Lives", id="soundtrack-real-band"),
+            pytest.param("Various Production", id="various-real-artist"),
         ],
     )
     def test_non_compilation_artists(self, artist):
