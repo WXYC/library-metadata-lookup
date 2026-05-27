@@ -16,6 +16,11 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from scripts.entity_resolution.__main__ import (
+    OrphanDrainAbortError,
+    prune_orphan_identities,
+    seed_identities,
+)
 from scripts.entity_resolution.dedup import EntityDeduplicator
 from scripts.entity_resolution.discogs import DiscogsReconciler
 from scripts.entity_resolution.sources import PgSource
@@ -433,10 +438,6 @@ class TestOrphanPass:
         empty new row) and then ``prune_orphan_identities({"Beyoncé"})``
         which merges the orphan's provenance into the new row.
         """
-        from scripts.entity_resolution.__main__ import (
-            prune_orphan_identities,
-            seed_identities,
-        )
 
         store = EntityStore(pg_source)
 
@@ -488,10 +489,6 @@ class TestOrphanPass:
         After seed_identities, the orphan has no canonical-form sibling in
         the snapshot and falls through to hard delete.
         """
-        from scripts.entity_resolution.__main__ import (
-            prune_orphan_identities,
-            seed_identities,
-        )
 
         store = EntityStore(pg_source)
 
@@ -539,10 +536,6 @@ class TestOrphanPass:
         would otherwise be interpreted as a giant rename and silently wipe
         the accumulated provenance. The threshold makes that loud.
         """
-        from scripts.entity_resolution.__main__ import (
-            OrphanDrainAbortError,
-            prune_orphan_identities,
-        )
 
         store = EntityStore(pg_source)
 
@@ -571,10 +564,6 @@ class TestOrphanPass:
         Music Data"). Locks the orphan-pass behavior on a name we already
         use as the diacritic test artist throughout this codebase.
         """
-        from scripts.entity_resolution.__main__ import (
-            prune_orphan_identities,
-            seed_identities,
-        )
 
         store = EntityStore(pg_source)
 
@@ -602,10 +591,6 @@ class TestOrphanPass:
         ``stored_names == current_names`` and the orphan diff is empty — no
         further merges, no further deletes, no reconciliation_log shuffling.
         """
-        from scripts.entity_resolution.__main__ import (
-            prune_orphan_identities,
-            seed_identities,
-        )
 
         store = EntityStore(pg_source)
 

@@ -70,6 +70,34 @@ def make_mock_conn():
 
 
 @pytest.fixture
+def mock_pg_tx():
+    """Mock PgSource exposing pool-level methods plus ``acquire()`` for transactions.
+
+    Used by tests of store methods that wrap multi-statement work in
+    ``async with pg.acquire() as conn, conn.transaction()`` — including
+    ``EntityDeduplicator.merge_group`` and the LML#377 orphan-pass primitives
+    (`delete_identity_by_library_name`, `merge_identity_by_library_name`).
+    Tests inspect ``mock_pg_tx._mock_conn`` for assertions about which
+    queries ran inside the transaction.
+    """
+    pg = AsyncMock()
+    pg.fetchall = AsyncMock(return_value=[])
+    pg.fetchone = AsyncMock(return_value=None)
+    pg.execute = AsyncMock(return_value="OK")
+
+    conn = make_mock_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    conn.execute = AsyncMock(return_value="OK")
+
+    acq_ctx = MagicMock()
+    acq_ctx.__aenter__ = AsyncMock(return_value=conn)
+    acq_ctx.__aexit__ = AsyncMock(return_value=False)
+    pg.acquire = MagicMock(return_value=acq_ctx)
+    pg._mock_conn = conn
+    return pg
+
+
+@pytest.fixture
 def mock_asyncpg_pool():
     """AsyncMock mimicking asyncpg.Pool."""
     pool = AsyncMock()

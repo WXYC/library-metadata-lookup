@@ -1,6 +1,6 @@
 """Unit tests for entity store CRUD operations."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -9,7 +9,6 @@ from scripts.entity_resolution.store import (
     EntityStore,
     _strip_nul,
 )
-from tests.unit.conftest import make_mock_conn
 
 
 class TestStripNul:
@@ -52,34 +51,12 @@ def store(mock_pg):
 
 
 @pytest.fixture
-def mock_pg_tx():
-    """Mock PgSource exposing both pool-level methods and ``acquire()`` for transactions.
-
-    Mirrors the pattern in ``test_entity_dedup.py``: the orphan-pass primitives
-    (`delete_identity_by_library_name`, `merge_identity_by_library_name`) use
-    ``async with pg.acquire() as conn, conn.transaction()`` and run multiple
-    statements on the same connection. Tests inspect ``mock_pg_tx._mock_conn``
-    for assertions about which queries ran inside the transaction.
-    """
-    pg = AsyncMock()
-    pg.fetchall = AsyncMock(return_value=[])
-    pg.fetchone = AsyncMock(return_value=None)
-    pg.execute = AsyncMock(return_value="DELETE 0")
-
-    conn = make_mock_conn()
-    conn.fetchrow = AsyncMock(return_value=None)
-    conn.execute = AsyncMock(return_value="DELETE 0")
-
-    acq_ctx = MagicMock()
-    acq_ctx.__aenter__ = AsyncMock(return_value=conn)
-    acq_ctx.__aexit__ = AsyncMock(return_value=False)
-    pg.acquire = MagicMock(return_value=acq_ctx)
-    pg._mock_conn = conn
-    return pg
-
-
-@pytest.fixture
 def store_tx(mock_pg_tx):
+    """EntityStore wired to the shared transactional mock-pg fixture.
+
+    ``mock_pg_tx`` lives in ``tests/unit/conftest.py`` so it's reusable across
+    tests of any store method that runs ``acquire() + conn.transaction()``.
+    """
     return EntityStore(mock_pg_tx)
 
 
