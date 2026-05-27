@@ -28,6 +28,7 @@ import sys
 
 import aiosqlite
 from dotenv import load_dotenv
+from wxyc_etl.text import is_compilation_artist
 
 from scripts.entity_resolution.dedup import EntityDeduplicator
 from scripts.entity_resolution.discogs import DiscogsReconciler
@@ -196,12 +197,24 @@ async def prune_orphan_identities(
 
 
 async def seed_identities(store: EntityStore, artists: list[str]) -> int:
-    """Seed entity.identity with library artist names. Returns count of new rows."""
+    """Seed entity.identity with library artist names. Returns count of new rows.
+
+    Skips ``is_compilation_artist`` matches (V/A bucket entries like
+    ``"Various Artists - Rock - A"`` and ``"Soundtracks - C"``) — these are
+    filed by the catalog librarian for shelf navigation, not real artists,
+    and must not enter the identity store. See LML#385; sibling of the
+    live-writeback guard in LML#379.
+    """
     seeded = 0
+    skipped_compilation = 0
     for artist in artists:
+        if is_compilation_artist(artist):
+            skipped_compilation += 1
+            continue
         result = await store.upsert_identity(library_name=artist)
         if result is not None:
             seeded += 1
+    logger.info("seed.skipped_compilation count=%d", skipped_compilation)
     return seeded
 
 

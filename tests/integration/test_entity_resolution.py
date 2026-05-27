@@ -663,6 +663,57 @@ class TestOrphanPass:
 
 
 @pytest.mark.pg
+class TestSeedIdentitiesCompilationGuard:
+    """Acceptance tests for LML#385: V/A filings never enter entity.identity.
+
+    The audit on LML#379 found 67 polluted rows in prod ``entity.identity``
+    seeded by prior runs of this function. The guard adds an
+    ``is_compilation_artist`` check inside the upsert loop; these PG-backed
+    tests pin the contract end-to-end.
+    """
+
+    @pytest.mark.asyncio
+    async def test_seed_skips_v_a_rows_in_pg(self, pg_source):
+        """V/A bucket entries from the librarian's shelf-navigation filings stay out."""
+        store = EntityStore(pg_source)
+        snapshot = [
+            "Various Artists - Soundtracks",
+            "Soundtracks - A",
+            "V/A - Rock - C",
+            "Juana Molina",
+        ]
+
+        await seed_identities(store, snapshot)
+
+        rows = await pg_source.fetchall(
+            "SELECT library_name FROM entity.identity ORDER BY library_name"
+        )
+        assert [r["library_name"] for r in rows] == ["Juana Molina"]
+
+    @pytest.mark.asyncio
+    async def test_seed_preserves_real_artists_with_v_a_lookalikes(self, pg_source):
+        """The wxyc-etl 0.5.0 keep-set: anchored matcher must not trip on real artists.
+
+        ``Epic Soundtracks`` (Swell Maps drummer) and ``The 27 Various``
+        (Minneapolis indie band) end in / contain the V/A token but are not
+        V/A filings. They must seed successfully.
+        """
+        store = EntityStore(pg_source)
+        snapshot = ["Epic Soundtracks", "The 27 Various", "Jessica Pratt"]
+
+        await seed_identities(store, snapshot)
+
+        rows = await pg_source.fetchall(
+            "SELECT library_name FROM entity.identity ORDER BY library_name"
+        )
+        assert [r["library_name"] for r in rows] == [
+            "Epic Soundtracks",
+            "Jessica Pratt",
+            "The 27 Various",
+        ]
+
+
+@pytest.mark.pg
 class TestDeduplicationIntegration:
     """Test deduplication against real PostgreSQL."""
 
