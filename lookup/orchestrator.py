@@ -1523,6 +1523,16 @@ def _build_streaming_search_url(base: str, artist: str, term: str) -> str:
     return f"{base}{quote(query)}"
 
 
+# Minimum fuzzy score (0-100) for accepting an iTunes Search result as a genuine
+# match for the requested artist + track. Mirrors the 80/80 artist+title floor
+# the streaming-availability batch matcher enforces
+# (scripts/streaming_availability/matching.py:is_acceptable_match). iTunes Search
+# ranking is non-deterministic for obscure artists, so a bare results[0]
+# intermittently surfaces a popular but wrong artist (e.g. "Pleasure"/"Joyous" ->
+# Sheryl Crow), and the wrong link then freezes onto the flowsheet row. See #389.
+_APPLE_MUSIC_MATCH_FLOOR = 80.0
+
+
 async def _fetch_apple_music_url(
     artist: str, song: str, http_client: httpx.AsyncClient | None = None
 ) -> str | None:
@@ -1532,18 +1542,41 @@ async def _fetch_apple_music_url(
     provided so callers can degrade gracefully. Constructing a fresh
     ``httpx.AsyncClient`` per probe is what leaked FDs in the 2026-05-01
     LML outage (issue #241), so the per-call fallback was removed.
+
+    Returns the ``trackViewUrl`` of the first result whose ``artistName`` and
+    ``trackName`` both clear ``_APPLE_MUSIC_MATCH_FLOOR`` against the requested
+    ``artist`` / ``song`` (diacritics-folded fuzzy token-set match), else
+    ``None``. iTunes Search ranking is unstable for obscure artists, so a bare
+    ``results[0]`` can confidently return the wrong artist; verifying avoids
+    persisting a wrong link onto the flowsheet row (#389).
     """
     if http_client is None:
         return None
+    from rapidfuzz import fuzz
+
     try:
         query = quote(f"{artist} {song}")
-        url = f"https://itunes.apple.com/search?term={query}&entity=song&media=music&limit=1"
+        url = f"https://itunes.apple.com/search?term={query}&entity=song&media=music&limit=5"
         resp = await http_client.get(url)
         if resp.status_code != 200:
             return None
-        data = resp.json()
-        results = data.get("results", [])
-        return results[0].get("trackViewUrl") if results else None
+        results = resp.json().get("results", [])
+
+        norm_artist = normalize_for_comparison(artist)
+        norm_song = normalize_for_comparison(song)
+        for result in results:
+            track_url = result.get("trackViewUrl")
+            if not track_url:
+                continue
+            artist_score = fuzz.token_set_ratio(
+                norm_artist, normalize_for_comparison(result.get("artistName", ""))
+            )
+            track_score = fuzz.token_set_ratio(
+                norm_song, normalize_for_comparison(result.get("trackName", ""))
+            )
+            if artist_score >= _APPLE_MUSIC_MATCH_FLOOR and track_score >= _APPLE_MUSIC_MATCH_FLOOR:
+                return track_url
+        return None
     except Exception:
         return None
 
