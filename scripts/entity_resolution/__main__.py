@@ -38,9 +38,28 @@ from scripts.entity_resolution.wikidata import WikidataReconciler
 
 logger = logging.getLogger(__name__)
 
+# Default threshold knobs for `prune_orphan_identities`. Calibrated against
+# the ~24K-row prod baseline: the absolute floor (100) lets day-to-day name
+# drift through; the 10% fractional cap (~2,400 rows) bounds the worst-case
+# bulk-rename run. Both are overridable via CLI flags.
+_DEFAULT_ORPHAN_THRESHOLD_FRAC = 0.10
+_DEFAULT_ORPHAN_THRESHOLD_ABS = 100
+
 _LIBRARY_ARTISTS_SQL = (
     "SELECT DISTINCT artist FROM library WHERE artist IS NOT NULL ORDER BY artist"
 )
+
+
+class OrphanDrainAbortError(RuntimeError):
+    """Raised when orphan count exceeds the drain-safety threshold.
+
+    ``main()`` catches this, logs at ERROR with the orphan count + sample
+    names, and exits non-zero. The operator re-runs with
+    ``--allow-orphan-drain`` after confirming the ``library.db`` snapshot
+    is correct. Guards LML#377's failure mode where a corrupted / partial
+    library export would otherwise look like "every artist was renamed at
+    once" and silently wipe every ``entity.reconciliation_log`` row.
+    """
 
 
 async def get_library_artists(db_path: str) -> list[str]:
@@ -49,6 +68,130 @@ async def get_library_artists(db_path: str) -> list[str]:
         cursor = await db.execute(_LIBRARY_ARTISTS_SQL)
         rows = await cursor.fetchall()
         return [row[0] for row in rows if row[0]]
+
+
+async def prune_orphan_identities(
+    store: EntityStore,
+    current_names: set[str],
+    *,
+    allow_orphan_drain: bool = False,
+    threshold_frac: float = _DEFAULT_ORPHAN_THRESHOLD_FRAC,
+    threshold_abs: int = _DEFAULT_ORPHAN_THRESHOLD_ABS,
+) -> tuple[int, int, list[str]]:
+    """Remove or merge ``entity.identity`` rows no longer in the snapshot.
+
+    Computes ``stored_names - current_names`` and resolves each orphan via a
+    canonical-form lookup against ``current_names``: when exactly one current
+    name canonicalizes to the same form as the orphan, the orphan's
+    reconciliation_log provenance and external IDs are merged into the
+    current row; otherwise the orphan is hard-deleted.
+
+    Args:
+        store: EntityStore wired to the discogs-cache database.
+        current_names: Set of ``library.artist`` values from the current
+            ``library.db`` snapshot.
+        allow_orphan_drain: When False (default), raises ``OrphanDrainAbortError``
+            if orphan count exceeds ``max(threshold_abs, threshold_frac *
+            len(current_names))``. Pass True for an authorized one-shot
+            bulk-rename run.
+        threshold_frac: Fraction of the current snapshot above which the
+            drain guard fires.
+        threshold_abs: Absolute floor; the guard fires above
+            ``max(threshold_abs, threshold_frac * len(current_names))``.
+
+    Returns:
+        ``(merged_count, deleted_count, orphan_names)``.
+
+    Raises:
+        OrphanDrainAbortError: When the orphan count crosses the threshold and
+            ``allow_orphan_drain`` is False.
+    """
+    # Local import keeps the wxyc_etl Rust extension off the module-load
+    # path for callers that don't reach this code path.
+    from identity.normalize import canonicalize_for_identity_lookup
+
+    stored_names = await store.fetch_all_identity_library_names()
+    orphans = sorted(stored_names - current_names)
+
+    if not orphans:
+        logger.info("Orphan pass: no orphans (stored=%d)", len(stored_names))
+        return (0, 0, [])
+
+    threshold = max(threshold_abs, int(threshold_frac * len(current_names)))
+    if len(orphans) > threshold and not allow_orphan_drain:
+        sample = orphans[:20]
+        logger.error(
+            "Orphan pass: %d orphans exceeds threshold %d (current=%d, stored=%d). "
+            "Sample: %s. Re-run with --allow-orphan-drain after verifying the "
+            "library.db snapshot is correct.",
+            len(orphans),
+            threshold,
+            len(current_names),
+            len(stored_names),
+            sample,
+        )
+        raise OrphanDrainAbortError(f"{len(orphans)} orphans exceeds threshold {threshold}")
+
+    # Build a canonical-form index over current names so each orphan's merge
+    # target lookup is O(1). Collisions (multiple current names sharing one
+    # canonical form) get tracked here so the orphan pass falls through to
+    # delete rather than guessing.
+    canonical_to_current: dict[str, list[str]] = {}
+    for name in current_names:
+        c = canonicalize_for_identity_lookup(name)
+        if c:
+            canonical_to_current.setdefault(c, []).append(name)
+
+    merged_count = 0
+    deleted_count = 0
+    for orphan in orphans:
+        c = canonicalize_for_identity_lookup(orphan)
+        candidates = canonical_to_current.get(c, []) if c else []
+        if len(candidates) == 1:
+            target_name = candidates[0]
+            target = await store.get_identity(target_name)
+            if target is not None:
+                did_merge = await store.merge_identity_by_library_name(
+                    from_name=orphan, into_id=target.id
+                )
+                if did_merge:
+                    logger.info(
+                        "Orphan pass merge: %r -> %r (into id=%d)",
+                        orphan,
+                        target_name,
+                        target.id,
+                    )
+                    merged_count += 1
+                    continue
+                # merge_identity_by_library_name returned False — orphan row
+                # was already gone (concurrent run) or already merged. Skip
+                # delete to avoid touching the canonical row by mistake.
+                logger.info("Orphan pass skip: %r (no row to merge)", orphan)
+                continue
+            logger.warning(
+                "Orphan pass: canonical target %r for orphan %r not found in store; "
+                "falling through to delete",
+                target_name,
+                orphan,
+            )
+        elif len(candidates) > 1:
+            logger.warning(
+                "Orphan pass: orphan %r canonicalizes to %r which matches multiple "
+                "current names %s; falling through to delete to avoid ambiguous merge",
+                orphan,
+                c,
+                candidates,
+            )
+
+        log_rows = await store.delete_identity_by_library_name(orphan)
+        logger.info(
+            "Orphan pass delete: %r (removed %d reconciliation_log rows)",
+            orphan,
+            log_rows,
+        )
+        deleted_count += 1
+
+    return (merged_count, deleted_count, orphans)
 
 
 async def seed_identities(store: EntityStore, artists: list[str]) -> int:
@@ -291,6 +434,26 @@ async def main(args: argparse.Namespace) -> None:
         artists = await get_library_artists(library_db_path)
         logger.info("Found %d distinct artists in library", len(artists))
 
+        # Step 1a: Prune orphans (LML#377). Runs before seed so the new
+        # seed_identities upsert loop can't fight with the orphan diff.
+        try:
+            merged, deleted, orphans = await prune_orphan_identities(
+                store,
+                set(artists),
+                allow_orphan_drain=args.allow_orphan_drain,
+                threshold_frac=args.orphan_threshold_frac,
+                threshold_abs=args.orphan_threshold_abs,
+            )
+            logger.info(
+                "Orphan pass: %d merged, %d deleted (of %d total orphans)",
+                merged,
+                deleted,
+                len(orphans),
+            )
+        except OrphanDrainAbortError as exc:
+            logger.error("Aborting seeding run: %s", exc)
+            sys.exit(1)
+
         seeded = await seed_identities(store, artists)
         logger.info("Seeded %d identities", seeded)
 
@@ -362,6 +525,34 @@ def parse_args() -> argparse.Namespace:
         "--skip-musicbrainz",
         action="store_true",
         help="Skip MusicBrainz reconciliation stage",
+    )
+    parser.add_argument(
+        "--allow-orphan-drain",
+        action="store_true",
+        help=(
+            "Bypass the orphan-count safety threshold. Required when a "
+            "legitimate bulk rename pushes the orphan count above "
+            "max(--orphan-threshold-abs, --orphan-threshold-frac * snapshot)."
+        ),
+    )
+    parser.add_argument(
+        "--orphan-threshold-frac",
+        type=float,
+        default=_DEFAULT_ORPHAN_THRESHOLD_FRAC,
+        help=(
+            "Fractional cap on orphan count vs current snapshot size "
+            f"(default: {_DEFAULT_ORPHAN_THRESHOLD_FRAC})"
+        ),
+    )
+    parser.add_argument(
+        "--orphan-threshold-abs",
+        type=int,
+        default=_DEFAULT_ORPHAN_THRESHOLD_ABS,
+        help=(
+            "Absolute floor for the orphan threshold; the guard fires above "
+            "max(--orphan-threshold-abs, --orphan-threshold-frac * snapshot) "
+            f"(default: {_DEFAULT_ORPHAN_THRESHOLD_ABS})"
+        ),
     )
     parser.add_argument(
         "-v",
