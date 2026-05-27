@@ -163,10 +163,11 @@ async def prune_orphan_identities(
                     )
                     merged_count += 1
                     continue
-                # merge_identity_by_library_name returned False — orphan row
-                # was already gone (concurrent run) or already merged. Skip
-                # delete to avoid touching the canonical row by mistake.
-                logger.info("Orphan pass skip: %r (no row to merge)", orphan)
+                # merge returned False: either the orphan row is already gone
+                # (concurrent run) or it's already the canonical target (no-op
+                # self-merge). Both cases: skip delete so we don't touch the
+                # canonical row by mistake.
+                logger.info("Orphan pass skip: %r (already merged or missing)", orphan)
                 continue
             logger.warning(
                 "Orphan pass: canonical target %r for orphan %r not found in store; "

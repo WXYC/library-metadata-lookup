@@ -444,8 +444,8 @@ class EntityStore:
                 _DELETE_RECONCILIATION_LOG_BY_IDENTITY_ID_SQL, identity_id
             )
             await conn.execute(_DELETE_IDENTITY_BY_ID_SQL, identity_id)
-            # asyncpg returns "DELETE N" — parse the trailing count.
-            return int(log_status.split()[-1]) if log_status.startswith("DELETE") else 0
+            # asyncpg returns "DELETE N" for a DELETE statement.
+            return int(log_status.split()[-1])
 
     async def merge_identity_by_library_name(self, from_name: str, into_id: int) -> bool:
         """Merge the row keyed by ``from_name`` into the row at ``into_id``.
