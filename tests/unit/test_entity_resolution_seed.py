@@ -23,9 +23,7 @@ def mock_store():
     """Mock EntityStore whose ``upsert_identity`` records every call."""
     store = AsyncMock()
     store.upsert_identity = AsyncMock(
-        side_effect=lambda library_name, **_: Identity(
-            id=hash(library_name) & 0xFFFF, library_name=library_name
-        )
+        side_effect=lambda library_name, **_: Identity(id=1, library_name=library_name)
     )
     return store
 
