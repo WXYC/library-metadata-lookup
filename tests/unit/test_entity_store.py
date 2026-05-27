@@ -497,8 +497,8 @@ class TestMergeIdentityByLibraryName:
     """
 
     @pytest.mark.asyncio
-    async def test_merges_external_ids_then_reassigns_logs_then_deletes(self, store_tx, mock_pg_tx):
-        """The from row's external IDs land on the into row; log rows move; from row gone."""
+    async def test_unreconciled_orphan_merges_without_status_upgrade(self, store_tx, mock_pg_tx):
+        """Orphan with status=unreconciled: 3 executes (no status upgrade)."""
         conn = mock_pg_tx._mock_conn
         conn.fetchrow = AsyncMock(
             return_value={
@@ -506,6 +506,68 @@ class TestMergeIdentityByLibraryName:
                 "library_name": "Beyonce",
                 "discogs_artist_id": 1419,
                 "wikidata_qid": None,
+                "musicbrainz_artist_id": "mbid-1",
+                "spotify_artist_id": "spotify-1",
+                "apple_music_artist_id": None,
+                "bandcamp_id": None,
+                "reconciliation_status": "unreconciled",
+            }
+        )
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        merged = await store_tx.merge_identity_by_library_name(from_name="Beyonce", into_id=42)
+
+        assert merged is True
+        # Three execute calls: UPDATE merged, REASSIGN logs, DELETE from row.
+        # No status upgrade because the orphan was unreconciled.
+        assert conn.execute.await_count == 3
+        update_sql = conn.execute.await_args_list[0][0][0]
+        reassign_sql = conn.execute.await_args_list[1][0][0]
+        delete_sql = conn.execute.await_args_list[2][0][0]
+        assert "UPDATE entity.identity" in update_sql
+        assert "COALESCE" in update_sql
+        assert "UPDATE entity.reconciliation_log" in reassign_sql
+        assert "DELETE FROM entity.identity" in delete_sql
+
+        # UPDATE binds into_id first, then the from row's external IDs + QID.
+        update_args = conn.execute.await_args_list[0][0]
+        assert update_args[1] == 42  # into_id
+        assert update_args[2] == 1419  # discogs_artist_id from the orphan
+        assert update_args[3] == "mbid-1"
+        assert update_args[4] == "spotify-1"
+        assert update_args[5] is None  # apple_music_artist_id
+        assert update_args[6] is None  # bandcamp_id
+        assert update_args[7] is None  # wikidata_qid
+
+        # REASSIGN binds (new_id, old_id).
+        reassign_args = conn.execute.await_args_list[1][0]
+        assert reassign_args[1] == 42  # into_id (new)
+        assert reassign_args[2] == 17  # from_id (old)
+
+        # DELETE targets the from row's id.
+        delete_args = conn.execute.await_args_list[2][0]
+        assert delete_args[1] == 17
+
+    @pytest.mark.asyncio
+    async def test_reconciled_orphan_upgrades_target_status_and_carries_qid(
+        self, store_tx, mock_pg_tx
+    ):
+        """Orphan with status=reconciled + wikidata_qid: target gets both via merge.
+
+        Locks the LML#377 contract that the orphan-pass merge carries the
+        Wikidata QID and the reconciliation status across, not just the
+        non-QID external IDs. Without this, a "Beyonce" → "Beyoncé" rename
+        would silently drop the QID (set by the Wikidata bridge) and leave
+        the freshly-seeded target row at status='unreconciled', which would
+        trigger a wasted re-fetch on the next reconciliation pass.
+        """
+        conn = mock_pg_tx._mock_conn
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "id": 17,
+                "library_name": "Beyonce",
+                "discogs_artist_id": 1419,
+                "wikidata_qid": "Q36153",
                 "musicbrainz_artist_id": "mbid-1",
                 "spotify_artist_id": "spotify-1",
                 "apple_music_artist_id": None,
@@ -518,31 +580,21 @@ class TestMergeIdentityByLibraryName:
         merged = await store_tx.merge_identity_by_library_name(from_name="Beyonce", into_id=42)
 
         assert merged is True
-        # Three execute calls: UPDATE merged, REASSIGN logs, DELETE from row.
-        assert conn.execute.await_count == 3
-        update_sql = conn.execute.await_args_list[0][0][0]
-        reassign_sql = conn.execute.await_args_list[1][0][0]
-        delete_sql = conn.execute.await_args_list[2][0][0]
-        assert "UPDATE entity.identity" in update_sql
-        assert "COALESCE" in update_sql
-        assert "UPDATE entity.reconciliation_log" in reassign_sql
-        assert "DELETE FROM entity.identity" in delete_sql
+        # Four execute calls: UPDATE merged, UPDATE status, REASSIGN logs, DELETE.
+        assert conn.execute.await_count == 4
+        update_merged_args = conn.execute.await_args_list[0][0]
+        update_status_args = conn.execute.await_args_list[1][0]
 
-        # UPDATE binds into_id first, then the from row's external IDs.
-        update_args = conn.execute.await_args_list[0][0]
-        assert update_args[1] == 42  # into_id
-        assert update_args[2] == 1419  # discogs_artist_id from the orphan
-        assert update_args[3] == "mbid-1"
-        assert update_args[4] == "spotify-1"
+        # _UPDATE_MERGED_SQL carries the QID at $7.
+        assert update_merged_args[1] == 42  # into_id
+        assert update_merged_args[7] == "Q36153"
+        assert "wikidata_qid" in update_merged_args[0]
 
-        # REASSIGN binds (new_id, old_id).
-        reassign_args = conn.execute.await_args_list[1][0]
-        assert reassign_args[1] == 42  # into_id (new)
-        assert reassign_args[2] == 17  # from_id (old)
-
-        # DELETE targets the from row's id.
-        delete_args = conn.execute.await_args_list[2][0]
-        assert delete_args[1] == 17
+        # _UPDATE_STATUS_SQL is called with (into_id, 'reconciled').
+        assert "UPDATE entity.identity" in update_status_args[0]
+        assert "reconciliation_status" in update_status_args[0]
+        assert update_status_args[1] == 42
+        assert update_status_args[2] == "reconciled"
 
     @pytest.mark.asyncio
     async def test_no_op_when_from_name_missing(self, store_tx, mock_pg_tx):
