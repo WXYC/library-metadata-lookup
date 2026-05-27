@@ -1389,6 +1389,40 @@ class SpotifyTrackResponse(BaseModel):
     artworkUrl: str | None = Field(None, description="Album artwork URL from Spotify")
 
 
+class Type3(StrEnum):
+    update = "update"
+
+
+class LiveFsUpdateEvent(BaseModel):
+    type: Literal["update"]
+    payload: FlowsheetEntryResponse
+    timestamp: AwareDatetime
+
+
+class Type4(StrEnum):
+    refetch = "refetch"
+
+
+class Payload(BaseModel):
+    source: str = Field(
+        ..., description="Free-text label naming the upstream cause (telemetry only)."
+    )
+
+
+class LiveFsRefetchEvent(BaseModel):
+    type: Literal["refetch"]
+    payload: Payload
+    timestamp: AwareDatetime
+
+
+class LiveFsEvent(RootModel[LiveFsUpdateEvent | LiveFsRefetchEvent]):
+    root: LiveFsUpdateEvent | LiveFsRefetchEvent = Field(
+        ...,
+        description="Discriminated union of events emitted on the `live-fs-topic`. Every event has the same `{ type, payload, timestamp }` envelope — pinned by `CONTRACTS.LIVE_FS_EVENT_ENVELOPE_SHAPE`.\n",
+        discriminator="type",
+    )
+
+
 class AlbumSearchResult(BaseModel):
     id: int
     add_date: AwareDatetime
