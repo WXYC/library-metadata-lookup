@@ -39,22 +39,110 @@ class TestBuildStreamingSearchUrl:
 
 
 class TestFetchAppleMusicUrl:
-    @pytest.mark.asyncio
-    async def test_returns_url_on_success(self):
+    @staticmethod
+    def _mock_client(results: list[dict]):
         import httpx
 
         mock_response = httpx.Response(
             200,
-            json={"results": [{"trackViewUrl": "https://music.apple.com/us/album/test/123"}]},
+            json={"results": results},
             request=httpx.Request("GET", "https://itunes.apple.com/search"),
         )
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.get = AsyncMock(return_value=mock_response)
+        return mock_client
+
+    @pytest.mark.asyncio
+    async def test_returns_url_on_success(self):
+        mock_client = self._mock_client(
+            [
+                {
+                    "artistName": "Kate Bush",
+                    "trackName": "The Saxophone Song",
+                    "trackViewUrl": "https://music.apple.com/us/album/test/123",
+                }
+            ]
+        )
 
         result = await _fetch_apple_music_url(
             "Kate Bush", "The Saxophone Song", http_client=mock_client
         )
         assert result == "https://music.apple.com/us/album/test/123"
+
+    @pytest.mark.asyncio
+    async def test_skips_wrong_artist_and_picks_correct_lower_result(self):
+        """Regression for the Pleasure/'Joyous' -> Sheryl Crow mismatch (#389).
+
+        iTunes Search relevance is unstable for obscure artists and can rank a
+        popular but wrong artist first. The correct match must be chosen over a
+        higher-ranked wrong-artist result, not blindly taken from results[0].
+        """
+        mock_client = self._mock_client(
+            [
+                {
+                    "artistName": "Sheryl Crow",
+                    "trackName": "All I Wanna Do",
+                    "trackViewUrl": "https://music.apple.com/us/album/all-i-wanna-do/1440651031",
+                },
+                {
+                    "artistName": "Pleasure",
+                    "trackName": "Joyous",
+                    "trackViewUrl": "https://music.apple.com/us/album/joyous/1568229263",
+                },
+            ]
+        )
+
+        result = await _fetch_apple_music_url("Pleasure", "Joyous", http_client=mock_client)
+        assert result == "https://music.apple.com/us/album/joyous/1568229263"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_only_wrong_artist(self):
+        """A confident-but-wrong link is worse than no link: reject, don't return it."""
+        mock_client = self._mock_client(
+            [
+                {
+                    "artistName": "Sheryl Crow",
+                    "trackName": "All I Wanna Do",
+                    "trackViewUrl": "https://music.apple.com/us/album/all-i-wanna-do/1440651031",
+                }
+            ]
+        )
+
+        result = await _fetch_apple_music_url("Pleasure", "Joyous", http_client=mock_client)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_matches_despite_diacritics(self):
+        """Diacritic-folded comparison: 'Nilüfer Yanya' must match iTunes' 'Nilufer Yanya'."""
+        mock_client = self._mock_client(
+            [
+                {
+                    "artistName": "Nilufer Yanya",
+                    "trackName": "Stabilise",
+                    "trackViewUrl": "https://music.apple.com/us/album/stabilise/1480000000",
+                }
+            ]
+        )
+
+        result = await _fetch_apple_music_url("Nilüfer Yanya", "Stabilise", http_client=mock_client)
+        assert result == "https://music.apple.com/us/album/stabilise/1480000000"
+
+    @pytest.mark.asyncio
+    async def test_skips_result_missing_track_url(self):
+        """A matching result with no trackViewUrl is skipped in favor of a usable one."""
+        mock_client = self._mock_client(
+            [
+                {"artistName": "Pleasure", "trackName": "Joyous"},
+                {
+                    "artistName": "Pleasure",
+                    "trackName": "Joyous",
+                    "trackViewUrl": "https://music.apple.com/us/album/joyous/1568229263",
+                },
+            ]
+        )
+
+        result = await _fetch_apple_music_url("Pleasure", "Joyous", http_client=mock_client)
+        assert result == "https://music.apple.com/us/album/joyous/1568229263"
 
     @pytest.mark.asyncio
     async def test_returns_none_on_no_results(self):
