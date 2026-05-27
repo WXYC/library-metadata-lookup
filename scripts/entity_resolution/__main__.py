@@ -434,8 +434,17 @@ async def main(args: argparse.Namespace) -> None:
         artists = await get_library_artists(library_db_path)
         logger.info("Found %d distinct artists in library", len(artists))
 
-        # Step 1a: Prune orphans (LML#377). Runs before seed so the new
-        # seed_identities upsert loop can't fight with the orphan diff.
+        seeded = await seed_identities(store, artists)
+        logger.info("Seeded %d identities", seeded)
+
+        # Step 1a: Prune orphans (LML#377). Runs AFTER seed so the merge path
+        # has a target row to merge INTO. On a librarian-driven rename
+        # ("Beyonce" → "Beyoncé"), seed_identities first creates the empty
+        # "Beyoncé" row; the orphan pass then merges "Beyonce"'s accumulated
+        # reconciliation_log + external IDs into it, then deletes the "Beyonce"
+        # row. If the pass ran before seed, get_identity(new_name) would
+        # return None and every rename would fall through to hard-delete,
+        # losing the provenance the pass exists to preserve.
         try:
             merged, deleted, orphans = await prune_orphan_identities(
                 store,
@@ -453,9 +462,6 @@ async def main(args: argparse.Namespace) -> None:
         except OrphanDrainAbortError as exc:
             logger.error("Aborting seeding run: %s", exc)
             sys.exit(1)
-
-        seeded = await seed_identities(store, artists)
-        logger.info("Seeded %d identities", seeded)
 
         # Step 2: Discogs reconciliation
         logger.info("Running Discogs reconciliation...")
