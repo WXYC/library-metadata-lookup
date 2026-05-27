@@ -409,22 +409,38 @@ class TestIdentityRouterEntityStoreUnavailable:
 
 @pytest.mark.pg
 class TestOrphanPass:
-    """Acceptance tests for LML#377: the orphan pass before seed_identities.
+    """Acceptance tests for LML#377: the orphan pass after seed_identities.
 
     The Beyonce → Beyoncé scenario is the motivating case in the issue body
     — these tests pin the contract: reconciliation_log provenance is either
     *preserved* (merge path) or *explicitly removed* (delete path), never
     silently abandoned under the new orphan row.
+
+    Production ordering: ``main()`` runs ``seed_identities(snapshot)`` first
+    (upserting a new empty row for every current artist name), then
+    ``prune_orphan_identities(snapshot)`` to merge or delete the names no
+    longer in the snapshot. These tests mirror that ordering so the merge
+    path's target row exists at the time of the merge call.
     """
 
     @pytest.mark.asyncio
-    async def test_orphan_with_canonical_match_merges_provenance(self, pg_source):
-        """Beyonce → Beyoncé: prior reconciliation_log preserved on the new row."""
-        from scripts.entity_resolution.__main__ import prune_orphan_identities
+    async def test_rename_preserves_provenance_via_merge(self, pg_source):
+        """Beyonce → Beyoncé: prior reconciliation_log preserved on the new row.
+
+        Mirrors the full production sequence: librarian had ``"Beyonce"``
+        reconciled; renames to ``"Beyoncé"`` in library.db. The next
+        reconciliation run calls ``seed_identities(["Beyoncé"])`` (adds an
+        empty new row) and then ``prune_orphan_identities({"Beyoncé"})``
+        which merges the orphan's provenance into the new row.
+        """
+        from scripts.entity_resolution.__main__ import (
+            prune_orphan_identities,
+            seed_identities,
+        )
 
         store = EntityStore(pg_source)
 
-        # Pre-orphan state: librarian had "Beyonce" with a reconciled Discogs ID.
+        # Pre-existing state: librarian had "Beyonce" with a reconciled Discogs ID.
         old = await store.upsert_identity(library_name="Beyonce", discogs_artist_id=1419)
         assert old is not None
         await store.log_reconciliation(
@@ -435,13 +451,10 @@ class TestOrphanPass:
             confidence=1.0,
         )
 
-        # Librarian renames to "Beyoncé". Pre-pass, both rows exist (the new
-        # one is empty; the orphan-pass has not yet run).
-        new = await store.upsert_identity(library_name="Beyoncé")
-        assert new is not None
-        assert new.id != old.id
-
-        merged, deleted, orphans = await prune_orphan_identities(store, {"Beyoncé"})
+        # Production flow: seed first (adds empty new row), then prune.
+        current_snapshot = ["Beyoncé"]
+        await seed_identities(store, current_snapshot)
+        merged, deleted, orphans = await prune_orphan_identities(store, set(current_snapshot))
 
         assert merged == 1
         assert deleted == 0
@@ -468,9 +481,17 @@ class TestOrphanPass:
         assert ids_row["discogs_artist_id"] == 1419
 
     @pytest.mark.asyncio
-    async def test_orphan_with_no_canonical_match_is_deleted(self, pg_source):
-        """Truly-removed artist: identity AND its log rows both go (no FK leak)."""
-        from scripts.entity_resolution.__main__ import prune_orphan_identities
+    async def test_removal_deletes_identity_and_logs(self, pg_source):
+        """Truly-removed artist: identity AND its log rows both go (no FK leak).
+
+        Librarian retires an artist from the library entirely (not a rename).
+        After seed_identities, the orphan has no canonical-form sibling in
+        the snapshot and falls through to hard delete.
+        """
+        from scripts.entity_resolution.__main__ import (
+            prune_orphan_identities,
+            seed_identities,
+        )
 
         store = EntityStore(pg_source)
 
@@ -485,7 +506,10 @@ class TestOrphanPass:
             method="exact_match",
         )
 
-        merged, deleted, orphans = await prune_orphan_identities(store, {"DifferentBand"})
+        # Production flow: seed the new snapshot, then prune the orphan.
+        current_snapshot = ["DifferentBand"]
+        await seed_identities(store, current_snapshot)
+        merged, deleted, orphans = await prune_orphan_identities(store, set(current_snapshot))
 
         assert merged == 0
         assert deleted == 1
@@ -503,6 +527,9 @@ class TestOrphanPass:
             gone.id,
         )
         assert log_rows == []
+        # "DifferentBand" (the surviving new entry) is still there.
+        survivors = await pg_source.fetchall("SELECT library_name FROM entity.identity")
+        assert [r["library_name"] for r in survivors] == ["DifferentBand"]
 
     @pytest.mark.asyncio
     async def test_threshold_aborts_without_mutation(self, pg_source):
@@ -537,14 +564,17 @@ class TestOrphanPass:
 
     @pytest.mark.asyncio
     async def test_diacritic_canonical_merge_with_canonical_fixture_artist(self, pg_source):
-        """Mirror the Beyonce → Beyoncé case using WXYC canonical fixture artist.
+        """Mirror the rename-merge case using WXYC canonical fixture artist.
 
         ``Nilüfer Yanya`` is the canonical diacritic-bearing fixture from
         ``wxycCanonicalArtistNames`` (see WXYC org-level CLAUDE.md, "Example
         Music Data"). Locks the orphan-pass behavior on a name we already
         use as the diacritic test artist throughout this codebase.
         """
-        from scripts.entity_resolution.__main__ import prune_orphan_identities
+        from scripts.entity_resolution.__main__ import (
+            prune_orphan_identities,
+            seed_identities,
+        )
 
         store = EntityStore(pg_source)
 
@@ -553,16 +583,53 @@ class TestOrphanPass:
         await store.log_reconciliation(
             identity_id=old.id, source="discogs", external_id="5499521", method="exact_match"
         )
-        new = await store.upsert_identity(library_name="Nilüfer Yanya")
-        assert new is not None
 
-        merged, deleted, _ = await prune_orphan_identities(store, {"Nilüfer Yanya"})
+        current_snapshot = ["Nilüfer Yanya"]
+        await seed_identities(store, current_snapshot)
+        merged, deleted, _ = await prune_orphan_identities(store, set(current_snapshot))
 
         assert (merged, deleted) == (1, 0)
         rows = await pg_source.fetchall("SELECT library_name FROM entity.identity")
         assert [r["library_name"] for r in rows] == ["Nilüfer Yanya"]
         log_rows = await pg_source.fetchall("SELECT external_id FROM entity.reconciliation_log")
         assert [r["external_id"] for r in log_rows] == ["5499521"]
+
+    @pytest.mark.asyncio
+    async def test_idempotent_on_re_run(self, pg_source):
+        """Second seed+prune over the same snapshot is a no-op.
+
+        After a successful rename merge, the next reconciliation run sees
+        ``stored_names == current_names`` and the orphan diff is empty — no
+        further merges, no further deletes, no reconciliation_log shuffling.
+        """
+        from scripts.entity_resolution.__main__ import (
+            prune_orphan_identities,
+            seed_identities,
+        )
+
+        store = EntityStore(pg_source)
+
+        old = await store.upsert_identity(library_name="Beyonce", discogs_artist_id=1419)
+        assert old is not None
+        await store.log_reconciliation(
+            identity_id=old.id, source="discogs", external_id="1419", method="exact_match"
+        )
+
+        snapshot = ["Beyoncé"]
+        # Run 1: the rename merge.
+        await seed_identities(store, snapshot)
+        m1, d1, _ = await prune_orphan_identities(store, set(snapshot))
+        assert (m1, d1) == (1, 0)
+
+        # Run 2 over the same snapshot: nothing to do.
+        await seed_identities(store, snapshot)
+        m2, d2, orphans = await prune_orphan_identities(store, set(snapshot))
+        assert (m2, d2, orphans) == (0, 0, [])
+
+        rows = await pg_source.fetchall("SELECT library_name FROM entity.identity")
+        assert [r["library_name"] for r in rows] == ["Beyoncé"]
+        log_rows = await pg_source.fetchall("SELECT count(*) AS n FROM entity.reconciliation_log")
+        assert log_rows[0]["n"] == 1
 
 
 @pytest.mark.pg
