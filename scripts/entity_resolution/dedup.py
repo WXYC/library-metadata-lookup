@@ -11,7 +11,13 @@ from __future__ import annotations
 import logging
 
 from scripts.entity_resolution.sources import PgSource
-from scripts.entity_resolution.store import Identity, _record_to_identity
+from scripts.entity_resolution.store import (
+    _DELETE_IDENTITY_BY_ID_SQL,
+    _REASSIGN_LOGS_SQL,
+    _UPDATE_MERGED_SQL,
+    Identity,
+    _record_to_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,25 +33,6 @@ WHERE wikidata_qid IN (
     HAVING count(*) > 1
 )
 ORDER BY wikidata_qid, id\
-"""
-
-_UPDATE_MERGED_SQL = """\
-UPDATE entity.identity
-SET discogs_artist_id = COALESCE($2, discogs_artist_id),
-    musicbrainz_artist_id = COALESCE($3, musicbrainz_artist_id),
-    spotify_artist_id = COALESCE($4, spotify_artist_id),
-    apple_music_artist_id = COALESCE($5, apple_music_artist_id),
-    bandcamp_id = COALESCE($6, bandcamp_id),
-    updated_at = now()
-WHERE id = $1\
-"""
-
-_DELETE_DUPLICATE_SQL = """\
-DELETE FROM entity.identity WHERE id = $1\
-"""
-
-_REASSIGN_LOGS_SQL = """\
-UPDATE entity.reconciliation_log SET identity_id = $1 WHERE identity_id = $2\
 """
 
 
@@ -128,7 +115,7 @@ class EntityDeduplicator:
             # Reassign logs and delete duplicates
             for dup in duplicates:
                 await conn.execute(_REASSIGN_LOGS_SQL, primary.id, dup.id)
-                await conn.execute(_DELETE_DUPLICATE_SQL, dup.id)
+                await conn.execute(_DELETE_IDENTITY_BY_ID_SQL, dup.id)
 
         logger.info(
             "Merged %d identities for QID %s into identity %d (%s)",

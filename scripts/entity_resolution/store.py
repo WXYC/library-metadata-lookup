@@ -131,6 +131,41 @@ INSERT INTO entity.reconciliation_log (identity_id, source, external_id, confide
 VALUES ($1, $2, $3, $4, $5)\
 """
 
+# Shared merge / delete primitives. Used both by `EntityDeduplicator.merge_group`
+# (for QID-collapse merges) and by the LML#377 orphan-pass helpers
+# `merge_identity_by_library_name` / `delete_identity_by_library_name`. Hoisted
+# here so there's one source of truth; `dedup.py` imports these.
+#
+# `entity.reconciliation_log.identity_id` is a FK with NO ON DELETE CASCADE
+# (see the schema in tests/integration/test_entity_resolution.py:75-85), so any
+# DELETE on `entity.identity` must remove the log rows first or reassign them.
+_UPDATE_MERGED_SQL = """\
+UPDATE entity.identity
+SET discogs_artist_id = COALESCE($2, discogs_artist_id),
+    musicbrainz_artist_id = COALESCE($3, musicbrainz_artist_id),
+    spotify_artist_id = COALESCE($4, spotify_artist_id),
+    apple_music_artist_id = COALESCE($5, apple_music_artist_id),
+    bandcamp_id = COALESCE($6, bandcamp_id),
+    updated_at = now()
+WHERE id = $1\
+"""
+
+_DELETE_IDENTITY_BY_ID_SQL = """\
+DELETE FROM entity.identity WHERE id = $1\
+"""
+
+_REASSIGN_LOGS_SQL = """\
+UPDATE entity.reconciliation_log SET identity_id = $1 WHERE identity_id = $2\
+"""
+
+_DELETE_RECONCILIATION_LOG_BY_IDENTITY_ID_SQL = """\
+DELETE FROM entity.reconciliation_log WHERE identity_id = $1\
+"""
+
+_FETCH_ALL_LIBRARY_NAMES_SQL = """\
+SELECT library_name FROM entity.identity\
+"""
+
 # Most-recent reconciliation log row per source for a given identity.
 # DISTINCT ON keeps a single row per source, ordered by created_at DESC so we
 # pick the latest attempt — matching the "most recent matcher decision" notion
@@ -375,3 +410,80 @@ class EntityStore:
             confidence,
             _strip_nul(method),
         )
+
+    async def fetch_all_identity_library_names(self) -> set[str]:
+        """Return every ``entity.identity.library_name`` as a set.
+
+        Used by the LML#377 orphan pass to compute set-difference against the
+        current ``library.db`` snapshot. Returns a set (not a list) so the
+        diff in `prune_orphan_identities` is O(N).
+        """
+        rows = await self._pg.fetchall(_FETCH_ALL_LIBRARY_NAMES_SQL)
+        if not rows:
+            return set()
+        return {row["library_name"] for row in rows}
+
+    async def delete_identity_by_library_name(self, library_name: str) -> int:
+        """Delete an identity row and its reconciliation_log children.
+
+        FK on ``entity.reconciliation_log.identity_id`` has no ON DELETE
+        CASCADE, so the log rows are removed first. Both DELETEs run inside a
+        single asyncpg transaction so a mid-call failure leaves either both
+        rows present or both rows gone.
+
+        Returns the count of ``entity.reconciliation_log`` rows removed.
+        Returns 0 (no-op) if no identity row matches ``library_name``.
+        """
+        verbatim = _strip_nul(library_name)
+        async with self._pg.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(_GET_IDENTITY_SQL, verbatim)
+            if row is None:
+                return 0
+            identity_id = row["id"]
+            log_status = await conn.execute(
+                _DELETE_RECONCILIATION_LOG_BY_IDENTITY_ID_SQL, identity_id
+            )
+            await conn.execute(_DELETE_IDENTITY_BY_ID_SQL, identity_id)
+            # asyncpg returns "DELETE N" — parse the trailing count.
+            return int(log_status.split()[-1]) if log_status.startswith("DELETE") else 0
+
+    async def merge_identity_by_library_name(self, from_name: str, into_id: int) -> bool:
+        """Merge the row keyed by ``from_name`` into the row at ``into_id``.
+
+        COALESCEs the from row's external IDs into the into row (matching the
+        semantics of ``EntityDeduplicator.merge_group``), re-points every
+        ``entity.reconciliation_log`` row whose ``identity_id`` matches the
+        from row to ``into_id``, then DELETEs the from row.
+
+        Used by the LML#377 orphan pass when an orphaned ``library_name``'s
+        canonical form matches a current row — preserves accumulated
+        reconciliation provenance across artist-name edits like
+        ``"Beyonce"`` → ``"Beyoncé"``.
+
+        Returns True on merge; False (no-op) when ``from_name`` is not found
+        or already equals ``into_id`` (idempotent on re-invocation).
+
+        Runs as a single asyncpg transaction so a mid-call failure leaves
+        the from row, the into row, and the log rows all in their original
+        state — never partial.
+        """
+        verbatim = _strip_nul(from_name)
+        async with self._pg.acquire() as conn, conn.transaction():
+            from_row = await conn.fetchrow(_GET_IDENTITY_SQL, verbatim)
+            if from_row is None:
+                return False
+            from_id = from_row["id"]
+            if from_id == into_id:
+                return False
+            await conn.execute(
+                _UPDATE_MERGED_SQL,
+                into_id,
+                from_row["discogs_artist_id"],
+                from_row["musicbrainz_artist_id"],
+                from_row["spotify_artist_id"],
+                from_row["apple_music_artist_id"],
+                from_row["bandcamp_id"],
+            )
+            await conn.execute(_REASSIGN_LOGS_SQL, into_id, from_id)
+            await conn.execute(_DELETE_IDENTITY_BY_ID_SQL, from_id)
+            return True

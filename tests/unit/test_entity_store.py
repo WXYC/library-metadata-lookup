@@ -1,6 +1,6 @@
 """Unit tests for entity store CRUD operations."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -9,6 +9,7 @@ from scripts.entity_resolution.store import (
     EntityStore,
     _strip_nul,
 )
+from tests.unit.conftest import make_mock_conn
 
 
 class TestStripNul:
@@ -48,6 +49,38 @@ def mock_pg():
 @pytest.fixture
 def store(mock_pg):
     return EntityStore(mock_pg)
+
+
+@pytest.fixture
+def mock_pg_tx():
+    """Mock PgSource exposing both pool-level methods and ``acquire()`` for transactions.
+
+    Mirrors the pattern in ``test_entity_dedup.py``: the orphan-pass primitives
+    (`delete_identity_by_library_name`, `merge_identity_by_library_name`) use
+    ``async with pg.acquire() as conn, conn.transaction()`` and run multiple
+    statements on the same connection. Tests inspect ``mock_pg_tx._mock_conn``
+    for assertions about which queries ran inside the transaction.
+    """
+    pg = AsyncMock()
+    pg.fetchall = AsyncMock(return_value=[])
+    pg.fetchone = AsyncMock(return_value=None)
+    pg.execute = AsyncMock(return_value="DELETE 0")
+
+    conn = make_mock_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    conn.execute = AsyncMock(return_value="DELETE 0")
+
+    acq_ctx = MagicMock()
+    acq_ctx.__aenter__ = AsyncMock(return_value=conn)
+    acq_ctx.__aexit__ = AsyncMock(return_value=False)
+    pg.acquire = MagicMock(return_value=acq_ctx)
+    pg._mock_conn = conn
+    return pg
+
+
+@pytest.fixture
+def store_tx(mock_pg_tx):
+    return EntityStore(mock_pg_tx)
 
 
 class TestUpsertIdentity:
@@ -390,3 +423,203 @@ class TestGetIdentitiesByStatus:
         mock_pg.fetchall = AsyncMock(return_value=[])
         identities = await store.get_identities_by_status("reconciled")
         assert identities == []
+
+
+class TestFetchAllIdentityLibraryNames:
+    """LML#377 orphan-pass primitive: set of every stored library_name."""
+
+    @pytest.mark.asyncio
+    async def test_returns_set_of_names(self, store, mock_pg):
+        mock_pg.fetchall = AsyncMock(
+            return_value=[
+                {"library_name": "Stereolab"},
+                {"library_name": "Autechre"},
+                {"library_name": "Nilüfer Yanya"},
+            ]
+        )
+        names = await store.fetch_all_identity_library_names()
+        assert names == {"Stereolab", "Autechre", "Nilüfer Yanya"}
+        # Set type matters: callers do O(N) set-difference, not list scans.
+        assert isinstance(names, set)
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_set_when_table_empty(self, store, mock_pg):
+        mock_pg.fetchall = AsyncMock(return_value=[])
+        names = await store.fetch_all_identity_library_names()
+        assert names == set()
+
+
+class TestDeleteIdentityByLibraryName:
+    """LML#377 orphan-pass primitive: hard DELETE with log-row cleanup.
+
+    `entity.reconciliation_log.identity_id` has no ON DELETE CASCADE, so the
+    method must remove log rows first, then the identity row, both inside a
+    single transaction.
+    """
+
+    @pytest.mark.asyncio
+    async def test_deletes_log_rows_before_identity(self, store_tx, mock_pg_tx):
+        """Log DELETE precedes identity DELETE; both run on the acquired conn."""
+        conn = mock_pg_tx._mock_conn
+        conn.fetchrow = AsyncMock(return_value={"id": 42, "library_name": "Beyonce"})
+        conn.execute = AsyncMock(side_effect=["DELETE 3", "DELETE 1"])
+
+        log_rows_deleted = await store_tx.delete_identity_by_library_name("Beyonce")
+
+        assert log_rows_deleted == 3
+        # Two execute calls — log delete first, then identity delete.
+        assert conn.execute.await_count == 2
+        first_sql = conn.execute.await_args_list[0][0][0]
+        second_sql = conn.execute.await_args_list[1][0][0]
+        assert "DELETE FROM entity.reconciliation_log" in first_sql
+        assert "DELETE FROM entity.identity" in second_sql
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_identity_missing(self, store_tx, mock_pg_tx):
+        """fetchrow returns None → no DELETEs issued, return 0."""
+        conn = mock_pg_tx._mock_conn
+        conn.fetchrow = AsyncMock(return_value=None)
+
+        log_rows_deleted = await store_tx.delete_identity_by_library_name("Nonexistent")
+
+        assert log_rows_deleted == 0
+        conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runs_in_single_transaction(self, store_tx, mock_pg_tx):
+        """One acquire(), one transaction(), all statements on the same conn."""
+        conn = mock_pg_tx._mock_conn
+        conn.fetchrow = AsyncMock(return_value={"id": 1, "library_name": "X"})
+        conn.execute = AsyncMock(return_value="DELETE 0")
+
+        await store_tx.delete_identity_by_library_name("X")
+
+        mock_pg_tx.acquire.assert_called_once()
+        conn.transaction.assert_called_once()
+        conn._mock_tx_ctx.__aenter__.assert_awaited_once()
+        conn._mock_tx_ctx.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_strips_nul_from_input(self, store_tx, mock_pg_tx):
+        """U+0000 in input is stripped before the lookup query."""
+        conn = mock_pg_tx._mock_conn
+        conn.fetchrow = AsyncMock(return_value=None)
+
+        await store_tx.delete_identity_by_library_name("Bey\x00once")
+
+        bind_arg = conn.fetchrow.await_args_list[0][0][1]
+        assert bind_arg == "Beyonce"
+
+
+class TestMergeIdentityByLibraryName:
+    """LML#377 orphan-pass primitive: merge an orphan into a canonical row.
+
+    Preserves accumulated reconciliation_log provenance across renames like
+    ``"Beyonce"`` → ``"Beyoncé"``. Adapted from `EntityDeduplicator.merge_group`;
+    same UPDATE-then-reassign-then-DELETE shape inside a single transaction.
+    """
+
+    @pytest.mark.asyncio
+    async def test_merges_external_ids_then_reassigns_logs_then_deletes(self, store_tx, mock_pg_tx):
+        """The from row's external IDs land on the into row; log rows move; from row gone."""
+        conn = mock_pg_tx._mock_conn
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "id": 17,
+                "library_name": "Beyonce",
+                "discogs_artist_id": 1419,
+                "wikidata_qid": None,
+                "musicbrainz_artist_id": "mbid-1",
+                "spotify_artist_id": "spotify-1",
+                "apple_music_artist_id": None,
+                "bandcamp_id": None,
+                "reconciliation_status": "reconciled",
+            }
+        )
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        merged = await store_tx.merge_identity_by_library_name(from_name="Beyonce", into_id=42)
+
+        assert merged is True
+        # Three execute calls: UPDATE merged, REASSIGN logs, DELETE from row.
+        assert conn.execute.await_count == 3
+        update_sql = conn.execute.await_args_list[0][0][0]
+        reassign_sql = conn.execute.await_args_list[1][0][0]
+        delete_sql = conn.execute.await_args_list[2][0][0]
+        assert "UPDATE entity.identity" in update_sql
+        assert "COALESCE" in update_sql
+        assert "UPDATE entity.reconciliation_log" in reassign_sql
+        assert "DELETE FROM entity.identity" in delete_sql
+
+        # UPDATE binds into_id first, then the from row's external IDs.
+        update_args = conn.execute.await_args_list[0][0]
+        assert update_args[1] == 42  # into_id
+        assert update_args[2] == 1419  # discogs_artist_id from the orphan
+        assert update_args[3] == "mbid-1"
+        assert update_args[4] == "spotify-1"
+
+        # REASSIGN binds (new_id, old_id).
+        reassign_args = conn.execute.await_args_list[1][0]
+        assert reassign_args[1] == 42  # into_id (new)
+        assert reassign_args[2] == 17  # from_id (old)
+
+        # DELETE targets the from row's id.
+        delete_args = conn.execute.await_args_list[2][0]
+        assert delete_args[1] == 17
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_from_name_missing(self, store_tx, mock_pg_tx):
+        """fetchrow None → no merge, return False, no executes."""
+        conn = mock_pg_tx._mock_conn
+        conn.fetchrow = AsyncMock(return_value=None)
+
+        merged = await store_tx.merge_identity_by_library_name(from_name="Nonexistent", into_id=42)
+
+        assert merged is False
+        conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_from_equals_into(self, store_tx, mock_pg_tx):
+        """If from_name's id equals into_id, no-op (return False) — re-invocation safe."""
+        conn = mock_pg_tx._mock_conn
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "id": 42,
+                "library_name": "X",
+                "discogs_artist_id": None,
+                "wikidata_qid": None,
+                "musicbrainz_artist_id": None,
+                "spotify_artist_id": None,
+                "apple_music_artist_id": None,
+                "bandcamp_id": None,
+                "reconciliation_status": "reconciled",
+            }
+        )
+
+        merged = await store_tx.merge_identity_by_library_name(from_name="X", into_id=42)
+
+        assert merged is False
+        conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runs_in_single_transaction(self, store_tx, mock_pg_tx):
+        """Three statements all on the same conn under one transaction."""
+        conn = mock_pg_tx._mock_conn
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "library_name": "X",
+                "discogs_artist_id": 99,
+                "wikidata_qid": None,
+                "musicbrainz_artist_id": None,
+                "spotify_artist_id": None,
+                "apple_music_artist_id": None,
+                "bandcamp_id": None,
+                "reconciliation_status": "reconciled",
+            }
+        )
+
+        await store_tx.merge_identity_by_library_name(from_name="X", into_id=2)
+
+        mock_pg_tx.acquire.assert_called_once()
+        conn.transaction.assert_called_once()
