@@ -146,6 +146,7 @@ SET discogs_artist_id = COALESCE($2, discogs_artist_id),
     spotify_artist_id = COALESCE($4, spotify_artist_id),
     apple_music_artist_id = COALESCE($5, apple_music_artist_id),
     bandcamp_id = COALESCE($6, bandcamp_id),
+    wikidata_qid = COALESCE($7, wikidata_qid),
     updated_at = now()
 WHERE id = $1\
 """
@@ -450,15 +451,24 @@ class EntityStore:
     async def merge_identity_by_library_name(self, from_name: str, into_id: int) -> bool:
         """Merge the row keyed by ``from_name`` into the row at ``into_id``.
 
-        COALESCEs the from row's external IDs into the into row (matching the
-        semantics of ``EntityDeduplicator.merge_group``), re-points every
-        ``entity.reconciliation_log`` row whose ``identity_id`` matches the
-        from row to ``into_id``, then DELETEs the from row.
+        COALESCEs the from row's external IDs **and Wikidata QID** into the
+        into row, re-points every ``entity.reconciliation_log`` row whose
+        ``identity_id`` matches the from row to ``into_id``, then DELETEs the
+        from row. If the from row was ``reconciliation_status='reconciled'``
+        and the into row was not, the into row is upgraded to ``'reconciled'``
+        — otherwise the freshly-seeded target's default 'unreconciled' would
+        trigger a wasteful re-fetch on the next reconciliation pass.
 
         Used by the LML#377 orphan pass when an orphaned ``library_name``'s
         canonical form matches a current row — preserves accumulated
         reconciliation provenance across artist-name edits like
         ``"Beyonce"`` → ``"Beyoncé"``.
+
+        Why this differs from ``EntityDeduplicator.merge_group``: dedup keys
+        on a shared Wikidata QID, so the surviving row always already has the
+        QID and a reconciled status. The orphan pass keys on canonical-form
+        match, a weaker constraint — the orphan can carry a QID and a status
+        that the freshly-seeded target lacks. Both fields must be carried.
 
         Returns True on merge; False (no-op) when ``from_name`` is not found
         or already equals ``into_id`` (idempotent on re-invocation).
@@ -483,7 +493,16 @@ class EntityStore:
                 from_row["spotify_artist_id"],
                 from_row["apple_music_artist_id"],
                 from_row["bandcamp_id"],
+                from_row["wikidata_qid"],
             )
+            # `reconciliation_status` is NOT NULL with default 'unreconciled',
+            # so a plain COALESCE in _UPDATE_MERGED_SQL would always pick the
+            # bind value over the existing column — that's wrong for dedup
+            # (could downgrade 'reconciled' to 'no_match'). Apply selectively
+            # here instead: only upgrade the target to 'reconciled' if the
+            # orphan was reconciled.
+            if from_row["reconciliation_status"] == "reconciled":
+                await conn.execute(_UPDATE_STATUS_SQL, into_id, "reconciled")
             await conn.execute(_REASSIGN_LOGS_SQL, into_id, from_id)
             await conn.execute(_DELETE_IDENTITY_BY_ID_SQL, from_id)
             return True

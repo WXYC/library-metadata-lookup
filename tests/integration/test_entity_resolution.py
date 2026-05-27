@@ -584,6 +584,51 @@ class TestOrphanPass:
         assert [r["external_id"] for r in log_rows] == ["5499521"]
 
     @pytest.mark.asyncio
+    async def test_merge_carries_wikidata_qid_and_reconciled_status(self, pg_source):
+        """Orphan's Wikidata QID + reconciled status survive the rename merge.
+
+        Regression pin for the bug surfaced by /review-loop: a librarian's
+        rename ("Beyonce" → "Beyoncé") on a row that the Wikidata bridge had
+        already populated would silently drop the QID and leave the merged
+        row's reconciliation_status at the freshly-seeded default of
+        'unreconciled'. Both losses defeat the orphan-pass's whole point
+        (provenance preservation) and trigger wasted re-fetches on the next
+        reconciliation pass.
+        """
+        store = EntityStore(pg_source)
+
+        # Pre-existing fully-reconciled orphan: Discogs ID, Wikidata QID,
+        # status='reconciled', and a log row.
+        old = await store.upsert_identity(
+            library_name="Beyonce",
+            discogs_artist_id=1419,
+            wikidata_qid="Q36153",
+        )
+        assert old is not None
+        await store.update_status(old.id, "reconciled")
+        await store.log_reconciliation(
+            identity_id=old.id,
+            source="wikidata",
+            external_id="Q36153",
+            method="discogs_bridge",
+        )
+
+        await seed_identities(store, ["Beyoncé"])
+        merged, deleted, _ = await prune_orphan_identities(store, {"Beyoncé"})
+        assert (merged, deleted) == (1, 0)
+
+        # Surviving row carries the QID + reconciled status.
+        rows = await pg_source.fetchall(
+            "SELECT library_name, discogs_artist_id, wikidata_qid, reconciliation_status "
+            "FROM entity.identity"
+        )
+        assert len(rows) == 1
+        assert rows[0]["library_name"] == "Beyoncé"
+        assert rows[0]["discogs_artist_id"] == 1419
+        assert rows[0]["wikidata_qid"] == "Q36153"
+        assert rows[0]["reconciliation_status"] == "reconciled"
+
+    @pytest.mark.asyncio
     async def test_idempotent_on_re_run(self, pg_source):
         """Second seed+prune over the same snapshot is a no-op.
 

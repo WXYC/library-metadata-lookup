@@ -101,7 +101,12 @@ class EntityDeduplicator:
             merged_bandcamp = merged_bandcamp or dup.bandcamp_id
 
         async with self._pg.acquire() as conn, conn.transaction():
-            # Update the primary identity with all merged IDs
+            # Update the primary identity with all merged IDs. The
+            # `wikidata_qid` bind is the shared group key by construction
+            # (groups are built by QID collision), so passing it through
+            # `_UPDATE_MERGED_SQL`'s new $7 slot is a no-op on the primary
+            # but keeps a single SQL shape for both callers (this method
+            # and the LML#377 orphan-pass merge).
             await conn.execute(
                 _UPDATE_MERGED_SQL,
                 primary.id,
@@ -110,6 +115,7 @@ class EntityDeduplicator:
                 merged_spotify,
                 merged_apple,
                 merged_bandcamp,
+                qid,
             )
 
             # Reassign logs and delete duplicates
