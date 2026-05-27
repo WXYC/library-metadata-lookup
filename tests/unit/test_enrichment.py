@@ -146,15 +146,7 @@ class TestFetchAppleMusicUrl:
 
     @pytest.mark.asyncio
     async def test_returns_none_on_no_results(self):
-        import httpx
-
-        mock_response = httpx.Response(
-            200,
-            json={"results": []},
-            request=httpx.Request("GET", "https://itunes.apple.com/search"),
-        )
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client = self._mock_client([])
 
         result = await _fetch_apple_music_url(
             "Obscure Artist", "Obscure Song", http_client=mock_client
