@@ -1564,6 +1564,9 @@ async def _fetch_apple_music_url(
 
         norm_artist = normalize_for_comparison(artist)
         norm_song = normalize_for_comparison(song)
+        # token_set_ratio (not the batch matcher's token_sort_ratio) so extra
+        # tokens on either side — "The", "feat. X", "(Remastered)" — don't sink
+        # an otherwise-correct match.
         for result in results:
             track_url = result.get("trackViewUrl")
             if not track_url:
