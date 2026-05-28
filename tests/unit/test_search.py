@@ -1381,3 +1381,107 @@ class TestCallerBudget:
 
         keys = {c.args[0] for c in mock_transaction.set_data.call_args_list}
         assert "lml.caller_budget_ms" not in keys
+
+    @pytest.mark.asyncio
+    async def test_pipeline_caller_budget_cuts_off_empty_results(self, monkeypatch):
+        """Caller-budget honored even when no strategy has produced results.
+
+        The env-default soft budget has an `and state.results` safety branch
+        (test_budget_exceeded_safety_branch_when_all_empty above) so the
+        request keeps grinding when nothing has hit yet. But when the caller
+        explicitly sends X-Caller-Budget-Ms, they have already opted into
+        "discard whatever comes after my deadline" semantics — LML grinding
+        past that is wasted Discogs quota. With a tight caller budget and
+        all strategies slow + empty, the pipeline must short-circuit at the
+        budget and surface state.timed_out=True.
+
+        Mirrors the WXYC/library-metadata-lookup#337 production tail
+        (Rita Villa, The Fly Girlz) where compilation strategies blocked on
+        Discogs rate-limit for 20+ s after returning zero results.
+        """
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+
+        async def slow_empty(*args, **kwargs):
+            await asyncio.sleep(0.05)  # 50ms; blows any reasonable budget
+            return ([], False)
+
+        async def slow_empty_compilation(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            return ([], {})
+
+        search_lib = AsyncMock(side_effect=slow_empty)
+        search_alt = AsyncMock(return_value=([], None))
+        search_comp = AsyncMock(side_effect=slow_empty_compilation)
+
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Rita Villa",
+            song="Czardas",
+            raw_message="Rita Villa - Czardas",
+        )
+
+        # caller_budget_ms = TRANSPORT_OVERHEAD_MS + 1 → effective budget = 1ms.
+        state = await execute_search_pipeline(
+            parsed,
+            AsyncMock(),
+            "Rita Villa - Czardas",
+            strategies,
+            song_not_found=True,
+            caller_budget_ms=TRANSPORT_OVERHEAD_MS + 1,
+        )
+
+        # First strategy's 50ms blew the 1ms effective budget. The empty-results
+        # caller-budget gate must fire and skip the subsequent compilation
+        # strategy — that's the 20+ s burn we're trying to avoid in prod.
+        assert state.results == []
+        assert state.timed_out is True
+        search_comp.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pipeline_no_caller_budget_keeps_safety_branch(self, monkeypatch):
+        """Without a caller header, the env soft budget's safety branch holds.
+
+        Regression guard: the no-results / empty-state caller-budget gate
+        must NOT activate when the caller didn't opt in. Without a header,
+        an empty cascade still runs to completion (subject only to the hard
+        cap), preserving the WXYC/library-metadata-lookup#340 safety
+        contract documented at test_budget_exceeded_safety_branch_when_all_empty.
+        """
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "1")
+
+        late_hit = _item(id=99, artist="Rita Villa", title="Czardas")
+
+        async def slow_empty(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            return ([], False)
+
+        async def slow_then_hit(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            return ([late_hit], {})
+
+        search_lib = AsyncMock(side_effect=slow_empty)
+        search_alt = AsyncMock(return_value=([], None))
+        search_comp = AsyncMock(side_effect=slow_then_hit)
+
+        strategies = build_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Rita Villa",
+            song="Czardas",
+            raw_message="Rita Villa - Czardas",
+        )
+
+        state = await execute_search_pipeline(
+            parsed,
+            AsyncMock(),
+            "Rita Villa - Czardas",
+            strategies,
+            song_not_found=True,
+            # caller_budget_ms not passed — safety branch must hold.
+        )
+
+        # Cascade kept grinding past the 1ms budget because state.results
+        # stayed empty, and the second strategy surfaced the late hit.
+        assert state.results == [late_hit]
+        assert state.timed_out is False

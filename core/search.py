@@ -585,6 +585,25 @@ async def execute_search_pipeline(
             )
             break
 
+        # Caller-budget gate (LML#347 — Epic A no-results tail follow-up).
+        # An explicit X-Caller-Budget-Ms header is the caller saying "I will
+        # discard whatever arrives after my deadline." LML continuing past
+        # that deadline is wasted Discogs quota for an answer the caller
+        # already abandoned — see WXYC/library-metadata-lookup#337's
+        # Rita Villa / Fly Girlz tail (20+ s with empty results).
+        # Distinct from the env safety branch above: this gate fires when
+        # `state.results` is empty AND the caller opted in. Without a
+        # header, the safety branch above keeps the keep-grinding contract
+        # intact for warm-cache / write-path callers.
+        if caller_budget_ms is not None and elapsed_ms > budget_ms and not state.results:
+            state.timed_out = True
+            _log_search_budget_exceeded(
+                elapsed_ms=elapsed_ms,
+                skipped=[s.name for s in strategies[idx:]],
+                budget_ms=budget_ms,
+            )
+            break
+
         # Check if strategy should run
         if not strategy.condition(parsed, state, raw_message):
             continue
