@@ -145,6 +145,88 @@ class TestFetchAppleMusicUrl:
         assert result == "https://music.apple.com/us/album/joyous/1568229263"
 
     @pytest.mark.asyncio
+    async def test_rejects_right_track_on_wrong_album(self):
+        """Regression for the Yenbett -> Tzenni mismatch (#396).
+
+        Same-named track on multiple of the artist's releases: iTunes returns
+        the older more-indexed album's track; without album verification,
+        artist 100 + track 100 slip past #390's floor and persist the
+        wrong-album URL.
+        """
+        mock_client = self._mock_client(
+            [
+                {
+                    "artistName": "Noura Mint Seymali",
+                    "trackName": "Hebebeb (Zrag)",
+                    "collectionName": "Tzenni",
+                    "trackViewUrl": "https://music.apple.com/us/album/hebebeb-zrag/882843574?i=882843707",
+                }
+            ]
+        )
+
+        result = await _fetch_apple_music_url(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett", http_client=mock_client
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_accepts_when_album_matches(self):
+        """Album verification passes when the requested album matches the result's collection."""
+        mock_client = self._mock_client(
+            [
+                {
+                    "artistName": "Noura Mint Seymali",
+                    "trackName": "Hebebeb (Zrag)",
+                    "collectionName": "Tzenni",
+                    "trackViewUrl": "https://music.apple.com/us/album/tzenni/882843574?i=882843692",
+                }
+            ]
+        )
+
+        result = await _fetch_apple_music_url(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Tzenni", http_client=mock_client
+        )
+        assert result == "https://music.apple.com/us/album/tzenni/882843574?i=882843692"
+
+    @pytest.mark.asyncio
+    async def test_accepts_album_reissue_variant(self):
+        """token_set_ratio handles reissue/edition variants ('Tzenni' vs 'Tzenni (Deluxe Edition)')."""
+        mock_client = self._mock_client(
+            [
+                {
+                    "artistName": "Noura Mint Seymali",
+                    "trackName": "Hebebeb (Zrag)",
+                    "collectionName": "Tzenni (Deluxe Edition)",
+                    "trackViewUrl": "https://music.apple.com/us/album/tzenni-deluxe/9999",
+                }
+            ]
+        )
+
+        result = await _fetch_apple_music_url(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Tzenni", http_client=mock_client
+        )
+        assert result == "https://music.apple.com/us/album/tzenni-deluxe/9999"
+
+    @pytest.mark.asyncio
+    async def test_omitted_album_skips_album_check(self):
+        """Backward compat: when no album context is passed, verification mirrors pre-#396 behavior."""
+        mock_client = self._mock_client(
+            [
+                {
+                    "artistName": "Noura Mint Seymali",
+                    "trackName": "Hebebeb (Zrag)",
+                    "collectionName": "Tzenni",
+                    "trackViewUrl": "https://music.apple.com/us/album/tzenni/882843574?i=882843692",
+                }
+            ]
+        )
+
+        result = await _fetch_apple_music_url(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", http_client=mock_client
+        )
+        assert result == "https://music.apple.com/us/album/tzenni/882843574?i=882843692"
+
+    @pytest.mark.asyncio
     async def test_returns_none_on_no_results(self):
         mock_client = self._mock_client([])
 
