@@ -11,7 +11,7 @@ Usage:
     DATABASE_URL_DISCOGS=postgresql://... python scripts/audit_va_writeback_pollution.py [--apply]
 
 By default emits counts + writes per-row CSVs to /tmp/audit-lml-379-{delete,keep}.csv.
-Pass --apply to execute the DELETE statements (requires re-running with explicit confirmation).
+Pass --apply to execute the DELETE statements; review the dry-run CSVs first.
 """
 
 from __future__ import annotations
