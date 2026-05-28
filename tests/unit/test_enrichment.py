@@ -308,12 +308,123 @@ class TestEnrichArtworkResults:
 
     @pytest.mark.asyncio
     async def test_handles_none_artwork(self):
-        item = make_library_item()
+        """An item with no Discogs match still gets a synthesized streaming-URL
+        artwork block (``release_id=0`` sentinel marks the synthetic shape).
 
-        results = await enrich_artwork_results([(item, None)], AsyncMock())
+        Per LML#401 / BS#1184: the no-Discogs-match path used to short-circuit
+        with ``artwork=None``, leaving releases that ARE on streaming but
+        ISN'T in the WXYC catalog (e.g. Tragic Magic) with no iOS streaming
+        buttons at all. The synthetic result surfaces the existing
+        search-URL fallbacks (Spotify/YT/BC/SC) without inviting BS's
+        ``extractAlbumMetadata`` projection — the ``release_id=0`` sentinel
+        is what Backend-Service (BS#1185) keys off of to skip album-derived
+        projections while still consuming streaming URLs.
+        """
+        item = make_library_item(artist="Stereolab", title="Aluminum Tunes")
+
+        # No ``_fetch_apple_music_url`` patch — exercises the real
+        # ``http_client=None`` graceful-degrade path (function returns None).
+        results = await enrich_artwork_results([(item, None)], AsyncMock(), song="French Disko")
 
         _, enriched = results[0]
-        assert enriched is None
+        assert enriched is not None
+        # Sentinel: BS uses these to identify a streaming-only synthetic
+        # result and skip extractAlbumMetadata.
+        assert enriched.release_id == 0
+        assert enriched.release_url == ""
+        # Positional gating preserved: no album-derived fields anywhere.
+        assert enriched.release_year is None
+        assert enriched.artist_bio is None
+        assert enriched.wikipedia_url is None
+        # apple_music_url stays None because http_client is None.
+        assert enriched.apple_music_url is None
+        # Search-URL fallbacks fill (artist + song are non-empty).
+        assert enriched.spotify_url is not None
+        assert enriched.youtube_music_url is not None
+        assert enriched.bandcamp_url is not None
+        assert enriched.soundcloud_url is not None
+
+    @pytest.mark.asyncio
+    async def test_no_discogs_match_surfaces_apple_url_via_itunes(self):
+        """When ``_fetch_apple_music_url`` clears the 80/80/80 floor on a
+        no-Discogs-match item, the synthesized artwork carries the URL.
+
+        This is the Tragic Magic case from BS#1184 in miniature: an album
+        absent from the WXYC catalog but present on Apple Music.
+        """
+        item = make_library_item(
+            artist="Julianna Barwick & Mary Lattimore",
+            title="The Four Sleeping Princesses",
+        )
+
+        apple_url = "https://music.apple.com/us/album/tragic-magic/1843854211"
+        with patch(
+            "lookup.orchestrator._fetch_apple_music_url",
+            return_value=apple_url,
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="The Four Sleeping Princesses",
+                album="Tragic Magic",
+            )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.release_id == 0
+        assert enriched.apple_music_url == apple_url
+        # Album-derived fields stay None even though Apple matched — those
+        # are positionally gated and require a real Discogs artwork.
+        assert enriched.release_year is None
+        assert enriched.artist_bio is None
+        assert enriched.wikipedia_url is None
+
+    @pytest.mark.asyncio
+    async def test_no_discogs_match_preserves_positional_gating_for_lower_items(self):
+        """When ``items_with_artwork[0]`` has no artwork, no item in the
+        response carries album-derived fields — even items further down
+        that DO have artwork. The positional invariant from
+        ``enrich_artwork_results``' docstring stays intact post-#401.
+        """
+        items_with_artwork: list[tuple[object, DiscogsSearchResult | None]] = [
+            (
+                make_library_item(id=1, artist="Artist 1", title="Album 1"),
+                None,  # top-1 has no artwork
+            ),
+            (
+                make_library_item(id=2, artist="Artist 2", title="Album 2"),
+                make_discogs_result(release_id=42, artist="Artist 2", album="Album 2"),
+            ),
+        ]
+
+        discogs_service = AsyncMock()
+        # Even if Discogs would return data for the lower item, top-1 gating
+        # means the orchestrator never calls it.
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=42,
+            title="Album 2",
+            artist="Artist 2",
+            year=2020,
+            artist_id=99,
+            release_url="https://discogs.com/release/42",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Artist 2",
+            profile="bio",
+            urls=["https://en.wikipedia.org/wiki/Artist_2"],
+        )
+
+        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
+            results = await enrich_artwork_results(items_with_artwork, discogs_service, song="Song")
+
+        # Both items return non-None artwork (synthetic for top-1, real for
+        # lower); but neither carries album-derived fields.
+        for _, enriched in results:
+            assert enriched is not None
+            assert enriched.release_year is None
+            assert enriched.artist_bio is None
+            assert enriched.wikipedia_url is None
 
     @pytest.mark.asyncio
     async def test_handles_no_discogs_service(self):
@@ -781,6 +892,12 @@ class TestEnrichArtworkResultsExtended:
         None, no item gets release-year enrichment — even items further
         down that have artwork. BS/iOS only consume results[0] so this is
         fine in practice; documented in the function's docstring.
+
+        Post-LML#401: position 0 is now a synthesized streaming-only
+        ``DiscogsSearchResult`` (release_id=0 sentinel) rather than None,
+        so a release that's on Apple Music can still surface a streaming
+        button on the no-Discogs-match path. The positional-gating
+        invariant still holds — both positions have ``release_year=None``.
         """
         items_with_artwork = [
             (make_library_item(id=1), None),
@@ -800,10 +917,15 @@ class TestEnrichArtworkResultsExtended:
         with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
             results = await enrich_artwork_results(items_with_artwork, discogs_service)
 
-        # Position 0 stays None-artwork; position 1 gets streaming URLs
-        # but NOT release_year — the gate skipped it.
-        assert results[0][1] is None
+        # Position 0 is now a synthetic streaming-only result (release_id=0
+        # sentinel marks it for BS#1185 to skip extractAlbumMetadata);
+        # position 1 keeps its real artwork. Neither carries release_year.
+        assert results[0][1] is not None
+        assert results[0][1].release_id == 0
+        assert results[0][1].release_url == ""
+        assert results[0][1].release_year is None
         assert results[1][1] is not None
+        assert results[1][1].release_id == 2
         assert results[1][1].release_year is None
         # No release fetch fired — fetch_top1_release_details short-circuits
         # when top-1's artwork is None.
