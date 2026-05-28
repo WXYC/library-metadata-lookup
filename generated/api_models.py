@@ -112,34 +112,6 @@ class FlowsheetEntryBase(BaseModel):
     show_id: int
 
 
-class FlowsheetEntryResponse(FlowsheetEntryBase):
-    album_id: int | None = None
-    track_title: str | None = None
-    album_title: str | None = None
-    artist_name: str | None = None
-    record_label: str | None = None
-    label_id: int | None = None
-    rotation_id: int | None = None
-    rotation_bin: RotationBin | None = None
-    request_flag: bool
-    segue: bool | None = None
-    message: str | None = None
-    artwork_url: str | None = None
-    discogs_url: str | None = None
-    release_year: int | None = None
-    spotify_url: str | None = None
-    apple_music_url: str | None = None
-    youtube_music_url: str | None = None
-    bandcamp_url: str | None = None
-    soundcloud_url: str | None = None
-    artist_bio: str | None = None
-    artist_wikipedia_url: str | None = None
-    track_position: str | None = Field(
-        None,
-        description='Track position on the release (e.g., "A1", "B2", "5"). Populated when the flowsheet entry was created via the dj-site picker after release selection (catalog-track-search plan §5.3 / Track 3). String-typed to match Discogs\'s `release_track.position`. Null for free-text entries and legacy rows.\n',
-    )
-
-
 class FlowsheetSongEntry(FlowsheetEntryBase):
     track_title: str
     artist_name: str
@@ -289,37 +261,6 @@ class EntryType1(StrEnum):
     track = "track"
 
 
-class FlowsheetV2TrackEntry(FlowsheetV2Base):
-    entry_type: Literal["track"]
-    album_id: int | None = None
-    rotation_id: int | None = None
-    artist_name: str | None = None
-    album_title: str | None = None
-    track_title: str | None = None
-    track_position: str | None = Field(
-        None,
-        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Set by the dj-site flowsheet picker (catalog-track-search plan §5.3 / Track 3) when the DJ selected a track from the resolved release; null when the track_title was entered free-form or the release had no resolvable identity. String-typed to match Discogs\'s `release_track.position`.\n',
-    )
-    record_label: str | None = None
-    request_flag: bool
-    segue: bool | None = None
-    rotation_bin: RotationBin | None = None
-    artwork_url: str | None = None
-    discogs_url: str | None = None
-    release_year: int | None = None
-    spotify_url: str | None = None
-    apple_music_url: str | None = None
-    youtube_music_url: str | None = None
-    bandcamp_url: str | None = None
-    soundcloud_url: str | None = None
-    artist_bio: str | None = None
-    artist_wikipedia_url: str | None = None
-    on_streaming: bool | None = Field(
-        None,
-        description="Whether this album is available on streaming platforms. False means WXYC library exclusive. Null if unknown.",
-    )
-
-
 class EntryType2(StrEnum):
     show_start = "show_start"
 
@@ -385,38 +326,6 @@ class FlowsheetV2MessageEntry(FlowsheetV2Base):
     message: str
 
 
-class Entries(
-    RootModel[
-        FlowsheetV2TrackEntry
-        | FlowsheetV2ShowStartEntry
-        | FlowsheetV2ShowEndEntry
-        | FlowsheetV2DJJoinEntry
-        | FlowsheetV2DJLeaveEntry
-        | FlowsheetV2TalksetEntry
-        | FlowsheetV2BreakpointEntry
-        | FlowsheetV2MessageEntry
-    ]
-):
-    root: (
-        FlowsheetV2TrackEntry
-        | FlowsheetV2ShowStartEntry
-        | FlowsheetV2ShowEndEntry
-        | FlowsheetV2DJJoinEntry
-        | FlowsheetV2DJLeaveEntry
-        | FlowsheetV2TalksetEntry
-        | FlowsheetV2BreakpointEntry
-        | FlowsheetV2MessageEntry
-    ) = Field(..., discriminator="entry_type")
-
-
-class FlowsheetV2PaginatedResponse(BaseModel):
-    entries: list[Entries]
-    page: int
-    limit: int
-    total: int = Field(..., description="Total number of entries")
-    totalPages: int = Field(..., description="Total number of pages")
-
-
 class OnAirDJ(BaseModel):
     id: int
     dj_name: str
@@ -442,27 +351,9 @@ class ShowDJ(BaseModel):
     active: bool | None = None
 
 
-class ShowPlaylist(BaseModel):
-    show_name: str | None = None
-    specialty_show: str | None = None
-    start_time: AwareDatetime | None = None
-    end_time: AwareDatetime | None = None
-    show_djs: list[OnAirDJ] | None = None
-    entries: list[FlowsheetEntryResponse] | None = None
-
-
 class Dj(BaseModel):
     dj_id: int | None = None
     dj_name: str | None = None
-
-
-class ShowPeek(BaseModel):
-    show: int | None = None
-    show_name: str | None = None
-    date: AwareDatetime | None = None
-    djs: list[Dj] | None = None
-    specialty_show: str | None = None
-    preview: list[FlowsheetEntryResponse] | None = None
 
 
 class Artist(BaseModel):
@@ -807,6 +698,14 @@ class MetadataSource(StrEnum):
     apple_music = "apple_music"
     cache = "cache"
     none = "none"
+
+
+class MetadataStatus(StrEnum):
+    pending = "pending"
+    enriching = "enriching"
+    enriched_match = "enriched_match"
+    enriched_no_match = "enriched_no_match"
+    failed_no_retry = "failed_no_retry"
 
 
 class AlbumMetadata(BaseModel):
@@ -1393,12 +1292,6 @@ class Type3(StrEnum):
     update = "update"
 
 
-class LiveFsUpdateEvent(BaseModel):
-    type: Literal["update"]
-    payload: FlowsheetEntryResponse
-    timestamp: AwareDatetime
-
-
 class Type4(StrEnum):
     refetch = "refetch"
 
@@ -1415,12 +1308,115 @@ class LiveFsRefetchEvent(BaseModel):
     timestamp: AwareDatetime
 
 
-class LiveFsEvent(RootModel[LiveFsUpdateEvent | LiveFsRefetchEvent]):
-    root: LiveFsUpdateEvent | LiveFsRefetchEvent = Field(
-        ...,
-        description="Discriminated union of events emitted on the `live-fs-topic`. Every event has the same `{ type, payload, timestamp }` envelope — pinned by `CONTRACTS.LIVE_FS_EVENT_ENVELOPE_SHAPE`.\n",
-        discriminator="type",
+class FlowsheetEntryResponse(FlowsheetEntryBase):
+    album_id: int | None = None
+    track_title: str | None = None
+    album_title: str | None = None
+    artist_name: str | None = None
+    record_label: str | None = None
+    label_id: int | None = None
+    rotation_id: int | None = None
+    rotation_bin: RotationBin | None = None
+    request_flag: bool
+    segue: bool | None = None
+    message: str | None = None
+    artwork_url: str | None = None
+    discogs_url: str | None = None
+    release_year: int | None = None
+    spotify_url: str | None = None
+    apple_music_url: str | None = None
+    youtube_music_url: str | None = None
+    bandcamp_url: str | None = None
+    soundcloud_url: str | None = None
+    artist_bio: str | None = None
+    artist_wikipedia_url: str | None = None
+    track_position: str | None = Field(
+        None,
+        description='Track position on the release (e.g., "A1", "B2", "5"). Populated when the flowsheet entry was created via the dj-site picker after release selection (catalog-track-search plan §5.3 / Track 3). String-typed to match Discogs\'s `release_track.position`. Null for free-text entries and legacy rows.\n',
     )
+    metadata_status: MetadataStatus | None = None
+
+
+class FlowsheetV2TrackEntry(FlowsheetV2Base):
+    entry_type: Literal["track"]
+    album_id: int | None = None
+    rotation_id: int | None = None
+    artist_name: str | None = None
+    album_title: str | None = None
+    track_title: str | None = None
+    track_position: str | None = Field(
+        None,
+        description='Track position on the release (e.g., "A1", "B2", "5", "1-12"). Set by the dj-site flowsheet picker (catalog-track-search plan §5.3 / Track 3) when the DJ selected a track from the resolved release; null when the track_title was entered free-form or the release had no resolvable identity. String-typed to match Discogs\'s `release_track.position`.\n',
+    )
+    record_label: str | None = None
+    request_flag: bool
+    segue: bool | None = None
+    rotation_bin: RotationBin | None = None
+    artwork_url: str | None = None
+    discogs_url: str | None = None
+    release_year: int | None = None
+    spotify_url: str | None = None
+    apple_music_url: str | None = None
+    youtube_music_url: str | None = None
+    bandcamp_url: str | None = None
+    soundcloud_url: str | None = None
+    artist_bio: str | None = None
+    artist_wikipedia_url: str | None = None
+    on_streaming: bool | None = Field(
+        None,
+        description="Whether this album is available on streaming platforms. False means WXYC library exclusive. Null if unknown.",
+    )
+    metadata_status: MetadataStatus | None = None
+
+
+class Entries(
+    RootModel[
+        FlowsheetV2TrackEntry
+        | FlowsheetV2ShowStartEntry
+        | FlowsheetV2ShowEndEntry
+        | FlowsheetV2DJJoinEntry
+        | FlowsheetV2DJLeaveEntry
+        | FlowsheetV2TalksetEntry
+        | FlowsheetV2BreakpointEntry
+        | FlowsheetV2MessageEntry
+    ]
+):
+    root: (
+        FlowsheetV2TrackEntry
+        | FlowsheetV2ShowStartEntry
+        | FlowsheetV2ShowEndEntry
+        | FlowsheetV2DJJoinEntry
+        | FlowsheetV2DJLeaveEntry
+        | FlowsheetV2TalksetEntry
+        | FlowsheetV2BreakpointEntry
+        | FlowsheetV2MessageEntry
+    ) = Field(..., discriminator="entry_type")
+
+
+class FlowsheetV2PaginatedResponse(BaseModel):
+    entries: list[Entries]
+    page: int
+    limit: int
+    total: int = Field(..., description="Total number of entries")
+    totalPages: int = Field(..., description="Total number of pages")
+
+
+class ShowPlaylist(BaseModel):
+    show_name: str | None = None
+    specialty_show: str | None = None
+    start_time: AwareDatetime | None = None
+    end_time: AwareDatetime | None = None
+    show_djs: list[OnAirDJ] | None = None
+    entries: list[FlowsheetEntryResponse] | None = None
+
+
+class ShowPeek(BaseModel):
+    show: int | None = None
+    show_name: str | None = None
+    date: AwareDatetime | None = None
+    djs: list[Dj] | None = None
+    specialty_show: str | None = None
+    preview: list[FlowsheetEntryResponse] | None = None
 
 
 class AlbumSearchResult(BaseModel):
@@ -1573,6 +1569,20 @@ class BulkResolveLibrariesRequest(BaseModel):
         description="Inputs to resolve. Order preserved in `BulkResolveLibrariesResponse.results`.\n",
         max_length=1000,
         min_length=1,
+    )
+
+
+class LiveFsUpdateEvent(BaseModel):
+    type: Literal["update"]
+    payload: FlowsheetEntryResponse
+    timestamp: AwareDatetime
+
+
+class LiveFsEvent(RootModel[LiveFsUpdateEvent | LiveFsRefetchEvent]):
+    root: LiveFsUpdateEvent | LiveFsRefetchEvent = Field(
+        ...,
+        description="Discriminated union of events emitted on the `live-fs-topic`. Every event has the same `{ type, payload, timestamp }` envelope — pinned by `CONTRACTS.LIVE_FS_EVENT_ENVELOPE_SHAPE`.\n",
+        discriminator="type",
     )
 
 
