@@ -1723,9 +1723,6 @@ async def enrich_artwork_results(
         *,
         is_top1: bool,
     ) -> tuple[LibraryItem, DiscogsSearchResult | None]:
-        if not artwork:
-            return (item, artwork)
-
         artist = item.alternate_artist_name or item.artist or ""
         search_term = song or item.title or ""
 
@@ -1735,13 +1732,20 @@ async def enrich_artwork_results(
             else None
         )
 
-        # Top-1 scalars; non-top-1 leaves these as None and renders with
-        # streaming-URL fallbacks only.
-        year_result = top1_year if is_top1 else None
-        artist_bio = top1_bio if is_top1 else None
-        wikipedia_url = top1_wiki if is_top1 else None
+        # Album-derived fields are positionally gated: only on top-1, and
+        # only when top-1 actually has artwork. When ``artwork`` is None
+        # here (this branch is also taken for the synthesized no-Discogs-
+        # match streaming-only result), these stay None — preserves the
+        # docstring's positional-gating invariant.
+        is_album_derived_eligible = is_top1 and artwork is not None
+        year_result = top1_year if is_album_derived_eligible else None
+        artist_bio = top1_bio if is_album_derived_eligible else None
+        wikipedia_url = top1_wiki if is_album_derived_eligible else None
 
-        # Get streaming URLs: prefer direct links from DB, fall back to search URLs
+        # Get streaming URLs: prefer direct links from DB, fall back to search URLs.
+        # Runs unconditionally — releases that ARE on streaming but ISN'T
+        # in the WXYC catalog (a Discogs miss) still surface streaming
+        # buttons via the synthesized result below (LML#401 / BS#1184).
         spotify_url = None
         apple_music_override = None
         youtube_music_url = None
@@ -1790,11 +1794,12 @@ async def enrich_artwork_results(
             "soundcloud_url": soundcloud_url,
         }
 
-        # Extended fields land on the top-1 result only. The non-top-1
-        # items keep their lean shape so non-iOS lookup callers (request
-        # line, dj-site proxy, BS catalog) don't pay payload bloat for
-        # results they ignore.
-        if extended and is_top1:
+        # Extended fields land on the top-1 result only and require artwork
+        # (same positional + artwork gating as the album-derived scalars).
+        # The non-top-1 items keep their lean shape so non-iOS lookup
+        # callers (request line, dj-site proxy, BS catalog) don't pay
+        # payload bloat for results they ignore.
+        if extended and is_album_derived_eligible:
             if top1_release is not None:
                 update["discogs_artist_id"] = top1_release.artist_id
                 update["tracklist"] = (
@@ -1808,6 +1813,16 @@ async def enrich_artwork_results(
                 top1_details.image_url if top1_details is not None else None
             )
             update["profile_tokens"] = top1_profile_tokens
+
+        if artwork is None:
+            # No Discogs match: return a synthesized streaming-only result.
+            # ``release_id=0`` / ``release_url=""`` are the sentinels
+            # Backend-Service (BS#1185) keys off of to skip
+            # ``extractAlbumMetadata`` while still consuming streaming URLs.
+            # Album-derived fields stay None (set above when
+            # ``is_album_derived_eligible`` is False), preserving the
+            # positional-gating invariant from this function's docstring.
+            return (item, DiscogsSearchResult(release_id=0, release_url="", **update))
 
         return (item, artwork.model_copy(update=update))
 
