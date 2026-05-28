@@ -56,9 +56,10 @@ _NEGATIVE_CACHE_DEFAULT_TTL_SECONDS = 604_800
 # In-process TTL cache for ``search_artists_by_name``. The trigram scan over
 # UNION(artist, artist_name_variation) was the dominant DB chokepoint in prod
 # (p50 = 303 ms × ~1k calls/day, ~317 s aggregate DB time per 24 h). The
-# resolver pre-pass in ``lookup.orchestrator.resolve_canonical_artist`` runs on
-# every inbound lookup regardless of ``LML_RESOLVE_ARTIST_CANONICAL``, so the
-# query is paid even when the canonical-swap behaviour is disabled. The WXYC
+# resolver pre-pass in ``lookup.orchestrator.resolve_canonical_artist`` now
+# only runs when ``LML_RESOLVE_ARTIST_CANONICAL`` is enabled (WXYC/library-
+# metadata-lookup#343 Option 2), so the dominant caller is the Phase 1.5
+# mojibake-recovery fallback in ``lookup/external_search.py``. The WXYC
 # catalog input space is bounded (~30k library artists), so a 2k-entry LRU +
 # 1h TTL covers the working set after warmup. Registered with
 # ``create_ttl_cache`` so ``clear_all_caches()`` resets it alongside the
