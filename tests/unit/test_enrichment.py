@@ -308,17 +308,10 @@ class TestEnrichArtworkResults:
 
     @pytest.mark.asyncio
     async def test_handles_none_artwork(self):
-        """An item with no Discogs match still gets a synthesized streaming-URL
-        artwork block (``release_id=0`` sentinel marks the synthetic shape).
-
-        Per LML#401 / BS#1184: the no-Discogs-match path used to short-circuit
-        with ``artwork=None``, leaving releases that ARE on streaming but
-        ISN'T in the WXYC catalog (e.g. Tragic Magic) with no iOS streaming
-        buttons at all. The synthetic result surfaces the existing
-        search-URL fallbacks (Spotify/YT/BC/SC) without inviting BS's
-        ``extractAlbumMetadata`` projection — the ``release_id=0`` sentinel
-        is what Backend-Service (BS#1185) keys off of to skip album-derived
-        projections while still consuming streaming URLs.
+        """No-Discogs-match items return a synthesized streaming-only
+        ``DiscogsSearchResult`` (``release_id=0`` sentinel; see LML#401).
+        With ``http_client=None`` the Apple lookup degrades gracefully and
+        only the search-URL fallbacks fill.
         """
         item = make_library_item(artist="Stereolab", title="Aluminum Tunes")
 

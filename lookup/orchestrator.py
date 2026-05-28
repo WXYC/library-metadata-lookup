@@ -1633,6 +1633,19 @@ async def enrich_artwork_results(
     this is fine in practice; the lookup pipeline guarantees the strongest
     match is in position 0.
 
+    **Behavior change vs. v0.6.0 (LML#401):** an item entering with
+    ``artwork=None`` no longer round-trips as ``(item, None)``. It returns
+    a synthesized ``DiscogsSearchResult(release_id=0, release_url="")``
+    carrying only the streaming-URL fields (Apple via iTunes Search +
+    Spotify/YT/BC/SC search-URL fallbacks). Album-derived scalars
+    (release_year, artist_bio, wikipedia_url) and the ``extended=True``
+    payload stay None on the synthesized result, preserving the positional-
+    gating invariant above. The ``(release_id=0, release_url="")`` pair is
+    a cross-service contract: Backend-Service (BS#1185) keys off of it to
+    skip ``extractAlbumMetadata`` while still consuming streaming URLs.
+    Required for the WXYC/BS#1184 fix — releases on Apple Music that aren't
+    in the WXYC/Discogs catalog now surface streaming buttons on iOS.
+
     ``extended=True`` additionally populates the new DiscogsMatchResult
     fields LML already loaded during the release+artist fetches:
     ``discogs_artist_id``, ``tracklist``, ``genres``, ``styles``, ``label``,
@@ -1815,13 +1828,9 @@ async def enrich_artwork_results(
             update["profile_tokens"] = top1_profile_tokens
 
         if artwork is None:
-            # No Discogs match: return a synthesized streaming-only result.
-            # ``release_id=0`` / ``release_url=""`` are the sentinels
-            # Backend-Service (BS#1185) keys off of to skip
-            # ``extractAlbumMetadata`` while still consuming streaming URLs.
-            # Album-derived fields stay None (set above when
-            # ``is_album_derived_eligible`` is False), preserving the
-            # positional-gating invariant from this function's docstring.
+            # No Discogs match: synthesize a streaming-only result. See
+            # docstring's "Behavior change vs. v0.6.0 (LML#401)" section
+            # for the BS#1185 sentinel contract.
             return (item, DiscogsSearchResult(release_id=0, release_url="", **update))
 
         return (item, artwork.model_copy(update=update))
