@@ -90,7 +90,7 @@ module = [
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-module = ["wxyc_etl", "wxyc_etl.*", "asyncpg", "asyncpg.*"]
+module = ["wxyc_etl", "wxyc_etl.*", "asyncpg", "asyncpg.*", "psycopg", "psycopg.*"]
 ignore_missing_imports = true
 follow_untyped_imports = true
 
