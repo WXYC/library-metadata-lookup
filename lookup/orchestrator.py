@@ -921,16 +921,25 @@ async def search_compilations_for_track(
 
         # Resolver pre-pass: when the inbound artist string trigram-matches a
         # canonical Discogs name with confidence >= the floor, use the canonical
-        # form for both Discogs probes. The pre-pass runs unconditionally for
-        # shadow logging; the actual swap is gated on
-        # ``settings.lml_resolve_artist_canonical`` for a controlled rollout.
-        # See WXYC/library-metadata-lookup#318.
-        cache_service = getattr(discogs_service, "cache_service", None)
-        outcome = await resolve_canonical_artist(parsed.artist, cache_service=cache_service)
+        # form for both Discogs probes. Gated by ``lml_resolve_artist_canonical``
+        # — the flag controls *both* the trigram lookup and the swap, so the
+        # default-off path pays no PG cost. See WXYC/library-metadata-lookup#343
+        # Option 2.
         enforce_swap = bool(get_settings().lml_resolve_artist_canonical)
-        actual_swap = outcome.swapped and enforce_swap
-        _log_resolver_pre_pass(outcome, actual_swap=actual_swap)
-        artist_for_probes = outcome.canonical if actual_swap else parsed.artist
+        if enforce_swap:
+            cache_service = getattr(discogs_service, "cache_service", None)
+            outcome = await resolve_canonical_artist(parsed.artist, cache_service=cache_service)
+            actual_swap = outcome.swapped
+            _log_resolver_pre_pass(outcome, actual_swap=actual_swap)
+            artist_for_probes = outcome.canonical if actual_swap else parsed.artist
+        else:
+            outcome = ResolverOutcome(
+                original=parsed.artist or "",
+                canonical=parsed.artist or "",
+                score=0.0,
+                swapped=False,
+            )
+            artist_for_probes = parsed.artist
 
         # Get raw releases from Discogs without per-release validation.
         # We search the library first and only validate releases that match,

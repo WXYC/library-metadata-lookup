@@ -216,10 +216,11 @@ class TestResolverPrePassCallSite:
             assert artist_arg == "Alexander Robotnick"
 
     @pytest.mark.asyncio
-    async def test_shadow_mode_does_not_swap_even_when_resolver_recommends(self):
-        """Flag default is False (shadow mode). Even with a high-confidence
-        canonical, the original artist must reach both probes — the resolver's
-        recommendation only feeds telemetry until the flag flips."""
+    async def test_pre_pass_skipped_when_flag_off_no_pg_call(self):
+        """Flag default is False. The pre-pass must skip the PG trigram call
+        entirely — that's the ~50 ms / lookup we don't pay until calibration
+        clears the swap to be enabled. See WXYC/library-metadata-lookup#343
+        Option 2. The original artist must still reach both probes."""
         from config.settings import get_settings
 
         get_settings.cache_clear()  # ensure no stale env from another test
@@ -258,6 +259,7 @@ class TestResolverPrePassCallSite:
             ):
                 await search_compilations_for_track(db, parsed, discogs_service=service)
 
+            cache_service.search_artists_by_name.assert_not_awaited()
             assert service.search_releases_by_track.await_count == 2
             for call in service.search_releases_by_track.await_args_list:
                 artist_arg = call.kwargs.get("artist")
