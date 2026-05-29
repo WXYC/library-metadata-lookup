@@ -865,6 +865,7 @@ class TestGetRelease:
             title="Cached Album",
             artist="Artist",
             release_url="https://discogs.com/release/123",
+            artwork_url="https://img.com/cached.jpg",
             cached=True,
         )
         service_with_cache.cache_service.get_release = AsyncMock(return_value=cached)
@@ -872,6 +873,51 @@ class TestGetRelease:
         result = await service_with_cache.get_release(123)
         assert result.title == "Cached Album"
         assert result.cached is True
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_with_null_artwork_falls_through_to_api(self, service_with_cache):
+        """A cache row with artwork_url=None is a partial miss: hit the API to fill it in,
+        then write back. Without this, bulk-loaded rows whose XML lacked images stay
+        permanently artworkless and downstream consumers (BS V2, iOS) render placeholders.
+        """
+        stale = ReleaseMetadataResponse(
+            release_id=33696615,
+            title="Loved By Sound, Lost in Forms",
+            artist="Lucy Liyou",
+            release_url="https://discogs.com/release/33696615",
+            artwork_url=None,
+            cached=True,
+        )
+        service_with_cache.cache_service.get_release = AsyncMock(return_value=stale)
+        service_with_cache.cache_service.write_release = AsyncMock()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Loved By Sound, Lost in Forms",
+            "artists": [{"name": "Lucy Liyou"}],
+            "tracklist": [],
+            "images": [{"uri": "https://img.discogs.com/cover.jpg"}],
+            "labels": [],
+            "genres": [],
+            "styles": [],
+        }
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ) as mock_request:
+            result = await service_with_cache.get_release(33696615)
+
+        mock_request.assert_called_once()
+        assert result is not None
+        assert result.artwork_url == "https://img.discogs.com/cover.jpg"
+        service_with_cache.cache_service.write_release.assert_called_once()
+        written = service_with_cache.cache_service.write_release.call_args.args[0]
+        assert written.artwork_url == "https://img.discogs.com/cover.jpg"
 
     @pytest.mark.asyncio
     async def test_404_returns_none(self, service):

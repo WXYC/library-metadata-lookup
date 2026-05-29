@@ -810,6 +810,10 @@ class DiscogsService:
             pg_read=lambda: cache.get_release(release_id),
             api_fetch=_api_fetch,
             pg_write=cache.write_release,
+            # A row with `artwork_url IS NULL` is a partial miss: the bulk
+            # loader leaves ~48% of `release` rows that way (LML#414). Fall
+            # through to the API so the write-back back-patches the cover.
+            is_pg_hit=lambda v: v is not None and v.artwork_url is not None,
             breadcrumb_data={"release_id": release_id},
         )
 
