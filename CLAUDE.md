@@ -45,6 +45,7 @@ Strategies never mutate `SearchState`; they return an `Outcome` and the runner a
 - `discogs/service.py` -- Discogs API client with optional PostgreSQL cache
 - `discogs/cache_service.py` -- PostgreSQL cache (asyncpg + pg_trgm). Tier 5 in the [org cache-hierarchy reference](https://github.com/WXYC/wiki/blob/main/architecture/cache-hierarchy.md).
 - `discogs/memory_cache.py` -- In-memory TTL cache (cachetools). Tier 4 in the [org cache-hierarchy reference](https://github.com/WXYC/wiki/blob/main/architecture/cache-hierarchy.md); per-cache TTLs + maxsizes documented there with the upstream and downstream tiers in context.
+- `discogs/fallthrough.py` -- Read-through cache seam (#393): one `fallthrough()` function owns L2-PG → L3-API + optional write-back + cool-down on cache outage. Five `discogs/service.py` methods call it. See the "Discogs cache fallthrough seam" section below for the per-method policy table.
 - `core/search.py` -- Declarative search strategy pattern + ambiguous format detection
 - `discogs/markup_parser.py` -- Discogs markup parser: tokenize/resolve `[a=Name]`, `[a12345]`, `[b]...[/b]`, etc. into structured `ResolvedToken` models. Includes `EntityResolver` protocol and `DiscogsServiceResolver` adapter for async ID resolution. Translated from iOS `DiscogsMarkupParser.swift`.
 - `discogs/matching.py` -- Discogs-specific normalization (strip_discogs_suffix, normalize_for_track_comparison, normalize_artist_for_validation)
@@ -123,6 +124,32 @@ The service supports an optional PostgreSQL cache for Discogs data:
 4. Gracefully degrade to API-only if cache unavailable
 
 Set `DATABASE_URL_DISCOGS` to enable. The cache schema is defined in [WXYC/discogs-etl](https://github.com/WXYC/discogs-etl).
+
+### Discogs cache fallthrough seam (`discogs/fallthrough.py`)
+
+The 3-tier read-through (in-memory L1 via `@async_cached` → PostgreSQL L2 → Discogs API L3 + optional write-back) is concentrated in `discogs/fallthrough.py:fallthrough()`. Each cache-bearing method in `discogs/service.py` calls the seam with its own `pg_read` / `api_fetch` / `pg_write` closures and, where relevant, the negative-cache hooks. The L1 `@async_cached(<CACHE>)` decorator stays per-method — it owns a separate, already-deep concern (per-type TTL, cache-key normalization, the `should_skip_cache()` bypass).
+
+#### Per-method write-back policy
+
+The drift the deepening (#393) removes — every `pg_write=None` call site documents *why* it's read-only:
+
+| Method | `pg_write` | Why |
+|---|---|---|
+| `get_release` | `cache_service.write_release` | Full read-through. `ReleaseMetadataResponse` maps cleanly to the cache's normalized schema. |
+| `get_artist_details` | `cache_service.write_artist_details` | Full read-through. Same shape. |
+| `search_releases_by_track` | `None` | Read-only by design — the PG side queries the normalized `release_track` index populated by the ETL pipeline. Writing arbitrary Discogs `/database/search` hits back wouldn't fit that schema. Negative-cache write still fires via `pg_negative_record`. |
+| `search` | `None` | Read-only by design — same shape. |
+| `validate_track_on_release` | `None` | Read-only by design. Tri-state PG read short-circuits when the cache has an answer; on miss, the API path calls `get_release` which writes back to the `release` cache via its own seam call. The validation verdict itself isn't separately cached. |
+
+When adding a new cache-bearing method, pass an explicit `pg_write=` argument (or `pg_write=None` with a one-line comment explaining why). The seam's signature makes the policy decision visible at the call site.
+
+#### Cool-down on cache outage (LML#324)
+
+When a `pg_read` raises one of a narrow set of "DB unreachable" exceptions — `asyncpg.exceptions.PostgresConnectionError`, `CannotConnectNowError`, `InterfaceError`, `UndefinedTableError` (the dedup-swap window), or the local `CacheUnavailableError` — the seam arms a process-wide cool-down for `_COOL_DOWN_SECONDS` (default 30s). While active, `pg_read` is short-circuited and the seam jumps straight to the API leg. `asyncio.CancelledError` propagates; everything else (programming errors, `asyncio.TimeoutError`) falls through to the API without arming.
+
+The arming exception set lives in `_ARMING_EXCEPTIONS` in `discogs/fallthrough.py` and is pinned by tests in `tests/unit/test_fallthrough.py` so a future asyncpg release adding new exception classes can't silently widen the arming criteria.
+
+Cool-down arm projects `data.cache_fallback_fired = {reason, error_class, cool_down_seconds}` onto the active Sentry transaction, matching the pattern used by `_log_album_title_fallback` in `lookup/orchestrator.py`. Queryable in the Sentry trace explorer to track outage incidents.
 
 ### External-Cache Fallback for `/api/v1/lookup` (Phase 1.5 mojibake recovery)
 
