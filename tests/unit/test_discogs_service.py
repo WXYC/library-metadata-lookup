@@ -935,7 +935,7 @@ class TestGetRelease:
         completes: API result returned with artwork_url=None, write-back records
         the row. The next lookup must see artwork_checked_at set (from this
         write-back via cache_service.write_release) and treat it as a hit —
-        covered by `test_cache_hit_with_checked_at_does_not_call_api`.
+        covered by `test_cache_hit_with_checked_at_set_and_null_artwork_does_not_call_api`.
         """
         stale = ReleaseMetadataResponse(
             release_id=33696616,
