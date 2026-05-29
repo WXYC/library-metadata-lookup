@@ -11,9 +11,9 @@ from core.search import (
     DEFAULT_SEARCH_HARD_TIMEOUT_MS,
     TRANSPORT_OVERHEAD_MS,
     SearchState,
-    SearchStrategy,
     SearchStrategyType,
     _log_hard_cap_fired,
+    _Strategy,
     build_strategies,
     execute_search_pipeline,
     get_search_type_from_state,
@@ -529,6 +529,50 @@ class TestExecuteSearchPipeline:
         assert state.results == []
         assert state.matched_via_by_id == {}
         search_track.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Runner dispatches by interface (LML#391 step 1)
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerIsGeneric:
+    """``execute_search_pipeline`` consumes ``_Strategy`` by interface, not by name.
+
+    The pre-#391 runner switched on ``strategy.name`` in a five-arm ``if/elif``,
+    so a strategy whose name didn't match any arm would silently no-op. The
+    deepened runner has no such switch: a ``_Strategy`` produced by
+    ``build_strategies`` or constructed elsewhere drives the pipeline through
+    its ``run`` callable directly. This pins generic dispatch — adding a sixth
+    strategy (catalog-track-search's planned ``SONG_AS_LABEL``, etc.) does not
+    require touching the runner.
+    """
+
+    @pytest.mark.asyncio
+    async def test_runner_drives_a_custom_strategy_with_no_orchestrator_arm(self):
+        custom_item = _item(id=42, artist="Custom", title="Strategy")
+        ran: list[bool] = []
+
+        async def custom_run(db, parsed, state, raw_message):
+            ran.append(True)
+            state.results = [custom_item]
+            return True
+
+        # ARTIST_ONLY is a SearchStrategyType value that the pre-#391 if/elif
+        # never dispatched on (no orchestrator arm for it). Post-#391 the runner
+        # just calls ``run`` regardless of name.
+        custom = _Strategy(
+            name=SearchStrategyType.ARTIST_ONLY,
+            condition=lambda parsed, state, raw_message: True,
+            run=custom_run,
+        )
+
+        parsed = ParsedRequest(artist="Custom", raw_message="Custom")
+        state = await execute_search_pipeline(parsed, AsyncMock(), "Custom", [custom])
+
+        assert ran == [True]
+        assert state.results == [custom_item]
+        assert state.strategies_tried == [SearchStrategyType.ARTIST_ONLY]
 
 
 # ---------------------------------------------------------------------------
@@ -1120,19 +1164,19 @@ class TestPerStrategyWaitFor:
             time.sleep(0.1)  # 100ms blocking sleep — blows the 50ms cap
             return True
 
-        async def slow_empty(*_args, **_kwargs):
+        async def slow_run(db, parsed, state, raw_message):  # noqa: ARG001
             # Anything > 10ms triggers the 0.01s wait_for floor's TimeoutError.
             await asyncio.sleep(0.05)
-            return ([], False)
+            return False
 
-        # Single-strategy pipeline with the jittery condition.
+        # Single-strategy pipeline with the jittery condition. Constructed by
+        # hand rather than through build_strategies so we can inject the
+        # jittery_condition that triggers the floor.
         strategies = [
-            SearchStrategy(
+            _Strategy(
                 name=SearchStrategyType.ARTIST_PLUS_ALBUM,
                 condition=jittery_condition,
-                execute=slow_empty,
-                updates_song_not_found=False,
-                updates_discogs_titles=False,
+                run=slow_run,
             )
         ]
 
