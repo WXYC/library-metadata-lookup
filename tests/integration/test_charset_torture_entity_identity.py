@@ -21,8 +21,8 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from scripts.entity_resolution.sources import PgSource
-from scripts.entity_resolution.store import EntityStore
+from entity.sources import PgSource
+from entity.store import EntityStore
 from tests.charset_torture import CharsetTortureEntry, entry_id, iter_entries
 
 DATABASE_URL = os.getenv(

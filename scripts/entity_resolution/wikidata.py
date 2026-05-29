@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass
 from typing import Literal
 
-from scripts.entity_resolution.sources import PgSource, SparqlSource
+from entity.sources import PgSource, SparqlSource
 
 logger = logging.getLogger(__name__)
 

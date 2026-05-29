@@ -20,7 +20,7 @@ import logging
 from typing import Any, Literal
 
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
-from scripts.entity_resolution.sources import PgSourceProtocol
+from entity.sources import PgSourceProtocol
 
 logger = logging.getLogger(__name__)
 

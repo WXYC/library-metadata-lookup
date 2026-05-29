@@ -6,10 +6,10 @@ from fastapi import Depends
 
 from core.dependencies import get_discogs_service
 from discogs.service import DiscogsService
+from entity.store import EntityStore
 from identity.dependencies import get_entity_store
 from release.orchestrator import _ResolverDependencies
 from scripts.bandcamp_client import BandcampClient
-from scripts.entity_resolution.store import EntityStore
 from scripts.streaming_availability.apple_music_client import AppleMusicClient
 from scripts.streaming_availability.deezer_client import DeezerClient
 from scripts.streaming_availability.spotify_client import SpotifyClient

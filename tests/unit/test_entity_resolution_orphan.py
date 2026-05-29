@@ -13,11 +13,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from entity.store import Identity
 from scripts.entity_resolution.__main__ import (
     OrphanDrainAbortError,
     prune_orphan_identities,
 )
-from scripts.entity_resolution.store import Identity
 
 
 @pytest.fixture

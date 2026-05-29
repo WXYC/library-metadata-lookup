@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from scripts.entity_resolution.sources import PgSource
+from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
 

@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from scripts.entity_resolution.sources import SparqlSource
+from entity.sources import SparqlSource
 from scripts.entity_resolution.wikidata import (
     _SPARQL_DISCOGS_TO_QID,
     _SPARQL_QID_TO_DISCOGS_ARTIST,

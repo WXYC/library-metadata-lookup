@@ -49,7 +49,7 @@ def _make_identity_record(
     reconciliation_status: str = "reconciled",
 ):
     """Build a mock Identity dataclass-like object."""
-    from scripts.entity_resolution.store import Identity
+    from entity.store import Identity
 
     return Identity(
         id=id,

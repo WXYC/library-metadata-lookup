@@ -32,6 +32,7 @@ import re
 from wxyc_etl.text import is_compilation_artist
 
 from discogs.service import DiscogsService
+from entity.store import EntityStore
 from release.bandcamp_resolver import resolve_bandcamp_album
 from release.discogs_resolver import (
     resolve_discogs_master,
@@ -45,7 +46,6 @@ from release.models import (
 )
 from release.url_parser import ParsedUrl, parse_url
 from scripts.bandcamp_client import BandcampClient, extract_slug
-from scripts.entity_resolution.store import EntityStore
 from scripts.streaming_availability.apple_music_client import AppleMusicClient
 from scripts.streaming_availability.deezer_client import DeezerClient
 from scripts.streaming_availability.spotify_client import SpotifyClient

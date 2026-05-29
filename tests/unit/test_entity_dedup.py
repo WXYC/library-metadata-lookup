@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from entity.store import Identity
 from scripts.entity_resolution.dedup import EntityDeduplicator
-from scripts.entity_resolution.store import Identity
 from tests.unit.conftest import make_mock_conn
 
 

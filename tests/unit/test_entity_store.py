@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from scripts.entity_resolution.store import (
+from entity.store import (
     _GET_IDENTITY_LOWER_SQL,
     EntityStore,
     _strip_nul,
