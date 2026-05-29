@@ -739,6 +739,49 @@ def _release_matches_library_row(release: ReleaseInfo, item: LibraryItem) -> boo
     return False
 
 
+# Minimum fuzzy score (0-100) for accepting a library-row title as a genuine
+# album match for the DJ-typed album. Mirrors `_APPLE_MUSIC_MATCH_FLOOR` and
+# the streaming-availability batch matcher. When the artist-fallback branches
+# of `search_library_with_fallback` surface a row whose title doesn't clear
+# this floor against the typed album, the row would otherwise carry the
+# matched Discogs release's `release_year` / `apple_music_url` / `spotify_url`
+# / `discogs_url` / `artwork_url` onto a flowsheet row tagged with a
+# completely different album — the contamination shape documented in #400
+# (~184k rows; 16,532 distinct Discogs URLs each attached to many distinct
+# DJ-typed `(artist, album)` pairs). #390 / #398 tightened the iTunes-result
+# verification; this tightens the LML lookup result itself.
+_ALBUM_MATCH_FLOOR = 80.0
+
+
+def _filter_results_by_album_match(
+    results: list[LibraryItem],
+    album: str | None,
+) -> list[LibraryItem]:
+    """Drop library rows whose title doesn't clear `_ALBUM_MATCH_FLOOR` against
+    the typed album. No-ops when `album` is empty or whitespace-only.
+
+    Pure CPU (`rapidfuzz.fuzz.token_set_ratio` + `to_match_form`); no I/O —
+    safe to call in the lookup hot path without compounding the LML cascade
+    semaphore-queue accumulation (the BS#1064 / BS#1078 failure mode).
+    """
+    if not album or not album.strip():
+        return results
+    from rapidfuzz import fuzz
+
+    norm_album = normalize_for_comparison(album)
+    kept: list[LibraryItem] = []
+    for item in results:
+        title_norm = normalize_for_comparison(item.title or "")
+        if fuzz.token_set_ratio(norm_album, title_norm) >= _ALBUM_MATCH_FLOOR:
+            kept.append(item)
+    if len(kept) < len(results):
+        logger.info(
+            f"Album-match floor dropped {len(results) - len(kept)} of {len(results)} "
+            f"artist-fallback candidates against typed album '{album}' (#400)"
+        )
+    return kept
+
+
 async def search_library_with_fallback(
     db: LibraryDB,
     parsed: ParsedRequest,
@@ -839,6 +882,7 @@ async def search_library_with_fallback(
         query = f"{parsed.artist} {parsed.song}"
         results = await db.search(query=query, limit=_FETCH_LIMIT)
         results = filter_results_by_artist(results, parsed.artist)
+        results = _filter_results_by_album_match(results, parsed.album)
 
         if results:
             song_lower = parsed.song.lower()
@@ -852,6 +896,7 @@ async def search_library_with_fallback(
         logger.info(f"No results for albums {albums}, trying artist only: '{parsed.artist}'")
         results = await db.search(query=parsed.artist, limit=_FETCH_LIMIT)
         results = filter_results_by_artist(results, parsed.artist)
+        results = _filter_results_by_album_match(results, parsed.album)
         if results:
             return results, True
 

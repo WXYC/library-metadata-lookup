@@ -474,7 +474,13 @@ class TestSearchLibraryWithFallback:
 
     @pytest.mark.asyncio
     async def test_falls_back_to_artist_only_when_no_discogs_albums(self, mock_library_db):
-        """Falls back to artist-only when Discogs found no albums (empty list)."""
+        """Falls back to artist-only when Discogs found no albums (empty list).
+
+        With no typed album, the #400 album-match floor does not fire and the
+        cascade returns the artist-only candidate as before. The with-typed-
+        album-but-no-library-match shape is pinned in
+        ``tests/unit/test_album_match_floor.py``.
+        """
         item = make_library_item(
             id=2,
             artist="Queen",
@@ -490,7 +496,6 @@ class TestSearchLibraryWithFallback:
         parsed = ParsedRequest(
             song="Test Song",
             artist="Queen",
-            album="Unknown Album",
             raw_message="Test",
             is_request=True,
             message_type=MessageType.REQUEST,
