@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import logging
 
-from scripts.entity_resolution.sources import PgSource
-from scripts.entity_resolution.store import (
+from entity.sources import PgSource
+from entity.store import (
     _DELETE_IDENTITY_BY_ID_SQL,
     _REASSIGN_LOGS_SQL,
     _UPDATE_MERGED_SQL,

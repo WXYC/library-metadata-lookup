@@ -290,7 +290,7 @@ class TestSourceTransportFailures:
     async def test_pg_source_connection_refused(self):
         """PgSource to a closed port raises a clear connection error."""
         try:
-            from scripts.entity_resolution.sources import PgSource
+            from entity.sources import PgSource
         except ImportError:
             pytest.skip("Entity resolution sources not available on this branch")
 
@@ -306,7 +306,7 @@ class TestSourceTransportFailures:
     async def test_pg_source_bad_credentials(self):
         """PgSource with bad credentials raises an auth error."""
         try:
-            from scripts.entity_resolution.sources import PgSource
+            from entity.sources import PgSource
         except ImportError:
             pytest.skip("Entity resolution sources not available on this branch")
 

@@ -44,9 +44,9 @@ async def test_returns_none_when_probe_raises_undefined_table(monkeypatch):
     async def boom(self, query, *args):
         raise asyncpg.UndefinedTableError('relation "entity.identity" does not exist')
 
-    monkeypatch.setattr("scripts.entity_resolution.sources.PgSource.fetchone", boom)
+    monkeypatch.setattr("entity.sources.PgSource.fetchone", boom)
     monkeypatch.setattr(
-        "scripts.entity_resolution.sources.PgSource.close",
+        "entity.sources.PgSource.close",
         _noop_close,
     )
 
@@ -61,8 +61,8 @@ async def test_returns_none_when_probe_raises_oserror(monkeypatch):
     async def boom(self, query, *args):
         raise OSError("connection refused")
 
-    monkeypatch.setattr("scripts.entity_resolution.sources.PgSource.fetchone", boom)
-    monkeypatch.setattr("scripts.entity_resolution.sources.PgSource.close", _noop_close)
+    monkeypatch.setattr("entity.sources.PgSource.fetchone", boom)
+    monkeypatch.setattr("entity.sources.PgSource.close", _noop_close)
 
     result = await deps.get_entity_store(_settings("postgresql://x:y@127.0.0.1:1/z"))
     assert result is None
@@ -78,8 +78,8 @@ async def test_probe_failure_is_cached(monkeypatch):
         call_count += 1
         raise asyncpg.UndefinedTableError("nope")
 
-    monkeypatch.setattr("scripts.entity_resolution.sources.PgSource.fetchone", boom)
-    monkeypatch.setattr("scripts.entity_resolution.sources.PgSource.close", _noop_close)
+    monkeypatch.setattr("entity.sources.PgSource.fetchone", boom)
+    monkeypatch.setattr("entity.sources.PgSource.close", _noop_close)
 
     settings = _settings("postgresql://x:y@127.0.0.1:1/z")
     assert await deps.get_entity_store(settings) is None
@@ -93,7 +93,7 @@ async def test_returns_store_when_probe_succeeds(monkeypatch):
     async def ok(self, query, *args):
         return None  # SELECT ... LIMIT 0 returns no rows
 
-    monkeypatch.setattr("scripts.entity_resolution.sources.PgSource.fetchone", ok)
+    monkeypatch.setattr("entity.sources.PgSource.fetchone", ok)
 
     result = await deps.get_entity_store(_settings("postgresql://x:y@127.0.0.1:1/z"))
     assert result is not None

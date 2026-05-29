@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from scripts.entity_resolution.sources import PgSource
+from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
 

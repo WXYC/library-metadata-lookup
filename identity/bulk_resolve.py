@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from entity.store import EntityStore, Identity, ProvenanceRow
 from generated.api_models import (
     BulkResolveProvenanceEntry,
     BulkResolveResult,
@@ -36,7 +37,6 @@ from generated.api_models import (
     IdentitySource,
     ReconciledIdentity,
 )
-from scripts.entity_resolution.store import EntityStore, Identity, ProvenanceRow
 
 logger = logging.getLogger(__name__)
 

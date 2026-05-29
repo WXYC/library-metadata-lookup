@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from entity.store import Identity, ProvenanceRow
 from generated.api_models import (
     BulkResolveResultKind,
     IdentityMethod,
@@ -22,7 +23,6 @@ from identity.bulk_resolve import (
     compilation_result,
     compose_for_identity,
 )
-from scripts.entity_resolution.store import Identity, ProvenanceRow
 
 
 def _make_identity(

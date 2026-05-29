@@ -26,6 +26,8 @@ from core.dependencies import (
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
 from discogs.service import DiscogsService
+from entity.sources import PgSource
+from entity.store import EntityStore
 from generated.api_models import CacheStats
 from identity.dependencies import get_entity_store
 from library.db import LibraryDB
@@ -37,8 +39,6 @@ from lookup.models import (
     LookupResponse,
 )
 from lookup.orchestrator import perform_lookup
-from scripts.entity_resolution.sources import PgSource
-from scripts.entity_resolution.store import EntityStore
 
 if TYPE_CHECKING:
     from posthog import Posthog

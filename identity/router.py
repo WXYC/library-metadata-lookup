@@ -19,6 +19,7 @@ from asyncpg.exceptions import PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
+from entity.store import EntityStore, Identity
 from generated.api_models import (
     BulkResolveLibrariesRequest,
     BulkResolveLibrariesResponse,
@@ -30,7 +31,6 @@ from identity.models import (
     BulkIdentityResponse,
     IdentityResponse,
 )
-from scripts.entity_resolution.store import EntityStore, Identity
 
 # Lazy imports inside the handler:
 #   wxyc_etl.text.is_compilation_artist — required at handler scope only.

@@ -21,8 +21,8 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from entity.sources import PgSource
 from lookup.external_search import _MB_ARTIST_FUZZY_SQL
-from scripts.entity_resolution.sources import PgSource
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL_TEST",

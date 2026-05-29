@@ -46,6 +46,8 @@ from discogs.models import (
     TrackReleasesResponse,
 )
 from discogs.service import DiscogsService
+from entity.sources import PgSourceProtocol
+from entity.store import EntityStore, Identity
 from generated.api_models import (
     LibraryCatalogItem,
     ReconciledIdentity,
@@ -61,8 +63,6 @@ from lookup.external_search import (
 )
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.strategies import build_strategies
-from scripts.entity_resolution.sources import PgSourceProtocol
-from scripts.entity_resolution.store import EntityStore, Identity
 from services.parser import MessageType, ParsedRequest
 
 logger = logging.getLogger(__name__)

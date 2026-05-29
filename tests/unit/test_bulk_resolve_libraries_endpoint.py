@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from scripts.entity_resolution.store import Identity
+from entity.store import Identity
 from tests.unit.conftest import override_deps
 
 

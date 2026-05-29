@@ -15,8 +15,8 @@ from config.settings import Settings, get_settings
 from core.exceptions import ServiceInitializationError
 from discogs.cache_service import DiscogsCacheService
 from discogs.service import DiscogsService
+from entity.sources import PgSource
 from library.db import LibraryDB
-from scripts.entity_resolution.sources import PgSource
 
 if TYPE_CHECKING:
     from posthog import Posthog

@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from scripts.entity_resolution.sources import SparqlSource
+from entity.sources import SparqlSource
 
 
 class TestQueryBatchedTemplateSubstitution:

@@ -1038,7 +1038,7 @@ class TestPerformLookupReconciledIdentity:
         self, mock_library_db, mock_discogs_service, telemetry, queen_item
     ):
         """Each result gets ReconciledIdentity from EntityStore.get_identity."""
-        from scripts.entity_resolution.store import Identity
+        from entity.store import Identity
 
         mock_library_db.search.return_value = [queen_item]
         mock_library_db.find_similar_artist.return_value = None
@@ -1113,7 +1113,7 @@ class TestPerformLookupReconciledIdentity:
         self, mock_library_db, mock_discogs_service, telemetry, queen_item, queen_game_item
     ):
         """Two results for the same artist trigger only one EntityStore.get_identity call."""
-        from scripts.entity_resolution.store import Identity
+        from entity.store import Identity
 
         mock_library_db.search.return_value = [queen_item, queen_game_item]
         mock_library_db.find_similar_artist.return_value = None

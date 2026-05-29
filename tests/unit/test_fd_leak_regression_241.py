@@ -132,7 +132,7 @@ class TestPgSourcePoolRace:
         """Concurrent ``_get_pool`` callers must share a single pool. The
         lazy init needs an asyncio.Lock around the check-and-set.
         """
-        from scripts.entity_resolution.sources import PgSource
+        from entity.sources import PgSource
 
         create_calls: list[tuple] = []
         release_event = asyncio.Event()
@@ -145,7 +145,7 @@ class TestPgSourcePoolRace:
             return AsyncMock(name="pool")
 
         with patch(
-            "scripts.entity_resolution.sources.asyncpg.create_pool",
+            "entity.sources.asyncpg.create_pool",
             side_effect=fake_create_pool,
         ):
             src = PgSource("postgres://fake/db")

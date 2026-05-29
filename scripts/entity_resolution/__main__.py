@@ -30,11 +30,11 @@ import aiosqlite
 from dotenv import load_dotenv
 from wxyc_etl.text import is_compilation_artist
 
+from entity.sources import PgSource, SparqlSource
+from entity.store import EntityStore
 from scripts.entity_resolution.dedup import EntityDeduplicator
 from scripts.entity_resolution.discogs import DiscogsReconciler
 from scripts.entity_resolution.musicbrainz import MusicBrainzReconciler
-from scripts.entity_resolution.sources import PgSource, SparqlSource
-from scripts.entity_resolution.store import EntityStore
 from scripts.entity_resolution.wikidata import WikidataReconciler
 
 logger = logging.getLogger(__name__)

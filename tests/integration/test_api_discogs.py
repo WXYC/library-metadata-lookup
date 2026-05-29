@@ -8,7 +8,7 @@ import pytest_asyncio
 
 from discogs.models import DiscogsSearchRequest
 from discogs.service import DiscogsService
-from scripts.entity_resolution.sources import SparqlSource
+from entity.sources import SparqlSource
 from scripts.entity_resolution.wikidata import WikidataReconciler
 
 # Wikidata QIDs for entities used by ``TestEntityResolution``. QIDs are

@@ -40,7 +40,7 @@ from wxyc_etl.text import split_artist_name
 # on the column side (deployed in WXYC/discogs-etl#195).
 from wxyc_etl.text import to_identity_match_form as normalize_artist_name
 
-from scripts.entity_resolution.sources import PgSource
+from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
 

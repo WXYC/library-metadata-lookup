@@ -6,8 +6,8 @@ from asyncpg.exceptions import PostgresError
 from fastapi import Depends
 
 from config.settings import Settings, get_settings
-from scripts.entity_resolution.sources import PgSource
-from scripts.entity_resolution.store import EntityStore
+from entity.sources import PgSource
+from entity.store import EntityStore
 
 logger = logging.getLogger(__name__)
 
