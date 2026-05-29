@@ -370,22 +370,25 @@ class TestIdentityRouterEntityStoreUnavailable:
     @pytest_asyncio.fixture
     async def app_with_pg_dsn(self, monkeypatch):
         """Reset the dep cache and point Settings at the test DSN."""
+        import core.dependencies as core_deps
         import identity.dependencies as deps
         from config.settings import get_settings
 
         monkeypatch.setenv("DATABASE_URL_DISCOGS", DATABASE_URL)
         get_settings.cache_clear()
         deps._entity_store = None
-        deps._entity_pg = None
         deps._entity_probe_failed = False
+        # Post-WXYC#395 the entity store reuses ``core.dependencies.get_discogs_pool``.
+        # Reset the shared pool so each test sees a fresh init cycle.
+        await core_deps.close_discogs_pool()
 
         from main import app
 
         yield app
 
         deps._entity_store = None
-        deps._entity_pg = None
         deps._entity_probe_failed = False
+        await core_deps.close_discogs_pool()
         get_settings.cache_clear()
 
     @pytest.mark.asyncio

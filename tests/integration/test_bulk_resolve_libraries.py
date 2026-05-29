@@ -88,14 +88,19 @@ async def app_client(monkeypatch):
     """ASGI client with the LML app pointed at the test PG."""
     from httpx import ASGITransport, AsyncClient
 
+    import core.dependencies as core_deps
     import identity.dependencies as deps
     from config.settings import get_settings
 
     monkeypatch.setenv("DATABASE_URL_DISCOGS", DATABASE_URL)
     get_settings.cache_clear()
     deps._entity_store = None
-    deps._entity_pg = None
     deps._entity_probe_failed = False
+    # Post-WXYC#395 the entity store reuses ``core.dependencies.get_discogs_pool``.
+    # Clearing the entity-store singleton alone leaves the shared pool cached;
+    # the next ``get_entity_store`` would reuse it (which is fine within one
+    # test) but a parallel suite that toggles the DSN env var would race.
+    await core_deps.close_discogs_pool()
 
     from main import app
 
@@ -103,8 +108,8 @@ async def app_client(monkeypatch):
         yield ac
 
     deps._entity_store = None
-    deps._entity_pg = None
     deps._entity_probe_failed = False
+    await core_deps.close_discogs_pool()
     get_settings.cache_clear()
 
 
