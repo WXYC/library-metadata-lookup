@@ -101,7 +101,15 @@ async def _build_discogs_pool() -> asyncpg.Pool | None:
         return None
 
 
-_get_discogs_pool, _close_discogs_pool = async_singleton(_build_discogs_pool)
+# Public seam (WXYC/library-metadata-lookup#395): both the Discogs cache
+# service AND the entity store reach into this getter for their
+# discogs-cache pool. Concentrating both paths through one
+# ``async_singleton`` instance gives one timeout/sizing policy, one
+# degradation signal on ``/health``, and one connection budget against the
+# backend. Pre-#395 the entity store ran its own racy lazy-init via
+# ``PgSource(dsn=...)`` on the same DSN — a second-pool window that
+# uncoordinated FD exhaustion + #357's racy-init audit both flagged.
+get_discogs_pool, close_discogs_pool = async_singleton(_build_discogs_pool)
 
 
 async def _build_discogs_service() -> DiscogsService | None:
@@ -113,7 +121,7 @@ async def _build_discogs_service() -> DiscogsService | None:
         logger.debug("No Discogs credentials set - Discogs service disabled")
         return None
 
-    pool = await _get_discogs_pool()
+    pool = await get_discogs_pool()
     cache_service = DiscogsCacheService(pool) if pool is not None else None
     if cache_service is not None:
         logger.info("Discogs cache service enabled")
@@ -162,7 +170,7 @@ async def close_discogs_service() -> None:
     # work the service might have in progress sees the pool until aclose
     # returns.
     await _close_discogs_service()
-    await _close_discogs_pool()
+    await close_discogs_pool()
 
 
 async def get_discogs_cache_service(

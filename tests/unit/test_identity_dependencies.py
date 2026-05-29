@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+from unittest.mock import AsyncMock, patch
+
 import asyncpg
 import pytest
 
+import core.dependencies as core_deps
 import identity.dependencies as deps
 from config.settings import Settings
 
@@ -13,12 +17,41 @@ from config.settings import Settings
 def _reset_dep_state():
     """Ensure each test sees a fresh dependency cache."""
     deps._entity_store = None
-    deps._entity_pg = None
     deps._entity_probe_failed = False
     yield
     deps._entity_store = None
-    deps._entity_pg = None
     deps._entity_probe_failed = False
+
+
+@pytest.fixture
+def _reset_discogs_pool():
+    """Tear down the core-dependencies discogs pool around tests that exercise it."""
+
+    async def _run():
+        await core_deps.close_discogs_pool()
+
+    asyncio.run(_run())
+    yield
+    asyncio.run(_run())
+
+
+@pytest.fixture
+def _fake_discogs_pool(monkeypatch, _reset_discogs_pool):
+    """Stub ``asyncpg.create_pool`` so ``get_discogs_pool`` returns a fake.
+
+    Post-WXYC#395 the entity store reaches into ``core.dependencies.get_discogs_pool``
+    instead of constructing its own pool. Tests that exercise the probe
+    therefore need the shared pool factory to succeed; otherwise the entity
+    store short-circuits to ``None`` before the probe ever runs.
+    """
+    fake_pool = AsyncMock(name="shared-discogs-pool")
+    fake_pool.fetchval = AsyncMock(return_value=1)
+
+    async def fake_create_pool(*args, **kwargs):
+        return fake_pool
+
+    monkeypatch.setattr("core.dependencies.asyncpg.create_pool", fake_create_pool)
+    return fake_pool
 
 
 def _settings(dsn: str | None) -> Settings:
@@ -38,38 +71,37 @@ async def test_returns_none_when_dsn_unset():
 
 
 @pytest.mark.asyncio
-async def test_returns_none_when_probe_raises_undefined_table(monkeypatch):
+async def test_returns_none_when_probe_raises_undefined_table(monkeypatch, _fake_discogs_pool):
     """Probe failure (entity schema not applied) → store disabled."""
 
     async def boom(self, query, *args):
         raise asyncpg.UndefinedTableError('relation "entity.identity" does not exist')
 
     monkeypatch.setattr("entity.sources.PgSource.fetchone", boom)
-    monkeypatch.setattr(
-        "entity.sources.PgSource.close",
-        _noop_close,
-    )
+    settings = _settings("postgresql://x:y@127.0.0.1:1/z")
+    monkeypatch.setattr("core.dependencies.get_settings", lambda: settings)
 
-    result = await deps.get_entity_store(_settings("postgresql://x:y@127.0.0.1:1/z"))
+    result = await deps.get_entity_store(settings)
     assert result is None
 
 
 @pytest.mark.asyncio
-async def test_returns_none_when_probe_raises_oserror(monkeypatch):
+async def test_returns_none_when_probe_raises_oserror(monkeypatch, _fake_discogs_pool):
     """Probe failure (PG host unreachable) → store disabled."""
 
     async def boom(self, query, *args):
         raise OSError("connection refused")
 
     monkeypatch.setattr("entity.sources.PgSource.fetchone", boom)
-    monkeypatch.setattr("entity.sources.PgSource.close", _noop_close)
+    settings = _settings("postgresql://x:y@127.0.0.1:1/z")
+    monkeypatch.setattr("core.dependencies.get_settings", lambda: settings)
 
-    result = await deps.get_entity_store(_settings("postgresql://x:y@127.0.0.1:1/z"))
+    result = await deps.get_entity_store(settings)
     assert result is None
 
 
 @pytest.mark.asyncio
-async def test_probe_failure_is_cached(monkeypatch):
+async def test_probe_failure_is_cached(monkeypatch, _fake_discogs_pool):
     """A failed probe is not retried on subsequent calls (process-lifetime cache)."""
     call_count = 0
 
@@ -79,9 +111,9 @@ async def test_probe_failure_is_cached(monkeypatch):
         raise asyncpg.UndefinedTableError("nope")
 
     monkeypatch.setattr("entity.sources.PgSource.fetchone", boom)
-    monkeypatch.setattr("entity.sources.PgSource.close", _noop_close)
-
     settings = _settings("postgresql://x:y@127.0.0.1:1/z")
+    monkeypatch.setattr("core.dependencies.get_settings", lambda: settings)
+
     assert await deps.get_entity_store(settings) is None
     assert await deps.get_entity_store(settings) is None
     assert await deps.get_entity_store(settings) is None
@@ -89,15 +121,146 @@ async def test_probe_failure_is_cached(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_returns_store_when_probe_succeeds(monkeypatch):
+async def test_returns_store_when_probe_succeeds(monkeypatch, _fake_discogs_pool):
     async def ok(self, query, *args):
         return None  # SELECT ... LIMIT 0 returns no rows
 
     monkeypatch.setattr("entity.sources.PgSource.fetchone", ok)
+    settings = _settings("postgresql://x:y@127.0.0.1:1/z")
+    monkeypatch.setattr("core.dependencies.get_settings", lambda: settings)
 
-    result = await deps.get_entity_store(_settings("postgresql://x:y@127.0.0.1:1/z"))
+    result = await deps.get_entity_store(settings)
     assert result is not None
 
 
-async def _noop_close(self):
-    return None
+# ---------------------------------------------------------------------------
+# Consolidation contract (WXYC/library-metadata-lookup#395): the entity store
+# must draw its discogs-cache connection from the same pool-provider seam as
+# the Discogs cache service. Two pools on one DSN contend for the same
+# backend connection budget and surface different degradation signals — see
+# the issue body for the audit detail.
+# ---------------------------------------------------------------------------
+
+
+class TestSinglePoolContract:
+    """The entity store and the Discogs cache service must share one
+    ``asyncpg.Pool`` for ``DATABASE_URL_DISCOGS``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entity_store_and_discogs_cache_share_one_pool(
+        self, monkeypatch, _reset_discogs_pool
+    ):
+        """``get_entity_store`` and ``get_discogs_service`` must resolve to the
+        same underlying asyncpg pool object so there is one connection-budget
+        and one degradation signal for the discogs-cache DB.
+        """
+        settings = Settings(
+            discogs_token="test-token",
+            database_url_discogs="postgresql://x:y@127.0.0.1:1/z",
+            sentry_dsn=None,
+            posthog_api_key=None,
+            enable_telemetry=False,
+            library_db_path="test_library.db",
+        )
+
+        # One pool fake covers both call sites. `fetchval("SELECT 1")` is the
+        # cache-service health probe; the entity-store probe runs via the
+        # `PgSource.fetchone` monkeypatch below — both end up grabbing the
+        # same pool from `get_discogs_pool`.
+        fake_pool = AsyncMock(name="shared-discogs-pool")
+        fake_pool.fetchval = AsyncMock(return_value=1)
+
+        async def fake_create_pool(*args, **kwargs):
+            return fake_pool
+
+        async def probe_ok(self, query, *args):
+            return None  # SELECT ... LIMIT 0
+
+        monkeypatch.setattr("entity.sources.PgSource.fetchone", probe_ok)
+
+        with (
+            patch("core.dependencies.get_settings", return_value=settings),
+            patch("core.dependencies.asyncpg.create_pool", side_effect=fake_create_pool),
+        ):
+            store = await deps.get_entity_store(settings)
+            service = await core_deps.get_discogs_service(settings)
+
+        assert store is not None
+        assert service is not None
+        assert service.cache_service is not None
+        # `store._pg` wraps a PgSource that should reference the same pool the
+        # cache service got. The PgSource keeps the pool on `_pool` so it can
+        # be acquired for queries; cache_service stores it on `pool`.
+        assert store._pg._pool is service.cache_service.pool is fake_pool
+
+    @pytest.mark.asyncio
+    async def test_get_discogs_pool_is_public(self):
+        """`core.dependencies.get_discogs_pool` must be a public, awaitable
+        getter. The entity-store seam imports it by this name (WXYC#395);
+        renaming or unpublishing it would silently break the consolidation.
+        """
+        from core import dependencies
+
+        assert hasattr(dependencies, "get_discogs_pool"), (
+            "core.dependencies.get_discogs_pool must be public — it is the "
+            "single seam the entity-store reaches into for its discogs-cache "
+            "pool (WXYC/library-metadata-lookup#395)."
+        )
+        assert callable(dependencies.get_discogs_pool)
+
+
+class TestEntityStoreLazyInitRace:
+    """Concurrent first-callers to ``get_entity_store`` must produce exactly
+    one probe call. The pre-consolidation code constructed a fresh
+    ``PgSource`` per racing caller, each of which ran the probe — orphaning
+    everything but the last writer. Lock-guarded init closes that window.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_get_entity_store_probes_once(self, monkeypatch, _reset_discogs_pool):
+        settings = Settings(
+            discogs_token="test-token",
+            database_url_discogs="postgresql://x:y@127.0.0.1:1/z",
+            sentry_dsn=None,
+            posthog_api_key=None,
+            enable_telemetry=False,
+            library_db_path="test_library.db",
+        )
+
+        fake_pool = AsyncMock(name="shared-discogs-pool")
+        fake_pool.fetchval = AsyncMock(return_value=1)
+
+        async def fake_create_pool(*args, **kwargs):
+            return fake_pool
+
+        probe_calls = 0
+        release_event = asyncio.Event()
+
+        async def probe_ok(self, query, *args):
+            nonlocal probe_calls
+            probe_calls += 1
+            # Yield long enough for every concurrent caller to reach the
+            # probe await before any of them assigns the cached store.
+            await release_event.wait()
+            return None
+
+        monkeypatch.setattr("entity.sources.PgSource.fetchone", probe_ok)
+
+        with (
+            patch("core.dependencies.get_settings", return_value=settings),
+            patch("core.dependencies.asyncpg.create_pool", side_effect=fake_create_pool),
+        ):
+            tasks = [asyncio.create_task(deps.get_entity_store(settings)) for _ in range(8)]
+            for _ in range(4):
+                await asyncio.sleep(0)
+            release_event.set()
+            results = await asyncio.gather(*tasks)
+
+        assert probe_calls == 1, (
+            f"PgSource.fetchone probe ran {probe_calls} times for 8 "
+            "concurrent first-callers — the lazy init must be lock-guarded "
+            "so only one caller drives the probe (WXYC/library-metadata-lookup#395 / #357)."
+        )
+        # All callers must see the same EntityStore instance.
+        assert len({id(r) for r in results}) == 1

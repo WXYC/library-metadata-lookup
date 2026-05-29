@@ -53,22 +53,49 @@ class SparqlSourceProtocol(Protocol):
 class PgSource:
     """PostgreSQL source transport wrapping asyncpg.
 
-    Args:
-        dsn: PostgreSQL connection string.
+    Two construction shapes:
+
+    * ``PgSource(dsn=...)`` — owns its pool. Used by per-DSN paths whose
+      pool lifecycle does not coincide with another (e.g. the musicbrainz
+      cache: ``core/dependencies.get_musicbrainz_pg``).
+    * ``PgSource(pool=...)`` — borrows an externally-managed pool. Used by
+      paths that share a process-wide pool via a single provider seam
+      (e.g. the discogs-cache entity store, which reuses the pool built
+      by ``core/dependencies.get_discogs_pool`` — see
+      WXYC/library-metadata-lookup#395). The external owner closes the
+      pool; this source's ``close()`` is a no-op so concurrent teardown
+      from this side never closes the pool out from under a still-live
+      Discogs cache service.
+
+    Exactly one of ``dsn`` / ``pool`` must be supplied.
     """
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(
+        self,
+        dsn: str | None = None,
+        *,
+        pool: asyncpg.Pool | None = None,
+    ) -> None:
+        if (dsn is None) == (pool is None):
+            raise ValueError("PgSource requires exactly one of `dsn` or `pool`")
         self._dsn = dsn
-        self._pool: asyncpg.Pool | None = None
+        self._pool: asyncpg.Pool | None = pool
+        self._owns_pool: bool = pool is None
         # Serializes concurrent first-callers to ``_get_pool``. Without it,
         # both callers pass the ``self._pool is None`` check and each await
         # ``asyncpg.create_pool``, orphaning all but one pool with up to 5
-        # open connections (FDs). See issue #241.
+        # open connections (FDs). See issue #241. Only meaningful for the
+        # owned-pool path; the borrowed-pool path never enters the
+        # create-pool branch.
         self._pool_lock: asyncio.Lock = asyncio.Lock()
 
     async def _get_pool(self) -> asyncpg.Pool:
         if self._pool is not None:
             return self._pool
+        # Borrowed-pool sources set ``self._pool`` at construction and never
+        # reach this path. Owned-pool sources fall through to a lock-guarded
+        # ``asyncpg.create_pool`` per the issue #241 fix.
+        assert self._dsn is not None  # narrowed by __init__ XOR check
         async with self._pool_lock:
             if self._pool is None:
                 self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
@@ -110,8 +137,13 @@ class PgSource:
             yield conn
 
     async def close(self) -> None:
-        """Close the connection pool."""
-        if self._pool is not None:
+        """Close the connection pool.
+
+        No-op for borrowed-pool sources — the external owner controls the
+        pool's lifecycle and closing it here would tear it out from under
+        every other consumer (WXYC/library-metadata-lookup#395).
+        """
+        if self._pool is not None and self._owns_pool:
             await self._pool.close()
             self._pool = None
 
