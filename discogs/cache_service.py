@@ -483,7 +483,8 @@ class DiscogsCacheService:
         """
         try:
             release_row = await self.pool.fetchrow(
-                "SELECT id, title, release_year, artwork_url, released FROM release WHERE id = $1",
+                "SELECT id, title, release_year, artwork_url, released, artwork_checked_at "
+                "FROM release WHERE id = $1",
                 release_id,
             )
 
@@ -631,6 +632,7 @@ class DiscogsCacheService:
                 genres=[row["genre"] for row in genre_rows],
                 styles=[row["style"] for row in style_rows],
                 artwork_url=release_row["artwork_url"],
+                artwork_checked_at=release_row["artwork_checked_at"],
                 tracklist=tracklist,
                 release_url=f"https://www.discogs.com/release/{release_id}",
                 cached=True,
@@ -662,16 +664,28 @@ class DiscogsCacheService:
                 # empty release_artist / release_track / etc., while
                 # cache_metadata.cached_at advances to "fresh". See WXYC#375.
 
-                # Upsert release row (including released date)
+                # Upsert release row. `artwork_checked_at` is stamped to
+                # `now()` on every write — `write_release` is only called
+                # from the live-Discogs-API path (via the fallthrough seam),
+                # so by definition we just asked Discogs about this row's
+                # artwork. The downstream `is_pg_hit` predicate in
+                # `discogs/service.py:get_release` reads this column to
+                # avoid re-fetching genuinely-imageless releases
+                # (WXYC/library-metadata-lookup#423, backed by the schema
+                # column from WXYC/discogs-etl#239).
                 await conn.execute(
                     """
-                    INSERT INTO release (id, title, release_year, artwork_url, released)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO release (
+                        id, title, release_year, artwork_url, released,
+                        artwork_checked_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, now())
                     ON CONFLICT (id) DO UPDATE SET
                         title = EXCLUDED.title,
                         release_year = EXCLUDED.release_year,
                         artwork_url = EXCLUDED.artwork_url,
-                        released = EXCLUDED.released
+                        released = EXCLUDED.released,
+                        artwork_checked_at = EXCLUDED.artwork_checked_at
                     """,
                     release.release_id,
                     release.title,

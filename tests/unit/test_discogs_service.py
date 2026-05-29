@@ -1,5 +1,6 @@
 """Unit tests for discogs/service.py."""
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -875,10 +876,15 @@ class TestGetRelease:
         assert result.cached is True
 
     @pytest.mark.asyncio
-    async def test_cache_hit_with_null_artwork_falls_through_to_api(self, service_with_cache):
-        """A cache row with artwork_url=None is a partial miss: hit the API to fill it in,
-        then write back. Without this, bulk-loaded rows whose XML lacked images stay
-        permanently artworkless and downstream consumers (BS V2, iOS) render placeholders.
+    async def test_cache_hit_with_null_artwork_and_null_checked_at_falls_through_to_api(
+        self, service_with_cache
+    ):
+        """A cache row with `artwork_url IS NULL AND artwork_checked_at IS NULL`
+        is the "never asked" state: the bulk loader populated the row but LML
+        has not yet asked Discogs about the artwork. Predicate must fall through
+        to the API to back-fill. Without this, bulk-loaded rows whose XML lacked
+        images stay permanently artworkless and downstream consumers (BS V2, iOS)
+        render placeholders.
         """
         stale = ReleaseMetadataResponse(
             release_id=33696615,
@@ -886,6 +892,7 @@ class TestGetRelease:
             artist="Lucy Liyou",
             release_url="https://discogs.com/release/33696615",
             artwork_url=None,
+            artwork_checked_at=None,
             cached=True,
         )
         service_with_cache.cache_service.get_release = AsyncMock(return_value=stale)
@@ -923,11 +930,12 @@ class TestGetRelease:
     async def test_cache_null_artwork_with_imageless_api_still_writes_back(
         self, service_with_cache
     ):
-        """Cache row has artwork_url=None AND the live API genuinely returns no
-        images. Fall-through still completes: API result returned with
-        artwork_url=None, write-back records the row. Until discogs-etl#239
-        ships (artwork_checked_at), every lookup re-runs this path; a future
-        regression swallowing the write-back here would only surface in prod.
+        """Cache row is "never asked" (artwork_url=None, artwork_checked_at=None)
+        and the live API genuinely returns no images. Fall-through still
+        completes: API result returned with artwork_url=None, write-back records
+        the row. The next lookup must see artwork_checked_at set (from this
+        write-back via cache_service.write_release) and treat it as a hit —
+        covered by `test_cache_hit_with_checked_at_does_not_call_api`.
         """
         stale = ReleaseMetadataResponse(
             release_id=33696616,
@@ -935,6 +943,7 @@ class TestGetRelease:
             artist="Stereolab",
             release_url="https://discogs.com/release/33696616",
             artwork_url=None,
+            artwork_checked_at=None,
             cached=True,
         )
         service_with_cache.cache_service.get_release = AsyncMock(return_value=stale)
@@ -967,6 +976,39 @@ class TestGetRelease:
         service_with_cache.cache_service.write_release.assert_called_once()
         written = service_with_cache.cache_service.write_release.call_args.args[0]
         assert written.artwork_url is None
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_with_checked_at_set_and_null_artwork_does_not_call_api(
+        self, service_with_cache
+    ):
+        """Cache row has ``artwork_url=None`` but ``artwork_checked_at`` set —
+        the "asked Discogs, genuinely no image" state. Predicate must treat
+        this as a full hit and skip the API call. Without honoring
+        ``artwork_checked_at``, LML re-fetches every imageless release on
+        every lookup, burning Discogs rate limit (WXYC#423).
+        """
+        cached = ReleaseMetadataResponse(
+            release_id=33696616,
+            title="White Label Promo",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/33696616",
+            artwork_url=None,
+            artwork_checked_at=datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC),
+            cached=True,
+        )
+        service_with_cache.cache_service.get_release = AsyncMock(return_value=cached)
+        service_with_cache.cache_service.write_release = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+        ) as mock_request:
+            result = await service_with_cache.get_release(33696616)
+
+        mock_request.assert_not_called()
+        service_with_cache.cache_service.write_release.assert_not_called()
+        assert result is cached
 
     @pytest.mark.asyncio
     async def test_404_returns_none(self, service):
