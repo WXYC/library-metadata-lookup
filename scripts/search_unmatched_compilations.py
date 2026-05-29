@@ -19,7 +19,7 @@ from argparse import ArgumentParser
 import aiosqlite
 from dotenv import load_dotenv
 
-from scripts.streaming_availability.matching import (
+from clients.streaming.matching import (
     find_best_match,
     normalize_album_title,
     score_match,
@@ -196,7 +196,7 @@ async def run(args) -> None:
     # Phase 2: Streaming API search for Discogs misses
     logger.info("Phase 2: Searching streaming APIs for %d Discogs misses...", len(discogs_misses))
 
-    from scripts.streaming_availability.deezer_client import DeezerClient
+    from clients.streaming.deezer import DeezerClient
 
     deezer = DeezerClient()
     spotify = None
@@ -204,7 +204,7 @@ async def run(args) -> None:
     client_id = os.environ.get("SPOTIFY_CLIENT_ID")
     client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
     if client_id and client_secret:
-        from scripts.streaming_availability.spotify_client import SpotifyClient
+        from clients.streaming.spotify import SpotifyClient
 
         spotify = SpotifyClient(client_id, client_secret)
 

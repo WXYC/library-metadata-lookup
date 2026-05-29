@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from scripts.bandcamp_client import BandcampClient
-from scripts.streaming_availability.apple_music_client import AppleMusicClient
-from scripts.streaming_availability.deezer_client import DeezerClient
-from scripts.streaming_availability.matching import find_best_match, score_match
-from scripts.streaming_availability.spotify_client import SpotifyClient
+from clients.bandcamp import BandcampClient
+from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.deezer import DeezerClient
+from clients.streaming.matching import find_best_match, score_match
+from clients.streaming.spotify import SpotifyClient
 from streaming.models import SourceMatch, StreamingCheckResponse, StreamingCheckSources
 
 logger = logging.getLogger(__name__)

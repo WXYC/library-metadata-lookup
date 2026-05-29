@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from scripts.streaming_availability.http_client import BaseStreamingClient
+from clients.streaming.base import BaseStreamingClient
 
 logger = logging.getLogger(__name__)
 

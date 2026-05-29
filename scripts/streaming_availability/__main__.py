@@ -23,22 +23,22 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from scripts.streaming_availability.apple_music_client import AppleMusicClient
+from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.deezer import DeezerClient
+from clients.streaming.matching import (
+    find_best_match,
+    strip_discogs_suffix,
+    strip_format_suffix,
+)
+from clients.streaming.spotify import SpotifyClient
 from scripts.streaming_availability.dedup import deduplicate_library
-from scripts.streaming_availability.deezer_client import DeezerClient
 from scripts.streaming_availability.discogs_enricher import (
     check_wxyc_schema,
     enrich_album,
     load_entity_store_mapping,
 )
-from scripts.streaming_availability.matching import (
-    find_best_match,
-    strip_discogs_suffix,
-    strip_format_suffix,
-)
 from scripts.streaming_availability.report import generate_csv_report, generate_summary
 from scripts.streaming_availability.results_db import ResultsDB
-from scripts.streaming_availability.spotify_client import SpotifyClient
 
 logger = logging.getLogger("streaming_availability")
 

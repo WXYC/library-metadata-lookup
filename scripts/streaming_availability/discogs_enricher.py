@@ -6,7 +6,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from scripts.streaming_availability.matching import (
+from clients.streaming.matching import (
     is_acceptable_match,
     score_match,
     strip_discogs_suffix,

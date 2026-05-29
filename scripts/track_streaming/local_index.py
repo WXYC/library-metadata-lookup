@@ -12,7 +12,7 @@ from typing import NamedTuple
 
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
-from scripts.streaming_availability.matching import score_match
+from clients.streaming.matching import score_match
 
 
 class TrackEntry(NamedTuple):

@@ -20,11 +20,11 @@ from datetime import UTC
 import aiosqlite
 from dotenv import load_dotenv
 
-from scripts.streaming_availability.matching import (
+from clients.streaming.matching import (
     find_best_match,
     strip_format_suffix,
 )
-from scripts.streaming_availability.spotify_client import SpotifyClient
+from clients.streaming.spotify import SpotifyClient
 
 logger = logging.getLogger(__name__)
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 
-from scripts.streaming_availability.matching import strip_format_suffix
+from clients.streaming.matching import strip_format_suffix
 
 # Bracket tags: [single], [ep], [split 7-inch], [missing], [45 rpm EP], etc.
 _BRACKET_RE = re.compile(r"\s*\[[^\]]*\]\s*$")

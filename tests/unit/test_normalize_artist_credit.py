@@ -2,7 +2,7 @@
 
 import pytest
 
-from scripts.streaming_availability.matching import normalize_artist_credit
+from clients.streaming.matching import normalize_artist_credit
 
 
 class TestNormalizeArtistCredit:

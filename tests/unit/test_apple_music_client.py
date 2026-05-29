@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from scripts.streaming_availability.apple_music_client import AppleMusicClient
+from clients.streaming.apple_music import AppleMusicClient
 
 
 def _search_response(results: list[dict] | None = None) -> httpx.Response:

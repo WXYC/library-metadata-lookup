@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from scripts.bandcamp_client import BandcampClient, extract_slug
+from clients.bandcamp import BandcampClient, extract_slug
 
 
 def _autocomplete_response(results: list[dict]) -> httpx.Response:
@@ -65,7 +65,7 @@ class TestExtractSlug:
 
 class TestBandcampClientInit:
     def test_inherits_base_streaming_client(self):
-        from scripts.streaming_availability.http_client import BaseStreamingClient
+        from clients.streaming.base import BaseStreamingClient
 
         client = BandcampClient()
         assert isinstance(client, BaseStreamingClient)
@@ -175,7 +175,7 @@ class TestSearchArtist:
         mock_http.request = AsyncMock(side_effect=[rate_limited, success])
         client._http = mock_http
 
-        with unittest.mock.patch("scripts.bandcamp_client.RETRY_BASE_DELAY", 0.01):
+        with unittest.mock.patch("clients.bandcamp.RETRY_BASE_DELAY", 0.01):
             results = await client.search_artist("Autechre")
 
         assert len(results) == 1

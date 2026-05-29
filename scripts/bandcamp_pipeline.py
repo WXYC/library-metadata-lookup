@@ -27,8 +27,8 @@ from collections import defaultdict
 
 from rapidfuzz import fuzz
 
-from scripts.bandcamp_client import BandcampClient, extract_slug
-from scripts.streaming_availability.matching import score_match
+from clients.bandcamp import BandcampClient, extract_slug
+from clients.streaming.matching import score_match
 from scripts.streaming_availability.results_db import ResultsDB
 
 logging.basicConfig(

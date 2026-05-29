@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from fastapi import Depends
 
+from clients.bandcamp import BandcampClient
+from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.deezer import DeezerClient
+from clients.streaming.spotify import SpotifyClient
 from core.dependencies import get_discogs_service
 from discogs.service import DiscogsService
 from entity.store import EntityStore
 from identity.dependencies import get_entity_store
 from release.orchestrator import _ResolverDependencies
-from scripts.bandcamp_client import BandcampClient
-from scripts.streaming_availability.apple_music_client import AppleMusicClient
-from scripts.streaming_availability.deezer_client import DeezerClient
-from scripts.streaming_availability.spotify_client import SpotifyClient
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,

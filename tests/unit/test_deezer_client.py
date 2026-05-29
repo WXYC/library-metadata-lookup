@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from scripts.streaming_availability.deezer_client import DeezerClient
+from clients.streaming.deezer import DeezerClient
 
 
 def _search_response(data: list[dict] | None = None) -> httpx.Response:
