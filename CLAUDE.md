@@ -23,16 +23,17 @@ Library Metadata Lookup is a FastAPI service for WXYC radio that searches the li
 
 ### Search Strategy Pipeline
 
-Strategies are defined declaratively in `core/search.py` and executed in order:
+The strategy seam (`Outcome` value type, `Strategy` Protocol, `_apply` write site, `execute_search_pipeline` runner) lives in `core/search.py`. Each concrete strategy is a `@dataclass(frozen=True)` class in `lookup/strategies/`, one module per strategy; the orchestrator-side execute funcs that do the actual library/Discogs work still live in `lookup/orchestrator.py` and are injected into each strategy at construction time.
 
-| Strategy | Trigger | Implementation |
-|---|---|---|
-| `ARTIST_PLUS_ALBUM` | Has artist, album, or song | `search_library_with_fallback()` |
-| `SWAPPED_INTERPRETATION` | No results + "X - Y" / "X, Y" / "X. Y" format | `search_with_alternative_interpretation()` |
-| `TRACK_ON_COMPILATION` | Song not found + artist + song | `search_compilations_for_track()` |
-| `SONG_AS_ARTIST` | No results + song but no artist | `search_song_as_artist()` |
+| Strategy | Trigger | Class | Execute func |
+|---|---|---|---|
+| `ARTIST_PLUS_ALBUM` | Has artist, album, or song | `lookup/strategies/artist_plus_album.py` | `search_library_with_fallback()` |
+| `SWAPPED_INTERPRETATION` | No results + "X - Y" / "X, Y" / "X. Y" format | `lookup/strategies/swapped_interpretation.py` | `search_with_alternative_interpretation()` |
+| `TRACK_ON_COMPILATION` | Song not found + artist + song | `lookup/strategies/track_on_compilation.py` | `search_compilations_for_track()` |
+| `SONG_AS_ARTIST` | No results + song but no artist | `lookup/strategies/song_as_artist.py` | `search_song_as_artist()` |
+| `SONG_AS_TRACK` | SONG_AS_ARTIST ran and returned empty (catalog-track-search §4.2) | `lookup/strategies/song_as_track.py` | `search_song_as_track()` |
 
-All strategy implementations live in `lookup/orchestrator.py`.
+Strategies never mutate `SearchState`; they return an `Outcome` and the runner applies it via `_apply`. This makes cancellation safety structural — a cancelled `attempt()` is a no-op against state by construction. Production wiring lives in `lookup.strategies.build_strategies`, called from `perform_lookup`.
 
 ### Key Files
 
