@@ -75,7 +75,7 @@ class TestOutcomeConstructors:
         title didn't get a direct hit. Downstream TRACK_ON_COMPILATION keys
         on ``state.song_not_found`` to decide whether to run.
         """
-        item = _item(id=1, artist="Queen", title="Hot Space")
+        item = _item(id=1, artist="Cat Power", title="Moon Pix")
         o = Outcome.artist_fallback([item])
         assert o.items == [item]
         assert o.song_not_found_after is True

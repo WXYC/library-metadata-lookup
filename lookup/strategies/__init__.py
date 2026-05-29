@@ -23,44 +23,18 @@ Production construction lives in :func:`lookup.orchestrator.perform_lookup`;
 the :func:`build_strategies` factory below is the seam tests use.
 """
 
-from collections.abc import Awaitable, Callable
-from typing import Any
-
 from core.search import Strategy
-from generated.api_models import TrackMatchHint
 from library.db import LibraryDB
-from library.models import LibraryItem
-from services.parser import ParsedRequest
 
-from .artist_plus_album import ArtistPlusAlbum
-from .song_as_artist import SongAsArtist
-from .song_as_track import SongAsTrack
-from .swapped_interpretation import SwappedInterpretation
-from .track_on_compilation import TrackOnCompilation
-
-# Execute-func type aliases — kept as public re-exports so the factory's
-# parameters are documented and ``orchestrator.py`` can annotate its
-# call site. Each shape mirrors the existing orchestrator-side return type.
-ArtistPlusAlbumExecute = Callable[
-    [LibraryDB, ParsedRequest, list[str]],
-    Awaitable[tuple[list[LibraryItem], bool]],
-]
-SwappedInterpretationExecute = Callable[
-    [LibraryDB, str, str],
-    Awaitable[tuple[list[LibraryItem], Any]],
-]
-TrackOnCompilationExecute = Callable[
-    [LibraryDB, ParsedRequest],
-    Awaitable[tuple[list[LibraryItem], dict[int, str]]],
-]
-SongAsArtistExecute = Callable[
-    [LibraryDB, str | None],
-    Awaitable[tuple[list[LibraryItem], Any]],
-]
-SongAsTrackExecute = Callable[
-    [LibraryDB, str | None],
-    Awaitable[tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]],
-]
+# Execute-func type aliases live next to the strategy class that consumes
+# them (one file per strategy). Re-exported here so the factory's parameters
+# are documented and ``orchestrator.py`` can annotate its call site without
+# importing each strategy module individually.
+from .artist_plus_album import ArtistPlusAlbum, ArtistPlusAlbumExecute
+from .song_as_artist import SongAsArtist, SongAsArtistExecute
+from .song_as_track import SongAsTrack, SongAsTrackExecute
+from .swapped_interpretation import SwappedInterpretation, SwappedInterpretationExecute
+from .track_on_compilation import TrackOnCompilation, TrackOnCompilationExecute
 
 
 def build_strategies(
