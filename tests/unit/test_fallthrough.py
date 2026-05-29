@@ -34,6 +34,13 @@ from discogs.fallthrough import (
 from discogs.memory_cache import set_skip_cache
 
 
+def _unused() -> str:
+    """Placeholder factory for ``on_negative_hit`` when the test path doesn't
+    exercise the negative-hit branch — keeps the seam's type contract happy
+    without sprinkling ``lambda: "unused"  # noqa: E731`` at every call site."""
+    return "unused"
+
+
 @pytest.fixture(autouse=True)
 def _reset_cool_down():
     """Cool-down is process-wide; reset between tests to keep them independent."""
@@ -213,7 +220,7 @@ class TestNegativeCache:
         pg_negative_check = AsyncMock(return_value=False)
         api_fetch = AsyncMock(return_value=[])
         pg_negative_record = AsyncMock()
-        on_negative_hit = lambda: "unused"  # noqa: E731
+        on_negative_hit = _unused
 
         await fallthrough(
             label="search_releases_by_track",
@@ -233,7 +240,7 @@ class TestNegativeCache:
         pg_negative_check = AsyncMock(return_value=False)
         api_fetch = AsyncMock(return_value=["item"])
         pg_negative_record = AsyncMock()
-        on_negative_hit = lambda: "unused"  # noqa: E731
+        on_negative_hit = _unused
 
         await fallthrough(
             label="search_releases_by_track",
@@ -288,7 +295,7 @@ class TestNegativeCache:
             pg_read=pg_read,
             api_fetch=api_fetch,
             pg_negative_check=pg_negative_check,
-            on_negative_hit=lambda: "unused",
+            on_negative_hit=_unused,
             pg_negative_record=pg_negative_record,
             is_empty=lambda v: not v,
         )
@@ -420,8 +427,6 @@ class TestCoolDown:
     @pytest.mark.asyncio
     async def test_cool_down_expires_after_window(self, monkeypatch):
         """After ``_COOL_DOWN_SECONDS`` elapses, PG reads resume."""
-        import time as time_module
-
         from discogs import fallthrough as fallthrough_module
 
         clock = [1000.0]
@@ -450,8 +455,6 @@ class TestCoolDown:
         )
         assert result == "from-pg"
         pg_read.assert_awaited_once()
-        # Quiet the unused import warning while keeping monkeypatch typing happy.
-        _ = time_module
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +476,7 @@ class TestSkipCacheBypass:
                 pg_read=pg_read,
                 api_fetch=api_fetch,
                 pg_negative_check=pg_negative_check,
-                on_negative_hit=lambda: "unused",
+                on_negative_hit=_unused,
                 pg_negative_record=AsyncMock(),
                 is_empty=lambda v: not v,
             )
