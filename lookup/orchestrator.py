@@ -759,10 +759,6 @@ def _filter_results_by_album_match(
 ) -> list[LibraryItem]:
     """Drop library rows whose title doesn't clear `_ALBUM_MATCH_FLOOR` against
     the typed album. No-ops when `album` is empty or whitespace-only.
-
-    Pure CPU (`rapidfuzz.fuzz.token_set_ratio` + `to_match_form`); no I/O —
-    safe to call in the lookup hot path without compounding the LML cascade
-    semaphore-queue accumulation (the BS#1064 / BS#1078 failure mode).
     """
     if not album or not album.strip():
         return results
@@ -777,7 +773,7 @@ def _filter_results_by_album_match(
     if len(kept) < len(results):
         logger.info(
             f"Album-match floor dropped {len(results) - len(kept)} of {len(results)} "
-            f"artist-fallback candidates against typed album '{album}' (#400)"
+            f"artist-fallback candidates against typed album '{album}'"
         )
     return kept
 

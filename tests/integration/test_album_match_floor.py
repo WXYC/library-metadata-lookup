@@ -33,20 +33,14 @@ class TestAlbumMatchFloorIntegration:
     @pytest.mark.asyncio
     async def test_nina_simone_wild_is_the_wind_does_not_surface_pastel_blues(self, library_db):
         """The exact prod-evidence failure mode: artist matches the library but
-        the typed album doesn't, and the artist-fallback cascade would
-        otherwise contaminate the flowsheet row with a wrong-album Discogs
-        release.
+        the typed album doesn't, and the artist-fallback cascade would otherwise
+        contaminate the flowsheet row with a wrong-album Discogs release.
 
         Library seed has Nina Simone / Pastel Blues only. Request types album
-        "Wild Is the Wind" + song "Sinnerman". Without the floor:
-        artist-fallback surfaces Pastel Blues, enrichment attaches its
-        release metadata, BS persists `release_year` / `apple_music_url` /
-        `spotify_url` / `discogs_url` onto a row tagged "Wild Is the Wind".
-
-        With the floor: token_set_ratio("Wild Is the Wind", "Pastel Blues")
-        is well below 80 (no shared significant tokens), the candidate is
-        dropped, and no album-derived enrichment leaks. The response mirrors
-        the unknown-artist shape.
+        "Wild Is the Wind" + song "Sinnerman" —
+        token_set_ratio("Wild Is the Wind", "Pastel Blues") sits well below 80
+        (no shared significant tokens), so the candidate is dropped and the
+        response mirrors the unknown-artist shape.
         """
         from wxyc_fastapi.observability import init_cache_stats
 

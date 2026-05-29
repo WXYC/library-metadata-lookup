@@ -42,8 +42,7 @@ class TestArtistFallbackAlbumMatchFloor:
     80-floor token_set_ratio against the requested album, otherwise drop.
     """
 
-    @pytest.mark.asyncio
-    async def test_floor_constant_is_80(self):
+    def test_floor_constant_is_80(self):
         """Pinned at the same value as #390/#398's ``_APPLE_MUSIC_MATCH_FLOOR``."""
         assert _ALBUM_MATCH_FLOOR == 80.0
 
@@ -57,10 +56,6 @@ class TestArtistFallbackAlbumMatchFloor:
         typed album, and downstream enrichment inherits the matched release's
         Discogs URL / release year / Spotify URL / Apple URL onto a row tagged
         ``album_title="Kind of Blue"``.
-
-        With the floor in place: artist-fallback candidates whose titles don't
-        clear ``token_set_ratio >= 80`` against ``parsed.album`` are dropped.
-        Nothing survives → empty result, mirroring the unknown-artist shape.
         """
         # Library has Miles Davis but only "Bitches Brew" and "On the Corner".
         # Neither title overlaps with "Kind of Blue" at token_set_ratio >= 80.
@@ -323,11 +318,6 @@ class TestArtistFallbackAlbumMatchFloor:
         pastel = make_library_item(
             id=70, artist="Nina Simone", title="Pastel Blues", call_letters="SI"
         )
-        # artist+song hit returns Pastel Blues (which the floor will drop
-        # because "Pastel Blues" doesn't clear 80 against "Wild Is the Wind").
-        # The cascade then falls through to artist-only — same Pastel Blues
-        # surfaces there and gets dropped again. Both branches enforce the
-        # floor, so nothing leaks downstream.
         mock_library_db.search.side_effect = [
             [pastel],  # artist+song hit
             [pastel],  # artist-only hit
