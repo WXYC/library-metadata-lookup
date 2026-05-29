@@ -327,10 +327,11 @@ class TestEndToEndCoolDownOnExhaustedPool:
                 )
 
                 # (4) Sentry transaction carries the cache-fallback payload.
-                payload = transaction._data.get("cache_fallback_fired")
+                transaction_data = transaction.to_json()["data"]
+                payload = transaction_data.get("cache_fallback_fired")
                 assert payload is not None, (
                     "Expected `cache_fallback_fired` to be projected onto the "
-                    f"transaction. Got data keys: {list(transaction._data.keys())}"
+                    f"transaction. Got data keys: {list(transaction_data.keys())}"
                 )
                 assert payload["reason"] == "get_release"
                 assert payload["error_class"] == "CacheUnavailableError"
