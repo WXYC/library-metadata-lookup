@@ -87,6 +87,12 @@ SEED_ITEMS = [
     (39, "Confield", "Autechre", "EL", 16, 1, "Electronic", "CD"),
     (40, "1st Class", "Large Professor", "HH", 1, 1, "Hiphop", "CD"),
     (41, "...Destroys The Space Invaders", "Prince Jammy", "RE", 1, 1, "Reggae", "Vinyl"),
+    # Nina Simone: top-2 prod offender in the #400 evidence table
+    # (/release/1402136 → 150 distinct DJ-typed albums across 419 rows). The
+    # library carries Pastel Blues but NOT every Nina Simone album a DJ might
+    # type — the artist-fallback contamination floor (#400) must drop
+    # candidates whose titles don't clear 80 against the typed album.
+    (42, "Pastel Blues", "Nina Simone", "SI", 1, 1, "Jazz", "Vinyl"),
     # Junior Kimbrough: title-album and same-artist comp that both contain the
     # song "Meet Me in the City". Exercises song-title-vs-primary-album
     # ranking when several library candidates by the same artist all pass
