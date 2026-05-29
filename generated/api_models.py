@@ -1063,6 +1063,10 @@ class DiscogsReleaseMetadata(BaseModel):
     styles: list[str] | None = []
     tracklist: list[DiscogsTrackItem] | None = Field([], validate_default=True)
     artwork_url: str | None = None
+    artwork_checked_at: AwareDatetime | None = Field(
+        None,
+        description="Timestamp of the most recent live Discogs API call that resolved\nthis release's artwork. `null` means LML's bulk loader populated\nthe row but the live API has not been queried yet (the \"never\nasked\" state); a value means LML hit the live API and either\npopulated `artwork_url` or confirmed Discogs has no cover. LML\nuses this to distinguish bulk-loader gaps (which it back-fills)\nfrom genuinely-imageless releases (which it does not refetch).\nSee WXYC/discogs-etl#239 + WXYC/library-metadata-lookup#423.\n",
+    )
     release_url: str
     cached: bool | None = False
     artists: list[DiscogsArtistCredit] | None = Field([], validate_default=True)

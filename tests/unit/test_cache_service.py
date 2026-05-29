@@ -210,6 +210,7 @@ class TestGetRelease:
                 "release_year": 1980,
                 "artwork_url": "https://img.com/a.jpg",
                 "released": None,
+                "artwork_checked_at": None,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -245,6 +246,7 @@ class TestGetRelease:
                 "release_year": 2000,
                 "artwork_url": None,
                 "released": None,
+                "artwork_checked_at": None,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -275,6 +277,7 @@ class TestGetRelease:
                 "release_year": 1996,
                 "artwork_url": None,
                 "released": None,
+                "artwork_checked_at": None,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -325,6 +328,7 @@ class TestGetRelease:
                 "release_year": 1998,
                 "artwork_url": None,
                 "released": None,
+                "artwork_checked_at": None,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -355,6 +359,7 @@ class TestGetRelease:
                 "release_year": 1996,
                 "artwork_url": None,
                 "released": None,
+                "artwork_checked_at": None,
             }
         )
 
@@ -398,6 +403,50 @@ class TestWriteRelease:
         conn = mock_asyncpg_pool._mock_conn
         assert conn.execute.call_count >= 3  # insert release, artist, delete tracks, cache_metadata
         assert conn.executemany.call_count >= 1  # insert tracks
+
+    @pytest.mark.asyncio
+    async def test_release_upsert_stamps_artwork_checked_at_now(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """The release-row UPSERT must stamp ``artwork_checked_at = now()`` in
+        the SQL itself. ``write_release`` is only invoked from the live
+        Discogs-API path (via the fallthrough seam), so every call by
+        definition means "we just asked Discogs about this row". The
+        downstream ``is_pg_hit`` predicate reads this column to skip
+        re-fetching genuinely-imageless releases; if the stamp regresses,
+        LML burns Discogs rate limit on every lookup of an imageless tail
+        row. Regression pin for WXYC/library-metadata-lookup#423 / backed by
+        WXYC/discogs-etl#239.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=33696616,
+            title="White Label Promo",
+            artist="Stereolab",
+            artwork_url=None,
+            artwork_checked_at=None,  # API-derived; the stamp is SQL-side.
+            release_url="https://discogs.com/release/33696616",
+        )
+
+        await cache_service.write_release(release)
+
+        conn = mock_asyncpg_pool._mock_conn
+        # The first execute is the release upsert.
+        release_sql = conn.execute.call_args_list[0][0][0]
+        assert "artwork_checked_at" in release_sql, (
+            "release upsert must reference artwork_checked_at "
+            "(predicate consumer in service.py:get_release)"
+        )
+        assert "now()" in release_sql, (
+            "release upsert must stamp now() on artwork_checked_at — see WXYC#423"
+        )
+        # Pinned together: the EXCLUDED.artwork_checked_at line must also
+        # appear so the ON CONFLICT path stamps the same now() value, not
+        # leave the column at its prior value on re-upsert.
+        assert "artwork_checked_at = EXCLUDED.artwork_checked_at" in release_sql, (
+            "ON CONFLICT must update artwork_checked_at from EXCLUDED so the "
+            "re-upsert path refreshes the stamp; without this, re-asking "
+            "Discogs leaves artwork_checked_at at its prior value."
+        )
 
     @pytest.mark.asyncio
     async def test_error_raises(self, cache_service, mock_asyncpg_pool):
@@ -650,6 +699,7 @@ class TestGetReleaseEnriched:
                 "release_year": 2001,
                 "artwork_url": "https://img.com/a.jpg",
                 "released": "2001-04-30",
+                "artwork_checked_at": None,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(

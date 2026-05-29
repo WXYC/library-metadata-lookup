@@ -810,10 +810,17 @@ class DiscogsService:
             pg_read=lambda: cache.get_release(release_id),
             api_fetch=_api_fetch,
             pg_write=cache.write_release,
-            # A row with `artwork_url IS NULL` is a partial miss: the bulk
-            # loader leaves ~48% of `release` rows that way (LML#414). Fall
-            # through to the API so the write-back back-patches the cover.
-            is_pg_hit=lambda v: v is not None and v.artwork_url is not None,
+            # `artwork_url IS NULL AND artwork_checked_at IS NULL` is the
+            # "never asked" state — the bulk loader populated the row but
+            # LML has not yet asked Discogs (~48% of release rows are like
+            # this; see WXYC/library-metadata-lookup#414 and
+            # WXYC/discogs-etl#239). Falling through to the API is the
+            # back-fill path. Once `artwork_checked_at` is set, both
+            # "asked, got a cover" and "asked, no cover" are full hits —
+            # we don't re-ask Discogs about the no-cover tail.
+            is_pg_hit=lambda v: (
+                v is not None and (v.artwork_url is not None or v.artwork_checked_at is not None)
+            ),
             breadcrumb_data={"release_id": release_id},
         )
 
