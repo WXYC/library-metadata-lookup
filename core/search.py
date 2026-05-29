@@ -345,38 +345,60 @@ Args:
 """
 
 ExecuteFunc = Callable[..., Awaitable[tuple[list[LibraryItem], Any]]]
-"""Async function that executes the search strategy.
+"""Async function executed by a strategy's ``run`` wrapper.
 
-Returns:
-    Tuple of (results, metadata). Metadata varies by strategy:
-    - ARTIST_PLUS_ALBUM: bool (fallback_used)
-    - SWAPPED_INTERPRETATION: None
-    - TRACK_ON_COMPILATION: dict (discogs_titles)
+Returns a tuple whose second element shape varies per strategy:
+
+    - ``ARTIST_PLUS_ALBUM``: ``bool`` (fallback_used)
+    - ``SWAPPED_INTERPRETATION``: ``None``
+    - ``TRACK_ON_COMPILATION``: ``dict[int, str]`` (discogs_titles)
+    - ``SONG_AS_ARTIST``: ``None``
+    - ``SONG_AS_TRACK``: ``dict[int, list[TrackMatchHint]]`` (matched_via_by_id)
+
+The heterogeneous shape is the artifact step 2 (#399) replaces with a uniform
+``Outcome`` value type. In step 1 it lives behind each strategy's ``run``
+wrapper so the central dispatch loop never sees it.
+"""
+
+RunFunc = Callable[[LibraryDB, ParsedRequest, "SearchState", str], Awaitable[bool]]
+"""Async strategy body invoked by ``execute_search_pipeline``.
+
+Contract:
+    1. Do **all** awaits before any write to ``SearchState``. The runner wraps
+       ``run`` in ``asyncio.wait_for`` (the LML#370 hard cap); a cancellation
+       between the last await and the final state mutation would leave the
+       state half-updated. Await-then-commit makes a cancelled ``run`` a
+       structural no-op.
+    2. Return ``True`` if this strategy populated ``state.results``; ``False``
+       otherwise. The runner combines the return with the current
+       ``state.results`` / ``state.song_not_found`` to decide whether to
+       break the cascade.
 """
 
 
-@dataclass
-class SearchStrategy:
-    """Declarative search strategy with explicit trigger condition.
+@dataclass(frozen=True)
+class _Strategy:
+    """Strategy seam consumed by :func:`execute_search_pipeline`.
 
-    Strategies are executed in priority order (array position).
-    The first strategy that produces results wins.
+    Built by :func:`build_strategies` from an injected ``ExecuteFunc`` plus the
+    per-strategy condition predicate; each strategy's ``run`` closure owns the
+    commit logic that used to live in the runner's ``if/elif`` arm.
+
+    Underscore-prefixed because callers should not construct these directly —
+    they're an implementation detail of the runner's seam. Tests that need a
+    bespoke strategy (e.g. ``TestPerStrategyWaitFor``) bypass
+    ``build_strategies`` and construct ``_Strategy`` directly, which is the
+    one accepted external use.
     """
 
     name: SearchStrategyType
-    """Strategy identifier for telemetry."""
+    """Strategy identifier for telemetry (``strategies_tried`` log)."""
 
     condition: ConditionFunc
-    """Function that returns True if this strategy should run."""
+    """Predicate gating whether ``run`` is called this iteration."""
 
-    execute: ExecuteFunc
-    """Async function that performs the search."""
-
-    updates_song_not_found: bool = False
-    """If True, the strategy's metadata (second return value) updates song_not_found."""
-
-    updates_discogs_titles: bool = False
-    """If True, the strategy's metadata contains discogs_titles to merge."""
+    run: RunFunc
+    """Async body — see :data:`RunFunc` for the cancellation contract."""
 
 
 # =============================================================================
@@ -447,61 +469,157 @@ def build_strategies(
     search_compilations_func: ExecuteFunc,
     search_song_as_artist_func: ExecuteFunc | None = None,
     search_song_as_track_func: ExecuteFunc | None = None,
-) -> list[SearchStrategy]:
+) -> list[_Strategy]:
     """Build the list of search strategies with injected execute functions.
 
-    This allows the router to inject its own implementations while keeping
-    the strategy pattern logic separate.
+    Wraps each ``ExecuteFunc`` into a :class:`_Strategy` whose ``run`` closure
+    owns the per-strategy commit to :class:`SearchState`. The five wrappers
+    encode the contract that used to live in the runner's ``if/elif`` arms:
+    each one awaits first, then commits, then returns the ``produced`` bool.
 
     Args:
-        search_library_func: Function implementing ARTIST_PLUS_ALBUM search
-        search_alternative_func: Function implementing SWAPPED_INTERPRETATION search
-        search_compilations_func: Function implementing TRACK_ON_COMPILATION search
-        search_song_as_artist_func: Function implementing SONG_AS_ARTIST search
+        search_library_func: Function implementing ARTIST_PLUS_ALBUM search.
+            Returns ``(list, fallback_used)``; the wrapper writes
+            ``state.results`` when non-empty and ``state.song_not_found``
+            when the fallback flag fires.
+        search_alternative_func: Function implementing SWAPPED_INTERPRETATION
+            search. The wrapper extracts ``(part1, part2)`` from the raw
+            message via :func:`detect_ambiguous_format`.
+        search_compilations_func: Function implementing TRACK_ON_COMPILATION
+            search. The wrapper stashes the prior artist-fallback results
+            into ``state.artist_fallback_results`` before replacing
+            ``state.results``, so perform_lookup can validate them against
+            Discogs tracklists afterward.
+        search_song_as_artist_func: Function implementing SONG_AS_ARTIST search.
+            Optional; when ``None``, the strategy is omitted from the list.
         search_song_as_track_func: Function implementing SONG_AS_TRACK search
             (catalog-track-search §4.2). Fires strictly after SONG_AS_ARTIST.
+            Optional; when ``None``, the strategy is omitted.
 
     Returns:
-        List of SearchStrategy objects in execution order
+        List of ``_Strategy`` objects in execution order. The runner consumes
+        them generically — see :class:`_Strategy` for the seam contract.
     """
-    strategies = [
-        SearchStrategy(
+
+    async def run_artist_plus_album(
+        db: LibraryDB,
+        parsed: ParsedRequest,
+        state: SearchState,
+        raw_message: str,  # noqa: ARG001
+    ) -> bool:
+        results, fallback_used = await search_library_func(db, parsed, state.albums_for_search)
+        # Commit only after the await returns — cancellation between here and
+        # the wait_for raise is a structural no-op because no state was written.
+        if results:
+            state.results = results
+        if fallback_used:
+            state.song_not_found = True
+        return bool(results)
+
+    async def run_swapped_interpretation(
+        db: LibraryDB,
+        parsed: ParsedRequest,  # noqa: ARG001
+        state: SearchState,
+        raw_message: str,
+    ) -> bool:
+        parts = detect_ambiguous_format(raw_message)
+        if parts is None:
+            # Defensive — the SWAPPED condition already guarantees parts is non-None
+            # when this runs. Kept so a future condition change can't silently
+            # crash here.
+            return False
+        part1, part2 = parts
+        results, _meta = await search_alternative_func(db, part1, part2)
+        if results:
+            state.results = results
+            state.song_not_found = False
+        return bool(results)
+
+    async def run_track_on_compilation(
+        db: LibraryDB,
+        parsed: ParsedRequest,
+        state: SearchState,
+        raw_message: str,  # noqa: ARG001
+    ) -> bool:
+        results, discogs_titles = await search_compilations_func(db, parsed)
+        if not results:
+            return False
+        # Save artist-fallback results before replacing — perform_lookup will
+        # validate them against Discogs tracklists and merge any confirmed
+        # matches back into the final results. The condition for this stash
+        # (state.results AND state.song_not_found) was previously inlined in
+        # the runner's TRACK_ON_COMPILATION arm.
+        if state.results and state.song_not_found:
+            state.artist_fallback_results = list(state.results)
+        state.results = results
+        state.found_on_compilation = True
+        state.song_not_found = False
+        state.discogs_titles = discogs_titles
+        return True
+
+    async def run_song_as_artist(
+        db: LibraryDB,
+        parsed: ParsedRequest,
+        state: SearchState,
+        raw_message: str,  # noqa: ARG001
+    ) -> bool:
+        assert search_song_as_artist_func is not None  # type narrowing — see closure capture
+        results, _meta = await search_song_as_artist_func(db, parsed.song)
+        if results:
+            state.results = results
+            state.song_not_found = False
+        return bool(results)
+
+    async def run_song_as_track(
+        db: LibraryDB,
+        parsed: ParsedRequest,
+        state: SearchState,
+        raw_message: str,  # noqa: ARG001
+    ) -> bool:
+        assert search_song_as_track_func is not None
+        results, matched_via_by_id = await search_song_as_track_func(db, parsed.song)
+        if results:
+            state.results = results
+            state.song_not_found = False
+            state.matched_via_by_id = matched_via_by_id
+        return bool(results)
+
+    strategies: list[_Strategy] = [
+        _Strategy(
             name=SearchStrategyType.ARTIST_PLUS_ALBUM,
             condition=has_artist_or_album_or_song,
-            execute=search_library_func,
-            updates_song_not_found=True,
+            run=run_artist_plus_album,
         ),
-        SearchStrategy(
+        _Strategy(
             name=SearchStrategyType.SWAPPED_INTERPRETATION,
             condition=no_results_and_ambiguous_format,
-            execute=search_alternative_func,
+            run=run_swapped_interpretation,
         ),
-        SearchStrategy(
+        _Strategy(
             name=SearchStrategyType.TRACK_ON_COMPILATION,
             condition=song_not_found_with_artist_and_song,
-            execute=search_compilations_func,
-            updates_discogs_titles=True,
+            run=run_track_on_compilation,
         ),
     ]
 
-    # Add SONG_AS_ARTIST if function provided
     if search_song_as_artist_func is not None:
         strategies.append(
-            SearchStrategy(
+            _Strategy(
                 name=SearchStrategyType.SONG_AS_ARTIST,
                 condition=no_results_and_song_but_no_artist,
-                execute=search_song_as_artist_func,
+                run=run_song_as_artist,
             )
         )
 
     # SONG_AS_TRACK must come AFTER SONG_AS_ARTIST — its condition checks that
-    # SONG_AS_ARTIST already ran and produced nothing.
+    # SONG_AS_ARTIST already ran and produced nothing. Ordering is array
+    # position; the condition does the runtime cross-check.
     if search_song_as_track_func is not None:
         strategies.append(
-            SearchStrategy(
+            _Strategy(
                 name=SearchStrategyType.SONG_AS_TRACK,
                 condition=no_results_and_song_but_no_artist_track_fallback,
-                execute=search_song_as_track_func,
+                run=run_song_as_track,
             )
         )
 
@@ -512,23 +630,34 @@ async def execute_search_pipeline(
     parsed: ParsedRequest,
     db: LibraryDB,
     raw_message: str,
-    strategies: list[SearchStrategy],
+    strategies: list[_Strategy],
     albums_for_search: list[str] | None = None,
     song_not_found: bool = False,
     caller_budget_ms: int | None = None,
 ) -> SearchState:
     """Execute strategies in array order until results found.
 
+    Dispatch is **generic**: the runner calls ``strategy.run`` without naming
+    any strategy. Each ``run`` is a closure built by :func:`build_strategies`
+    that owns the per-strategy commit to ``SearchState`` (see :data:`RunFunc`
+    for the cancellation contract). The cross-cutting budget / hard-cap /
+    caller-budget machinery and the ``state.timed_out`` projection are
+    unchanged from pre-#391.
+
     Args:
-        parsed: The parsed request with artist/song/album
-        db: Library database for searches
-        raw_message: Original request message (for ambiguous format detection)
-        strategies: List of search strategies to try
-        albums_for_search: Optional list of album names from Discogs lookup
-        song_not_found: Whether album resolution already determined the song wasn't found
+        parsed: The parsed request with artist/song/album.
+        db: Library database for searches.
+        raw_message: Original request message (for ambiguous format detection).
+        strategies: List of search strategies to try, in execution order.
+        albums_for_search: Optional list of album names from Discogs lookup.
+        song_not_found: Whether album resolution already determined the song
+            wasn't found.
+        caller_budget_ms: Optional X-Caller-Budget-Ms header value
+            (LML#345). When set, also gates the empty-results tail
+            short-circuit (LML#347).
 
     Returns:
-        SearchState with results and metadata about the search
+        SearchState with results and metadata about the search.
     """
     state = SearchState(
         results=[],
@@ -619,77 +748,17 @@ async def execute_search_pipeline(
         # records the strategy as timed out, same end state as a real cap fire.
         remaining_budget_seconds = max(0.01, (hard_cap_ms - elapsed_ms) / 1000)
 
-        # Single try/except around the whole if/elif so the per-strategy
-        # wait_for ceiling fires uniformly regardless of which branch is
-        # dispatched. CancelledError → TimeoutError raised by wait_for
-        # propagates into in-flight asyncio.gather() probes inside the
-        # strategy, freeing the Discogs semaphore on cap-fire.
+        # Single try/except around the strategy invocation so the per-strategy
+        # wait_for ceiling fires uniformly. CancelledError → TimeoutError raised
+        # by wait_for propagates into in-flight asyncio.gather() probes inside
+        # the strategy, freeing the Discogs semaphore on cap-fire. The
+        # RunFunc contract (await-then-commit) makes a cancelled run a
+        # structural no-op against SearchState.
         try:
-            # Execute the strategy
-            if strategy.name == SearchStrategyType.ARTIST_PLUS_ALBUM:
-                results, fallback_used = await asyncio.wait_for(
-                    strategy.execute(db, parsed, state.albums_for_search),
-                    timeout=remaining_budget_seconds,
-                )
-                if results:
-                    state.results = results
-                if strategy.updates_song_not_found and fallback_used:
-                    state.song_not_found = True
-
-            elif strategy.name == SearchStrategyType.SWAPPED_INTERPRETATION:
-                # Parse the ambiguous format
-                parts = detect_ambiguous_format(raw_message)
-                if parts:
-                    part1, part2 = parts
-                    results, _ = await asyncio.wait_for(
-                        strategy.execute(db, part1, part2),
-                        timeout=remaining_budget_seconds,
-                    )
-                else:
-                    results = []
-                if results:
-                    state.results = results
-                    state.song_not_found = False
-
-            elif strategy.name == SearchStrategyType.TRACK_ON_COMPILATION:
-                results, discogs_titles = await asyncio.wait_for(
-                    strategy.execute(db, parsed),
-                    timeout=remaining_budget_seconds,
-                )
-                if results:
-                    # Save artist fallback results before replacing — perform_lookup
-                    # will validate them against Discogs tracklists and merge any
-                    # confirmed matches back into the final results.
-                    if state.results and state.song_not_found:
-                        state.artist_fallback_results = list(state.results)
-                    state.results = results
-                    state.found_on_compilation = True
-                    state.song_not_found = False
-                    if strategy.updates_discogs_titles:
-                        state.discogs_titles = discogs_titles
-
-            elif strategy.name == SearchStrategyType.SONG_AS_ARTIST:
-                # Try using the parsed song as an artist name
-                results, _ = await asyncio.wait_for(
-                    strategy.execute(db, parsed.song),
-                    timeout=remaining_budget_seconds,
-                )
-                if results:
-                    state.results = results
-                    state.song_not_found = False
-
-            elif strategy.name == SearchStrategyType.SONG_AS_TRACK:
-                # Two-value unpack (unlike other branches): the strategy returns
-                # matched_via_by_id alongside the library items so SearchState can
-                # carry provenance to perform_lookup. See plan §4.2.
-                results, matched_via_by_id = await asyncio.wait_for(
-                    strategy.execute(db, parsed.song),
-                    timeout=remaining_budget_seconds,
-                )
-                if results:
-                    state.results = results
-                    state.song_not_found = False
-                    state.matched_via_by_id = matched_via_by_id
+            produced = await asyncio.wait_for(
+                strategy.run(db, parsed, state, raw_message),
+                timeout=remaining_budget_seconds,
+            )
         except TimeoutError:
             state.timed_out = True
             _log_hard_cap_fired(
@@ -699,12 +768,16 @@ async def execute_search_pipeline(
             )
             break
 
-        # Stop if we found results (unless we're doing compilation search which can replace results)
-        if state.results and strategy.name != SearchStrategyType.TRACK_ON_COMPILATION:
-            # For compilation search, we continue even if we have artist-only results
-            # because finding the actual song is better than just artist albums
-            if not state.song_not_found:
-                break
+        # Stop when this strategy populated results AND we're not still in the
+        # song-not-found cascade. The pre-#391 ``strategy.name !=
+        # TRACK_ON_COMPILATION`` clause collapses away: every downstream
+        # strategy already gates on ``not state.results`` in its condition, so
+        # the name-check never changed the outcome. ``produced`` separates
+        # "this strategy added results" from "results carried over from a
+        # previous strategy" — keeps the contract legible even though
+        # ``state.results`` would also be True in the well-behaved case.
+        if produced and state.results and not state.song_not_found:
+            break
 
     return state
 
