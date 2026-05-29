@@ -305,13 +305,10 @@ async def handle_bulk_lookup(
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors()) from None
 
-    # Observability entry signal (LML#371). The bulk endpoint was silent in
-    # production: when a handler hung past the caller's AbortController, neither
-    # uvicorn's access log nor Sentry's automatic `http.server` transaction fired
-    # because both signals only commit on response completion. This INFO log
-    # fires synchronously before any awaits, so operators always see that a
-    # bulk request reached LML — even if the rest of the handler hangs and the
-    # response is never delivered.
+    # Entry signal (LML#371). Fires synchronously before any awaits, so a
+    # handler that later hangs past the caller's AbortController still leaves
+    # a trace — uvicorn's access log and Sentry's automatic `http.server`
+    # transaction only commit on response completion.
     logger.info("bulk lookup start: size=%d", len(request.items))
 
     # Honor the same `skip_cache` query flag the per-item route accepts. Backed
@@ -448,8 +445,9 @@ async def handle_bulk_lookup(
 
         _project_cache_stats_to_transaction(get_cache_stats())
 
+        counts = Counter(r.status for r in results)
+
         if posthog_client:
-            counts = Counter(r.status for r in results)
             batch_telemetry.send_to_posthog(
                 posthog_client,
                 {
@@ -461,16 +459,15 @@ async def handle_bulk_lookup(
                 },
             )
 
-        # Observability exit signal (LML#371). Pairs with the entry log so
-        # operators can confirm response delivery and read off the status
-        # breakdown without correlating to a Sentry trace.
-        exit_counts = Counter(r.status for r in results)
+        # Exit signal pairs with the entry log so operators can confirm
+        # response delivery and read off the status breakdown without
+        # correlating to a Sentry trace.
         logger.info(
             "bulk lookup complete: size=%d match=%d no_match=%d error=%d",
             len(request.items),
-            exit_counts["match"],
-            exit_counts["no_match"],
-            exit_counts["error"],
+            counts["match"],
+            counts["no_match"],
+            counts["error"],
         )
         http_span.set_data("http.status_code", 200)
 
