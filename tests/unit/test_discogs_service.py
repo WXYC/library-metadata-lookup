@@ -920,6 +920,55 @@ class TestGetRelease:
         assert written.artwork_url == "https://img.discogs.com/cover.jpg"
 
     @pytest.mark.asyncio
+    async def test_cache_null_artwork_with_imageless_api_still_writes_back(
+        self, service_with_cache
+    ):
+        """Cache row has artwork_url=None AND the live API genuinely returns no
+        images. Fall-through still completes: API result returned with
+        artwork_url=None, write-back records the row. Until discogs-etl#239
+        ships (artwork_checked_at), every lookup re-runs this path; a future
+        regression swallowing the write-back here would only surface in prod.
+        """
+        stale = ReleaseMetadataResponse(
+            release_id=33696616,
+            title="White Label Promo",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/33696616",
+            artwork_url=None,
+            cached=True,
+        )
+        service_with_cache.cache_service.get_release = AsyncMock(return_value=stale)
+        service_with_cache.cache_service.write_release = AsyncMock()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "White Label Promo",
+            "artists": [{"name": "Stereolab"}],
+            "tracklist": [],
+            "images": [],
+            "labels": [],
+            "genres": [],
+            "styles": [],
+        }
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ) as mock_request:
+            result = await service_with_cache.get_release(33696616)
+
+        mock_request.assert_called_once()
+        assert result is not None
+        assert result.artwork_url is None
+        service_with_cache.cache_service.write_release.assert_called_once()
+        written = service_with_cache.cache_service.write_release.call_args.args[0]
+        assert written.artwork_url is None
+
+    @pytest.mark.asyncio
     async def test_404_returns_none(self, service):
         with patch.object(
             service, "_request_with_retry", new_callable=AsyncMock, return_value=None
