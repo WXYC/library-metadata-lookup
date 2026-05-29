@@ -1,4 +1,4 @@
-"""Unit tests for scripts/streaming_availability/matching.py."""
+"""Unit tests for clients/streaming/matching.py."""
 
 import pytest
 

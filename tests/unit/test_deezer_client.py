@@ -1,4 +1,4 @@
-"""Unit tests for scripts/streaming_availability/deezer_client.py."""
+"""Unit tests for clients/streaming/deezer.py."""
 
 from unittest.mock import AsyncMock
 
