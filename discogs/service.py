@@ -16,10 +16,10 @@ from wxyc_fastapi.observability import (
     add_breadcrumb,
     get_cache_stats_recorder,
     timed_api,
-    timed_pg,
 )
 
 from config.settings import get_settings
+from discogs.fallthrough import fallthrough
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import (
     ARTIST_CACHE,
@@ -30,7 +30,6 @@ from discogs.memory_cache import (
     TRACK_CACHE,
     VALIDATION_CACHE,
     async_cached,
-    should_skip_cache,
 )
 from discogs.models import (
     ArtistCredit,
@@ -406,10 +405,15 @@ class DiscogsService:
     ) -> TrackReleasesResponse:
         """Search for ALL releases containing a track.
 
-        Uses a hybrid approach with optional PostgreSQL cache:
-        1. Try local cache first (if available)
-        2. On cache miss, search Discogs API
-        3. Supplement with keyword search if few results
+        Read-through via :func:`fallthrough` with ``pg_write=None`` and the
+        negative-cache hooks wired. PG read is skipped when
+        ``artist_as_keyword=True`` because the PG cache filters by
+        release-level artist which excludes VA compilations where the artist
+        is credited on individual tracks — the API keyword search handles
+        that correctly with ``format=Compilation``. Negative-cache check runs
+        for every query (its key includes ``artist_as_keyword`` so a negative
+        answer on one shape doesn't poison the other). Read-only by design
+        (no API write-back); see #393.
 
         Args:
             track: Track title to search for
@@ -419,122 +423,53 @@ class DiscogsService:
         Returns:
             TrackReleasesResponse with list of releases
         """
-        # Try local cache first.
-        # Skip cache when artist_as_keyword=True: the PG cache filters by
-        # release-level artist which excludes VA compilations where the
-        # artist is credited on individual tracks.  The API keyword search
-        # handles this correctly with format=Compilation.
-        if self.cache_service and not should_skip_cache() and not artist_as_keyword:
+
+        async def _pg_read() -> TrackReleasesResponse | None:
+            assert cache is not None
+            cached_releases = await cache.search_releases_by_track(
+                track=track, artist=artist, limit=limit
+            )
+            if not cached_releases:
+                return None
+            return TrackReleasesResponse(
+                track=track,
+                artist=artist,
+                releases=cached_releases,
+                total=len(cached_releases),
+                cached=True,
+            )
+
+        def _on_negative_hit() -> TrackReleasesResponse:
+            return TrackReleasesResponse(
+                track=track, artist=artist, releases=[], total=0, cached=True
+            )
+
+        async def _api_fetch() -> TrackReleasesResponse | None:
+            releases: list[ReleaseInfo] = []
+            seen_albums: set = set()
+
+            params: dict = {
+                "type": "release",
+                "track": track,
+                "per_page": limit,
+            }
+            if artist:
+                if artist_as_keyword:
+                    # Use q (keyword) instead of artist (field filter) to find
+                    # VA compilations where the artist is credited on tracks.
+                    # Also filter by format=Compilation to exclude single/album
+                    # releases that dominate results for common track names.
+                    params["q"] = artist
+                    params["format"] = "Compilation"
+                else:
+                    params["artist"] = artist
+
+            logger.info(f"Searching Discogs for releases with track: '{track}', artist: {artist}")
+
             try:
-                add_discogs_breadcrumb(
-                    "cache_search_releases_by_track",
-                    {"track": track, "artist": artist},
-                )
-                async with timed_pg():
-                    cached_releases = await self.cache_service.search_releases_by_track(
-                        track=track, artist=artist, limit=limit
-                    )
-                if cached_releases:
-                    logger.info(f"Cache hit: found {len(cached_releases)} releases for '{track}'")
-                    get_cache_stats_recorder().record_pg_cache_hit()
-                    add_discogs_breadcrumb(
-                        "cache_hit", {"track": track, "count": len(cached_releases)}
-                    )
-                    return TrackReleasesResponse(
-                        track=track,
-                        artist=artist,
-                        releases=cached_releases,
-                        total=len(cached_releases),
-                        cached=True,
-                    )
-                logger.debug(f"Cache miss for track '{track}'")
-                get_cache_stats_recorder().record_pg_cache_miss()
-                add_discogs_breadcrumb("cache_miss", {"track": track})
-            except Exception as e:
-                logger.warning(f"Cache lookup failed, falling back to API: {e}")
-                add_discogs_breadcrumb("cache_error", {"error": str(e)}, level="warning")
-
-        # Negative-result cache check (LML#341 / A4). Consulted on every
-        # query, not just non-keyword paths, because its key includes the
-        # `artist_as_keyword` dimension so a negative answer on one shape
-        # doesn't poison the other. Always best-effort — `lookup_negative_hit`
-        # returns False on pool errors so we fall through to the API.
-        if self.cache_service and not should_skip_cache():
-            try:
-                if await self.cache_service.lookup_negative_hit(artist, track, artist_as_keyword):
-                    logger.info(
-                        f"Negative-cache hit for track '{track}' artist '{artist}' "
-                        f"(artist_as_keyword={artist_as_keyword}); short-circuiting Discogs API"
-                    )
-                    get_cache_stats_recorder().record("pg_negative_hits")
-                    add_discogs_breadcrumb(
-                        "negative_cache_hit",
-                        {"track": track, "artist": artist, "artist_as_keyword": artist_as_keyword},
-                    )
-                    return TrackReleasesResponse(
-                        track=track, artist=artist, releases=[], total=0, cached=True
-                    )
-                get_cache_stats_recorder().record("pg_negative_misses")
-            except Exception as e:
-                # lookup_negative_hit already swallows pool errors; this catch
-                # is for defense-in-depth against an unexpected programming
-                # error so the request never dies in the negative-cache leg.
-                logger.warning(f"Negative-cache check failed (continuing to API): {e}")
-
-        # Fall back to Discogs API
-        releases: list[ReleaseInfo] = []
-        seen_albums: set = set()
-
-        params: dict = {
-            "type": "release",
-            "track": track,
-            "per_page": limit,
-        }
-        if artist:
-            if artist_as_keyword:
-                # Use q (keyword) instead of artist (field filter) to find
-                # VA compilations where the artist is credited on tracks.
-                # Also filter by format=Compilation to exclude single/album
-                # releases that dominate results for common track names.
-                params["q"] = artist
-                params["format"] = "Compilation"
-            else:
-                params["artist"] = artist
-
-        logger.info(f"Searching Discogs for releases with track: '{track}', artist: {artist}")
-
-        try:
-            async with timed_api():
-                response = await self._request_with_retry("GET", "/database/search", params=params)
-
-            if response is not None:
-                get_cache_stats_recorder().record_api_call()
-                response.raise_for_status()
-                data = response.json()
-
-                for result in data.get("results", []):
-                    release_info = self._process_search_result(result, seen_albums)
-                    if release_info:
-                        releases.append(release_info)
-
-            logger.info(f"Track search found {len(releases)} releases")
-
-            # Supplement with keyword search if few results
-            if len(releases) < 3:
-                query_parts = [track]
-                if artist:
-                    query_parts.append(artist)
-
-                query_params: dict = {
-                    "type": "release",
-                    "q": " ".join(query_parts),
-                    "per_page": limit,
-                }
-
-                logger.info(f"Supplementing with keyword search: '{query_params['q']}'")
                 async with timed_api():
                     response = await self._request_with_retry(
-                        "GET", "/database/search", params=query_params
+                        "GET", "/database/search", params=params
                     )
 
                 if response is not None:
@@ -547,36 +482,88 @@ class DiscogsService:
                         if release_info:
                             releases.append(release_info)
 
-                    logger.info(f"After keyword search: {len(releases)} total releases")
+                logger.info(f"Track search found {len(releases)} releases")
 
-            # On a confirmed-empty Discogs response, record the negative
-            # verdict so the next process restart (Railway redeploy) doesn't
-            # repeat the full cascade. Skipped on exception path below — a
-            # 5xx or rate-limit isn't a "we asked, nothing" verdict; it's
-            # "we couldn't ask, try later." Best-effort write.
-            if not releases and self.cache_service and not should_skip_cache():
-                try:
-                    await self.cache_service.record_lookup_negative(
-                        artist, track, artist_as_keyword
-                    )
-                    add_discogs_breadcrumb(
-                        "negative_cache_write",
-                        {"track": track, "artist": artist, "artist_as_keyword": artist_as_keyword},
-                    )
-                except Exception as e:
-                    logger.warning(f"Negative-cache write failed (best-effort): {e}")
+                # Supplement with keyword search if few results
+                if len(releases) < 3:
+                    query_parts = [track]
+                    if artist:
+                        query_parts.append(artist)
 
-            return TrackReleasesResponse(
-                track=track,
-                artist=artist,
-                releases=releases[:limit],
-                total=len(releases[:limit]),
-                cached=False,
-            )
+                    query_params: dict = {
+                        "type": "release",
+                        "q": " ".join(query_parts),
+                        "per_page": limit,
+                    }
 
-        except Exception as e:
-            logger.error(f"Discogs search failed: {e}")
+                    logger.info(f"Supplementing with keyword search: '{query_params['q']}'")
+                    async with timed_api():
+                        response = await self._request_with_retry(
+                            "GET", "/database/search", params=query_params
+                        )
+
+                    if response is not None:
+                        get_cache_stats_recorder().record_api_call()
+                        response.raise_for_status()
+                        data = response.json()
+
+                        for result in data.get("results", []):
+                            release_info = self._process_search_result(result, seen_albums)
+                            if release_info:
+                                releases.append(release_info)
+
+                        logger.info(f"After keyword search: {len(releases)} total releases")
+
+                return TrackReleasesResponse(
+                    track=track,
+                    artist=artist,
+                    releases=releases[:limit],
+                    total=len(releases[:limit]),
+                    cached=False,
+                )
+
+            except Exception as e:
+                logger.error(f"Discogs search failed: {e}")
+                # An exception-path empty is NOT a "we asked, nothing" verdict
+                # — it's "we couldn't ask, try later." Return ``None`` so the
+                # seam skips both the write-back and negative-record paths
+                # (both are best-effort writes triggered only on a successful
+                # API result). The caller wraps ``None`` into an empty
+                # ``TrackReleasesResponse`` for the API consumer.
+                return None
+
+        cache = self.cache_service
+        bc = {"track": track, "artist": artist, "artist_as_keyword": artist_as_keyword}
+
+        def _empty_error_response() -> TrackReleasesResponse:
+            """The shape returned to callers when the API leg failed."""
             return TrackReleasesResponse(track=track, artist=artist, cached=False)
+
+        if cache is None:
+            return await _api_fetch() or _empty_error_response()
+
+        # The negative-cache check fires regardless of ``artist_as_keyword``
+        # because its key includes that dimension. The PG read is only safe
+        # when ``artist_as_keyword`` is False (see method docstring).
+        pg_read_hook = None if artist_as_keyword else _pg_read
+
+        result = await fallthrough(
+            label="search_releases_by_track",
+            pg_read=pg_read_hook,
+            api_fetch=_api_fetch,
+            # pg_write=None: read-only by design — see method docstring.
+            pg_negative_check=lambda: cache.lookup_negative_hit(artist, track, artist_as_keyword),
+            pg_negative_record=lambda: cache.record_lookup_negative(
+                artist, track, artist_as_keyword
+            ),
+            on_negative_hit=_on_negative_hit,
+            is_empty=lambda r: not r.releases,
+            breadcrumb_data=bc,
+        )
+        # Seam returns None only when ``_api_fetch`` returned None (the
+        # exception path). Wrap into the error-shape response so the API
+        # consumer always gets a populated model.
+        return result or _empty_error_response()
 
     async def search_releases_by_album_title(
         self,
@@ -698,10 +685,10 @@ class DiscogsService:
     async def get_release(self, release_id: int) -> ReleaseMetadataResponse | None:
         """Get full release metadata by ID.
 
-        Uses optional PostgreSQL cache with write-back strategy:
-        1. Try local cache first (if available)
-        2. On cache miss, fetch from Discogs API
-        3. Write API result back to cache for future queries
+        Read-through via :func:`fallthrough`: in-memory (decorator) → PG → API
+        + write-back. Full read-through — ``ReleaseMetadataResponse`` maps
+        cleanly to the cache's normalized schema. See #393 for the per-method
+        write-back policy table.
 
         Args:
             release_id: Discogs release ID
@@ -709,149 +696,131 @@ class DiscogsService:
         Returns:
             ReleaseMetadataResponse with full metadata, or None on error
         """
-        # Try local cache first
-        if self.cache_service and not should_skip_cache():
+
+        async def _api_fetch() -> ReleaseMetadataResponse | None:
             try:
-                add_discogs_breadcrumb("cache_get_release", {"release_id": release_id})
-                async with timed_pg():
-                    cached_release = await self.cache_service.get_release(release_id)
-                if cached_release:
-                    logger.info(f"Cache hit: release {release_id}")
-                    get_cache_stats_recorder().record_pg_cache_hit()
-                    add_discogs_breadcrumb("cache_hit", {"release_id": release_id})
-                    return cached_release
-                logger.debug(f"Cache miss for release {release_id}")
-                get_cache_stats_recorder().record_pg_cache_miss()
-                add_discogs_breadcrumb("cache_miss", {"release_id": release_id})
+                async with timed_api():
+                    response = await self._request_with_retry("GET", f"/releases/{release_id}")
+
+                if response is None:
+                    logger.warning(f"Failed to fetch release {release_id} (rate limited or error)")
+                    return None
+
+                get_cache_stats_recorder().record_api_call()
+                response.raise_for_status()
+                data = response.json()
+
+                # Extract all artists
+                raw_artists = data.get("artists", [])
+                artist_credits = [
+                    ArtistCredit(
+                        artist_id=a.get("id"),
+                        name=a.get("name", ""),
+                        join=a.get("join", ""),
+                    )
+                    for a in raw_artists
+                ]
+                artist_name = artist_credits[0].name if artist_credits else ""
+                artist_id = artist_credits[0].artist_id if artist_credits else None
+
+                # Extract extra artists (credits)
+                raw_extras = data.get("extraartists", [])
+                extra_artist_credits = [
+                    ArtistCredit(
+                        artist_id=a.get("id"),
+                        name=a.get("name", ""),
+                        role=a.get("role"),
+                    )
+                    for a in raw_extras
+                ]
+
+                # Extract all labels
+                raw_labels = data.get("labels", [])
+                label_credits = [
+                    LabelCredit(
+                        label_id=lbl.get("id"),
+                        name=lbl.get("name", ""),
+                        catno=lbl.get("catno"),
+                    )
+                    for lbl in raw_labels
+                ]
+                label_name = label_credits[0].name if label_credits else None
+                label_id = label_credits[0].label_id if label_credits else None
+
+                # Extract full release date
+                released = data.get("released")
+
+                # Extract tracklist with per-track artists (for compilations)
+                tracklist = [
+                    TrackItem(
+                        position=t.get("position", ""),
+                        title=t.get("title", ""),
+                        duration=t.get("duration"),
+                        artists=[a.get("name", "") for a in t.get("artists", [])],
+                    )
+                    for t in data.get("tracklist", [])
+                ]
+
+                # Extract artwork
+                images = data.get("images", [])
+                artwork_url = images[0].get("uri") if images else None
+
+                # Extract videos (skip entries without a URI)
+                videos = [
+                    ReleaseVideo(
+                        src=v["uri"],
+                        title=v.get("title"),
+                        duration=v.get("duration"),
+                        embed=v.get("embed", True),
+                    )
+                    for v in data.get("videos", [])
+                    if v.get("uri")
+                ]
+
+                return ReleaseMetadataResponse(
+                    release_id=release_id,
+                    title=data.get("title", ""),
+                    artist=artist_name,
+                    year=data.get("year"),
+                    label=label_name,
+                    artist_id=artist_id,
+                    label_id=label_id,
+                    genres=data.get("genres", []),
+                    styles=data.get("styles", []),
+                    tracklist=tracklist,
+                    artwork_url=artwork_url,
+                    release_url=f"https://www.discogs.com/release/{release_id}",
+                    cached=False,
+                    artists=artist_credits,
+                    extra_artists=extra_artist_credits,
+                    labels=label_credits,
+                    released=released,
+                    videos=videos,
+                )
+
             except Exception as e:
-                logger.warning(f"Cache lookup failed, falling back to API: {e}")
-                add_discogs_breadcrumb("cache_error", {"error": str(e)}, level="warning")
-
-        # Fall back to Discogs API
-        try:
-            async with timed_api():
-                response = await self._request_with_retry("GET", f"/releases/{release_id}")
-
-            if response is None:
-                logger.warning(f"Failed to fetch release {release_id} (rate limited or error)")
+                logger.error(f"Failed to fetch release {release_id}: {e}")
                 return None
 
-            get_cache_stats_recorder().record_api_call()
-            response.raise_for_status()
-            data = response.json()
-
-            # Extract all artists
-            raw_artists = data.get("artists", [])
-            artist_credits = [
-                ArtistCredit(
-                    artist_id=a.get("id"),
-                    name=a.get("name", ""),
-                    join=a.get("join", ""),
-                )
-                for a in raw_artists
-            ]
-            artist_name = artist_credits[0].name if artist_credits else ""
-            artist_id = artist_credits[0].artist_id if artist_credits else None
-
-            # Extract extra artists (credits)
-            raw_extras = data.get("extraartists", [])
-            extra_artist_credits = [
-                ArtistCredit(
-                    artist_id=a.get("id"),
-                    name=a.get("name", ""),
-                    role=a.get("role"),
-                )
-                for a in raw_extras
-            ]
-
-            # Extract all labels
-            raw_labels = data.get("labels", [])
-            label_credits = [
-                LabelCredit(
-                    label_id=lbl.get("id"),
-                    name=lbl.get("name", ""),
-                    catno=lbl.get("catno"),
-                )
-                for lbl in raw_labels
-            ]
-            label_name = label_credits[0].name if label_credits else None
-            label_id = label_credits[0].label_id if label_credits else None
-
-            # Extract full release date
-            released = data.get("released")
-
-            # Extract tracklist with per-track artists (for compilations)
-            tracklist = [
-                TrackItem(
-                    position=t.get("position", ""),
-                    title=t.get("title", ""),
-                    duration=t.get("duration"),
-                    artists=[a.get("name", "") for a in t.get("artists", [])],
-                )
-                for t in data.get("tracklist", [])
-            ]
-
-            # Extract artwork
-            images = data.get("images", [])
-            artwork_url = images[0].get("uri") if images else None
-
-            # Extract videos (skip entries without a URI)
-            videos = [
-                ReleaseVideo(
-                    src=v["uri"],
-                    title=v.get("title"),
-                    duration=v.get("duration"),
-                    embed=v.get("embed", True),
-                )
-                for v in data.get("videos", [])
-                if v.get("uri")
-            ]
-
-            release = ReleaseMetadataResponse(
-                release_id=release_id,
-                title=data.get("title", ""),
-                artist=artist_name,
-                year=data.get("year"),
-                label=label_name,
-                artist_id=artist_id,
-                label_id=label_id,
-                genres=data.get("genres", []),
-                styles=data.get("styles", []),
-                tracklist=tracklist,
-                artwork_url=artwork_url,
-                release_url=f"https://www.discogs.com/release/{release_id}",
-                cached=False,
-                artists=artist_credits,
-                extra_artists=extra_artist_credits,
-                labels=label_credits,
-                released=released,
-                videos=videos,
-            )
-
-            # Write back to cache for future queries
-            if self.cache_service and not should_skip_cache():
-                try:
-                    add_discogs_breadcrumb("cache_write_release", {"release_id": release_id})
-                    await self.cache_service.write_release(release)
-                    logger.debug(f"Cached release {release_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to cache release {release_id}: {e}")
-                    add_discogs_breadcrumb("cache_write_error", {"error": str(e)}, level="warning")
-
-            return release
-
-        except Exception as e:
-            logger.error(f"Failed to fetch release {release_id}: {e}")
-            return None
+        cache = self.cache_service
+        if cache is None:
+            return await _api_fetch()
+        return await fallthrough(
+            label="get_release",
+            pg_read=lambda: cache.get_release(release_id),
+            api_fetch=_api_fetch,
+            pg_write=cache.write_release,
+            breadcrumb_data={"release_id": release_id},
+        )
 
     @async_cached(ARTIST_CACHE)
     async def get_artist_details(self, artist_id: int) -> ArtistDetails | None:
         """Fetch full artist details from Discogs.
 
-        Uses optional PostgreSQL cache with write-back strategy:
-        1. Try local cache first (if available)
-        2. On cache miss, fetch from Discogs API
-        3. Write API result back to cache for future queries
+        Read-through via :func:`fallthrough`: in-memory (decorator) → PG → API
+        + write-back. Full read-through — ``ArtistDetails`` maps cleanly to
+        the cache's normalized schema. See #393 for the per-method write-back
+        policy table.
 
         Args:
             artist_id: Discogs artist ID
@@ -859,71 +828,59 @@ class DiscogsService:
         Returns:
             ArtistDetails with full metadata, or None on error
         """
-        # Try local cache first
-        if self.cache_service and not should_skip_cache():
+
+        async def _api_fetch() -> ArtistDetails | None:
             try:
-                add_discogs_breadcrumb("cache_get_artist_details", {"artist_id": artist_id})
-                async with timed_pg():
-                    cached_details = await self.cache_service.get_artist_details(artist_id)
-                if cached_details:
-                    logger.info(f"Cache hit: artist {artist_id}")
-                    get_cache_stats_recorder().record_pg_cache_hit()
-                    return cached_details
-                logger.debug(f"Cache miss for artist {artist_id}")
-                get_cache_stats_recorder().record_pg_cache_miss()
+                async with timed_api():
+                    response = await self._request_with_retry("GET", f"/artists/{artist_id}")
+                if response is None:
+                    return None
+                get_cache_stats_recorder().record_api_call()
+                add_discogs_breadcrumb("get_artist_details", {"artist_id": artist_id})
+                response.raise_for_status()
+                data = response.json()
+
+                images = data.get("images", [])
+                image_url = images[0].get("uri") if images else None
+
+                return ArtistDetails(
+                    artist_id=artist_id,
+                    name=data.get("name", ""),
+                    profile=data.get("profile") or None,
+                    image_url=image_url,
+                    name_variations=data.get("namevariations", []),
+                    aliases=[
+                        ArtistRef(id=a["id"], name=a["name"])
+                        for a in data.get("aliases", [])
+                        if "id" in a and "name" in a
+                    ],
+                    members=[
+                        MemberRef(
+                            id=m["id"],
+                            name=m["name"],
+                            active=m.get("active", True),
+                        )
+                        for m in data.get("members", [])
+                        if "id" in m and "name" in m
+                    ],
+                    urls=data.get("urls", []),
+                    cached=False,
+                )
+
             except Exception as e:
-                logger.warning(f"Cache lookup failed, falling back to API: {e}")
-
-        try:
-            async with timed_api():
-                response = await self._request_with_retry("GET", f"/artists/{artist_id}")
-            if response is None:
+                logger.warning(f"Failed to fetch artist details for {artist_id}: {e}")
                 return None
-            get_cache_stats_recorder().record_api_call()
-            add_discogs_breadcrumb("get_artist_details", {"artist_id": artist_id})
-            response.raise_for_status()
-            data = response.json()
 
-            images = data.get("images", [])
-            image_url = images[0].get("uri") if images else None
-
-            details = ArtistDetails(
-                artist_id=artist_id,
-                name=data.get("name", ""),
-                profile=data.get("profile") or None,
-                image_url=image_url,
-                name_variations=data.get("namevariations", []),
-                aliases=[
-                    ArtistRef(id=a["id"], name=a["name"])
-                    for a in data.get("aliases", [])
-                    if "id" in a and "name" in a
-                ],
-                members=[
-                    MemberRef(
-                        id=m["id"],
-                        name=m["name"],
-                        active=m.get("active", True),
-                    )
-                    for m in data.get("members", [])
-                    if "id" in m and "name" in m
-                ],
-                urls=data.get("urls", []),
-                cached=False,
-            )
-
-            # Write back to cache
-            if self.cache_service and not should_skip_cache():
-                try:
-                    await self.cache_service.write_artist_details(details)
-                    logger.debug(f"Cached artist {artist_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to cache artist {artist_id}: {e}")
-
-            return details
-
-        except Exception as e:
-            logger.warning(f"Failed to fetch artist details for {artist_id}: {e}")
-            return None
+        cache = self.cache_service
+        if cache is None:
+            return await _api_fetch()
+        return await fallthrough(
+            label="get_artist_details",
+            pg_read=lambda: cache.get_artist_details(artist_id),
+            api_fetch=_api_fetch,
+            pg_write=cache.write_artist_details,
+            breadcrumb_data={"artist_id": artist_id},
+        )
 
     async def get_artist_image(self, artist_id: int) -> str | None:
         """Fetch primary image for a Discogs artist.
@@ -998,6 +955,13 @@ class DiscogsService:
     async def search(self, request: DiscogsSearchRequest, limit: int = 5) -> DiscogsSearchResponse:
         """General release search for artwork discovery.
 
+        Read-through via :func:`fallthrough` with ``pg_write=None`` — the PG
+        cache's ``search_releases`` query is indexed against ETL-populated
+        ``release_artist`` / ``release_track`` data. Writing arbitrary Discogs
+        ``/database/search`` API hits back wouldn't fit that schema (they'd
+        be denormalized release stubs without the indexed columns the read
+        query depends on). Read-only by design; see #393.
+
         Args:
             request: Search parameters (artist, album, track)
             limit: Maximum number of results to return
@@ -1010,141 +974,146 @@ class DiscogsService:
             logger.warning("No searchable fields in request")
             return DiscogsSearchResponse(cached=False)
 
-        # Try local cache first
-        if self.cache_service and not should_skip_cache():
-            try:
-                add_discogs_breadcrumb(
-                    "cache_search_releases",
-                    {"artist": request.artist, "album": request.album},
-                )
-                async with timed_pg():
-                    cached = await self.cache_service.search_releases(
-                        artist=request.artist,
-                        album=request.album or request.track,
-                        limit=limit,
-                    )
-                if cached:
-                    logger.info(f"Cache hit: found {len(cached)} releases for search")
-                    get_cache_stats_recorder().record_pg_cache_hit()
-                    add_discogs_breadcrumb("cache_hit", {"count": len(cached)})
-                    results = []
-                    for row in cached:
-                        confidence = calculate_confidence(
-                            request.artist,
-                            request.album,
-                            row["artist_name"],
-                            row["title"],
-                            request_label=request.label,
-                            result_label=row.get("label_name"),
-                            request_format=request.format,
-                            result_format=None,  # cache doesn't include format yet
-                        )
-                        results.append(
-                            DiscogsSearchResult(
-                                album=row["title"],
-                                artist=row["artist_name"],
-                                release_id=row["release_id"],
-                                release_url=f"https://www.discogs.com/release/{row['release_id']}",
-                                artwork_url=row.get("artwork_url"),
-                                confidence=confidence,
-                            )
-                        )
-                    results.sort(key=lambda r: r.confidence, reverse=True)
-                    return DiscogsSearchResponse(results=results, total=len(results), cached=True)
-                logger.debug("Cache miss for search")
-                get_cache_stats_recorder().record_pg_cache_miss()
-                add_discogs_breadcrumb("cache_miss", {"artist": request.artist})
-            except Exception as e:
-                logger.warning(f"Cache search failed, falling back to API: {e}")
-                add_discogs_breadcrumb("cache_error", {"error": str(e)}, level="warning")
-
-        logger.info(f"Searching Discogs with params: {params}")
-
-        try:
-            async with timed_api():
-                response = await self._request_with_retry("GET", "/database/search", params=params)
-
-            if response is None:
-                logger.warning("Discogs search failed (rate limited or error)")
-                return DiscogsSearchResponse(cached=False)
-
-            get_cache_stats_recorder().record_api_call()
-            response.raise_for_status()
-            data = response.json()
-
-            # If strict search returned nothing, try fuzzy query
-            if not data.get("results") and (request.artist or request.album):
-                query_parts = []
-                if request.artist:
-                    query_parts.append(request.artist)
-                if request.album:
-                    query_parts.append(request.album)
-                fallback_params: dict[str, Any] = {
-                    "type": "release",
-                    "per_page": limit,
-                    "q": " ".join(query_parts),
-                }
-                logger.info(f"Strict search empty, trying fuzzy query: {fallback_params}")
-                async with timed_api():
-                    response = await self._request_with_retry(
-                        "GET", "/database/search", params=fallback_params
-                    )
-                if response is not None:
-                    get_cache_stats_recorder().record_api_call()
-                    response.raise_for_status()
-                    data = response.json()
-
+        async def _pg_read() -> DiscogsSearchResponse | None:
+            assert cache is not None  # narrowed by the caller before invocation
+            cached = await cache.search_releases(
+                artist=request.artist,
+                album=request.album or request.track,
+                limit=limit,
+            )
+            if not cached:
+                return None
             results = []
-            for item in data.get("results", []):
-                cover_url = item.get("thumb")
-                if not cover_url or "spacer.gif" in cover_url:
-                    cover_url = None
-
-                title = item.get("title", "")
-                result_artist, album = self._parse_title(title)
-
-                # Extract label and format from Discogs search result
-                result_labels = item.get("label", [])
-                result_label = result_labels[0] if result_labels else None
-                result_formats = item.get("format", [])
-                result_format = result_formats[0] if result_formats else None
-
+            for row in cached:
                 confidence = calculate_confidence(
                     request.artist,
                     request.album,
-                    result_artist,
-                    album,
+                    row["artist_name"],
+                    row["title"],
                     request_label=request.label,
-                    result_label=result_label,
+                    result_label=row.get("label_name"),
                     request_format=request.format,
-                    result_format=result_format,
+                    result_format=None,  # cache doesn't include format yet
                 )
-
-                release_id = item.get("id")
-                release_url = f"https://www.discogs.com/release/{release_id}"
-
                 results.append(
                     DiscogsSearchResult(
-                        album=album,
-                        artist=result_artist,
-                        release_id=release_id,
-                        release_url=release_url,
-                        artwork_url=cover_url,
+                        album=row["title"],
+                        artist=row["artist_name"],
+                        release_id=row["release_id"],
+                        release_url=f"https://www.discogs.com/release/{row['release_id']}",
+                        artwork_url=row.get("artwork_url"),
                         confidence=confidence,
                     )
                 )
-
             results.sort(key=lambda r: r.confidence, reverse=True)
+            return DiscogsSearchResponse(results=results, total=len(results), cached=True)
 
-            return DiscogsSearchResponse(
-                results=results,
-                total=len(results),
-                cached=False,
+        async def _api_fetch() -> DiscogsSearchResponse | None:
+            logger.info(f"Searching Discogs with params: {params}")
+            try:
+                async with timed_api():
+                    response = await self._request_with_retry(
+                        "GET", "/database/search", params=params
+                    )
+
+                if response is None:
+                    logger.warning("Discogs search failed (rate limited or error)")
+                    return DiscogsSearchResponse(cached=False)
+
+                get_cache_stats_recorder().record_api_call()
+                response.raise_for_status()
+                data = response.json()
+
+                # If strict search returned nothing, try fuzzy query
+                if not data.get("results") and (request.artist or request.album):
+                    query_parts = []
+                    if request.artist:
+                        query_parts.append(request.artist)
+                    if request.album:
+                        query_parts.append(request.album)
+                    fallback_params: dict[str, Any] = {
+                        "type": "release",
+                        "per_page": limit,
+                        "q": " ".join(query_parts),
+                    }
+                    logger.info(f"Strict search empty, trying fuzzy query: {fallback_params}")
+                    async with timed_api():
+                        response = await self._request_with_retry(
+                            "GET", "/database/search", params=fallback_params
+                        )
+                    if response is not None:
+                        get_cache_stats_recorder().record_api_call()
+                        response.raise_for_status()
+                        data = response.json()
+
+                results = []
+                for item in data.get("results", []):
+                    cover_url = item.get("thumb")
+                    if not cover_url or "spacer.gif" in cover_url:
+                        cover_url = None
+
+                    title = item.get("title", "")
+                    result_artist, album = self._parse_title(title)
+
+                    # Extract label and format from Discogs search result
+                    result_labels = item.get("label", [])
+                    result_label = result_labels[0] if result_labels else None
+                    result_formats = item.get("format", [])
+                    result_format = result_formats[0] if result_formats else None
+
+                    confidence = calculate_confidence(
+                        request.artist,
+                        request.album,
+                        result_artist,
+                        album,
+                        request_label=request.label,
+                        result_label=result_label,
+                        request_format=request.format,
+                        result_format=result_format,
+                    )
+
+                    release_id = item.get("id")
+                    release_url = f"https://www.discogs.com/release/{release_id}"
+
+                    results.append(
+                        DiscogsSearchResult(
+                            album=album,
+                            artist=result_artist,
+                            release_id=release_id,
+                            release_url=release_url,
+                            artwork_url=cover_url,
+                            confidence=confidence,
+                        )
+                    )
+
+                results.sort(key=lambda r: r.confidence, reverse=True)
+
+                return DiscogsSearchResponse(
+                    results=results,
+                    total=len(results),
+                    cached=False,
+                )
+
+            except Exception as e:
+                logger.error(f"Discogs search failed: {e}")
+                return DiscogsSearchResponse(cached=False)
+
+        cache = self.cache_service
+        if cache is None:
+            result = await _api_fetch()
+        else:
+            result = await fallthrough(
+                label="search",
+                pg_read=_pg_read,
+                api_fetch=_api_fetch,
+                # pg_write=None: read-only by design — see method docstring.
+                breadcrumb_data={"artist": request.artist, "album": request.album},
             )
-
-        except Exception as e:
-            logger.error(f"Discogs search failed: {e}")
-            return DiscogsSearchResponse(cached=False)
+        # ``api_fetch`` returns a non-None DiscogsSearchResponse on every path
+        # (parses or constructs a cached=False empty), so the seam's `T | None`
+        # never narrows to None here in practice.
+        assert result is not None
+        return result
 
     def _build_search_params(self, request: DiscogsSearchRequest, limit: int = 5) -> dict:
         """Build search params using Discogs-specific fields.
@@ -1184,9 +1153,12 @@ class DiscogsService:
     async def validate_track_on_release(self, release_id: int, track: str, artist: str) -> bool:
         """Validate that a track by an artist exists on a release.
 
-        Uses optional PostgreSQL cache for validation:
-        1. Try cache validation first (if available)
-        2. On cache miss (None), fall back to API via get_release
+        Read-through via :func:`fallthrough` with ``pg_write=None`` — the
+        validation verdict itself isn't separately cached on the API path.
+        The API fallback goes through ``get_release``, which writes back to
+        the ``release`` cache via its own seam call, so the release rows do
+        get persisted; only the validation answer is re-derived per call.
+        Read-only by design; see #393.
 
         Args:
             release_id: Discogs release ID
@@ -1196,91 +1168,101 @@ class DiscogsService:
         Returns:
             True if the track by the artist is found on the release
         """
-        # Try cache validation first
-        if self.cache_service and not should_skip_cache():
-            try:
-                add_discogs_breadcrumb(
-                    "cache_validate_track",
-                    {"release_id": release_id, "track": track, "artist": artist},
-                )
-                async with timed_pg():
-                    cached_result = await self.cache_service.validate_track_on_release(
-                        release_id, track, artist
-                    )
-                if cached_result is not None:
-                    logger.info(
-                        f"Cache {'validated' if cached_result else 'rejected'}: "
-                        f"'{track}' by '{artist}' on release {release_id}"
-                    )
-                    get_cache_stats_recorder().record_pg_cache_hit()
-                    add_discogs_breadcrumb(
-                        "cache_hit", {"release_id": release_id, "validated": cached_result}
-                    )
-                    return cached_result
-                logger.debug(f"Cache miss for validation on release {release_id}")
-                get_cache_stats_recorder().record_pg_cache_miss()
-                add_discogs_breadcrumb("cache_miss", {"release_id": release_id})
-            except Exception as e:
-                logger.warning(f"Cache validation failed, falling back to API: {e}")
-                add_discogs_breadcrumb("cache_error", {"error": str(e)}, level="warning")
 
-        # Fall back to API via get_release
-        release = await self.get_release(release_id)
-        if release is None:
-            return False
+        async def _api_fetch() -> bool | None:
+            # Fall back to API via get_release. Returns False (not None) when
+            # the release is missing or the track isn't on it, because the
+            # method's contract is ``-> bool``. The seam treats False as a
+            # valid result (it's not None), so it'll be returned to the
+            # caller.
+            release = await self.get_release(release_id)
+            if release is None:
+                return False
 
-        track_lower = normalize_for_track_comparison(track)
-        artist_lower = normalize_artist_for_validation(artist)
+            track_lower = normalize_for_track_comparison(track)
+            artist_lower = normalize_artist_for_validation(artist)
+            return _scan_tracklist_for_match(
+                release, release_id, track, track_lower, artist, artist_lower
+            )
 
-        for item in release.tracklist or []:
-            item_title = normalize_for_track_comparison(item.title)
-            # Check if track title matches
-            if track_lower not in item_title and item_title not in track_lower:
-                continue
+        cache = self.cache_service
+        if cache is not None:
+            validated = await fallthrough(
+                label="validate_track_on_release",
+                pg_read=lambda: cache.validate_track_on_release(release_id, track, artist),
+                api_fetch=_api_fetch,
+                # pg_write=None: read-only by design — see method docstring.
+                breadcrumb_data={
+                    "release_id": release_id,
+                    "track": track,
+                    "artist": artist,
+                },
+            )
+        else:
+            validated = await _api_fetch()
+        # The API path always returns bool (never None), so the seam's
+        # ``T | None`` here is always bool in practice.
+        return bool(validated)
 
-            # Per-track credits first (compilations, or tracks crediting the
-            # writers/performers). A positive hit short-circuits.
-            if item.artists:
-                for track_artist in item.artists:
-                    track_artist_lower = normalize_artist_for_validation(track_artist)
-                    if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
-                        logger.info(
-                            f"Validated: '{track}' by '{artist}' found on release {release_id}"
-                        )
-                        return True
-                # Fuzzy fallback: when no individual per-track artist substring-matches,
-                # compare against the joined credit string. Catches collaboration trios
-                # where each member is credited separately but the request uses the
-                # compact group name (LML#210).
-                joined = normalize_artist_for_validation(" ".join(item.artists))
-                if (
-                    joined
-                    and fuzz.token_set_ratio(artist_lower, joined) >= _ARTIST_FUZZY_MATCH_THRESHOLD
-                ):
-                    logger.info(
-                        f"Validated (fuzzy): '{track}' by '{artist}' on release {release_id}"
-                    )
+
+def _scan_tracklist_for_match(
+    release: ReleaseMetadataResponse,
+    release_id: int,
+    track: str,
+    track_lower: str,
+    artist: str,
+    artist_lower: str,
+) -> bool:
+    """Tracklist match logic extracted from ``validate_track_on_release``.
+
+    Kept as a module-level helper so ``validate_track_on_release``'s body
+    after the seam refactor reads as orchestration, not algorithm. Inputs
+    are pre-normalized by the caller (single call to
+    ``normalize_for_track_comparison`` / ``normalize_artist_for_validation``)
+    so the inner loop is hot-path arithmetic.
+    """
+    for item in release.tracklist or []:
+        item_title = normalize_for_track_comparison(item.title)
+        # Check if track title matches
+        if track_lower not in item_title and item_title not in track_lower:
+            continue
+
+        # Per-track credits first (compilations, or tracks crediting the
+        # writers/performers). A positive hit short-circuits.
+        if item.artists:
+            for track_artist in item.artists:
+                track_artist_lower = normalize_artist_for_validation(track_artist)
+                if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
+                    logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")
                     return True
-
-            # Release-level artist. Always consulted when per-track credits
-            # haven't already matched — per-track credits often list band
-            # members / producers / writers rather than the band itself (e.g.,
-            # The Orb's "Towers Of Dub" on Live 93 is credited to Paterson /
-            # Weston / Fehlmann), so the release-level credit is the last
-            # word on "is this track by this artist."
-            release_artist = normalize_artist_for_validation(release.artist)
-            if release_artist and (
-                artist_lower in release_artist or release_artist in artist_lower
-            ):
-                logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")
-                return True
+            # Fuzzy fallback: when no individual per-track artist substring-matches,
+            # compare against the joined credit string. Catches collaboration trios
+            # where each member is credited separately but the request uses the
+            # compact group name (LML#210).
+            joined = normalize_artist_for_validation(" ".join(item.artists))
             if (
-                release_artist
-                and fuzz.token_set_ratio(artist_lower, release_artist)
-                >= _ARTIST_FUZZY_MATCH_THRESHOLD
+                joined
+                and fuzz.token_set_ratio(artist_lower, joined) >= _ARTIST_FUZZY_MATCH_THRESHOLD
             ):
                 logger.info(f"Validated (fuzzy): '{track}' by '{artist}' on release {release_id}")
                 return True
 
-        logger.info(f"Track '{track}' by '{artist}' NOT found on release {release_id}")
-        return False
+        # Release-level artist. Always consulted when per-track credits
+        # haven't already matched — per-track credits often list band
+        # members / producers / writers rather than the band itself (e.g.,
+        # The Orb's "Towers Of Dub" on Live 93 is credited to Paterson /
+        # Weston / Fehlmann), so the release-level credit is the last
+        # word on "is this track by this artist."
+        release_artist = normalize_artist_for_validation(release.artist)
+        if release_artist and (artist_lower in release_artist or release_artist in artist_lower):
+            logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")
+            return True
+        if (
+            release_artist
+            and fuzz.token_set_ratio(artist_lower, release_artist) >= _ARTIST_FUZZY_MATCH_THRESHOLD
+        ):
+            logger.info(f"Validated (fuzzy): '{track}' by '{artist}' on release {release_id}")
+            return True
+
+    logger.info(f"Track '{track}' by '{artist}' NOT found on release {release_id}")
+    return False
