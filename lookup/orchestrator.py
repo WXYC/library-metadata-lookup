@@ -24,7 +24,6 @@ from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats_recorde
 
 from config.settings import get_settings
 from core.search import (
-    build_strategies,
     execute_search_pipeline,
     get_search_type_from_state,
 )
@@ -61,6 +60,7 @@ from lookup.external_search import (
     search_external_tracks,
 )
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
+from lookup.strategies import build_strategies
 from scripts.entity_resolution.sources import PgSourceProtocol
 from scripts.entity_resolution.store import EntityStore, Identity
 from services.parser import MessageType, ParsedRequest
@@ -2066,7 +2066,12 @@ async def perform_lookup(
 
     # Step 3: Execute search strategy pipeline
     with telemetry.track_step("library_search"):
+        # Strategies hold their own ``db`` handle (no per-call db arg on the
+        # runner post-#399). The discogs_service is captured via ``partial`` on
+        # the three strategies that need it; ARTIST_PLUS_ALBUM and
+        # SWAPPED_INTERPRETATION are library-only.
         strategies = build_strategies(
+            db,
             search_library_func=search_library_with_fallback,
             search_alternative_func=search_with_alternative_interpretation,
             search_compilations_func=partial(
@@ -2082,7 +2087,6 @@ async def perform_lookup(
 
         search_state = await execute_search_pipeline(
             parsed=parsed,
-            db=db,
             raw_message=request.raw_message or "",
             strategies=strategies,
             albums_for_search=albums_for_search,

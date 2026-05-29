@@ -1,7 +1,19 @@
-"""Tests for uncovered lines in core/search.py."""
+"""Tests for ``core/search.py`` — the strategy seam, runner, and budget knobs.
+
+The ``Outcome`` value type and ``_apply`` helper have their own dedicated
+tests in ``tests/unit/test_outcome.py``. This file pins the runner, the
+strategy factory, and the budget / hard-cap / caller-budget machinery.
+
+Tests inject mocks that return ``Outcome`` instances (post-#399 seam).
+The strategy classes themselves live in ``lookup/strategies/`` and adapt
+the orchestrator-side tuple-returning execute funcs into Outcome — but
+the tests here drive the pipeline at the runner seam, so they construct
+strategies with mock Outcome-returning callables.
+"""
 
 import asyncio
 import time
+from dataclasses import dataclass
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -10,11 +22,11 @@ from core.search import (
     DEFAULT_SEARCH_BUDGET_MS,
     DEFAULT_SEARCH_HARD_TIMEOUT_MS,
     TRANSPORT_OVERHEAD_MS,
+    Outcome,
     SearchState,
     SearchStrategyType,
+    Strategy,
     _log_hard_cap_fired,
-    _Strategy,
-    build_strategies,
     execute_search_pipeline,
     get_search_type_from_state,
     has_artist_or_album_or_song,
@@ -27,8 +39,60 @@ from core.search import (
     song_not_found_with_artist_and_song,
 )
 from generated.api_models import TrackMatchHint, TrackMatchSource
+from lookup.strategies import build_strategies
 from services.parser import ParsedRequest
 from tests.factories import make_library_item as _item
+
+# ---------------------------------------------------------------------------
+# Test helpers: tiny strategy stand-ins for runner-level tests
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _StubStrategy:
+    """Bare-bones :class:`Strategy` for runner unit tests.
+
+    Production strategies live in ``lookup/strategies/`` and adapt the
+    orchestrator-side tuple-returning execute funcs into Outcome. The runner
+    tests here drive the pipeline directly with a stub that calls the
+    injected mock and a stub condition — exercises the runner / _apply
+    seam without dragging a real strategy class in.
+    """
+
+    name: SearchStrategyType
+    condition: object  # Callable[[ParsedRequest, SearchState, str], bool]
+    attempt_func: object  # Callable[..., Awaitable[Outcome]]
+
+    def should_attempt(self, parsed, state, raw_message) -> bool:
+        return self.condition(parsed, state, raw_message)  # type: ignore[operator]
+
+    async def attempt(self, parsed, state, raw_message) -> Outcome:
+        return await self.attempt_func(parsed, state, raw_message)  # type: ignore[no-any-return,operator,misc]
+
+
+def _build_test_strategies(
+    search_lib: AsyncMock,
+    search_alt: AsyncMock,
+    search_comp: AsyncMock,
+    search_song: AsyncMock | None = None,
+    search_track: AsyncMock | None = None,
+) -> list[Strategy]:
+    """Construct the production strategy classes wrapped around mock execute funcs.
+
+    Mirrors the old ``build_strategies(search_lib, search_alt, search_comp,
+    search_song)`` test ergonomics. ``db`` is a shared AsyncMock because the
+    strategies pass it to their execute funcs (which are mocks themselves
+    here, so the db value never matters).
+    """
+    return build_strategies(
+        AsyncMock(),
+        search_library_func=search_lib,
+        search_alternative_func=search_alt,
+        search_compilations_func=search_comp,
+        search_song_as_artist_func=search_song,
+        search_song_as_track_func=search_track,
+    )
+
 
 # ---------------------------------------------------------------------------
 # get_search_type_from_state
@@ -189,6 +253,7 @@ class TestConditions:
 class TestBuildStrategies:
     def test_basic_strategies(self):
         strategies = build_strategies(
+            AsyncMock(),
             search_library_func=AsyncMock(),
             search_alternative_func=AsyncMock(),
             search_compilations_func=AsyncMock(),
@@ -201,6 +266,7 @@ class TestBuildStrategies:
 
     def test_includes_song_as_artist(self):
         strategies = build_strategies(
+            AsyncMock(),
             search_library_func=AsyncMock(),
             search_alternative_func=AsyncMock(),
             search_compilations_func=AsyncMock(),
@@ -211,6 +277,7 @@ class TestBuildStrategies:
 
     def test_song_as_track_excluded_without_func(self):
         strategies = build_strategies(
+            AsyncMock(),
             search_library_func=AsyncMock(),
             search_alternative_func=AsyncMock(),
             search_compilations_func=AsyncMock(),
@@ -227,6 +294,7 @@ class TestBuildStrategies:
         condition's `SONG_AS_ARTIST in strategies_tried` precondition.
         """
         strategies = build_strategies(
+            AsyncMock(),
             search_library_func=AsyncMock(),
             search_alternative_func=AsyncMock(),
             search_compilations_func=AsyncMock(),
@@ -253,13 +321,12 @@ class TestExecuteSearchPipeline:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(return_value=([], {}))
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(artist="Queen", album="The Game", raw_message="Queen The Game")
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "Queen The Game",
             strategies,
         )
@@ -276,18 +343,12 @@ class TestExecuteSearchPipeline:
         search_comp = AsyncMock(return_value=([], {}))
         search_song = AsyncMock(return_value=([item], None))
 
-        strategies = build_strategies(
-            search_lib,
-            search_alt,
-            search_comp,
-            search_song,
-        )
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp, search_song)
 
         parsed = ParsedRequest(song="Stereolab", raw_message="Stereolab")
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "Stereolab",
             strategies,
         )
@@ -304,13 +365,12 @@ class TestExecuteSearchPipeline:
         search_alt = AsyncMock(return_value=([item], None))
         search_comp = AsyncMock(return_value=([], {}))
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(artist="Foo", album="Bar", raw_message="Foo - Bar")
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "Foo - Bar",
             strategies,
         )
@@ -327,7 +387,7 @@ class TestExecuteSearchPipeline:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(return_value=([item], {1: "Rock Comp"}))
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Queen",
@@ -337,7 +397,6 @@ class TestExecuteSearchPipeline:
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "Queen - We Will Rock You",
             strategies,
         )
@@ -367,7 +426,7 @@ class TestExecuteSearchPipeline:
             return_value=([compilation], {46602: "Trax Records 20th Anniversary Collection"})
         )
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Adonis",
@@ -377,7 +436,6 @@ class TestExecuteSearchPipeline:
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "No Way Back by Adonis",
             strategies,
             song_not_found=True,
@@ -404,7 +462,7 @@ class TestExecuteSearchPipeline:
         search_comp = AsyncMock(return_value=([], {}))
         search_song = AsyncMock(return_value=([], None))
 
-        strategies = build_strategies(search_lib, search_alt, search_comp, search_song)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp, search_song)
 
         parsed = ParsedRequest(
             song="Lost Love",
@@ -414,7 +472,6 @@ class TestExecuteSearchPipeline:
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "Lost Love, Adult.",
             strategies,
         )
@@ -446,19 +503,14 @@ class TestExecuteSearchPipeline:
         search_song = AsyncMock(return_value=([], None))
         search_track = AsyncMock(return_value=([confield], {60359: [hint]}))
 
-        strategies = build_strategies(
-            search_lib,
-            search_alt,
-            search_comp,
-            search_song,
-            search_song_as_track_func=search_track,
+        strategies = _build_test_strategies(
+            search_lib, search_alt, search_comp, search_song, search_track
         )
 
         parsed = ParsedRequest(song="vi scose poise", raw_message="vi scose poise")
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "vi scose poise",
             strategies,
         )
@@ -480,19 +532,14 @@ class TestExecuteSearchPipeline:
         search_song = AsyncMock(return_value=([item], None))
         search_track = AsyncMock(return_value=([], {}))
 
-        strategies = build_strategies(
-            search_lib,
-            search_alt,
-            search_comp,
-            search_song,
-            search_song_as_track_func=search_track,
+        strategies = _build_test_strategies(
+            search_lib, search_alt, search_comp, search_song, search_track
         )
 
         parsed = ParsedRequest(song="Stereolab", raw_message="Stereolab")
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "Stereolab",
             strategies,
         )
@@ -509,19 +556,14 @@ class TestExecuteSearchPipeline:
         search_song = AsyncMock(return_value=([], None))
         search_track = AsyncMock(return_value=([], {}))
 
-        strategies = build_strategies(
-            search_lib,
-            search_alt,
-            search_comp,
-            search_song,
-            search_song_as_track_func=search_track,
+        strategies = _build_test_strategies(
+            search_lib, search_alt, search_comp, search_song, search_track
         )
 
         parsed = ParsedRequest(song="nonexistent track", raw_message="nonexistent track")
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "nonexistent track",
             strategies,
         )
@@ -553,22 +595,22 @@ class TestRunnerIsGeneric:
         custom_item = _item(id=42, artist="Custom", title="Strategy")
         ran: list[bool] = []
 
-        async def custom_run(db, parsed, state, raw_message):
+        async def custom_attempt(parsed, state, raw_message):
             ran.append(True)
-            state.results = [custom_item]
-            return True
+            return Outcome.found([custom_item])
 
-        # ARTIST_ONLY is a SearchStrategyType value that the pre-#391 if/elif
-        # never dispatched on (no orchestrator arm for it). Post-#391 the runner
-        # just calls ``run`` regardless of name.
-        custom = _Strategy(
+        # ARTIST_ONLY is a SearchStrategyType value the pre-#391 if/elif
+        # never dispatched on (no orchestrator arm for it). Post-#391 / #399
+        # the runner just calls ``attempt`` regardless of name; the returned
+        # Outcome drives ``_apply`` without a per-strategy branch.
+        custom = _StubStrategy(
             name=SearchStrategyType.ARTIST_ONLY,
             condition=lambda parsed, state, raw_message: True,
-            run=custom_run,
+            attempt_func=custom_attempt,
         )
 
         parsed = ParsedRequest(artist="Custom", raw_message="Custom")
-        state = await execute_search_pipeline(parsed, AsyncMock(), "Custom", [custom])
+        state = await execute_search_pipeline(parsed, "Custom", [custom])
 
         assert ran == [True]
         assert state.results == [custom_item]
@@ -658,7 +700,7 @@ class TestSearchBudget:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(side_effect=must_not_run_compilation)
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         # song_not_found=True keeps TRACK_ON_COMPILATION's condition true even
         # after ARTIST_PLUS_ALBUM populates state.results — without the budget
@@ -675,7 +717,6 @@ class TestSearchBudget:
         with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
             state = await execute_search_pipeline(
                 parsed,
-                AsyncMock(),
                 "Stereolab - Miss Modular",
                 strategies,
                 song_not_found=True,
@@ -723,19 +764,14 @@ class TestSearchBudget:
         search_song = AsyncMock(return_value=([], None))
         search_track = AsyncMock(return_value=([track_hit], {60359: [hint]}))
 
-        strategies = build_strategies(
-            search_lib,
-            search_alt,
-            search_comp,
-            search_song,
-            search_song_as_track_func=search_track,
+        strategies = _build_test_strategies(
+            search_lib, search_alt, search_comp, search_song, search_track
         )
 
         parsed = ParsedRequest(song="vi scose poise", raw_message="vi scose poise")
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "vi scose poise",
             strategies,
         )
@@ -759,7 +795,7 @@ class TestSearchBudget:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(return_value=([], {}))
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Juana Molina", album="DOGA", raw_message="Juana Molina - DOGA"
@@ -771,7 +807,6 @@ class TestSearchBudget:
         with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
             state = await execute_search_pipeline(
                 parsed,
-                AsyncMock(),
                 "Juana Molina - DOGA",
                 strategies,
             )
@@ -800,7 +835,7 @@ class TestSearchBudget:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(return_value=([], {}))
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Stereolab",
@@ -814,7 +849,6 @@ class TestSearchBudget:
         with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
             state = await execute_search_pipeline(
                 parsed,
-                AsyncMock(),
                 "Stereolab - Miss Modular",
                 strategies,
                 song_not_found=True,
@@ -843,7 +877,7 @@ class TestSearchBudget:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(return_value=([], {}))
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Stereolab",
@@ -857,7 +891,6 @@ class TestSearchBudget:
         ):
             state = await execute_search_pipeline(
                 parsed,
-                AsyncMock(),
                 "Stereolab - Miss Modular",
                 strategies,
                 song_not_found=True,
@@ -961,7 +994,7 @@ class TestSearchHardTimeoutLoopGate:
         search_alt = AsyncMock(side_effect=must_not_run)
         search_comp = AsyncMock(side_effect=must_not_run)
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Some Unknown Artist",
@@ -971,7 +1004,6 @@ class TestSearchHardTimeoutLoopGate:
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "Some Unknown Artist - Untracked Song",
             strategies,
             song_not_found=True,
@@ -998,7 +1030,7 @@ class TestSearchHardTimeoutLoopGate:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(return_value=([], {}))
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Untracked",
@@ -1012,7 +1044,6 @@ class TestSearchHardTimeoutLoopGate:
         with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
             await execute_search_pipeline(
                 parsed,
-                AsyncMock(),
                 "Untracked - Song",
                 strategies,
                 song_not_found=True,
@@ -1108,7 +1139,7 @@ class TestPerStrategyWaitFor:
         search_lib = AsyncMock(side_effect=fan_out_strategy)
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(return_value=([], {}))
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(artist="x", song=None, raw_message="x")
 
@@ -1116,7 +1147,7 @@ class TestPerStrategyWaitFor:
         # instead of stalling CI for 60s waiting on the mock probes.
         start = time.monotonic()
         state = await asyncio.wait_for(
-            execute_search_pipeline(parsed, AsyncMock(), "x", strategies),
+            execute_search_pipeline(parsed, "x", strategies),
             timeout=5.0,
         )
         elapsed = time.monotonic() - start
@@ -1158,25 +1189,25 @@ class TestPerStrategyWaitFor:
 
         # Real-time sleep in the *condition* function — runs between the
         # loop-gate elapsed_ms read and the remaining_budget calculation.
-        # SearchStrategy.condition is a sync callable in the strategy
+        # ``Strategy.should_attempt`` is a sync callable in the strategy
         # contract; sync time.sleep here directly mimics scheduler jitter.
         def jittery_condition(parsed, state, raw_message):  # noqa: ARG001
             time.sleep(0.1)  # 100ms blocking sleep — blows the 50ms cap
             return True
 
-        async def slow_run(db, parsed, state, raw_message):  # noqa: ARG001
+        async def slow_attempt(parsed, state, raw_message):  # noqa: ARG001
             # Anything > 10ms triggers the 0.01s wait_for floor's TimeoutError.
             await asyncio.sleep(0.05)
-            return False
+            return Outcome.empty()
 
         # Single-strategy pipeline with the jittery condition. Constructed by
         # hand rather than through build_strategies so we can inject the
         # jittery_condition that triggers the floor.
         strategies = [
-            _Strategy(
+            _StubStrategy(
                 name=SearchStrategyType.ARTIST_PLUS_ALBUM,
                 condition=jittery_condition,
-                run=slow_run,
+                attempt_func=slow_attempt,
             )
         ]
 
@@ -1190,7 +1221,6 @@ class TestPerStrategyWaitFor:
         state = await asyncio.wait_for(
             execute_search_pipeline(
                 parsed,
-                AsyncMock(),
                 "Overshoot Artist - Overshoot Song",
                 strategies,
                 song_not_found=True,
@@ -1237,7 +1267,7 @@ class TestHardCapSoftBudgetIndependence:
         search_lib = AsyncMock(side_effect=slow_first)
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(side_effect=must_not_run)
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Stereolab",
@@ -1251,7 +1281,6 @@ class TestHardCapSoftBudgetIndependence:
         with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
             state = await execute_search_pipeline(
                 parsed,
-                AsyncMock(),
                 "Stereolab - Miss Modular",
                 strategies,
                 song_not_found=True,
@@ -1353,7 +1382,7 @@ class TestCallerBudget:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = must_not_run_compilation
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Stereolab",
@@ -1369,7 +1398,6 @@ class TestCallerBudget:
         with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
             state = await execute_search_pipeline(
                 parsed,
-                AsyncMock(),
                 "Stereolab - Miss Modular",
                 strategies,
                 song_not_found=True,
@@ -1402,7 +1430,7 @@ class TestCallerBudget:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(return_value=([], {}))
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Stereolab",
@@ -1416,7 +1444,6 @@ class TestCallerBudget:
         with patch("core.search.sentry_sdk.get_current_scope", return_value=mock_scope):
             await execute_search_pipeline(
                 parsed,
-                AsyncMock(),
                 "Stereolab - Miss Modular",
                 strategies,
                 song_not_found=True,
@@ -1457,7 +1484,7 @@ class TestCallerBudget:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(side_effect=slow_empty_compilation)
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Rita Villa",
@@ -1468,7 +1495,6 @@ class TestCallerBudget:
         # caller_budget_ms = TRANSPORT_OVERHEAD_MS + 1 → effective budget = 1ms.
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "Rita Villa - Czardas",
             strategies,
             song_not_found=True,
@@ -1508,7 +1534,7 @@ class TestCallerBudget:
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(side_effect=slow_then_hit)
 
-        strategies = build_strategies(search_lib, search_alt, search_comp)
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
         parsed = ParsedRequest(
             artist="Rita Villa",
@@ -1518,7 +1544,6 @@ class TestCallerBudget:
 
         state = await execute_search_pipeline(
             parsed,
-            AsyncMock(),
             "Rita Villa - Czardas",
             strategies,
             song_not_found=True,
