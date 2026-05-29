@@ -447,6 +447,161 @@ class TestBulkLookupEndpoint:
         assert resp.status_code == 200
 
 
+class TestBulkLookupObservability:
+    """Entry/exit instrumentation pins (LML#371).
+
+    The bulk endpoint was silent in production — successful requests emitted no
+    uvicorn access lines AND no Sentry ``http.server`` spans (issue #371). The
+    underlying cause was that both signals fire on response completion, so a
+    handler that hung past the client's AbortController timeout left zero trace
+    on the server side even though Discogs work was visibly running downstream.
+
+    These tests pin the defensive instrumentation that closes the gap:
+    1. An ``INFO`` log at handler entry carrying the request shape — fires
+       BEFORE any awaits, so even a totally-hung handler produces this signal.
+    2. An ``INFO`` log at handler exit carrying status counts — confirms
+       response completion and gives operators a count breakdown without
+       digging into Sentry.
+    3. A Sentry ``http.server`` span tied to the bulk route — emitted via an
+       explicit ``start_span(op="http.server", ...)`` wrap so the signal does
+       not depend on the FastApiIntegration patch landing for this specific
+       endpoint.
+
+    The matching production change is in ``lookup/router.py:handle_bulk_lookup``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entry_log_includes_request_shape(self, app_client, caplog):
+        """An INFO log fires at handler entry with size + max_concurrent.
+
+        This is the load-bearing observability signal — it fires synchronously
+        before any awaits, so even if the handler later hangs and the response
+        never completes, operators see the request shape in Railway logs.
+        """
+        import logging
+
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_no_match_response(),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                with caplog.at_level(logging.INFO, logger="lookup.router"):
+                    resp = await ac.post(
+                        "/api/v1/lookup/bulk",
+                        json={
+                            "items": [
+                                {"artist": "Juana Molina", "album": "DOGA"},
+                                {"artist": "Cat Power", "album": "Moon Pix"},
+                                {"artist": "Stereolab", "album": "Aluminum Tunes"},
+                            ]
+                        },
+                    )
+
+        assert resp.status_code == 200
+        entry_records = [
+            r for r in caplog.records if "bulk lookup" in r.message and "start" in r.message
+        ]
+        assert entry_records, (
+            "Expected an INFO log at bulk handler entry; got logs: "
+            f"{[r.message for r in caplog.records]}"
+        )
+        entry_msg = entry_records[0].message
+        # Pin the shape: size of the batch must be in the log line so operators
+        # can correlate Railway log entries with caller-side batch sizes.
+        assert "3" in entry_msg, f"Entry log missing batch size: {entry_msg!r}"
+
+    @pytest.mark.asyncio
+    async def test_exit_log_includes_status_counts(self, app_client, caplog):
+        """An INFO log fires at handler exit carrying per-status counts.
+
+        Pairs with the entry log: the exit log confirms the response completed
+        and gives operators a count breakdown (match/no_match/error) without
+        having to query Sentry or correlate by trace id.
+        """
+        import logging
+
+        async def fake_lookup(request, **kwargs):
+            if request.artist == "miss":
+                return _no_match_response()
+            if request.artist == "boom":
+                raise RuntimeError("boom")
+            return _match_response(request.artist or "?", request.album or "?")
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock, side_effect=fake_lookup):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                with caplog.at_level(logging.INFO, logger="lookup.router"):
+                    resp = await ac.post(
+                        "/api/v1/lookup/bulk",
+                        json={
+                            "items": [
+                                {"artist": "Juana Molina", "album": "DOGA"},
+                                {"artist": "miss", "album": "X"},
+                                {"artist": "boom", "album": "Y"},
+                            ]
+                        },
+                    )
+
+        assert resp.status_code == 200
+        exit_records = [
+            r for r in caplog.records if "bulk lookup" in r.message and "complete" in r.message
+        ]
+        assert exit_records, (
+            "Expected an INFO log at bulk handler exit; got logs: "
+            f"{[r.message for r in caplog.records]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_http_server_span_emitted_for_bulk(self, app_client):
+        """An ``http.server`` Sentry span is started with the bulk route name.
+
+        Pins the explicit ``sentry_sdk.start_span(op="http.server", ...)`` in
+        the handler. Without this, observability of the bulk endpoint depended
+        entirely on the FastApiIntegration's automatic instrumentation — which
+        the production logs at 22:21-22:34 on 2026-05-24 showed was not firing
+        for hung handlers (the album-level-backfill case in #371).
+        """
+        captured_spans: list[dict] = []
+        original_start_span = sentry_sdk.start_span
+
+        def capture_start_span(*args, **kwargs):
+            captured_spans.append({"args": args, "kwargs": kwargs})
+            return original_start_span(*args, **kwargs)
+
+        with (
+            patch(
+                "lookup.router.perform_lookup",
+                new_callable=AsyncMock,
+                return_value=_no_match_response(),
+            ),
+            patch("lookup.router.sentry_sdk.start_span", side_effect=capture_start_span),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={"items": [{"artist": "Juana Molina", "album": "DOGA"}]},
+                )
+
+        assert resp.status_code == 200
+        http_server_spans = [s for s in captured_spans if s["kwargs"].get("op") == "http.server"]
+        assert http_server_spans, (
+            "Expected at least one Sentry span with op='http.server'; got: "
+            f"{[s['kwargs'].get('op') for s in captured_spans]}"
+        )
+        # The span's name must identify the bulk route so operators can filter
+        # for `span.description: POST /api/v1/lookup/bulk` in the trace explorer.
+        span_name = http_server_spans[0]["kwargs"].get("name", "")
+        assert "lookup/bulk" in span_name, (
+            f"Expected http.server span name to include 'lookup/bulk'; got {span_name!r}"
+        )
+
+
 class TestBulkLookupClientAbort:
     """Cancel-aware gather under client disconnect (LML#372).
 
