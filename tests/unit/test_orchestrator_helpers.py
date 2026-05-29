@@ -1331,6 +1331,36 @@ class TestFetchArtworkFallback:
         assert results[0][1] is not None
         assert results[0][1].artwork_url is None
 
+    @pytest.mark.asyncio
+    async def test_uses_release_artwork_when_search_misses(self, mock_discogs_service):
+        """When search returned no cover_image but get_release surfaces an
+        artwork_url (from images[0].uri), prefer the release-level cover over
+        the artist/label image fallback. The /proxy/metadata/album legacy
+        two-call path already does this via populateReleaseMetadata; the
+        enrichment-worker takes the single-call path, so the fallback resolver
+        is the only place that can surface the cover for it."""
+        items = [make_library_item(id=1, artist="Autechre", title="Confield")]
+
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[make_discogs_result(release_id=28138, artwork_url=None)]
+        )
+        mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=28138,
+            title="Confield",
+            artist="Autechre",
+            artist_id=77,
+            label_id=233,
+            artwork_url="https://i.discogs.com/release-cover.jpg",
+            release_url="https://www.discogs.com/release/28138",
+        )
+
+        results = await fetch_artwork_for_items(items, mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1].artwork_url == "https://i.discogs.com/release-cover.jpg"
+        mock_discogs_service.get_artist_image.assert_not_called()
+        mock_discogs_service.get_label_image.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Tests: search_song_as_track (catalog-track-search §4.2, LML#301)

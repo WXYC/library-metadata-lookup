@@ -1458,10 +1458,18 @@ async def find_library_albums_with_cached_track(
 
 
 async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id: int) -> str | None:
-    """Try artist image, then label image, for a release with no cover art."""
+    """Try the release's own cover (images[0]), then artist image, then label image."""
     release = await discogs_service.get_release(release_id)
     if not release:
         return None
+
+    # The search endpoint's `cover_image` is sometimes empty for releases whose
+    # release-detail `images[0].uri` is populated. Prefer that over the
+    # artist/label image fallback so enrichment-worker callers (single LML
+    # round-trip) recover the same cover the /proxy/metadata/album legacy
+    # two-call path produces via populateReleaseMetadata.
+    if release.artwork_url:
+        return release.artwork_url
 
     if release.artist_id:
         image = await discogs_service.get_artist_image(release.artist_id)
