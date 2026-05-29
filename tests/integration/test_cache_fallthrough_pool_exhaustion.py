@@ -53,6 +53,7 @@ discogs-cache.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 from unittest.mock import MagicMock
 
@@ -83,7 +84,7 @@ _POOL_ACQUIRE_TIMEOUT_SECONDS = 0.5
 
 
 class _TimeoutPoolWrapper:
-    """Proxy an asyncpg pool, capping every query's wall time with ``asyncio.wait_for``.
+    """Proxy an asyncpg pool, capping every coroutine call with ``asyncio.wait_for``.
 
     ``asyncpg.Pool.fetchrow`` / ``fetch`` / ``fetchval`` accept a ``timeout=``
     kwarg, but it only governs the *per-query* command timeout — the inner
@@ -95,23 +96,24 @@ class _TimeoutPoolWrapper:
     a clean :class:`TimeoutError` within a bounded window, matching the
     deliberately-undersized-pool scenario the AC describes.
 
-    Only proxies the methods :class:`DiscogsCacheService.get_release` needs;
-    other call sites would need their own pass-throughs added here if a future
-    test exercises them.
+    Forwards every coroutine-returning attribute (``fetchrow``, ``fetch``,
+    ``fetchval``, ``execute``, ...); non-coroutine attributes pass through
+    unwrapped. New cache-service call sites work automatically.
     """
 
     def __init__(self, pool: asyncpg.Pool, timeout: float):
         self._pool = pool
         self._timeout = timeout
 
-    async def fetchrow(self, *args, **kwargs):
-        return await asyncio.wait_for(self._pool.fetchrow(*args, **kwargs), timeout=self._timeout)
+    def __getattr__(self, name: str):
+        attr = getattr(self._pool, name)
+        if not inspect.iscoroutinefunction(attr):
+            return attr
 
-    async def fetch(self, *args, **kwargs):
-        return await asyncio.wait_for(self._pool.fetch(*args, **kwargs), timeout=self._timeout)
+        async def _timed(*args, **kwargs):
+            return await asyncio.wait_for(attr(*args, **kwargs), timeout=self._timeout)
 
-    async def fetchval(self, *args, **kwargs):
-        return await asyncio.wait_for(self._pool.fetchval(*args, **kwargs), timeout=self._timeout)
+        return _timed
 
 
 @pytest_asyncio.fixture
