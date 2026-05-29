@@ -1,4 +1,4 @@
-"""Unit tests for scripts/bandcamp_client.py."""
+"""Unit tests for clients/bandcamp.py."""
 
 from __future__ import annotations
 

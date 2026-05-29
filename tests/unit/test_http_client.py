@@ -1,4 +1,4 @@
-"""Unit tests for scripts/streaming_availability/http_client.py."""
+"""Unit tests for clients/streaming/base.py."""
 
 import asyncio
 from unittest.mock import AsyncMock, patch

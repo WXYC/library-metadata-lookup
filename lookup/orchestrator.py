@@ -1584,7 +1584,7 @@ def _build_streaming_search_url(base: str, artist: str, term: str) -> str:
 # Minimum fuzzy score (0-100) for accepting an iTunes Search result as a genuine
 # match for the requested artist + track (+ album, when provided). Mirrors the
 # 80/80 artist+title floor the streaming-availability batch matcher enforces
-# (scripts/streaming_availability/matching.py:is_acceptable_match). iTunes
+# (clients/streaming/matching.py:is_acceptable_match). iTunes
 # Search ranking is non-deterministic for obscure artists, so a bare results[0]
 # intermittently surfaces a popular but wrong artist (e.g. "Pleasure"/"Joyous"
 # -> Sheryl Crow, see #389), and same-named tracks on multiple of an artist's

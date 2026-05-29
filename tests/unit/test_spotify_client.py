@@ -1,4 +1,4 @@
-"""Unit tests for scripts/streaming_availability/spotify_client.py."""
+"""Unit tests for clients/streaming/spotify.py."""
 
 from unittest.mock import AsyncMock, patch
 

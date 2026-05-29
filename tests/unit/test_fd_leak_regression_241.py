@@ -18,7 +18,7 @@ investigation as concrete contracts the code should satisfy:
    accumulate FDs faster than they can be cleaned up.
 
 2. Two lazy-init asyncpg pools have a TOCTOU race:
-   ``scripts/entity_resolution/sources.py:PgSource._get_pool`` and
+   ``entity/sources.py:PgSource._get_pool`` and
    ``core/dependencies.py:get_discogs_service``. Both check ``self._pool is
    None`` then ``await asyncpg.create_pool(...)`` without a lock. Concurrent
    first-callers each pass the check, each create a pool, and all but one
