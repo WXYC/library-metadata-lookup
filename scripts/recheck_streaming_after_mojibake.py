@@ -31,10 +31,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from scripts.bandcamp_client import BandcampClient
-from scripts.streaming_availability.apple_music_client import AppleMusicClient
-from scripts.streaming_availability.deezer_client import DeezerClient
-from scripts.streaming_availability.spotify_client import SpotifyClient
+from clients.bandcamp import BandcampClient
+from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.deezer import DeezerClient
+from clients.streaming.spotify import SpotifyClient
 from streaming.orchestrator import check_streaming_availability
 
 logger = logging.getLogger(__name__)

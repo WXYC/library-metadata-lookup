@@ -16,13 +16,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from clients.streaming.matching import score_match
 from scripts.streaming_availability.discogs_enricher import (
     check_wxyc_schema,
     enrich_album,
     load_entity_store_mapping,
     pick_best_match,
 )
-from scripts.streaming_availability.matching import score_match
 
 # ---------------------------------------------------------------------------
 # Fixture data: representative WXYC artists and their Discogs counterparts

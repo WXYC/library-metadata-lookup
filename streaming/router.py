@@ -6,10 +6,10 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from scripts.bandcamp_client import BandcampClient
-from scripts.streaming_availability.apple_music_client import AppleMusicClient
-from scripts.streaming_availability.deezer_client import DeezerClient
-from scripts.streaming_availability.spotify_client import SpotifyClient
+from clients.bandcamp import BandcampClient
+from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.deezer import DeezerClient
+from clients.streaming.spotify import SpotifyClient
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,

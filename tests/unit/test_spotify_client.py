@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from scripts.streaming_availability.spotify_client import SpotifyClient
+from clients.streaming.spotify import SpotifyClient
 
 
 def _token_response(access_token: str = "test-token", expires_in: int = 3600) -> httpx.Response:

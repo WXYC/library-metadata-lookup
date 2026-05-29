@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from scripts.streaming_availability.http_client import BaseStreamingClient
+from clients.streaming.base import BaseStreamingClient
 
 
 class TestBaseStreamingClient:
@@ -141,7 +141,7 @@ class TestBaseStreamingClientGetClientRace:
         sentinel = AsyncMock()
         sentinel.aclose = AsyncMock()
         with patch(
-            "scripts.streaming_availability.http_client.httpx.AsyncClient",
+            "clients.streaming.base.httpx.AsyncClient",
             return_value=sentinel,
         ):
             await client._get_client()

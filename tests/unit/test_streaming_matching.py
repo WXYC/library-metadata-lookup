@@ -2,7 +2,7 @@
 
 import pytest
 
-from scripts.streaming_availability.matching import (
+from clients.streaming.matching import (
     is_acceptable_match,
     normalize_album_title,
     normalize_artist_name,
@@ -146,7 +146,7 @@ class TestFindBestMatch:
     """Tests for the generic find_best_match function."""
 
     def test_finds_best_by_combined_score(self):
-        from scripts.streaming_availability.matching import find_best_match
+        from clients.streaming.matching import find_best_match
 
         results = [
             {"artist": "Stereolab", "album": "Dots and Loops", "url": "http://a"},
@@ -165,7 +165,7 @@ class TestFindBestMatch:
         assert best["matched_title"] == "Aluminum Tunes"
 
     def test_returns_none_when_no_acceptable_match(self):
-        from scripts.streaming_availability.matching import find_best_match
+        from clients.streaming.matching import find_best_match
 
         results = [
             {"artist": "Cat Power", "album": "Moon Pix", "url": "http://x"},
@@ -181,7 +181,7 @@ class TestFindBestMatch:
         assert best is None
 
     def test_returns_none_for_empty_results(self):
-        from scripts.streaming_availability.matching import find_best_match
+        from clients.streaming.matching import find_best_match
 
         best = find_best_match(
             [],
@@ -194,7 +194,7 @@ class TestFindBestMatch:
         assert best is None
 
     def test_includes_id_when_id_fn_provided(self):
-        from scripts.streaming_availability.matching import find_best_match
+        from clients.streaming.matching import find_best_match
 
         results = [
             {"artist": "Stereolab", "album": "Aluminum Tunes", "url": "http://b", "id": "abc123"},
@@ -212,7 +212,7 @@ class TestFindBestMatch:
         assert best["id"] == "abc123"
 
     def test_no_id_key_when_id_fn_omitted(self):
-        from scripts.streaming_availability.matching import find_best_match
+        from clients.streaming.matching import find_best_match
 
         results = [
             {"artist": "Stereolab", "album": "Aluminum Tunes", "url": "http://b"},
@@ -230,7 +230,7 @@ class TestFindBestMatch:
 
     def test_spotify_field_extraction(self):
         """Verifies find_best_match works with Spotify's nested response format."""
-        from scripts.streaming_availability.matching import find_best_match
+        from clients.streaming.matching import find_best_match
 
         results = [
             {

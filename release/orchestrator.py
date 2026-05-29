@@ -31,6 +31,10 @@ import re
 
 from wxyc_etl.text import is_compilation_artist
 
+from clients.bandcamp import BandcampClient, extract_slug
+from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.deezer import DeezerClient
+from clients.streaming.spotify import SpotifyClient
 from discogs.service import DiscogsService
 from entity.store import EntityStore
 from release.bandcamp_resolver import resolve_bandcamp_album
@@ -45,10 +49,6 @@ from release.models import (
     ReleaseResolveResponse,
 )
 from release.url_parser import ParsedUrl, parse_url
-from scripts.bandcamp_client import BandcampClient, extract_slug
-from scripts.streaming_availability.apple_music_client import AppleMusicClient
-from scripts.streaming_availability.deezer_client import DeezerClient
-from scripts.streaming_availability.spotify_client import SpotifyClient
 from streaming.models import SourceMatch, StreamingCheckResponse, StreamingCheckSources
 from streaming.orchestrator import check_streaming_availability
 

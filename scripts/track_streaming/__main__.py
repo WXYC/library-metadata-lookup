@@ -289,11 +289,11 @@ async def phase_api_search(results_db: ResultsDB, args) -> tuple[int, int]:
     client_id = os.environ.get("SPOTIFY_CLIENT_ID")
     client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
     if client_id and client_secret:
-        from scripts.streaming_availability.spotify_client import SpotifyClient
+        from clients.streaming.spotify import SpotifyClient
 
         spotify = SpotifyClient(client_id, client_secret)
 
-    from scripts.streaming_availability.deezer_client import DeezerClient
+    from clients.streaming.deezer import DeezerClient
 
     deezer = DeezerClient()
 

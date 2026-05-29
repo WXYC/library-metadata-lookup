@@ -23,8 +23,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from clients.bandcamp import BandcampClient
 from release.models import CanonicalRelease, ReleaseIdentifiers
-from scripts.bandcamp_client import BandcampClient
 
 logger = logging.getLogger(__name__)
 

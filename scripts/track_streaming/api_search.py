@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from scripts.streaming_availability.matching import find_best_match
+from clients.streaming.matching import find_best_match
 
 logger = logging.getLogger(__name__)
 

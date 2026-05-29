@@ -20,7 +20,7 @@ from argparse import ArgumentParser
 import aiosqlite
 from dotenv import load_dotenv
 
-from scripts.streaming_availability.matching import (
+from clients.streaming.matching import (
     normalize_artist_credit,
     score_match,
     strip_format_suffix,
