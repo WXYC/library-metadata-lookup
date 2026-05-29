@@ -75,7 +75,9 @@ logger = logging.getLogger(__name__)
 
 # How long PG reads stay suppressed after a cache-leg failure. Process-wide;
 # Railway runs single-process workers per replica so per-replica granularity
-# is what we want.
+# is what we want. Heads-up for future-Jake: switching to a multi-process
+# worker model (e.g. gunicorn with N workers per replica) would mean each
+# worker arms its own cool-down independently — no cross-worker propagation.
 _COOL_DOWN_SECONDS: float = 30.0
 
 # Module-level cool-down state. Mutated by ``_arm_cool_down`` /
@@ -93,6 +95,13 @@ _ARMING_EXCEPTIONS: tuple[type[BaseException], ...] = (
     asyncpg.exceptions.UndefinedTableError,
     CacheUnavailableError,
 )
+
+
+# Default predicate for ``fallthrough(is_pg_hit=...)``. Hoisted to module scope
+# (rather than inlined as a default lambda) so ``repr(fallthrough)`` and the
+# signature read "default sentinel" instead of "anonymous lambda".
+def _default_is_pg_hit(v: object | None) -> bool:
+    return v is not None
 
 
 def _arm_cool_down(reason: str, error: BaseException) -> None:
@@ -141,7 +150,7 @@ async def fallthrough[T](
     pg_negative_check: Callable[[], Awaitable[bool]] | None = None,
     pg_negative_record: Callable[[], Awaitable[None]] | None = None,
     on_negative_hit: Callable[[], T] | None = None,
-    is_pg_hit: Callable[[T | None], bool] = lambda v: v is not None,
+    is_pg_hit: Callable[[T | None], bool] = _default_is_pg_hit,
     is_empty: Callable[[T], bool] | None = None,
     breadcrumb_data: dict[str, Any] | None = None,
 ) -> T | None:
