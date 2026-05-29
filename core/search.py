@@ -11,15 +11,14 @@ import logging
 import os
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import ClassVar, Protocol
 
 import sentry_sdk
 
 from generated.api_models import TrackMatchHint
-from library.db import LibraryDB
 from library.models import LibraryItem
 from services.parser import ParsedRequest
 
@@ -344,61 +343,237 @@ Args:
     raw_message: Original request message
 """
 
-ExecuteFunc = Callable[..., Awaitable[tuple[list[LibraryItem], Any]]]
-"""Async function executed by a strategy's ``run`` wrapper.
 
-Returns a tuple whose second element shape varies per strategy:
+@dataclass(frozen=True, slots=True)
+class Outcome:
+    """A strategy's complete declared effect on :class:`SearchState`.
 
-    - ``ARTIST_PLUS_ALBUM``: ``bool`` (fallback_used)
-    - ``SWAPPED_INTERPRETATION``: ``None``
-    - ``TRACK_ON_COMPILATION``: ``dict[int, str]`` (discogs_titles)
-    - ``SONG_AS_ARTIST``: ``None``
-    - ``SONG_AS_TRACK``: ``dict[int, list[TrackMatchHint]]`` (matched_via_by_id)
+    Returned (not applied) by :meth:`Strategy.attempt` — the runner applies it
+    via :func:`_apply`. This is what makes cancellation safety structural: a
+    cancelled ``attempt()`` never returns an ``Outcome``, so no commit happens,
+    period. The await-then-commit *discipline* from step 1 (#391) becomes a
+    *type-enforced* contract here.
 
-The heterogeneous shape is the artifact step 2 (#399) replaces with a uniform
-``Outcome`` value type. In step 1 it lives behind each strategy's ``run``
-wrapper so the central dispatch loop never sees it.
-"""
+    The five named constructors below encode the four real effect-shapes the
+    pre-#399 strategy wrappers expressed with heterogeneous ``(list, Any)``
+    tuples, plus an explicit no-op:
 
-RunFunc = Callable[[LibraryDB, ParsedRequest, "SearchState", str], Awaitable[bool]]
-"""Async strategy body invoked by ``execute_search_pipeline``.
+        - :meth:`empty`            -- nothing to apply
+        - :meth:`found`            -- direct match (the 90% case)
+        - :meth:`artist_fallback`  -- fell through to artist-only / artist+song
+        - :meth:`compilation`      -- TRACK_ON_COMPILATION's full signal
+        - :meth:`track_match`      -- SONG_AS_TRACK's per-id hint set
 
-Contract:
-    1. Do **all** awaits before any write to ``SearchState``. The runner wraps
-       ``run`` in ``asyncio.wait_for`` (the LML#370 hard cap); a cancellation
-       between the last await and the final state mutation would leave the
-       state half-updated. Await-then-commit makes a cancelled ``run`` a
-       structural no-op.
-    2. Return ``True`` if this strategy populated ``state.results``; ``False``
-       otherwise. The runner combines the return with the current
-       ``state.results`` / ``state.song_not_found`` to decide whether to
-       break the cascade.
-"""
-
-
-@dataclass(frozen=True)
-class _Strategy:
-    """Strategy seam consumed by :func:`execute_search_pipeline`.
-
-    Built by :func:`build_strategies` from an injected ``ExecuteFunc`` plus the
-    per-strategy condition predicate; each strategy's ``run`` closure owns the
-    commit logic that used to live in the runner's ``if/elif`` arm.
-
-    Underscore-prefixed because callers should not construct these directly —
-    they're an implementation detail of the runner's seam. Tests that need a
-    bespoke strategy (e.g. ``TestPerStrategyWaitFor``) bypass
-    ``build_strategies`` and construct ``_Strategy`` directly, which is the
-    one accepted external use.
+    Field-level documentation lives on :func:`_apply`, which is the single
+    write site that consumes these fields.
     """
 
-    name: SearchStrategyType
-    """Strategy identifier for telemetry (``strategies_tried`` log)."""
+    items: list[LibraryItem]
+    """Library items the strategy produced. Empty list means no-op for results.
 
-    condition: ConditionFunc
-    """Predicate gating whether ``run`` is called this iteration."""
+    ``Outcome.artist_fallback([])`` is the exception: empty items but
+    ``song_not_found_after=True`` — ARTIST_PLUS_ALBUM's "no library hit but
+    flag the downstream cascade" signal.
+    """
 
-    run: RunFunc
-    """Async body — see :data:`RunFunc` for the cancellation contract."""
+    song_not_found_after: bool | None = None
+    """Desired ``state.song_not_found`` value after :func:`_apply`.
+
+    ``None`` means "leave alone". The flag flips for two opposite reasons:
+    ``True`` when fallback was used (downstream TRACK_ON_COMPILATION needs to
+    know the song wasn't directly matched), ``False`` when the strategy
+    actually matched the song (clears any prior fallback signal).
+    """
+
+    found_on_compilation_after: bool = False
+    """When True, :func:`_apply` sets ``state.found_on_compilation = True``."""
+
+    preserve_prior_results_as_fallback: bool = False
+    """The TRACK_ON_COMPILATION stash rule.
+
+    When True AND ``state.results`` AND ``state.song_not_found``, the
+    pre-update ``state.results`` is copied to ``state.artist_fallback_results``
+    so ``perform_lookup`` can validate the artist fallback against Discogs
+    tracklists and merge any confirmed matches back into the final results
+    after the compilation hit replaces them.
+    """
+
+    discogs_titles: dict[int, str] | None = None
+    """Per-id Discogs album titles (for artwork lookup). ``None`` = no-op."""
+
+    matched_via_by_id: dict[int, list[TrackMatchHint]] | None = None
+    """Per-id track-match hints (catalog-track-search §5.1). ``None`` = no-op."""
+
+    @classmethod
+    def empty(cls) -> "Outcome":
+        """Strategy ran but produced nothing — no writes to apply."""
+        return cls(items=[])
+
+    @classmethod
+    def found(cls, items: list[LibraryItem]) -> "Outcome":
+        """Direct match where the strategy can vouch for the song.
+
+        Clears ``state.song_not_found`` because the strategy explicitly
+        confirmed the song (SWAPPED_INTERPRETATION matched the swapped
+        interpretation, SONG_AS_ARTIST cross-referenced Discogs releases,
+        etc.). Use this for the 90% case where success means "the song
+        was matched."
+
+        For ARTIST_PLUS_ALBUM's direct path — where the artist's album was
+        found by name but the song's presence on the album wasn't verified —
+        use :meth:`album_match` instead, which leaves ``song_not_found``
+        alone so a prior album-resolution signal can still drive
+        TRACK_ON_COMPILATION downstream.
+        """
+        return cls(items=items, song_not_found_after=False)
+
+    @classmethod
+    def album_match(cls, items: list[LibraryItem]) -> "Outcome":
+        """ARTIST_PLUS_ALBUM's direct path: items found, but no claim about the song.
+
+        ARTIST_PLUS_ALBUM is the only strategy that doesn't independently
+        confirm the song — it matches by artist+album text, not by tracklist
+        cross-reference. When ``resolve_albums_for_track`` already set
+        ``song_not_found=True`` (Discogs returned only VA releases for the
+        track), and ARTIST_PLUS_ALBUM then finds the artist's album by name,
+        we want to *preserve* that ``song_not_found=True`` signal so
+        TRACK_ON_COMPILATION still runs to surface the compilation match.
+        ``perform_lookup``'s post-pipeline track_validation step then merges
+        the artist's album back in via the artist_fallback_results stash.
+
+        See ``test_compilation_search_when_song_not_found_from_album_resolution``
+        and the wider trace in the Adonis / "No Way Back" / Trax 20th case.
+        """
+        return cls(items=items)
+
+    @classmethod
+    def artist_fallback(cls, items: list[LibraryItem]) -> "Outcome":
+        """ARTIST_PLUS_ALBUM's fallback path: results came from artist-only
+        or artist+song search rather than artist+album.
+
+        ``song_not_found_after=True`` because the song title wasn't directly
+        matched. Downstream TRACK_ON_COMPILATION keys on the flag.
+        Works with ``items=[]`` too — the flag-only "no library hit but
+        downstream cascade should know" signal.
+        """
+        return cls(items=items, song_not_found_after=True)
+
+    @classmethod
+    def compilation(cls, items: list[LibraryItem], *, discogs_titles: dict[int, str]) -> "Outcome":
+        """TRACK_ON_COMPILATION's full signal.
+
+        Five writes packaged together:
+            - new items
+            - ``found_on_compilation = True``
+            - ``song_not_found = False`` (the song was matched, just on a
+              compilation rather than the artist's own release)
+            - ``discogs_titles`` for artwork lookup
+            - ``preserve_prior_results_as_fallback = True`` so any artist
+              fallback that ran first is stashed for post-pipeline validation
+        """
+        return cls(
+            items=items,
+            song_not_found_after=False,
+            found_on_compilation_after=True,
+            preserve_prior_results_as_fallback=True,
+            discogs_titles=discogs_titles,
+        )
+
+    @classmethod
+    def track_match(
+        cls,
+        items: list[LibraryItem],
+        *,
+        matched_via_by_id: dict[int, list[TrackMatchHint]],
+    ) -> "Outcome":
+        """SONG_AS_TRACK's signal: track-driven match with per-id provenance.
+
+        The library row(s) were surfaced by cross-referencing the song against
+        Discogs's tracklist index. Each row carries a TrackMatchHint pointing
+        back to the release that surfaced it — the API contract uses this for
+        the ``matched_via`` field per catalog-track-search §5.1.
+        """
+        return cls(
+            items=items,
+            song_not_found_after=False,
+            matched_via_by_id=matched_via_by_id,
+        )
+
+
+def _apply(state: SearchState, outcome: Outcome) -> None:
+    """Apply an :class:`Outcome` to :class:`SearchState`.
+
+    The single write site for strategy-driven SearchState mutations. The runner
+    calls this exactly once per strategy attempt (after ``asyncio.wait_for``
+    returns successfully); no per-strategy branching needed.
+
+    Two ordering invariants worth pinning:
+
+    1. **Items-empty short-circuit applies to most writes, but not to
+       ``song_not_found_after``.** ARTIST_PLUS_ALBUM can return ``([], True)``
+       when artist+song falls through to artist-only and the artist isn't in
+       the library at all — the flag still needs to propagate so downstream
+       TRACK_ON_COMPILATION's condition (``state.song_not_found and ...``)
+       evaluates correctly.
+
+    2. **The stash check reads prior ``state.song_not_found`` before the
+       update.** TRACK_ON_COMPILATION clears ``song_not_found`` to False as
+       part of its outcome (the song WAS matched, just on a compilation), but
+       the stash predicate ``state.results and state.song_not_found`` must
+       evaluate against the value as it stood when the strategy started. A
+       naive single-pass write order would never stash; this function does
+       stash first, then writes.
+    """
+    if not outcome.items:
+        # No items → only the flag-only signal (ARTIST_PLUS_ALBUM ``([], True)``
+        # case) can propagate. Skip results / found_on_compilation / titles /
+        # hints to avoid clobbering prior strategy state with a no-op.
+        if outcome.song_not_found_after is not None:
+            state.song_not_found = outcome.song_not_found_after
+        return
+
+    # Stash check must run BEFORE song_not_found_after is written, because
+    # the predicate reads the prior value.
+    if outcome.preserve_prior_results_as_fallback and state.results and state.song_not_found:
+        state.artist_fallback_results = list(state.results)
+
+    state.results = outcome.items
+    if outcome.song_not_found_after is not None:
+        state.song_not_found = outcome.song_not_found_after
+    if outcome.found_on_compilation_after:
+        state.found_on_compilation = True
+    if outcome.discogs_titles is not None:
+        state.discogs_titles = outcome.discogs_titles
+    if outcome.matched_via_by_id is not None:
+        state.matched_via_by_id = outcome.matched_via_by_id
+
+
+class Strategy(Protocol):
+    """The runner's strategy seam — concrete implementations live in ``lookup/strategies/``.
+
+    Two methods plus a name:
+
+        - ``name`` (a ``ClassVar``) — telemetry identifier appended to
+          ``state.strategies_tried`` before ``attempt`` runs.
+        - ``should_attempt(parsed, state, raw_message) -> bool`` — predicate
+          gating whether this iteration runs ``attempt``. Pure; cheap; reads
+          only the inputs.
+        - ``attempt(parsed, state, raw_message) -> Outcome`` — the async body.
+          Returns an :class:`Outcome`; **never** writes to ``state`` directly.
+          This is what makes cancellation safety structural — see
+          :class:`Outcome` for the contract.
+    """
+
+    name: ClassVar[SearchStrategyType]
+    """Telemetry identifier appended to ``state.strategies_tried``."""
+
+    def should_attempt(
+        self, parsed: ParsedRequest, state: SearchState, raw_message: str
+    ) -> bool: ...
+
+    async def attempt(
+        self, parsed: ParsedRequest, state: SearchState, raw_message: str
+    ) -> Outcome: ...
 
 
 # =============================================================================
@@ -459,196 +634,46 @@ def no_results_and_song_but_no_artist_track_fallback(
 
 
 # =============================================================================
-# Strategy Registry
+# Pipeline runner
 # =============================================================================
-
-
-def build_strategies(
-    search_library_func: ExecuteFunc,
-    search_alternative_func: ExecuteFunc,
-    search_compilations_func: ExecuteFunc,
-    search_song_as_artist_func: ExecuteFunc | None = None,
-    search_song_as_track_func: ExecuteFunc | None = None,
-) -> list[_Strategy]:
-    """Build the list of search strategies with injected execute functions.
-
-    Wraps each ``ExecuteFunc`` into a :class:`_Strategy` whose ``run`` closure
-    owns the per-strategy commit to :class:`SearchState`. The five wrappers
-    encode the contract that used to live in the runner's ``if/elif`` arms:
-    each one awaits first, then commits, then returns the ``produced`` bool.
-
-    Args:
-        search_library_func: Function implementing ARTIST_PLUS_ALBUM search.
-            Returns ``(list, fallback_used)``; the wrapper writes
-            ``state.results`` when non-empty and ``state.song_not_found``
-            when the fallback flag fires.
-        search_alternative_func: Function implementing SWAPPED_INTERPRETATION
-            search. The wrapper extracts ``(part1, part2)`` from the raw
-            message via :func:`detect_ambiguous_format`.
-        search_compilations_func: Function implementing TRACK_ON_COMPILATION
-            search. The wrapper stashes the prior artist-fallback results
-            into ``state.artist_fallback_results`` before replacing
-            ``state.results``, so perform_lookup can validate them against
-            Discogs tracklists afterward.
-        search_song_as_artist_func: Function implementing SONG_AS_ARTIST search.
-            Optional; when ``None``, the strategy is omitted from the list.
-        search_song_as_track_func: Function implementing SONG_AS_TRACK search
-            (catalog-track-search §4.2). Fires strictly after SONG_AS_ARTIST.
-            Optional; when ``None``, the strategy is omitted.
-
-    Returns:
-        List of ``_Strategy`` objects in execution order. The runner consumes
-        them generically — see :class:`_Strategy` for the seam contract.
-    """
-
-    async def run_artist_plus_album(
-        db: LibraryDB,
-        parsed: ParsedRequest,
-        state: SearchState,
-        raw_message: str,  # noqa: ARG001
-    ) -> bool:
-        results, fallback_used = await search_library_func(db, parsed, state.albums_for_search)
-        # Commit only after the await returns — cancellation between here and
-        # the wait_for raise is a structural no-op because no state was written.
-        if results:
-            state.results = results
-        if fallback_used:
-            state.song_not_found = True
-        return bool(results)
-
-    async def run_swapped_interpretation(
-        db: LibraryDB,
-        parsed: ParsedRequest,  # noqa: ARG001
-        state: SearchState,
-        raw_message: str,
-    ) -> bool:
-        parts = detect_ambiguous_format(raw_message)
-        if parts is None:
-            # Defensive — the SWAPPED condition already guarantees parts is non-None
-            # when this runs. Kept so a future condition change can't silently
-            # crash here.
-            return False
-        part1, part2 = parts
-        results, _meta = await search_alternative_func(db, part1, part2)
-        if results:
-            state.results = results
-            state.song_not_found = False
-        return bool(results)
-
-    async def run_track_on_compilation(
-        db: LibraryDB,
-        parsed: ParsedRequest,
-        state: SearchState,
-        raw_message: str,  # noqa: ARG001
-    ) -> bool:
-        results, discogs_titles = await search_compilations_func(db, parsed)
-        if not results:
-            return False
-        # Save artist-fallback results before replacing — perform_lookup will
-        # validate them against Discogs tracklists and merge any confirmed
-        # matches back into the final results. The condition for this stash
-        # (state.results AND state.song_not_found) was previously inlined in
-        # the runner's TRACK_ON_COMPILATION arm.
-        if state.results and state.song_not_found:
-            state.artist_fallback_results = list(state.results)
-        state.results = results
-        state.found_on_compilation = True
-        state.song_not_found = False
-        state.discogs_titles = discogs_titles
-        return True
-
-    async def run_song_as_artist(
-        db: LibraryDB,
-        parsed: ParsedRequest,
-        state: SearchState,
-        raw_message: str,  # noqa: ARG001
-    ) -> bool:
-        assert search_song_as_artist_func is not None  # type narrowing — see closure capture
-        results, _meta = await search_song_as_artist_func(db, parsed.song)
-        if results:
-            state.results = results
-            state.song_not_found = False
-        return bool(results)
-
-    async def run_song_as_track(
-        db: LibraryDB,
-        parsed: ParsedRequest,
-        state: SearchState,
-        raw_message: str,  # noqa: ARG001
-    ) -> bool:
-        assert search_song_as_track_func is not None
-        results, matched_via_by_id = await search_song_as_track_func(db, parsed.song)
-        if results:
-            state.results = results
-            state.song_not_found = False
-            state.matched_via_by_id = matched_via_by_id
-        return bool(results)
-
-    strategies: list[_Strategy] = [
-        _Strategy(
-            name=SearchStrategyType.ARTIST_PLUS_ALBUM,
-            condition=has_artist_or_album_or_song,
-            run=run_artist_plus_album,
-        ),
-        _Strategy(
-            name=SearchStrategyType.SWAPPED_INTERPRETATION,
-            condition=no_results_and_ambiguous_format,
-            run=run_swapped_interpretation,
-        ),
-        _Strategy(
-            name=SearchStrategyType.TRACK_ON_COMPILATION,
-            condition=song_not_found_with_artist_and_song,
-            run=run_track_on_compilation,
-        ),
-    ]
-
-    if search_song_as_artist_func is not None:
-        strategies.append(
-            _Strategy(
-                name=SearchStrategyType.SONG_AS_ARTIST,
-                condition=no_results_and_song_but_no_artist,
-                run=run_song_as_artist,
-            )
-        )
-
-    # SONG_AS_TRACK must come AFTER SONG_AS_ARTIST — its condition checks that
-    # SONG_AS_ARTIST already ran and produced nothing. Ordering is array
-    # position; the condition does the runtime cross-check.
-    if search_song_as_track_func is not None:
-        strategies.append(
-            _Strategy(
-                name=SearchStrategyType.SONG_AS_TRACK,
-                condition=no_results_and_song_but_no_artist_track_fallback,
-                run=run_song_as_track,
-            )
-        )
-
-    return strategies
+#
+# Step-1 (#391) made the runner generic — no ``strategy.name`` branch — by
+# wrapping each execute func in a closure that owned the commit logic.
+# Step-2 (#399) deepens it further: the seam now carries a uniform
+# :class:`Outcome` value type, and the runner has exactly one
+# :func:`_apply` write site to ``SearchState``. The per-strategy commit
+# logic moves into the strategy classes themselves
+# (``lookup/strategies/``); the runner names no strategy and writes no
+# state field individually.
 
 
 async def execute_search_pipeline(
     parsed: ParsedRequest,
-    db: LibraryDB,
     raw_message: str,
-    strategies: list[_Strategy],
+    strategies: list[Strategy],
     albums_for_search: list[str] | None = None,
     song_not_found: bool = False,
     caller_budget_ms: int | None = None,
 ) -> SearchState:
     """Execute strategies in array order until results found.
 
-    Dispatch is **generic**: the runner calls ``strategy.run`` without naming
-    any strategy. Each ``run`` is a closure built by :func:`build_strategies`
-    that owns the per-strategy commit to ``SearchState`` (see :data:`RunFunc`
-    for the cancellation contract). The cross-cutting budget / hard-cap /
-    caller-budget machinery and the ``state.timed_out`` projection are
-    unchanged from pre-#391.
+    Dispatch is **generic**: the runner calls ``strategy.attempt`` without
+    naming any strategy and applies the returned :class:`Outcome` via
+    :func:`_apply`. The cross-cutting budget / hard-cap / caller-budget
+    machinery and the ``state.timed_out`` projection are unchanged from
+    pre-#399.
+
+    Cancellation safety is **structural**: ``attempt()`` returns ``Outcome``
+    and cannot mutate ``state`` directly, so a cancelled ``attempt()`` is a
+    no-op against state by construction. The step-1 await-then-commit
+    *discipline* is replaced by a type-enforced contract.
 
     Args:
         parsed: The parsed request with artist/song/album.
-        db: Library database for searches.
         raw_message: Original request message (for ambiguous format detection).
         strategies: List of search strategies to try, in execution order.
+            Each strategy holds its own dependencies (``db``,
+            ``discogs_service``, etc.) as instance fields.
         albums_for_search: Optional list of album names from Discogs lookup.
         song_not_found: Whether album resolution already determined the song
             wasn't found.
@@ -733,8 +758,8 @@ async def execute_search_pipeline(
             )
             break
 
-        # Check if strategy should run
-        if not strategy.condition(parsed, state, raw_message):
+        # Check if strategy should run.
+        if not strategy.should_attempt(parsed, state, raw_message):
             continue
 
         state.strategies_tried.append(strategy.name)
@@ -752,11 +777,12 @@ async def execute_search_pipeline(
         # wait_for ceiling fires uniformly. CancelledError → TimeoutError raised
         # by wait_for propagates into in-flight asyncio.gather() probes inside
         # the strategy, freeing the Discogs semaphore on cap-fire. The
-        # RunFunc contract (await-then-commit) makes a cancelled run a
-        # structural no-op against SearchState.
+        # Outcome-returning contract (attempt cannot mutate state) makes a
+        # cancelled attempt a structural no-op against SearchState — no need
+        # for an await-then-commit discipline inside the strategy body.
         try:
-            produced = await asyncio.wait_for(
-                strategy.run(db, parsed, state, raw_message),
+            outcome = await asyncio.wait_for(
+                strategy.attempt(parsed, state, raw_message),
                 timeout=remaining_budget_seconds,
             )
         except TimeoutError:
@@ -768,15 +794,19 @@ async def execute_search_pipeline(
             )
             break
 
-        # Stop when this strategy populated results AND we're not still in the
+        # The one write site: every per-strategy ``SearchState`` mutation
+        # happens here, driven by the outcome's flags. See :func:`_apply`.
+        _apply(state, outcome)
+
+        # Stop when results are populated AND we're not still in the
         # song-not-found cascade. The pre-#391 ``strategy.name !=
-        # TRACK_ON_COMPILATION`` clause collapses away: every downstream
-        # strategy already gates on ``not state.results`` in its condition, so
-        # the name-check never changed the outcome. ``produced`` separates
-        # "this strategy added results" from "results carried over from a
-        # previous strategy" — keeps the contract legible even though
-        # ``state.results`` would also be True in the well-behaved case.
-        if produced and state.results and not state.song_not_found:
+        # TRACK_ON_COMPILATION`` clause collapsed away in step 1: every
+        # downstream strategy already gates on ``not state.results`` in its
+        # condition, so the name-check never changed the outcome. With the
+        # Outcome seam in place, the check simplifies to a pure state read —
+        # ``outcome.items`` would imply ``state.results`` here, so dropping
+        # the ``produced`` boolean from step 1 doesn't change semantics.
+        if state.results and not state.song_not_found:
             break
 
     return state
