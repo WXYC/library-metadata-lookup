@@ -68,6 +68,7 @@ from discogs.fallthrough import (
     _COOL_DOWN_SECONDS,
     _cool_down_active,
     _reset_cool_down_for_tests,
+    fallthrough,
 )
 from discogs.memory_cache import RELEASE_CACHE
 from discogs.models import ReleaseMetadataResponse, TrackItem
@@ -280,14 +281,13 @@ class TestEndToEndCoolDownOnExhaustedPool:
         try:
             await acquired.wait()
 
+            # ``DiscogsService.get_release`` is decorated with
+            # ``@async_cached(RELEASE_CACHE)``, so its API-fetch closure is
+            # private to the method body. Exercise the same seam shape
+            # (``fallthrough()`` with the cache's ``get_release`` as
+            # ``pg_read``) so the test reflects the real call shape without
+            # punching through the decorator.
             with sentry_sdk.start_transaction(name="test_end_to_end") as transaction:
-                # ``DiscogsService.get_release`` is decorated with
-                # ``@async_cached(RELEASE_CACHE)``, so its API-fetch closure is
-                # private to the method body. Exercise the same seam shape
-                # (``fallthrough()`` with the cache's ``get_release`` as
-                # ``pg_read``) so the test reflects the real call shape without
-                # punching through the decorator.
-                from discogs.fallthrough import fallthrough
 
                 async def call_seam(release_id: int) -> ReleaseMetadataResponse | None:
                     payload = api_payloads[release_id]
