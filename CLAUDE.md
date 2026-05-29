@@ -57,7 +57,10 @@ Strategies never mutate `SearchState`; they return an `Outcome` and the runner a
 - `identity/router.py` -- `GET /identity/resolve` and `POST /identity/bulk` endpoints for identity resolution
 - `identity/models.py` -- Pydantic models for identity resolution responses
 - `identity/dependencies.py` -- FastAPI DI for EntityStore (reuses `DATABASE_URL_DISCOGS` pool)
-- `scripts/entity_resolution/store.py` -- Entity store CRUD against `entity.identity` PG table
+- `entity/store.py` -- Entity store CRUD against `entity.identity` PG table
+- `entity/sources.py` -- `PgSource` / `SparqlSource` transports backing the entity store
+- `clients/bandcamp.py` -- Bandcamp HTTP client (autocomplete + page scraping)
+- `clients/streaming/{spotify,deezer,apple_music,base,matching}.py` -- Streaming-service HTTP clients (Spotify, Deezer, Apple Music) sharing `base.BaseStreamingClient`, plus the streaming-side text matching/scoring helpers
 
 ### Identity Resolution Endpoints
 
@@ -461,7 +464,7 @@ python -m scripts.bandcamp_pipeline [--phase {search,lookup,both}] [--include-st
 
 Options: `--phase` (default: both, runs concurrently), `--include-streaming` (search all artists, not just not-on-streaming), `--artist-fallback` (write artist-level URL when no album match), `--dry-run` (report what would happen without changes), `--limit N` (max artists/slugs to process).
 
-Uses `BandcampClient` (`scripts/bandcamp_client.py`) extending `BaseStreamingClient` with rate limiting (1 req/s, semaphore 2) and 429 retry with exponential backoff. Optionally loads Wikidata slugs via `DATABASE_URL_WIKIDATA`.
+Uses `BandcampClient` (`clients/bandcamp.py`) extending `BaseStreamingClient` (`clients/streaming/base.py`) with rate limiting (1 req/s, semaphore 2) and 429 retry with exponential backoff. Optionally loads Wikidata slugs via `DATABASE_URL_WIKIDATA`.
 
 ### Resolver Calibration (`scripts/resolver_calibration/`)
 
