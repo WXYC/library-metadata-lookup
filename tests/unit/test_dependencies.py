@@ -10,6 +10,7 @@ import core.dependencies as deps_module
 from core.dependencies import (
     close_discogs_service,
     close_library_db,
+    close_musicbrainz_pg,
     get_discogs_service,
     get_library_db,
     get_posthog_client,
@@ -20,17 +21,19 @@ from core.dependencies import (
 def reset_globals():
     """Reset module-level singleton state between tests.
 
-    The Discogs service + pool singletons live inside `async_singleton`
-    closures (WXYC/library-metadata-lookup#283), so the only safe way to
+    The Discogs service + pool + musicbrainz_pg singletons live inside
+    `async_singleton` closures (#283, #435), so the only safe way to
     rebuild them between tests is via their public closers. We drive the
     coroutine with `asyncio.run` so this fixture stays sync (autouse async
     fixtures don't work for sync tests under pytest-asyncio strict mode).
     """
     deps_module._library_db = None
     asyncio.run(close_discogs_service())
+    asyncio.run(close_musicbrainz_pg())
     yield
     deps_module._library_db = None
     asyncio.run(close_discogs_service())
+    asyncio.run(close_musicbrainz_pg())
 
 
 def test_no_module_level_asyncio_lock_in_dependencies():
