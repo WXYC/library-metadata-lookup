@@ -13,6 +13,7 @@ Provides:
   rules. Composition lives in ``identity/bulk_resolve.py``.
 """
 
+import asyncio
 import logging
 from collections import Counter
 
@@ -217,12 +218,16 @@ async def bulk_resolve_libraries(
 
     store = _require_entity_store(entity_store)
 
-    # Entry signal (LML#430, sibling-of-#371). Fires synchronously before any
-    # awaits, so a handler that later hangs past the caller's AbortController
-    # still leaves a trace — uvicorn's access log and Sentry's automatic
-    # `http.server` transaction only commit on response completion, and the
-    # LML#355 audit hit exactly that gap (zero spans for 60 batches over the
-    # 2026-05-20 prod dry-run despite the handler running).
+    # Entry signal (LML#430, sibling-of-#371). Fires before the per-input PG
+    # loop, so a handler that hangs inside the loop still leaves a trace —
+    # uvicorn's access log and Sentry's automatic `http.server` transaction
+    # only commit on response completion, and the LML#355 audit hit exactly
+    # that gap (zero spans for 60 batches over the 2026-05-20 prod dry-run
+    # despite the handler running). Note: `await http_request.json()` above
+    # ran before this point, so the "before any awaits" guarantee is for the
+    # downstream loop only; a hang during JSON parse is not covered here, but
+    # body parse is bounded by request size and was not the LML#355 failure
+    # mode.
     inputs_count = len(request.inputs)
     logger.info("bulk resolve start: inputs=%d", inputs_count)
 
@@ -241,46 +246,69 @@ async def bulk_resolve_libraries(
         http_span.set_data("lml.bulk_resolve.inputs", inputs_count)
 
         results = []
-        for input_row in request.inputs:
-            if is_compilation_artist(input_row.artist_name):
-                results.append(compilation_result(input_row.library_id))
-                continue
+        try:
+            for input_row in request.inputs:
+                if is_compilation_artist(input_row.artist_name):
+                    results.append(compilation_result(input_row.library_id))
+                    continue
 
-            try:
-                # Three-leg fall-through lookup (issues #274 / #276): exact
-                # match first (handles the 99.8% dominant case where Backend's
-                # `library.artist_name` shape equals storage), then case-
-                # insensitive `LOWER()` (catches pure case drift), then
-                # canonical form (catches diacritic / `&`-vs-`and` /
-                # smart-quote / etc. divergence when storage happens to be
-                # canonical). Strictly ≥ legacy `get_identity()` hit rate.
-                identity: Identity | None = await store.resolve_library_name(input_row.artist_name)
-            except (PostgresError, OSError):
-                # Fail closed on partial PG failure — the caller cannot
-                # distinguish "row had no identity" from "PG died before this
-                # row was tried". Same posture as ``/identity/bulk``.
-                logger.exception(
-                    "Entity store query failed mid-bulk-resolve for library_id=%d artist_name=%r",
-                    input_row.library_id,
-                    input_row.artist_name,
-                )
-                http_span.set_data("http.status_code", 503)
-                raise HTTPException(
-                    status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
-                ) from None
+                try:
+                    # Three-leg fall-through lookup (issues #274 / #276): exact
+                    # match first (handles the 99.8% dominant case where
+                    # Backend's `library.artist_name` shape equals storage),
+                    # then case-insensitive `LOWER()` (catches pure case
+                    # drift), then canonical form (catches diacritic /
+                    # `&`-vs-`and` / smart-quote / etc. divergence when
+                    # storage happens to be canonical). Strictly ≥ legacy
+                    # `get_identity()` hit rate.
+                    identity: Identity | None = await store.resolve_library_name(
+                        input_row.artist_name
+                    )
+                except (PostgresError, OSError):
+                    # Fail closed on partial PG failure — the caller cannot
+                    # distinguish "row had no identity" from "PG died before
+                    # this row was tried". Same posture as ``/identity/bulk``.
+                    logger.exception(
+                        "Entity store query failed mid-bulk-resolve for "
+                        "library_id=%d artist_name=%r",
+                        input_row.library_id,
+                        input_row.artist_name,
+                    )
+                    http_span.set_data("http.status_code", 503)
+                    raise HTTPException(
+                        status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
+                    ) from None
 
-            try:
-                result = await compose_for_identity(input_row.library_id, identity, store)
-            except (PostgresError, OSError):
-                logger.exception(
-                    "Provenance fetch failed mid-bulk-resolve for library_id=%d",
-                    input_row.library_id,
-                )
-                http_span.set_data("http.status_code", 503)
-                raise HTTPException(
-                    status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
-                ) from None
-            results.append(result)
+                try:
+                    result = await compose_for_identity(input_row.library_id, identity, store)
+                except (PostgresError, OSError):
+                    logger.exception(
+                        "Provenance fetch failed mid-bulk-resolve for library_id=%d",
+                        input_row.library_id,
+                    )
+                    http_span.set_data("http.status_code", 503)
+                    raise HTTPException(
+                        status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
+                    ) from None
+                results.append(result)
+        except asyncio.CancelledError:
+            # Client aborted mid-loop. The sequential per-input loop has no
+            # gather/sentinel structure (unlike PR #417's `/lookup/bulk`
+            # shape), so CancelledError raised at the next `await` point is
+            # the only abort signal we get. Pin 499 on the span before
+            # re-raising so the audit-style query
+            # `op:http.server http.status_code:499` surfaces these in Sentry,
+            # and emit a warn log so Railway also carries the record.
+            # CancelledError is re-raised (not converted to HTTPException) —
+            # the asyncio cancellation contract requires this, and the client
+            # is gone anyway so there is nobody to read a 499 response.
+            http_span.set_data("http.status_code", 499)
+            logger.warning(
+                "bulk resolve aborted by client: inputs=%d processed=%d",
+                inputs_count,
+                len(results),
+            )
+            raise
 
         # Exit signal pairs with the entry log so operators can confirm
         # response delivery and read off the per-kind verdict breakdown
