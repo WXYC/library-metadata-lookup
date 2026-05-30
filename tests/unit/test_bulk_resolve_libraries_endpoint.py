@@ -6,9 +6,10 @@ internals are covered separately in `test_bulk_resolve_composer.py`.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
+import sentry_sdk
 from httpx import ASGITransport, AsyncClient
 
 from entity.store import Identity
@@ -294,3 +295,159 @@ class TestBulkResolveLibrariesEndpoint:
 
         assert resp.status_code == 422
         mock_entity_store.resolve_library_name.assert_not_awaited()
+
+
+class TestBulkResolveObservability:
+    """Entry/exit instrumentation pins (LML#430, sibling of #371 / PR #417).
+
+    The bulk-resolve-libraries route emits no `http.server` Sentry spans and no
+    log lines visible to Sentry — the [#355](https://github.com/WXYC/library-metadata-lookup/issues/355)
+    audit's prescribed Sentry pivot couldn't run because of this gap. The same
+    root cause as #371 applies: FastAPI integration's automatic transaction
+    commits on response completion, so a handler that hangs past the caller's
+    AbortController leaves zero server-side signal.
+
+    These tests pin the defensive instrumentation that closes the gap on this
+    sibling endpoint, mirroring the shape PR #417 landed for `/lookup/bulk`:
+    1. An ``INFO`` log at handler entry carrying `inputs=<N>` — fires BEFORE
+       any awaits, so a totally-hung handler still produces this signal.
+    2. An ``INFO`` log at handler exit carrying the per-kind verdict counts.
+    3. An explicit Sentry ``http.server`` span tied to the bulk-resolve route.
+
+    The matching production change is in
+    ``identity/router.py:bulk_resolve_libraries``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entry_log_includes_inputs_count(self, app_client, mock_entity_store, caplog):
+        """An INFO log fires at handler entry with inputs=N.
+
+        Load-bearing observability signal — synchronous fire before any awaits
+        means a hung handler still produces this line. Pins the entry-log
+        shape so refactors don't accidentally drop it.
+        """
+        import logging
+
+        mock_entity_store.resolve_library_name.return_value = None
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            with caplog.at_level(logging.INFO, logger="identity.router"):
+                resp = await ac.post(
+                    "/api/v1/identity/bulk-resolve-libraries",
+                    json={
+                        "inputs": [
+                            {"library_id": 1, "artist_name": "Juana Molina", "album_title": "DOGA"},
+                            {"library_id": 2, "artist_name": "Stereolab", "album_title": "AT"},
+                            {"library_id": 3, "artist_name": "Cat Power", "album_title": "Moon"},
+                        ]
+                    },
+                )
+
+        assert resp.status_code == 200
+        entry_records = [
+            r for r in caplog.records if "bulk resolve" in r.message and "start" in r.message
+        ]
+        assert entry_records, (
+            "Expected an INFO log at bulk-resolve handler entry; got logs: "
+            f"{[r.message for r in caplog.records]}"
+        )
+        entry_msg = entry_records[0].message
+        assert "3" in entry_msg, f"Entry log missing inputs count: {entry_msg!r}"
+
+    @pytest.mark.asyncio
+    async def test_exit_log_includes_verdict_counts(self, app_client, mock_entity_store, caplog):
+        """An INFO log fires at handler exit carrying per-kind verdict counts.
+
+        Pairs with the entry log — operators can read off the
+        single_artist / compilation / unresolved breakdown directly from
+        Railway without correlating to a Sentry trace.
+        """
+        import logging
+
+        async def resolve(name: str):
+            if name == "Stereolab":
+                return _identity("Stereolab", id=1, discogs_artist_id=2154)
+            return None
+
+        mock_entity_store.resolve_library_name.side_effect = resolve
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            with caplog.at_level(logging.INFO, logger="identity.router"):
+                resp = await ac.post(
+                    "/api/v1/identity/bulk-resolve-libraries",
+                    json={
+                        "inputs": [
+                            {
+                                "library_id": 1,
+                                "artist_name": "Various Artists",
+                                "album_title": "VA",
+                            },
+                            {"library_id": 2, "artist_name": "Stereolab", "album_title": "AT"},
+                            {"library_id": 3, "artist_name": "Unknown", "album_title": "X"},
+                        ]
+                    },
+                )
+
+        assert resp.status_code == 200
+        exit_records = [
+            r for r in caplog.records if "bulk resolve" in r.message and "complete" in r.message
+        ]
+        assert exit_records, (
+            "Expected an INFO log at bulk-resolve handler exit; got logs: "
+            f"{[r.message for r in caplog.records]}"
+        )
+        exit_msg = exit_records[0].message
+        # Pin the shape: inputs + the three kinds present. The format string
+        # may use `=` or `:` — assert on keyword presence + count values, not
+        # the exact format token.
+        assert "inputs" in exit_msg, exit_msg
+        assert "single_artist" in exit_msg, exit_msg
+        assert "compilation" in exit_msg, exit_msg
+        assert "unresolved" in exit_msg, exit_msg
+
+    @pytest.mark.asyncio
+    async def test_http_server_span_emitted(self, app_client, mock_entity_store):
+        """An explicit Sentry `http.server` span wraps the handler.
+
+        Defensive against the FastApiIntegration's automatic transaction not
+        landing for this endpoint (the gap LML#355's audit hit). With the
+        wrap, a query for `op:http.server span.description:*bulk-resolve-libraries*`
+        in the trace explorer always surfaces traffic.
+        """
+        captured_spans: list[dict] = []
+        original_start_span = sentry_sdk.start_span
+
+        def capture_start_span(*args, **kwargs):
+            captured_spans.append({"args": args, "kwargs": kwargs})
+            return original_start_span(*args, **kwargs)
+
+        mock_entity_store.resolve_library_name.return_value = None
+
+        with patch("identity.router.sentry_sdk.start_span", side_effect=capture_start_span):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/identity/bulk-resolve-libraries",
+                    json={
+                        "inputs": [
+                            {"library_id": 1, "artist_name": "Juana Molina", "album_title": "DOGA"}
+                        ]
+                    },
+                )
+
+        assert resp.status_code == 200
+        http_server_spans = [s for s in captured_spans if s["kwargs"].get("op") == "http.server"]
+        assert http_server_spans, (
+            "Expected at least one Sentry span with op='http.server'; got ops: "
+            f"{[s['kwargs'].get('op') for s in captured_spans]}"
+        )
+        span_name = http_server_spans[0]["kwargs"].get("name", "")
+        assert "bulk-resolve-libraries" in span_name, (
+            f"Expected http.server span name to include 'bulk-resolve-libraries'; got {span_name!r}"
+        )

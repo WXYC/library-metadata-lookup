@@ -14,7 +14,9 @@ Provides:
 """
 
 import logging
+from collections import Counter
 
+import sentry_sdk
 from asyncpg.exceptions import PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
@@ -215,40 +217,88 @@ async def bulk_resolve_libraries(
 
     store = _require_entity_store(entity_store)
 
-    results = []
-    for input_row in request.inputs:
-        if is_compilation_artist(input_row.artist_name):
-            results.append(compilation_result(input_row.library_id))
-            continue
+    # Entry signal (LML#430, sibling-of-#371). Fires synchronously before any
+    # awaits, so a handler that later hangs past the caller's AbortController
+    # still leaves a trace — uvicorn's access log and Sentry's automatic
+    # `http.server` transaction only commit on response completion, and the
+    # LML#355 audit hit exactly that gap (zero spans for 60 batches over the
+    # 2026-05-20 prod dry-run despite the handler running).
+    inputs_count = len(request.inputs)
+    logger.info("bulk resolve start: inputs=%d", inputs_count)
 
-        try:
-            # Three-leg fall-through lookup (issues #274 / #276): exact match
-            # first (handles the 99.8% dominant case where Backend's
-            # `library.artist_name` shape equals storage), then case-
-            # insensitive `LOWER()` (catches pure case drift), then canonical
-            # form (catches diacritic / `&`-vs-`and` / smart-quote / etc.
-            # divergence when storage happens to be canonical). Strictly ≥
-            # legacy `get_identity()` hit rate.
-            identity: Identity | None = await store.resolve_library_name(input_row.artist_name)
-        except (PostgresError, OSError):
-            # Fail closed on partial PG failure — the caller cannot
-            # distinguish "row had no identity" from "PG died before this
-            # row was tried". Same posture as ``/identity/bulk``.
-            logger.exception(
-                "Entity store query failed mid-bulk-resolve for library_id=%d artist_name=%r",
-                input_row.library_id,
-                input_row.artist_name,
-            )
-            raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
+    # Explicit `http.server` span (LML#430). Defense-in-depth against the
+    # FastApiIntegration's automatic transaction not landing for this endpoint
+    # — `op:http.server span.description:*bulk-resolve-libraries*` queries in
+    # the trace explorer will surface bulk-resolve traffic even when the
+    # automatic instrumentation misses. Mirrors PR #417's pattern for
+    # `/api/v1/lookup/bulk`.
+    with sentry_sdk.start_span(
+        op="http.server",
+        name="POST /api/v1/identity/bulk-resolve-libraries",
+    ) as http_span:
+        http_span.set_data("http.method", "POST")
+        http_span.set_data("http.target", "/api/v1/identity/bulk-resolve-libraries")
+        http_span.set_data("lml.bulk_resolve.inputs", inputs_count)
 
-        try:
-            result = await compose_for_identity(input_row.library_id, identity, store)
-        except (PostgresError, OSError):
-            logger.exception(
-                "Provenance fetch failed mid-bulk-resolve for library_id=%d",
-                input_row.library_id,
-            )
-            raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
-        results.append(result)
+        results = []
+        for input_row in request.inputs:
+            if is_compilation_artist(input_row.artist_name):
+                results.append(compilation_result(input_row.library_id))
+                continue
+
+            try:
+                # Three-leg fall-through lookup (issues #274 / #276): exact
+                # match first (handles the 99.8% dominant case where Backend's
+                # `library.artist_name` shape equals storage), then case-
+                # insensitive `LOWER()` (catches pure case drift), then
+                # canonical form (catches diacritic / `&`-vs-`and` /
+                # smart-quote / etc. divergence when storage happens to be
+                # canonical). Strictly ≥ legacy `get_identity()` hit rate.
+                identity: Identity | None = await store.resolve_library_name(input_row.artist_name)
+            except (PostgresError, OSError):
+                # Fail closed on partial PG failure — the caller cannot
+                # distinguish "row had no identity" from "PG died before this
+                # row was tried". Same posture as ``/identity/bulk``.
+                logger.exception(
+                    "Entity store query failed mid-bulk-resolve for library_id=%d artist_name=%r",
+                    input_row.library_id,
+                    input_row.artist_name,
+                )
+                http_span.set_data("http.status_code", 503)
+                raise HTTPException(
+                    status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
+                ) from None
+
+            try:
+                result = await compose_for_identity(input_row.library_id, identity, store)
+            except (PostgresError, OSError):
+                logger.exception(
+                    "Provenance fetch failed mid-bulk-resolve for library_id=%d",
+                    input_row.library_id,
+                )
+                http_span.set_data("http.status_code", 503)
+                raise HTTPException(
+                    status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
+                ) from None
+            results.append(result)
+
+        # Exit signal pairs with the entry log so operators can confirm
+        # response delivery and read off the per-kind verdict breakdown
+        # without correlating to a Sentry trace. The kind enum values
+        # (`single_artist`, `compilation`, `unresolved`) come from
+        # `BulkResolveResultKind` and are what the LML#355 audit needed when
+        # it had to fall back to local-cache simulation.
+        kinds = Counter(r.kind.value for r in results)
+        logger.info(
+            "bulk resolve complete: inputs=%d single_artist=%d compilation=%d unresolved=%d",
+            inputs_count,
+            kinds.get("single_artist", 0),
+            kinds.get("compilation", 0),
+            kinds.get("unresolved", 0),
+        )
+        http_span.set_data("lml.bulk_resolve.single_artist", kinds.get("single_artist", 0))
+        http_span.set_data("lml.bulk_resolve.compilation", kinds.get("compilation", 0))
+        http_span.set_data("lml.bulk_resolve.unresolved", kinds.get("unresolved", 0))
+        http_span.set_data("http.status_code", 200)
 
     return BulkResolveLibrariesResponse(results=results)
