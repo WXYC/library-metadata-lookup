@@ -220,8 +220,9 @@ async def fallthrough[T](
     if pg_read is not None and not skip and not _cool_down_active():
         try:
             _add_discogs_breadcrumb(f"cache_lookup_{label}", bc_data)
-            async with timed_pg():
-                cached = await pg_read()
+            with sentry_sdk.start_span(op="db.query", name=f"l2_read:{label}"):
+                async with timed_pg():
+                    cached = await pg_read()
             if is_pg_hit(cached):
                 _add_discogs_breadcrumb("cache_hit", bc_data)
                 get_cache_stats_recorder().record_pg_cache_hit()
@@ -252,7 +253,9 @@ async def fallthrough[T](
     # ----- Negative-cache pre-check (skipped under skip-cache flag).
     if pg_negative_check is not None and on_negative_hit is not None and not skip:
         try:
-            if await pg_negative_check():
+            with sentry_sdk.start_span(op="db.query", name=f"l2_negative_check:{label}"):
+                negative_hit = await pg_negative_check()
+            if negative_hit:
                 _add_discogs_breadcrumb("negative_cache_hit", bc_data)
                 get_cache_stats_recorder().record("pg_negative_hits")
                 logger.info("Negative-cache hit (%s); short-circuiting API", label)
@@ -272,7 +275,8 @@ async def fallthrough[T](
         if pg_write is not None:
             try:
                 _add_discogs_breadcrumb(f"cache_write_{label}", bc_data)
-                await pg_write(api_result)
+                with sentry_sdk.start_span(op="db.query", name=f"l2_write:{label}"):
+                    await pg_write(api_result)
                 logger.debug("Cached %s", label)
             except Exception as e:
                 logger.warning("Failed to cache %s: %s", label, e)
