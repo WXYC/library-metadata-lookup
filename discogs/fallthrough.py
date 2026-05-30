@@ -220,9 +220,10 @@ async def fallthrough[T](
     if pg_read is not None and not skip and not _cool_down_active():
         try:
             _add_discogs_breadcrumb(f"cache_lookup_{label}", bc_data)
-            with sentry_sdk.start_span(op="db.query", name=f"l2_read:{label}"):
+            with sentry_sdk.start_span(op="cache.get", name=f"l2:{label}") as span:
                 async with timed_pg():
                     cached = await pg_read()
+                span.set_data("cache.hit", is_pg_hit(cached))
             if is_pg_hit(cached):
                 _add_discogs_breadcrumb("cache_hit", bc_data)
                 get_cache_stats_recorder().record_pg_cache_hit()
@@ -253,8 +254,9 @@ async def fallthrough[T](
     # ----- Negative-cache pre-check (skipped under skip-cache flag).
     if pg_negative_check is not None and on_negative_hit is not None and not skip:
         try:
-            with sentry_sdk.start_span(op="db.query", name=f"l2_negative_check:{label}"):
+            with sentry_sdk.start_span(op="cache.get", name=f"l2_negative:{label}") as span:
                 negative_hit = await pg_negative_check()
+                span.set_data("cache.hit", bool(negative_hit))
             if negative_hit:
                 _add_discogs_breadcrumb("negative_cache_hit", bc_data)
                 get_cache_stats_recorder().record("pg_negative_hits")
@@ -275,7 +277,7 @@ async def fallthrough[T](
         if pg_write is not None:
             try:
                 _add_discogs_breadcrumb(f"cache_write_{label}", bc_data)
-                with sentry_sdk.start_span(op="db.query", name=f"l2_write:{label}"):
+                with sentry_sdk.start_span(op="cache.put", name=f"l2:{label}"):
                     await pg_write(api_result)
                 logger.debug("Cached %s", label)
             except Exception as e:
@@ -294,7 +296,8 @@ async def fallthrough[T](
     ):
         try:
             _add_discogs_breadcrumb("negative_cache_write", bc_data)
-            await pg_negative_record()
+            with sentry_sdk.start_span(op="cache.put", name=f"l2_negative:{label}"):
+                await pg_negative_record()
         except Exception as e:
             logger.warning("Negative-cache write failed for %s: %s", label, e)
 
