@@ -8,12 +8,16 @@ import httpx
 from aiolimiter import AsyncLimiter
 from wxyc_fastapi.http import async_singleton
 
+from streaming.models import SourceMatch
+
 
 class BaseStreamingClient:
     """Base class for streaming service HTTP clients.
 
     Provides lazy httpx.AsyncClient lifecycle management, rate limiting
-    via aiolimiter, and concurrency control via asyncio.Semaphore.
+    via aiolimiter, concurrency control via asyncio.Semaphore, and the
+    ``find_album_match`` interface that lets the streaming-check
+    orchestrator gather over any client uniformly (LML#392).
 
     Args:
         rate_limit: Tuple of (max_rate, time_period) for AsyncLimiter.
@@ -55,3 +59,14 @@ class BaseStreamingClient:
         """Close the HTTP client and release resources."""
         await self._singleton_close()
         self._http = None
+
+    async def find_album_match(self, artist: str, title: str) -> SourceMatch | None:
+        """Search this service for an album match and return a normalized verdict.
+
+        The deep contract the streaming-check orchestrator (LML#392) gathers
+        over: each provider absorbs its own response-shape adaptation so the
+        orchestrator never branches on service identity. Subclasses MUST
+        override; the base raises ``NotImplementedError`` so a missing
+        override fails loudly the first time the orchestrator dispatches.
+        """
+        raise NotImplementedError(f"{type(self).__name__} must override find_album_match")

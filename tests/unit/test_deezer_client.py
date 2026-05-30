@@ -119,3 +119,38 @@ class TestSearchTrack:
         results = await client.search_track("The Afros", "Feel It")
         assert len(results) == 1
         assert results[0]["title"] == "Feel It"
+
+
+class TestFindAlbumMatch:
+    """`find_album_match` extracts the Deezer-shaped result fields and
+    returns a normalized `SourceMatch` (LML#392)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_source_match_from_top_hit(self):
+        client = DeezerClient()
+        client.search_album = AsyncMock(return_value=[_make_album_result()])
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+
+        assert match is not None
+        assert match.url == "https://www.deezer.com/album/12345"
+        assert match.confidence >= 80.0
+        client.search_album.assert_awaited_once_with("Stereolab", "Aluminum Tunes")
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_search_empty(self):
+        client = DeezerClient()
+        client.search_album = AsyncMock(return_value=[])
+
+        match = await client.find_album_match("Unknown", "Unknown")
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_acceptable_match(self):
+        client = DeezerClient()
+        client.search_album = AsyncMock(
+            return_value=[_make_album_result(title="Unrelated", artist_name="Different")]
+        )
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+        assert match is None

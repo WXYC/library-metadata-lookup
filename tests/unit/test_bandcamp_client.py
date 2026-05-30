@@ -290,3 +290,94 @@ class TestFetchArtistCatalog:
 
         assert len(albums) == 1
         assert albums[0]["title"] == title
+
+
+class TestFindAlbumMatch:
+    """`find_album_match` runs Bandcamp's two-phase flow (autocomplete the
+    artist subdomain, then scrape the catalog) and returns a normalized
+    `SourceMatch` (LML#392). Both phases' response shapes stay encapsulated
+    here; the orchestrator never branches on the two-phase nature."""
+
+    @pytest.mark.asyncio
+    async def test_returns_source_match_when_artist_and_album_both_match(self):
+        client = BandcampClient()
+        client.search_artist = AsyncMock(
+            return_value=[
+                {"name": "Stereolab", "url": "https://stereolab.bandcamp.com", "slug": "stereolab"}
+            ]
+        )
+        client.fetch_artist_catalog = AsyncMock(
+            return_value=[
+                {
+                    "title": "Aluminum Tunes",
+                    "url": "https://stereolab.bandcamp.com/album/aluminum-tunes",
+                }
+            ]
+        )
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+
+        assert match is not None
+        assert match.url == "https://stereolab.bandcamp.com/album/aluminum-tunes"
+        assert match.confidence >= 80.0
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_artist_autocomplete_empty(self):
+        client = BandcampClient()
+        client.search_artist = AsyncMock(return_value=[])
+
+        match = await client.find_album_match("Unknown", "Whatever")
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_artist_match_below_floor(self):
+        """Autocomplete returned a hit, but the artist name fuzz-score is <80."""
+        client = BandcampClient()
+        client.search_artist = AsyncMock(
+            return_value=[
+                {
+                    "name": "Completely Different Band",
+                    "url": "https://different.bandcamp.com",
+                    "slug": "different",
+                }
+            ]
+        )
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+        assert match is None
+        # Catalog scrape should not have been reached.
+        # (No assertion on fetch_artist_catalog because the mock is auto-created
+        # by AsyncMock; the contract is just "no SourceMatch returned".)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_catalog_empty(self):
+        client = BandcampClient()
+        client.search_artist = AsyncMock(
+            return_value=[
+                {"name": "Stereolab", "url": "https://stereolab.bandcamp.com", "slug": "stereolab"}
+            ]
+        )
+        client.fetch_artist_catalog = AsyncMock(return_value=[])
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_album_title_doesnt_match(self):
+        client = BandcampClient()
+        client.search_artist = AsyncMock(
+            return_value=[
+                {"name": "Stereolab", "url": "https://stereolab.bandcamp.com", "slug": "stereolab"}
+            ]
+        )
+        client.fetch_artist_catalog = AsyncMock(
+            return_value=[
+                {
+                    "title": "Completely Different Album",
+                    "url": "https://stereolab.bandcamp.com/album/different",
+                }
+            ]
+        )
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+        assert match is None

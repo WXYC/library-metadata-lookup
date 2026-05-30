@@ -216,3 +216,45 @@ class TestSearchTrack:
         await client.search_track("The Afros", "Feel It")
         params = mock_http.get.call_args.kwargs.get("params", {})
         assert params.get("type") == "track"
+
+
+class TestFindAlbumMatch:
+    """`find_album_match` extracts the Spotify-shaped result fields and
+    returns a normalized `SourceMatch` (LML#392).
+
+    Tests at this layer mock the `search_album` call directly — the deeper
+    HTTP-shape adaptation is already covered by `TestSearchAlbum`. The
+    layer separation matches the deepening: response-shape knowledge lives
+    here in the adapter, not in the orchestrator.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_source_match_from_top_hit(self):
+        client = SpotifyClient("test-id", "test-secret")
+        client.search_album = AsyncMock(return_value=[_make_album_item()])
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+
+        assert match is not None
+        assert match.url == "https://open.spotify.com/album/abc123"
+        assert match.confidence >= 80.0
+        client.search_album.assert_awaited_once_with("Stereolab", "Aluminum Tunes")
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_search_empty(self):
+        client = SpotifyClient("test-id", "test-secret")
+        client.search_album = AsyncMock(return_value=[])
+
+        match = await client.find_album_match("Unknown", "Unknown")
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_acceptable_match(self):
+        """Spotify returned a hit but artist+title fuzz score is below floor."""
+        client = SpotifyClient("test-id", "test-secret")
+        client.search_album = AsyncMock(
+            return_value=[_make_album_item(name="Unrelated Album", artist_name="Different Artist")]
+        )
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+        assert match is None

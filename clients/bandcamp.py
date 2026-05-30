@@ -15,6 +15,8 @@ import re
 import httpx
 
 from clients.streaming.base import BaseStreamingClient
+from clients.streaming.matching import find_best_match, score_match
+from streaming.models import SourceMatch
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +94,42 @@ class BandcampClient(BaseStreamingClient):
 
             return resp
         return None
+
+    async def find_album_match(self, artist: str, title: str) -> SourceMatch | None:
+        """Search Bandcamp for ``(artist, title)`` and return the best match.
+
+        See ``BaseStreamingClient.find_album_match`` for the contract.
+        Two-phase: autocomplete the artist subdomain, then scrape the
+        artist's ``/music`` catalog and fuzzy-match the album title. Both
+        phases' response shapes are encapsulated here.
+        """
+        artist_results = await self.search_artist(artist)
+        if not artist_results:
+            return None
+        best_artist: dict | None = None
+        best_artist_score = 0.0
+        for result in artist_results:
+            s = score_match(artist, result["name"])
+            if s >= 80.0 and s > best_artist_score:
+                best_artist = result
+                best_artist_score = s
+        if best_artist is None:
+            return None
+        catalog = await self.fetch_artist_catalog(best_artist["slug"])
+        if not catalog:
+            return None
+        matched_artist_name = best_artist["name"]
+        best = find_best_match(
+            catalog,
+            artist,
+            title,
+            artist_fn=lambda _: matched_artist_name,
+            title_fn=lambda x: x["title"],
+            url_fn=lambda x: x["url"],
+        )
+        if best is None:
+            return None
+        return SourceMatch(url=best["url"], confidence=best["confidence"])
 
     async def search_artist(self, artist_name: str) -> list[dict]:
         """Search Bandcamp autocomplete for artist pages.

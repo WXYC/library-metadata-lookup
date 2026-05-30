@@ -114,3 +114,41 @@ class TestErrorHandling:
 
         results = await client.search_album("Stereolab", "Aluminum Tunes")
         assert results == []
+
+
+class TestFindAlbumMatch:
+    """`find_album_match` extracts the iTunes-shaped result fields and
+    returns a normalized `SourceMatch` (LML#392). The artist-floor check
+    inside `find_best_match` carries the LML#389 wrong-artist guard."""
+
+    @pytest.mark.asyncio
+    async def test_returns_source_match_from_top_hit(self):
+        client = AppleMusicClient()
+        client.search_album = AsyncMock(return_value=[_make_album_result()])
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+
+        assert match is not None
+        assert "apple.com" in match.url
+        assert match.confidence >= 80.0
+        client.search_album.assert_awaited_once_with("Stereolab", "Aluminum Tunes")
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_search_empty(self):
+        client = AppleMusicClient()
+        client.search_album = AsyncMock(return_value=[])
+
+        match = await client.find_album_match("Unknown", "Unknown")
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_wrong_artist_match(self):
+        """LML#389: iTunes can return a same-titled album by a different artist.
+        The shared artist-floor inside `find_best_match` rejects it."""
+        client = AppleMusicClient()
+        client.search_album = AsyncMock(
+            return_value=[_make_album_result(artist_name="Completely Different Artist")]
+        )
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+        assert match is None
