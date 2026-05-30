@@ -26,8 +26,15 @@ async def check_streaming_availability(
 ) -> StreamingCheckResponse:
     """Check streaming availability for an artist+title across all configured services.
 
-    Runs all service checks concurrently. Returns on_streaming=True if any service
-    has a match, False if all checked services returned no match, None if all errored.
+    Runs all service checks concurrently. Verdict (LML#376):
+
+    - ``on_streaming=True`` when any service confirmed a match (positive evidence wins
+      even if other services errored).
+    - ``on_streaming=False`` strictly when every dispatched service was checked AND
+      none found a match AND none errored.
+    - ``on_streaming=None`` when no services were dispatched, or when at least one
+      service raised an exception without positive evidence elsewhere — callers
+      should treat this as "do not persist" / "retry later".
 
     Args:
         artist: Artist name to search for.
@@ -38,7 +45,10 @@ async def check_streaming_availability(
         bandcamp: Optional Bandcamp client.
 
     Returns:
-        StreamingCheckResponse with on_streaming boolean and per-source match details.
+        ``StreamingCheckResponse`` with the verdict, per-source match details, and
+        ``errored_sources`` listing services whose check raised (sorted; empty when
+        every dispatched check completed without raising). The errored set is
+        independent of the verdict — a service can match while others error.
     """
     tasks: dict[str, asyncio.Task] = {}
 

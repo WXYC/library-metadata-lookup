@@ -133,6 +133,11 @@ async def test_no_clients_returns_inconclusive():
     result = await check_streaming_availability("Stereolab", "Aluminum Tunes")
 
     assert result.on_streaming is None
+    # The empty-dispatched-tasks branch shares its on_streaming verdict with the
+    # all-errored branch; errored_sources is what distinguishes them. Pinning []
+    # here prevents a future change from conflating "nothing tried" with
+    # "tried, all failed".
+    assert result.errored_sources == []
 
 
 @pytest.mark.asyncio
