@@ -652,6 +652,51 @@ class TestFindSimilarArtist:
         result = await db.find_similar_artist(misspelled)
         assert result == expected
 
+    @pytest.mark.asyncio
+    async def test_leading_article_skipped_for_candidate_prefix(self):
+        """Leading articles should not make the candidate query miss filed artist names."""
+        db = LibraryDB()
+
+        class FakeRow:
+            def __init__(self, val):
+                self.val = val
+
+            def __getitem__(self, idx):
+                return self.val
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Black Dog")])
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(return_value=mock_cursor)
+
+        result = await db.find_similar_artist("The Bleack Dog")
+
+        assert result == "Black Dog"
+        _, params = db._conn.execute.await_args.args
+        assert params == ["ble%", "%dog%"]
+        assert "the%" not in params
+
+    @pytest.mark.asyncio
+    async def test_leading_article_exact_after_strip_is_not_corrected(self):
+        """Exact matches after stripping an article should not mutate the parsed artist."""
+        db = LibraryDB()
+
+        class FakeRow:
+            def __init__(self, val):
+                self.val = val
+
+            def __getitem__(self, idx):
+                return self.val
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Black Dog")])
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(return_value=mock_cursor)
+
+        result = await db.find_similar_artist("The Black Dog")
+
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # alternate_artist_name column

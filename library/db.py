@@ -36,6 +36,9 @@ STOPWORDS = frozenset(
 )
 """Words to exclude when extracting significant keywords from search queries."""
 
+LEADING_ARTICLES = frozenset({"the", "a", "an"})
+"""Artist-name articles to skip when choosing fuzzy candidate prefixes."""
+
 # Default path to SQLite database (relative to project root)
 DEFAULT_DB_PATH = Path(__file__).parent.parent / "library.db"
 
@@ -82,6 +85,13 @@ def _get_library_caches() -> tuple[TTLCache, TTLCache]:
             maxsize=settings.library_cache_maxsize, ttl=settings.library_cache_ttl
         )
     return _artist_cache, _search_cache
+
+
+def _strip_leading_artist_article(name: str) -> str:
+    words = name.split()
+    if words and words[0] in LEADING_ARTICLES:
+        return " ".join(words[1:])
+    return name
 
 
 def clear_library_caches() -> None:
@@ -483,32 +493,53 @@ class LibraryDB:
 
         words = artist_lower.split()
 
-        # Use first word with 3+ chars for candidate search
-        search_word = next((w for w in words if len(w) >= 3), None)
+        # Use first non-article word with 3+ chars for candidate search
+        search_word = next(
+            (
+                w
+                for i, w in enumerate(words)
+                if len(w) >= 3 and not (i == 0 and w in LEADING_ARTICLES)
+            ),
+            None,
+        )
         if not search_word:
             return None
 
         prefix = search_word[:3]
+        candidate_patterns = [f"{prefix}%"]
+        candidate_patterns.extend(
+            f"%{w[:3]}%"
+            for w in words
+            if len(w) >= 3 and w != search_word and w not in LEADING_ARTICLES
+        )
+        artist_compare = _strip_leading_artist_article(artist_lower) or artist_lower
 
-        unions = ["SELECT artist AS name FROM library WHERE artist LIKE ?"]
-        params_list = [f"{prefix}%"]
+        column_filter = " OR ".join("artist LIKE ?" for _ in candidate_patterns)
+        unions = [f"SELECT artist AS name FROM library WHERE {column_filter}"]
+        params_list = list(candidate_patterns)
         if self._has_alternate_artist:
+            column_filter = " OR ".join(
+                "alternate_artist_name LIKE ?" for _ in candidate_patterns
+            )
             unions.append(
                 "SELECT alternate_artist_name AS name FROM library "
-                "WHERE alternate_artist_name IS NOT NULL AND alternate_artist_name LIKE ?"
+                f"WHERE alternate_artist_name IS NOT NULL AND ({column_filter})"
             )
-            params_list.append(f"{prefix}%")
+            params_list.extend(candidate_patterns)
         if self._has_album_artist:
+            column_filter = " OR ".join("album_artist LIKE ?" for _ in candidate_patterns)
             unions.append(
                 "SELECT album_artist AS name FROM library "
-                "WHERE album_artist IS NOT NULL AND album_artist LIKE ?"
+                f"WHERE album_artist IS NOT NULL AND ({column_filter})"
             )
-            params_list.append(f"{prefix}%")
+            params_list.extend(candidate_patterns)
         if self._has_compilation_track_artist:
+            column_filter = " OR ".join("artist_name LIKE ?" for _ in candidate_patterns)
             unions.append(
-                "SELECT artist_name AS name FROM compilation_track_artist WHERE artist_name LIKE ?"
+                "SELECT artist_name AS name FROM compilation_track_artist "
+                f"WHERE {column_filter}"
             )
-            params_list.append(f"{prefix}%")
+            params_list.extend(candidate_patterns)
 
         sql = f"SELECT DISTINCT name FROM ({' UNION '.join(unions)}) LIMIT 100"
         cursor = await self._conn.execute(sql, params_list)
@@ -526,12 +557,21 @@ class LibraryDB:
             if not candidate:
                 continue
 
-            score = fuzz.ratio(artist_lower, candidate.lower())
+            candidate_lower = candidate.lower()
+            candidate_compare = _strip_leading_artist_article(candidate_lower) or candidate_lower
+            score = max(
+                fuzz.ratio(artist_lower, candidate_lower),
+                fuzz.ratio(artist_compare, candidate_compare),
+            )
             if score > best_score and score >= effective_threshold:
                 best_score = score
                 best_match = candidate
 
-        if best_match and best_match.lower() != artist_lower:
+        if (
+            best_match
+            and best_match.lower() != artist_lower
+            and _strip_leading_artist_article(best_match.lower()) != artist_compare
+        ):
             logger.info(
                 f"Corrected artist '{artist}' to '{best_match}' "
                 f"(score: {best_score}, threshold: {effective_threshold})"
