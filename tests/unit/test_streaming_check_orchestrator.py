@@ -121,6 +121,10 @@ async def test_not_found_on_any_service():
     assert result.on_streaming is False
     assert result.sources.spotify is None
     assert result.sources.deezer is None
+    # LML#376: False is reserved for "checked all, none found, none errored".
+    # The empty errored_sources is part of the False contract — a regression
+    # that re-introduces the bug (False with errored_sources populated) trips here.
+    assert result.errored_sources == []
 
 
 @pytest.mark.asyncio
@@ -144,6 +148,8 @@ async def test_all_clients_error_returns_inconclusive():
     )
 
     assert result.on_streaming is None
+    # Both services errored — both surface in errored_sources, sorted.
+    assert result.errored_sources == ["deezer", "spotify"]
 
 
 @pytest.mark.asyncio
@@ -161,6 +167,34 @@ async def test_partial_error_still_returns_result():
     assert result.on_streaming is True
     assert result.sources.spotify is None
     assert result.sources.deezer is not None
+    # Positive evidence wins for on_streaming, but errored_sources still records
+    # the failure so a caller can schedule a retry of just the spotify leg.
+    assert result.errored_sources == ["spotify"]
+
+
+@pytest.mark.asyncio
+async def test_partial_error_with_no_match_is_inconclusive():
+    """One service errors, another returns no match — returns on_streaming=None (LML#376).
+
+    Before the fix this collapsed to `False`: the no-match success flipped `any_checked`
+    to True so the verdict followed the "all-checked, none-found" branch and ignored the
+    error. Persisted as `library.on_streaming=false` forever, with no retry path. After
+    the fix, any-error → None so consumers' `!== null` guards skip the write.
+    """
+    spotify = AsyncMock()
+    spotify.search_album = AsyncMock(side_effect=Exception("network error"))
+    deezer = AsyncMock()
+    deezer.search_album = AsyncMock(return_value=[])
+
+    result = await check_streaming_availability(
+        "Stereolab", "Aluminum Tunes", spotify=spotify, deezer=deezer
+    )
+
+    assert result.on_streaming is None
+    assert result.sources.spotify is None
+    assert result.sources.deezer is None
+    assert "spotify" in result.errored_sources
+    assert "deezer" not in result.errored_sources
 
 
 @pytest.mark.asyncio

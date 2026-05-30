@@ -52,6 +52,7 @@ async def check_streaming_availability(
         tasks["bandcamp"] = asyncio.create_task(_check_bandcamp(bandcamp, artist, title))
 
     sources = StreamingCheckSources()
+    errored: set[str] = set()
     any_checked = False
     any_found = False
 
@@ -63,16 +64,30 @@ async def check_streaming_availability(
                 any_found = True
                 setattr(sources, service, match)
         except Exception:
+            errored.add(service)
             logger.exception("Streaming check failed for %s on %s - %s", service, artist, title)
 
-    if not any_checked:
+    # LML#376: tighten False's meaning so partial-failures can't masquerade as
+    # confirmed absences. Positive evidence still wins (a confirmed match elsewhere
+    # is reason to persist True even if a flake errored), but absent positive
+    # evidence, any error escalates the verdict to None — Backend's `!== null`
+    # guard then refuses to write through. `False` now means strictly "every
+    # dispatched service was checked AND none found a match AND none errored".
+    # `errored_sources` carries the partial-failure signal for selective retry.
+    if any_found:
+        on_streaming: bool | None = True
+    elif errored:
         on_streaming = None
-    elif any_found:
-        on_streaming = True
-    else:
+    elif any_checked:
         on_streaming = False
+    else:
+        on_streaming = None
 
-    return StreamingCheckResponse(on_streaming=on_streaming, sources=sources)
+    return StreamingCheckResponse(
+        on_streaming=on_streaming,
+        sources=sources,
+        errored_sources=sorted(errored),
+    )
 
 
 async def _check_spotify(client: SpotifyClient, artist: str, title: str) -> SourceMatch | None:
