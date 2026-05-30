@@ -580,50 +580,67 @@ class TestTriStateRead:
 
 
 class TestSentrySpanInstrumentation:
-    """The release-fetch handler's 2-9 s cold-path is opaque without per-leg
-    spans — the auto-FastApi transaction shows total time but not where it
-    went. These tests pin the seam emitting child spans for each I/O leg so
-    a trace decomposes into ``l2_read:<label>``, ``l2_write:<label>``, and
-    ``l2_negative_check:<label>``. The API leg is already covered by the
-    httpx auto-instrumentation in ``wxyc_fastapi``."""
+    """Pins the seam emitting per-leg child spans so a cache-bearing route's
+    auto-FastApi transaction decomposes into ``cache.get`` / ``cache.put`` legs
+    in the trace explorer. The API leg is covered by the httpx auto-instrumentation
+    in ``wxyc_fastapi``."""
 
-    @pytest.mark.asyncio
-    async def test_pg_read_emits_l2_read_span(self, monkeypatch):
+    @staticmethod
+    def _install_span_recorder(
+        monkeypatch,
+    ) -> tuple[list[tuple[str, str]], list[dict[str, object]]]:
+        """Replace ``sentry_sdk.start_span`` with a recorder.
+
+        Returns ``(spans_started, span_data)`` where ``spans_started`` is a list
+        of ``(op, name)`` tuples and ``span_data`` is the list of mappings the
+        seam called ``set_data`` with on each span.
+        """
         from unittest.mock import MagicMock
 
         spans_started: list[tuple[str, str]] = []
+        span_data: list[dict[str, object]] = []
 
         def fake_start_span(*, op: str, name: str, **_kwargs):
             spans_started.append((op, name))
+            data: dict[str, object] = {}
+            span_data.append(data)
+            span = MagicMock()
+            span.set_data = lambda k, v: data.__setitem__(k, v)
             ctx = MagicMock()
-            ctx.__enter__ = MagicMock(return_value=MagicMock())
+            ctx.__enter__ = MagicMock(return_value=span)
             ctx.__exit__ = MagicMock(return_value=False)
             return ctx
 
         monkeypatch.setattr("discogs.fallthrough.sentry_sdk.start_span", fake_start_span)
+        return spans_started, span_data
 
+    @pytest.mark.asyncio
+    async def test_pg_read_emits_cache_get_span_with_hit_data(self, monkeypatch):
+        spans_started, span_data = self._install_span_recorder(monkeypatch)
+        pg_read = AsyncMock(return_value="cached")
+        api_fetch = AsyncMock()
+
+        await fallthrough(label="get_release", pg_read=pg_read, api_fetch=api_fetch)
+
+        assert ("cache.get", "l2:get_release") in spans_started
+        # `cache.hit=True` because pg_read returned non-None (default predicate).
+        idx = spans_started.index(("cache.get", "l2:get_release"))
+        assert span_data[idx].get("cache.hit") is True
+
+    @pytest.mark.asyncio
+    async def test_pg_read_miss_records_cache_hit_false(self, monkeypatch):
+        spans_started, span_data = self._install_span_recorder(monkeypatch)
         pg_read = AsyncMock(return_value=None)
         api_fetch = AsyncMock(return_value="fresh")
 
         await fallthrough(label="get_release", pg_read=pg_read, api_fetch=api_fetch)
 
-        assert ("db.query", "l2_read:get_release") in spans_started
+        idx = spans_started.index(("cache.get", "l2:get_release"))
+        assert span_data[idx].get("cache.hit") is False
 
     @pytest.mark.asyncio
-    async def test_pg_write_emits_l2_write_span(self, monkeypatch):
-        from unittest.mock import MagicMock
-
-        spans_started: list[tuple[str, str]] = []
-
-        def fake_start_span(*, op: str, name: str, **_kwargs):
-            spans_started.append((op, name))
-            ctx = MagicMock()
-            ctx.__enter__ = MagicMock(return_value=MagicMock())
-            ctx.__exit__ = MagicMock(return_value=False)
-            return ctx
-
-        monkeypatch.setattr("discogs.fallthrough.sentry_sdk.start_span", fake_start_span)
-
+    async def test_pg_write_emits_cache_put_span(self, monkeypatch):
+        spans_started, _ = self._install_span_recorder(monkeypatch)
         pg_read = AsyncMock(return_value=None)
         api_fetch = AsyncMock(return_value="fresh")
         pg_write = AsyncMock()
@@ -632,23 +649,11 @@ class TestSentrySpanInstrumentation:
             label="get_release", pg_read=pg_read, api_fetch=api_fetch, pg_write=pg_write
         )
 
-        assert ("db.query", "l2_write:get_release") in spans_started
+        assert ("cache.put", "l2:get_release") in spans_started
 
     @pytest.mark.asyncio
-    async def test_negative_cache_check_emits_l2_negative_check_span(self, monkeypatch):
-        from unittest.mock import MagicMock
-
-        spans_started: list[tuple[str, str]] = []
-
-        def fake_start_span(*, op: str, name: str, **_kwargs):
-            spans_started.append((op, name))
-            ctx = MagicMock()
-            ctx.__enter__ = MagicMock(return_value=MagicMock())
-            ctx.__exit__ = MagicMock(return_value=False)
-            return ctx
-
-        monkeypatch.setattr("discogs.fallthrough.sentry_sdk.start_span", fake_start_span)
-
+    async def test_negative_cache_check_emits_cache_get_span_with_hit_data(self, monkeypatch):
+        spans_started, span_data = self._install_span_recorder(monkeypatch)
         pg_negative_check = AsyncMock(return_value=False)
         api_fetch = AsyncMock(return_value="fresh")
 
@@ -660,26 +665,37 @@ class TestSentrySpanInstrumentation:
             on_negative_hit=_unused,
         )
 
-        assert ("db.query", "l2_negative_check:search") in spans_started
+        assert ("cache.get", "l2_negative:search") in spans_started
+        idx = spans_started.index(("cache.get", "l2_negative:search"))
+        assert span_data[idx].get("cache.hit") is False
+
+    @pytest.mark.asyncio
+    async def test_negative_cache_write_emits_cache_put_span(self, monkeypatch):
+        """Symmetry with the positive write-back: the negative-record path also
+        gets a span so trace decomposition shows both write legs."""
+        spans_started, _ = self._install_span_recorder(monkeypatch)
+        pg_negative_check = AsyncMock(return_value=False)
+        pg_negative_record = AsyncMock()
+        api_fetch = AsyncMock(return_value="empty-api-result")
+
+        await fallthrough(
+            label="search",
+            pg_read=None,
+            api_fetch=api_fetch,
+            pg_negative_check=pg_negative_check,
+            on_negative_hit=_unused,
+            pg_negative_record=pg_negative_record,
+            is_empty=lambda v: True,
+        )
+
+        assert ("cache.put", "l2_negative:search") in spans_started
 
     @pytest.mark.asyncio
     async def test_pg_read_span_omitted_when_no_pg_leg(self, monkeypatch):
         """``pg_read=None`` short-circuits the L2 read — no span should be emitted."""
-        from unittest.mock import MagicMock
-
-        spans_started: list[tuple[str, str]] = []
-
-        def fake_start_span(*, op: str, name: str, **_kwargs):
-            spans_started.append((op, name))
-            ctx = MagicMock()
-            ctx.__enter__ = MagicMock(return_value=MagicMock())
-            ctx.__exit__ = MagicMock(return_value=False)
-            return ctx
-
-        monkeypatch.setattr("discogs.fallthrough.sentry_sdk.start_span", fake_start_span)
-
+        spans_started, _ = self._install_span_recorder(monkeypatch)
         api_fetch = AsyncMock(return_value="fresh")
 
         await fallthrough(label="search", pg_read=None, api_fetch=api_fetch)
 
-        assert not any(name.startswith("l2_read:") for _op, name in spans_started)
+        assert not any(op == "cache.get" and name == "l2:search" for op, name in spans_started)
