@@ -11,7 +11,7 @@ import asyncio
 import logging
 
 from clients.streaming.base import BaseStreamingClient
-from clients.streaming.matching import find_best_match
+from clients.streaming.matching import find_best_source_match
 from streaming.models import SourceMatch
 
 logger = logging.getLogger(__name__)
@@ -32,20 +32,14 @@ class DeezerClient(BaseStreamingClient):
         Deezer response shape (``artist.name`` / ``title`` / ``link``) is
         encapsulated here.
         """
-        results = await self.search_album(artist, title)
-        if not results:
-            return None
-        best = find_best_match(
-            results,
+        return find_best_source_match(
+            await self.search_album(artist, title),
             artist,
             title,
             artist_fn=lambda x: x["artist"]["name"],
             title_fn=lambda x: x["title"],
             url_fn=lambda x: x["link"],
         )
-        if best is None:
-            return None
-        return SourceMatch(url=best["url"], confidence=best["confidence"])
 
     async def search_album(self, artist: str, title: str) -> list[dict]:
         """Search Deezer for albums matching artist + title.
