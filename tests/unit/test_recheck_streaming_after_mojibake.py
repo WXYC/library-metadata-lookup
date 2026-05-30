@@ -122,17 +122,15 @@ class TestFindAffectedReleases:
 class TestRecheckReleases:
     @pytest.mark.asyncio
     async def test_calls_streaming_check_with_corrected_artist(self):
+        from streaming.models import SourceMatch
+
         release = AffectedRelease(library_id=1, artist="μ-ziq", title="Lunatic Harness")
         spotify = AsyncMock()
-        spotify.search_album = AsyncMock(
-            return_value=[
-                {
-                    "artists": [{"name": "μ-ziq"}],
-                    "name": "Lunatic Harness",
-                    "external_urls": {"spotify": "https://open.spotify.com/album/x"},
-                    "id": "x",
-                }
-            ]
+        # Post-LML#392: the orchestrator dispatches via `find_album_match`,
+        # which returns a normalized SourceMatch — Spotify's per-shape
+        # adaptation lives inside the client (covered by test_spotify_client).
+        spotify.find_album_match = AsyncMock(
+            return_value=SourceMatch(url="https://open.spotify.com/album/x", confidence=95.0)
         )
 
         results = await recheck_releases([release], spotify=spotify)
@@ -141,13 +139,13 @@ class TestRecheckReleases:
         assert results[0].library_id == 1
         assert results[0].on_streaming is True
         assert results[0].sources["spotify"] == "https://open.spotify.com/album/x"
-        spotify.search_album.assert_awaited_with("μ-ziq", "Lunatic Harness")
+        spotify.find_album_match.assert_awaited_with("μ-ziq", "Lunatic Harness")
 
     @pytest.mark.asyncio
     async def test_returns_false_when_no_match(self):
         release = AffectedRelease(library_id=2, artist="μ-ziq", title="Bluff Limbo")
         spotify = AsyncMock()
-        spotify.search_album = AsyncMock(return_value=[])
+        spotify.find_album_match = AsyncMock(return_value=None)
 
         results = await recheck_releases([release], spotify=spotify)
 

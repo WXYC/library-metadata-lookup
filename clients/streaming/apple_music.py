@@ -6,6 +6,8 @@ import asyncio
 import logging
 
 from clients.streaming.base import BaseStreamingClient
+from clients.streaming.matching import find_best_match
+from streaming.models import SourceMatch
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,30 @@ class AppleMusicClient(BaseStreamingClient):
     def __init__(self):
         super().__init__(rate_limit=(15, 60), semaphore_limit=3)
         self._max_retries = 2
+
+    async def find_album_match(self, artist: str, title: str) -> SourceMatch | None:
+        """Search iTunes for ``(artist, title)`` and return the best match.
+
+        See ``BaseStreamingClient.find_album_match`` for the contract. The
+        iTunes response shape (``artistName`` / ``collectionName`` /
+        ``collectionViewUrl``) is encapsulated here. The wrong-artist
+        verification from LML#389 lives in the shared
+        ``is_acceptable_match`` floor inside ``find_best_match``.
+        """
+        results = await self.search_album(artist, title)
+        if not results:
+            return None
+        best = find_best_match(
+            results,
+            artist,
+            title,
+            artist_fn=lambda x: x["artistName"],
+            title_fn=lambda x: x["collectionName"],
+            url_fn=lambda x: x["collectionViewUrl"],
+        )
+        if best is None:
+            return None
+        return SourceMatch(url=best["url"], confidence=best["confidence"])
 
     async def search_album(self, artist: str, title: str) -> list[dict]:
         """Search iTunes for albums matching artist + title.

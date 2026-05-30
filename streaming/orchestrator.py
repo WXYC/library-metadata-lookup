@@ -8,9 +8,8 @@ import logging
 from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.deezer import DeezerClient
-from clients.streaming.matching import find_best_match, score_match
 from clients.streaming.spotify import SpotifyClient
-from streaming.models import SourceMatch, StreamingCheckResponse, StreamingCheckSources
+from streaming.models import StreamingCheckResponse, StreamingCheckSources
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +25,10 @@ async def check_streaming_availability(
 ) -> StreamingCheckResponse:
     """Check streaming availability for an artist+title across all configured services.
 
-    Runs all service checks concurrently. Verdict (LML#376):
+    Runs every configured service concurrently via the
+    ``BaseStreamingClient.find_album_match`` seam (LML#392) — the orchestrator
+    never branches on service identity, so adding a fifth provider means
+    adding an adapter, not editing here. Verdict matrix (LML#376):
 
     - ``on_streaming=True`` when any service confirmed a match (positive evidence wins
       even if other services errored).
@@ -50,16 +52,20 @@ async def check_streaming_availability(
         every dispatched check completed without raising). The errored set is
         independent of the verdict — a service can match while others error.
     """
-    tasks: dict[str, asyncio.Task] = {}
-
-    if spotify:
-        tasks["spotify"] = asyncio.create_task(_check_spotify(spotify, artist, title))
-    if deezer:
-        tasks["deezer"] = asyncio.create_task(_check_deezer(deezer, artist, title))
-    if apple_music:
-        tasks["apple_music"] = asyncio.create_task(_check_apple_music(apple_music, artist, title))
-    if bandcamp:
-        tasks["bandcamp"] = asyncio.create_task(_check_bandcamp(bandcamp, artist, title))
+    # The kwarg names (spotify / deezer / apple_music / bandcamp) double as
+    # `StreamingCheckSources` field names — the response shape is API-locked,
+    # so the gather loop maps name-to-client uniformly without branching.
+    clients = {
+        "spotify": spotify,
+        "deezer": deezer,
+        "apple_music": apple_music,
+        "bandcamp": bandcamp,
+    }
+    tasks: dict[str, asyncio.Task] = {
+        name: asyncio.create_task(client.find_album_match(artist, title))
+        for name, client in clients.items()
+        if client is not None
+    }
 
     sources = StreamingCheckSources()
     errored: set[str] = set()
@@ -98,102 +104,3 @@ async def check_streaming_availability(
         sources=sources,
         errored_sources=sorted(errored),
     )
-
-
-async def _check_spotify(client: SpotifyClient, artist: str, title: str) -> SourceMatch | None:
-    """Search Spotify for an album match."""
-    results = await client.search_album(artist, title)
-    if not results:
-        return None
-
-    best = find_best_match(
-        results,
-        artist,
-        title,
-        artist_fn=lambda x: x["artists"][0]["name"],
-        title_fn=lambda x: x["name"],
-        url_fn=lambda x: x["external_urls"]["spotify"],
-        id_fn=lambda x: x["id"],
-    )
-    if best is None:
-        return None
-    return SourceMatch(url=best["url"], confidence=best["confidence"])
-
-
-async def _check_deezer(client: DeezerClient, artist: str, title: str) -> SourceMatch | None:
-    """Search Deezer for an album match."""
-    results = await client.search_album(artist, title)
-    if not results:
-        return None
-
-    best = find_best_match(
-        results,
-        artist,
-        title,
-        artist_fn=lambda x: x["artist"]["name"],
-        title_fn=lambda x: x["title"],
-        url_fn=lambda x: x["link"],
-    )
-    if best is None:
-        return None
-    return SourceMatch(url=best["url"], confidence=best["confidence"])
-
-
-async def _check_apple_music(
-    client: AppleMusicClient, artist: str, title: str
-) -> SourceMatch | None:
-    """Search Apple Music (iTunes) for an album match."""
-    results = await client.search_album(artist, title)
-    if not results:
-        return None
-
-    best = find_best_match(
-        results,
-        artist,
-        title,
-        artist_fn=lambda x: x["artistName"],
-        title_fn=lambda x: x["collectionName"],
-        url_fn=lambda x: x["collectionViewUrl"],
-    )
-    if best is None:
-        return None
-    return SourceMatch(url=best["url"], confidence=best["confidence"])
-
-
-async def _check_bandcamp(client: BandcampClient, artist: str, title: str) -> SourceMatch | None:
-    """Search Bandcamp for an album match.
-
-    Two-phase: first find the artist page via autocomplete, then scrape the catalog
-    and fuzzy-match the album title.
-    """
-    artist_results = await client.search_artist(artist)
-    if not artist_results:
-        return None
-
-    # Find best artist match
-    best_artist = None
-    best_artist_score = 0.0
-    for result in artist_results:
-        s = score_match(artist, result["name"])
-        if s >= 80.0 and s > best_artist_score:
-            best_artist = result
-            best_artist_score = s
-
-    if best_artist is None:
-        return None
-
-    catalog = await client.fetch_artist_catalog(best_artist["slug"])
-    if not catalog:
-        return None
-
-    best = find_best_match(
-        catalog,
-        artist,
-        title,
-        artist_fn=lambda _: best_artist["name"],
-        title_fn=lambda x: x["title"],
-        url_fn=lambda x: x["url"],
-    )
-    if best is None:
-        return None
-    return SourceMatch(url=best["url"], confidence=best["confidence"])
