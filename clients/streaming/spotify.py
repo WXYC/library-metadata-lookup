@@ -8,7 +8,7 @@ import logging
 import time
 
 from clients.streaming.base import BaseStreamingClient
-from clients.streaming.matching import find_best_match
+from clients.streaming.matching import find_best_source_match
 from streaming.models import SourceMatch
 
 logger = logging.getLogger(__name__)
@@ -57,24 +57,16 @@ class SpotifyClient(BaseStreamingClient):
 
         See ``BaseStreamingClient.find_album_match`` for the contract. The
         Spotify response shape (``artists[0].name`` / ``name`` /
-        ``external_urls.spotify``) is encapsulated here; the orchestrator
-        never sees it.
+        ``external_urls.spotify``) is encapsulated here.
         """
-        results = await self.search_album(artist, title)
-        if not results:
-            return None
-        best = find_best_match(
-            results,
+        return find_best_source_match(
+            await self.search_album(artist, title),
             artist,
             title,
             artist_fn=lambda x: x["artists"][0]["name"],
             title_fn=lambda x: x["name"],
             url_fn=lambda x: x["external_urls"]["spotify"],
-            id_fn=lambda x: x["id"],
         )
-        if best is None:
-            return None
-        return SourceMatch(url=best["url"], confidence=best["confidence"])
 
     async def search_album(self, artist: str, title: str, market: str = "US") -> list[dict]:
         """Search Spotify for albums matching artist + title.

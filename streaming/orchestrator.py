@@ -13,6 +13,15 @@ from streaming.models import StreamingCheckResponse, StreamingCheckSources
 
 logger = logging.getLogger(__name__)
 
+# Fail loudly at import time if the orchestrator's per-service kwargs ever
+# drift from `StreamingCheckSources` field names (the response shape is
+# API-locked, so the gather loop relies on this mapping being 1:1).
+_EXPECTED_SERVICE_FIELDS = {"spotify", "deezer", "apple_music", "bandcamp"}
+assert set(StreamingCheckSources.model_fields) == _EXPECTED_SERVICE_FIELDS, (
+    "StreamingCheckSources fields drifted from check_streaming_availability "
+    f"kwargs; got {set(StreamingCheckSources.model_fields)}"
+)
+
 
 async def check_streaming_availability(
     artist: str,
@@ -26,9 +35,10 @@ async def check_streaming_availability(
     """Check streaming availability for an artist+title across all configured services.
 
     Runs every configured service concurrently via the
-    ``BaseStreamingClient.find_album_match`` seam (LML#392) — the orchestrator
-    never branches on service identity, so adding a fifth provider means
-    adding an adapter, not editing here. Verdict matrix (LML#376):
+    ``BaseStreamingClient.find_album_match`` seam — the orchestrator never
+    branches on service identity, so adding a fifth provider means adding an
+    adapter (plus one kwarg + one ``StreamingCheckSources`` field) rather
+    than editing here. Verdict matrix (LML#376):
 
     - ``on_streaming=True`` when any service confirmed a match (positive evidence wins
       even if other services errored).

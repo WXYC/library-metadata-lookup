@@ -17,7 +17,7 @@ class BaseStreamingClient:
     Provides lazy httpx.AsyncClient lifecycle management, rate limiting
     via aiolimiter, concurrency control via asyncio.Semaphore, and the
     ``find_album_match`` interface that lets the streaming-check
-    orchestrator gather over any client uniformly (LML#392).
+    orchestrator gather over any client uniformly.
 
     Args:
         rate_limit: Tuple of (max_rate, time_period) for AsyncLimiter.

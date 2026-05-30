@@ -9,6 +9,7 @@ from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison  # noqa: F401
 
 from discogs.matching import strip_discogs_suffix  # noqa: F401
+from streaming.models import SourceMatch
 
 # Trailing format indicators: 12", 7", 10", LP, EP, CD, and multi-disc (x 2, x 3, ...)
 _FORMAT_SUFFIX_RE = re.compile(
@@ -192,3 +193,35 @@ def find_best_match(
                 match["id"] = id_fn(item)
             best = match
     return best
+
+
+def find_best_source_match(
+    results: list[dict],
+    query_artist: str,
+    query_title: str,
+    *,
+    artist_fn: Callable[[dict], str],
+    title_fn: Callable[[dict], str],
+    url_fn: Callable[[dict], str],
+) -> SourceMatch | None:
+    """Run ``find_best_match`` and wrap the verdict as a ``SourceMatch``.
+
+    The shape every streaming adapter's ``find_album_match`` reduces to: pass
+    the raw results + per-shape extractors, get back a normalized
+    ``SourceMatch`` or ``None``. Keeps the per-shape lambdas at the call site
+    (the only thing legitimately different across adapters) and concentrates
+    the ``best is None / SourceMatch(url=..., confidence=...)`` boilerplate
+    here. ``id_fn`` deliberately omitted — ``SourceMatch`` doesn't carry an
+    id, so the extra extractor was dead weight in adapter bodies.
+    """
+    best = find_best_match(
+        results,
+        query_artist,
+        query_title,
+        artist_fn=artist_fn,
+        title_fn=title_fn,
+        url_fn=url_fn,
+    )
+    if best is None:
+        return None
+    return SourceMatch(url=best["url"], confidence=best["confidence"])

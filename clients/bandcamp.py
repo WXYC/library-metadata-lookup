@@ -15,7 +15,7 @@ import re
 import httpx
 
 from clients.streaming.base import BaseStreamingClient
-from clients.streaming.matching import find_best_match, score_match
+from clients.streaming.matching import find_best_source_match, score_match
 from streaming.models import SourceMatch
 
 log = logging.getLogger(__name__)
@@ -116,10 +116,8 @@ class BandcampClient(BaseStreamingClient):
         if best_artist is None:
             return None
         catalog = await self.fetch_artist_catalog(best_artist["slug"])
-        if not catalog:
-            return None
         matched_artist_name = best_artist["name"]
-        best = find_best_match(
+        return find_best_source_match(
             catalog,
             artist,
             title,
@@ -127,9 +125,6 @@ class BandcampClient(BaseStreamingClient):
             title_fn=lambda x: x["title"],
             url_fn=lambda x: x["url"],
         )
-        if best is None:
-            return None
-        return SourceMatch(url=best["url"], confidence=best["confidence"])
 
     async def search_artist(self, artist_name: str) -> list[dict]:
         """Search Bandcamp autocomplete for artist pages.

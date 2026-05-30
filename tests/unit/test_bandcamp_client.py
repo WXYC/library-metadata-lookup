@@ -331,7 +331,12 @@ class TestFindAlbumMatch:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_artist_match_below_floor(self):
-        """Autocomplete returned a hit, but the artist name fuzz-score is <80."""
+        """Autocomplete returned a hit, but the artist name fuzz-score is <80.
+
+        Also pins that the catalog scrape is short-circuited — without this,
+        every below-floor autocomplete hit would burn a (rate-limited)
+        ``fetch_artist_catalog`` HTTP call.
+        """
         client = BandcampClient()
         client.search_artist = AsyncMock(
             return_value=[
@@ -342,12 +347,11 @@ class TestFindAlbumMatch:
                 }
             ]
         )
+        client.fetch_artist_catalog = AsyncMock()
 
         match = await client.find_album_match("Stereolab", "Aluminum Tunes")
         assert match is None
-        # Catalog scrape should not have been reached.
-        # (No assertion on fetch_artist_catalog because the mock is auto-created
-        # by AsyncMock; the contract is just "no SourceMatch returned".)
+        client.fetch_artist_catalog.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_none_when_catalog_empty(self):
