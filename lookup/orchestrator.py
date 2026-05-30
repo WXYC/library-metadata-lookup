@@ -63,6 +63,7 @@ from lookup.external_search import (
 )
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.strategies import build_strategies
+from release.musicbrainz_resolver import resolve_tracklist_via_musicbrainz
 from services.parser import MessageType, ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -250,6 +251,31 @@ def _log_album_title_fallback(
             transaction.set_data("album_title_fallback", payload)
     except Exception as e:
         logger.warning("Failed to project album_title_fallback onto Sentry transaction: %s", e)
+
+
+def _project_mb_rescue_attrs(attempted: bool, tracklist_found: bool) -> None:
+    """Project MusicBrainz tracklist-rescue outcome onto the active Sentry trace.
+
+    Two boolean attrs on the synth path's enrichment span:
+    - ``lookup.mb_rescue.attempted``: gating condition met (top-1 + extended
+      + ``mb_pg`` set + non-empty artist + non-empty album).
+    - ``lookup.mb_rescue.tracklist_found``: resolver returned a non-empty
+      tracklist (similarity floor cleared and PG returned rows).
+
+    Always reports both — ``attempted=False`` with ``tracklist_found=False``
+    means the gate skipped (no MB cache configured, non-extended call, or
+    missing inputs). This lets the trace query "how often does the rescue
+    fire, and how often does it hit?" without inferring from absence.
+
+    Silent on Sentry SDK errors; observability never breaks /lookup.
+    """
+    try:
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is not None:
+            transaction.set_data("lookup.mb_rescue.attempted", attempted)
+            transaction.set_data("lookup.mb_rescue.tracklist_found", tracklist_found)
+    except Exception as e:
+        logger.warning("Failed to project mb_rescue attrs onto Sentry transaction: %s", e)
 
 
 def _log_track_validation(
@@ -1670,6 +1696,7 @@ async def enrich_artwork_results(
     extended: bool = False,
     warm_cache: bool = False,
     discogs_cache: DiscogsCacheService | None = None,
+    mb_pg: PgSourceProtocol | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
@@ -1886,9 +1913,24 @@ async def enrich_artwork_results(
             update["profile_tokens"] = top1_profile_tokens
 
         if artwork is None:
-            # No Discogs match: synthesize a streaming-only result. See
-            # docstring's "Behavior change vs. v0.6.0 (LML#401)" section
-            # for the BS#1185 sentinel contract.
+            # No Discogs match: try MusicBrainz for a tracklist before
+            # synthesizing the streaming-only result. Same positional gate
+            # as the rest of the extended payload — only the top-1 item is
+            # eligible, and only when extended mode is on.
+            mb_rescue_attempted = False
+            mb_rescue_hit = False
+            if is_top1 and extended and mb_pg is not None and item.artist and album:
+                mb_rescue_attempted = True
+                mb_tracklist = await resolve_tracklist_via_musicbrainz(
+                    item.artist, album, mb_pg=mb_pg
+                )
+                if mb_tracklist:
+                    mb_rescue_hit = True
+                    update["tracklist"] = mb_tracklist
+            _project_mb_rescue_attrs(mb_rescue_attempted, mb_rescue_hit)
+
+            # See docstring's "Behavior change vs. v0.6.0 (LML#401)"
+            # section for the BS#1185 sentinel contract.
             return (item, DiscogsSearchResult(release_id=0, release_url="", **update))
 
         return (item, artwork.model_copy(update=update))
@@ -2177,6 +2219,7 @@ async def perform_lookup(
                 extended=extended_mode,
                 warm_cache=warm_cache_mode,
                 discogs_cache=discogs_cache,
+                mb_pg=mb_pg,
             )
 
     # Project the request-side flags onto the active Sentry transaction so

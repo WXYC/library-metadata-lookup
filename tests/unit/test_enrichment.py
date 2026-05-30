@@ -940,3 +940,175 @@ class TestEnrichArtworkResultsExtended:
         assert match.artist_bio == "A great artist."
         assert match.wikipedia_url == "https://en.wikipedia.org/wiki/Artist"
         assert match.spotify_url == "https://open.spotify.com/search/Artist%20Song"
+
+
+class TestMbTracklistRescue:
+    """``mb_pg`` rescue: when the top-1 result has no Discogs artwork AND
+    ``extended=true``, ``enrich_artwork_results`` calls
+    ``resolve_tracklist_via_musicbrainz`` and stitches the tracklist onto
+    the synth ``DiscogsSearchResult(release_id=0, ...)``. The picker's
+    rotation-tracks controller then consumes it inline.
+
+    Tests mock the resolver — no PG traffic.
+    """
+
+    @staticmethod
+    def _track_items():
+        from generated.api_models import DiscogsTrackItem
+
+        return [
+            DiscogsTrackItem(position="1", title="Brakhage", duration="4:12", artists=[]),
+            DiscogsTrackItem(position="2", title="Cybele's Reverie", duration="4:05", artists=[]),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_synth_carries_mb_tracklist_when_resolver_hits(self):
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        mb_pg = AsyncMock()
+
+        with (
+            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
+            patch(
+                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+                new=AsyncMock(return_value=self._track_items()),
+            ) as resolver,
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                album="Emperor Tomato Ketchup",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        _, enriched = results[0]
+        assert enriched.release_id == 0  # synth sentinel preserved
+        assert enriched.tracklist is not None
+        assert [t.title for t in enriched.tracklist] == ["Brakhage", "Cybele's Reverie"]
+        resolver.assert_awaited_once_with("Stereolab", "Emperor Tomato Ketchup", mb_pg=mb_pg)
+
+    @pytest.mark.asyncio
+    async def test_no_resolver_call_when_extended_is_false(self):
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        mb_pg = AsyncMock()
+
+        with (
+            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
+            patch(
+                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+                new=AsyncMock(),
+            ) as resolver,
+        ):
+            await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                album="Emperor Tomato Ketchup",
+                extended=False,
+                mb_pg=mb_pg,
+            )
+
+        resolver.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_resolver_call_when_mb_pg_is_none(self):
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+
+        with (
+            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
+            patch(
+                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+                new=AsyncMock(),
+            ) as resolver,
+        ):
+            await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                album="Emperor Tomato Ketchup",
+                extended=True,
+                mb_pg=None,
+            )
+
+        resolver.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_resolver_call_when_top1_has_artwork(self):
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        artwork = make_discogs_result(release_id=42)
+        mb_pg = AsyncMock()
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=42,
+            title="Emperor Tomato Ketchup",
+            artist="Stereolab",
+            year=1996,
+            artist_id=None,
+            release_url="https://discogs.com/release/42",
+        )
+
+        with (
+            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
+            patch(
+                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+                new=AsyncMock(),
+            ) as resolver,
+        ):
+            await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                album="Emperor Tomato Ketchup",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        resolver.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_resolver_call_when_album_empty(self):
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        mb_pg = AsyncMock()
+
+        with (
+            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
+            patch(
+                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+                new=AsyncMock(),
+            ) as resolver,
+        ):
+            await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                album=None,
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        resolver.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_synth_tracklist_none_when_resolver_misses(self):
+        # Resolver returned ``None`` (low similarity / no row / DB error).
+        # The synth still composes; ``tracklist`` stays absent / falsy.
+        item = make_library_item(artist="Stereolab", title="Aluminum Tunes")
+        mb_pg = AsyncMock()
+
+        with (
+            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
+            patch(
+                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+                new=AsyncMock(return_value=None),
+            ) as resolver,
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                album="Aluminum Tunes",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        resolver.assert_awaited_once()
+        _, enriched = results[0]
+        assert enriched.release_id == 0
+        # Either absent or an empty/None-equivalent tracklist — both fine.
+        assert not enriched.tracklist
