@@ -309,10 +309,13 @@ class TestBulkResolveObservability:
 
     These tests pin the defensive instrumentation that closes the gap on this
     sibling endpoint, mirroring the shape PR #417 landed for `/lookup/bulk`:
-    1. An ``INFO`` log at handler entry carrying `inputs=<N>` — fires BEFORE
-       any awaits, so a totally-hung handler still produces this signal.
+    1. An ``INFO`` log at handler entry carrying `inputs=<N>` — fires before
+       the per-input PG loop, so a handler that hangs in the loop still
+       produces this signal.
     2. An ``INFO`` log at handler exit carrying the per-kind verdict counts.
     3. An explicit Sentry ``http.server`` span tied to the bulk-resolve route.
+    4. A ``http.status_code=499`` pin on the span when the client aborts
+       mid-loop (CancelledError caught and re-raised).
 
     The matching production change is in
     ``identity/router.py:bulk_resolve_libraries``.
@@ -409,6 +412,90 @@ class TestBulkResolveObservability:
         assert "single_artist" in exit_msg, exit_msg
         assert "compilation" in exit_msg, exit_msg
         assert "unresolved" in exit_msg, exit_msg
+
+    @pytest.mark.asyncio
+    async def test_499_set_on_span_when_client_aborts_mid_loop(
+        self, app_client, mock_entity_store, caplog
+    ):
+        """Mid-loop CancelledError → http.status_code=499 on span + warn log.
+
+        The sequential per-input loop has no gather/sentinel structure (unlike
+        PR #417's `/lookup/bulk` shape), so the only signal of a client abort
+        is the `asyncio.CancelledError` raised at the next `await` point.
+        Without an explicit catch the span closes with no ``http.status_code``
+        set, and the audit-style query
+        ``op:http.server http.status_code:499`` returns nothing.
+
+        The handler must catch ``CancelledError``, pin 499 on the span, emit
+        a warn log so Railway carries a record, and re-raise so the asyncio
+        cancellation contract is honored.
+        """
+        import asyncio
+        import logging
+        from unittest.mock import MagicMock
+
+        async def cancel_mid_lookup(name: str):
+            raise asyncio.CancelledError()
+
+        mock_entity_store.resolve_library_name.side_effect = cancel_mid_lookup
+
+        # Capture the span so we can assert set_data calls after the request
+        # raises out of the test client.
+        span_mock = MagicMock()
+        span_cm = MagicMock()
+        span_cm.__enter__ = MagicMock(return_value=span_mock)
+        span_cm.__exit__ = MagicMock(return_value=False)
+
+        with patch("identity.router.sentry_sdk.start_span", return_value=span_cm):
+            with caplog.at_level(logging.WARNING, logger="identity.router"):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app_client), base_url="http://test"
+                ) as ac:
+                    # CancelledError propagating out of the handler surfaces to
+                    # the test client as a connection-level exception. We don't
+                    # care which exact class — only that the span was tagged
+                    # 499 and the warn log fired before the re-raise. Use a
+                    # bare try/except (rather than pytest.raises(BaseException),
+                    # which trips B017) so any exception class — including
+                    # CancelledError, which subclasses BaseException not
+                    # Exception — is captured.
+                    raised: BaseException | None = None
+                    try:
+                        await ac.post(
+                            "/api/v1/identity/bulk-resolve-libraries",
+                            json={
+                                "inputs": [
+                                    {
+                                        "library_id": 1,
+                                        "artist_name": "Juana Molina",
+                                        "album_title": "DOGA",
+                                    }
+                                ]
+                            },
+                        )
+                    except BaseException as e:
+                        raised = e
+                    assert raised is not None, (
+                        "Expected CancelledError (or wrapped client-abort exception) "
+                        "to propagate out of the test client; nothing raised."
+                    )
+
+        status_data_calls = [
+            c for c in span_mock.set_data.call_args_list if c.args[0] == "http.status_code"
+        ]
+        assert any(c.args[1] == 499 for c in status_data_calls), (
+            f"Expected http.status_code=499 on span; saw: {status_data_calls}"
+        )
+
+        abort_logs = [
+            r
+            for r in caplog.records
+            if "abort" in r.message.lower() or "client" in r.message.lower()
+        ]
+        assert abort_logs, (
+            f"Expected a warn log mentioning the client abort; got: "
+            f"{[r.message for r in caplog.records]}"
+        )
 
     @pytest.mark.asyncio
     async def test_http_server_span_emitted(self, app_client, mock_entity_store):
