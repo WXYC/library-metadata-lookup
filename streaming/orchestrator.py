@@ -16,11 +16,15 @@ logger = logging.getLogger(__name__)
 # Fail loudly at import time if the orchestrator's per-service kwargs ever
 # drift from `StreamingCheckSources` field names (the response shape is
 # API-locked, so the gather loop relies on this mapping being 1:1).
+# Explicit raise (not `assert`) so the guard survives `python -O` /
+# `PYTHONOPTIMIZE=1`, which compiles bare `assert` statements out and would
+# silently disable the check in optimized production runs.
 _EXPECTED_SERVICE_FIELDS = {"spotify", "deezer", "apple_music", "bandcamp"}
-assert set(StreamingCheckSources.model_fields) == _EXPECTED_SERVICE_FIELDS, (
-    "StreamingCheckSources fields drifted from check_streaming_availability "
-    f"kwargs; got {set(StreamingCheckSources.model_fields)}"
-)
+if set(StreamingCheckSources.model_fields) != _EXPECTED_SERVICE_FIELDS:
+    raise RuntimeError(
+        "StreamingCheckSources fields drifted from check_streaming_availability "
+        f"kwargs; got {set(StreamingCheckSources.model_fields)}"
+    )
 
 
 async def check_streaming_availability(

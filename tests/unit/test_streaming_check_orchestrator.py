@@ -12,8 +12,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from streaming.models import SourceMatch
-from streaming.orchestrator import check_streaming_availability
+from streaming.models import SourceMatch, StreamingCheckSources
+from streaming.orchestrator import _EXPECTED_SERVICE_FIELDS, check_streaming_availability
+
+
+def test_orchestrator_kwargs_match_response_fields():
+    """Pin the kwarg-to-response-field mapping the gather loop relies on.
+
+    The module-load guard in `streaming/orchestrator.py` raises if these
+    drift, but module-load guards don't run in test workers that mock the
+    module away. This test makes the invariant CI-discoverable and survives
+    any future restructuring that moves the guard.
+    """
+    assert set(StreamingCheckSources.model_fields) == _EXPECTED_SERVICE_FIELDS
 
 
 def _mock_client(match: SourceMatch | None | Exception = None) -> AsyncMock:
