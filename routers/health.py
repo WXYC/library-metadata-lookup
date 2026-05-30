@@ -12,9 +12,9 @@ Why a local handler instead of ``readiness_router``:
 2. **Granular failure values.** ``services.discogs_api`` carries a documented
    vocabulary (``ok``, ``auth-error``, ``rate-limited``, ``upstream-error``,
    ``network-error``, ``error``, ``unavailable``) — see the "Health Check
-   Behavior" section of CLAUDE.md. ``readiness_router._run_probe`` collapses
-   any non-``"ok"`` return value to ``"unavailable"``, which would silently
-   delete operator-facing diagnostic information.
+   Behavior" section of ``docs/deployment.md``. ``readiness_router._run_probe``
+   collapses any non-``"ok"`` return value to ``"unavailable"``, which would
+   silently delete operator-facing diagnostic information.
 3. **Extra response fields.** The body includes ``version``; the shared
    ``ReadinessResponse`` allows extras but the router does not populate them.
 
