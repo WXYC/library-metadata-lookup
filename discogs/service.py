@@ -12,6 +12,7 @@ import httpx
 import sentry_sdk
 from rapidfuzz import fuzz
 from wxyc_etl.text import is_compilation_artist
+from wxyc_fastapi.http import async_singleton
 from wxyc_fastapi.observability import (
     add_breadcrumb,
     get_cache_stats_recorder,
@@ -258,26 +259,55 @@ class DiscogsService:
             raise ValueError("Provide either token or api_key+api_secret")
         self.token = token or api_key  # backward-compat for callers reading .token
         self.cache_service = cache_service
+        # Test seam: tests assign ``service._client = mock`` before any call;
+        # the singleton getter respects that pre-set value (see _get_client).
         self._client: httpx.AsyncClient | None = None
+        # Per-instance ``async_singleton`` for the HTTP client (LML#435 /
+        # LML#357 audit follow-up). One (build, close) pair per
+        # DiscogsService instance so each instance keeps its own lock-guarded
+        # client; the prior `if self._client is None: self._client = …`
+        # pattern was a lock-free lazy-init that orphaned one
+        # ``httpx.AsyncClient`` per cold-start concurrent burst. Mirrors
+        # ``clients/streaming/base.py:BaseStreamingClient`` and
+        # ``core/dependencies.py`` for the same pattern; see LML#241 / #242
+        # / #243 for the original FD-leak class.
+        self._build_client, self._close_client = async_singleton(self._make_client)
+
+    async def _make_client(self) -> httpx.AsyncClient:
+        """Construct the underlying HTTP client.
+
+        Called at most once per instance lifetime by the ``async_singleton``
+        wrapper in ``_build_client``. Carries the per-instance auth header
+        so token-vs-key/secret callers each get the right ``Authorization``.
+        """
+        return httpx.AsyncClient(
+            base_url=DISCOGS_API_BASE,
+            headers={
+                "Authorization": self._auth_header,
+                "User-Agent": "LibraryMetadataLookupService/1.0",
+            },
+            timeout=10.0,
+        )
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create the HTTP client."""
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=DISCOGS_API_BASE,
-                headers={
-                    "Authorization": self._auth_header,
-                    "User-Agent": "LibraryMetadataLookupService/1.0",
-                },
-                timeout=10.0,
-            )
-        return self._client
+        """Get or create the HTTP client.
+
+        Honors a test-set ``self._client`` (tests sometimes pre-assign a
+        mock client); otherwise delegates to the singleton getter so
+        concurrent first-callers race-safely converge on one instance.
+        """
+        if self._client is not None:
+            return self._client
+        client = await self._build_client()
+        # Cache on the instance so future calls (and ``service._client``
+        # introspection in tests) see the same value the singleton holds.
+        self._client = client
+        return client
 
     async def close(self):
         """Close the HTTP client."""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        await self._close_client()
+        self._client = None
 
     async def check_api(self) -> DiscogsApiCheckResult:
         """Probe Discogs API connectivity, classifying the failure mode.

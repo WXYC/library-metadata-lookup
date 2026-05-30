@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 # health endpoint reports `unhealthy` instead of repeatedly retrying connect).
 # See WXYC/library-metadata-lookup#283.
 _library_db: LibraryDB | None = None
-_musicbrainz_pg: PgSource | None = None
 
 
 async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryDB:
@@ -193,6 +192,36 @@ async def get_discogs_cache_service(
     return service.cache_service
 
 
+async def _build_musicbrainz_pg() -> PgSource | None:
+    """Build the PgSource backing the musicbrainz-cache external-cache fallback.
+
+    Returns ``None`` when ``DATABASE_URL_MUSICBRAINZ`` is unset — the lookup
+    endpoint then gracefully degrades to discogs-only fallback (or
+    library-only when neither cache is configured). The race-free wiring
+    lives in ``async_singleton`` (LML#435 / LML#357 audit follow-up); this
+    factory just owns the config-load + log-on-failure shape, matching the
+    pattern of ``_build_discogs_pool`` and ``_build_apple_music_http_client``
+    in this same file.
+    """
+    settings = get_settings()
+    dsn = settings.database_url_musicbrainz
+    if not dsn:
+        logger.debug("DATABASE_URL_MUSICBRAINZ not set -- MB cache fallback disabled")
+        return None
+    try:
+        pg = PgSource(dsn)
+        logger.info("MusicBrainz cache source initialized")
+        return pg
+    except Exception as e:
+        logger.warning("Failed to initialize MusicBrainz cache source: %s: %s", type(e).__name__, e)
+        return None
+
+
+_get_musicbrainz_pg_singleton, _close_musicbrainz_pg_singleton = async_singleton(
+    _build_musicbrainz_pg
+)
+
+
 async def get_musicbrainz_pg(
     settings: Settings = Depends(get_settings),
 ) -> PgSource | None:
@@ -200,34 +229,18 @@ async def get_musicbrainz_pg(
 
     Used by the Phase 1.5 mojibake-recovery external-cache fallback in
     ``/api/v1/lookup``. Returns ``None`` when ``DATABASE_URL_MUSICBRAINZ`` is
-    unset so the lookup endpoint gracefully degrades to discogs-only fallback
-    (or library-only when neither cache is configured).
+    unset so the lookup endpoint gracefully degrades.
+
+    The ``settings`` argument is preserved for FastAPI DI compatibility; the
+    underlying ``async_singleton`` factory reads from ``get_settings()`` so
+    concurrent cold-start callers see a single, race-free init (LML#435).
     """
-    global _musicbrainz_pg
-
-    if _musicbrainz_pg is not None:
-        return _musicbrainz_pg
-
-    dsn = settings.database_url_musicbrainz
-    if not dsn:
-        logger.debug("DATABASE_URL_MUSICBRAINZ not set -- MB cache fallback disabled")
-        return None
-
-    try:
-        _musicbrainz_pg = PgSource(dsn)
-        logger.info("MusicBrainz cache source initialized")
-        return _musicbrainz_pg
-    except Exception as e:
-        logger.warning("Failed to initialize MusicBrainz cache source: %s: %s", type(e).__name__, e)
-        return None
+    return await _get_musicbrainz_pg_singleton()
 
 
 async def close_musicbrainz_pg() -> None:
-    """Close the musicbrainz-cache PgSource."""
-    global _musicbrainz_pg
-    if _musicbrainz_pg is not None:
-        await _musicbrainz_pg.close()
-        _musicbrainz_pg = None
+    """Close the musicbrainz-cache PgSource on app shutdown."""
+    await _close_musicbrainz_pg_singleton()
 
 
 async def _build_apple_music_http_client() -> httpx.AsyncClient:

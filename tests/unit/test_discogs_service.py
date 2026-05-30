@@ -1,11 +1,13 @@
 """Unit tests for discogs/service.py."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
+import discogs.service as discogs_service_module
 from discogs.models import (
     DiscogsSearchRequest,
     DiscogsSearchResponse,
@@ -14,6 +16,27 @@ from discogs.models import (
     TrackReleasesResponse,
 )
 from discogs.service import DiscogsApiCheckResult, DiscogsService
+
+
+def test_no_lockfree_lazy_init_in_get_client():
+    """LML#435 (LML#357 audit follow-up): `DiscogsService._get_client` must
+    not use the unguarded `self._client = httpx.AsyncClient(...)` lazy-init
+    pattern.
+
+    On cold start, two concurrent first-callers both see `self._client is
+    None`, both construct a fresh `httpx.AsyncClient`, and only one is
+    retained — the orphan is never closed (1 FD leaked per process lifetime
+    per cold-start burst). Smaller magnitude than the #241 / #242 incident
+    but the same class. Migrate to per-instance `async_singleton` (mirroring
+    `clients/streaming/base.py:BaseStreamingClient`) so the race closes.
+    """
+    src = Path(discogs_service_module.__file__).read_text()
+    assert "self._client = httpx.AsyncClient(" not in src, (
+        "discogs/service.py constructs `self._client = httpx.AsyncClient(...)` "
+        "inside a lock-free lazy-init — the racy pattern LML#357's audit "
+        "flagged. Migrate to per-instance `async_singleton` (template: "
+        "clients/streaming/base.py:BaseStreamingClient). See LML#435."
+    )
 
 
 @pytest.fixture

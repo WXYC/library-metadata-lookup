@@ -50,6 +50,27 @@ def test_no_module_level_asyncio_lock_in_dependencies():
     )
 
 
+def test_no_global_musicbrainz_pg_in_dependencies():
+    """LML#435 (LML#357 audit follow-up): `get_musicbrainz_pg` must not use
+    the `global _musicbrainz_pg` + None-check + assign lazy-init pattern.
+
+    The pre-fix shape has a zero-width TOCTOU race today (sync `PgSource()`
+    constructor — no await between the None-check and the assignment), but
+    that race reactivates the moment anyone adds an await between them —
+    exactly the failure mode `get_entity_store` had pre-#395, where a probe
+    await opened a real race window and orphaned a PgSource per cold-start
+    burst. Pin the migration to `async_singleton` so re-introducing the
+    racy shape fails this test.
+    """
+    src = Path(deps_module.__file__).read_text()
+    assert "global _musicbrainz_pg" not in src, (
+        "core/dependencies.py uses `global _musicbrainz_pg` — the lock-free "
+        "lazy-init pattern that LML#357's audit flagged as racy. Migrate to "
+        "`async_singleton(_build_musicbrainz_pg)` (mirroring the Discogs "
+        "pool + Apple Music client pattern in the same file). See LML#435."
+    )
+
+
 # ---------------------------------------------------------------------------
 # get_library_db
 # ---------------------------------------------------------------------------
