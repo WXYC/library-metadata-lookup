@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -159,6 +159,25 @@ async def test_returns_none_on_pg_exception():
     mb_pg.fetchall = AsyncMock(side_effect=RuntimeError("connection refused"))
 
     result = await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_returns_none_on_pg_timeout():
+    # A slow MB query must not push the response past Backend-Service's
+    # 30s AbortController; the timeout coerces it to a quiet None.
+    import asyncio
+
+    async def hang(*_args, **_kwargs):
+        await asyncio.sleep(60)
+        return []
+
+    mb_pg = AsyncMock()
+    mb_pg.fetchall = hang
+
+    with patch("release.musicbrainz_resolver._PG_TIMEOUT_S", 0.05):
+        result = await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
 
     assert result is None
 

@@ -253,19 +253,14 @@ def _log_album_title_fallback(
         logger.warning("Failed to project album_title_fallback onto Sentry transaction: %s", e)
 
 
-def _project_mb_rescue_attrs(attempted: bool, tracklist_found: bool) -> None:
+def _project_mb_rescue_attrs(*, attempted: bool, tracklist_found: bool) -> None:
     """Project MusicBrainz tracklist-rescue outcome onto the active Sentry trace.
 
-    Two boolean attrs on the synth path's enrichment span:
-    - ``lookup.mb_rescue.attempted``: gating condition met (top-1 + extended
-      + ``mb_pg`` set + non-empty artist + non-empty album).
-    - ``lookup.mb_rescue.tracklist_found``: resolver returned a non-empty
-      tracklist (similarity floor cleared and PG returned rows).
-
-    Always reports both — ``attempted=False`` with ``tracklist_found=False``
-    means the gate skipped (no MB cache configured, non-extended call, or
-    missing inputs). This lets the trace query "how often does the rescue
-    fire, and how often does it hit?" without inferring from absence.
+    Called from the synth path only when the rescue was eligible (top-1 +
+    extended + ``mb_pg`` set + non-empty artist + non-empty album), so the
+    trace gets an attr per eligible call — non-eligible lookups never emit
+    the boolean, keeping the trace explorer's filter on ``attempted=true``
+    informative.
 
     Silent on Sentry SDK errors; observability never breaks /lookup.
     """
@@ -1917,17 +1912,13 @@ async def enrich_artwork_results(
             # synthesizing the streaming-only result. Same positional gate
             # as the rest of the extended payload — only the top-1 item is
             # eligible, and only when extended mode is on.
-            mb_rescue_attempted = False
-            mb_rescue_hit = False
             if is_top1 and extended and mb_pg is not None and item.artist and album:
-                mb_rescue_attempted = True
                 mb_tracklist = await resolve_tracklist_via_musicbrainz(
                     item.artist, album, mb_pg=mb_pg
                 )
                 if mb_tracklist:
-                    mb_rescue_hit = True
                     update["tracklist"] = mb_tracklist
-            _project_mb_rescue_attrs(mb_rescue_attempted, mb_rescue_hit)
+                _project_mb_rescue_attrs(attempted=True, tracklist_found=bool(mb_tracklist))
 
             # See docstring's "Behavior change vs. v0.6.0 (LML#401)"
             # section for the BS#1185 sentinel contract.

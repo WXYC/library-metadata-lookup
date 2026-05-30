@@ -23,6 +23,7 @@ ops surface.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -32,29 +33,38 @@ from generated.api_models import DiscogsTrackItem
 logger = logging.getLogger(__name__)
 
 # Matches `CANONICAL_ARTIST_SIMILARITY_FLOOR` in ``lookup/orchestrator.py``.
+# Kept duplicated rather than imported to avoid a circular import with the
+# orchestrator (which imports this module). Bump both together on calibration.
 # False-positive tracklists are worse than no tracklist — the DJ types the
 # correct tracks in 10s either way, but a wrong tracklist gets unknowingly
 # committed to the flowsheet.
 _SIMILARITY_FLOOR: float = 0.70
 
-# Top-1 (artist, album) candidate plus its tracklist in one round trip.
-# The artist-credit and release-name % predicates both gate with pg_trgm,
-# so the floor is enforced twice: first in PG (any score below the
-# similarity-cutoff yields zero rows), then in Python (defensive, in case
-# a future PG tunable lowers the % cutoff below our floor). Ordering by
-# medium position, then track position, keeps multi-disc releases in
-# play order.
+# Hard ceiling on the PG round trip. The rescue fires inside
+# ``enrich_artwork_results``, AFTER the cascade's ``LML_SEARCH_HARD_TIMEOUT_MS``
+# already closed; without this, a slow MB query could push the response past
+# Backend-Service's 30s ``AbortController`` ceiling and surface as a CORS-less
+# 502 to the dj-site picker.
+_PG_TIMEOUT_S: float = 2.0
+
+# Top-1 (artist, album) candidate plus its tracklist in one round trip. The
+# ``lower(f_unaccent(...))`` wrapping matches the Phase 1.5 mojibake-recovery
+# pattern in ``lookup/external_search.py``: diacritic-stripped inputs (e.g.
+# "Sigur Ros" against MB's "Sigur Rós") must hit when both sides are normalized.
+# Index dependency: expression-trigram indexes on ``lower(f_unaccent(name))``
+# on ``mb_release.name`` and ``mb_artist_credit.name`` (mirrors the index
+# requirement called out in ``external_search.py``).
 _MB_TRACKLIST_FOR_ALBUM_SQL = """\
 WITH candidate AS (
     SELECT r.id AS release_id,
            ac.name AS release_artist,
            r.name AS release_title,
-           similarity(lower(r.name), lower($2)) AS album_score,
-           similarity(lower(ac.name), lower($1)) AS artist_score
+           similarity(lower(f_unaccent(r.name)), lower(f_unaccent($2))) AS album_score,
+           similarity(lower(f_unaccent(ac.name)), lower(f_unaccent($1))) AS artist_score
     FROM mb_release r
     JOIN mb_artist_credit ac ON ac.id = r.artist_credit
-    WHERE lower(r.name) % lower($2)
-      AND lower(ac.name) % lower($1)
+    WHERE lower(f_unaccent(r.name)) % lower(f_unaccent($2))
+      AND lower(f_unaccent(ac.name)) % lower(f_unaccent($1))
     ORDER BY album_score DESC, artist_score DESC
     LIMIT 1
 )
@@ -112,9 +122,18 @@ async def resolve_tracklist_via_musicbrainz(
         return None
 
     try:
-        rows: list[dict[str, Any]] = await mb_pg.fetchall(
-            _MB_TRACKLIST_FOR_ALBUM_SQL, artist, album
+        rows: list[dict[str, Any]] = await asyncio.wait_for(
+            mb_pg.fetchall(_MB_TRACKLIST_FOR_ALBUM_SQL, artist, album),
+            timeout=_PG_TIMEOUT_S,
         )
+    except TimeoutError:
+        logger.warning(
+            "MusicBrainz tracklist resolver timed out after %.1fs for (%r, %r)",
+            _PG_TIMEOUT_S,
+            artist,
+            album,
+        )
+        return None
     except Exception as e:
         logger.warning(
             "MusicBrainz tracklist resolver query failed for (%r, %r): %s",
