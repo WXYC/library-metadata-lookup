@@ -1216,9 +1216,13 @@ class StreamingCheckSources(BaseModel):
 class StreamingCheckResponse(BaseModel):
     on_streaming: bool = Field(
         ...,
-        description="True if found on any service, false if absent on all, null if inconclusive.",
+        description='True if found on any service, false if all services confirmed absent (no errors),\nnull if inconclusive — either no services checked OR at least one service raised\nan error (see `errored_sources`). Treat null as "do not persist" / "retry later".\n',
     )
     sources: StreamingCheckSources
+    errored_sources: list[str] | None = Field(
+        None,
+        description="Names of services whose check raised an exception (transient network/rate-limit/\nscraping failure). Empty when every dispatched check completed without raising.\nWhen non-empty, callers should consider the listed services unchecked and may\nschedule a selective retry. Independent of `on_streaming`: a service can both\nmatch (populating `sources.<service>`) and other services can error.\n",
+    )
 
 
 class AppConfig(BaseModel):

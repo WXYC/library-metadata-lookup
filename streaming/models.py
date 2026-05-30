@@ -34,8 +34,20 @@ class StreamingCheckResponse(BaseModel):
     on_streaming: bool | None = Field(
         ...,
         description=(
-            "True if found on any service, False if confirmed absent on all, "
-            "None if inconclusive (e.g., all checks errored)"
+            "True if found on any service, False if all services confirmed absent "
+            "(no errors), None if inconclusive — either no services checked or at "
+            "least one service raised an error (see errored_sources). Callers should "
+            "treat None as 'do not persist' / 'retry later' (LML#376)."
         ),
     )
     sources: StreamingCheckSources = Field(..., description="Per-service match results")
+    errored_sources: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Service names whose check raised an exception (transient network/rate-"
+            "limit/scraping failure). Empty when every dispatched check completed "
+            "without raising. Independent of on_streaming: a service can match while "
+            "others error. Use to schedule a selective retry of just the listed "
+            "services rather than re-running every leg."
+        ),
+    )
