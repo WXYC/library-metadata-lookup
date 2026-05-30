@@ -262,23 +262,16 @@ class DiscogsService:
         # Test seam: tests assign ``service._client = mock`` before any call;
         # the singleton getter respects that pre-set value (see _get_client).
         self._client: httpx.AsyncClient | None = None
-        # Per-instance ``async_singleton`` for the HTTP client (LML#435 /
-        # LML#357 audit follow-up). One (build, close) pair per
-        # DiscogsService instance so each instance keeps its own lock-guarded
-        # client; the prior `if self._client is None: self._client = …`
-        # pattern was a lock-free lazy-init that orphaned one
-        # ``httpx.AsyncClient`` per cold-start concurrent burst. Mirrors
-        # ``clients/streaming/base.py:BaseStreamingClient`` and
-        # ``core/dependencies.py`` for the same pattern; see LML#241 / #242
-        # / #243 for the original FD-leak class.
+        # Per-instance singleton — see clients/streaming/base.py for the
+        # same pattern (LML#241 FD-leak class).
         self._build_client, self._close_client = async_singleton(self._make_client)
 
     async def _make_client(self) -> httpx.AsyncClient:
         """Construct the underlying HTTP client.
 
-        Called at most once per instance lifetime by the ``async_singleton``
-        wrapper in ``_build_client``. Carries the per-instance auth header
-        so token-vs-key/secret callers each get the right ``Authorization``.
+        Method (not free function) so ``self._auth_header`` closes over the
+        per-instance token-vs-key/secret distinction without threading the
+        header through ``async_singleton``'s factory signature.
         """
         return httpx.AsyncClient(
             base_url=DISCOGS_API_BASE,
@@ -305,7 +298,14 @@ class DiscogsService:
         return client
 
     async def close(self):
-        """Close the HTTP client."""
+        """Close the HTTP client.
+
+        For a test-injected ``self._client`` (a mock), the singleton's
+        internal instance is still ``None``, so ``_close_client()`` is a
+        no-op for it. Acceptable because tests use ``AsyncMock``, which
+        needs no teardown; a real pre-assigned client (only seen in tests
+        today) would be a leak.
+        """
         await self._close_client()
         self._client = None
 

@@ -197,11 +197,7 @@ async def _build_musicbrainz_pg() -> PgSource | None:
 
     Returns ``None`` when ``DATABASE_URL_MUSICBRAINZ`` is unset — the lookup
     endpoint then gracefully degrades to discogs-only fallback (or
-    library-only when neither cache is configured). The race-free wiring
-    lives in ``async_singleton`` (LML#435 / LML#357 audit follow-up); this
-    factory just owns the config-load + log-on-failure shape, matching the
-    pattern of ``_build_discogs_pool`` and ``_build_apple_music_http_client``
-    in this same file.
+    library-only when neither cache is configured).
     """
     settings = get_settings()
     dsn = settings.database_url_musicbrainz
@@ -228,12 +224,9 @@ async def get_musicbrainz_pg(
     """Get a PgSource for the musicbrainz-cache PostgreSQL DB, if configured.
 
     Used by the Phase 1.5 mojibake-recovery external-cache fallback in
-    ``/api/v1/lookup``. Returns ``None`` when ``DATABASE_URL_MUSICBRAINZ`` is
-    unset so the lookup endpoint gracefully degrades.
-
-    The ``settings`` argument is preserved for FastAPI DI compatibility; the
-    underlying ``async_singleton`` factory reads from ``get_settings()`` so
-    concurrent cold-start callers see a single, race-free init (LML#435).
+    ``/api/v1/lookup``. The ``settings`` argument looks dead but is
+    preserved for FastAPI DI compatibility — the underlying singleton
+    factory reads from ``get_settings()`` directly.
     """
     return await _get_musicbrainz_pg_singleton()
 
