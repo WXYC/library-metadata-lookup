@@ -1643,8 +1643,8 @@ async def enrich_artwork_results(
     **Behavior change vs. v0.6.0 (LML#401):** an item entering with
     ``artwork=None`` no longer round-trips as ``(item, None)``. It returns
     a synthesized ``DiscogsSearchResult(release_id=0, release_url="")``
-    carrying only the streaming-URL fields (Apple via iTunes Search +
-    Spotify/YT/BC/SC search-URL fallbacks). Album-derived scalars
+    carrying only the streaming-URL fields (Apple via the authenticated
+    ``AppleMusicClient`` + Spotify/YT/BC/SC search-URL fallbacks). Album-derived scalars
     (release_year, artist_bio, wikipedia_url) and the ``extended=True``
     payload stay None on the synthesized result, preserving the positional-
     gating invariant above. The ``(release_id=0, release_url="")`` pair is
