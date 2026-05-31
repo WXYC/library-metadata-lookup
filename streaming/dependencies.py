@@ -48,14 +48,33 @@ def get_deezer_client() -> DeezerClient:
     return _deezer_client
 
 
-def get_apple_music_client() -> AppleMusicClient:
-    """Get Apple Music (iTunes) client instance. No auth required."""
+def get_apple_music_client(
+    settings: Settings = Depends(get_settings),
+) -> AppleMusicClient | None:
+    """Get Apple Music client. Requires APPLE_MUSIC_TEAM_ID, KEY_ID, and
+    PRIVATE_KEY; returns None when any is missing so the check degrades to
+    no-op (matches the Spotify-without-creds pattern). See
+    docs/adr/0001-authenticated-apple-music-api.md.
+    """
     global _apple_music_client
 
-    if _apple_music_client is None:
-        _apple_music_client = AppleMusicClient()
-        logger.info("Apple Music client initialized")
+    if _apple_music_client is not None:
+        return _apple_music_client
 
+    if (
+        not settings.apple_music_team_id
+        or not settings.apple_music_key_id
+        or not settings.apple_music_private_key
+    ):
+        logger.debug("Apple Music credentials not set — Apple Music check disabled")
+        return None
+
+    _apple_music_client = AppleMusicClient(
+        team_id=settings.apple_music_team_id,
+        key_id=settings.apple_music_key_id,
+        private_key=settings.apple_music_private_key,
+    )
+    logger.info("Apple Music client initialized")
     return _apple_music_client
 
 

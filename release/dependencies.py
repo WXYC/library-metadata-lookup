@@ -26,7 +26,7 @@ def get_resolver_dependencies(
     bandcamp: BandcampClient = Depends(get_bandcamp_client),
     spotify: SpotifyClient | None = Depends(get_spotify_client),
     deezer: DeezerClient = Depends(get_deezer_client),
-    apple_music: AppleMusicClient = Depends(get_apple_music_client),
+    apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     entity_store: EntityStore | None = Depends(get_entity_store),
 ) -> _ResolverDependencies:
     """Bundle the I/O clients the resolver orchestrator needs.

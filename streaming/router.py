@@ -41,7 +41,7 @@ async def handle_streaming_check(
     request: StreamingCheckRequest,
     spotify: SpotifyClient | None = Depends(get_spotify_client),
     deezer: DeezerClient = Depends(get_deezer_client),
-    apple_music: AppleMusicClient = Depends(get_apple_music_client),
+    apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     bandcamp: BandcampClient = Depends(get_bandcamp_client),
 ) -> StreamingCheckResponse:
     """Check streaming availability across all configured services."""
