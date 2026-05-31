@@ -22,6 +22,7 @@ from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats_recorder
 
+from clients.streaming.apple_music import AppleMusicClient
 from config.settings import get_settings
 from core.search import (
     execute_search_pipeline,
@@ -1692,15 +1693,19 @@ async def enrich_artwork_results(
     warm_cache: bool = False,
     discogs_cache: DiscogsCacheService | None = None,
     mb_pg: PgSourceProtocol | None = None,
+    apple_music: AppleMusicClient | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
     When library_db has a streaming_links table, uses direct URLs from the database.
     Falls back to search URLs when direct links are not available.
 
-    ``http_client`` is the shared ``httpx.AsyncClient`` used for the iTunes
-    Search probe. Passing ``None`` skips the Apple Music lookup — the
-    orchestrator never instantiates its own client (issue #241).
+    ``apple_music`` is the authenticated Apple Music client (LML#443). When
+    provided, the orchestrator calls ``apple_music.find_track_url(...)`` to
+    surface Apple Music URLs; when None (credentials unconfigured), the
+    apple_music_url field stays None — matching the Spotify L1 degradation
+    pattern. ``http_client`` is retained for the not-yet-migrated legacy
+    iTunes probe in ``_fetch_apple_music_url``; PR-4 deletes both.
 
     **Behavior change vs. v0.5.0:** release/artist details (release_year,
     artist_bio, wikipedia_url) are fetched only for ``items_with_artwork[0]``.
@@ -1820,8 +1825,8 @@ async def enrich_artwork_results(
         search_term = song or item.title or ""
 
         apple_music_result = (
-            await _fetch_apple_music_url(artist, search_term, album=album, http_client=http_client)
-            if (artist and search_term)
+            await apple_music.find_track_url(artist, search_term, album=album)
+            if (apple_music is not None and artist and search_term)
             else None
         )
 
@@ -2048,6 +2053,7 @@ async def perform_lookup(
     discogs_cache: DiscogsCacheService | None = None,
     mb_pg: PgSourceProtocol | None = None,
     http_client: httpx.AsyncClient | None = None,
+    apple_music: AppleMusicClient | None = None,
     caller_budget_ms: int | None = None,
 ) -> LookupResponse:
     """Orchestrate the full lookup pipeline.
@@ -2211,6 +2217,7 @@ async def perform_lookup(
                 warm_cache=warm_cache_mode,
                 discogs_cache=discogs_cache,
                 mb_pg=mb_pg,
+                apple_music=apple_music,
             )
 
     # Project the request-side flags onto the active Sentry transaction so

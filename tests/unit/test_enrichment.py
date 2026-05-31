@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from clients.streaming.apple_music import AppleMusicClient
 from discogs.models import (
     ArtistDetails,
     DiscogsSearchResult,
@@ -338,9 +339,9 @@ class TestEnrichArtworkResults:
         assert enriched.soundcloud_url is not None
 
     @pytest.mark.asyncio
-    async def test_no_discogs_match_surfaces_apple_url_via_itunes(self):
-        """When ``_fetch_apple_music_url`` clears the 80/80/80 floor on a
-        no-Discogs-match item, the synthesized artwork carries the URL.
+    async def test_no_discogs_match_surfaces_apple_url_via_apple_music(self):
+        """When ``AppleMusicClient.find_track_url`` clears the 80/80/80 floor
+        on a no-Discogs-match item, the synthesized artwork carries the URL.
 
         This is the Tragic Magic case from BS#1184 in miniature: an album
         absent from the WXYC catalog but present on Apple Music.
@@ -351,16 +352,16 @@ class TestEnrichArtworkResults:
         )
 
         apple_url = "https://music.apple.com/us/album/tragic-magic/1843854211"
-        with patch(
-            "lookup.orchestrator._fetch_apple_music_url",
-            return_value=apple_url,
-        ):
-            results = await enrich_artwork_results(
-                [(item, None)],
-                AsyncMock(),
-                song="The Four Sleeping Princesses",
-                album="Tragic Magic",
-            )
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_url = AsyncMock(return_value=apple_url)
+
+        results = await enrich_artwork_results(
+            [(item, None)],
+            AsyncMock(),
+            song="The Four Sleeping Princesses",
+            album="Tragic Magic",
+            apple_music=apple_music,
+        )
 
         _, enriched = results[0]
         assert enriched is not None
@@ -1112,3 +1113,148 @@ class TestMbTracklistRescue:
         assert enriched.release_id == 0
         # Either absent or an empty/None-equivalent tracklist — both fine.
         assert not enriched.tracklist
+
+
+class TestEnrichArtworkResultsWithAppleMusicClient:
+    """PR-3 / LML#443: orchestrator hot path consumes ``AppleMusicClient.find_track_url``
+    instead of the iTunes Search probe in ``_fetch_apple_music_url``.
+
+    These tests pin the new contract — ``enrich_artwork_results`` accepts an
+    ``apple_music`` client and threads the call. The legacy
+    ``_fetch_apple_music_url`` function (and the ``http_client`` parameter
+    backing it) survives PR-3 for backward compatibility with the not-yet-
+    migrated batch backfill script; PR-4 removes both.
+    """
+
+    @pytest.mark.asyncio
+    async def test_apple_music_client_url_propagates_to_synthesized_result(self):
+        """A no-Discogs-match item paired with an ``AppleMusicClient`` that
+        returns a URL produces a synthesized ``DiscogsSearchResult`` carrying
+        that URL — mirrors LML#401 / BS#1184 (Tragic Magic on Apple Music but
+        absent from the WXYC Discogs catalog).
+        """
+        item = make_library_item(
+            artist="Julianna Barwick & Mary Lattimore",
+            title="The Four Sleeping Princesses",
+        )
+        apple_url = "https://music.apple.com/us/album/tragic-magic/1843854211"
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_url = AsyncMock(return_value=apple_url)
+
+        # The legacy iTunes path must NOT be reached — patch so a regression
+        # back to the old call site surfaces as a failed assertion rather
+        # than a silently-wrong URL.
+        with patch(
+            "lookup.orchestrator._fetch_apple_music_url",
+            new=AsyncMock(return_value="https://itunes.example/should-not-appear"),
+        ) as legacy_itunes:
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="The Four Sleeping Princesses",
+                album="Tragic Magic",
+                apple_music=apple_music,
+            )
+
+        legacy_itunes.assert_not_awaited()
+        apple_music.find_track_url.assert_awaited_once_with(
+            "Julianna Barwick & Mary Lattimore",
+            "The Four Sleeping Princesses",
+            album="Tragic Magic",
+        )
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.release_id == 0
+        assert enriched.apple_music_url == apple_url
+
+    @pytest.mark.asyncio
+    async def test_apple_music_client_none_degrades_gracefully(self):
+        """When ``apple_music`` is None (creds unconfigured), the lookup
+        produces a result with ``apple_music_url`` None instead of raising.
+        Matches the Spotify L1 degradation pattern in
+        ``streaming/dependencies.py:get_spotify_client``.
+        """
+        item = make_library_item(artist="Stereolab", title="Aluminum Tunes")
+
+        results = await enrich_artwork_results(
+            [(item, None)],
+            AsyncMock(),
+            song="French Disko",
+            album="Aluminum Tunes",
+            apple_music=None,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.apple_music_url is None
+        # Search-URL fallbacks for the OTHER services still fill.
+        assert enriched.spotify_url is not None
+
+    @pytest.mark.asyncio
+    async def test_apple_music_client_returning_none_leaves_url_unset(self):
+        """An ``AppleMusicClient`` that scores no result below the floor
+        returns None — the synthesized result's ``apple_music_url`` stays
+        None, mirroring the legacy iTunes path's behavior for unmatched
+        queries.
+        """
+        item = make_library_item(artist="Obscure Artist", title="Obscure Album")
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_url = AsyncMock(return_value=None)
+
+        results = await enrich_artwork_results(
+            [(item, None)],
+            AsyncMock(),
+            song="Obscure Song",
+            album="Obscure Album",
+            apple_music=apple_music,
+        )
+
+        apple_music.find_track_url.assert_awaited_once()
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.apple_music_url is None
+
+    @pytest.mark.asyncio
+    async def test_apple_music_url_does_not_override_db_streaming_link(self):
+        """Direct streaming-links from the library DB take precedence over the
+        AppleMusicClient probe — preserves the existing
+        ``apple_music_override or apple_music_result or None`` priority.
+        """
+        item = make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")
+        artwork = make_discogs_result(
+            release_id=1, artist="Jessica Pratt", album="On Your Own Love Again"
+        )
+
+        db_url = "https://music.apple.com/us/album/db-override/111"
+        probe_url = "https://music.apple.com/us/album/probe-result/222"
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_url = AsyncMock(return_value=probe_url)
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(return_value={"apple_music_url": db_url})
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="On Your Own Love Again",
+            artist="Jessica Pratt",
+            year=2015,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Back, Baby",
+            album="On Your Own Love Again",
+            library_db=library_db,
+            apple_music=apple_music,
+        )
+
+        _, enriched = results[0]
+        assert enriched.apple_music_url == db_url
