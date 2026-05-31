@@ -4,6 +4,8 @@ from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from config.settings import Settings
 from discogs.memory_cache import clear_all_caches, set_skip_cache
@@ -118,6 +120,33 @@ def mock_asyncpg_pool():
 
     pool._mock_conn = conn  # expose for assertions
     return pool
+
+
+@pytest.fixture(scope="session")
+def es256_keypair() -> tuple[str, str]:
+    """Generate an ephemeral ES256 (P-256) keypair for Apple Music client tests.
+
+    Returns ``(private_pem, public_pem)`` as PKCS#8 / SubjectPublicKeyInfo PEM
+    strings. Tests sign real JWTs with the private half and verify with the
+    public half — the same shape Apple validates, just against a key we own
+    instead of one Apple registered. Session-scoped so generation cost (~1 ms)
+    isn't paid per test.
+    """
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    public_pem = (
+        private_key.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
+    return private_pem, public_pem
 
 
 @pytest.fixture

@@ -178,7 +178,9 @@ def write_report(results: list[RecheckResult], output_path: Path) -> None:
             )
 
 
-def _build_clients() -> tuple[SpotifyClient | None, DeezerClient, AppleMusicClient, BandcampClient]:
+def _build_clients() -> tuple[
+    SpotifyClient | None, DeezerClient, AppleMusicClient | None, BandcampClient
+]:
     spotify: SpotifyClient | None = None
     cid = os.environ.get("SPOTIFY_CLIENT_ID")
     csec = os.environ.get("SPOTIFY_CLIENT_SECRET")
@@ -186,7 +188,19 @@ def _build_clients() -> tuple[SpotifyClient | None, DeezerClient, AppleMusicClie
         spotify = SpotifyClient(cid, csec)
     else:
         logger.warning("SPOTIFY_CLIENT_ID/SECRET not set — skipping Spotify check")
-    return spotify, DeezerClient(), AppleMusicClient(), BandcampClient()
+
+    apple_music: AppleMusicClient | None = None
+    am_team = os.environ.get("APPLE_MUSIC_TEAM_ID")
+    am_key = os.environ.get("APPLE_MUSIC_KEY_ID")
+    am_priv = os.environ.get("APPLE_MUSIC_PRIVATE_KEY")
+    if am_team and am_key and am_priv:
+        apple_music = AppleMusicClient(team_id=am_team, key_id=am_key, private_key=am_priv)
+    else:
+        logger.warning(
+            "APPLE_MUSIC_TEAM_ID/KEY_ID/PRIVATE_KEY not all set — skipping Apple Music check"
+        )
+
+    return spotify, DeezerClient(), apple_music, BandcampClient()
 
 
 async def _close_clients(*clients) -> None:

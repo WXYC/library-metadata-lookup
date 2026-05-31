@@ -21,6 +21,26 @@ class Settings(BaseSettings):
         None, description="Spotify client secret for streaming availability checks"
     )
 
+    # Apple Music API authentication (replaces unauthenticated iTunes Search after the
+    # 2026-05-28 Railway egress 403; see docs/adr/0001-authenticated-apple-music-api.md).
+    # All three must be set for the client to function; absent any one of them the
+    # provider returns None and Apple Music checks degrade to no-op (same shape as
+    # Spotify-without-creds).
+    apple_music_team_id: str | None = Field(
+        None, description="Apple Developer Team ID (10-char) used as the JWT `iss` claim"
+    )
+    apple_music_key_id: str | None = Field(
+        None, description="Apple Developer Key ID (10-char) used as the JWT `kid` header"
+    )
+    apple_music_private_key: str | None = Field(
+        None,
+        description=(
+            "ES256 PEM private key contents downloaded from the Apple Developer "
+            "console. Railway stores the multi-line PEM verbatim; never check the "
+            "key material into the repo."
+        ),
+    )
+
     # Database Configuration
     library_db_path: Path = Field(
         default=Path("library.db"), description="Path to SQLite library database"
