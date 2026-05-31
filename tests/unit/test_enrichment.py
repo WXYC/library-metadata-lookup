@@ -467,9 +467,7 @@ class TestEnrichArtworkResultsExtended:
             scheduled.append(task)
             return task
 
-        with (
-            patch("lookup.orchestrator.asyncio.create_task", side_effect=spy_create_task),
-        ):
+        with patch("lookup.orchestrator.asyncio.create_task", side_effect=spy_create_task):
             await enrich_artwork_results(
                 [(item, artwork)],
                 discogs_service,
@@ -510,9 +508,7 @@ class TestEnrichArtworkResultsExtended:
             scheduled.append(task)
             return task
 
-        with (
-            patch("lookup.orchestrator.asyncio.create_task", side_effect=spy_create_task),
-        ):
+        with patch("lookup.orchestrator.asyncio.create_task", side_effect=spy_create_task):
             await enrich_artwork_results(
                 [(item, artwork)], discogs_service, extended=True, warm_cache=False
             )
@@ -556,9 +552,7 @@ class TestEnrichArtworkResultsExtended:
             scheduled.append(task)
             return task
 
-        with (
-            patch("lookup.orchestrator.asyncio.create_task", side_effect=spy_create_task),
-        ):
+        with patch("lookup.orchestrator.asyncio.create_task", side_effect=spy_create_task):
             await enrich_artwork_results(
                 [(item, artwork)], discogs_service, extended=True, warm_cache=True
             )
@@ -733,12 +727,10 @@ class TestMbTracklistRescue:
         item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
         mb_pg = AsyncMock()
 
-        with (
-            patch(
-                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
-                new=AsyncMock(return_value=self._track_items()),
-            ) as resolver,
-        ):
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(return_value=self._track_items()),
+        ) as resolver:
             results = await enrich_artwork_results(
                 [(item, None)],
                 AsyncMock(),
@@ -758,12 +750,10 @@ class TestMbTracklistRescue:
         item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
         mb_pg = AsyncMock()
 
-        with (
-            patch(
-                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
-                new=AsyncMock(),
-            ) as resolver,
-        ):
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(),
+        ) as resolver:
             await enrich_artwork_results(
                 [(item, None)],
                 AsyncMock(),
@@ -778,12 +768,10 @@ class TestMbTracklistRescue:
     async def test_no_resolver_call_when_mb_pg_is_none(self):
         item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
 
-        with (
-            patch(
-                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
-                new=AsyncMock(),
-            ) as resolver,
-        ):
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(),
+        ) as resolver:
             await enrich_artwork_results(
                 [(item, None)],
                 AsyncMock(),
@@ -810,12 +798,10 @@ class TestMbTracklistRescue:
             release_url="https://discogs.com/release/42",
         )
 
-        with (
-            patch(
-                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
-                new=AsyncMock(),
-            ) as resolver,
-        ):
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(),
+        ) as resolver:
             await enrich_artwork_results(
                 [(item, artwork)],
                 discogs_service,
@@ -831,12 +817,10 @@ class TestMbTracklistRescue:
         item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
         mb_pg = AsyncMock()
 
-        with (
-            patch(
-                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
-                new=AsyncMock(),
-            ) as resolver,
-        ):
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(),
+        ) as resolver:
             await enrich_artwork_results(
                 [(item, None)],
                 AsyncMock(),
@@ -854,12 +838,10 @@ class TestMbTracklistRescue:
         item = make_library_item(artist="Stereolab", title="Aluminum Tunes")
         mb_pg = AsyncMock()
 
-        with (
-            patch(
-                "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
-                new=AsyncMock(return_value=None),
-            ) as resolver,
-        ):
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(return_value=None),
+        ) as resolver:
             results = await enrich_artwork_results(
                 [(item, None)],
                 AsyncMock(),
