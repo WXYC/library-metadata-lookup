@@ -1647,6 +1647,7 @@ async def _fetch_apple_music_url(
         url = f"https://itunes.apple.com/search?term={query}&entity=song&media=music&limit=5"
         resp = await http_client.get(url)
         if resp.status_code != 200:
+            logger.warning("iTunes API returned %d for %s %s", resp.status_code, artist, song)
             return None
         results = resp.json().get("results", [])
 
@@ -1676,7 +1677,8 @@ async def _fetch_apple_music_url(
                     continue
             return track_url
         return None
-    except Exception:
+    except Exception as exc:
+        logger.error("iTunes API request failed: %s", exc)
         return None
 
 
