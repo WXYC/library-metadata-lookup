@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import ValidationError
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats, init_cache_stats
 
+from clients.streaming.apple_music import AppleMusicClient
 from core.dependencies import (
     get_apple_music_http_client,
     get_discogs_cache_service,
@@ -39,6 +40,7 @@ from lookup.models import (
     LookupResponse,
 )
 from lookup.orchestrator import perform_lookup
+from streaming.dependencies import get_apple_music_client
 
 if TYPE_CHECKING:
     from posthog import Posthog
@@ -115,6 +117,7 @@ async def handle_lookup(
     entity_store: EntityStore | None = Depends(get_entity_store),
     posthog_client: Posthog | None = Depends(get_posthog_client),
     http_client: httpx.AsyncClient = Depends(get_apple_music_http_client),
+    apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
         default=None,
@@ -147,6 +150,7 @@ async def handle_lookup(
             discogs_cache=discogs_cache,
             mb_pg=mb_pg,
             http_client=http_client,
+            apple_music=apple_music,
             caller_budget_ms=x_caller_budget_ms,
         )
 
@@ -269,6 +273,7 @@ async def handle_bulk_lookup(
     entity_store: EntityStore | None = Depends(get_entity_store),
     posthog_client: Posthog | None = Depends(get_posthog_client),
     http_client: httpx.AsyncClient = Depends(get_apple_music_http_client),
+    apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
         default=None,
@@ -351,6 +356,7 @@ async def handle_bulk_lookup(
                         discogs_cache=discogs_cache,
                         mb_pg=mb_pg,
                         http_client=http_client,
+                        apple_music=apple_music,
                         caller_budget_ms=x_caller_budget_ms,
                     )
             except Exception as e:
