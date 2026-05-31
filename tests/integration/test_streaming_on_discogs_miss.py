@@ -15,10 +15,11 @@ Backend-Service (BS#1185) "no Discogs match, but streaming URLs are
 valid; do NOT call ``extractAlbumMetadata``".
 """
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
+from clients.streaming.apple_music import AppleMusicClient
 from discogs.models import DiscogsSearchResponse
 from lookup.models import LookupRequest
 from lookup.orchestrator import perform_lookup
@@ -29,7 +30,7 @@ class TestStreamingOnDiscogsMiss:
     @pytest.mark.asyncio
     async def test_apple_music_url_populated_when_discogs_returns_no_artwork(self, library_db):
         """End-to-end: artist+album+song hit the library, Discogs returns
-        empty (no artwork), iTunes Search matches → top-1 result carries
+        empty (no artwork), Apple Music matches → top-1 result carries
         the Apple Music URL via the synthesized streaming-only artwork.
 
         Uses the seeded Stereolab entries (per CLAUDE.md fixture preference)
@@ -60,22 +61,22 @@ class TestStreamingOnDiscogsMiss:
         mock_service.validate_track_on_release = AsyncMock(return_value=False)
 
         apple_url = "https://music.apple.com/us/album/aluminum-tunes/1234567890"
-        with patch(
-            "lookup.orchestrator._fetch_apple_music_url",
-            return_value=apple_url,
-        ):
-            request = LookupRequest(
-                artist="Stereolab",
-                album="Aluminum Tunes",
-                song="Cybele's Reverie",
-                raw_message="Stereolab - Aluminum Tunes - Cybele's Reverie",
-            )
-            response = await perform_lookup(
-                request,
-                library_db,
-                mock_service,
-                make_lml_telemetry(),
-            )
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_url = AsyncMock(return_value=apple_url)
+
+        request = LookupRequest(
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            song="Cybele's Reverie",
+            raw_message="Stereolab - Aluminum Tunes - Cybele's Reverie",
+        )
+        response = await perform_lookup(
+            request,
+            library_db,
+            mock_service,
+            make_lml_telemetry(),
+            apple_music=apple_music,
+        )
 
         assert len(response.results) >= 1, "Expected at least one library result"
 
@@ -100,7 +101,7 @@ class TestStreamingOnDiscogsMiss:
 
     @pytest.mark.asyncio
     async def test_search_urls_fill_when_apple_match_fails(self, library_db):
-        """When iTunes Search has no clearable match either, the synthesized
+        """When Apple Music has no clearable match either, the synthesized
         artwork still carries the Spotify/YT/BC/SC search URLs so iOS isn't
         stuck with all-greyed streaming buttons.
         """
@@ -122,25 +123,28 @@ class TestStreamingOnDiscogsMiss:
         mock_service.get_release = AsyncMock(return_value=None)
         mock_service.validate_track_on_release = AsyncMock(return_value=False)
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            request = LookupRequest(
-                artist="Stereolab",
-                album="Aluminum Tunes",
-                song="Cybele's Reverie",
-                raw_message="Stereolab - Aluminum Tunes - Cybele's Reverie",
-            )
-            response = await perform_lookup(
-                request,
-                library_db,
-                mock_service,
-                make_lml_telemetry(),
-            )
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_url = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            song="Cybele's Reverie",
+            raw_message="Stereolab - Aluminum Tunes - Cybele's Reverie",
+        )
+        response = await perform_lookup(
+            request,
+            library_db,
+            mock_service,
+            make_lml_telemetry(),
+            apple_music=apple_music,
+        )
 
         assert len(response.results) >= 1
         top = response.results[0]
         assert top.artwork is not None
         assert top.artwork.release_id == 0
-        assert top.artwork.apple_music_url is None  # iTunes had no match
+        assert top.artwork.apple_music_url is None  # Apple Music had no match
         # But search-URL fallbacks still fill — iOS gets at least four buttons.
         assert top.artwork.spotify_url is not None
         assert top.artwork.youtube_music_url is not None

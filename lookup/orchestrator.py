@@ -1703,9 +1703,13 @@ async def enrich_artwork_results(
     ``apple_music`` is the authenticated Apple Music client (LML#443). When
     provided, the orchestrator calls ``apple_music.find_track_url(...)`` to
     surface Apple Music URLs; when None (credentials unconfigured), the
-    apple_music_url field stays None — matching the Spotify L1 degradation
-    pattern. ``http_client`` is retained for the not-yet-migrated legacy
-    iTunes probe in ``_fetch_apple_music_url``; PR-4 deletes both.
+    probe is skipped and ``apple_music_url`` is set from the library DB
+    ``streaming_links`` override (if present) or stays None. The DB
+    override always wins over the probe — see the final assignment
+    ``apple_music_override or apple_music_result or None``.
+
+    ``http_client`` is retained for the not-yet-migrated legacy iTunes
+    probe in ``_fetch_apple_music_url``; PR-4 deletes both.
 
     **Behavior change vs. v0.5.0:** release/artist details (release_year,
     artist_bio, wikipedia_url) are fetched only for ``items_with_artwork[0]``.
@@ -1824,11 +1828,23 @@ async def enrich_artwork_results(
         artist = item.alternate_artist_name or item.artist or ""
         search_term = song or item.title or ""
 
-        apple_music_result = (
-            await apple_music.find_track_url(artist, search_term, album=album)
-            if (apple_music is not None and artist and search_term)
-            else None
-        )
+        # Mirror the legacy ``_fetch_apple_music_url`` blanket-swallow:
+        # ``find_track_url`` has no top-level exception guard around its
+        # result-iteration loop, and the enclosing ``asyncio.gather`` lacks
+        # ``return_exceptions=True``. Without this wrap a single malformed
+        # Apple payload (non-dict item, rapidfuzz dispatch error) propagates
+        # through the gather and 500s the whole /lookup or /lookup/bulk
+        # request.
+        apple_music_result: str | None = None
+        if apple_music is not None and artist and search_term:
+            try:
+                apple_music_result = await apple_music.find_track_url(
+                    artist, search_term, album=album
+                )
+            except Exception:
+                logger.exception(
+                    "AppleMusicClient.find_track_url raised for %s - %s", artist, search_term
+                )
 
         # Album-derived fields are positionally gated: only on top-1, and
         # only when top-1 actually has artwork. When ``artwork`` is None
