@@ -11,7 +11,7 @@ our claim structure and request shape.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import jwt as pyjwt
@@ -90,6 +90,28 @@ def _client(es256_keypair: tuple[str, str]) -> AppleMusicClient:
     return AppleMusicClient(team_id=TEAM_ID, key_id=KEY_ID, private_key=private_pem)
 
 
+class TestConstruction:
+    """Constructor pre-parses the PEM so misconfigurations fail at startup
+    rather than silently degrading every search to `[]`."""
+
+    def test_accepts_valid_pem(self, es256_keypair):
+        # No raise.
+        _ = _client(es256_keypair)
+
+    def test_rejects_garbage_pem(self):
+        with pytest.raises((ValueError, Exception)):
+            AppleMusicClient(team_id=TEAM_ID, key_id=KEY_ID, private_key="not a pem")
+
+    def test_rejects_escaped_newlines_pem(self, es256_keypair):
+        """Railway sometimes renders PEM newlines as the literal two-char `\\n`
+        sequence; the constructor must reject so the operator sees the
+        misconfig at startup, not as a silent stream of empty searches."""
+        private_pem, _ = es256_keypair
+        mangled = private_pem.replace("\n", "\\n")
+        with pytest.raises((ValueError, Exception)):
+            AppleMusicClient(team_id=TEAM_ID, key_id=KEY_ID, private_key=mangled)
+
+
 class TestJwtSigning:
     """The developer token is an ES256 JWT signed per request. Claims and
     header shape are what Apple validates server-side."""
@@ -100,8 +122,6 @@ class TestJwtSigning:
 
         token = client._sign_jwt()
 
-        # Verify with the public half — exercises both the signing path and
-        # the claim/header structure that Apple parses.
         decoded = pyjwt.decode(token, public_pem, algorithms=["ES256"])
         assert decoded["iss"] == TEAM_ID
         assert "iat" in decoded
@@ -122,13 +142,13 @@ class TestSearchRequestShape:
     `api.music.apple.com/v1/catalog/us/search` with the right `types=` param."""
 
     @pytest.mark.asyncio
-    async def test_search_songs_uses_songs_type(self, es256_keypair):
+    async def test_search_song_uses_songs_type(self, es256_keypair):
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(return_value=_songs_response([]))
         client._http = mock_http
 
-        await client.search_songs("Jessica Pratt", "Back, Baby")
+        await client.search_song("Jessica Pratt", "Back, Baby")
 
         call = mock_http.get.call_args
         assert call.args[0] == SEARCH_URL
@@ -136,18 +156,17 @@ class TestSearchRequestShape:
         assert params["types"] == "songs"
         assert "Jessica Pratt" in params["term"]
         assert "Back, Baby" in params["term"]
-        # Authorization header carries the signed JWT.
         auth = call.kwargs["headers"]["Authorization"]
         assert auth.startswith("Bearer ")
 
     @pytest.mark.asyncio
-    async def test_search_albums_uses_albums_type(self, es256_keypair):
+    async def test_search_album_uses_albums_type(self, es256_keypair):
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(return_value=_albums_response([]))
         client._http = mock_http
 
-        await client.search_albums("Stereolab", "Aluminum Tunes")
+        await client.search_album("Stereolab", "Aluminum Tunes")
 
         params = mock_http.get.call_args.kwargs["params"]
         assert params["types"] == "albums"
@@ -158,7 +177,7 @@ class TestFindTrackUrl:
     """`find_track_url` is the orchestrator's replacement for the inline
     `_fetch_apple_music_url` in lookup/orchestrator.py: artist+song+optional
     album with a 3-way fuzz floor on `attributes.{artistName,name,albumName}`.
-    """
+    Picks the highest-scoring URL clearing the floor, not the first."""
 
     @pytest.mark.asyncio
     async def test_returns_url_when_song_clears_floor(self, es256_keypair):
@@ -202,6 +221,43 @@ class TestFindTrackUrl:
         assert url is None
 
     @pytest.mark.asyncio
+    async def test_picks_best_scoring_when_multiple_clear_floor(self, es256_keypair):
+        """Iterates all results and selects the highest-combined-score match.
+        A sub-optimal early result must not freeze the wrong URL onto the row."""
+        client = _client(es256_keypair)
+        # First result is a same-titled cover by a similar-named artist that
+        # barely clears 80; second is the canonical exact match.
+        sub_optimal = _make_song_data(
+            artist_name="Jessica Praatt",  # 1-char typo, clears 80 but not 100
+            url="https://music.apple.com/us/song/wrong/1",
+        )
+        canonical = _make_song_data(
+            url="https://music.apple.com/us/song/right/2",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([sub_optimal, canonical]))
+        client._http = mock_http
+
+        url = await client.find_track_url("Jessica Pratt", "Back, Baby")
+        assert url == "https://music.apple.com/us/song/right/2"
+
+    @pytest.mark.asyncio
+    async def test_handles_null_string_attributes(self, es256_keypair):
+        """Apple returns JSON null for missing string fields; normalize_for_comparison
+        cannot accept None. The client must coerce None to '' so a null
+        albumName doesn't raise mid-iteration."""
+        client = _client(es256_keypair)
+        item = _make_song_data()
+        item["attributes"]["albumName"] = None
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([item]))
+        client._http = mock_http
+
+        # No raise. Without the album filter, the item still matches.
+        url = await client.find_track_url("Jessica Pratt", "Back, Baby")
+        assert url == "https://music.apple.com/us/song/back-baby/123"
+
+    @pytest.mark.asyncio
     async def test_returns_none_when_search_empty(self, es256_keypair):
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
@@ -212,7 +268,8 @@ class TestFindTrackUrl:
         assert url is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_on_non_200(self, es256_keypair):
+    async def test_returns_none_on_terminal_non_200(self, es256_keypair):
+        """401/403 are terminal — no retry, no recovery, return [] (→ None)."""
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(
@@ -231,7 +288,7 @@ class TestFindAlbumMatch:
     @pytest.mark.asyncio
     async def test_returns_source_match_from_top_hit(self, es256_keypair):
         client = _client(es256_keypair)
-        client.search_albums = AsyncMock(return_value=[_make_album_data()])
+        client.search_album = AsyncMock(return_value=[_make_album_data()])
 
         match = await client.find_album_match("Stereolab", "Aluminum Tunes")
 
@@ -242,7 +299,7 @@ class TestFindAlbumMatch:
     @pytest.mark.asyncio
     async def test_returns_none_when_search_empty(self, es256_keypair):
         client = _client(es256_keypair)
-        client.search_albums = AsyncMock(return_value=[])
+        client.search_album = AsyncMock(return_value=[])
 
         match = await client.find_album_match("Unknown", "Unknown")
         assert match is None
@@ -250,12 +307,113 @@ class TestFindAlbumMatch:
     @pytest.mark.asyncio
     async def test_returns_none_for_wrong_artist_match(self, es256_keypair):
         client = _client(es256_keypair)
-        client.search_albums = AsyncMock(
+        client.search_album = AsyncMock(
             return_value=[_make_album_data(artist_name="Completely Different Artist")]
         )
 
         match = await client.find_album_match("Stereolab", "Aluminum Tunes")
         assert match is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_item_does_not_kill_iteration(self, es256_keypair):
+        """An item missing `attributes` (region-restricted, malformed, etc.)
+        must not raise inside `find_best_match` and erase legitimate later
+        matches. Score=0 from .get()-chained extractors is the correct
+        outcome — the item gets skipped naturally."""
+        client = _client(es256_keypair)
+        malformed = {"id": "bad", "type": "albums"}  # no attributes
+        ok = _make_album_data()
+        client.search_album = AsyncMock(return_value=[malformed, ok])
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/album/aluminum-tunes/456"
+
+    @pytest.mark.asyncio
+    async def test_item_with_null_attributes_does_not_raise(self, es256_keypair):
+        """Apple returns `attributes: null` on rare records; extractors must
+        return '' for None-typed attributes, not raise."""
+        client = _client(es256_keypair)
+        null_attrs = {"id": "bad", "type": "albums", "attributes": None}
+        ok = _make_album_data()
+        client.search_album = AsyncMock(return_value=[null_attrs, ok])
+
+        # No raise.
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+        assert match is not None
+        assert match.url.endswith("/456")
+
+
+class TestRetryBehavior:
+    """429 and transient 5xx are retried; terminal 4xx are not. Mirrors
+    SpotifyClient's _search_with_retry shape."""
+
+    @pytest.mark.asyncio
+    async def test_retries_on_429_honoring_retry_after(self, es256_keypair):
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        rate_limited = httpx.Response(
+            429,
+            headers={"Retry-After": "1"},
+            request=httpx.Request("GET", SEARCH_URL),
+        )
+        success = _songs_response([_make_song_data()])
+        mock_http.get = AsyncMock(side_effect=[rate_limited, success])
+        client._http = mock_http
+
+        with patch("clients.streaming.apple_music.asyncio.sleep", new_callable=AsyncMock):
+            results = await client.search_song("Jessica Pratt", "Back, Baby")
+
+        assert len(results) == 1
+        assert mock_http.get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_retries_on_503_with_backoff(self, es256_keypair):
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        unavailable = httpx.Response(503, request=httpx.Request("GET", SEARCH_URL))
+        success = _songs_response([_make_song_data()])
+        mock_http.get = AsyncMock(side_effect=[unavailable, success])
+        client._http = mock_http
+
+        with patch("clients.streaming.apple_music.asyncio.sleep", new_callable=AsyncMock):
+            results = await client.search_song("Jessica Pratt", "Back, Baby")
+
+        assert len(results) == 1
+        assert mock_http.get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_terminal_4xx(self, es256_keypair):
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=httpx.Response(401, request=httpx.Request("GET", SEARCH_URL))
+        )
+        client._http = mock_http
+
+        results = await client.search_song("Stereolab", "Aluminum Tunes")
+        assert results == []
+        assert mock_http.get.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_max_retries_on_429_burst(self, es256_keypair):
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        rate_limited = httpx.Response(
+            429,
+            headers={"Retry-After": "1"},
+            request=httpx.Request("GET", SEARCH_URL),
+        )
+        # 10 consecutive 429s — should give up after _MAX_RETRIES (4).
+        mock_http.get = AsyncMock(return_value=rate_limited)
+        client._http = mock_http
+
+        with patch("clients.streaming.apple_music.asyncio.sleep", new_callable=AsyncMock):
+            results = await client.search_song("Stereolab", "Aluminum Tunes")
+
+        assert results == []
+        assert mock_http.get.call_count == 4  # _MAX_RETRIES
 
 
 class TestErrorHandling:
@@ -266,26 +424,39 @@ class TestErrorHandling:
         mock_http.get = AsyncMock(side_effect=httpx.ConnectError("boom"))
         client._http = mock_http
 
-        results = await client.search_songs("Stereolab", "Aluminum Tunes")
+        results = await client.search_song("Stereolab", "Aluminum Tunes")
         assert results == []
 
     @pytest.mark.asyncio
-    async def test_search_returns_empty_on_server_error(self, es256_keypair):
+    async def test_search_returns_empty_on_invalid_json_body(self, es256_keypair):
+        """Apple's CDN occasionally serves a 200 with an HTML body during
+        edge-cache hiccups; `resp.json()` raises JSONDecodeError which must
+        be absorbed by the same path that handles network errors — and
+        captured to Sentry, not silently dropped."""
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(
-            return_value=httpx.Response(500, request=httpx.Request("GET", SEARCH_URL))
+            return_value=httpx.Response(
+                200,
+                content=b"<html>edge cache error</html>",
+                request=httpx.Request("GET", SEARCH_URL),
+            )
         )
         client._http = mock_http
 
-        results = await client.search_songs("Stereolab", "Aluminum Tunes")
+        with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
+            mock_sentry.start_span.return_value.__enter__.return_value = MagicMock()
+            results = await client.search_song("Stereolab", "Aluminum Tunes")
+
         assert results == []
+        mock_sentry.capture_exception.assert_called_once()
 
 
 class TestObservability:
-    """O3: every non-200 must log, capture to Sentry, AND project onto the
-    active span as `apple_music.search.{status,result}` (matches the
-    wrap-at-chokepoint pattern from LML#213)."""
+    """O3: every call lives in a dedicated `apple_music.search` child span;
+    `.status` and `.result` are set on that span (LML#213 wrap-at-chokepoint).
+    capture_exception preserves the stack on the error path; capture_message
+    fires on terminal non-200."""
 
     @pytest.mark.asyncio
     async def test_non_200_captures_to_sentry(self, es256_keypair):
@@ -297,11 +468,11 @@ class TestObservability:
         client._http = mock_http
 
         with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
-            mock_span = mock_sentry.get_current_scope.return_value.transaction
-            await client.search_songs("Stereolab", "Aluminum Tunes")
+            mock_span = MagicMock()
+            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
+            await client.search_song("Stereolab", "Aluminum Tunes")
 
         mock_sentry.capture_message.assert_called_once()
-        # Project onto active span: status code + miss-class result.
         set_data_calls = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
         assert set_data_calls.get("apple_music.search.status") == 403
         assert set_data_calls.get("apple_music.search.result") == "403"
@@ -314,8 +485,9 @@ class TestObservability:
         client._http = mock_http
 
         with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
-            mock_span = mock_sentry.get_current_scope.return_value.transaction
-            await client.search_songs("Jessica Pratt", "Back, Baby")
+            mock_span = MagicMock()
+            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
+            await client.search_song("Jessica Pratt", "Back, Baby")
 
         set_data_calls = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
         assert set_data_calls.get("apple_music.search.status") == 200
@@ -329,11 +501,28 @@ class TestObservability:
         client._http = mock_http
 
         with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
-            mock_span = mock_sentry.get_current_scope.return_value.transaction
-            await client.search_songs("Jessica Pratt", "Back, Baby")
+            mock_span = MagicMock()
+            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
+            await client.search_song("Jessica Pratt", "Back, Baby")
 
         set_data_calls = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
         assert set_data_calls.get("apple_music.search.result") == "miss"
+
+    @pytest.mark.asyncio
+    async def test_network_error_captures_exception_with_stack(self, es256_keypair):
+        """The except branch must use capture_exception (preserving the live
+        stack) rather than capture_message (a static string) so distinct
+        underlying failures don't collapse into one Sentry issue."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(side_effect=httpx.ConnectError("dns failure"))
+        client._http = mock_http
+
+        with patch("clients.streaming.apple_music.sentry_sdk") as mock_sentry:
+            mock_sentry.start_span.return_value.__enter__.return_value = MagicMock()
+            await client.search_song("Stereolab", "Aluminum Tunes")
+
+        mock_sentry.capture_exception.assert_called_once()
 
 
 def test_match_floor_constant_is_80():

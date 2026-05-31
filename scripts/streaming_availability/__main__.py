@@ -849,13 +849,22 @@ async def run(args: argparse.Namespace) -> None:
 
         # Apple Music (still sequential, runs after pipeline)
         if not args.spotify_only and not _shutdown_requested:
-            apple = AppleMusicClient()
-            try:
-                await _process_apple_music(
-                    results_db, apple, args.batch_size, check_all=args.apple_only
+            am_team = os.environ.get("APPLE_MUSIC_TEAM_ID")
+            am_key = os.environ.get("APPLE_MUSIC_KEY_ID")
+            am_priv = os.environ.get("APPLE_MUSIC_PRIVATE_KEY")
+            if not (am_team and am_key and am_priv):
+                logger.warning(
+                    "APPLE_MUSIC_TEAM_ID/KEY_ID/PRIVATE_KEY not all set — "
+                    "skipping Apple Music phase"
                 )
-            finally:
-                await apple.close()
+            else:
+                apple = AppleMusicClient(team_id=am_team, key_id=am_key, private_key=am_priv)
+                try:
+                    await _process_apple_music(
+                        results_db, apple, args.batch_size, check_all=args.apple_only
+                    )
+                finally:
+                    await apple.close()
 
         # Report
         logger.info("Generating CSV report: %s", args.output)
