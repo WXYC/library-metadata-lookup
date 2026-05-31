@@ -9,14 +9,12 @@ lifetime, header `kid=Key ID`, claims `iss=Team ID`, `iat`, `exp`. Apple
 validates the signature against the public half registered to the MusicKit
 identifier `media.org.wxyc.lml`.
 
-Surface area mirrors the previous iTunes client so the migration of the two
-call sites (`lookup/orchestrator._fetch_apple_music_url` and
-`streaming/router.handle_streaming_check`) is mechanical:
+Public surface:
 
 - `find_album_match(artist, title)` — BaseStreamingClient contract; powers
-  /streaming-check.
-- `find_track_url(artist, song, album=None)` — replaces the inline
-  `_fetch_apple_music_url` in the lookup hot path. 3-way fuzz floor on
+  `/streaming-check` via `streaming/router.handle_streaming_check`.
+- `find_track_url(artist, song, album=None)` — used by the lookup hot path
+  in `lookup/orchestrator.enrich_artwork_results`. 3-way fuzz floor on
   `attributes.{artistName,name,albumName}`.
 """
 
@@ -271,8 +269,7 @@ class AppleMusicClient(BaseStreamingClient):
         """Search for `(artist, song[, album])` and return the highest-scoring
         Apple Music track URL clearing the 80/80(/80) fuzz floor, else `None`.
 
-        Replaces `lookup.orchestrator._fetch_apple_music_url`. Uses
-        `fuzz.token_set_ratio` (not the batch matcher's `token_sort_ratio`)
+        Uses `fuzz.token_set_ratio` (not the batch matcher's `token_sort_ratio`)
         so extra tokens — "The", "feat. X", "(Remastered)" — don't sink an
         otherwise-correct match. Iterates the full result list and picks the
         best-scoring URL so an early sub-optimal match in Apple's ranking

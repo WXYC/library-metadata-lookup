@@ -16,7 +16,6 @@ from functools import partial
 from typing import Any
 from urllib.parse import quote
 
-import httpx
 import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
@@ -762,15 +761,16 @@ def _release_matches_library_row(release: ReleaseInfo, item: LibraryItem) -> boo
 
 
 # Minimum fuzzy score (0-100) for accepting a library-row title as a genuine
-# album match for the DJ-typed album. Mirrors `_APPLE_MUSIC_MATCH_FLOOR` and
-# the streaming-availability batch matcher. When the artist-fallback branches
+# album match for the DJ-typed album. Mirrors the 80-floor in
+# `clients/streaming/apple_music._APPLE_MUSIC_MATCH_FLOOR` and the
+# streaming-availability batch matcher. When the artist-fallback branches
 # of `search_library_with_fallback` surface a row whose title doesn't clear
 # this floor against the typed album, the row would otherwise carry the
 # matched Discogs release's `release_year` / `apple_music_url` / `spotify_url`
 # / `discogs_url` / `artwork_url` onto a flowsheet row tagged with a
 # completely different album — the contamination shape documented in #400
 # (~184k rows; 16,532 distinct Discogs URLs each attached to many distinct
-# DJ-typed `(artist, album)` pairs). #390 / #398 tightened the iTunes-result
+# DJ-typed `(artist, album)` pairs). #390 / #398 tightened the result
 # verification; this tightens the LML lookup result itself.
 _ALBUM_MATCH_FLOOR = 80.0
 
@@ -1603,91 +1603,12 @@ def _build_streaming_search_url(base: str, artist: str, term: str) -> str:
     return f"{base}{quote(query)}"
 
 
-# Minimum fuzzy score (0-100) for accepting an iTunes Search result as a genuine
-# match for the requested artist + track (+ album, when provided). Mirrors the
-# 80/80 artist+title floor the streaming-availability batch matcher enforces
-# (clients/streaming/matching.py:is_acceptable_match). iTunes
-# Search ranking is non-deterministic for obscure artists, so a bare results[0]
-# intermittently surfaces a popular but wrong artist (e.g. "Pleasure"/"Joyous"
-# -> Sheryl Crow, see #389), and same-named tracks on multiple of an artist's
-# releases can land on the wrong album (e.g. Yenbett's "Hebebeb (Zrag)" -> the
-# track of the same name on Tzenni, see #396). Verification stops the wrong
-# link from freezing onto the flowsheet row.
-_APPLE_MUSIC_MATCH_FLOOR = 80.0
-
-
-async def _fetch_apple_music_url(
-    artist: str,
-    song: str,
-    album: str | None = None,
-    http_client: httpx.AsyncClient | None = None,
-) -> str | None:
-    """Search the iTunes API for an Apple Music link. Free, no auth required.
-
-    Requires a shared ``http_client``; returns ``None`` when one isn't
-    provided so callers can degrade gracefully. Constructing a fresh
-    ``httpx.AsyncClient`` per probe is what leaked FDs in the 2026-05-01
-    LML outage (issue #241), so the per-call fallback was removed.
-
-    Returns the ``trackViewUrl`` of the first result whose ``artistName`` and
-    ``trackName`` (and, when ``album`` is provided, ``collectionName``) all
-    clear ``_APPLE_MUSIC_MATCH_FLOOR`` against the requested ``artist`` /
-    ``song`` / ``album`` (diacritics-folded fuzzy token-set match), else
-    ``None``. iTunes Search ranking is unstable for obscure artists, so a bare
-    ``results[0]`` can confidently return the wrong artist (#389) or — when
-    the same track title appears on multiple of the artist's releases — the
-    wrong album (#396); verifying avoids persisting a wrong link onto the
-    flowsheet row.
-    """
-    if http_client is None:
-        return None
-    from rapidfuzz import fuzz
-
-    try:
-        query = quote(f"{artist} {song}")
-        url = f"https://itunes.apple.com/search?term={query}&entity=song&media=music&limit=5"
-        resp = await http_client.get(url)
-        if resp.status_code != 200:
-            return None
-        results = resp.json().get("results", [])
-
-        norm_artist = normalize_for_comparison(artist)
-        norm_song = normalize_for_comparison(song)
-        norm_album = normalize_for_comparison(album) if album else None
-        # token_set_ratio (not the batch matcher's token_sort_ratio) so extra
-        # tokens on either side — "The", "feat. X", "(Remastered)" — don't sink
-        # an otherwise-correct match.
-        for result in results:
-            track_url = result.get("trackViewUrl")
-            if not track_url:
-                continue
-            artist_score = fuzz.token_set_ratio(
-                norm_artist, normalize_for_comparison(result.get("artistName", ""))
-            )
-            track_score = fuzz.token_set_ratio(
-                norm_song, normalize_for_comparison(result.get("trackName", ""))
-            )
-            if artist_score < _APPLE_MUSIC_MATCH_FLOOR or track_score < _APPLE_MUSIC_MATCH_FLOOR:
-                continue
-            if norm_album is not None:
-                album_score = fuzz.token_set_ratio(
-                    norm_album, normalize_for_comparison(result.get("collectionName", ""))
-                )
-                if album_score < _APPLE_MUSIC_MATCH_FLOOR:
-                    continue
-            return track_url
-        return None
-    except Exception:
-        return None
-
-
 async def enrich_artwork_results(
     items_with_artwork: list[tuple[LibraryItem, DiscogsSearchResult | None]],
     discogs_service: DiscogsService | None,
     song: str | None = None,
     album: str | None = None,
     library_db: LibraryDB | None = None,
-    http_client: httpx.AsyncClient | None = None,
     *,
     extended: bool = False,
     warm_cache: bool = False,
@@ -1707,9 +1628,6 @@ async def enrich_artwork_results(
     ``streaming_links`` override (if present) or stays None. The DB
     override always wins over the probe — see the final assignment
     ``apple_music_override or apple_music_result or None``.
-
-    ``http_client`` is retained for the not-yet-migrated legacy iTunes
-    probe in ``_fetch_apple_music_url``; PR-4 deletes both.
 
     **Behavior change vs. v0.5.0:** release/artist details (release_year,
     artist_bio, wikipedia_url) are fetched only for ``items_with_artwork[0]``.
@@ -1828,7 +1746,6 @@ async def enrich_artwork_results(
         artist = item.alternate_artist_name or item.artist or ""
         search_term = song or item.title or ""
 
-        # Mirror the legacy ``_fetch_apple_music_url`` blanket-swallow:
         # ``find_track_url`` has no top-level exception guard around its
         # result-iteration loop, and the enclosing ``asyncio.gather`` lacks
         # ``return_exceptions=True``. Without this wrap a single malformed
@@ -2068,7 +1985,6 @@ async def perform_lookup(
     entity_store: EntityStore | None = None,
     discogs_cache: DiscogsCacheService | None = None,
     mb_pg: PgSourceProtocol | None = None,
-    http_client: httpx.AsyncClient | None = None,
     apple_music: AppleMusicClient | None = None,
     caller_budget_ms: int | None = None,
 ) -> LookupResponse:
@@ -2228,7 +2144,6 @@ async def perform_lookup(
                 song=parsed.song,
                 album=parsed.album,
                 library_db=db,
-                http_client=http_client,
                 extended=extended_mode,
                 warm_cache=warm_cache_mode,
                 discogs_cache=discogs_cache,

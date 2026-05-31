@@ -14,7 +14,6 @@ from discogs.models import (
 )
 from lookup.orchestrator import (
     _build_streaming_search_url,
-    _fetch_apple_music_url,
     enrich_artwork_results,
 )
 from tests.factories import make_discogs_result, make_library_item
@@ -37,212 +36,6 @@ class TestBuildStreamingSearchUrl:
         )
         assert "Bj%C3%B6rk" in url
         assert "J%C3%B3ga" in url
-
-
-class TestFetchAppleMusicUrl:
-    @staticmethod
-    def _mock_client(results: list[dict]):
-        import httpx
-
-        mock_response = httpx.Response(
-            200,
-            json={"results": results},
-            request=httpx.Request("GET", "https://itunes.apple.com/search"),
-        )
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.get = AsyncMock(return_value=mock_response)
-        return mock_client
-
-    @pytest.mark.asyncio
-    async def test_returns_url_on_success(self):
-        mock_client = self._mock_client(
-            [
-                {
-                    "artistName": "Kate Bush",
-                    "trackName": "The Saxophone Song",
-                    "trackViewUrl": "https://music.apple.com/us/album/test/123",
-                }
-            ]
-        )
-
-        result = await _fetch_apple_music_url(
-            "Kate Bush", "The Saxophone Song", http_client=mock_client
-        )
-        assert result == "https://music.apple.com/us/album/test/123"
-
-    @pytest.mark.asyncio
-    async def test_skips_wrong_artist_and_picks_correct_lower_result(self):
-        """Regression for the Pleasure/'Joyous' -> Sheryl Crow mismatch (#389).
-
-        iTunes Search relevance is unstable for obscure artists and can rank a
-        popular but wrong artist first. The correct match must be chosen over a
-        higher-ranked wrong-artist result, not blindly taken from results[0].
-        """
-        mock_client = self._mock_client(
-            [
-                {
-                    "artistName": "Sheryl Crow",
-                    "trackName": "All I Wanna Do",
-                    "trackViewUrl": "https://music.apple.com/us/album/all-i-wanna-do/1440651031",
-                },
-                {
-                    "artistName": "Pleasure",
-                    "trackName": "Joyous",
-                    "trackViewUrl": "https://music.apple.com/us/album/joyous/1568229263",
-                },
-            ]
-        )
-
-        result = await _fetch_apple_music_url("Pleasure", "Joyous", http_client=mock_client)
-        assert result == "https://music.apple.com/us/album/joyous/1568229263"
-
-    @pytest.mark.asyncio
-    async def test_returns_none_when_only_wrong_artist(self):
-        """A confident-but-wrong link is worse than no link: reject, don't return it."""
-        mock_client = self._mock_client(
-            [
-                {
-                    "artistName": "Sheryl Crow",
-                    "trackName": "All I Wanna Do",
-                    "trackViewUrl": "https://music.apple.com/us/album/all-i-wanna-do/1440651031",
-                }
-            ]
-        )
-
-        result = await _fetch_apple_music_url("Pleasure", "Joyous", http_client=mock_client)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_matches_despite_diacritics(self):
-        """Diacritic-folded comparison: 'Nilüfer Yanya' must match iTunes' 'Nilufer Yanya'."""
-        mock_client = self._mock_client(
-            [
-                {
-                    "artistName": "Nilufer Yanya",
-                    "trackName": "Stabilise",
-                    "trackViewUrl": "https://music.apple.com/us/album/stabilise/1480000000",
-                }
-            ]
-        )
-
-        result = await _fetch_apple_music_url("Nilüfer Yanya", "Stabilise", http_client=mock_client)
-        assert result == "https://music.apple.com/us/album/stabilise/1480000000"
-
-    @pytest.mark.asyncio
-    async def test_skips_result_missing_track_url(self):
-        """A matching result with no trackViewUrl is skipped in favor of a usable one."""
-        mock_client = self._mock_client(
-            [
-                {"artistName": "Pleasure", "trackName": "Joyous"},
-                {
-                    "artistName": "Pleasure",
-                    "trackName": "Joyous",
-                    "trackViewUrl": "https://music.apple.com/us/album/joyous/1568229263",
-                },
-            ]
-        )
-
-        result = await _fetch_apple_music_url("Pleasure", "Joyous", http_client=mock_client)
-        assert result == "https://music.apple.com/us/album/joyous/1568229263"
-
-    @pytest.mark.asyncio
-    async def test_rejects_right_track_on_wrong_album(self):
-        """Regression for the Yenbett -> Tzenni mismatch (#396).
-
-        Same-named track on multiple of the artist's releases: iTunes returns
-        the older more-indexed album's track; without album verification,
-        artist 100 + track 100 slip past #390's floor and persist the
-        wrong-album URL.
-        """
-        mock_client = self._mock_client(
-            [
-                {
-                    "artistName": "Noura Mint Seymali",
-                    "trackName": "Hebebeb (Zrag)",
-                    "collectionName": "Tzenni",
-                    "trackViewUrl": "https://music.apple.com/us/album/hebebeb-zrag/882843574?i=882843707",
-                }
-            ]
-        )
-
-        result = await _fetch_apple_music_url(
-            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett", http_client=mock_client
-        )
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_accepts_when_album_matches(self):
-        """Album verification passes when the requested album matches the result's collection."""
-        mock_client = self._mock_client(
-            [
-                {
-                    "artistName": "Noura Mint Seymali",
-                    "trackName": "Hebebeb (Zrag)",
-                    "collectionName": "Tzenni",
-                    "trackViewUrl": "https://music.apple.com/us/album/tzenni/882843574?i=882843692",
-                }
-            ]
-        )
-
-        result = await _fetch_apple_music_url(
-            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Tzenni", http_client=mock_client
-        )
-        assert result == "https://music.apple.com/us/album/tzenni/882843574?i=882843692"
-
-    @pytest.mark.asyncio
-    async def test_accepts_album_reissue_variant(self):
-        """token_set_ratio handles reissue/edition variants ('Tzenni' vs 'Tzenni (Deluxe Edition)')."""
-        mock_client = self._mock_client(
-            [
-                {
-                    "artistName": "Noura Mint Seymali",
-                    "trackName": "Hebebeb (Zrag)",
-                    "collectionName": "Tzenni (Deluxe Edition)",
-                    "trackViewUrl": "https://music.apple.com/us/album/tzenni-deluxe/9999",
-                }
-            ]
-        )
-
-        result = await _fetch_apple_music_url(
-            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Tzenni", http_client=mock_client
-        )
-        assert result == "https://music.apple.com/us/album/tzenni-deluxe/9999"
-
-    @pytest.mark.asyncio
-    async def test_omitted_album_skips_album_check(self):
-        """Backward compat: when no album context is passed, verification mirrors pre-#396 behavior."""
-        mock_client = self._mock_client(
-            [
-                {
-                    "artistName": "Noura Mint Seymali",
-                    "trackName": "Hebebeb (Zrag)",
-                    "collectionName": "Tzenni",
-                    "trackViewUrl": "https://music.apple.com/us/album/tzenni/882843574?i=882843692",
-                }
-            ]
-        )
-
-        result = await _fetch_apple_music_url(
-            "Noura Mint Seymali", "Hebebeb (Zrag)", http_client=mock_client
-        )
-        assert result == "https://music.apple.com/us/album/tzenni/882843574?i=882843692"
-
-    @pytest.mark.asyncio
-    async def test_returns_none_on_no_results(self):
-        mock_client = self._mock_client([])
-
-        result = await _fetch_apple_music_url(
-            "Obscure Artist", "Obscure Song", http_client=mock_client
-        )
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_returns_none_on_error(self):
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=Exception("Network error"))
-
-        result = await _fetch_apple_music_url("Artist", "Song", http_client=mock_client)
-        assert result is None
 
 
 class TestEnrichArtworkResults:
@@ -269,11 +62,9 @@ class TestEnrichArtworkResults:
             urls=["https://en.wikipedia.org/wiki/Kate_Bush", "https://katebush.com"],
         )
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(
-                [(item, artwork)], discogs_service, song="The Saxophone Song"
-            )
-
+        results = await enrich_artwork_results(
+            [(item, artwork)], discogs_service, song="The Saxophone Song"
+        )
         _, enriched = results[0]
         assert enriched is not None
         assert enriched.release_year == 1978
@@ -299,9 +90,7 @@ class TestEnrichArtworkResults:
             release_url="https://discogs.com/release/123",
         )
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results([(item, artwork)], discogs_service)
-
+        results = await enrich_artwork_results([(item, artwork)], discogs_service)
         _, enriched = results[0]
         assert enriched.release_year == 2020
         assert enriched.artist_bio is None
@@ -311,13 +100,13 @@ class TestEnrichArtworkResults:
     async def test_handles_none_artwork(self):
         """No-Discogs-match items return a synthesized streaming-only
         ``DiscogsSearchResult`` (``release_id=0`` sentinel; see LML#401).
-        With ``http_client=None`` the Apple lookup degrades gracefully and
+        With ``apple_music=None`` the Apple lookup degrades gracefully and
         only the search-URL fallbacks fill.
         """
         item = make_library_item(artist="Stereolab", title="Aluminum Tunes")
 
-        # No ``_fetch_apple_music_url`` patch — exercises the real
-        # ``http_client=None`` graceful-degrade path (function returns None).
+        # No ``apple_music`` argument — exercises the graceful-degrade path
+        # (the orchestrator skips the probe when the client is None).
         results = await enrich_artwork_results([(item, None)], AsyncMock(), song="French Disko")
 
         _, enriched = results[0]
@@ -330,7 +119,7 @@ class TestEnrichArtworkResults:
         assert enriched.release_year is None
         assert enriched.artist_bio is None
         assert enriched.wikipedia_url is None
-        # apple_music_url stays None because http_client is None.
+        # apple_music_url stays None because apple_music is None.
         assert enriched.apple_music_url is None
         # Search-URL fallbacks fill (artist + song are non-empty).
         assert enriched.spotify_url is not None
@@ -409,9 +198,7 @@ class TestEnrichArtworkResults:
             urls=["https://en.wikipedia.org/wiki/Artist_2"],
         )
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(items_with_artwork, discogs_service, song="Song")
-
+        results = await enrich_artwork_results(items_with_artwork, discogs_service, song="Song")
         # Both items return non-None artwork (synthetic for top-1, real for
         # lower); but neither carries album-derived fields.
         for _, enriched in results:
@@ -438,9 +225,7 @@ class TestEnrichArtworkResults:
         discogs_service = AsyncMock()
         discogs_service.get_release.side_effect = Exception("API error")
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results([(item, artwork)], discogs_service)
-
+        results = await enrich_artwork_results([(item, artwork)], discogs_service)
         _, enriched = results[0]
         # Enriched fields should be None but streaming URLs still generated
         assert enriched.release_year is None
@@ -483,9 +268,7 @@ class TestEnrichArtworkResults:
 
         discogs_service.get_release.side_effect = lambda rid: make_release(rid)
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(items_with_artwork, discogs_service, song="Song")
-
+        results = await enrich_artwork_results(items_with_artwork, discogs_service, song="Song")
         assert len(results) == 3
         for i, (item, enriched) in enumerate(results, start=1):
             assert item.id == i, f"Item order not preserved at position {i}"
@@ -542,14 +325,12 @@ class TestEnrichArtworkResultsExtended:
             urls=["https://en.wikipedia.org/wiki/Stereolab"],
         )
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(
-                [(item, artwork)],
-                discogs_service,
-                song="Olv 26",
-                extended=True,
-            )
-
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Olv 26",
+            extended=True,
+        )
         _, enriched = results[0]
         assert enriched is not None
         assert enriched.discogs_artist_id == 42
@@ -594,11 +375,7 @@ class TestEnrichArtworkResultsExtended:
             image_url="https://img.discogs.com/x.jpg",
         )
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(
-                [(item, artwork)], discogs_service, extended=False
-            )
-
+        results = await enrich_artwork_results([(item, artwork)], discogs_service, extended=False)
         _, enriched = results[0]
         assert enriched.discogs_artist_id is None
         assert enriched.label is None
@@ -643,14 +420,12 @@ class TestEnrichArtworkResultsExtended:
         )
         cache_service.get_release.return_value = None  # unknown
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(
-                [(item, artwork)],
-                discogs_service,
-                extended=True,
-                discogs_cache=cache_service,
-            )
-
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            extended=True,
+            discogs_cache=cache_service,
+        )
         _, enriched = results[0]
         assert enriched.profile_tokens is not None
         # The artist link resolved against the cache; the release ref didn't.
@@ -693,7 +468,6 @@ class TestEnrichArtworkResultsExtended:
             return task
 
         with (
-            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
             patch("lookup.orchestrator.asyncio.create_task", side_effect=spy_create_task),
         ):
             await enrich_artwork_results(
@@ -737,7 +511,6 @@ class TestEnrichArtworkResultsExtended:
             return task
 
         with (
-            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
             patch("lookup.orchestrator.asyncio.create_task", side_effect=spy_create_task),
         ):
             await enrich_artwork_results(
@@ -784,7 +557,6 @@ class TestEnrichArtworkResultsExtended:
             return task
 
         with (
-            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
             patch("lookup.orchestrator.asyncio.create_task", side_effect=spy_create_task),
         ):
             await enrich_artwork_results(
@@ -820,14 +592,12 @@ class TestEnrichArtworkResultsExtended:
 
         snapshot_before = set(_background_tasks)
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            await enrich_artwork_results(
-                [(item, artwork)],
-                discogs_service,
-                extended=True,
-                warm_cache=True,
-            )
-
+        await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            extended=True,
+            warm_cache=True,
+        )
         # The task is anchored in _background_tasks at scheduling time.
         added = _background_tasks - snapshot_before
         assert len(added) == 1
@@ -864,14 +634,12 @@ class TestEnrichArtworkResultsExtended:
             profile="Members [a=Tim Gane] and [a42]. [b]Active since 1990.[/b]",
         )
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(
-                [(item, artwork)],
-                discogs_service,
-                extended=True,
-                discogs_cache=None,  # Explicit: no cache available
-            )
-
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            extended=True,
+            discogs_cache=None,  # Explicit: no cache available
+        )
         _, enriched = results[0]
         assert enriched.profile_tokens is not None
         kinds = [type(t).__name__ for t in enriched.profile_tokens]
@@ -908,9 +676,7 @@ class TestEnrichArtworkResultsExtended:
             release_url="https://discogs.com/release/2",
         )
 
-        with patch("lookup.orchestrator._fetch_apple_music_url", return_value=None):
-            results = await enrich_artwork_results(items_with_artwork, discogs_service)
-
+        results = await enrich_artwork_results(items_with_artwork, discogs_service)
         # Position 0 is now a synthetic streaming-only result (release_id=0
         # sentinel marks it for BS#1185 to skip extractAlbumMetadata);
         # position 1 keeps its real artwork. Neither carries release_year.
@@ -968,7 +734,6 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with (
-            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
             patch(
                 "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
                 new=AsyncMock(return_value=self._track_items()),
@@ -994,7 +759,6 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with (
-            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
             patch(
                 "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
                 new=AsyncMock(),
@@ -1015,7 +779,6 @@ class TestMbTracklistRescue:
         item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
 
         with (
-            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
             patch(
                 "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
                 new=AsyncMock(),
@@ -1048,7 +811,6 @@ class TestMbTracklistRescue:
         )
 
         with (
-            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
             patch(
                 "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
                 new=AsyncMock(),
@@ -1070,7 +832,6 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with (
-            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
             patch(
                 "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
                 new=AsyncMock(),
@@ -1094,7 +855,6 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with (
-            patch("lookup.orchestrator._fetch_apple_music_url", return_value=None),
             patch(
                 "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
                 new=AsyncMock(return_value=None),
@@ -1116,14 +876,10 @@ class TestMbTracklistRescue:
 
 
 class TestEnrichArtworkResultsWithAppleMusicClient:
-    """PR-3 / LML#443: orchestrator hot path consumes ``AppleMusicClient.find_track_url``
-    instead of the iTunes Search probe in ``_fetch_apple_music_url``.
+    """LML#443/#444: orchestrator hot path consumes ``AppleMusicClient.find_track_url``.
 
-    These tests pin the new contract — ``enrich_artwork_results`` accepts an
-    ``apple_music`` client and threads the call. The legacy
-    ``_fetch_apple_music_url`` function (and the ``http_client`` parameter
-    backing it) survives PR-3 for backward compatibility with the not-yet-
-    migrated batch backfill script; PR-4 removes both.
+    These tests pin the contract — ``enrich_artwork_results`` accepts an
+    ``apple_music`` client and threads the call.
     """
 
     @pytest.mark.asyncio
@@ -1142,22 +898,14 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_url = AsyncMock(return_value=apple_url)
 
-        # The legacy iTunes path must NOT be reached — patch so a regression
-        # back to the old call site surfaces as a failed assertion rather
-        # than a silently-wrong URL.
-        with patch(
-            "lookup.orchestrator._fetch_apple_music_url",
-            new=AsyncMock(return_value="https://itunes.example/should-not-appear"),
-        ) as legacy_itunes:
-            results = await enrich_artwork_results(
-                [(item, None)],
-                AsyncMock(),
-                song="The Four Sleeping Princesses",
-                album="Tragic Magic",
-                apple_music=apple_music,
-            )
+        results = await enrich_artwork_results(
+            [(item, None)],
+            AsyncMock(),
+            song="The Four Sleeping Princesses",
+            album="Tragic Magic",
+            apple_music=apple_music,
+        )
 
-        legacy_itunes.assert_not_awaited()
         apple_music.find_track_url.assert_awaited_once_with(
             "Julianna Barwick & Mary Lattimore",
             "The Four Sleeping Princesses",
@@ -1219,12 +967,10 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
     @pytest.mark.asyncio
     async def test_apple_music_client_raising_does_not_sink_whole_batch(self):
         """A single ``find_track_url`` exception must NOT propagate through
-        ``asyncio.gather`` and fail the entire enrichment. Mirrors the legacy
-        ``_fetch_apple_music_url`` blanket ``try: ... except Exception: return
-        None`` guarantee — bulk lookups regress to 500 without this wrap if
-        Apple returns a malformed result that trips ``find_track_url``'s
-        result-iteration loop (which itself has no top-level exception
-        handler).
+        ``asyncio.gather`` and fail the entire enrichment. ``find_track_url``
+        has no top-level exception handler around its result-iteration loop,
+        so the orchestrator wraps the call defensively — bulk lookups would
+        otherwise regress to 500 if Apple returns a malformed result.
         """
         items_with_artwork = [
             (make_library_item(id=1, artist="Artist 1", title="Album 1"), None),
