@@ -9,7 +9,6 @@ import os
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
-import httpx
 import sentry_sdk
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import ValidationError
@@ -17,7 +16,6 @@ from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats, init_c
 
 from clients.streaming.apple_music import AppleMusicClient
 from core.dependencies import (
-    get_apple_music_http_client,
     get_discogs_cache_service,
     get_discogs_service,
     get_library_db,
@@ -116,7 +114,6 @@ async def handle_lookup(
     mb_pg: PgSource | None = Depends(get_musicbrainz_pg),
     entity_store: EntityStore | None = Depends(get_entity_store),
     posthog_client: Posthog | None = Depends(get_posthog_client),
-    http_client: httpx.AsyncClient = Depends(get_apple_music_http_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
@@ -149,7 +146,6 @@ async def handle_lookup(
             entity_store=entity_store,
             discogs_cache=discogs_cache,
             mb_pg=mb_pg,
-            http_client=http_client,
             apple_music=apple_music,
             caller_budget_ms=x_caller_budget_ms,
         )
@@ -272,7 +268,6 @@ async def handle_bulk_lookup(
     mb_pg: PgSource | None = Depends(get_musicbrainz_pg),
     entity_store: EntityStore | None = Depends(get_entity_store),
     posthog_client: Posthog | None = Depends(get_posthog_client),
-    http_client: httpx.AsyncClient = Depends(get_apple_music_http_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
@@ -355,7 +350,6 @@ async def handle_bulk_lookup(
                         entity_store=entity_store,
                         discogs_cache=discogs_cache,
                         mb_pg=mb_pg,
-                        http_client=http_client,
                         apple_music=apple_music,
                         caller_budget_ms=x_caller_budget_ms,
                     )

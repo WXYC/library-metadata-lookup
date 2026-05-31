@@ -6,7 +6,6 @@ import logging
 from typing import TYPE_CHECKING
 
 import asyncpg
-import httpx
 from fastapi import Depends
 from wxyc_fastapi.http import async_singleton
 from wxyc_fastapi.observability import get_posthog_client as _shared_posthog_client
@@ -234,36 +233,6 @@ async def get_musicbrainz_pg(
 async def close_musicbrainz_pg() -> None:
     """Close the musicbrainz-cache PgSource on app shutdown."""
     await _close_musicbrainz_pg_singleton()
-
-
-async def _build_apple_music_http_client() -> httpx.AsyncClient:
-    """Build the process-lifetime httpx client for iTunes Search probes."""
-    client = httpx.AsyncClient(timeout=5.0)
-    logger.info("Apple Music shared HTTP client initialized")
-    return client
-
-
-_get_apple_music_http_client, _close_apple_music_http_client = async_singleton(
-    _build_apple_music_http_client
-)
-
-
-async def get_apple_music_http_client() -> httpx.AsyncClient:
-    """Process-lifetime ``httpx.AsyncClient`` for the iTunes Search probe.
-
-    The lookup orchestrator probes ``itunes.apple.com/search`` once per
-    enriched result item. Constructing a fresh ``httpx.AsyncClient`` per
-    probe (the previous behavior) leaked file descriptors under sustained
-    /api/v1/lookup traffic and exhausted the container's FD limit on
-    2026-05-01 (issue #241). A shared client is returned instead and
-    closed on app shutdown via ``close_apple_music_http_client``.
-    """
-    return await _get_apple_music_http_client()
-
-
-async def close_apple_music_http_client() -> None:
-    """Close the shared Apple Music HTTP client on app shutdown."""
-    await _close_apple_music_http_client()
 
 
 def get_posthog_client(settings: Settings = Depends(get_settings)) -> Posthog | None:

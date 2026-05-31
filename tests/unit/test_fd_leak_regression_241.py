@@ -8,14 +8,13 @@ the container; the leak source survives until something changes.
 These tests encode the two prime hypotheses identified during incident
 investigation as concrete contracts the code should satisfy:
 
-1. ``_fetch_apple_music_url`` is on the request hot path and must NOT
-   construct a fresh ``httpx.AsyncClient`` per call. Every other outbound
-   client in the service (Discogs, Spotify, Deezer, Bandcamp, AppleMusicClient)
-   is a process-lifetime singleton with explicit ``close()`` on shutdown;
-   this one slipped through. Each instantiation opens a fresh transport
-   (DNS resolver socket + connection pool) — under sustained traffic from
-   request-o-matic ``/health/ready`` polls + real iOS DJ requests, those
-   accumulate FDs faster than they can be cleaned up.
+1. The artwork-enrichment hot path must NOT construct ``httpx.AsyncClient``
+   instances. Every outbound client in the service (Discogs, Spotify,
+   Deezer, Bandcamp, AppleMusicClient) is a process-lifetime singleton with
+   explicit ``close()`` on shutdown. The legacy ``_fetch_apple_music_url``
+   used to construct a fresh client per call — that was removed in LML#241
+   and the function itself in LML#444; the orchestrator no longer imports
+   ``httpx`` at all.
 
 2. Two lazy-init asyncpg pools have a TOCTOU race:
    ``entity/sources.py:PgSource._get_pool`` and
@@ -24,8 +23,6 @@ investigation as concrete contracts the code should satisfy:
    first-callers each pass the check, each create a pool, and all but one
    pool is orphaned with no reference to ``close()`` it. Each orphaned pool
    holds up to 5 connections (FDs).
-
-These tests fail today; they should pass after fixes ship.
 """
 
 from __future__ import annotations
@@ -33,88 +30,36 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, patch
 
-import httpx
 import pytest
 
-from discogs.models import ReleaseMetadataResponse
 
+class TestOrchestratorOwnsNoHttpxClients:
+    """Hypothesis #1: the artwork-enrichment hot path must not own transient
+    ``httpx.AsyncClient`` instances.
 
-class TestFetchAppleMusicUrlNoLeak:
-    """Hypothesis #1: the artwork-enrichment hot path must not instantiate
-    ``httpx.AsyncClient`` per call.
-
-    The desired contract: ``enrich_artwork_results`` accepts (or sources from
-    DI) a shared ``httpx.AsyncClient`` / ``AppleMusicClient`` and threads it
-    down to ``_fetch_apple_music_url``. The orchestrator owns no transient
-    clients of its own.
+    Strongest form of the invariant: ``lookup.orchestrator`` does not import
+    ``httpx`` at all (LML#444 removed the last reference when ``_fetch_apple_music_url``
+    was deleted). Any future regression that re-introduces ``import httpx``
+    into the module — typically the first step toward a per-call client
+    construction — fails this test before it can ship the FD-leak shape from
+    issue #241.
     """
 
-    @pytest.mark.asyncio
-    async def test_enrich_artwork_results_does_not_construct_httpx_client(self):
-        """A full enrich pass over multiple items must not instantiate any
-        ``httpx.AsyncClient`` inside the orchestrator. Every instantiation
-        on the hot path is a leaked-FD risk (issue #241).
+    def test_orchestrator_does_not_import_httpx(self):
+        """The orchestrator's request hot path must source HTTP clients via
+        DI (e.g. ``AppleMusicClient``) rather than construct them. The
+        BaseStreamingClient singleton pattern guarantees one process-lifetime
+        ``httpx.AsyncClient`` per service with explicit shutdown.
         """
-        from lookup.orchestrator import enrich_artwork_results
-        from tests.factories import make_discogs_result, make_library_item
+        import lookup.orchestrator as orchestrator_module
 
-        items_with_artwork = [
-            (
-                make_library_item(id=i, artist=f"Artist {i}", title=f"Album {i}"),
-                make_discogs_result(release_id=i, artist=f"Artist {i}", album=f"Album {i}"),
-            )
-            for i in range(1, 4)
-        ]
-
-        discogs_service = AsyncMock()
-
-        def make_release(release_id: int) -> ReleaseMetadataResponse:
-            return ReleaseMetadataResponse(
-                release_id=release_id,
-                title=f"Album {release_id}",
-                artist=f"Artist {release_id}",
-                year=2000 + release_id,
-                artist_id=None,
-                release_url=f"https://discogs.com/release/{release_id}",
-            )
-
-        discogs_service.get_release.side_effect = lambda rid: make_release(rid)
-
-        instantiations: list[tuple] = []
-
-        class TrackingAsyncClient:
-            """Stand-in for ``httpx.AsyncClient`` that records construction
-            and yields a get-stub returning an empty iTunes response.
-            """
-
-            def __init__(self, *args, **kwargs):
-                instantiations.append((args, kwargs))
-
-            async def __aenter__(self):
-                stub = AsyncMock()
-                stub.get = AsyncMock(
-                    return_value=httpx.Response(
-                        200,
-                        json={"results": []},
-                        request=httpx.Request("GET", "https://itunes.apple.com/search"),
-                    )
-                )
-                return stub
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return None
-
-        with patch("lookup.orchestrator.httpx.AsyncClient", TrackingAsyncClient):
-            await enrich_artwork_results(items_with_artwork, discogs_service, song="Song")
-
-        assert instantiations == [], (
-            f"lookup.orchestrator constructed {len(instantiations)} "
-            f"httpx.AsyncClient(s) during a single enrich pass over "
-            f"{len(items_with_artwork)} items. Each instantiation opens a "
-            "fresh transport (DNS + connection pool); under sustained "
-            "/api/v1/lookup traffic this leaks FDs (issue #241). "
-            "enrich_artwork_results should accept a shared client and "
-            "thread it through to _fetch_apple_music_url."
+        assert not hasattr(orchestrator_module, "httpx"), (
+            "lookup.orchestrator must not import httpx. Every outbound HTTP "
+            "client in this service is a process-lifetime singleton with "
+            "explicit close() on shutdown — the orchestrator sources from "
+            "DI rather than constructing. Re-introducing httpx here is the "
+            "first step toward the per-call construction pattern that "
+            "leaked FDs in issue #241."
         )
 
 
