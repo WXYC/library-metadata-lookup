@@ -1217,6 +1217,52 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         assert enriched.apple_music_url is None
 
     @pytest.mark.asyncio
+    async def test_apple_music_client_raising_does_not_sink_whole_batch(self):
+        """A single ``find_track_url`` exception must NOT propagate through
+        ``asyncio.gather`` and fail the entire enrichment. Mirrors the legacy
+        ``_fetch_apple_music_url`` blanket ``try: ... except Exception: return
+        None`` guarantee — bulk lookups regress to 500 without this wrap if
+        Apple returns a malformed result that trips ``find_track_url``'s
+        result-iteration loop (which itself has no top-level exception
+        handler).
+        """
+        items_with_artwork = [
+            (make_library_item(id=1, artist="Artist 1", title="Album 1"), None),
+            (make_library_item(id=2, artist="Artist 2", title="Album 2"), None),
+        ]
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        # Item 1 raises; item 2 returns a normal URL. Without a defensive
+        # wrap at the call site, the gather() in enrich_artwork_results
+        # cancels item 2's enrichment mid-flight and raises.
+        item2_url = "https://music.apple.com/us/album/album-2/222"
+        apple_music.find_track_url = AsyncMock(
+            side_effect=[
+                AttributeError("Apple returned a non-dict item"),
+                item2_url,
+            ]
+        )
+
+        results = await enrich_artwork_results(
+            items_with_artwork,
+            AsyncMock(),
+            song="Song",
+            album="Album",
+            apple_music=apple_music,
+        )
+
+        assert len(results) == 2
+        _, enriched_1 = results[0]
+        _, enriched_2 = results[1]
+        # Item 1 degraded to no Apple URL but did not crash the request.
+        assert enriched_1 is not None
+        assert enriched_1.apple_music_url is None
+        # Item 2's enrichment was not collateral-damaged by item 1's raise.
+        # (Top-1 positional gating means album-derived fields are still
+        # None, but the streaming URL itself survives.)
+        assert enriched_2 is not None
+
+    @pytest.mark.asyncio
     async def test_apple_music_url_does_not_override_db_streaming_link(self):
         """Direct streaming-links from the library DB take precedence over the
         AppleMusicClient probe — preserves the existing
