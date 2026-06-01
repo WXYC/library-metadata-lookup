@@ -1305,17 +1305,17 @@ class DiscogsCacheService:
                     ):
                         return True
 
-                # Release-level fallback, consulted when no per-track main
-                # credit matched. After #333 the per-track read above is
-                # filtered to ``extra = 0``; this branch is what rescues
-                # the legitimate case where the per-track main credit
-                # exists but didn't substring/fuzz-match the requested
-                # artist string, AND the release-level credit does. Common
-                # shape: band-member-only per-track credits with the band
-                # name at the release level — see #333 acceptance criteria
-                # for the canonical Live 93 / The Orb walkthrough.
-                # Mirrors the API path in ``discogs/service.py``. Do not
-                # remove without replacing the rescue path.
+                # Release-level fallback, consulted whenever the per-track
+                # main credits (post-#333 ``extra = 0`` filter) didn't
+                # close the match — either no per-track main credit exists
+                # for this row at all, or one exists but didn't substring/
+                # fuzz-match the requested artist. Rescued by a
+                # release-level credit that does match. The band-member
+                # shape (per-track main credits list only members, release-
+                # level is the band) is one canonical case; see #333
+                # acceptance criteria. Mirrors the API path in
+                # ``discogs/service.py``. Do not remove without replacing
+                # the rescue path.
                 if release_artist_clean and (
                     artist_lower in release_artist_clean or release_artist_clean in artist_lower
                 ):
