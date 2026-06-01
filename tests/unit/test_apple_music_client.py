@@ -283,34 +283,42 @@ class TestFindTrackUrl:
 
     @pytest.mark.asyncio
     async def test_returns_url_despite_diacritics(self, es256_keypair):
-        """LML#453: the composition `normalize_for_comparison` → `token_set_ratio`
-        must fold diacritics on BOTH sides — DJ-side AND Apple-side. A refactor
-        that drops the wrapper on either Apple-side extractor (artistName,
-        name, albumName) would silently fail to match WXYC's diacritic-bearing
-        catalog (Nilüfer Yanya, Csillagrablók, Hermanos Gutiérrez, Mūm,
-        Sigur Rós, Béla Bartók, …).
+        """LML#453 + #458: the composition `normalize_for_comparison` →
+        `token_set_ratio` must fold diacritics on BOTH sides — DJ-side AND
+        Apple-side — at EVERY one of the three Apple-side extractors
+        (artistName, name, albumName). A refactor that drops the wrapper
+        on any one of them would silently fail to match WXYC's
+        diacritic-bearing catalog (Nilüfer Yanya, Csillagrablók,
+        Hermanos Gutiérrez, Mūm, Sigur Rós, Björk, Béla Bartók, …).
 
-        Mūm gives the sharpest pin: 3-letter artist name where the raw
-        `token_set_ratio('Mūm', 'mum')` is 33.3 (below the 80 floor) but
-        the wrapped composition is 100. So if anyone drops the normalize
-        wrapper on the Apple-side extractor and Apple stores the canonical
-        diacritic, every Mūm track lookup silently returns None — and this
-        test fails."""
+        Real WXYC-spinnable fixture — Björk's "Vísur Vatnsenda-Rósu" from
+        Medúlla (2004) — carries a diacritic on every axis short enough
+        that dropping the Apple-side wrapper trips the 80-floor independently:
+
+            * artistName: `token_set_ratio('björk', 'Björk')`        = 60.0
+            * name:       `token_set_ratio('vísur ...', 'Vísur ...')` = 75.0
+            * albumName:  `token_set_ratio('medúlla', 'Medúlla')`    = 71.4
+
+        Each is < 80, so removing `normalize_for_comparison` from any
+        single Apple-side call site causes the corresponding `< floor`
+        check to fire `continue`, the candidate is skipped, and this test
+        fails. The wrapped composition is 100 on every axis, so the
+        as-shipped code returns the URL."""
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        # Apple stores the canonical diacritic-bearing form (matches Mūm's
-        # registered MusicBrainz / Discogs canonical).
+        # Apple stores the canonical diacritic-bearing form on every axis
+        # (matches Björk's registered MusicBrainz / Discogs canonical).
         apple_item = _make_song_data(
-            name="Sleep/Swim",
-            artist_name="Mūm",
-            album_name="Summer Make Good",
-            url="https://music.apple.com/us/song/sleep-swim/789",
+            name="Vísur Vatnsenda-Rósu",
+            artist_name="Björk",
+            album_name="Medúlla",
+            url="https://music.apple.com/us/song/visur-vatnsenda-rosu/789",
         )
         mock_http.get = AsyncMock(return_value=_songs_response([apple_item]))
         client._http = mock_http
 
-        url = await client.find_track_url("Mūm", "Sleep/Swim", album="Summer Make Good")
-        assert url == "https://music.apple.com/us/song/sleep-swim/789"
+        url = await client.find_track_url("Björk", "Vísur Vatnsenda-Rósu", album="Medúlla")
+        assert url == "https://music.apple.com/us/song/visur-vatnsenda-rosu/789"
 
     @pytest.mark.asyncio
     async def test_skips_result_with_missing_url(self, es256_keypair):
@@ -354,10 +362,18 @@ class TestFindTrackUrl:
     @pytest.mark.asyncio
     async def test_accepts_album_reissue_variant(self, es256_keypair):
         """LML#453: the deliberate choice of `token_set_ratio` (not
-        `token_sort_ratio` or `partial_ratio`) lets `album='Tzenni'` match
-        Apple's `albumName='Tzenni (Deluxe Edition)'`. A refactor that swaps
-        the fuzz function would silently break every album-verified track
-        lookup whose DJ-typed input lacks the edition suffix."""
+        `token_sort_ratio`) lets `album='Tzenni'` match Apple's
+        `albumName='Tzenni (Deluxe Edition)'`. A refactor that swaps to
+        `token_sort_ratio` would silently break every album-verified track
+        lookup whose DJ-typed input lacks the edition suffix:
+
+            * `token_sort_ratio('tzenni', 'tzenni (deluxe edition)')` = 41.4
+            * `token_set_ratio` of the same pair = 100
+
+        (The sibling pin against `partial_ratio` lives in
+        `test_accepts_album_with_extra_tokens_in_canonical_title` —
+        `partial_ratio` would actually pass this fixture at 100, since
+        'tzenni' is a clean substring; see #460.)"""
         client = _client(es256_keypair)
         reissue = _make_song_data(
             name="Tzenni",
@@ -371,6 +387,46 @@ class TestFindTrackUrl:
 
         url = await client.find_track_url("Noura Mint Seymali", "Tzenni", album="Tzenni")
         assert url == "https://music.apple.com/us/song/tzenni/901"
+
+    @pytest.mark.asyncio
+    async def test_accepts_album_with_extra_tokens_in_canonical_title(self, es256_keypair):
+        """LML#460: the choice of `token_set_ratio` (not `partial_ratio`)
+        also lets a DJ-typed shortform match a canonical title whose tokens
+        appear in a DIFFERENT ORDER, interleaved with extra words — the
+        shape `partial_ratio` punishes because there's no contiguous
+        substring covering the DJ tokens.
+
+        Real WXYC-spinnable fixture: Sigur Rós's "Glósóli" from the
+        canonical album "Með suð í eyrum við spilum endalaust" (2008). A
+        DJ types `album='Eyrum Spilum Suð'` — a recognizable shortform
+        that pulls three tokens from the canonical title in non-canonical
+        order:
+
+            * `token_set_ratio('eyrum spilum suð', 'með suð i eyrum við
+              spilum endalaust')` = 100 (DJ tokens are a subset)
+            * `partial_ratio` of the same pair = 75.0 (best substring of
+              the DJ string in Apple's string is < 80)
+            * `token_sort_ratio` = 61.5 (token order differs)
+
+        So a refactor that swaps `token_set_ratio` -> `partial_ratio` at
+        any of the three call sites trips the floor on its axis,
+        `continue` fires, and this test fails. The existing
+        `test_accepts_album_reissue_variant` only catches the
+        `token_sort_ratio` swap; this one catches the `partial_ratio`
+        swap that the original docstring also promised but did not pin."""
+        client = _client(es256_keypair)
+        rearranged = _make_song_data(
+            name="Glósóli",
+            artist_name="Sigur Rós",
+            album_name="Með suð í eyrum við spilum endalaust",
+            url="https://music.apple.com/us/song/glosoli/902",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([rearranged]))
+        client._http = mock_http
+
+        url = await client.find_track_url("Sigur Rós", "Glósóli", album="Eyrum Spilum Suð")
+        assert url == "https://music.apple.com/us/song/glosoli/902"
 
 
 class TestFindAlbumMatch:
