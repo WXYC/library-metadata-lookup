@@ -9,7 +9,7 @@ are isolated so one item cannot poison the batch.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 import sentry_sdk
@@ -510,8 +510,11 @@ class TestBulkLookupObservability:
         )
         entry_msg = entry_records[0].message
         # Pin the shape: size of the batch must be in the log line so operators
-        # can correlate Railway log entries with caller-side batch sizes.
-        assert "3" in entry_msg, f"Entry log missing batch size: {entry_msg!r}"
+        # can correlate Railway log entries with caller-side batch sizes. Match
+        # the `size=N` prefix (not just the bare digit) so a future format change
+        # that drops the key — or a timestamp containing the digit — can't
+        # silently pass this assertion.
+        assert "size=3" in entry_msg, f"Entry log missing batch size: {entry_msg!r}"
 
     @pytest.mark.asyncio
     async def test_exit_log_includes_status_counts(self, app_client, caplog):
@@ -535,11 +538,16 @@ class TestBulkLookupObservability:
                 transport=ASGITransport(app=app_client), base_url="http://test"
             ) as ac:
                 with caplog.at_level(logging.INFO, logger="lookup.router"):
+                    # Distinct count distribution (match=2, no_match=1, error=1) so
+                    # a regression that swaps the order of `counts["match"]` and
+                    # `counts["error"]` in the format args produces a *different*
+                    # log line; an all-1s fixture would mask that swap entirely.
                     resp = await ac.post(
                         "/api/v1/lookup/bulk",
                         json={
                             "items": [
                                 {"artist": "Juana Molina", "album": "DOGA"},
+                                {"artist": "Cat Power", "album": "Moon Pix"},
                                 {"artist": "miss", "album": "X"},
                                 {"artist": "boom", "album": "Y"},
                             ]
@@ -554,6 +562,15 @@ class TestBulkLookupObservability:
             "Expected an INFO log at bulk handler exit; got logs: "
             f"{[r.message for r in caplog.records]}"
         )
+        exit_msg = exit_records[0].message
+        # Pin each count by its key=value pair (not bare digit) so a regression
+        # that drops a key, garbles the format string, or swaps two count
+        # positions all fail loudly. The distinct distribution above is what
+        # makes the swap detectable.
+        assert "size=4" in exit_msg, f"Exit log missing batch size: {exit_msg!r}"
+        assert "match=2" in exit_msg, f"Exit log missing match count: {exit_msg!r}"
+        assert "no_match=1" in exit_msg, f"Exit log missing no_match count: {exit_msg!r}"
+        assert "error=1" in exit_msg, f"Exit log missing error count: {exit_msg!r}"
 
     @pytest.mark.asyncio
     async def test_http_server_span_emitted_for_bulk(self, app_client):
@@ -565,12 +582,21 @@ class TestBulkLookupObservability:
         the production logs at 22:21-22:34 on 2026-05-24 showed was not firing
         for hung handlers (the album-level-backfill case in #371).
         """
+        # Replace `start_span` with a factory that hands back a fresh MagicMock
+        # per call — including the inner `lml.bulk.batch` / `lml.bulk.item`
+        # spans the handler also opens. Each mock self-enters as its own
+        # context manager and records every `set_data(...)` call so the
+        # assertions below can pin both the span name and the `http.target`
+        # data field. (The previous version returned the real span, which made
+        # the data calls untestable.)
         captured_spans: list[dict] = []
-        original_start_span = sentry_sdk.start_span
 
         def capture_start_span(*args, **kwargs):
-            captured_spans.append({"args": args, "kwargs": kwargs})
-            return original_start_span(*args, **kwargs)
+            span_mock = MagicMock()
+            span_mock.__enter__ = MagicMock(return_value=span_mock)
+            span_mock.__exit__ = MagicMock(return_value=False)
+            captured_spans.append({"args": args, "kwargs": kwargs, "span": span_mock})
+            return span_mock
 
         with (
             patch(
@@ -594,11 +620,22 @@ class TestBulkLookupObservability:
             "Expected at least one Sentry span with op='http.server'; got: "
             f"{[s['kwargs'].get('op') for s in captured_spans]}"
         )
-        # The span's name must identify the bulk route so operators can filter
-        # for `span.description: POST /api/v1/lookup/bulk` in the trace explorer.
+        # The span name must be exactly the canonical route string so operators
+        # can filter for `span.description:"POST /api/v1/lookup/bulk"` in the
+        # trace explorer. A substring match would not catch a drift to e.g.
+        # `/api/v2/lookup/bulk` if the constant ever gets out of sync with the
+        # route registration.
         span_name = http_server_spans[0]["kwargs"].get("name", "")
-        assert "lookup/bulk" in span_name, (
-            f"Expected http.server span name to include 'lookup/bulk'; got {span_name!r}"
+        assert span_name == "POST /api/v1/lookup/bulk", (
+            f"Expected http.server span name 'POST /api/v1/lookup/bulk'; got {span_name!r}"
+        )
+        # Pin the `http.target` data field — the second canonical-route usage
+        # in the handler. Together with the span-name pin above, this proves
+        # both call sites stay in sync (e.g. after the constant is hoisted).
+        set_data_calls = http_server_spans[0]["span"].set_data.call_args_list
+        http_target_args = [c.args for c in set_data_calls if c.args and c.args[0] == "http.target"]
+        assert http_target_args == [("http.target", "/api/v1/lookup/bulk")], (
+            f"Expected http.target set to '/api/v1/lookup/bulk' exactly once; got {http_target_args!r}"
         )
 
 
