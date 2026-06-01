@@ -7,6 +7,7 @@ track validation -> artwork fetch -> metadata enrichment -> context message.
 
 import asyncio
 import logging
+import os
 import random
 import re
 import time
@@ -108,6 +109,49 @@ silently drops. The standard pattern is a module-level set; each task
 removes itself in a done_callback. See
 https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
 """
+
+
+_APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S = 4.0
+"""Default wall-clock ceiling for a single ``find_track_url`` call from the
+lookup hot path. Sized to the legacy iTunes Search ``httpx`` timeout (5s)
+with margin so the orchestrator's wait_for trips before the underlying
+``BaseStreamingClient`` httpx timeout. LML#449 + LML#450."""
+
+_APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR = "LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS"
+
+
+def _apple_music_lookup_timeout_s() -> float:
+    """Resolve the per-call wall-clock ceiling for ``find_track_url`` on the
+    lookup hot path. Read at request time (not via ``Settings``) so the knob
+    can be tuned via Railway env vars without a redeploy — mirrors the
+    ``LML_BULK_MAX_CONCURRENT`` and ``LML_SEARCH_BUDGET_MS`` patterns.
+
+    A misconfigured value (negative, zero, or unparseable) falls back to the
+    default with a WARN. The default is ``_APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S``
+    (4s). See LML#449 + LML#450.
+    """
+    raw = os.getenv(_APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR)
+    if not raw:
+        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
+    try:
+        ms = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r, falling back to %.1fs",
+            _APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
+            raw,
+            _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S,
+        )
+        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
+    if ms <= 0:
+        logger.warning(
+            "%s=%d must be > 0, falling back to %.1fs",
+            _APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
+            ms,
+            _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S,
+        )
+        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
+    return ms / 1000.0
 
 
 CANONICAL_ARTIST_SIMILARITY_FLOOR: float = 0.70
@@ -1751,12 +1795,24 @@ async def enrich_artwork_results(
         # ``return_exceptions=True``. Without this wrap a single malformed
         # Apple payload (non-dict item, rapidfuzz dispatch error) propagates
         # through the gather and 500s the whole /lookup or /lookup/bulk
-        # request.
+        # request. The ``asyncio.wait_for`` ceiling additionally caps the
+        # worst-case latency a single Apple call can impose on the request —
+        # without it, a 429/5xx storm could pin one of the Apple Music
+        # Semaphore(5) slots for up to ``_MAX_RETRIES`` × ``_RETRY_AFTER_CAP_SECONDS``
+        # seconds while still being unbounded at the call site (LML#449 + LML#450).
+        # On timeout we degrade to no-Apple-URL, same as the LML#444 exception path.
         apple_music_result: str | None = None
         if apple_music is not None and artist and search_term:
             try:
-                apple_music_result = await apple_music.find_track_url(
-                    artist, search_term, album=album
+                apple_music_result = await asyncio.wait_for(
+                    apple_music.find_track_url(artist, search_term, album=album),
+                    timeout=_apple_music_lookup_timeout_s(),
+                )
+            except TimeoutError:
+                logger.warning(
+                    "AppleMusicClient.find_track_url timed out for %s - %s",
+                    artist,
+                    search_term,
                 )
             except Exception:
                 logger.exception(

@@ -472,6 +472,10 @@ class TestRetryBehavior:
 
     @pytest.mark.asyncio
     async def test_gives_up_after_max_retries_on_429_burst(self, es256_keypair):
+        """LML#450: ``_MAX_RETRIES=2`` (down from 4). Lookup is latency-
+        sensitive; under sustained 429/5xx we degrade to no-Apple immediately
+        rather than holding a Semaphore(5) slot for the worst case.
+        """
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         rate_limited = httpx.Response(
@@ -479,7 +483,7 @@ class TestRetryBehavior:
             headers={"Retry-After": "1"},
             request=httpx.Request("GET", SEARCH_URL),
         )
-        # 10 consecutive 429s — should give up after _MAX_RETRIES (4).
+        # 10 consecutive 429s — should give up after _MAX_RETRIES (2).
         mock_http.get = AsyncMock(return_value=rate_limited)
         client._http = mock_http
 
@@ -487,7 +491,42 @@ class TestRetryBehavior:
             results = await client.search_song("Stereolab", "Aluminum Tunes")
 
         assert results == []
-        assert mock_http.get.call_count == 4  # _MAX_RETRIES
+        assert mock_http.get.call_count == 2  # _MAX_RETRIES (LML#450)
+
+
+class TestParseRetryAfter:
+    """LML#450: pre-fix the Retry-After parser capped at 60s; combined with
+    ``_MAX_RETRIES=4`` that allowed a single ``find_track_url`` to hold one
+    of the 5 Semaphore slots for 240s under a sustained 429 storm. The cap
+    drops to 5s so the worst-case retry-loop latency is now ``2 * 5 = 10s``
+    (and the orchestrator additionally bounds with ``asyncio.wait_for``).
+    """
+
+    def test_caps_retry_after_at_5s(self):
+        """A pathological upstream `Retry-After: 60` (or higher) must clamp
+        to 5s so one slow item can't pin a Semaphore slot for a minute."""
+        from clients.streaming.apple_music import _parse_retry_after
+
+        assert _parse_retry_after("60") == 5.0
+        assert _parse_retry_after("120") == 5.0
+
+    def test_honors_small_retry_after(self):
+        """A small Retry-After (under the cap) is honored verbatim — Apple
+        usually returns ``1`` or ``2`` for transient 429s, and respecting it
+        avoids hammering."""
+        from clients.streaming.apple_music import _parse_retry_after
+
+        assert _parse_retry_after("1") == 1.0
+        assert _parse_retry_after("3") == 3.0
+
+    def test_fallback_when_header_absent_or_malformed(self):
+        """Missing/garbage headers fall back to the cap (5s) — same as the
+        post-fix max so the slow path is bounded either way."""
+        from clients.streaming.apple_music import _parse_retry_after
+
+        assert _parse_retry_after(None) == 5.0
+        assert _parse_retry_after("") == 5.0
+        assert _parse_retry_after("not-a-number") == 5.0
 
 
 class TestErrorHandling:

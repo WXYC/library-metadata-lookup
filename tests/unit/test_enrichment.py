@@ -991,6 +991,51 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         assert enriched_2 is not None
 
     @pytest.mark.asyncio
+    async def test_apple_music_find_track_url_timeout_degrades_to_none(self):
+        """LML#449 + LML#450: a single ``find_track_url`` call that exceeds
+        the call-site timeout must NOT pull the rest of the request past its
+        deadline. The orchestrator wraps the call in ``asyncio.wait_for``
+        with a tight ceiling; on TimeoutError the item degrades to no Apple
+        URL, same as the LML#444 exception path. Pins the upper bound so the
+        worst-case 4×60s retry loop in LML#450 cannot block enrichment.
+        """
+        items_with_artwork = [
+            (make_library_item(id=1, artist="Mūm", title="Summer Make Good"), None),
+            (make_library_item(id=2, artist="Stereolab", title="Aluminum Tunes"), None),
+        ]
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+
+        # Sleep longer than any sane timeout. The wait_for ceiling triggers
+        # before this completes; the test then verifies graceful degradation.
+        async def slow_find(*_args, **_kwargs):
+            await asyncio.sleep(60)
+            return "https://music.apple.com/should-never-resolve"
+
+        apple_music.find_track_url = AsyncMock(side_effect=slow_find)
+
+        # Patch the call-site timeout to a tiny value so the test runs in
+        # milliseconds and the asyncio.wait_for ceiling fires deterministically.
+        with patch("lookup.orchestrator._apple_music_lookup_timeout_s", return_value=0.05):
+            results = await enrich_artwork_results(
+                items_with_artwork,
+                AsyncMock(),
+                song="Song",
+                album="Album",
+                apple_music=apple_music,
+            )
+
+        assert len(results) == 2
+        _, enriched_1 = results[0]
+        _, enriched_2 = results[1]
+        # Both items degraded to no Apple URL; neither propagated TimeoutError
+        # through the enclosing gather() to fail the whole batch.
+        assert enriched_1 is not None
+        assert enriched_1.apple_music_url is None
+        assert enriched_2 is not None
+        assert enriched_2.apple_music_url is None
+
+    @pytest.mark.asyncio
     async def test_apple_music_url_does_not_override_db_streaming_link(self):
         """Direct streaming-links from the library DB take precedence over the
         AppleMusicClient probe — preserves the existing
