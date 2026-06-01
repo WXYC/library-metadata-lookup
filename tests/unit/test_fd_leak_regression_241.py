@@ -28,6 +28,7 @@ investigation as concrete contracts the code should satisfy:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -178,3 +179,110 @@ class TestGetDiscogsServicePoolRace:
             "holds up to 5 connections. The lazy init must go through "
             "`wxyc_fastapi.http.async_singleton` (issue #241 / #283)."
         )
+
+
+class TestGetAppleMusicClientRace:
+    """Hypothesis #2c: ``streaming.dependencies.get_apple_music_client`` is racy.
+
+    Same shape as the Discogs-pool race: the pre-fix getter is a sync FastAPI
+    dep with a ``global _apple_music_client`` + ``is None`` check + assign. The
+    dep runs in FastAPI's threadpool, so concurrent cold-start callers can
+    each observe ``None``, each construct a fresh ``AppleMusicClient`` (PEM
+    parse + ECDSA key load + AsyncLimiter + asyncio.Semaphore), and orphan
+    all but one. The orphan's HTTP transport itself doesn't leak (the base
+    class wraps that in ``async_singleton``), but the orphan's rate limiter
+    and semaphore are wasted work and a transient drift hazard (two limiters
+    mean ~2x the effective rate budget until the orphan is GC'd).
+
+    Post-#451 the singleton is provided by `wxyc_fastapi.http.async_singleton`,
+    which owns the double-check + `asyncio.Lock` together. The test drives
+    the public getter end-to-end so a future refactor that bypasses
+    `async_singleton` would re-introduce the race and re-fail this test.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_cold_start_creates_one_client(self):
+        """Concurrent cold-start callers in ``get_apple_music_client`` must
+        share a single ``AppleMusicClient`` instance.
+
+        Pre-fix the sync FastAPI dep returned the result of a bare
+        ``AppleMusicClient(...)`` call after a ``global _apple_music_client``
+        check. Sync deps run in FastAPI's threadpool, so concurrent cold-
+        starters could each pass the ``is None`` check before any of them
+        assigned the global. Post-#451 the getter is async, the underlying
+        factory runs inside ``wxyc_fastapi.http.async_singleton``'s lock,
+        and every caller observes the same instance.
+        """
+        from config.settings import Settings
+        from streaming import dependencies
+
+        # Reset module-level state via the public closer so the next
+        # `get_apple_music_client` call drives a cold-start through the
+        # `async_singleton` factory (the underlying state lives in a closure
+        # we can't reach directly).
+        await dependencies.close_streaming_clients()
+
+        settings = Settings(
+            apple_music_team_id="TEAMID1234",
+            apple_music_key_id="KEYID12345",
+            apple_music_private_key="-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
+        )
+
+        init_calls: list[tuple] = []
+        fake_client = AsyncMock(name="apple-music-client")
+
+        def fake_constructor(*args, **kwargs):
+            init_calls.append((args, kwargs))
+            return fake_client
+
+        try:
+            with (
+                patch("streaming.dependencies.get_settings", return_value=settings),
+                patch(
+                    "streaming.dependencies.AppleMusicClient",
+                    side_effect=fake_constructor,
+                ),
+            ):
+                tasks = [
+                    asyncio.create_task(dependencies.get_apple_music_client(settings))
+                    for _ in range(8)
+                ]
+                results = await asyncio.gather(*tasks)
+        finally:
+            await dependencies.close_streaming_clients()
+
+        assert len(init_calls) == 1, (
+            f"AppleMusicClient was constructed {len(init_calls)} times for "
+            "the same Apple Music singleton. Concurrent cold-start callers "
+            "race in get_apple_music_client, orphaning all but one client — "
+            "each orphan holds an AsyncLimiter and asyncio.Semaphore (two "
+            "limiters mean transiently 2x the effective per-team rate "
+            "budget). The lazy init must go through "
+            "`wxyc_fastapi.http.async_singleton` (issue #241 / #451)."
+        )
+        # All callers must observe the same singleton instance.
+        assert all(r is fake_client for r in results), (
+            "Concurrent cold-start callers received different "
+            "AppleMusicClient instances. The async_singleton wrapper must "
+            "return the same instance to every caller after the factory "
+            "completes (issue #451)."
+        )
+
+
+def test_no_global_apple_music_client_in_streaming_dependencies():
+    """LML#451: race-prone ``global _apple_music_client`` lazy-init must be
+    gone from ``streaming/dependencies.py``. The lock + double-check belongs
+    inside ``wxyc_fastapi.http.async_singleton``; reintroducing a hand-rolled
+    sync getter with a module-level singleton + ``is None`` check would
+    re-open the same race that LML#241/#283/#435 closed elsewhere.
+    """
+    from streaming import dependencies as streaming_deps_module
+
+    src = Path(streaming_deps_module.__file__).read_text()
+    assert "global _apple_music_client" not in src, (
+        "streaming/dependencies.py uses `global _apple_music_client` — the "
+        "lock-free lazy-init pattern that LML#451 closed. Migrate to "
+        "`async_singleton(_build_apple_music_client)` (mirroring the Discogs "
+        "pool + MusicBrainz PgSource pattern in core/dependencies.py). See "
+        "LML#451."
+    )
