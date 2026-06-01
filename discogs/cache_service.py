@@ -231,6 +231,15 @@ class DiscogsCacheService:
                 FROM matching_tracks mt
                 JOIN release r ON r.id = mt.release_id
                 JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
+                -- `rta.extra = 0` constrains the LEFT JOIN to main-artist
+                -- credits (mirrors validate_track_on_release after #333).
+                -- Note: unlike validate_track_on_release, this query has no
+                -- Python-side release-level fuzz fallback — a release where
+                -- the only matching credit is `extra = 1` (featuring guest,
+                -- composer, remixer) drops from the candidate ranking. The
+                -- fallthrough seam's API leg will surface it at the cost of
+                -- Discogs quota. See PR #471 body for the documented recall
+                -- trade-off and follow-up tickets.
                 LEFT JOIN release_track_artist rta
                     ON rta.release_id = mt.release_id
                     AND rta.track_sequence = mt.sequence
@@ -1198,14 +1207,17 @@ class DiscogsCacheService:
                     ):
                         return True
 
-                # Release-level artist. Always consulted when per-track
-                # credits haven't matched — ``release_track_artist`` has no
-                # role column, so writer / producer / member credits land
-                # alongside main-artist credits (e.g., Live 93 by The Orb
-                # credits Paterson / Weston / Fehlmann on every track), and
-                # the release-level credit is the last word on "is this
-                # track by this artist." Mirrors the API path in
-                # ``discogs/service.py``.
+                # Release-level fallback, consulted when no per-track main
+                # credit matched. After #333 the per-track read above is
+                # filtered to ``extra = 0``, so this branch rescues two
+                # legitimate cases: (a) the band-member shape — Live 93 /
+                # The Orb credits Paterson / Weston / Fehlmann as the only
+                # per-track main artists; the release-level credit "The
+                # Orb" is the last word; (b) any release where the per-
+                # track main credit substring-missed the requested artist
+                # but the release-level credit fuzz-matches. Mirrors the
+                # API path in ``discogs/service.py``. Do not remove without
+                # replacing both rescue paths.
                 if release_artist_clean and (
                     artist_lower in release_artist_clean or release_artist_clean in artist_lower
                 ):

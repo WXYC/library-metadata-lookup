@@ -1047,9 +1047,13 @@ class TestValidateTrackOnRelease:
             f"Expected a query against release_track_artist; got: {captured_queries!r}"
         )
         rta_query = rta_queries[0]
-        assert "extra = 0" in rta_query, (
-            "Expected `extra = 0` filter in release_track_artist query "
-            f"(see #333); got: {rta_query!r}"
+        # Pin the *complete* WHERE clause adjacency, not just the substring
+        # ``extra = 0`` (which could co-occur in an unrelated CTE branch,
+        # whitespace-different variant, or even a `-- extra = 0` comment).
+        # The intent is: this specific table's WHERE includes both predicates.
+        assert "WHERE release_id = $1 AND extra = 0" in rta_query, (
+            "Expected exact `WHERE release_id = $1 AND extra = 0` clause in "
+            f"release_track_artist query (see #333); got: {rta_query!r}"
         )
 
 
