@@ -1051,9 +1051,14 @@ class TestValidateTrackOnRelease:
         # ``extra = 0`` (which could co-occur in an unrelated CTE branch,
         # whitespace-different variant, or even a `-- extra = 0` comment).
         # The intent is: this specific table's WHERE includes both predicates.
-        assert "WHERE release_id = $1 AND extra = 0" in rta_query, (
-            "Expected exact `WHERE release_id = $1 AND extra = 0` clause in "
-            f"release_track_artist query (see #333); got: {rta_query!r}"
+        # Include the leading space before WHERE so a future delete-the-
+        # trailing-space typo on the adjacent string literal in
+        # cache_service.py (which would produce
+        # ``release_track_artistWHERE`` — a PG parse error at runtime) also
+        # fails this unit test instead of slipping through.
+        assert "release_track_artist WHERE release_id = $1 AND extra = 0" in rta_query, (
+            "Expected exact `release_track_artist WHERE release_id = $1 AND extra = 0` "
+            f"clause in release_track_artist query (see #333); got: {rta_query!r}"
         )
 
 
