@@ -286,3 +286,29 @@ def test_no_global_apple_music_client_in_streaming_dependencies():
         "pool + MusicBrainz PgSource pattern in core/dependencies.py). See "
         "LML#451."
     )
+
+
+def test_no_module_level_asyncio_lock_in_streaming_dependencies():
+    """LML#459 (LML#451 follow-up): race-prone hand-rolled ``asyncio.Lock()``
+    plumbing must stay out of ``streaming/dependencies.py``. The lock +
+    double-check belongs inside ``wxyc_fastapi.http.async_singleton``;
+    reintroducing one at the module level (a) duplicates the contract and
+    (b) means a future author could write a new lazy-init that re-races the
+    FD-leak fix from #242.
+
+    Mirrors ``tests/unit/test_dependencies.py::
+    test_no_module_level_asyncio_lock_in_dependencies`` for symmetry — the
+    Apple Music singleton pin (above) catches the ``global X`` re-introduction
+    shape, this pin catches the ``asyncio.Lock()`` re-introduction shape.
+    """
+    from streaming import dependencies as streaming_deps_module
+
+    src = Path(streaming_deps_module.__file__).read_text()
+    assert "asyncio.Lock()" not in src, (
+        "streaming/dependencies.py contains a module-level `asyncio.Lock()` "
+        "instance — async singletons in this module must use "
+        "`wxyc_fastapi.http.async_singleton(factory)` instead, which owns "
+        "the lock and the double-check together. See "
+        "WXYC/library-metadata-lookup#451 and "
+        "WXYC/library-metadata-lookup#241."
+    )

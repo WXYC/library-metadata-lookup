@@ -94,6 +94,15 @@ async def get_apple_music_client(
     The ``settings`` argument is preserved for FastAPI DI compatibility —
     the underlying singleton factory reads from ``get_settings()`` directly
     so concurrent cold-start callers see a single, race-free init (LML#451).
+
+    Testing note (LML#459): because the factory bypasses FastAPI DI and
+    calls ``get_settings()`` (an ``@lru_cache``'d module-level function)
+    directly, ``app.dependency_overrides[get_settings] = ...`` does NOT
+    reach the Apple Music branch. Integration tests that need to swap
+    Apple Music credentials must
+    ``patch("streaming.dependencies.get_settings", ...)`` directly —
+    mirroring the cold-start race test in
+    ``tests/unit/test_fd_leak_regression_241.py::TestGetAppleMusicClientRace``.
     """
     return await _get_apple_music_client()
 
