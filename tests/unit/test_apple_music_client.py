@@ -280,6 +280,80 @@ class TestFindTrackUrl:
         url = await client.find_track_url("Stereolab", "Aluminum Tunes")
         assert url is None
 
+    @pytest.mark.asyncio
+    async def test_returns_url_despite_diacritics(self, es256_keypair):
+        """LML#453: the composition `normalize_for_comparison` → `token_set_ratio`
+        must fold diacritics on BOTH sides — DJ-side AND Apple-side. A refactor
+        that drops the wrapper on either Apple-side extractor (artistName,
+        name, albumName) would silently fail to match WXYC's diacritic-bearing
+        catalog (Nilüfer Yanya, Csillagrablók, Hermanos Gutiérrez, Mūm,
+        Sigur Rós, Béla Bartók, …).
+
+        Mūm gives the sharpest pin: 3-letter artist name where the raw
+        `token_set_ratio('Mūm', 'mum')` is 33.3 (below the 80 floor) but
+        the wrapped composition is 100. So if anyone drops the normalize
+        wrapper on the Apple-side extractor and Apple stores the canonical
+        diacritic, every Mūm track lookup silently returns None — and this
+        test fails."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        # Apple stores the canonical diacritic-bearing form (matches Mūm's
+        # registered MusicBrainz / Discogs canonical).
+        apple_item = _make_song_data(
+            name="Sleep/Swim",
+            artist_name="Mūm",
+            album_name="Summer Make Good",
+            url="https://music.apple.com/us/song/sleep-swim/789",
+        )
+        mock_http.get = AsyncMock(return_value=_songs_response([apple_item]))
+        client._http = mock_http
+
+        url = await client.find_track_url("Mūm", "Sleep/Swim", album="Summer Make Good")
+        assert url == "https://music.apple.com/us/song/sleep-swim/789"
+
+    @pytest.mark.asyncio
+    async def test_skips_result_with_missing_url(self, es256_keypair):
+        """LML#453: a high-relevance hit with no `attributes.url` must be
+        skipped (`continue`), not freeze `best_url=None` or block lower-
+        scoring valid hits. A refactor that changes `continue` to `return None`
+        or sets `best_url = url` before the score check would silently
+        regress the LML#389-shape."""
+        client = _client(es256_keypair)
+        # Apple's top result is artist/title-exact but has no URL — must skip.
+        # Second result is the canonical valid match.
+        no_url_item = _make_song_data(url="")
+        no_url_item["attributes"]["url"] = None
+        canonical = _make_song_data(
+            url="https://music.apple.com/us/song/back-baby/123",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([no_url_item, canonical]))
+        client._http = mock_http
+
+        url = await client.find_track_url("Jessica Pratt", "Back, Baby")
+        assert url == "https://music.apple.com/us/song/back-baby/123"
+
+    @pytest.mark.asyncio
+    async def test_accepts_album_reissue_variant(self, es256_keypair):
+        """LML#453: the deliberate choice of `token_set_ratio` (not
+        `token_sort_ratio` or `partial_ratio`) lets `album='Tzenni'` match
+        Apple's `albumName='Tzenni (Deluxe Edition)'`. A refactor that swaps
+        the fuzz function would silently break every album-verified track
+        lookup whose DJ-typed input lacks the edition suffix."""
+        client = _client(es256_keypair)
+        reissue = _make_song_data(
+            name="Tzenni",
+            artist_name="Noura Mint Seymali",
+            album_name="Tzenni (Deluxe Edition)",
+            url="https://music.apple.com/us/song/tzenni/901",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([reissue]))
+        client._http = mock_http
+
+        url = await client.find_track_url("Noura Mint Seymali", "Tzenni", album="Tzenni")
+        assert url == "https://music.apple.com/us/song/tzenni/901"
+
 
 class TestFindAlbumMatch:
     """`find_album_match` is the BaseStreamingClient contract used by
