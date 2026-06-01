@@ -53,6 +53,12 @@ _BULK_LOOKUP_INPUT_CAP = 100
 
 _BULK_LOOKUP_DEFAULT_CONCURRENCY = 10
 
+# Canonical full path for the bulk endpoint. Referenced by the explicit
+# `http.server` span (name + `http.target` data field) so the two stay in
+# lockstep; the FastAPI route decorator below uses the relative `/lookup/bulk`
+# form because the router prefix `/api/v1` is applied at mount time.
+_BULK_LOOKUP_ROUTE = "/api/v1/lookup/bulk"
+
 
 def _project_cache_stats_to_transaction(stats: dict | None) -> None:
     """Attach numeric cache_stats fields to the current Sentry transaction.
@@ -379,9 +385,9 @@ async def handle_bulk_lookup(
     # in-flight bulk requests despite the handler running. With this wrap, any
     # Sentry trace explorer query for `op:http.server span.description:*lookup/bulk*`
     # will surface bulk-route traffic.
-    with sentry_sdk.start_span(op="http.server", name="POST /api/v1/lookup/bulk") as http_span:
+    with sentry_sdk.start_span(op="http.server", name=f"POST {_BULK_LOOKUP_ROUTE}") as http_span:
         http_span.set_data("http.method", "POST")
-        http_span.set_data("http.target", "/api/v1/lookup/bulk")
+        http_span.set_data("http.target", _BULK_LOOKUP_ROUTE)
         http_span.set_data("lml.bulk.size", len(request.items))
         http_span.set_data("lml.bulk.max_concurrent", max_concurrent)
 
