@@ -157,6 +157,26 @@ class TestSearchReleasesByTrack:
         assert "rta.artist_name" in sql
 
     @pytest.mark.asyncio
+    async def test_query_filters_rta_to_extra_zero(self, cache_service, mock_asyncpg_pool):
+        """The rta join must restrict to main-artist credits.
+
+        Mirrors the per-track filter in ``validate_track_on_release``: the
+        candidate-release ranking should not surface a release just because
+        a producer or writer name on the track happens to look like the
+        requested artist. ``release_track_artist`` rows with ``extra = 1``
+        are extra credits (writer / producer / performer) and must not
+        participate in the candidate-artist match. See #333.
+        """
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+
+        await cache_service.search_releases_by_track("Song", "Artist")
+
+        sql = mock_asyncpg_pool.fetch.call_args[0][0]
+        assert "rta.extra = 0" in sql, (
+            f"Expected `rta.extra = 0` constraint in rta join; got: {sql!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_deduplicates_multiple_track_artists(self, cache_service, mock_asyncpg_pool):
         """Multiple rows from LEFT JOIN (different track artists) are deduplicated."""
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -950,6 +970,87 @@ class TestValidateTrackOnRelease:
         mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "The Orb"})
         result = await cache_service.validate_track_on_release(13938, "Towers of Dub", "Stereolab")
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_main_credit_validates_but_extra_credit_request_does_not(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """Characterize the post-#333 filtered shape on a real example.
+
+        Live 93 / Towers Of Dub has Discogs credits like ``The Orb`` as the
+        main per-track credit (``extra = 0``) and members ``Alex Paterson``
+        et al. as extra per-track credits (``extra = 1``). After the SQL
+        adds ``AND extra = 0`` to the per-track read, the DB returns only
+        the main credit. The mock here mirrors that post-filter state.
+
+        Pins two behaviors at once:
+
+        1. ``("The Orb", "Towers of Dub")`` → True via the surviving main
+           credit. The existing release-level fallback isn't exercised.
+        2. ``("Alex Paterson", "Towers of Dub")`` → False. The extra credit
+           that previously would have validated this request has been
+           filtered at the DB; the release-level fallback (``The Orb``)
+           doesn't fuzz-match ``Alex Paterson``, so the request fails.
+
+        Documents the intended post-filter contract; a future change that
+        re-introduces extra credits into the per-track path or relaxes the
+        release-level fuzz threshold should break this test.
+        """
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=True)
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                # Post-filter: only the main credit comes back.
+                release_track_artist=[{"track_sequence": 5, "artist_name": "The Orb"}],
+                release_track=[{"sequence": 5, "title": "Towers Of Dub"}],
+            )
+        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "The Orb"})
+
+        orb_result = await cache_service.validate_track_on_release(
+            13938, "Towers of Dub", "The Orb"
+        )
+        assert orb_result is True
+
+        paterson_result = await cache_service.validate_track_on_release(
+            13938, "Towers of Dub", "Alex Paterson"
+        )
+        assert paterson_result is False
+
+    @pytest.mark.asyncio
+    async def test_query_filters_release_track_artist_to_extra_zero(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """The per-track credit query must restrict to main-artist credits.
+
+        After WXYC/discogs-etl#221 + WXYC/discogs-xml-converter#55 (2026-05-14),
+        ``release_track_artist`` has an ``extra`` column that distinguishes
+        main credits (``extra = 0``) from extra credits — writer, producer,
+        performer (``extra = 1``). The per-track read must only consider
+        main credits so a producer or performer name can't cross-pollinate
+        a precision match; the release-level fallback added in #328 stays
+        as defense-in-depth for legitimate per-track credit misses.
+        """
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=True)
+        captured_queries: list[str] = []
+
+        async def capture_fetch(query, *args):
+            captured_queries.append(query)
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=capture_fetch)
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=None)
+
+        await cache_service.validate_track_on_release(1, "Song", "Artist")
+
+        rta_queries = [q for q in captured_queries if "release_track_artist" in q]
+        assert rta_queries, (
+            f"Expected a query against release_track_artist; got: {captured_queries!r}"
+        )
+        rta_query = rta_queries[0]
+        assert "extra = 0" in rta_query, (
+            "Expected `extra = 0` filter in release_track_artist query "
+            f"(see #333); got: {rta_query!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -234,6 +234,7 @@ class DiscogsCacheService:
                 LEFT JOIN release_track_artist rta
                     ON rta.release_id = mt.release_id
                     AND rta.track_sequence = mt.sequence
+                    AND rta.extra = 0
                 WHERE (
                     $3::text IS NULL
                     OR lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3))
@@ -1146,7 +1147,13 @@ class DiscogsCacheService:
                     release_id,
                 ),
                 self.pool.fetch(
-                    "SELECT track_sequence, artist_name FROM release_track_artist WHERE release_id = $1",
+                    # `extra = 0` keeps the read tight on main-artist credits;
+                    # extra credits (writer/producer/performer) live with
+                    # `extra = 1` and would otherwise cross-pollinate a
+                    # precision match here. The release-level fallback below
+                    # remains as defense-in-depth for legitimate misses.
+                    "SELECT track_sequence, artist_name FROM release_track_artist "
+                    "WHERE release_id = $1 AND extra = 0",
                     release_id,
                 ),
                 self.pool.fetchrow(
