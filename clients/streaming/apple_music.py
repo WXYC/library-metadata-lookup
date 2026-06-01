@@ -223,11 +223,17 @@ class AppleMusicClient(BaseStreamingClient):
                 return payload.get("results", {}).get(result_key, {}).get("data", []), 200
 
             if resp.status_code == 429:
-                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                raw_retry_after = resp.headers.get("Retry-After")
+                retry_after = _parse_retry_after(raw_retry_after)
+                # Log the raw header so operators can spot when Apple is
+                # quota-pushing (Retry-After: 30+) vs returning routine 1-5s
+                # 429s — the clamp at ``_RETRY_AFTER_CAP_SECONDS`` (LML#450)
+                # is otherwise invisible. See LML#464.
                 logger.warning(
-                    "Apple Music 429 for %s - %s; sleeping %.1fs (attempt %d/%d)",
+                    "Apple Music 429 for %s - %s; Retry-After=%s sleeping %.1fs (attempt %d/%d)",
                     artist,
                     term,
+                    raw_retry_after,
                     retry_after,
                     attempt + 1,
                     _MAX_RETRIES,
