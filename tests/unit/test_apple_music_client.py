@@ -20,6 +20,7 @@ import pytest
 from clients.streaming.apple_music import (
     _APPLE_MUSIC_MATCH_FLOOR,
     AppleMusicClient,
+    _parse_retry_after,
 )
 
 TEAM_ID = "92V374HC38"
@@ -471,6 +472,40 @@ class TestRetryBehavior:
         assert mock_http.get.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_429_log_records_raw_retry_after_for_clamp_visibility(
+        self, es256_keypair, caplog
+    ):
+        """LML#464: when Apple's ``Retry-After`` exceeds the 5s cap, the WARN
+        log line must show the raw value so operators can distinguish
+        "Apple is quota-pushing at 30s, we clamped" from "normal transient
+        1-5s 429". Without the raw value, sustained Apple quota pressure
+        is invisible until the failure mode escalates."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        rate_limited = httpx.Response(
+            429,
+            headers={"Retry-After": "30"},
+            request=httpx.Request("GET", SEARCH_URL),
+        )
+        success = _songs_response([_make_song_data()])
+        mock_http.get = AsyncMock(side_effect=[rate_limited, success])
+        client._http = mock_http
+
+        import logging as _logging
+
+        with patch("clients.streaming.apple_music.asyncio.sleep", new_callable=AsyncMock):
+            with caplog.at_level(_logging.WARNING, logger="clients.streaming.apple_music"):
+                await client.search_song("Stereolab", "Aluminum Tunes")
+
+        warn_messages = [r.getMessage() for r in caplog.records if r.levelno == _logging.WARNING]
+        clamp_lines = [m for m in warn_messages if "429" in m]
+        assert clamp_lines, f"Expected a 429 WARN log line; got {warn_messages!r}"
+        assert any("30" in line for line in clamp_lines), (
+            "429 WARN log line must include the raw Retry-After value "
+            f"(30) so operators can see the clamp. Got: {clamp_lines!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_gives_up_after_max_retries_on_429_burst(self, es256_keypair):
         """LML#450: ``_MAX_RETRIES=2`` (down from 4). Lookup is latency-
         sensitive; under sustained 429/5xx we degrade to no-Apple immediately
@@ -505,8 +540,6 @@ class TestParseRetryAfter:
     def test_caps_retry_after_at_5s(self):
         """A pathological upstream `Retry-After: 60` (or higher) must clamp
         to 5s so one slow item can't pin a Semaphore slot for a minute."""
-        from clients.streaming.apple_music import _parse_retry_after
-
         assert _parse_retry_after("60") == 5.0
         assert _parse_retry_after("120") == 5.0
 
@@ -514,16 +547,12 @@ class TestParseRetryAfter:
         """A small Retry-After (under the cap) is honored verbatim — Apple
         usually returns ``1`` or ``2`` for transient 429s, and respecting it
         avoids hammering."""
-        from clients.streaming.apple_music import _parse_retry_after
-
         assert _parse_retry_after("1") == 1.0
         assert _parse_retry_after("3") == 3.0
 
     def test_fallback_when_header_absent_or_malformed(self):
         """Missing/garbage headers fall back to the cap (5s) — same as the
         post-fix max so the slow path is bounded either way."""
-        from clients.streaming.apple_music import _parse_retry_after
-
         assert _parse_retry_after(None) == 5.0
         assert _parse_retry_after("") == 5.0
         assert _parse_retry_after("not-a-number") == 5.0
