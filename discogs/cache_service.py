@@ -214,6 +214,18 @@ class DiscogsCacheService:
         Raises:
             CacheUnavailableError: If database is unreachable
         """
+        # `rta.extra = 0` constrains the LEFT JOIN to main-artist credits
+        # (mirrors validate_track_on_release after #333). Unlike
+        # validate_track_on_release, this query has no Python-side release-
+        # level fuzz fallback — a release where the only matching credit is
+        # `extra = 1` (featuring guest, composer, remixer) drops from the
+        # candidate ranking. The fallthrough seam's API leg will surface it
+        # at the cost of Discogs quota. See #333 for the documented recall
+        # trade-off; #472-#475 track the parallel filters in sibling read
+        # sites (get_release_metadata, va_disambiguate, match_compilations,
+        # track_streaming). Keep the rationale here (not in `--` comments
+        # inside the SQL) so it stays out of pg_stat_statements and PG
+        # logs.
         try:
             query = """
                 WITH matching_tracks AS (
@@ -231,15 +243,6 @@ class DiscogsCacheService:
                 FROM matching_tracks mt
                 JOIN release r ON r.id = mt.release_id
                 JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
-                -- `rta.extra = 0` constrains the LEFT JOIN to main-artist
-                -- credits (mirrors validate_track_on_release after #333).
-                -- Note: unlike validate_track_on_release, this query has no
-                -- Python-side release-level fuzz fallback — a release where
-                -- the only matching credit is `extra = 1` (featuring guest,
-                -- composer, remixer) drops from the candidate ranking. The
-                -- fallthrough seam's API leg will surface it at the cost of
-                -- Discogs quota. See PR #471 body for the documented recall
-                -- trade-off and follow-up tickets.
                 LEFT JOIN release_track_artist rta
                     ON rta.release_id = mt.release_id
                     AND rta.track_sequence = mt.sequence
@@ -1304,15 +1307,15 @@ class DiscogsCacheService:
 
                 # Release-level fallback, consulted when no per-track main
                 # credit matched. After #333 the per-track read above is
-                # filtered to ``extra = 0``, so this branch rescues two
-                # legitimate cases: (a) the band-member shape — Live 93 /
-                # The Orb credits Paterson / Weston / Fehlmann as the only
-                # per-track main artists; the release-level credit "The
-                # Orb" is the last word; (b) any release where the per-
-                # track main credit substring-missed the requested artist
-                # but the release-level credit fuzz-matches. Mirrors the
-                # API path in ``discogs/service.py``. Do not remove without
-                # replacing both rescue paths.
+                # filtered to ``extra = 0``; this branch is what rescues
+                # the legitimate case where the per-track main credit
+                # exists but didn't substring/fuzz-match the requested
+                # artist string, AND the release-level credit does. Common
+                # shape: band-member-only per-track credits with the band
+                # name at the release level — see #333 acceptance criteria
+                # for the canonical Live 93 / The Orb walkthrough.
+                # Mirrors the API path in ``discogs/service.py``. Do not
+                # remove without replacing the rescue path.
                 if release_artist_clean and (
                     artist_lower in release_artist_clean or release_artist_clean in artist_lower
                 ):
