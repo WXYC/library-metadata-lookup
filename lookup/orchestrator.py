@@ -1814,6 +1814,22 @@ async def enrich_artwork_results(
                     artist,
                     search_term,
                 )
+                # LML#462: project onto the active Sentry transaction so the
+                # trace explorer can distinguish "Apple Music timed out" from
+                # "Apple Music never ran" — the cancelled inner
+                # `apple_music.search` span never sets its `result` data, so
+                # without this marker the timeout shape is queryably
+                # indistinguishable from a no-op. Same swallow pattern as
+                # `_log_album_title_fallback` / `_log_resolver_pre_pass`.
+                try:
+                    transaction = sentry_sdk.get_current_scope().transaction
+                    if transaction is not None:
+                        transaction.set_data("apple_music.find_track_url.timeout", True)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to project apple_music timeout onto Sentry transaction: %s",
+                        e,
+                    )
             except Exception:
                 logger.exception(
                     "AppleMusicClient.find_track_url raised for %s - %s", artist, search_term

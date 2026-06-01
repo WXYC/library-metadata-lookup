@@ -1,7 +1,7 @@
 """Tests for metadata enrichment (release year, artist details, streaming links)."""
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1034,6 +1034,105 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         assert enriched_1.apple_music_url is None
         assert enriched_2 is not None
         assert enriched_2.apple_music_url is None
+
+    @pytest.mark.asyncio
+    async def test_apple_music_find_track_url_timeout_projects_sentry_marker(self):
+        """LML#462: on TimeoutError, the active Sentry transaction must carry
+        a `data.apple_music.find_track_url.timeout = True` attribute so trace
+        explorer can distinguish 'Apple Music timed out' from 'Apple Music
+        never ran' — the LML#444 silent-failure shape, just for a different
+        failure mode.
+
+        Mirrors the `_log_resolver_pre_pass` / `_log_album_title_fallback`
+        shape (lookup/orchestrator.py:262-298, 393-415): project onto
+        `sentry_sdk.get_current_scope().transaction.set_data(...)` with a
+        try/except so observability never breaks /lookup. The logger.warning
+        line stays — this test only pins the additional Sentry projection.
+        """
+        items_with_artwork = [
+            (make_library_item(id=1, artist="Mūm", title="Summer Make Good"), None),
+        ]
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+
+        async def slow_find(*_args, **_kwargs):
+            await asyncio.sleep(60)
+            return "https://music.apple.com/should-never-resolve"
+
+        apple_music.find_track_url = AsyncMock(side_effect=slow_find)
+
+        transaction = MagicMock()
+        scope = MagicMock()
+        scope.transaction = transaction
+
+        with (
+            patch("lookup.orchestrator._apple_music_lookup_timeout_s", return_value=0.05),
+            patch(
+                "lookup.orchestrator.sentry_sdk.get_current_scope",
+                return_value=scope,
+            ),
+        ):
+            results = await enrich_artwork_results(
+                items_with_artwork,
+                AsyncMock(),
+                song="Song",
+                album="Album",
+                apple_music=apple_music,
+            )
+
+        # User-visible behavior unchanged: item still degrades to no Apple URL.
+        assert len(results) == 1
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.apple_music_url is None
+
+        # AND the timeout was projected onto the active transaction so trace
+        # explorer can filter for it.
+        transaction.set_data.assert_any_call("apple_music.find_track_url.timeout", True)
+
+    @pytest.mark.asyncio
+    async def test_apple_music_find_track_url_timeout_survives_no_active_transaction(
+        self,
+    ):
+        """LML#462: when there is no active Sentry transaction (or the SDK
+        raises), the timeout marker projection must NOT break /lookup. Same
+        swallow pattern as `_log_album_title_fallback` / `_log_resolver_pre_pass`.
+        """
+        items_with_artwork = [
+            (make_library_item(id=1, artist="Mūm", title="Summer Make Good"), None),
+        ]
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+
+        async def slow_find(*_args, **_kwargs):
+            await asyncio.sleep(60)
+            return "https://music.apple.com/should-never-resolve"
+
+        apple_music.find_track_url = AsyncMock(side_effect=slow_find)
+
+        # No active transaction.
+        scope = MagicMock()
+        scope.transaction = None
+
+        with (
+            patch("lookup.orchestrator._apple_music_lookup_timeout_s", return_value=0.05),
+            patch(
+                "lookup.orchestrator.sentry_sdk.get_current_scope",
+                return_value=scope,
+            ),
+        ):
+            results = await enrich_artwork_results(
+                items_with_artwork,
+                AsyncMock(),
+                song="Song",
+                album="Album",
+                apple_music=apple_music,
+            )
+
+        # Degradation still works; no crash from the missing transaction.
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.apple_music_url is None
 
     @pytest.mark.asyncio
     async def test_apple_music_url_does_not_override_db_streaming_link(self):
