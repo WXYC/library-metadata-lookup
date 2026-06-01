@@ -313,16 +313,33 @@ class TestFindTrackUrl:
 
     @pytest.mark.asyncio
     async def test_skips_result_with_missing_url(self, es256_keypair):
-        """LML#453: a high-relevance hit with no `attributes.url` must be
-        skipped (`continue`), not freeze `best_url=None` or block lower-
-        scoring valid hits. A refactor that changes `continue` to `return None`
-        or sets `best_url = url` before the score check would silently
-        regress the LML#389-shape."""
+        """LML#453: a high-relevance hit with `attributes.url is None` must be
+        skipped (`continue`), not block lower-scoring valid hits. A refactor
+        that changes `continue` to `return None` would silently regress the
+        LML#389-shape."""
         client = _client(es256_keypair)
         # Apple's top result is artist/title-exact but has no URL — must skip.
         # Second result is the canonical valid match.
-        no_url_item = _make_song_data(url="")
+        no_url_item = _make_song_data()
         no_url_item["attributes"]["url"] = None
+        canonical = _make_song_data(
+            url="https://music.apple.com/us/song/back-baby/123",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([no_url_item, canonical]))
+        client._http = mock_http
+
+        url = await client.find_track_url("Jessica Pratt", "Back, Baby")
+        assert url == "https://music.apple.com/us/song/back-baby/123"
+
+    @pytest.mark.asyncio
+    async def test_skips_result_with_empty_string_url(self, es256_keypair):
+        """Sibling to test_skips_result_with_missing_url: covers the other
+        falsy `url` shape (empty string). Apple has historically returned both
+        `null` and `""` for missing track URLs across catalog regions; the
+        `if not url: continue` branch must handle both."""
+        client = _client(es256_keypair)
+        no_url_item = _make_song_data(url="")
         canonical = _make_song_data(
             url="https://music.apple.com/us/song/back-baby/123",
         )
