@@ -57,10 +57,20 @@ _SEARCH_URL = "https://api.music.apple.com/v1/catalog/us/search"
 # with comfort margin for request-o-matic bursts.
 _RATE_LIMIT = (60.0, 60.0)
 _SEMAPHORE_LIMIT = 5
-_MAX_RETRIES = 4
+# Latency budget: ``find_track_url`` is on the lookup hot path. With
+# ``_MAX_RETRIES=4`` and a 60s ``Retry-After`` cap, a single sustained 429
+# storm pinned one of 5 Semaphore slots for up to 240s — bulk burst then
+# starved real-time ``/lookup`` (LML#449 + LML#450). Trim retries to 2
+# (degrade-fast on transient upstream) and rely on the orchestrator's
+# ``asyncio.wait_for`` ceiling for the request-level latency cap.
+_MAX_RETRIES = 2
 
 # Status codes the retry loop sleeps + retries on. Anything else is terminal.
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Hard cap for a single ``Retry-After`` honor; before LML#450 this was 60s
+# which let one slot stall for a minute on a single pathological response.
+_RETRY_AFTER_CAP_SECONDS = 5.0
 
 
 class AppleMusicClient(BaseStreamingClient):
@@ -349,11 +359,12 @@ def _extract_url(item: dict) -> str:
 
 def _parse_retry_after(value: str | None) -> float:
     """Apple Music `Retry-After` is documented as integer seconds. Honor it
-    when present; fall back to 5s if absent or malformed. Capped at 60s so a
-    pathological upstream value doesn't stall the worker."""
+    when present; fall back to ``_RETRY_AFTER_CAP_SECONDS`` (5s) if absent or
+    malformed. Capped at the same value so a pathological upstream response
+    can't stall a Semaphore slot for the worst case (LML#450)."""
     if not value:
-        return 5.0
+        return _RETRY_AFTER_CAP_SECONDS
     try:
-        return min(float(value), 60.0)
+        return min(float(value), _RETRY_AFTER_CAP_SECONDS)
     except ValueError:
-        return 5.0
+        return _RETRY_AFTER_CAP_SECONDS
