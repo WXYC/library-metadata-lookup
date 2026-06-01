@@ -244,8 +244,7 @@ class TestGetAppleMusicClientRace:
                 ),
             ):
                 tasks = [
-                    asyncio.create_task(dependencies.get_apple_music_client(settings))
-                    for _ in range(8)
+                    asyncio.create_task(dependencies.get_apple_music_client()) for _ in range(8)
                 ]
                 results = await asyncio.gather(*tasks)
         finally:
@@ -269,6 +268,175 @@ class TestGetAppleMusicClientRace:
         )
 
 
+class TestGetSpotifyClientRace:
+    """Hypothesis #2d: ``streaming.dependencies.get_spotify_client`` is racy.
+
+    Same shape as the Apple Music race that #451 closed: the pre-fix getter is
+    a sync FastAPI dep with a ``global _spotify_client`` + ``is None`` check +
+    assign. The dep runs in FastAPI's threadpool, so concurrent cold-start
+    callers can each observe ``None``, each construct a fresh
+    ``SpotifyClient`` (AsyncLimiter + asyncio.Semaphore from
+    ``BaseStreamingClient``), and orphan all but one.
+
+    Spotify is materially the worst of the three siblings because its first
+    request also lazy-fetches an OAuth bearer token; two orphaned clients
+    means two OAuth token fetches before GC.
+
+    Post-#457 the singleton is provided by `wxyc_fastapi.http.async_singleton`,
+    which owns the double-check + `asyncio.Lock` together. The test drives the
+    public getter end-to-end so a future refactor that bypasses
+    `async_singleton` would re-introduce the race and re-fail this test.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_cold_start_creates_one_client(self):
+        """Concurrent cold-start callers in ``get_spotify_client`` must share
+        a single ``SpotifyClient`` instance.
+        """
+        from config.settings import Settings
+        from streaming import dependencies
+
+        await dependencies.close_streaming_clients()
+
+        settings = Settings(
+            spotify_client_id="fake-id",
+            spotify_client_secret="fake-secret",
+        )
+
+        init_calls: list[tuple] = []
+        fake_client = AsyncMock(name="spotify-client")
+
+        def fake_constructor(*args, **kwargs):
+            init_calls.append((args, kwargs))
+            return fake_client
+
+        try:
+            with (
+                patch("streaming.dependencies.get_settings", return_value=settings),
+                patch(
+                    "streaming.dependencies.SpotifyClient",
+                    side_effect=fake_constructor,
+                ),
+            ):
+                tasks = [asyncio.create_task(dependencies.get_spotify_client()) for _ in range(8)]
+                results = await asyncio.gather(*tasks)
+        finally:
+            await dependencies.close_streaming_clients()
+
+        assert len(init_calls) == 1, (
+            f"SpotifyClient was constructed {len(init_calls)} times for the "
+            "same Spotify singleton. Concurrent cold-start callers race in "
+            "get_spotify_client, orphaning all but one client — each orphan "
+            "holds an AsyncLimiter + asyncio.Semaphore AND triggers its own "
+            "OAuth bearer-token fetch on first request. The lazy init must "
+            "go through `wxyc_fastapi.http.async_singleton` (issue #241 / "
+            "#457)."
+        )
+        assert all(r is fake_client for r in results), (
+            "Concurrent cold-start callers received different SpotifyClient "
+            "instances. async_singleton must return the same instance to "
+            "every caller after the factory completes (issue #457)."
+        )
+
+
+class TestGetDeezerClientRace:
+    """Hypothesis #2e: ``streaming.dependencies.get_deezer_client`` is racy.
+
+    Identical shape to the Apple Music / Spotify races: pre-fix sync FastAPI
+    dep with a ``global _deezer_client`` + ``is None`` check + assign.
+    Concurrent cold-start callers race, orphaning all but one
+    ``DeezerClient``. Each orphan holds an AsyncLimiter + asyncio.Semaphore.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_cold_start_creates_one_client(self):
+        """Concurrent cold-start callers in ``get_deezer_client`` must share
+        a single ``DeezerClient`` instance.
+        """
+        from streaming import dependencies
+
+        await dependencies.close_streaming_clients()
+
+        init_calls: list[tuple] = []
+        fake_client = AsyncMock(name="deezer-client")
+
+        def fake_constructor(*args, **kwargs):
+            init_calls.append((args, kwargs))
+            return fake_client
+
+        try:
+            with patch(
+                "streaming.dependencies.DeezerClient",
+                side_effect=fake_constructor,
+            ):
+                tasks = [asyncio.create_task(dependencies.get_deezer_client()) for _ in range(8)]
+                results = await asyncio.gather(*tasks)
+        finally:
+            await dependencies.close_streaming_clients()
+
+        assert len(init_calls) == 1, (
+            f"DeezerClient was constructed {len(init_calls)} times for the "
+            "same Deezer singleton. Concurrent cold-start callers race in "
+            "get_deezer_client, orphaning all but one client. The lazy init "
+            "must go through `wxyc_fastapi.http.async_singleton` (issue "
+            "#241 / #457)."
+        )
+        assert all(r is fake_client for r in results), (
+            "Concurrent cold-start callers received different DeezerClient "
+            "instances. async_singleton must return the same instance to "
+            "every caller after the factory completes (issue #457)."
+        )
+
+
+class TestGetBandcampClientRace:
+    """Hypothesis #2f: ``streaming.dependencies.get_bandcamp_client`` is racy.
+
+    Identical shape to the Apple Music / Spotify / Deezer races: pre-fix sync
+    FastAPI dep with a ``global _bandcamp_client`` + ``is None`` check +
+    assign. Concurrent cold-start callers race, orphaning all but one
+    ``BandcampClient``. Each orphan holds an AsyncLimiter + asyncio.Semaphore.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_cold_start_creates_one_client(self):
+        """Concurrent cold-start callers in ``get_bandcamp_client`` must share
+        a single ``BandcampClient`` instance.
+        """
+        from streaming import dependencies
+
+        await dependencies.close_streaming_clients()
+
+        init_calls: list[tuple] = []
+        fake_client = AsyncMock(name="bandcamp-client")
+
+        def fake_constructor(*args, **kwargs):
+            init_calls.append((args, kwargs))
+            return fake_client
+
+        try:
+            with patch(
+                "streaming.dependencies.BandcampClient",
+                side_effect=fake_constructor,
+            ):
+                tasks = [asyncio.create_task(dependencies.get_bandcamp_client()) for _ in range(8)]
+                results = await asyncio.gather(*tasks)
+        finally:
+            await dependencies.close_streaming_clients()
+
+        assert len(init_calls) == 1, (
+            f"BandcampClient was constructed {len(init_calls)} times for "
+            "the same Bandcamp singleton. Concurrent cold-start callers "
+            "race in get_bandcamp_client, orphaning all but one client. "
+            "The lazy init must go through "
+            "`wxyc_fastapi.http.async_singleton` (issue #241 / #457)."
+        )
+        assert all(r is fake_client for r in results), (
+            "Concurrent cold-start callers received different BandcampClient "
+            "instances. async_singleton must return the same instance to "
+            "every caller after the factory completes (issue #457)."
+        )
+
+
 def test_no_global_apple_music_client_in_streaming_dependencies():
     """LML#451: race-prone ``global _apple_music_client`` lazy-init must be
     gone from ``streaming/dependencies.py``. The lock + double-check belongs
@@ -285,6 +453,51 @@ def test_no_global_apple_music_client_in_streaming_dependencies():
         "`async_singleton(_build_apple_music_client)` (mirroring the Discogs "
         "pool + MusicBrainz PgSource pattern in core/dependencies.py). See "
         "LML#451."
+    )
+
+
+def test_no_global_spotify_client_in_streaming_dependencies():
+    """LML#457: race-prone ``global _spotify_client`` lazy-init must be gone
+    from ``streaming/dependencies.py``. Mirrors the Apple Music pin above —
+    the Spotify, Deezer, and Bandcamp getters all share the same hand-rolled
+    lazy-init shape and must all migrate to ``async_singleton``.
+    """
+    from streaming import dependencies as streaming_deps_module
+
+    src = Path(streaming_deps_module.__file__).read_text()
+    assert "global _spotify_client" not in src, (
+        "streaming/dependencies.py uses `global _spotify_client` — the "
+        "lock-free lazy-init pattern that LML#457 closed for the three "
+        "siblings of the Apple Music getter. Migrate to "
+        "`async_singleton(_build_spotify_client)`."
+    )
+
+
+def test_no_global_deezer_client_in_streaming_dependencies():
+    """LML#457: race-prone ``global _deezer_client`` lazy-init must be gone
+    from ``streaming/dependencies.py``.
+    """
+    from streaming import dependencies as streaming_deps_module
+
+    src = Path(streaming_deps_module.__file__).read_text()
+    assert "global _deezer_client" not in src, (
+        "streaming/dependencies.py uses `global _deezer_client` — the "
+        "lock-free lazy-init pattern that LML#457 closed. Migrate to "
+        "`async_singleton(_build_deezer_client)`."
+    )
+
+
+def test_no_global_bandcamp_client_in_streaming_dependencies():
+    """LML#457: race-prone ``global _bandcamp_client`` lazy-init must be gone
+    from ``streaming/dependencies.py``.
+    """
+    from streaming import dependencies as streaming_deps_module
+
+    src = Path(streaming_deps_module.__file__).read_text()
+    assert "global _bandcamp_client" not in src, (
+        "streaming/dependencies.py uses `global _bandcamp_client` — the "
+        "lock-free lazy-init pattern that LML#457 closed. Migrate to "
+        "`async_singleton(_build_bandcamp_client)`."
     )
 
 
