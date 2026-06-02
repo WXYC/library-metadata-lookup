@@ -191,6 +191,29 @@ async def get_discogs_cache_service(
     return service.cache_service
 
 
+async def get_discogs_cache_service_from_pool(
+    settings: Settings = Depends(get_settings),
+) -> DiscogsCacheService | None:
+    """Cache-only DiscogsCacheService backed by the shared pool — no API requirement.
+
+    Sibling of `get_discogs_cache_service` for routes that never escalate
+    to the Discogs API. Unlike that dep (which short-circuits to None when
+    DISCOGS_TOKEN / DISCOGS_API_KEY are unset because the *API service* is
+    None), this one only depends on the shared discogs-cache pool from
+    `get_discogs_pool` — same posture as `get_entity_store`.
+
+    Used by `POST /api/v1/artists/search-aliases/bulk` (PR 2 of the
+    artist-search-alias plan), which is cache-only by design.
+
+    Returns ``None`` when DATABASE_URL_DISCOGS is unset or the shared pool
+    is unavailable; route renders 503 in that case.
+    """
+    pool = await get_discogs_pool()
+    if pool is None:
+        return None
+    return DiscogsCacheService(pool)
+
+
 async def _build_musicbrainz_pg() -> PgSource | None:
     """Build the PgSource backing the musicbrainz-cache external-cache fallback.
 
