@@ -29,6 +29,7 @@ from core.search import (
     execute_search_pipeline,
     get_search_type_from_state,
 )
+from core.text import strip_leading_article
 from discogs.cache_service import DiscogsCacheService
 from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
 from discogs.markup_parser import (
