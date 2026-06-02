@@ -167,6 +167,34 @@ _FETCH_ALL_LIBRARY_NAMES_SQL = """\
 SELECT library_name FROM entity.identity\
 """
 
+# Batched form of leg 1 (exact match). One round-trip against the unique
+# index on `entity.identity.library_name`, binding the input list as a
+# single text array. Returns rows for every input that hits — caller
+# pairs them back to inputs by matching `library_name == verbatim`.
+_BULK_GET_IDENTITY_EXACT_SQL = """\
+SELECT id, library_name, discogs_artist_id, wikidata_qid,
+       musicbrainz_artist_id, spotify_artist_id,
+       apple_music_artist_id, bandcamp_id, reconciliation_status
+FROM entity.identity
+WHERE library_name = ANY($1::text[])\
+"""
+
+# Batched form of leg 2 (case-insensitive). Seq-scans ~24k rows once,
+# matching every stored row whose LOWER form is in the input-lower list.
+# `LOWER(library_name)` is computed per-row; for ambiguous ties two
+# stored rows may share a lower form (the UNIQUE constraint is case-
+# sensitive), so the caller picks the lowest id per LOWER-key — matching
+# the per-call `ORDER BY id ASC + LIMIT 1` tie-break in
+# `_GET_IDENTITY_LOWER_SQL`.
+_BULK_GET_IDENTITY_LOWER_SQL = """\
+SELECT id, library_name, discogs_artist_id, wikidata_qid,
+       musicbrainz_artist_id, spotify_artist_id,
+       apple_music_artist_id, bandcamp_id, reconciliation_status
+FROM entity.identity
+WHERE LOWER(library_name) = ANY($1::text[])
+ORDER BY id ASC\
+"""
+
 # Most-recent reconciliation log row per source for a given identity.
 # DISTINCT ON keeps a single row per source, ordered by created_at DESC so we
 # pick the latest attempt — matching the "most recent matcher decision" notion
@@ -506,3 +534,110 @@ class EntityStore:
             await conn.execute(_REASSIGN_LOGS_SQL, into_id, from_id)
             await conn.execute(_DELETE_IDENTITY_BY_ID_SQL, from_id)
             return True
+
+    async def bulk_resolve_library_names(self, names: list[str]) -> dict[str, Identity]:
+        """Resolve a list of artist names through the three-leg fall-through.
+
+        Batched form of `resolve_library_name` (#276) for the artist-
+        search-alias bulk endpoint (PR 2). Each leg is one `WHERE ... =
+        ANY($1::text[])` round-trip against the still-missing residual
+        from the prior leg, so a 1,000-name batch costs at most three PG
+        round-trips total — independent of per-name cardinality.
+
+        Returns a dict keyed by the **input** name (not the stored
+        `library_name`) so callers can preserve input order without
+        maintaining their own reverse-index. Names that miss all three
+        legs are absent from the dict — they are never None-valued.
+
+        Legs:
+
+        1. **Exact** — `library_name = ANY($input_verbatim)`. Uses the
+           unique index. Catches the dominant case (99.8% of stored rows
+           per the #276 audit are verbatim).
+        2. **LOWER** — `LOWER(library_name) = ANY($input_lower)`. Catches
+           pure case drift. For ambiguous case-collisions (two stored
+           rows sharing the same lower form), the lowest stored id wins,
+           matching the per-call tie-break in `_GET_IDENTITY_LOWER_SQL`.
+        3. **Canonical** — `library_name = ANY($input_canonical)`.
+           Catches inputs whose canonical form equals a stored canonical
+           row.
+        """
+        if not names:
+            return {}
+
+        # Local import keeps the wxyc_etl Rust extension off the module-
+        # load path for store consumers that don't use this method.
+        from identity.normalize import canonicalize_for_identity_lookup
+
+        # Per-input bookkeeping: the verbatim (NUL-stripped) shape used
+        # to look up rows, plus the canonical form for the residual that
+        # falls all the way through.
+        verbatim_by_input: dict[str, str] = {}
+        for raw in names:
+            verbatim_by_input[raw] = _strip_nul(raw) or ""
+
+        results: dict[str, Identity] = {}
+
+        # ---- Leg 1: exact match on the unique index. ----
+        leg_1_binds = list({verbatim_by_input[n] for n in names})
+        leg_1_rows = await self._pg.fetchall(_BULK_GET_IDENTITY_EXACT_SQL, leg_1_binds)
+        leg_1_by_lib: dict[str, Identity] = {
+            row["library_name"]: _record_to_identity(row) for row in leg_1_rows
+        }
+        for raw_name in names:
+            verbatim = verbatim_by_input[raw_name]
+            if verbatim in leg_1_by_lib:
+                results[raw_name] = leg_1_by_lib[verbatim]
+
+        residual = [n for n in names if n not in results]
+        if not residual:
+            return results
+
+        # ---- Leg 2: LOWER(library_name) match on residual. ----
+        # Bind the LOWER forms of the residual inputs; result rows are
+        # stored-verbatim rows whose lower-form matches one of those
+        # binds. Pair back to inputs by LOWER key. On ambiguous ties (two
+        # stored rows sharing one lower form), the SQL's `ORDER BY id
+        # ASC` makes the iteration order deterministic — we set-once.
+        leg_2_binds = list({verbatim_by_input[n].lower() for n in residual})
+        leg_2_rows = await self._pg.fetchall(_BULK_GET_IDENTITY_LOWER_SQL, leg_2_binds)
+        leg_2_by_lower: dict[str, Identity] = {}
+        for row in leg_2_rows:
+            key = row["library_name"].lower()
+            # Lowest id wins on case-collision ties (rows come back in
+            # ASC id order).
+            if key not in leg_2_by_lower:
+                leg_2_by_lower[key] = _record_to_identity(row)
+        for raw_name in residual:
+            lower = verbatim_by_input[raw_name].lower()
+            if lower in leg_2_by_lower:
+                results[raw_name] = leg_2_by_lower[lower]
+
+        residual = [n for n in names if n not in results]
+        if not residual:
+            return results
+
+        # ---- Leg 3: canonical-form exact match on residual. ----
+        # Skip the canonical bind when it duplicates a previous leg's
+        # bind for this input (leg 2 already covered the lower-form
+        # space). The per-call resolve_library_name short-circuits the
+        # same way.
+        canonical_by_input: dict[str, str] = {}
+        for raw_name in residual:
+            verbatim = verbatim_by_input[raw_name]
+            canonical = canonicalize_for_identity_lookup(verbatim)
+            if canonical and canonical != verbatim and canonical != verbatim.lower():
+                canonical_by_input[raw_name] = canonical
+        if not canonical_by_input:
+            return results
+
+        leg_3_binds = list(set(canonical_by_input.values()))
+        leg_3_rows = await self._pg.fetchall(_BULK_GET_IDENTITY_EXACT_SQL, leg_3_binds)
+        leg_3_by_lib: dict[str, Identity] = {
+            row["library_name"]: _record_to_identity(row) for row in leg_3_rows
+        }
+        for raw_name, canonical in canonical_by_input.items():
+            if canonical in leg_3_by_lib:
+                results[raw_name] = leg_3_by_lib[canonical]
+
+        return results

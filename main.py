@@ -9,6 +9,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from wxyc_fastapi.observability import flush_posthog, init_sentry, shutdown_posthog
 
+from artists.router import router as artists_router
 from config.settings import get_settings
 from core.auth import require_lml_key
 from core.dependencies import (
@@ -117,6 +118,12 @@ app.include_router(release_router, prefix="/api/v1", tags=["release"], dependenc
 app.include_router(
     identity_api_v1_router, prefix="/api/v1", tags=["lookup"], dependencies=_lml_protected
 )
+# `POST /api/v1/artists/search-aliases/bulk` — artist-search-alias plan PR 2
+# (WXYC/library-metadata-lookup#479). Returns per-source variants for a batch
+# of WXYC canonical artist names; Backend-Service's consumer ETL writes the
+# response into its local `artist_search_alias` cache (BS PR 4) and the
+# catalog search extends with a LATERAL JOIN (BS PR 5).
+app.include_router(artists_router, prefix="/api/v1", tags=["artists"], dependencies=_lml_protected)
 
 if __name__ == "__main__":
     import uvicorn
