@@ -351,3 +351,35 @@ class TestSearchAliasesBulkEndpoint:
             "discogs_alias",
             "discogs_member",
         }
+
+    @pytest.mark.asyncio
+    async def test_case_variant_pair_both_resolve_against_real_pg(self, app_client):
+        """Two case-variant inputs of the same stored row both resolve through real PG.
+
+        End-to-end coverage for the leg-2 `DISTINCT ON (bind.name)` SQL.
+        Pre-iteration-2, the SQL used `DISTINCT ON (LOWER(bind.name))`,
+        which collapsed `['STEREOLAB', 'stereolab']` (both LOWER-match
+        'stereolab') into one returned row — one input silently
+        dropped to `missing[]`. The unit test exercises the Python-side
+        mapping via mocks; this test exercises the actual PG behavior so
+        a future regression of the SQL is caught here.
+        """
+        resp = await app_client.post(
+            "/api/v1/artists/search-aliases/bulk",
+            json={"names": ["STEREOLAB", "stereolab"]},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # Both case-variant inputs resolve — neither falls into `missing[]`.
+        assert data["missing"] == []
+        # One ArtistSearchAliasesResult per unique input, both resolving
+        # to the same stored 'Stereolab' identity.
+        names_in_result = {a["name"] for a in data["artists"]}
+        assert names_in_result == {"STEREOLAB", "stereolab"}
+        # Both inputs share the same resolved discogs sources.
+        for entry in data["artists"]:
+            assert set(entry["sources_present"]) == {
+                "discogs_name_variation",
+                "discogs_alias",
+                "discogs_member",
+            }

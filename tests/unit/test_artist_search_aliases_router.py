@@ -169,20 +169,19 @@ class TestErrorClassRouting:
 class TestInputCapGuard:
     """Drift guard between the manual 413 gate and the api.yaml cap."""
 
-    def test_input_cap_resolves_from_pydantic_model_metadata(self):
-        """`_resolve_input_cap()` reads max_length from the generated model.
+    def test_input_cap_resolves_from_model_json_schema(self):
+        """`_resolve_input_cap()` reads `maxItems` from the model's JSON schema.
 
         If api.yaml's `maxItems` for `names` ever changes, codegen
-        updates the Pydantic model's `max_length` and the route's
-        413 gate must follow automatically. This pins that mechanism.
+        updates the Pydantic model's constraint and the route's 413
+        gate must follow automatically. This pins that mechanism via
+        the same JSON-schema export the route uses (Pydantic's
+        documented public API).
         """
-        max_lengths = [
-            m.max_length
-            for m in ArtistSearchAliasesBulkRequest.model_fields["names"].metadata
-            if hasattr(m, "max_length")
-        ]
-        # max_length is sourced from the model; gate uses the same.
-        assert max_lengths and max_lengths[0] == _BULK_INPUT_CAP
+        schema = ArtistSearchAliasesBulkRequest.model_json_schema()
+        max_items = schema["properties"]["names"]["maxItems"]
+        # The gate uses the same source.
+        assert max_items == _BULK_INPUT_CAP
 
     @pytest.mark.asyncio
     async def test_413_when_over_input_cap(self, app_client, mock_entity_store):
