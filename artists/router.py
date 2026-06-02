@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
 
 from artists.composer import ArtistSearchAliasesComposer
-from core.dependencies import get_discogs_cache_service
+from core.dependencies import get_discogs_cache_service_from_pool
 from discogs.cache_service import DiscogsCacheService
 from entity.store import EntityStore
 from generated.api_models import (
@@ -62,7 +62,7 @@ router = APIRouter(tags=["artists"])
 async def search_aliases_bulk(
     http_request: Request,
     entity_store: EntityStore | None = Depends(get_entity_store),
-    discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service),
+    discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service_from_pool),
 ) -> ArtistSearchAliasesBulkResponse:
     """Compose artist-search-alias variants for a batch of input names.
 
