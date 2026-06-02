@@ -1098,25 +1098,41 @@ class TestFetchArtworkForItems:
 
     @pytest.mark.asyncio
     async def test_fetches_artwork_for_each_item(self, mock_discogs_service):
+        """Two items get their own per-search match — verifies the
+        gather-of-fetch_one pattern actually fans out and zips results back
+        in order. Returns distinct artwork per item via mock side_effect so
+        the second item isn't a degenerate copy of the first."""
         items = [
             make_library_item(id=1, artist="Queen", title="A Night at the Opera"),
             make_library_item(id=2, artist="Queen", title="The Game"),
         ]
 
-        artwork = make_discogs_result(
+        opera = make_discogs_result(
             release_id=12345,
             album="A Night at the Opera",
             artist="Queen",
-            artwork_url="https://example.com/cover.jpg",
+            artwork_url="https://example.com/opera.jpg",
         )
-        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
+        game = make_discogs_result(
+            release_id=67890,
+            album="The Game",
+            artist="Queen",
+            artwork_url="https://example.com/game.jpg",
+        )
+        mock_discogs_service.search.side_effect = [
+            DiscogsSearchResponse(results=[opera]),
+            DiscogsSearchResponse(results=[game]),
+        ]
 
         results = await fetch_artwork_for_items(items, mock_discogs_service)
 
         assert len(results) == 2
-        # Each result is a (LibraryItem, DiscogsSearchResult | None) tuple
         assert results[0][0].id == 1
         assert results[0][1] is not None
+        assert results[0][1].release_id == 12345
+        assert results[1][0].id == 2
+        assert results[1][1] is not None
+        assert results[1][1].release_id == 67890
 
     @pytest.mark.asyncio
     async def test_returns_none_artwork_without_discogs(self):
@@ -1218,6 +1234,61 @@ class TestFetchArtworkForItems:
         assert len(results) == 1
         assert results[0][1] is not None
         assert results[0][1].release_id == 88888
+        assert results[0][1].artwork_url == "https://example.com/disco-canonical.jpg"
+
+    @pytest.mark.asyncio
+    async def test_self_titled_does_not_leak_pattern_into_album_variants(
+        self, mock_discogs_service
+    ):
+        """The self-titled mutation sets album=item.artist; the title-variant
+        block must NOT re-append the trigger pattern ("S/t") because a stray
+        Discogs result whose album is literally "S/t" would clear the floor
+        trivially against the readmitted variant, defeating the floor's intent."""
+        item = make_library_item(id=1, artist="Pavement", title="S/t", format="LP")
+
+        # Wrong-release candidate that happens to carry album="S/t".
+        wrong_release_with_st_album = make_discogs_result(
+            release_id=999,
+            album="S/t",
+            artist="Pavement",
+            artwork_url="https://example.com/wrong.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[wrong_release_with_st_album]
+        )
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        # Without the self-titled-pattern filter on the variant append, the
+        # variant ["Pavement", "S/t"] would let this wrong-release clear via
+        # score_match("S/t", "S/t") = 100.
+        assert results[0][1] is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_item_title_is_empty(self, mock_discogs_service):
+        """Library rows with title=None or title='' (allowed by LibraryItem)
+        no longer return a top-1 by default. The album variant set collapses
+        to [''], the empty-variant short-circuit fires, the function returns
+        None. Pin this so a future relaxation can't silently re-introduce
+        the 'first Discogs hit wins regardless of title' behavior the floor
+        is meant to prevent."""
+        item = make_library_item(id=1, artist="Stereolab", title="", format="CD")
+
+        # Even a candidate that perfectly matches the artist clearly fails
+        # because there is no title to score against.
+        candidate = make_discogs_result(
+            release_id=42,
+            album="Aluminum Tunes",
+            artist="Stereolab",
+            artwork_url="https://example.com/al.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[candidate])
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is None
 
     @pytest.mark.asyncio
     async def test_artwork_search_passes_label_and_format(self, mock_discogs_service):

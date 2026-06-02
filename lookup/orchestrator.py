@@ -76,6 +76,16 @@ MAX_SEARCH_RESULTS = 5
 SELF_TITLED_PATTERNS = frozenset({"s/t", "s.t.", "self-titled", "self titled"})
 """Common abbreviations for self-titled albums (case-insensitive exact match)."""
 
+_COMPILATION_ARTIST_SEARCH_FORM = "Various"
+"""The bare form Discogs's search endpoint accepts for compilation artists."""
+
+_COMPILATION_ARTIST_CANONICAL_FORM = "Various Artists"
+"""The full form Discogs's response payloads typically carry. Kept paired with
+``_COMPILATION_ARTIST_SEARCH_FORM`` for the variant-scoring path in
+``fetch_artwork_for_items``; any change to one MUST change the other or
+``score_match("Various","Various Artists")=63.6`` will start flipping
+compilations to None at the 80/80 floor (LML#478 round-2 finding)."""
+
 _WARM_CACHE_CONCURRENCY: int = 4
 """Process-wide cap on concurrent bio cache-warm tasks.
 
@@ -1603,7 +1613,7 @@ async def fetch_artwork_for_items(
 
             artist = item.alternate_artist_name or item.artist or ""
             if is_compilation_artist(artist):
-                artist = "Various"
+                artist = _COMPILATION_ARTIST_SEARCH_FORM
 
             response = await discogs_service.search(
                 DiscogsSearchRequest(
@@ -1620,19 +1630,26 @@ async def fetch_artwork_for_items(
             # *Tzenni* and *Yenbett*).
             #
             # Query variants:
-            # - Artist: "Various" is the form Discogs's search endpoint
-            #   accepts, but Discogs's canonical artist field for compilations
-            #   is often "Various Artists" (sometimes with a "(N)" disambig
-            #   suffix). Score against both.
+            # - Artist: the compilation search uses bare "Various" because
+            #   that's the form Discogs's search endpoint accepts, but
+            #   Discogs's canonical artist field for compilations is often
+            #   "Various Artists" (sometimes with a "(N)" disambig suffix).
+            #   Score against both forms. Numeric disambigs clear via
+            #   token_sort_ratio's tolerance; descriptive disambigs
+            #   ("Brazilian Soul" etc.) are a known floor-rejection edge
+            #   case — accept the loss in exchange for the floor's gain.
             # - Album: when discogs_titles[item.id] overrides the library
             #   title with a long Discogs-canonical form (compilation rescue
             #   path), Discogs's own search results may carry just the short
-            #   library-side title. Score against both.
+            #   library-side title. Score against both. Don't readmit a
+            #   self-titled trigger ("S/t" etc.) as a variant — that would
+            #   let a wrong-release candidate with album="S/t" clear the
+            #   floor trivially.
             artist_variants = [artist]
-            if artist == "Various":
-                artist_variants.append("Various Artists")
+            if artist == _COMPILATION_ARTIST_SEARCH_FORM:
+                artist_variants.append(_COMPILATION_ARTIST_CANONICAL_FORM)
             album_variants = [album or ""]
-            if item.title and item.title != album:
+            if item.title and item.title != album and not is_self_titled(item.title):
                 album_variants.append(item.title)
             result = find_best_typed_match(
                 response.results,

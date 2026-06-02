@@ -16,6 +16,25 @@ The script touches the Discogs cache + API exactly like the runtime path. To
 keep API load low and the measurement repeatable, point ``DATABASE_URL_DISCOGS``
 at a cache that's already warmed for the sampled items (the production cache
 qualifies).
+
+Known divergences from the runtime path (these are why the measurement is
+illustrative, not exhaustive):
+
+- **``discogs_titles`` compilation-rescue overrides**. The runtime track-on-
+  compilation strategy populates ``discogs_titles[item.id]`` with the long
+  Discogs-canonical title before calling ``fetch_artwork_for_items``. That
+  override is populated mid-request from search-pipeline state the script
+  doesn't have access to — so for those rows, the script queries Discogs
+  with the short library title and scores against a single album variant,
+  whereas the runtime queries with the long override and scores against
+  two album variants. The script's flip-rate therefore under-samples this
+  cohort; spot-check compilation rows from the runtime side post-merge.
+
+- **Reproducibility / sampling determinism**. Sampling uses SQLite's
+  ``ORDER BY RANDOM()`` which has no externally-seedable PRNG. The CSV
+  writes ``library_id`` per row, so spot-checks can be re-run against the
+  same IDs by reading them out of an existing CSV; consecutive script
+  invocations otherwise sample fresh rows each time.
 """
 
 from __future__ import annotations
