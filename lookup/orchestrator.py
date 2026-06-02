@@ -27,6 +27,7 @@ from core.search import (
     execute_search_pipeline,
     get_search_type_from_state,
 )
+from core.text import strip_leading_article
 from discogs.cache_service import DiscogsCacheService
 from discogs.lookup import lookup_releases_by_artist, lookup_releases_by_track
 from discogs.markup_parser import (
@@ -403,19 +404,6 @@ def limit_results(results: list) -> list:
     return results[:MAX_SEARCH_RESULTS]
 
 
-_LEADING_ARTICLE_RE = re.compile(r"^(the|a|an)(\s+|$)")
-
-
-def _strip_leading_article(normalized: str) -> str:
-    """Strip a leading English article from a lowercase-normalized name.
-
-    Operates on the output of ``normalize_for_comparison`` (already
-    lowercased and trimmed), so the article check can be anchored and
-    case-blind.
-    """
-    return _LEADING_ARTICLE_RE.sub("", normalized, count=1)
-
-
 def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     """Check if a library item matches the given artist name.
 
@@ -429,7 +417,7 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     leaves the query empty so a bare "The" doesn't match arbitrary rows.
     """
     artist_normalized = normalize_for_comparison(artist)
-    artist_no_article = _strip_leading_article(artist_normalized)
+    artist_no_article = strip_leading_article(artist_normalized)
 
     for candidate in (item.artist, item.alternate_artist_name):
         if not candidate:
@@ -437,7 +425,7 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
         cand_normalized = normalize_for_comparison(candidate)
         if cand_normalized.startswith(artist_normalized):
             return True
-        if artist_no_article and _strip_leading_article(cand_normalized).startswith(
+        if artist_no_article and strip_leading_article(cand_normalized).startswith(
             artist_no_article
         ):
             return True

@@ -1,6 +1,9 @@
 """Integration tests for library/db.py with real SQLite + FTS5."""
 
+import aiosqlite
 import pytest
+
+from library.db import LibraryDB
 
 
 class TestFTS5Search:
@@ -110,6 +113,63 @@ class TestFindSimilarArtist:
     async def test_short_word(self, library_db):
         result = await library_db.find_similar_artist("XY")
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_article_prefix_artist_typo_uses_full_candidate_sql(self):
+        conn = await aiosqlite.connect(":memory:")
+        await conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT,
+                alternate_artist_name TEXT,
+                album_artist TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE compilation_track_artist (
+                library_id INTEGER NOT NULL,
+                artist_name TEXT NOT NULL
+            )
+        """)
+        await conn.execute(
+            "INSERT INTO library VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                1,
+                "Bytes",
+                "Black Dog",
+                "B",
+                1,
+                1,
+                "Electronic",
+                "CD",
+                "Black Dog Productions",
+                "Black Dog",
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO compilation_track_artist VALUES (?, ?)",
+            (1, "Black Dog"),
+        )
+        await conn.commit()
+
+        db = LibraryDB()
+        db._conn = conn
+        db._has_alternate_artist = True
+        db._has_album_artist = True
+        db._has_compilation_track_artist = True
+
+        try:
+            result = await db.find_similar_artist("The Bleack Dog")
+        finally:
+            await conn.close()
+
+        assert result == "Black Dog"
 
 
 class TestIsAvailable:
