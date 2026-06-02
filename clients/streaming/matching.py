@@ -218,18 +218,23 @@ def find_best_typed_match[T](
     "Various Artists" canonical artist; a ``discogs_titles`` long-canonical
     override paired against the raw library title).
 
-    Empty query strings short-circuit to no-match — ``score_match("", "")``
-    returns 100 by ``rapidfuzz`` convention, which would let candidates with
-    null artist/title fields trivially pass the floor. Any variant that's
-    empty is dropped from the scoring set; if no non-empty variant survives,
-    the result is rejected.
+    Empty or whitespace-only query strings short-circuit to no-match —
+    ``score_match("", "")`` returns 100 by ``rapidfuzz`` convention (and
+    ``score_match(" ", "")`` does too, because the normalizer strips
+    whitespace before scoring), which would let candidates with null
+    artist/title fields trivially pass the floor. Any variant that's empty
+    or whitespace-only is dropped from the scoring set; if no usable variant
+    survives on either side, the result is rejected.
 
     None-valued extractors score as 0 against any non-empty query. Ties
     resolve to the first candidate reaching the score, preserving input
     order.
+
+    Iterables are materialized to a list internally — a single-pass
+    generator is safe.
     """
-    artist_variants = [v for v in _as_variants(query_artist) if v]
-    title_variants = [v for v in _as_variants(query_title) if v]
+    artist_variants = [v for v in _as_variants(query_artist) if v and v.strip()]
+    title_variants = [v for v in _as_variants(query_title) if v and v.strip()]
     if not artist_variants or not title_variants:
         return None
 

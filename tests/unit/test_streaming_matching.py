@@ -429,6 +429,55 @@ class TestFindBestTypedMatch:
         )
         assert best is None
 
+    def test_returns_none_when_query_artist_is_whitespace_only(self):
+        """``score_match(" ", "")`` returns 100 because the title normalizer
+        strips whitespace before scoring. The empty-variant filter rejects
+        whitespace-only strings (not just literal empty strings) so a
+        sparse-but-not-empty library field can't sneak past the floor."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        junk = make_discogs_result(release_id=99, album="Aluminum Tunes", artist="")
+        best = find_best_typed_match(
+            [junk],
+            query_artist=" ",
+            query_title="Aluminum Tunes",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is None
+
+    def test_returns_none_when_every_variant_is_whitespace(self):
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        junk = make_discogs_result(release_id=99, album="Aluminum Tunes", artist="Stereolab")
+        best = find_best_typed_match(
+            [junk],
+            query_artist=["  ", "\t"],
+            query_title="Aluminum Tunes",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is None
+
+    def test_mixed_variants_keeps_non_empty(self):
+        """When variants are mixed (empty/whitespace + real), the real ones
+        are kept and used for scoring — the empty/whitespace entries are
+        dropped silently rather than blocking the call."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        candidate = make_discogs_result(release_id=42, album="Aluminum Tunes", artist="Stereolab")
+        best = find_best_typed_match(
+            [candidate],
+            query_artist=["", "Stereolab", "  "],
+            query_title=["Aluminum Tunes", ""],
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is candidate
+
 
 class TestStripThePrefix:
     @pytest.mark.parametrize(
