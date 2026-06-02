@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison  # noqa: F401
@@ -192,6 +192,39 @@ def find_best_match(
             if id_fn is not None:
                 match["id"] = id_fn(item)
             best = match
+    return best
+
+
+def find_best_typed_match[T](
+    results: Iterable[T],
+    *,
+    query_artist: str,
+    query_title: str,
+    artist_fn: Callable[[T], str | None],
+    title_fn: Callable[[T], str | None],
+) -> T | None:
+    """Return the highest-scoring result that clears the 80/80 floor, or None.
+
+    Sibling of ``find_best_match`` that returns the **original typed object**
+    instead of a flattened streaming-URL dict. Use when the caller wants the
+    matched candidate's full payload (e.g. a ``DiscogsSearchResult``) rather
+    than a normalized URL pair. None-valued extractors score as 0 against
+    any non-empty query; ties resolve to the first candidate reaching the
+    score, preserving input order.
+    """
+    best: T | None = None
+    best_score = 0.0
+    for item in results:
+        r_artist = artist_fn(item) or ""
+        r_title = title_fn(item) or ""
+        artist_score = score_match(query_artist, r_artist)
+        title_score = score_match(query_title, r_title)
+        if not is_acceptable_match(artist_score, title_score):
+            continue
+        combined = (artist_score + title_score) / 2
+        if combined > best_score:
+            best_score = combined
+            best = item
     return best
 
 

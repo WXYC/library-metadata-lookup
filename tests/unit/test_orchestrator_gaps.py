@@ -854,7 +854,7 @@ class TestFetchArtworkException:
                         make_discogs_result(
                             release_id=2,
                             album="Album2",
-                            artist="Artist",
+                            artist="Stereolab",
                         )
                     ],
                     total=1,

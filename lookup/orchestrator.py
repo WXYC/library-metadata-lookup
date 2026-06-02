@@ -23,7 +23,7 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats_recorder
 
 from clients.streaming.apple_music import AppleMusicClient
-from clients.streaming.matching import score_match
+from clients.streaming.matching import find_best_typed_match, score_match
 from config.settings import get_settings
 from core.search import (
     execute_search_pipeline,
@@ -1613,14 +1613,26 @@ async def fetch_artwork_for_items(
                     format=map_library_format_to_discogs(item.format),
                 )
             )
-            if response.results:
-                result = response.results[0]
-                if not result.artwork_url:
-                    fallback = await _resolve_fallback_artwork(discogs_service, result.release_id)
-                    if fallback:
-                        result = result.model_copy(update={"artwork_url": fallback})
-                return result
-            return None
+            # Score candidates against the post-mutation artist/album the
+            # search consumed (the is_self_titled / is_compilation_artist
+            # rewrites flow through here). Falls back to None — better than
+            # serving wrong artwork for releases that share a title across
+            # multiple albums (LML#478, e.g. Noura Mint Seymali's "Hebebeb
+            # (Zrag)" on both *Tzenni* and *Yenbett*).
+            result = find_best_typed_match(
+                response.results,
+                query_artist=artist,
+                query_title=album or "",
+                artist_fn=lambda r: r.artist,
+                title_fn=lambda r: r.album,
+            )
+            if result is None:
+                return None
+            if not result.artwork_url:
+                fallback = await _resolve_fallback_artwork(discogs_service, result.release_id)
+                if fallback:
+                    result = result.model_copy(update={"artwork_url": fallback})
+            return result
         except Exception as e:
             logger.warning(f"Artwork lookup failed for {item.title}: {e}")
             return None
