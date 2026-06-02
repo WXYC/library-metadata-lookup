@@ -47,29 +47,52 @@ async def set_up_schemas(pg_pool):
     ``artist_member`` in the default (public) schema — same shape as
     the production discogs-cache.
 
-    SAFETY: this fixture DROPs the public-schema `artist` (and child)
-    tables. The default ``DATABASE_URL_TEST`` (``postgresql://discogs:
-    discogs@localhost:5433/discogs``) points at the developer's local
-    discogs-cache. If that cache is populated (a real discogs-cache
-    rebuild produces tens of GB and takes hours), wiping it is
-    catastrophic. We refuse to run when public.artist has any rows, so
-    the operator must point ``DATABASE_URL_TEST`` at a clean DB before
-    these tests will execute.
+    SAFETY: this fixture DROPs both `entity` schema CASCADE and the
+    public-schema `artist` + four child tables. The default
+    ``DATABASE_URL_TEST`` (``postgresql://discogs:discogs@localhost:5433/discogs``)
+    points at the developer's local discogs-cache, which may also host
+    a populated `entity.identity` from a prior reconciliation campaign.
+    Wiping either set is catastrophic (the cache rebuild + reconcile
+    re-run takes hours). We refuse to run when ANY of the about-to-drop
+    tables already has rows, so the operator must point
+    ``DATABASE_URL_TEST`` at a clean DB.
     """
-    async with pg_pool.acquire() as conn:
-        artist_exists = await conn.fetchval(
+
+    async def _table_row_count(conn, schema: str, table: str) -> int | None:
+        """Return row count, or None if the table doesn't exist."""
+        exists = await conn.fetchval(
             "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_name = 'artist')"
+            "WHERE table_schema = $1 AND table_name = $2)",
+            schema,
+            table,
         )
-        if artist_exists:
-            existing_rows = await conn.fetchval("SELECT COUNT(*) FROM artist")
-            if existing_rows and existing_rows > 0:
-                pytest.skip(
-                    f"DATABASE_URL_TEST points at a populated discogs-cache "
-                    f"({existing_rows} rows in `public.artist`). Refusing to "
-                    "DROP and recreate the cache tables — point "
-                    "DATABASE_URL_TEST at a clean PG before running this suite."
-                )
+        if not exists:
+            return None
+        return await conn.fetchval(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
+
+    async with pg_pool.acquire() as conn:
+        # All tables this fixture will DROP. If any has data, bail.
+        targets: list[tuple[str, str]] = [
+            ("entity", "identity"),
+            ("entity", "reconciliation_log"),
+            ("public", "artist"),
+            ("public", "artist_alias"),
+            ("public", "artist_name_variation"),
+            ("public", "artist_member"),
+            ("public", "artist_url"),
+        ]
+        populated: list[tuple[str, str, int]] = []
+        for schema, table in targets:
+            count = await _table_row_count(conn, schema, table)
+            if count is not None and count > 0:
+                populated.append((schema, table, count))
+        if populated:
+            details = ", ".join(f"{s}.{t}={n}" for s, t, n in populated)
+            pytest.skip(
+                "DATABASE_URL_TEST points at a populated DB; refusing to "
+                f"DROP tables that hold data ({details}). Point "
+                "DATABASE_URL_TEST at a clean PG before running this suite."
+            )
         await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
         await conn.execute("CREATE SCHEMA entity")
         await conn.execute("""

@@ -160,6 +160,35 @@ class TestBulkResolveLibraryNames:
         assert mock_pg.fetchall.await_count == 1
 
     @pytest.mark.asyncio
+    async def test_case_variant_inputs_both_resolve_to_same_stored_row(self, store, mock_pg):
+        """Two distinct case-variant inputs that share a LOWER form both resolve.
+
+        Regression for the iteration-2 review finding: `DISTINCT ON
+        (LOWER(bind.name))` would have collapsed `['STEREOLAB',
+        'stereolab']` into one returned row (both LOWER-match
+        'stereolab'), silently dropping one input to `missing[]`.
+        After the fix to `DISTINCT ON (bind.name)`, each distinct bind
+        gets its own row even when binds share a LOWER form.
+        """
+        mock_pg.fetchall = AsyncMock(
+            side_effect=[
+                [],  # leg 1: both verbatim inputs miss stored 'Stereolab'.
+                # leg 2: with DISTINCT ON (bind.name), the JOIN produces
+                # one row per distinct bind, both pointing at the same
+                # stored Identity (id=1).
+                [
+                    _leg2_row("STEREOLAB", "Stereolab", id=1, discogs_artist_id=2154),
+                    _leg2_row("stereolab", "Stereolab", id=1, discogs_artist_id=2154),
+                ],
+            ]
+        )
+        result = await store.bulk_resolve_library_names(["STEREOLAB", "stereolab"])
+        # Both case-variant inputs resolve, neither falls to leg 3 or missing[].
+        assert set(result.keys()) == {"STEREOLAB", "stereolab"}
+        assert result["STEREOLAB"].discogs_artist_id == 2154
+        assert result["stereolab"].discogs_artist_id == 2154
+
+    @pytest.mark.asyncio
     async def test_dict_keyed_by_input_not_stored_library_name(self, store, mock_pg):
         """Case-drift input ('stereolab') resolves to stored row ('Stereolab').
 

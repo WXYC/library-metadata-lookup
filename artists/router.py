@@ -41,14 +41,24 @@ def _resolve_input_cap() -> int:
     `ArtistSearchAliasesBulkRequest.names` max_length. The route enforces
     the cap as 413 before Pydantic validation; sourcing the literal from
     the model means a future api.yaml change that regenerates the model
-    automatically updates the manual 413 gate. Falls back to 1000 (the
-    current cap) if the metadata shape ever shifts.
+    automatically updates the manual 413 gate.
+
+    Raises at module import time if `max_length` cannot be resolved
+    (e.g., a future Pydantic minor bump moves the constraint off
+    `.metadata`). Fail loud — a silent fallback to the historical cap of
+    1000 would mask any api.yaml reduction (501-N requests would return
+    422 instead of the documented 413 until someone noticed).
     """
     for meta in ArtistSearchAliasesBulkRequest.model_fields["names"].metadata:
         max_length = getattr(meta, "max_length", None)
         if max_length is not None:
             return int(max_length)
-    return 1000
+    raise RuntimeError(
+        "Cannot resolve `max_length` from ArtistSearchAliasesBulkRequest.names "
+        "metadata — Pydantic constraint shape likely changed. The route's 413 "
+        "gate must agree with the generated model; fix or pin the constraint "
+        "before this module can import."
+    )
 
 
 # Per api.yaml: max names per request; over-cap returns 413.
@@ -190,6 +200,13 @@ async def search_aliases_bulk(
             )
             http_span.set_data("http.status_code", 503)
             raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
+        except HTTPException:
+            # HTTPException carries its own status code, set by whoever
+            # raised it (either us above, or future inner code). Don't
+            # blanket-stamp 500 — that would lie to Sentry's
+            # http.status_code aggregation about the real response code.
+            # Re-raise unchanged.
+            raise
         except Exception:
             # Pin 500 on the span so unhandled-exception traces still carry
             # http.status_code for per-route status aggregation. Re-raise
