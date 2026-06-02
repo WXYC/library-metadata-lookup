@@ -22,7 +22,7 @@ dependencies = [
     "wxyc-fastapi[posthog]>=1.0.0,<2.0.0",
     "aiolimiter>=1.1.0",
     "python-multipart>=0.0.6",
-    "wxyc-etl>=0.5.0,<0.6.0",
+    "wxyc-etl>=0.6.0,<0.7.0",
     "pyjwt[crypto]>=2.8.0",
 ]
 
