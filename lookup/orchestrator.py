@@ -23,6 +23,7 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats_recorder
 
 from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.matching import score_match
 from config.settings import get_settings
 from core.search import (
     execute_search_pipeline,
@@ -1855,7 +1856,24 @@ async def enrich_artwork_results(
         bandcamp_url = None
         soundcloud_url = None
 
-        if library_db and getattr(library_db, "_has_streaming_links", None) is True and item.id:
+        # LML#477: only trust the library row's stored streaming URLs when
+        # its title plausibly matches the requested album. ``_fuzzy_search``
+        # in library/db.py accepts token_set_ratio >= 70 — permissive enough
+        # to surface sibling-album rows (same artist, different release)
+        # whose verified Spotify/Apple URLs would otherwise propagate as if
+        # they pointed at the requested album. The 80 floor mirrors
+        # ``is_acceptable_match`` in ``clients/streaming/matching``. When no
+        # album was requested (artist-only lookup) or the row's title is
+        # missing, there is no signal to gate against — fall through.
+        row_title_matches_requested_album = (
+            not album or not item.title or score_match(album, item.title) >= 80.0
+        )
+        if (
+            library_db
+            and getattr(library_db, "_has_streaming_links", None) is True
+            and item.id
+            and row_title_matches_requested_album
+        ):
             try:
                 links = await library_db.get_streaming_links(item.id)
             except Exception:

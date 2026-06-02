@@ -1176,3 +1176,159 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
 
         _, enriched = results[0]
         assert enriched.apple_music_url == db_url
+
+
+class TestStreamingLinksTitleGate:
+    """LML#477: gate library_db.streaming_links projection on a title-confidence
+    floor against the requested album.
+
+    Library search's fuzzy fallback (``_fuzzy_search`` in ``library/db.py``)
+    accepts ``token_set_ratio >= 70`` — permissive enough to surface
+    sibling-artist rows where the artist matches but the album doesn't
+    (e.g. requesting "Yenbett" returns "Tzenni" because both are Noura
+    Mint Seymali albums). Without a gate at the orchestrator's
+    streaming-link projection site, those rows' verified Spotify/Apple
+    URLs would propagate into the response as if they pointed at the
+    requested album. The 80 floor mirrors ``is_acceptable_match`` in
+    ``clients/streaming/matching.py``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_skips_streaming_links_when_row_title_mismatches_album(self):
+        # Sibling-album fuzzy hit: artist matches, title doesn't — the
+        # row's stored streaming URLs point at the sibling, not the
+        # requested album.
+        item = make_library_item(id=42, artist="Noura Mint Seymali", title="Tzenni")
+        artwork = make_discogs_result(release_id=1, artist="Noura Mint Seymali", album="Tzenni")
+
+        wrong_spotify = "https://open.spotify.com/album/tzenni-id"
+        wrong_apple = "https://music.apple.com/us/album/tzenni/111"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": wrong_spotify,
+                "apple_music_url": wrong_apple,
+                "youtube_music_url": "https://music.youtube.com/wrong",
+                "bandcamp_url": "https://wrong.bandcamp.com/album/tzenni",
+                "soundcloud_url": "https://soundcloud.com/wrong/tzenni",
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Tzenni",
+            artist="Noura Mint Seymali",
+            year=2014,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album="Yenbett",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # No wrong-album URLs propagated.
+        assert enriched.spotify_url != wrong_spotify
+        assert enriched.apple_music_url != wrong_apple
+        assert enriched.youtube_music_url != "https://music.youtube.com/wrong"
+        assert enriched.bandcamp_url != "https://wrong.bandcamp.com/album/tzenni"
+        assert enriched.soundcloud_url != "https://soundcloud.com/wrong/tzenni"
+        # Synthesized search-URL fallback fills in instead.
+        assert enriched.spotify_url is not None
+        assert "search" in enriched.spotify_url.lower()
+        # And we never even queried the DB for streaming links — the gate
+        # short-circuits before the lookup.
+        library_db.get_streaming_links.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_applies_streaming_links_when_row_title_matches_album(self):
+        # Happy path: library row title matches the requested album.
+        item = make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")
+        artwork = make_discogs_result(
+            release_id=1, artist="Jessica Pratt", album="On Your Own Love Again"
+        )
+
+        verified_spotify = "https://open.spotify.com/album/oyola-id"
+        verified_apple = "https://music.apple.com/us/album/oyola/222"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": verified_spotify,
+                "apple_music_url": verified_apple,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="On Your Own Love Again",
+            artist="Jessica Pratt",
+            year=2015,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album="On Your Own Love Again",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.spotify_url == verified_spotify
+        assert enriched.apple_music_url == verified_apple
+
+    @pytest.mark.asyncio
+    async def test_applies_streaming_links_when_album_not_requested(self):
+        # No requested album → no signal to gate against; preserve
+        # legacy behavior of trusting the library row.
+        item = make_library_item(id=42, artist="Juana Molina", title="DOGA")
+        artwork = make_discogs_result(release_id=1, artist="Juana Molina", album="DOGA")
+
+        verified_spotify = "https://open.spotify.com/album/doga-id"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": verified_spotify,
+                "apple_music_url": None,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="DOGA",
+            artist="Juana Molina",
+            year=2022,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album=None,
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.spotify_url == verified_spotify
