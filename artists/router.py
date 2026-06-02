@@ -35,29 +35,36 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_input_cap() -> int:
-    """Read the names array `max_length` from the generated Pydantic model.
+    """Read the names array `maxItems` from the generated model's JSON schema.
 
     Drift guard: api.yaml's `maxItems` for `names` drives the generated
-    `ArtistSearchAliasesBulkRequest.names` max_length. The route enforces
+    `ArtistSearchAliasesBulkRequest.names` constraint. The route enforces
     the cap as 413 before Pydantic validation; sourcing the literal from
     the model means a future api.yaml change that regenerates the model
     automatically updates the manual 413 gate.
 
-    Raises at module import time if `max_length` cannot be resolved
-    (e.g., a future Pydantic minor bump moves the constraint off
-    `.metadata`). Fail loud — a silent fallback to the historical cap of
-    1000 would mask any api.yaml reduction (501-N requests would return
-    422 instead of the documented 413 until someone noticed).
+    Uses `model_json_schema()` rather than the lower-level
+    `model_fields[...].metadata` introspection because the JSON-schema
+    export is Pydantic's documented public API (it's tied to OpenAPI
+    generation and unlikely to drift across minor versions), whereas the
+    metadata shape is implementation detail that has changed before.
+    `pydantic` is pinned only as a lower bound (`>=2.0.0`) so this
+    distinction matters across deploys.
+
+    Raises at module import time if `maxItems` is missing — fail loud, so
+    a regenerated model that drops the constraint can't silently widen
+    the 413 gate and produce 422 responses for cap-exceeded requests.
     """
-    for meta in ArtistSearchAliasesBulkRequest.model_fields["names"].metadata:
-        max_length = getattr(meta, "max_length", None)
-        if max_length is not None:
-            return int(max_length)
+    schema = ArtistSearchAliasesBulkRequest.model_json_schema()
+    names_schema = schema.get("properties", {}).get("names", {})
+    max_items = names_schema.get("maxItems")
+    if isinstance(max_items, int) and max_items > 0:
+        return max_items
     raise RuntimeError(
-        "Cannot resolve `max_length` from ArtistSearchAliasesBulkRequest.names "
-        "metadata — Pydantic constraint shape likely changed. The route's 413 "
-        "gate must agree with the generated model; fix or pin the constraint "
-        "before this module can import."
+        "Cannot resolve `maxItems` for ArtistSearchAliasesBulkRequest.names "
+        "from its JSON schema. The route's 413 gate must agree with the "
+        "generated model; fix or regenerate the model before this module "
+        f"can import (schema fragment: {names_schema!r})."
     )
 
 
