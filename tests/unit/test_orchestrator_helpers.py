@@ -1155,7 +1155,10 @@ class TestFetchArtworkForItems:
 
     @pytest.mark.asyncio
     async def test_uses_discogs_titles_for_compilation_lookup(self, mock_discogs_service):
-        """For compilations, use the Discogs album title (not library title) for artwork."""
+        """For compilations, use the Discogs album title (not library title) for
+        artwork — but the score floor must still accept the short library
+        title when Discogs returns it, since the long discogs_titles override
+        is a search aid, not a verification requirement."""
         item = make_library_item(
             id=20,
             artist="Various Artists - Rock - D",
@@ -1176,10 +1179,45 @@ class TestFetchArtworkForItems:
         )
 
         assert len(results) == 1
-        # Should have looked up with the Discogs title, not the library title
+        # Search used the long Discogs-canonical title (the override's purpose).
         call_args = mock_discogs_service.search.call_args[0][0]
         assert isinstance(call_args, DiscogsSearchRequest)
         assert "Disco Not Disco" in call_args.album
+        # ALSO the artwork survived the floor against the short library title
+        # (the variant the candidate carries). Without title-variant scoring,
+        # the long override vs. the short candidate would score 38.5 and the
+        # fuzzy-score floor would flip this to None.
+        assert results[0][1] is not None
+        assert results[0][1].release_id == 99999
+        assert results[0][1].artwork_url == "https://example.com/disco.jpg"
+
+    @pytest.mark.asyncio
+    async def test_compilation_canonical_various_artists(self, mock_discogs_service):
+        """Discogs returns most compilation releases with the canonical artist
+        string "Various Artists" (sometimes with a "(N)" disambiguation
+        suffix). The orchestrator mutates `artist` to bare "Various" for
+        Discogs's search endpoint, but scoring must tolerate the canonical
+        form — otherwise score_match("Various", "Various Artists") = 63.6 and
+        every "Various Artists" compilation flips to None."""
+        item = make_library_item(
+            id=21,
+            artist="Various Artists - Rock - D",
+            title="Disco Not Disco",
+        )
+
+        candidate = make_discogs_result(
+            release_id=88888,
+            album="Disco Not Disco",
+            artist="Various Artists",  # the canonical form, not the bare "Various"
+            artwork_url="https://example.com/disco-canonical.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[candidate])
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is not None
+        assert results[0][1].release_id == 88888
 
     @pytest.mark.asyncio
     async def test_artwork_search_passes_label_and_format(self, mock_discogs_service):

@@ -25,9 +25,9 @@ import asyncio
 import csv
 import logging
 import os
-import random
 import sys
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 import asyncpg
@@ -48,64 +48,121 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
-def mutate(artist: str, title: str) -> tuple[str, str]:
-    """Mirror the artist/album mutations fetch_one applies before the search."""
-    album = title
+@dataclass(frozen=True)
+class SampledItem:
+    """A library row, in the shape the artwork-search path consumes."""
+
+    library_id: int
+    artist: str
+    title: str
+    alternate_artist_name: str | None
+    label: str | None
+    format: str | None
+
+
+@dataclass(frozen=True)
+class QueryShape:
+    """The exact query shape fetch_one sends to Discogs + scores against."""
+
+    search_artist: str
+    search_album: str
+    artist_variants: list[str]
+    title_variants: list[str]
+
+
+def build_query(item: SampledItem) -> QueryShape:
+    """Mirror fetch_one's query construction — the search-query mutations AND
+    the score-variant lists. Must stay byte-for-byte aligned with
+    ``lookup.orchestrator.fetch_artwork_for_items.fetch_one``; any drift makes
+    the measurement compare apples to oranges.
+    """
+    album = item.title
+
     if is_self_titled(album or ""):
-        album = artist
+        album = item.artist
+
+    artist = item.alternate_artist_name or item.artist or ""
     if is_compilation_artist(artist):
         artist = "Various"
-    return artist, album
+
+    artist_variants = [artist]
+    if artist == "Various":
+        artist_variants.append("Various Artists")
+    album_variants = [album or ""]
+    if item.title and item.title != album:
+        album_variants.append(item.title)
+
+    return QueryShape(
+        search_artist=artist,
+        search_album=album or "",
+        artist_variants=artist_variants,
+        title_variants=album_variants,
+    )
 
 
-async def sample_library_items(
-    db: LibraryDB, n: int
-) -> list[tuple[int, str, str, str | None, str | None]]:
-    """Return ``n`` random rows from the library as (id, artist, title, label, format)."""
+async def sample_library_items(db: LibraryDB, n: int) -> list[SampledItem]:
+    """Return ``n`` random library rows, including alternate_artist_name and
+    label when the underlying schema carries them (mirrors ``LibraryDB``'s
+    own column-introspection done in ``connect()``).
+    """
     assert db._conn is not None
-    has_label = db._has_label
-    cols = "id, artist, title, format" + (", label" if has_label else "")
-    cursor = await db._conn.execute(f"SELECT {cols} FROM library ORDER BY RANDOM() LIMIT ?", (n,))
+    cols = ["id", "artist", "title", "format"]
+    if db._has_alternate_artist:
+        cols.append("alternate_artist_name")
+    if db._has_label:
+        cols.append("label")
+    cursor = await db._conn.execute(
+        f"SELECT {', '.join(cols)} FROM library ORDER BY RANDOM() LIMIT ?", (n,)
+    )
     rows = await cursor.fetchall()
-    out = []
+    out: list[SampledItem] = []
     for row in rows:
         out.append(
-            (
-                row["id"],
-                row["artist"] or "",
-                row["title"] or "",
-                row["label"] if has_label else None,
-                row["format"],
+            SampledItem(
+                library_id=row["id"],
+                artist=row["artist"] or "",
+                title=row["title"] or "",
+                alternate_artist_name=(
+                    row["alternate_artist_name"] if db._has_alternate_artist else None
+                ),
+                label=row["label"] if db._has_label else None,
+                format=row["format"],
             )
         )
     return out
 
 
 def classify(
-    results: Iterable[DiscogsSearchResult], query_artist: str, query_album: str
+    results: Iterable[DiscogsSearchResult], query: QueryShape
 ) -> tuple[DiscogsSearchResult | None, DiscogsSearchResult | None, float, float, float]:
-    """Return (old_pick, new_pick, top1_artist_score, top1_title_score, best_combined)."""
+    """Return (old_pick, new_pick, top1_artist_score, top1_title_score, best_combined).
+
+    Scores are taken against the same variant lists fetch_one uses, so the
+    top1 score reflects the floor's actual verdict, not a degenerate query.
+    """
     results = list(results)
     old_pick = results[0] if results else None
 
     top1_artist_score = 0.0
     top1_title_score = 0.0
     if old_pick is not None:
-        top1_artist_score = score_match(query_artist, old_pick.artist or "")
-        top1_title_score = score_match(query_album, old_pick.album or "")
+        top1_artist_score = max(
+            score_match(q, old_pick.artist or "") for q in query.artist_variants
+        )
+        top1_title_score = max(score_match(q, old_pick.album or "") for q in query.title_variants)
 
     new_pick = find_best_typed_match(
         results,
-        query_artist=query_artist,
-        query_title=query_album,
+        query_artist=query.artist_variants,
+        query_title=query.title_variants,
         artist_fn=lambda r: r.artist,
         title_fn=lambda r: r.album,
     )
 
     best_combined = 0.0
     if new_pick is not None:
-        a = score_match(query_artist, new_pick.artist or "")
-        t = score_match(query_album, new_pick.album or "")
+        a = max(score_match(q, new_pick.artist or "") for q in query.artist_variants)
+        t = max(score_match(q, new_pick.album or "") for q in query.title_variants)
         best_combined = (a + t) / 2
 
     return old_pick, new_pick, top1_artist_score, top1_title_score, best_combined
@@ -139,13 +196,14 @@ async def run(args: argparse.Namespace) -> None:
         items = await sample_library_items(library_db, args.sample)
         logger.info("Sampled %d library items", len(items))
 
-        with csv_path.open("w", newline="") as fh:
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
             writer.writerow(
                 [
                     "library_id",
                     "artist_raw",
                     "title_raw",
+                    "alternate_artist_name",
                     "artist_query",
                     "album_query",
                     "old_release_id",
@@ -157,24 +215,22 @@ async def run(args: argparse.Namespace) -> None:
                 ]
             )
 
-            for i, (lid, artist_raw, title_raw, label, fmt) in enumerate(items, start=1):
-                artist_q, album_q = mutate(artist_raw, title_raw)
+            for i, item in enumerate(items, start=1):
+                query = build_query(item)
                 try:
                     response = await service.search(
                         DiscogsSearchRequest(
-                            album=album_q,
-                            artist=artist_q,
-                            label=label,
-                            format=map_library_format_to_discogs(fmt),
+                            album=query.search_album,
+                            artist=query.search_artist,
+                            label=item.label,
+                            format=map_library_format_to_discogs(item.format),
                         )
                     )
                 except Exception as e:
-                    logger.warning("search failed for id=%s: %s", lid, e)
+                    logger.warning("search failed for id=%s: %s", item.library_id, e)
                     continue
 
-                old_pick, new_pick, a_score, t_score, best = classify(
-                    response.results, artist_q, album_q
-                )
+                old_pick, new_pick, a_score, t_score, best = classify(response.results, query)
 
                 if old_pick is None:
                     no_results += 1
@@ -191,11 +247,12 @@ async def run(args: argparse.Namespace) -> None:
 
                 writer.writerow(
                     [
-                        lid,
-                        artist_raw,
-                        title_raw,
-                        artist_q,
-                        album_q,
+                        item.library_id,
+                        item.artist,
+                        item.title,
+                        item.alternate_artist_name or "",
+                        query.search_artist,
+                        query.search_album,
                         old_pick.release_id if old_pick else "",
                         new_pick.release_id if new_pick else "",
                         outcome,
@@ -249,10 +306,7 @@ def main() -> None:
         default="/tmp/lml-478-floor.csv",
         help="Output CSV path",
     )
-    parser.add_argument("--seed", type=int, default=None, help="Random seed (optional)")
     args = parser.parse_args()
-    if args.seed is not None:
-        random.seed(args.seed)
     asyncio.run(run(args))
 
 
