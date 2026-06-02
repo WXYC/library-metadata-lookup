@@ -189,18 +189,25 @@ WHERE library_name = ANY($1::text[])\
 # the bind without re-keying via Python `.lower()` (which would re-
 # introduce the asymmetry).
 #
-# `DISTINCT ON (LOWER(bind.name))` + `ORDER BY ... id ASC` picks the
-# lowest stored id when two rows share a LOWER form, matching the per-
-# call's `ORDER BY id ASC LIMIT 1` tie-break.
+# `DISTINCT ON (bind.name)` (keyed on the original bind, NOT on its
+# LOWER form) ensures each distinct input bind gets its own row even
+# when multiple case-variant binds share a LOWER form. Two inputs
+# `'STEREOLAB'` and `'stereolab'` both resolve to the same stored row,
+# both returned as separate (bind.name, identity) pairs. Keying DISTINCT
+# ON the LOWERED bind would collapse them and silently drop one input
+# to `missing[]`. For case-collisions on the STORED side (e.g., both
+# 'Stereolab' and 'stereolab' stored as distinct rows), the `ORDER BY
+# bind.name, i.id ASC` tie-break picks the lowest stored id — matching
+# the per-call's `ORDER BY id ASC LIMIT 1`.
 _BULK_GET_IDENTITY_LOWER_SQL = """\
-SELECT DISTINCT ON (LOWER(bind.name))
+SELECT DISTINCT ON (bind.name)
     i.id, i.library_name, i.discogs_artist_id, i.wikidata_qid,
     i.musicbrainz_artist_id, i.spotify_artist_id,
     i.apple_music_artist_id, i.bandcamp_id, i.reconciliation_status,
     bind.name AS input_name
 FROM entity.identity i
 JOIN unnest($1::text[]) AS bind(name) ON LOWER(i.library_name) = LOWER(bind.name)
-ORDER BY LOWER(bind.name), i.id ASC\
+ORDER BY bind.name, i.id ASC\
 """
 
 # Most-recent reconciliation log row per source for a given identity.

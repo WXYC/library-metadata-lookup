@@ -76,7 +76,6 @@ class TestGetArtistDetailsBulk:
                         {"artist_id": 305253, "name": "J. Molina"},
                     ],
                     "artist_member": [],
-                    "artist_url": [],
                 }
             )
         )
@@ -105,7 +104,6 @@ class TestGetArtistDetailsBulk:
                     "artist_alias": [],
                     "artist_name_variation": [],
                     "artist_member": [],
-                    "artist_url": [],
                 }
             )
         )
@@ -151,7 +149,6 @@ class TestGetArtistDetailsBulk:
                     "artist_alias": [],
                     "artist_name_variation": [],
                     "artist_member": [],
-                    "artist_url": [],
                 }
             )
         )
@@ -164,7 +161,6 @@ class TestGetArtistDetailsBulk:
                     "artist_alias": [],
                     "artist_name_variation": [],
                     "artist_member": [],
-                    "artist_url": [],
                 }
             )
         )
