@@ -12,16 +12,18 @@ posture as `bulk-resolve-libraries`.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import sentry_sdk
 from asyncpg.exceptions import PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
+from starlette.requests import ClientDisconnect
 
 from artists.composer import ArtistSearchAliasesComposer
 from core.dependencies import get_discogs_cache_service_from_pool
-from discogs.cache_service import DiscogsCacheService
+from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from entity.store import EntityStore
 from generated.api_models import (
     ArtistSearchAliasesBulkRequest,
@@ -31,8 +33,26 @@ from identity.dependencies import get_entity_store
 
 logger = logging.getLogger(__name__)
 
-# Per api.yaml: max 1,000 names per request; over-cap returns 413.
-_BULK_INPUT_CAP = 1000
+
+def _resolve_input_cap() -> int:
+    """Read the names array `max_length` from the generated Pydantic model.
+
+    Drift guard: api.yaml's `maxItems` for `names` drives the generated
+    `ArtistSearchAliasesBulkRequest.names` max_length. The route enforces
+    the cap as 413 before Pydantic validation; sourcing the literal from
+    the model means a future api.yaml change that regenerates the model
+    automatically updates the manual 413 gate. Falls back to 1000 (the
+    current cap) if the metadata shape ever shifts.
+    """
+    for meta in ArtistSearchAliasesBulkRequest.model_fields["names"].metadata:
+        max_length = getattr(meta, "max_length", None)
+        if max_length is not None:
+            return int(max_length)
+    return 1000
+
+
+# Per api.yaml: max names per request; over-cap returns 413.
+_BULK_INPUT_CAP = _resolve_input_cap()
 
 _ROUTE_PATH = "/api/v1/artists/search-aliases/bulk"
 
@@ -54,8 +74,10 @@ router = APIRouter(tags=["artists"])
     summary="Bulk artist-search-alias variants",
     responses={
         200: {"description": "Composed variants per input name."},
+        400: {"description": "Malformed JSON body."},
         401: {"description": "Missing or invalid `LML_API_KEY` bearer token."},
-        413: {"description": "Batch exceeded the 1,000-name cap."},
+        413: {"description": "Batch exceeded the per-request name cap."},
+        422: {"description": "Request body failed Pydantic validation."},
         503: {"description": "Entity store or Discogs cache not available."},
     },
 )
@@ -81,6 +103,15 @@ async def search_aliases_bulk(
         body = await http_request.json()
     except (ValueError, TypeError) as e:
         raise HTTPException(status_code=400, detail=f"Malformed JSON body: {e}") from None
+    except ClientDisconnect:
+        # Client closed the connection before the body completed. There is
+        # no point sending a 5xx — the client is gone — but we want this to
+        # land as a 4xx in logs (the route did its job; the failure is the
+        # client's). Treat as 400 to keep error-class accounting clean.
+        raise HTTPException(
+            status_code=400,
+            detail="Client disconnected before request body completed.",
+        ) from None
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
     names_raw = body.get("names")
@@ -124,17 +155,47 @@ async def search_aliases_bulk(
 
         try:
             response = await composer.compose(request.names)
-        except (PostgresError, OSError):
-            # Fail closed on partial PG failure mid-compose. The two
-            # phases are batched, so a failure here is "the whole batch
-            # didn't make it through PG," not "some names worked." Mirror
-            # the bulk-resolve-libraries 503 posture.
+        except asyncio.CancelledError:
+            # Client aborted mid-compose. Pin 499 on the span so the
+            # trace explorer query
+            # `op:http.server http.status_code:499 description:*search-aliases/bulk*`
+            # surfaces aborts in Sentry — same observability gap LML#430
+            # paid down for the sibling bulk-resolve-libraries route.
+            # CancelledError is re-raised (not converted to HTTPException):
+            # the asyncio cancellation contract requires this, and the
+            # client is gone anyway.
+            http_span.set_data("http.status_code", 499)
+            logger.warning(
+                "artist-search-alias bulk aborted by client: names=%d",
+                names_count,
+            )
+            raise
+        except CacheUnavailableError:
+            # Phase 2: discogs-cache pool/PG failure. Distinct detail string
+            # from the entity-store path so the on-call sees which
+            # subsystem actually failed.
             logger.exception(
-                "Artist-search-alias compose failed against PG (names=%d)",
+                "Discogs cache unavailable during artist-search-alias compose (names=%d)",
+                names_count,
+            )
+            http_span.set_data("http.status_code", 503)
+            raise HTTPException(status_code=503, detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL) from None
+        except (PostgresError, OSError):
+            # Phase 1: entity-store PG failure (raw asyncpg error — not
+            # wrapped). Phase 2 errors are wrapped above; if a PostgresError
+            # reaches here, it came from `bulk_resolve_library_names`.
+            logger.exception(
+                "Entity store query failed during artist-search-alias compose (names=%d)",
                 names_count,
             )
             http_span.set_data("http.status_code", 503)
             raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
+        except Exception:
+            # Pin 500 on the span so unhandled-exception traces still carry
+            # http.status_code for per-route status aggregation. Re-raise
+            # so FastAPI's default handler produces the response.
+            http_span.set_data("http.status_code", 500)
+            raise
 
         http_span.set_data("lml.search_aliases.resolved", len(response.artists))
         http_span.set_data("lml.search_aliases.missing", len(response.missing))
