@@ -255,6 +255,91 @@ class TestFindBestMatch:
         assert best["confidence"] > 0
 
 
+class TestFindBestTypedMatch:
+    """Tests for find_best_typed_match — returns the original typed object."""
+
+    def test_returns_highest_combined_score_original(self):
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        slightly_off = make_discogs_result(
+            release_id=1, album="Aluminium Tunes", artist="Stereolab"
+        )
+        exact = make_discogs_result(release_id=2, album="Aluminum Tunes", artist="Stereolab")
+        best = find_best_typed_match(
+            [slightly_off, exact],
+            query_artist="Stereolab",
+            query_title="Aluminum Tunes",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is exact
+
+    def test_returns_none_when_no_candidate_clears_floor(self):
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        candidates = [
+            make_discogs_result(release_id=1, album="Moon Pix", artist="Cat Power"),
+            make_discogs_result(release_id=2, album="Greatest Hits", artist="Queen"),
+        ]
+        best = find_best_typed_match(
+            candidates,
+            query_artist="Autechre",
+            query_title="Confield",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is None
+
+    def test_returns_none_for_empty_iterable(self):
+        from clients.streaming.matching import find_best_typed_match
+
+        best = find_best_typed_match(
+            [],
+            query_artist="Stereolab",
+            query_title="Aluminum Tunes",
+            artist_fn=lambda r: "",
+            title_fn=lambda r: "",
+        )
+        assert best is None
+
+    def test_handles_none_fields_on_candidate(self):
+        """A candidate whose artist or title extractor returns None scores as 0
+        and is rejected — not raised."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        # DiscogsSearchResult.artist defaults to None; verify it doesn't blow up.
+        broken = make_discogs_result(release_id=1, album="Aluminum Tunes", artist=None)
+        good = make_discogs_result(release_id=2, album="Aluminum Tunes", artist="Stereolab")
+        best = find_best_typed_match(
+            [broken, good],
+            query_artist="Stereolab",
+            query_title="Aluminum Tunes",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is good
+
+    def test_first_result_wins_on_tie(self):
+        """Ties resolve to the first candidate reaching the score — mirrors
+        find_best_match's order-preserving behavior."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        first = make_discogs_result(release_id=1, album="Aluminum Tunes", artist="Stereolab")
+        second = make_discogs_result(release_id=2, album="Aluminum Tunes", artist="Stereolab")
+        best = find_best_typed_match(
+            [first, second],
+            query_artist="Stereolab",
+            query_title="Aluminum Tunes",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is first
+
+
 class TestStripThePrefix:
     @pytest.mark.parametrize(
         "name, expected",

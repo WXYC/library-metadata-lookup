@@ -1213,13 +1213,144 @@ class TestFetchArtworkForItems:
         """When item has no label, label should be None in search request."""
         item = make_library_item(id=1, artist="Cat Power", title="Moon Pix")
 
-        artwork = make_discogs_result(release_id=12345)
+        artwork = make_discogs_result(release_id=12345, album="Moon Pix", artist="Cat Power")
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
 
         await fetch_artwork_for_items([item], mock_discogs_service)
 
         call_args = mock_discogs_service.search.call_args[0][0]
         assert call_args.label is None
+
+    @pytest.mark.asyncio
+    async def test_picks_correct_release_over_misleading_top1(self, mock_discogs_service):
+        """When Discogs's top-1 is the wrong release, the 80/80 floor + score
+        picks the correct one further down. LML#478 — concrete repro:
+        "Hebebeb (Zrag)" by Noura Mint Seymali appears on both *Tzenni* (2014)
+        and *Yenbett* (2025); Discogs's popularity-ranked top-1 isn't always
+        the album the DJ entered."""
+        item = make_library_item(id=1, artist="Noura Mint Seymali", title="Tzenni", format="CD")
+
+        wrong = make_discogs_result(
+            release_id=99991,
+            album="Yenbett",
+            artist="Noura Mint Seymali",
+            artwork_url="https://example.com/yenbett.jpg",
+        )
+        right = make_discogs_result(
+            release_id=12345,
+            album="Tzenni",
+            artist="Noura Mint Seymali",
+            artwork_url="https://example.com/tzenni.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[wrong, right])
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is not None
+        assert results[0][1].release_id == 12345
+        assert results[0][1].album == "Tzenni"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_candidate_clears_floor(self, mock_discogs_service):
+        """When every candidate's artist+album fails the 80/80 floor against
+        the queried item, return None — better than serving wrong artwork
+        confidently. _resolve_fallback_artwork is NOT called (no result)."""
+        item = make_library_item(id=1, artist="Noura Mint Seymali", title="Tzenni", format="CD")
+
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(release_id=1, album="Greatest Hits", artist="Some Other Band"),
+                make_discogs_result(
+                    release_id=2, album="Live in Berlin", artist="Another Wrong Artist"
+                ),
+            ]
+        )
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is None
+        mock_discogs_service.get_release.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_self_titled_scores_against_mutated_album(self, mock_discogs_service):
+        """Self-titled albums stored as "S/t" have `album` mutated to the
+        artist name before the Discogs search; the score must use the mutated
+        value (constraint 4 in LML#478)."""
+        item = make_library_item(id=1, artist="Pavement", title="S/t", format="LP")
+
+        # Candidate album is "Pavement" — matches the mutated album, NOT the raw
+        # "S/t" library title. Without the mutation flowing into the score,
+        # this would fail the 80/80 floor.
+        candidate = make_discogs_result(
+            release_id=555,
+            album="Pavement",
+            artist="Pavement",
+            artwork_url="https://example.com/pavement.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[candidate])
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is not None
+        assert results[0][1].release_id == 555
+
+    @pytest.mark.asyncio
+    async def test_compilation_artist_scores_against_various(self, mock_discogs_service):
+        """Compilation artists ("Various Artists - …") have `artist` mutated
+        to "Various" before the Discogs search; the score must use the
+        mutated value (constraint 4 in LML#478)."""
+        item = make_library_item(
+            id=20, artist="Various Artists - Rock - D", title="Disco Not Disco"
+        )
+
+        candidate = make_discogs_result(
+            release_id=99999,
+            album="Disco Not Disco",
+            artist="Various",
+            artwork_url="https://example.com/disco.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[candidate])
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is not None
+        assert results[0][1].release_id == 99999
+
+    @pytest.mark.asyncio
+    async def test_picks_higher_combined_score_among_acceptable_candidates(
+        self, mock_discogs_service
+    ):
+        """When multiple candidates clear the 80/80 floor, pick the one with
+        the highest combined (artist + title) score — regardless of Discogs's
+        ordering."""
+        item = make_library_item(id=1, artist="Stereolab", title="Aluminum Tunes", format="CD")
+
+        # Both candidates pass 80/80 but the second is a near-perfect match.
+        slightly_off = make_discogs_result(
+            release_id=1,
+            album="Aluminium Tunes",  # British spelling, off by one char
+            artist="Stereolab",
+            artwork_url="https://example.com/off.jpg",
+        )
+        exact = make_discogs_result(
+            release_id=2,
+            album="Aluminum Tunes",
+            artist="Stereolab",
+            artwork_url="https://example.com/exact.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[slightly_off, exact]
+        )
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is not None
+        assert results[0][1].release_id == 2
 
 
 class TestFetchArtworkFallback:
@@ -1231,7 +1362,11 @@ class TestFetchArtworkFallback:
         items = [make_library_item(id=1, artist="Autechre", title="Confield")]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
-            results=[make_discogs_result(release_id=28138, artwork_url=None)]
+            results=[
+                make_discogs_result(
+                    release_id=28138, album="Confield", artist="Autechre", artwork_url=None
+                )
+            ]
         )
         mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
             release_id=28138,
@@ -1257,7 +1392,11 @@ class TestFetchArtworkFallback:
         items = [make_library_item(id=1, artist="Autechre", title="Confield")]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
-            results=[make_discogs_result(release_id=28138, artwork_url=None)]
+            results=[
+                make_discogs_result(
+                    release_id=28138, album="Confield", artist="Autechre", artwork_url=None
+                )
+            ]
         )
         mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
             release_id=28138,
@@ -1286,6 +1425,8 @@ class TestFetchArtworkFallback:
             results=[
                 make_discogs_result(
                     release_id=28138,
+                    album="Confield",
+                    artist="Autechre",
                     artwork_url="https://i.discogs.com/cover.jpg",
                 )
             ]
@@ -1305,7 +1446,11 @@ class TestFetchArtworkFallback:
         items = [make_library_item(id=1, artist="Autechre", title="Confield")]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
-            results=[make_discogs_result(release_id=28138, artwork_url=None)]
+            results=[
+                make_discogs_result(
+                    release_id=28138, album="Confield", artist="Autechre", artwork_url=None
+                )
+            ]
         )
         mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
             release_id=28138,
@@ -1326,7 +1471,11 @@ class TestFetchArtworkFallback:
         items = [make_library_item(id=1, artist="Autechre", title="Confield")]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
-            results=[make_discogs_result(release_id=28138, artwork_url=None)]
+            results=[
+                make_discogs_result(
+                    release_id=28138, album="Confield", artist="Autechre", artwork_url=None
+                )
+            ]
         )
         mock_discogs_service.get_release.return_value = None
 
@@ -1347,7 +1496,11 @@ class TestFetchArtworkFallback:
         items = [make_library_item(id=1, artist="Autechre", title="Confield")]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
-            results=[make_discogs_result(release_id=28138, artwork_url=None)]
+            results=[
+                make_discogs_result(
+                    release_id=28138, album="Confield", artist="Autechre", artwork_url=None
+                )
+            ]
         )
         mock_discogs_service.get_release.return_value = ReleaseMetadataResponse(
             release_id=28138,
