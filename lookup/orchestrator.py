@@ -1613,16 +1613,31 @@ async def fetch_artwork_for_items(
                     format=map_library_format_to_discogs(item.format),
                 )
             )
-            # Score candidates against the post-mutation artist/album the
-            # search consumed (the is_self_titled / is_compilation_artist
-            # rewrites flow through here). Falls back to None — better than
-            # serving wrong artwork for releases that share a title across
-            # multiple albums (LML#478, e.g. Noura Mint Seymali's "Hebebeb
-            # (Zrag)" on both *Tzenni* and *Yenbett*).
+            # Score candidates against (artist, album) with an 80/80 floor.
+            # Returns None when nothing clears — better than serving wrong
+            # artwork for releases that share a title across multiple albums
+            # (LML#478, e.g. Noura Mint Seymali's "Hebebeb (Zrag)" on both
+            # *Tzenni* and *Yenbett*).
+            #
+            # Query variants:
+            # - Artist: "Various" is the form Discogs's search endpoint
+            #   accepts, but Discogs's canonical artist field for compilations
+            #   is often "Various Artists" (sometimes with a "(N)" disambig
+            #   suffix). Score against both.
+            # - Album: when discogs_titles[item.id] overrides the library
+            #   title with a long Discogs-canonical form (compilation rescue
+            #   path), Discogs's own search results may carry just the short
+            #   library-side title. Score against both.
+            artist_variants = [artist]
+            if artist == "Various":
+                artist_variants.append("Various Artists")
+            album_variants = [album or ""]
+            if item.title and item.title != album:
+                album_variants.append(item.title)
             result = find_best_typed_match(
                 response.results,
-                query_artist=artist,
-                query_title=album or "",
+                query_artist=artist_variants,
+                query_title=album_variants,
                 artist_fn=lambda r: r.artist,
                 title_fn=lambda r: r.album,
             )

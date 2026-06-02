@@ -198,8 +198,8 @@ def find_best_match(
 def find_best_typed_match[T](
     results: Iterable[T],
     *,
-    query_artist: str,
-    query_title: str,
+    query_artist: str | Iterable[str],
+    query_title: str | Iterable[str],
     artist_fn: Callable[[T], str | None],
     title_fn: Callable[[T], str | None],
 ) -> T | None:
@@ -208,17 +208,38 @@ def find_best_typed_match[T](
     Sibling of ``find_best_match`` that returns the **original typed object**
     instead of a flattened streaming-URL dict. Use when the caller wants the
     matched candidate's full payload (e.g. a ``DiscogsSearchResult``) rather
-    than a normalized URL pair. None-valued extractors score as 0 against
-    any non-empty query; ties resolve to the first candidate reaching the
-    score, preserving input order.
+    than a normalized URL pair.
+
+    ``query_artist`` and ``query_title`` accept either a string or an iterable
+    of variant strings. When an iterable is passed, the candidate is scored
+    against each variant and the max score is used. This is the natural shape
+    for cases where the search query and the canonical-form a candidate
+    surfaces with are known to differ (e.g. "Various" search query vs.
+    "Various Artists" canonical artist; a ``discogs_titles`` long-canonical
+    override paired against the raw library title).
+
+    Empty query strings short-circuit to no-match — ``score_match("", "")``
+    returns 100 by ``rapidfuzz`` convention, which would let candidates with
+    null artist/title fields trivially pass the floor. Any variant that's
+    empty is dropped from the scoring set; if no non-empty variant survives,
+    the result is rejected.
+
+    None-valued extractors score as 0 against any non-empty query. Ties
+    resolve to the first candidate reaching the score, preserving input
+    order.
     """
+    artist_variants = [v for v in _as_variants(query_artist) if v]
+    title_variants = [v for v in _as_variants(query_title) if v]
+    if not artist_variants or not title_variants:
+        return None
+
     best: T | None = None
     best_score = 0.0
     for item in results:
         r_artist = artist_fn(item) or ""
         r_title = title_fn(item) or ""
-        artist_score = score_match(query_artist, r_artist)
-        title_score = score_match(query_title, r_title)
+        artist_score = max(score_match(q, r_artist) for q in artist_variants)
+        title_score = max(score_match(q, r_title) for q in title_variants)
         if not is_acceptable_match(artist_score, title_score):
             continue
         combined = (artist_score + title_score) / 2
@@ -226,6 +247,13 @@ def find_best_typed_match[T](
             best_score = combined
             best = item
     return best
+
+
+def _as_variants(query: str | Iterable[str]) -> list[str]:
+    """Normalize a query into a list of candidate strings."""
+    if isinstance(query, str):
+        return [query]
+    return list(query)
 
 
 def find_best_source_match(

@@ -339,6 +339,96 @@ class TestFindBestTypedMatch:
         )
         assert best is first
 
+    def test_query_artist_accepts_variant_list_and_takes_max(self):
+        """When the search-query form ('Various') differs from the canonical
+        form Discogs returns ('Various Artists'), passing both variants lets
+        the score clear the floor — score_match('Various', 'Various Artists')
+        is 63.6, but score_match('Various Artists', 'Various Artists') is
+        100, and the max wins."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        candidate = make_discogs_result(
+            release_id=42, album="Disco Not Disco", artist="Various Artists"
+        )
+        best = find_best_typed_match(
+            [candidate],
+            query_artist=["Various", "Various Artists"],
+            query_title="Disco Not Disco",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is candidate
+
+    def test_query_title_accepts_variant_list_and_takes_max(self):
+        """When the search-query form (a long canonical title) differs from
+        the form the candidate carries (short library title), passing both
+        variants lets the score clear the floor."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        candidate = make_discogs_result(release_id=42, album="Disco Not Disco", artist="Various")
+        best = find_best_typed_match(
+            [candidate],
+            query_artist="Various",
+            query_title=[
+                "Disco Not Disco (Post Punk, Electro & Leftfield Disco Classics)",
+                "Disco Not Disco",
+            ],
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is candidate
+
+    def test_returns_none_when_query_artist_is_empty_string(self):
+        """score_match('','') returns 100 by rapidfuzz convention. Without a
+        guard, a candidate with r.artist=None (coerced to '') and r.album=''
+        would trivially clear 100/100 against an empty query. Defense against
+        sparse library rows + malformed Discogs candidates."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        # Both candidate fields parse as empty/None.
+        junk = make_discogs_result(release_id=99, album="", artist=None)
+        best = find_best_typed_match(
+            [junk],
+            query_artist="",
+            query_title="Aluminum Tunes",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is None
+
+    def test_returns_none_when_query_title_is_empty_string(self):
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        junk = make_discogs_result(release_id=99, album=None, artist="")
+        best = find_best_typed_match(
+            [junk],
+            query_artist="Stereolab",
+            query_title="",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is None
+
+    def test_returns_none_when_every_variant_is_empty(self):
+        """Variant lists with only empty strings are equivalent to an empty
+        query and short-circuit to no-match."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        junk = make_discogs_result(release_id=99, album="", artist="")
+        best = find_best_typed_match(
+            [junk],
+            query_artist=["", ""],
+            query_title="Foo",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is None
+
 
 class TestStripThePrefix:
     @pytest.mark.parametrize(
