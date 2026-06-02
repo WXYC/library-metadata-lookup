@@ -59,6 +59,8 @@ from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
 from discogs.service import DiscogsService
 from library.db import LibraryDB
 from lookup.orchestrator import (
+    COMPILATION_ARTIST_CANONICAL_FORM,
+    COMPILATION_ARTIST_SEARCH_FORM,
     is_self_titled,
     map_library_format_to_discogs,
 )
@@ -102,13 +104,13 @@ def build_query(item: SampledItem) -> QueryShape:
 
     artist = item.alternate_artist_name or item.artist or ""
     if is_compilation_artist(artist):
-        artist = "Various"
+        artist = COMPILATION_ARTIST_SEARCH_FORM
 
     artist_variants = [artist]
-    if artist == "Various":
-        artist_variants.append("Various Artists")
+    if artist == COMPILATION_ARTIST_SEARCH_FORM:
+        artist_variants.append(COMPILATION_ARTIST_CANONICAL_FORM)
     album_variants = [album or ""]
-    if item.title and item.title != album:
+    if item.title and item.title != album and not is_self_titled(item.title):
         album_variants.append(item.title)
 
     return QueryShape(
@@ -210,6 +212,7 @@ async def run(args: argparse.Namespace) -> None:
     flipped_to_different = 0
     same_pick = 0
     no_results = 0
+    search_failed = 0
 
     try:
         items = await sample_library_items(library_db, args.sample)
@@ -247,6 +250,23 @@ async def run(args: argparse.Namespace) -> None:
                     )
                 except Exception as e:
                     logger.warning("search failed for id=%s: %s", item.library_id, e)
+                    search_failed += 1
+                    writer.writerow(
+                        [
+                            item.library_id,
+                            item.artist,
+                            item.title,
+                            item.alternate_artist_name or "",
+                            query.search_artist,
+                            query.search_album,
+                            "",
+                            "",
+                            "search_failed",
+                            "",
+                            "",
+                            "",
+                        ]
+                    )
                     continue
 
                 old_pick, new_pick, a_score, t_score, best = classify(response.results, query)
@@ -308,6 +328,7 @@ async def run(args: argparse.Namespace) -> None:
             100 * flipped_to_different / denom,
         )
         logger.info("  no results:          %d (excluded from rates)", no_results)
+        logger.info("  search failed:       %d (excluded from rates)", search_failed)
         logger.info("CSV: %s", csv_path)
     finally:
         await service.close()

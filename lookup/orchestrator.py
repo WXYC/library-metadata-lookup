@@ -76,15 +76,19 @@ MAX_SEARCH_RESULTS = 5
 SELF_TITLED_PATTERNS = frozenset({"s/t", "s.t.", "self-titled", "self titled"})
 """Common abbreviations for self-titled albums (case-insensitive exact match)."""
 
-_COMPILATION_ARTIST_SEARCH_FORM = "Various"
+COMPILATION_ARTIST_SEARCH_FORM = "Various"
 """The bare form Discogs's search endpoint accepts for compilation artists."""
 
-_COMPILATION_ARTIST_CANONICAL_FORM = "Various Artists"
+COMPILATION_ARTIST_CANONICAL_FORM = "Various Artists"
 """The full form Discogs's response payloads typically carry. Kept paired with
-``_COMPILATION_ARTIST_SEARCH_FORM`` for the variant-scoring path in
+``COMPILATION_ARTIST_SEARCH_FORM`` for the variant-scoring path in
 ``fetch_artwork_for_items``; any change to one MUST change the other or
 ``score_match("Various","Various Artists")=63.6`` will start flipping
-compilations to None at the 80/80 floor (LML#478 round-2 finding)."""
+compilations to None at the 80/80 floor (LML#478 round-2 finding).
+
+Module-public (no underscore prefix) so ``scripts/measure_artwork_match_floor.py``
+can import the same constants the runtime path uses — keeping the
+measurement's compilation handling provably-aligned with production."""
 
 _WARM_CACHE_CONCURRENCY: int = 4
 """Process-wide cap on concurrent bio cache-warm tasks.
@@ -1613,7 +1617,7 @@ async def fetch_artwork_for_items(
 
             artist = item.alternate_artist_name or item.artist or ""
             if is_compilation_artist(artist):
-                artist = _COMPILATION_ARTIST_SEARCH_FORM
+                artist = COMPILATION_ARTIST_SEARCH_FORM
 
             response = await discogs_service.search(
                 DiscogsSearchRequest(
@@ -1646,8 +1650,8 @@ async def fetch_artwork_for_items(
             #   let a wrong-release candidate with album="S/t" clear the
             #   floor trivially.
             artist_variants = [artist]
-            if artist == _COMPILATION_ARTIST_SEARCH_FORM:
-                artist_variants.append(_COMPILATION_ARTIST_CANONICAL_FORM)
+            if artist == COMPILATION_ARTIST_SEARCH_FORM:
+                artist_variants.append(COMPILATION_ARTIST_CANONICAL_FORM)
             album_variants = [album or ""]
             if item.title and item.title != album and not is_self_titled(item.title):
                 album_variants.append(item.title)
