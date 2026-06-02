@@ -1023,16 +1023,22 @@ class DiscogsCacheService:
     async def get_artist_details_bulk(self, artist_ids: list[int]) -> dict[int, ArtistDetails]:
         """Batched cache-only read of full artist details across many ids.
 
-        Used by the artist-search-alias bulk endpoint (PR 2, Phase 2). 5
+        Used by the artist-search-alias bulk endpoint (PR 2, Phase 2). 4
         PG round-trips per call regardless of input cardinality — one per
-        table — each binding the input list via `WHERE ... = ANY($1)`.
-        All four child tables have a B-tree index on `artist_id`, so each
-        leg stays index-driven even at the per-batch ceiling of ~125
-        ids.
+        relevant table (`artist`, `artist_alias`, `artist_name_variation`,
+        `artist_member`) — each binding the input list via
+        `WHERE ... = ANY($1)`. All three child tables have a B-tree index
+        on `artist_id`, so each leg stays index-driven even at the per-
+        batch ceiling of ~125 ids.
 
-        Returns a dict keyed by Discogs artist id. Cache-miss ids are
-        absent from the returned dict (never None-valued). Empty input
-        returns an empty dict without querying.
+        Returns a dict keyed by Discogs artist id with `urls=[]` — the
+        `artist_url` table is NOT queried because the artist-search-alias
+        composer doesn't read `details.urls`, and skipping the fetch
+        saves one PG round-trip per call. Extend with a kwarg if a
+        future caller needs URLs.
+
+        Cache-miss ids are absent from the returned dict (never
+        None-valued). Empty input returns an empty dict without querying.
 
         Cache-only — no Discogs API escalation, no rate-limit semaphore
         acquire. Callers wanting the API fall-through should still use
@@ -1047,7 +1053,6 @@ class DiscogsCacheService:
                 alias_rows,
                 nv_rows,
                 member_rows,
-                url_rows,
             ) = await asyncio.gather(
                 self.pool.fetch(
                     "SELECT id, name, profile, image_url FROM artist WHERE id = ANY($1::int[])",
@@ -1066,10 +1071,6 @@ class DiscogsCacheService:
                 self.pool.fetch(
                     "SELECT artist_id, member_id, member_name, active "
                     "FROM artist_member WHERE artist_id = ANY($1::int[])",
-                    artist_ids,
-                ),
-                self.pool.fetch(
-                    "SELECT artist_id, url FROM artist_url WHERE artist_id = ANY($1::int[])",
                     artist_ids,
                 ),
             )
@@ -1094,10 +1095,6 @@ class DiscogsCacheService:
                         active=row["active"],
                     )
                 )
-            urls_by_id: dict[int, list[str]] = {}
-            for row in url_rows:
-                urls_by_id.setdefault(row["artist_id"], []).append(row["url"])
-
             result: dict[int, ArtistDetails] = {}
             for row in artist_rows:
                 artist_id = row["id"]
@@ -1109,7 +1106,7 @@ class DiscogsCacheService:
                     aliases=aliases_by_id.get(artist_id, []),
                     name_variations=nvs_by_id.get(artist_id, []),
                     members=members_by_id.get(artist_id, []),
-                    urls=urls_by_id.get(artist_id, []),
+                    urls=[],
                     cached=True,
                 )
             return result

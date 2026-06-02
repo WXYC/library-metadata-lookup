@@ -44,10 +44,32 @@ async def set_up_schemas(pg_pool):
     Mirrors ``tests/integration/test_bulk_resolve_libraries.py`` for the
     entity side, then adds the discogs-cache children. The composer
     queries ``artist``, ``artist_alias``, ``artist_name_variation``,
-    ``artist_member``, ``artist_url`` in the default (public) schema —
-    same shape as the production discogs-cache.
+    ``artist_member`` in the default (public) schema — same shape as
+    the production discogs-cache.
+
+    SAFETY: this fixture DROPs the public-schema `artist` (and child)
+    tables. The default ``DATABASE_URL_TEST`` (``postgresql://discogs:
+    discogs@localhost:5433/discogs``) points at the developer's local
+    discogs-cache. If that cache is populated (a real discogs-cache
+    rebuild produces tens of GB and takes hours), wiping it is
+    catastrophic. We refuse to run when public.artist has any rows, so
+    the operator must point ``DATABASE_URL_TEST`` at a clean DB before
+    these tests will execute.
     """
     async with pg_pool.acquire() as conn:
+        artist_exists = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name = 'artist')"
+        )
+        if artist_exists:
+            existing_rows = await conn.fetchval("SELECT COUNT(*) FROM artist")
+            if existing_rows and existing_rows > 0:
+                pytest.skip(
+                    f"DATABASE_URL_TEST points at a populated discogs-cache "
+                    f"({existing_rows} rows in `public.artist`). Refusing to "
+                    "DROP and recreate the cache tables — point "
+                    "DATABASE_URL_TEST at a clean PG before running this suite."
+                )
         await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
         await conn.execute("CREATE SCHEMA entity")
         await conn.execute("""

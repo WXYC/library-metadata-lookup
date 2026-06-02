@@ -108,11 +108,25 @@ class ArtistSearchAliasesComposer:
         including identities that resolved but yielded no variants (in
         which case `sources_present` still records the legs the composer
         ran, per the reconcile contract).
+
+        Duplicate input names are deduped (first-occurrence wins):
+        callers that pass the same name multiple times get exactly one
+        `ArtistSearchAliasesResult` per unique input, in first-seen
+        order. A consumer that UPSERTs by name on its side never has to
+        worry about overwriting itself.
         """
+        # Dedup inputs preserving first-occurrence order.
+        seen: set[str] = set()
+        unique_names: list[str] = []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                unique_names.append(n)
+
         # ---- Phase 1: batched entity.identity fall-through. ----
         identities_by_name: dict[
             str, Identity
-        ] = await self.entity_store.bulk_resolve_library_names(names)
+        ] = await self.entity_store.bulk_resolve_library_names(unique_names)
 
         # ---- Phase 2: batched discogs-cache reads on the union of known
         # discogs_artist_ids. Skip the whole phase when there are none —
@@ -134,7 +148,7 @@ class ArtistSearchAliasesComposer:
         # ---- Assemble per-input results in input order. ----
         artists: list[ArtistSearchAliasesResult] = []
         missing: list[str] = []
-        for name in names:
+        for name in unique_names:
             identity = identities_by_name.get(name)
             if identity is None:
                 missing.append(name)

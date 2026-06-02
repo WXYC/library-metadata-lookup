@@ -179,20 +179,28 @@ FROM entity.identity
 WHERE library_name = ANY($1::text[])\
 """
 
-# Batched form of leg 2 (case-insensitive). Seq-scans ~24k rows once,
-# matching every stored row whose LOWER form is in the input-lower list.
-# `LOWER(library_name)` is computed per-row; for ambiguous ties two
-# stored rows may share a lower form (the UNIQUE constraint is case-
-# sensitive), so the caller picks the lowest id per LOWER-key — matching
-# the per-call `ORDER BY id ASC + LIMIT 1` tie-break in
-# `_GET_IDENTITY_LOWER_SQL`.
+# Batched form of leg 2 (case-insensitive). PG lowers both the stored
+# `library_name` AND each bind via `JOIN unnest(...)` so the comparison
+# is locale-symmetric — Python `str.lower()` and PG `LOWER()` can
+# disagree on Unicode locale edge cases (Turkish dotted I `İ`, capital
+# sharp S `ẞ`, Greek final sigma); the per-call `_GET_IDENTITY_LOWER_SQL`
+# already PG-lowers both sides via `LOWER($1)`, so this matches that
+# invariant. Returning `input_name` lets the caller map results back to
+# the bind without re-keying via Python `.lower()` (which would re-
+# introduce the asymmetry).
+#
+# `DISTINCT ON (LOWER(bind.name))` + `ORDER BY ... id ASC` picks the
+# lowest stored id when two rows share a LOWER form, matching the per-
+# call's `ORDER BY id ASC LIMIT 1` tie-break.
 _BULK_GET_IDENTITY_LOWER_SQL = """\
-SELECT id, library_name, discogs_artist_id, wikidata_qid,
-       musicbrainz_artist_id, spotify_artist_id,
-       apple_music_artist_id, bandcamp_id, reconciliation_status
-FROM entity.identity
-WHERE LOWER(library_name) = ANY($1::text[])
-ORDER BY id ASC\
+SELECT DISTINCT ON (LOWER(bind.name))
+    i.id, i.library_name, i.discogs_artist_id, i.wikidata_qid,
+    i.musicbrainz_artist_id, i.spotify_artist_id,
+    i.apple_music_artist_id, i.bandcamp_id, i.reconciliation_status,
+    bind.name AS input_name
+FROM entity.identity i
+JOIN unnest($1::text[]) AS bind(name) ON LOWER(i.library_name) = LOWER(bind.name)
+ORDER BY LOWER(bind.name), i.id ASC\
 """
 
 # Most-recent reconciliation log row per source for a given identity.
@@ -549,18 +557,28 @@ class EntityStore:
         maintaining their own reverse-index. Names that miss all three
         legs are absent from the dict — they are never None-valued.
 
+        Empty inputs after NUL-strip are skipped from binds entirely
+        (entity.identity's UNIQUE on library_name plus the discogs-etl
+        seed contract effectively rule out an empty stored value).
+
         Legs:
 
         1. **Exact** — `library_name = ANY($input_verbatim)`. Uses the
            unique index. Catches the dominant case (99.8% of stored rows
            per the #276 audit are verbatim).
-        2. **LOWER** — `LOWER(library_name) = ANY($input_lower)`. Catches
-           pure case drift. For ambiguous case-collisions (two stored
-           rows sharing the same lower form), the lowest stored id wins,
-           matching the per-call tie-break in `_GET_IDENTITY_LOWER_SQL`.
+        2. **LOWER (PG-on-both-sides)** — `LOWER(library_name) =
+           LOWER(bind.name)` via `JOIN unnest($1::text[])`. PG lowers both
+           sides so the comparison is locale-symmetric (Turkish dotted I,
+           sharp S, Greek final sigma agree with the per-call form). For
+           case-collisions, the lowest stored id wins via `DISTINCT ON +
+           ORDER BY ... id ASC`.
         3. **Canonical** — `library_name = ANY($input_canonical)`.
            Catches inputs whose canonical form equals a stored canonical
-           row.
+           row. Runs whenever canonical differs from verbatim (the
+           per-call's additional `!= verbatim.lower()` short-circuit is
+           dropped here because Python `.lower()` and PG `LOWER()` can
+           disagree, making the short-circuit wrongly skip legs in
+           Unicode-locale-edge cases).
         """
         if not names:
             return {}
@@ -579,54 +597,56 @@ class EntityStore:
         results: dict[str, Identity] = {}
 
         # ---- Leg 1: exact match on the unique index. ----
-        leg_1_binds = list({verbatim_by_input[n] for n in names})
-        leg_1_rows = await self._pg.fetchall(_BULK_GET_IDENTITY_EXACT_SQL, leg_1_binds)
-        leg_1_by_lib: dict[str, Identity] = {
-            row["library_name"]: _record_to_identity(row) for row in leg_1_rows
-        }
-        for raw_name in names:
-            verbatim = verbatim_by_input[raw_name]
-            if verbatim in leg_1_by_lib:
-                results[raw_name] = leg_1_by_lib[verbatim]
+        # Drop empty-string binds — entity.identity.library_name is
+        # NOT NULL UNIQUE and the discogs-etl seed never writes "".
+        leg_1_binds = [v for v in {verbatim_by_input[n] for n in names} if v]
+        if leg_1_binds:
+            leg_1_rows = await self._pg.fetchall(_BULK_GET_IDENTITY_EXACT_SQL, leg_1_binds)
+            leg_1_by_lib: dict[str, Identity] = {
+                row["library_name"]: _record_to_identity(row) for row in leg_1_rows
+            }
+            for raw_name in names:
+                verbatim = verbatim_by_input[raw_name]
+                if verbatim and verbatim in leg_1_by_lib:
+                    results[raw_name] = leg_1_by_lib[verbatim]
 
-        residual = [n for n in names if n not in results]
+        residual = [n for n in names if n not in results and verbatim_by_input[n]]
         if not residual:
             return results
 
-        # ---- Leg 2: LOWER(library_name) match on residual. ----
-        # Bind the LOWER forms of the residual inputs; result rows are
-        # stored-verbatim rows whose lower-form matches one of those
-        # binds. Pair back to inputs by LOWER key. On ambiguous ties (two
-        # stored rows sharing one lower form), the SQL's `ORDER BY id
-        # ASC` makes the iteration order deterministic — we set-once.
-        leg_2_binds = list({verbatim_by_input[n].lower() for n in residual})
+        # ---- Leg 2: PG-side LOWER on both sides via JOIN unnest. ----
+        # Bind the verbatim inputs (not Python-lowered); SQL lowers them
+        # on the PG side. The returned `input_name` column carries the
+        # matching bind so we map results to inputs without re-keying
+        # via Python `.lower()` (which is what reintroduced the
+        # Python/PG-LOWER asymmetry pre-fix).
+        leg_2_binds = list({verbatim_by_input[n] for n in residual})
         leg_2_rows = await self._pg.fetchall(_BULK_GET_IDENTITY_LOWER_SQL, leg_2_binds)
-        leg_2_by_lower: dict[str, Identity] = {}
-        for row in leg_2_rows:
-            key = row["library_name"].lower()
-            # Lowest id wins on case-collision ties (rows come back in
-            # ASC id order).
-            if key not in leg_2_by_lower:
-                leg_2_by_lower[key] = _record_to_identity(row)
+        leg_2_by_bind: dict[str, Identity] = {
+            row["input_name"]: _record_to_identity(row) for row in leg_2_rows
+        }
         for raw_name in residual:
-            lower = verbatim_by_input[raw_name].lower()
-            if lower in leg_2_by_lower:
-                results[raw_name] = leg_2_by_lower[lower]
+            verbatim = verbatim_by_input[raw_name]
+            if verbatim in leg_2_by_bind:
+                results[raw_name] = leg_2_by_bind[verbatim]
 
-        residual = [n for n in names if n not in results]
+        residual = [n for n in names if n not in results and verbatim_by_input[n]]
         if not residual:
             return results
 
         # ---- Leg 3: canonical-form exact match on residual. ----
-        # Skip the canonical bind when it duplicates a previous leg's
-        # bind for this input (leg 2 already covered the lower-form
-        # space). The per-call resolve_library_name short-circuits the
-        # same way.
+        # Skip the canonical bind only when it duplicates leg 1's
+        # verbatim bind (no value to running an identical query). We do
+        # NOT compare canonical to `verbatim.lower()` here — the per-
+        # call form does that, but the comparison assumes Python and PG
+        # agree on LOWER, which they may not for Unicode-locale edge
+        # cases; the asymmetric short-circuit would skip leg 3 even when
+        # leg 2's PG-LOWER missed.
         canonical_by_input: dict[str, str] = {}
         for raw_name in residual:
             verbatim = verbatim_by_input[raw_name]
             canonical = canonicalize_for_identity_lookup(verbatim)
-            if canonical and canonical != verbatim and canonical != verbatim.lower():
+            if canonical and canonical != verbatim:
                 canonical_by_input[raw_name] = canonical
         if not canonical_by_input:
             return results

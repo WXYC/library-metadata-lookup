@@ -5,9 +5,10 @@ artist-search-alias plan PR 2 composer.
 
 Contract:
 
-- 5 PG round-trips per call (one per child table: ``artist``,
-  ``artist_alias``, ``artist_name_variation``, ``artist_member``,
-  ``artist_url``), each ``WHERE artist_id = ANY($1::int[])``.
+- 4 PG round-trips per call (one per table consulted: ``artist``,
+  ``artist_alias``, ``artist_name_variation``, ``artist_member``),
+  each ``WHERE artist_id = ANY($1::int[])``. ``artist_url`` is NOT
+  queried — the composer doesn't read ``details.urls``.
 - Returns ``dict[int, ArtistDetails]`` keyed by discogs artist id.
 - Cache-miss artist ids are absent from the returned dict (never
   None-valued).
@@ -113,15 +114,26 @@ class TestGetArtistDetailsBulk:
         assert 99999 not in result
 
     @pytest.mark.asyncio
-    async def test_exactly_five_pg_round_trips(self, cache_service, mock_asyncpg_pool):
-        """The bulk read is 5 PG calls regardless of input cardinality.
+    async def test_exactly_four_pg_round_trips(self, cache_service, mock_asyncpg_pool):
+        """The bulk read is 4 PG calls regardless of input cardinality.
 
-        Pins the cost contract from the plan: a 1000-id batch is 5 round-
-        trips, not 5000.
+        Pins the cost contract: a 1000-id batch is 4 round-trips, not
+        5000. `artist_url` is intentionally NOT queried — the artist-
+        search-alias composer never reads `details.urls`, so the bulk
+        method skips that fetch.
         """
         mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
         await cache_service.get_artist_details_bulk(list(range(100)))
-        assert mock_asyncpg_pool.fetch.await_count == 5
+        assert mock_asyncpg_pool.fetch.await_count == 4
+
+    @pytest.mark.asyncio
+    async def test_artist_url_table_not_queried(self, cache_service, mock_asyncpg_pool):
+        """artist_url is not in the gather; bulk variant skips it deliberately."""
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        await cache_service.get_artist_details_bulk([2154])
+        all_sql = [call[0][0] for call in mock_asyncpg_pool.fetch.await_args_list]
+        # No fetch over artist_url.
+        assert not any("FROM artist_url" in sql for sql in all_sql)
 
     @pytest.mark.asyncio
     async def test_input_order_does_not_affect_output_contents(

@@ -49,6 +49,11 @@ def _row(library_name: str, **overrides):
     }
 
 
+def _leg2_row(input_name: str, library_name: str, **overrides):
+    """Leg 2 row shape — includes the JOIN'd `input_name` column."""
+    return _row(library_name, input_name=input_name, **overrides)
+
+
 class TestBulkResolveLibraryNames:
     @pytest.mark.asyncio
     async def test_empty_input_returns_empty_dict_without_querying(self, store, mock_pg):
@@ -79,12 +84,13 @@ class TestBulkResolveLibraryNames:
             side_effect=[
                 # Leg 1: only the verbatim-cased input hits.
                 [_row("Stereolab", id=1, discogs_artist_id=2154)],
-                # Leg 2: LOWER('stereolab') = LOWER(stored 'Stereolab') hits.
-                [_row("Stereolab", id=1, discogs_artist_id=2154)],
+                # Leg 2: `JOIN unnest(...)` pairs input='stereolab' against
+                # stored 'Stereolab' (PG `LOWER(stored) = LOWER(bind)`).
+                # Returned row carries the matching bind as `input_name`.
+                [_leg2_row("stereolab", "Stereolab", id=1, discogs_artist_id=2154)],
             ]
         )
-        # Map of input → stored canonical/lower used by the leg 2 bind. Tests
-        # the contract that the dict is keyed by INPUT name, not stored shape.
+        # Tests the contract that the dict is keyed by INPUT name, not stored shape.
         result = await store.bulk_resolve_library_names(["Stereolab", "stereolab"])
         assert mock_pg.fetchall.await_count == 2
         assert set(result.keys()) == {"Stereolab", "stereolab"}
@@ -131,7 +137,7 @@ class TestBulkResolveLibraryNames:
         mock_pg.fetchall = AsyncMock(
             side_effect=[
                 [_row("Stereolab", id=1, discogs_artist_id=2154)],
-                [_row("Juana Molina", id=2, discogs_artist_id=305253)],
+                [_leg2_row("juana molina", "Juana Molina", id=2, discogs_artist_id=305253)],
                 [],
             ]
         )
@@ -165,7 +171,10 @@ class TestBulkResolveLibraryNames:
         mock_pg.fetchall = AsyncMock(
             side_effect=[
                 [],  # leg 1: 'stereolab' verbatim misses
-                [_row("Stereolab", id=1, discogs_artist_id=2154)],  # leg 2: LOWER hits
+                # leg 2: PG-side LOWER pairs the input bind 'stereolab'
+                # against stored 'Stereolab'; row's `input_name` column
+                # carries the matching bind.
+                [_leg2_row("stereolab", "Stereolab", id=1, discogs_artist_id=2154)],
             ]
         )
         result = await store.bulk_resolve_library_names(["stereolab"])
