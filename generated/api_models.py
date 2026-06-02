@@ -1022,6 +1022,66 @@ class BulkResolveLibrariesResponse(BaseModel):
     cache_stats: CacheStats | None = None
 
 
+class ArtistSearchAliasSource(StrEnum):
+    discogs_name_variation = "discogs_name_variation"
+    discogs_alias = "discogs_alias"
+    discogs_member = "discogs_member"
+    wxyc_library_alt = "wxyc_library_alt"
+
+
+class ArtistSearchAliasMethod(StrEnum):
+    name_variation = "name_variation"
+    alias = "alias"
+    member = "member"
+    alt_curated = "alt_curated"
+
+
+class ArtistSearchAliasVariant(BaseModel):
+    source: ArtistSearchAliasSource
+    variant: str = Field(..., description='The searchable string (e.g. "Thee Oh Sees").')
+    related_external_id: str | None = Field(
+        None,
+        description='For alias / member kinds, the namespaced source-side id of the related artist (e.g. "discogs:artist:67890", "musicbrainz:artist:<mbid>"). NULL for name_variation and alt_curated.\n',
+    )
+    related_name: str | None = Field(
+        None,
+        description="For alias / member kinds, the canonical name of the related artist as the source records it. NULL otherwise.\n",
+    )
+    active: bool | None = Field(
+        None,
+        description="For member kind only — Discogs records active/inactive band membership. NULL for other kinds.\n",
+    )
+    method: ArtistSearchAliasMethod
+    confidence: confloat(ge=0.0, le=1.0) = Field(
+        ...,
+        description="Per-source default confidence (e.g. 0.95 for discogs_name_variation, 0.85 for discogs_alias / wxyc_library_alt, 0.70 for discogs_member). v1 search ignores this; stored for v2 ranking calibration.\n",
+    )
+
+
+class ArtistSearchAliasesResult(BaseModel):
+    name: str = Field(..., description="The WXYC canonical artist name from the request.")
+    variants: list[ArtistSearchAliasVariant]
+    sources_present: list[ArtistSearchAliasSource] = Field(
+        ...,
+        description="Sources the composer actually queried for this artist. A source appears here iff the composer reached its fetch code path — independent of whether that path produced any variants. Consumers use this to scope reconciliation: only delete cached rows whose `source` is listed here. Sources skipped because of missing prerequisites (e.g., no `discogs_artist_id` in `entity.identity`) are ABSENT from this list, and the consumer must leave their cached rows alone — that source did not run, so its absence is not evidence of upstream deletion. Modeled on the empty-provenance semantic of `BulkResolveProvenanceEntry`.\n",
+    )
+
+
+class ArtistSearchAliasesBulkRequest(BaseModel):
+    names: list[str] = Field(
+        ..., description="WXYC canonical artist names.", max_length=1000, min_length=1
+    )
+
+
+class ArtistSearchAliasesBulkResponse(BaseModel):
+    artists: list[ArtistSearchAliasesResult]
+    missing: list[str] = Field(
+        ...,
+        description="Input names with no `entity.identity` row in LML — i.e., LML doesn't know any external IDs for these. BS can choose to retry later (after a discogs-cache rebuild and entity-resolution campaign) or leave them.\n",
+    )
+    cache_stats: CacheStats | None = None
+
+
 class DiscogsTrackItem(BaseModel):
     position: str
     title: str
@@ -1170,6 +1230,13 @@ class TrackMatchHint(BaseModel):
     source: TrackMatchSource
 
 
+class ArtistMatchHint(BaseModel):
+    matched_variant: str = Field(
+        ..., description="The cached alias string that trigram-matched the query."
+    )
+    source: ArtistSearchAliasSource
+
+
 class LibrarySearchItem(BaseModel):
     id: int
     title: str | None = None
@@ -1187,6 +1254,10 @@ class LibrarySearchItem(BaseModel):
     matched_via: list[TrackMatchHint] | None = Field(
         None,
         description="Populated when a track-title match drove this release into the results (catalog-track-search plan §5.1). Empty or absent when the release matched on artist / title normally. Backward-compatible — existing consumers ignore the field.\n",
+    )
+    matched_via_alias: list[ArtistMatchHint] | None = Field(
+        None,
+        description="Sibling to `matched_via`. Reserved for the day LML composes artist-alias hits itself; not produced in v1 of the artist-search-alias plan (BS-local cache only). Optional and backward-compatible.\n",
     )
 
 
@@ -1465,6 +1536,10 @@ class AlbumSearchResult(BaseModel):
         None,
         description="Populated by Backend's catalog `/library/` search when a track-title match (CTA or LML proxy fallback) drove this release into the results, per catalog-track-search plan §5.1. Empty or absent on normal artist/album hits. Backward-compatible — existing consumers ignore the field.\n",
     )
+    matched_via_alias: list[ArtistMatchHint] | None = Field(
+        None,
+        description="Populated by Backend's catalog search when an artist-alias match (from `artist_search_alias`) drove this release into the results, per artist-search-alias plan PR 5. Sibling field to `matched_via` (which is track-title provenance). Empty or absent on normal artist/album hits. Backward-compatible — existing consumers ignore the field.\n",
+    )
 
 
 class LibraryMatch(BaseModel):
@@ -1537,6 +1612,10 @@ class LookupResultItem(BaseModel):
     matched_via: list[TrackMatchHint] | None = Field(
         None,
         description="Populated when a track-title match (LML's new SONG_AS_TRACK strategy) drove this release into the results, per catalog-track-search plan §5.1. Empty or absent when the release matched via artist/album strategies. Backward-compatible — existing consumers ignore the field.\n",
+    )
+    matched_via_alias: list[ArtistMatchHint] | None = Field(
+        None,
+        description="Sibling to `matched_via`. Reserved for the day LML composes artist-alias hits itself; not produced in v1 of the artist-search-alias plan (BS-local cache only). Optional and backward-compatible.\n",
     )
 
 
