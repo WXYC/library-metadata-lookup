@@ -163,6 +163,10 @@ class FlowsheetCreateSongFreeform(BaseModel):
     segue: bool | None = None
     record_label: str | None = None
     label_id: int | None = None
+    rotation_id: int | None = Field(
+        None,
+        description="Rotation linkage for a track on a rotation album that isn't in the WXYC library catalog (BS#1308). The Backend snapshot/else branch persists `rotation_id` alongside `album_id IS NULL` so the V2 read path can JOIN back to `rotation` for `rotation_bin` and the iOS rotation-artwork resolver can find the entry. `rotation_bin` is derived on read and intentionally not declared here.\n",
+    )
 
 
 class EntryType(StrEnum):
