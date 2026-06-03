@@ -2276,14 +2276,18 @@ async def perform_lookup(
                 apple_music=apple_music,
             )
 
-    # Project the request-side flags onto the active Sentry transaction so
-    # the trace can be filtered by request mode (lml.lookup.extended,
-    # lml.lookup.warm_cache).
+    # Project the request-side flags and result-quality signals onto the
+    # active Sentry transaction so the trace can be filtered by request mode
+    # (lml.lookup.extended, lml.lookup.warm_cache) and by match outcome
+    # (lookup.results_count, lookup.match_type — LML#158). Mirrors the
+    # cache_stats projection pattern (LML#213).
     try:
         scope = sentry_sdk.get_current_scope()
         if scope.transaction is not None:
             scope.transaction.set_data("lml.lookup.extended", extended_mode)
             scope.transaction.set_data("lml.lookup.warm_cache", warm_cache_mode)
+            scope.transaction.set_data("lookup.results_count", len(library_results))
+            scope.transaction.set_data("lookup.match_type", search_type)
     except Exception:
         # Observability must not break the request path.
         pass
