@@ -1,6 +1,6 @@
 """Integration tests for the lookup pipeline with real LibraryDB."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -147,6 +147,115 @@ class TestLookupPipeline:
         # Should have corrected the artist
         if body.get("corrected_artist"):
             assert body["corrected_artist"] == "Living Colour"
+
+
+class TestLookupResultAttributesProjection:
+    """LML#158: result-quality attributes on the /api/v1/lookup transaction.
+
+    Mirrors the LML#213 cache_stats projection pattern. After the orchestrator
+    runs its full pipeline, it must attach `lookup.results_count` and
+    `lookup.match_type` to the active Sentry transaction so trace explorer can
+    diagnose "right artist, wrong album" failures (the Underscores → fishmonger
+    class) without per-caller instrumentation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_direct_match_projects_results_count_and_match_type(self, app_client):
+        """A direct artist+album match projects the count and match_type onto the txn."""
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with patch("lookup.orchestrator.sentry_sdk.get_current_scope", return_value=mock_scope):
+            resp = await app_client.post(
+                "/api/v1/lookup",
+                json={
+                    "artist": "Stereolab",
+                    "album": "Dots and Loops",
+                    "raw_message": "Stereolab - Dots and Loops",
+                },
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        # Existing projection still fires.
+        assert "lml.lookup.extended" in calls
+        assert "lml.lookup.warm_cache" in calls
+        # New result-quality attributes.
+        assert calls["lookup.results_count"] == len(body["results"])
+        assert calls["lookup.match_type"] == body["search_type"]
+        # match_type is a SearchType slug, not a python-repr.
+        assert isinstance(calls["lookup.match_type"], str)
+        assert calls["lookup.match_type"] in {
+            "direct",
+            "fallback",
+            "alternative",
+            "compilation",
+            "song_as_artist",
+            "none",
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_results_projects_zero_count(self, app_client):
+        """A miss still projects results_count=0 and match_type, so traces filter cleanly."""
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with patch("lookup.orchestrator.sentry_sdk.get_current_scope", return_value=mock_scope):
+            resp = await app_client.post(
+                "/api/v1/lookup",
+                json={
+                    "artist": "ZZZNONEXISTENT",
+                    "raw_message": "ZZZNONEXISTENT",
+                },
+            )
+
+        assert resp.status_code == 200
+        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        assert calls["lookup.results_count"] == 0
+        # Even on miss, match_type is set (likely "none" or a fallback slug).
+        assert "lookup.match_type" in calls
+        assert isinstance(calls["lookup.match_type"], str)
+
+    @pytest.mark.asyncio
+    async def test_projection_no_op_without_active_transaction(self, app_client):
+        """No active Sentry transaction -> projection is a no-op (no crash)."""
+        mock_scope = Mock()
+        mock_scope.transaction = None
+
+        with patch("lookup.orchestrator.sentry_sdk.get_current_scope", return_value=mock_scope):
+            resp = await app_client.post(
+                "/api/v1/lookup",
+                json={
+                    "artist": "Stereolab",
+                    "album": "Dots and Loops",
+                    "raw_message": "Stereolab - Dots and Loops",
+                },
+            )
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_projection_failure_does_not_break_request(self, app_client):
+        """A raising set_data must not break the lookup. Observability is not load-bearing."""
+        mock_transaction = Mock()
+        mock_transaction.set_data = Mock(side_effect=RuntimeError("boom"))
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with patch("lookup.orchestrator.sentry_sdk.get_current_scope", return_value=mock_scope):
+            resp = await app_client.post(
+                "/api/v1/lookup",
+                json={
+                    "artist": "Stereolab",
+                    "album": "Dots and Loops",
+                    "raw_message": "Stereolab - Dots and Loops",
+                },
+            )
+
+        assert resp.status_code == 200
 
 
 class TestSelfTitledAlbumMatching:
