@@ -411,7 +411,14 @@ class DiscogsService:
                     return response
 
                 except httpx.RequestError as e:
-                    logger.error(f"Discogs request failed: {e}")
+                    logger.error(
+                        "Discogs request failed: %s %s -> %s: %r",
+                        method,
+                        path,
+                        type(e).__name__,
+                        e,
+                        exc_info=True,
+                    )
                     return None
         finally:
             semaphore.release()

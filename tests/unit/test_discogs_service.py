@@ -298,6 +298,32 @@ class TestRequestWithRetry:
         assert resp is None
 
     @pytest.mark.asyncio
+    async def test_request_error_log_includes_exception_type_and_request(self, service, caplog):
+        """LIBRARY-METADATA-LOOKUP-7: when an httpx.RequestError with an empty
+        message bubbles out of the request, the log line `Discogs request
+        failed: {e}` produces `Discogs request failed:` with no diagnostic
+        tail. The Sentry issue title is then unactionable. Capture the
+        exception class name, the method/path being requested, and exc_info
+        so the next outage is triage-able.
+        """
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=httpx.ConnectError(""))
+        service._client = mock_client
+
+        with caplog.at_level("ERROR", logger="discogs.service"):
+            resp = await service._request_with_retry("GET", "/database/search", max_retries=0)
+
+        assert resp is None
+        records = [r for r in caplog.records if "Discogs request failed" in r.getMessage()]
+        assert len(records) == 1, "expected exactly one Discogs request failed log line"
+        record = records[0]
+        msg = record.getMessage()
+        assert "ConnectError" in msg, f"log message missing exception class name: {msg!r}"
+        assert "GET" in msg, f"log message missing HTTP method: {msg!r}"
+        assert "/database/search" in msg, f"log message missing request path: {msg!r}"
+        assert record.exc_info is not None, "log record should carry exc_info for Sentry traceback"
+
+    @pytest.mark.asyncio
     async def test_429_honors_retry_after_header(self, service):
         """When Discogs sends Retry-After, sleep that long instead of exponential backoff."""
         mock_client = AsyncMock()
