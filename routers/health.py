@@ -31,6 +31,7 @@ collapse to ``app.include_router(readiness_router(...))``.
 
 import asyncio
 import logging
+import os
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
@@ -143,6 +144,7 @@ async def health_check(
     body = {
         "status": status,
         "version": settings.app_version,
+        "commit_sha": os.environ.get("RAILWAY_GIT_COMMIT_SHA"),
         "services": services,
     }
 
