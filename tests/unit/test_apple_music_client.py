@@ -20,6 +20,7 @@ import pytest
 from clients.streaming.apple_music import (
     _APPLE_MUSIC_MATCH_FLOOR,
     AppleMusicClient,
+    _extract_release_year,
     _parse_retry_after,
 )
 
@@ -676,6 +677,38 @@ class TestFindTrackMetadata:
         assert match.release_year == 2025
 
     @pytest.mark.asyncio
+    async def test_prefers_match_with_artwork_over_higher_scoring_without(self, es256_keypair):
+        """When the top fuzz-score match has no `artwork` block (region-
+        restricted single, promo entry, sparse Music-Connect record), the
+        probe must fall through to the next floor-clearing match that
+        carries artwork — otherwise the whole point of LML#487 (surface
+        the right cover) degrades to "show nothing" for these items."""
+        client = _client(es256_keypair)
+        # Top-scoring match has identical fixture but no artwork block.
+        no_artwork = _make_song_data_full(
+            url="https://music.apple.com/us/song/no-art/1",
+            artwork_url=None,
+        )
+        # Lower-scoring (still clears 80 across the board) carries artwork.
+        with_artwork = _make_song_data_full(
+            artist_name="Noura Mint Seymalii",  # 1-char drift, clears 80
+            url="https://music.apple.com/us/song/with-art/2",
+            artwork_url="https://example.com/right/{w}x{h}.jpg",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([no_artwork, with_artwork]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/with-art/2"
+        assert match.artwork_url is not None
+        assert "right" in match.artwork_url
+
+    @pytest.mark.asyncio
     async def test_url_matches_find_track_url_on_acceptable_hit(self, es256_keypair):
         """``find_track_metadata`` is a superset of ``find_track_url``: when
         both methods are called against the same response, the URL each
@@ -947,6 +980,46 @@ class TestObservability:
             await client.search_song("Stereolab", "Aluminum Tunes")
 
         mock_sentry.capture_exception.assert_called_once()
+
+
+class TestExtractReleaseYear:
+    """The extractor must reject malformed/sentinel/non-ASCII inputs so 0,
+    9999, 202, and Arabic-Indic digits don't reach downstream as a release
+    year. Apple's documented shape is ISO YYYY-MM-DD; anything else falls
+    through to None."""
+
+    def _item(self, release_date) -> dict:
+        return {"attributes": {"releaseDate": release_date}}
+
+    def test_valid_iso_date(self):
+        assert _extract_release_year(self._item("2025-03-14")) == 2025
+
+    def test_year_only(self):
+        assert _extract_release_year(self._item("2025")) == 2025
+
+    def test_rejects_zero_sentinel(self):
+        # Apple ships "0000-00-00" for placeholder/unknown records.
+        assert _extract_release_year(self._item("0000-00-00")) is None
+
+    def test_rejects_year_below_plausible_range(self):
+        assert _extract_release_year(self._item("1500")) is None
+
+    def test_rejects_year_above_plausible_range(self):
+        assert _extract_release_year(self._item("9999")) is None
+
+    def test_rejects_three_char_string(self):
+        # raw[:4] on "202" is "202", isdigit() passes — must require length 4.
+        assert _extract_release_year(self._item("202")) is None
+
+    def test_rejects_non_ascii_digits(self):
+        # Arabic-Indic digits clear str.isdigit() but aren't ASCII.
+        assert _extract_release_year(self._item("٢٠٢٥")) is None
+
+    def test_rejects_missing_field(self):
+        assert _extract_release_year({"attributes": {}}) is None
+
+    def test_rejects_non_string_field(self):
+        assert _extract_release_year(self._item(2025)) is None
 
 
 def test_match_floor_constant_is_80():

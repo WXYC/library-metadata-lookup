@@ -1611,3 +1611,54 @@ class TestExternalArtworkProbe:
         )
 
         apple_music.find_track_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_probe_skipped_on_happy_path_when_streaming_links_override_present(self):
+        """When the library row clears the LML#477 gate AND has a
+        librarian-curated ``streaming_links`` Apple Music override, the
+        final ``apple_music_url`` is the override (per the
+        ``apple_music_override or apple_music_url or None`` precedence).
+        The probe's URL would be discarded — so skip the Apple Music
+        call entirely. Saves one quota slot per overridden item."""
+        item = make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Jessica Pratt",
+            album="On Your Own Love Again",
+            artwork_url="https://example.com/oyola.jpg",
+            release_year=2015,
+        )
+
+        override_url = "https://music.apple.com/us/album/oyola/curated-by-librarian"
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(return_value={"apple_music_url": override_url})
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_url = AsyncMock(return_value="https://music.apple.com/discarded")
+        apple_music.find_track_metadata = AsyncMock()
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="On Your Own Love Again",
+            artist="Jessica Pratt",
+            year=2015,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Back, Baby",
+            album="On Your Own Love Again",
+            apple_music=apple_music,
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.apple_music_url == override_url
+        apple_music.find_track_url.assert_not_called()
+        apple_music.find_track_metadata.assert_not_called()

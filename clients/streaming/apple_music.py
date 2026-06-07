@@ -387,22 +387,16 @@ class AppleMusicClient(BaseStreamingClient):
         """Search for `(artist, song[, album])` and return URL + artwork + year.
 
         Sibling of ``find_track_url`` that surfaces the richer
-        ``AppleMusicTrackMatch`` shape (LML#487 / BS#1184). The lookup hot
-        path uses it to synthesize a ``DiscogsSearchResult`` carrying the
-        right album's cover art when the WXYC catalog has no acceptable
-        library row for the requested album — the Noura Mint Seymali
-        ``Hebebeb (Zrag) / Yenbett`` shape (library has Tzenni only, song
-        search would otherwise project Tzenni's artwork onto a Yenbett
-        flowsheet entry).
+        ``AppleMusicTrackMatch`` shape (LML#487 / BS#1184). Reuses the same
+        ``search_song`` endpoint + 80/80(/80) fuzz floor — one Apple
+        Music API call per invocation, no extra quota vs. ``find_track_url``.
 
-        Reuses the SAME ``search_song`` endpoint, ``fuzz.token_set_ratio``
-        scoring, and 80/80(/80) floor as ``find_track_url`` — no extra
-        Apple Music API rounds vs. the existing ``find_track_url`` quota,
-        and the artist/title/album wrong-match guards stay in lockstep
-        with the LML#389 / LML#396 / LML#453 hardening. The artwork +
-        release-year extractors gracefully degrade to ``None`` on sparse
-        records (no ``artwork`` block, malformed ``releaseDate``) rather
-        than raising mid-iteration.
+        Unlike ``find_track_url``, this method PREFERS floor-clearing matches
+        that carry ``attributes.artwork`` over higher-scoring matches that
+        lack it. Returning artwork_url=None on the synthesis path defeats
+        the whole point of LML#487 — for sparse Apple records (region-
+        restricted singles, promo entries) we'd rather surface a lower-
+        scoring-but-floor-clearing match's cover than nothing.
         """
         results = await self.search_song(artist, song)
         if not results:
@@ -412,8 +406,10 @@ class AppleMusicClient(BaseStreamingClient):
         norm_song = normalize_for_comparison(song)
         norm_album = normalize_for_comparison(album) if album else None
 
-        best: dict | None = None
-        best_score = 0.0
+        best_overall: dict | None = None
+        best_overall_score = 0.0
+        best_with_artwork: dict | None = None
+        best_with_artwork_score = 0.0
 
         for item in results:
             attrs = item.get("attributes") or {}
@@ -437,10 +433,14 @@ class AppleMusicClient(BaseStreamingClient):
                 combined = (artist_score + track_score + album_score) / 3
             else:
                 combined = (artist_score + track_score) / 2
-            if combined > best_score:
-                best_score = combined
-                best = item
+            if combined > best_overall_score:
+                best_overall_score = combined
+                best_overall = item
+            if (attrs.get("artwork") or {}).get("url") and combined > best_with_artwork_score:
+                best_with_artwork_score = combined
+                best_with_artwork = item
 
+        best = best_with_artwork or best_overall
         if best is None:
             return None
 
@@ -489,22 +489,29 @@ def _extract_artwork_url(item: dict) -> str | None:
     return template.replace("{w}", str(_ARTWORK_WIDTH)).replace("{h}", str(_ARTWORK_HEIGHT))
 
 
+_MIN_PLAUSIBLE_RELEASE_YEAR = 1900
+_MAX_PLAUSIBLE_RELEASE_YEAR = 2100
+
+
 def _extract_release_year(item: dict) -> int | None:
-    """Pull the leading 4-digit year from `attributes.releaseDate`.
+    """Pull the leading 4-digit ASCII year from `attributes.releaseDate`.
 
     Apple Music's catalog albums carry ISO dates (YYYY-MM-DD), but rare
-    records ship just the year ("2025") or are missing the field entirely.
-    Return ``None`` rather than raising so a sparse record's artwork still
-    surfaces with ``release_year=None``.
+    records ship just the year, sentinel placeholders ("0000-00-00"), or
+    partial strings. Reject anything that isn't a 4-ASCII-digit year in a
+    plausible range so 0/9999/202 don't reach downstream as a release year.
     """
     attrs = item.get("attributes") or {}
     raw = attrs.get("releaseDate")
     if not raw or not isinstance(raw, str):
         return None
     head = raw[:4]
-    if not head.isdigit():
+    if len(head) != 4 or not head.isascii() or not head.isdigit():
         return None
-    return int(head)
+    year = int(head)
+    if year < _MIN_PLAUSIBLE_RELEASE_YEAR or year > _MAX_PLAUSIBLE_RELEASE_YEAR:
+        return None
+    return year
 
 
 def _parse_retry_after(value: str | None) -> float:

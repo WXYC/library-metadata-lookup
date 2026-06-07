@@ -62,14 +62,16 @@ class TestStreamingOnDiscogsMiss:
 
         apple_url = "https://music.apple.com/us/album/aluminum-tunes/1234567890"
         apple_music = AsyncMock(spec=AppleMusicClient)
-        # LML#487: synthesis path now drives ``find_track_metadata`` so the
-        # same Apple Music search response can yield artwork + release_year
-        # alongside the URL. Use ``artwork_url=None`` / ``release_year=None``
-        # to pin the pre-LML#487 URL-only invariant (this test predates the
-        # artwork extraction; LML#487's TestExternalArtworkProbe covers the
-        # full-payload shape).
+        # LML#487: synthesis path drives ``find_track_metadata``; the test
+        # pins the pre-LML#487 URL-only invariant (artwork_url/release_year
+        # None). Fail loudly if a refactor accidentally routes through
+        # find_track_url — AsyncMock(spec=...) would otherwise auto-generate
+        # a Mock-returning stub and silently keep the test green.
         apple_music.find_track_metadata = AsyncMock(
             return_value=AppleMusicTrackMatch(url=apple_url, artwork_url=None, release_year=None)
+        )
+        apple_music.find_track_url = AsyncMock(
+            side_effect=AssertionError("find_track_url called on synthesis path")
         )
 
         request = LookupRequest(
@@ -133,6 +135,9 @@ class TestStreamingOnDiscogsMiss:
 
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=None)
+        apple_music.find_track_url = AsyncMock(
+            side_effect=AssertionError("find_track_url called on synthesis path")
+        )
 
         request = LookupRequest(
             artist="Stereolab",
