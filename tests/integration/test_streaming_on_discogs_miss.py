@@ -70,9 +70,7 @@ class TestStreamingOnDiscogsMiss:
         apple_music.find_track_metadata = AsyncMock(
             return_value=AppleMusicTrackMatch(url=apple_url, artwork_url=None, release_year=None)
         )
-        apple_music.find_track_url = AsyncMock(
-            side_effect=AssertionError("find_track_url called on synthesis path")
-        )
+        apple_music.find_track_url = AsyncMock()
 
         request = LookupRequest(
             artist="Stereolab",
@@ -108,6 +106,12 @@ class TestStreamingOnDiscogsMiss:
         assert top.artwork.youtube_music_url is not None
         assert top.artwork.bandcamp_url is not None
         assert top.artwork.soundcloud_url is not None
+        # Defense in depth: a refactor that routes the synthesis path through
+        # find_track_url instead of find_track_metadata is silently swallowed
+        # by the orchestrator's broad ``except Exception:``. Use mock
+        # call-history rather than ``side_effect`` so the assertion can't be
+        # caught by the production code.
+        apple_music.find_track_url.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_search_urls_fill_when_apple_match_fails(self, library_db):
@@ -135,9 +139,7 @@ class TestStreamingOnDiscogsMiss:
 
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=None)
-        apple_music.find_track_url = AsyncMock(
-            side_effect=AssertionError("find_track_url called on synthesis path")
-        )
+        apple_music.find_track_url = AsyncMock()
 
         request = LookupRequest(
             artist="Stereolab",
@@ -163,3 +165,6 @@ class TestStreamingOnDiscogsMiss:
         assert top.artwork.youtube_music_url is not None
         assert top.artwork.bandcamp_url is not None
         assert top.artwork.soundcloud_url is not None
+        # Pin the synthesis path — the no-match shape still routes through
+        # find_track_metadata, not find_track_url.
+        apple_music.find_track_url.assert_not_called()
