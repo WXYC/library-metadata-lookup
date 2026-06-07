@@ -13,16 +13,18 @@ Public surface:
 
 - `find_album_match(artist, title)` — BaseStreamingClient contract; powers
   `/streaming-check` via `streaming/router.handle_streaming_check`.
-- `find_track_url(artist, song, album=None)` — used by the lookup hot path
-  in `lookup/orchestrator.enrich_artwork_results` when the WXYC library
+- `find_track_url(artist, song, album=None)` — thin wrapper around
+  `find_track_metadata` (LML#500). Used by the lookup hot path in
+  `lookup/orchestrator.enrich_artwork_results` when the WXYC library
   row clears the LML#477 title gate (just need the URL for the
-  ``apple_music_url`` slot). 3-way fuzz floor on
-  `attributes.{artistName,name,albumName}`.
+  ``apple_music_url`` slot). Inherits `find_track_metadata`'s 3-way
+  fuzz floor + artwork-preference tie-break so the two methods cannot
+  drift on a multi-record response.
 - `find_track_metadata(artist, song, album=None)` — used by the same hot
   path when the library row fails the gate (LML#487) or the catalog has
-  no Discogs match (LML#401). Same `search_song` endpoint + same fuzz
-  floor as `find_track_url`; returns `AppleMusicTrackMatch` with the
-  URL plus `attributes.artwork.url` (artwork) and
+  no Discogs match (LML#401). 3-way fuzz floor on
+  `attributes.{artistName,name,albumName}`; returns `AppleMusicTrackMatch`
+  with the URL plus `attributes.artwork.url` (artwork) and
   `attributes.releaseDate` (year) so the synthesized
   `DiscogsSearchResult` surfaces the correct album's cover art instead
   of leaking a sibling-album library row's Discogs image.
@@ -313,53 +315,26 @@ class AppleMusicClient(BaseStreamingClient):
         return [], last_status
 
     async def find_track_url(self, artist: str, song: str, album: str | None = None) -> str | None:
-        """Search for `(artist, song[, album])` and return the highest-scoring
-        Apple Music track URL clearing the 80/80(/80) fuzz floor, else `None`.
+        """Search for `(artist, song[, album])` and return the Apple Music track
+        URL of the best floor-clearing match, else `None`.
 
-        Uses `fuzz.token_set_ratio` (not the batch matcher's `token_sort_ratio`)
-        so extra tokens — "The", "feat. X", "(Remastered)" — don't sink an
-        otherwise-correct match. Iterates the full result list and picks the
-        best-scoring URL so an early sub-optimal match in Apple's ranking
-        order doesn't freeze the wrong link onto a flowsheet row.
+        Thin wrapper around ``find_track_metadata`` (LML#500): both methods
+        score against the same ``search_song`` response with the same
+        80/80(/80) ``token_set_ratio`` floor — keeping two scorers meant
+        their match selection could drift silently (the artwork-preference
+        tie-break iter-1 review added to ``find_track_metadata`` did not
+        propagate here, so a multi-record response could surface two
+        different URLs). Collapsing onto ``find_track_metadata`` puts the
+        two methods in lockstep by construction.
+
+        Returns only the ``url`` slot of the match — the happy path
+        (``library_row_acceptable=True`` in ``enrich_artwork_results``)
+        does not consume ``artwork_url`` or ``release_year`` (the
+        Discogs-derived library row supplies those), so dropping them
+        here keeps the existing call-site shape.
         """
-        results = await self.search_song(artist, song)
-        if not results:
-            return None
-
-        norm_artist = normalize_for_comparison(artist)
-        norm_song = normalize_for_comparison(song)
-        norm_album = normalize_for_comparison(album) if album else None
-
-        best_url: str | None = None
-        best_score = 0.0
-
-        for item in results:
-            attrs = item.get("attributes") or {}
-            url = attrs.get("url")
-            if not url:
-                continue
-            artist_score = fuzz.token_set_ratio(
-                norm_artist, normalize_for_comparison(attrs.get("artistName") or "")
-            )
-            track_score = fuzz.token_set_ratio(
-                norm_song, normalize_for_comparison(attrs.get("name") or "")
-            )
-            if artist_score < _APPLE_MUSIC_MATCH_FLOOR or track_score < _APPLE_MUSIC_MATCH_FLOOR:
-                continue
-            if norm_album is not None:
-                album_score = fuzz.token_set_ratio(
-                    norm_album, normalize_for_comparison(attrs.get("albumName") or "")
-                )
-                if album_score < _APPLE_MUSIC_MATCH_FLOOR:
-                    continue
-                combined = (artist_score + track_score + album_score) / 3
-            else:
-                combined = (artist_score + track_score) / 2
-            if combined > best_score:
-                best_score = combined
-                best_url = url
-
-        return best_url
+        match = await self.find_track_metadata(artist, song, album=album)
+        return match.url if match is not None else None
 
     async def find_album_match(self, artist: str, title: str) -> SourceMatch | None:
         """Search Apple Music for `(artist, title)` and return the best match.
@@ -386,17 +361,22 @@ class AppleMusicClient(BaseStreamingClient):
     ) -> AppleMusicTrackMatch | None:
         """Search for `(artist, song[, album])` and return URL + artwork + year.
 
-        Sibling of ``find_track_url`` that surfaces the richer
-        ``AppleMusicTrackMatch`` shape (LML#487 / BS#1184). Reuses the same
-        ``search_song`` endpoint + 80/80(/80) fuzz floor — one Apple
-        Music API call per invocation, no extra quota vs. ``find_track_url``.
+        Surfaces the richer ``AppleMusicTrackMatch`` shape (LML#487 /
+        BS#1184) — URL + artwork + year from the same ``search_song``
+        response. Single Apple Music API call per invocation; the
+        URL-only ``find_track_url`` wrapper delegates here so both
+        methods scoring/selecting from the same record set is enforced
+        by construction (LML#500).
 
-        Unlike ``find_track_url``, this method PREFERS floor-clearing matches
-        that carry ``attributes.artwork`` over higher-scoring matches that
-        lack it. Returning artwork_url=None on the synthesis path defeats
-        the whole point of LML#487 — for sparse Apple records (region-
-        restricted singles, promo entries) we'd rather surface a lower-
-        scoring-but-floor-clearing match's cover than nothing.
+        PREFERS floor-clearing matches that carry ``attributes.artwork``
+        over higher-scoring matches that lack it. Returning
+        artwork_url=None on the synthesis path defeats the whole point
+        of LML#487 — for sparse Apple records (region-restricted
+        singles, promo entries) we'd rather surface a lower-scoring-but-
+        floor-clearing match's cover than nothing. The same preference
+        carries over to ``find_track_url`` (post-collapse): the happy
+        path doesn't consume artwork, but the URL it returns now comes
+        from a likely-more-canonical record.
         """
         results = await self.search_song(artist, song)
         if not results:

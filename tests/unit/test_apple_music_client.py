@@ -709,6 +709,58 @@ class TestFindTrackMetadata:
         assert "right" in match.artwork_url
 
     @pytest.mark.asyncio
+    async def test_url_agrees_with_find_track_metadata_under_artwork_preference(
+        self, es256_keypair
+    ):
+        """LML#500 (post-collapse): the multi-record artwork-preference
+        tie-break in ``find_track_metadata`` must propagate to
+        ``find_track_url`` so both methods surface the SAME URL for the
+        same response. Pre-collapse the two methods could drift —
+        ``find_track_url`` returned the top scorer while
+        ``find_track_metadata`` fell through to a lower-scoring
+        artwork-bearing runner-up. Collapsing ``find_track_url`` to a
+        ``find_track_metadata`` wrapper puts them in lockstep by
+        construction; this test pins that lockstep on the only fixture
+        shape (multi-record, one with artwork) where they ever diverged.
+
+        The companion single-record parity test
+        (``test_url_matches_find_track_url_on_acceptable_hit``) covers
+        the no-tie-break case."""
+        client_a = _client(es256_keypair)
+        client_b = _client(es256_keypair)
+
+        # Record A: top fuzz score (exact match on every axis), no artwork block.
+        top_no_artwork = _make_song_data_full(
+            url="https://music.apple.com/us/song/top-no-art/1",
+            artwork_url=None,
+        )
+        # Record B: lower-but-floor-clearing score, artwork block present.
+        runner_with_artwork = _make_song_data_full(
+            artist_name="Noura Mint Seymalii",  # 1-char drift, clears 80
+            url="https://music.apple.com/us/song/runner-with-art/2",
+            artwork_url="https://example.com/runner/{w}x{h}.jpg",
+        )
+        results = [top_no_artwork, runner_with_artwork]
+
+        mock_a = AsyncMock(spec=httpx.AsyncClient)
+        mock_a.get = AsyncMock(return_value=_songs_response(results))
+        client_a._http = mock_a
+
+        mock_b = AsyncMock(spec=httpx.AsyncClient)
+        mock_b.get = AsyncMock(return_value=_songs_response(results))
+        client_b._http = mock_b
+
+        url = await client_a.find_track_url("Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett")
+        match = await client_b.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+
+        # Both methods fall through to the artwork-bearing runner-up.
+        assert match is not None
+        assert url == match.url
+        assert url == "https://music.apple.com/us/song/runner-with-art/2"
+
+    @pytest.mark.asyncio
     async def test_url_matches_find_track_url_on_acceptable_hit(self, es256_keypair):
         """``find_track_metadata`` is a superset of ``find_track_url``: when
         both methods are called against the same response, the URL each
