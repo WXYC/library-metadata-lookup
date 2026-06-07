@@ -1226,6 +1226,231 @@ class TestWriteArtistDetails:
         conn._mock_tx_ctx.__aexit__.assert_awaited()
 
 
+class TestWriteArtistDetailsFetchedAtInvariant:
+    """Pin the cache-hit discriminator invariant for the artist row writer.
+
+    `DiscogsService.get_artist_details` distinguishes a stub row (created by
+    the out-of-repo monthly rebuild's stub-from-`release_artist` path) from a
+    fully-fetched row using `ArtistDetails.fetched_at is not None`. The
+    invariant the discriminator depends on: any row written by LML has
+    `fetched_at` set; only rebuild-created stubs have `fetched_at IS NULL`.
+
+    `write_artist_details` is the only in-repo writer; both its INSERT and
+    its ON CONFLICT UPDATE branches must stamp `fetched_at`. If a future
+    overload or sibling writer omits it, the discriminator silently regresses
+    into cache thrash (real rows treated as stubs and re-fetched on every
+    call) -- a bug that wouldn't show up in functional tests. These SQL
+    introspections fail the moment the column drops out of either branch.
+
+    See WXYC/library-metadata-lookup#502 (discriminator) and #511 (this pin).
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "clause_marker",
+        [
+            # INSERT branch -- fresh row written by LML.
+            "INSERT INTO artist",
+            # ON CONFLICT branch -- row was already present (typically a
+            # rebuild-created stub) and LML is hydrating it.
+            "ON CONFLICT",
+        ],
+    )
+    async def test_artist_upsert_sets_fetched_at(
+        self, cache_service, mock_asyncpg_pool, clause_marker
+    ):
+        """The single UPSERT statement must stamp `fetched_at` on BOTH branches.
+
+        We rely on this statement being a single INSERT ... ON CONFLICT (id) DO
+        UPDATE -- parameterising the marker keeps each branch's failure mode
+        distinct: drop the INSERT column and the first parametrisation fails;
+        drop the UPDATE-clause assignment and the second fails. Either way,
+        the discriminator is broken and this test catches it.
+        """
+        details = ArtistDetails(artist_id=77, name="Autechre")
+
+        await cache_service.write_artist_details(details)
+
+        conn = mock_asyncpg_pool._mock_conn
+        all_sql = [call.args[0] for call in conn.execute.call_args_list]
+        artist_upsert = next(
+            (sql for sql in all_sql if "INSERT INTO artist" in sql and "ON CONFLICT" in sql),
+            None,
+        )
+        assert artist_upsert is not None, (
+            "Expected a single INSERT INTO artist ... ON CONFLICT statement; "
+            f"got execute calls: {all_sql!r}"
+        )
+
+        # Locate the slice of SQL that corresponds to the branch under test.
+        branch_start = artist_upsert.index(clause_marker)
+        if clause_marker == "INSERT INTO artist":
+            branch_sql = artist_upsert[branch_start : artist_upsert.index("ON CONFLICT")]
+        else:
+            branch_sql = artist_upsert[branch_start:]
+
+        assert "fetched_at" in branch_sql, (
+            f"write_artist_details must stamp fetched_at on the {clause_marker} "
+            f"branch of the artist UPSERT -- the cache-hit discriminator in "
+            f"DiscogsService.get_artist_details depends on it (#502). "
+            f"Branch SQL: {branch_sql!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_artist_upsert_stamps_fetched_at_with_now(self, cache_service, mock_asyncpg_pool):
+        """`fetched_at` must be stamped server-side (`now()`), not bound as a parameter.
+
+        If a future refactor binds `fetched_at` as a positional arg, a caller
+        could pass None and silently revive the stub-row foot-gun the
+        discriminator was meant to close. Forcing the value to live in SQL
+        keeps it impossible to write a row with `fetched_at IS NULL` from
+        this method.
+        """
+        details = ArtistDetails(artist_id=77, name="Autechre")
+
+        await cache_service.write_artist_details(details)
+
+        conn = mock_asyncpg_pool._mock_conn
+        all_sql = [call.args[0] for call in conn.execute.call_args_list]
+        artist_upsert = next(
+            sql for sql in all_sql if "INSERT INTO artist" in sql and "ON CONFLICT" in sql
+        )
+
+        # `fetched_at = now()` (UPDATE branch) and `... now())` (INSERT branch
+        # value list) -- both compact forms are acceptable. The point is that
+        # `now()` appears at least twice in the statement: once per branch.
+        # Whitespace-tolerant: collapse runs of whitespace before counting.
+        compact = " ".join(artist_upsert.split())
+        assert compact.count("now()") >= 2, (
+            "fetched_at must be stamped with now() on both INSERT and ON "
+            "CONFLICT UPDATE branches -- expected at least two now() calls "
+            f"in the artist UPSERT, got: {artist_upsert!r}"
+        )
+
+
+class TestGetArtistDetailsBulkStubSemantics:
+    """Pin the bulk path's stub-vs-real semantics.
+
+    `get_artist_details_bulk` (used by the artist-search-alias composer) does
+    NOT project `fetched_at` from the artist table -- the SELECT at
+    cache_service.py:1076 reads `id, name, profile, image_url` only. The pydantic
+    default on `ArtistDetails.fetched_at` is None, so EVERY row the bulk path
+    returns -- stub or fully-fetched -- arrives at the caller with
+    `fetched_at is None`.
+
+    The decision locked in here: **the bulk path surfaces stubs as cache hits.**
+    Stubs and real rows are indistinguishable through this entrypoint, and
+    that's deliberate -- the only consumer (`search_artists_by_name` alias
+    expansion) doesn't need the discriminator. The per-id `get_artist_details`
+    is the only path that distinguishes the two, via the projected
+    `fetched_at` and the service-layer `is_pg_hit` predicate at
+    discogs/service.py:939.
+
+    If we ever want the bulk path to treat stubs as misses, the SELECT must
+    add `fetched_at` and the assembly loop must skip rows where it's NULL --
+    this test would then need updating, signalling the semantic shift.
+
+    See WXYC/library-metadata-lookup#502 (discriminator), #511 (this pin).
+    """
+
+    @pytest.mark.asyncio
+    async def test_stub_row_surfaces_as_cached_with_null_fetched_at(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """A row written by the rebuild stub path comes back as if cached.
+
+        Rebuild-created stub rows have `fetched_at IS NULL` in the DB. The
+        bulk SELECT doesn't project that column, so the assembled
+        `ArtistDetails` falls back to the model default (None) and the
+        artist_id appears in the result dict -- caller has no way to tell
+        the row is a stub.
+        """
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                **{
+                    # Stub row from the rebuild path -- no `fetched_at` in
+                    # the SELECT result because the query doesn't project it.
+                    "FROM artist ": [
+                        {"id": 2154, "name": "Stereolab", "profile": None, "image_url": None},
+                    ],
+                    "artist_alias": [],
+                    "artist_name_variation": [],
+                    "artist_member": [],
+                }
+            )
+        )
+
+        result = await cache_service.get_artist_details_bulk([2154])
+
+        assert 2154 in result, "stub row must be surfaced (not treated as a miss)"
+        assert result[2154].fetched_at is None, (
+            "bulk SELECT does not project fetched_at; model defaults to None"
+        )
+        assert result[2154].cached is True, "bulk path tags every row cached=True"
+
+    @pytest.mark.asyncio
+    async def test_stub_and_real_indistinguishable_by_caller(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """Stub rows and fully-fetched rows look identical to bulk callers.
+
+        Locks in the foot-gun: don't try to use `fetched_at` from a bulk
+        result as a discriminator -- it's always None regardless of the
+        underlying row's state. Discriminating between stubs and real rows
+        requires the per-id `get_artist_details` path.
+        """
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                **{
+                    "FROM artist ": [
+                        # Stub (DB: fetched_at IS NULL).
+                        {"id": 2154, "name": "Stereolab", "profile": None, "image_url": None},
+                        # Fully-fetched (DB: fetched_at IS NOT NULL).
+                        {
+                            "id": 305253,
+                            "name": "Juana Molina",
+                            "profile": "Argentinian artist...",
+                            "image_url": "https://example.com/jm.jpg",
+                        },
+                    ],
+                    "artist_alias": [],
+                    "artist_name_variation": [],
+                    "artist_member": [],
+                }
+            )
+        )
+
+        result = await cache_service.get_artist_details_bulk([2154, 305253])
+
+        # Both surface; both report fetched_at=None; both report cached=True.
+        # Caller has no signal to tell them apart from the bulk path.
+        assert result[2154].fetched_at == result[305253].fetched_at is None
+        assert result[2154].cached == result[305253].cached is True
+
+    @pytest.mark.asyncio
+    async def test_bulk_select_does_not_project_fetched_at(self, cache_service, mock_asyncpg_pool):
+        """SQL contract: the bulk artist SELECT omits `fetched_at`.
+
+        This is the structural cause of the semantics pinned above. If a
+        future change adds `fetched_at` to the projection, that's a signal
+        the bulk path is about to start distinguishing stubs from real --
+        update the semantics tests above to reflect the new behavior.
+        """
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        await cache_service.get_artist_details_bulk([2154])
+
+        artist_table_sql = next(
+            call.args[0]
+            for call in mock_asyncpg_pool.fetch.await_args_list
+            if "FROM artist " in call.args[0]
+        )
+        assert "fetched_at" not in artist_table_sql, (
+            "Bulk artist SELECT must not project fetched_at -- the bulk path's "
+            "stub-vs-real semantics depend on this. If you intentionally added "
+            "the column, update TestGetArtistDetailsBulkStubSemantics."
+        )
+
+
 class TestSearchArtistsByName:
     @pytest.mark.asyncio
     async def test_returns_canonical_artist(self, cache_service, mock_asyncpg_pool):

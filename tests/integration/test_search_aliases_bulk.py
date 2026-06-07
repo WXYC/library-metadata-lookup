@@ -170,12 +170,19 @@ async def set_up_schemas(pg_pool):
         # ``artist`` table but has no children (the "ran the leg, found
         # nothing" case). 305253 IS in artist so cache lookup hits; we just
         # leave the child tables empty for that row.
+        #
+        # ``fetched_at = now()`` mirrors what ``write_artist_details`` would
+        # produce in production -- the cache-hit discriminator (#502) treats
+        # rows with ``fetched_at IS NULL`` as rebuild-created stubs. Leaving
+        # this column NULL here would test the stub case instead of the
+        # production-write case. Stub-vs-real bulk semantics are pinned in
+        # tests/unit/test_cache_service.py::TestGetArtistDetailsBulkStubSemantics.
         await conn.execute(
             """
-            INSERT INTO artist (id, name, profile, image_url)
+            INSERT INTO artist (id, name, profile, image_url, fetched_at)
             VALUES
-                (2154, 'Stereolab', NULL, NULL),
-                (305253, 'Juana Molina', NULL, NULL)
+                (2154, 'Stereolab', NULL, NULL, now()),
+                (305253, 'Juana Molina', NULL, NULL, now())
             """
         )
         await conn.execute(
