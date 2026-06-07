@@ -677,6 +677,37 @@ class TestFindTrackMetadata:
         assert match.release_year == 2025
 
     @pytest.mark.asyncio
+    async def test_album_none_strips_album_derived_fields(self, es256_keypair):
+        """When ``album`` is None (artist+song-only lookup — request-o-matic's
+        canonical shape, ~40% of its traffic), the matching floor collapses
+        from 80/80/80 to 80/80 — any artist+song match clears regardless of
+        album, and Apple typically returns the most popular album containing
+        the song title. Surfacing that album's artwork on the synthesized
+        result is a wrong-album leak.
+
+        Strip ``artwork_url`` and ``release_year`` from the returned match
+        when ``album`` is None so the synthesized result drops back to the
+        LML#401 baseline (URL only, no album-derived fields). The URL itself
+        is per-track and stays.
+        """
+        client = _client(es256_keypair)
+        # The Apple Music response carries full artwork + releaseDate, but
+        # we can't trust either when no album was requested — they describe
+        # whatever album Apple's ranking surfaced for this song title.
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([_make_song_data_full()]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata("Noura Mint Seymali", "Hebebeb (Zrag)", album=None)
+
+        assert match is not None
+        # URL still surfaces — it's per-track, not per-album.
+        assert match.url == "https://music.apple.com/us/song/hebebeb-zrag/9"
+        # Album-derived fields stripped when album is None.
+        assert match.artwork_url is None
+        assert match.release_year is None
+
+    @pytest.mark.asyncio
     async def test_prefers_match_with_artwork_over_higher_scoring_without(self, es256_keypair):
         """When the top fuzz-score match has no `artwork` block (region-
         restricted single, promo entry, sparse Music-Connect record), the

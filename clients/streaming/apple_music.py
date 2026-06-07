@@ -424,6 +424,17 @@ class AppleMusicClient(BaseStreamingClient):
         if best is None:
             return None
 
+        # When ``album`` was not supplied the 80/80(/80) floor collapses to
+        # 80/80 — any artist+song match clears regardless of album, and
+        # Apple typically returns the most popular album containing this
+        # song title. The match's URL is per-track so it stays, but the
+        # album-derived fields (``artwork_url``, ``release_year``) describe
+        # whatever album Apple ranked highest; surfacing them on the
+        # synthesized result would be a wrong-album leak. ~40% of
+        # request-o-matic traffic is artist+song-only.
+        if album is None:
+            return AppleMusicTrackMatch(url=_extract_url(best), artwork_url=None, release_year=None)
+
         return AppleMusicTrackMatch(
             url=_extract_url(best),
             artwork_url=_extract_artwork_url(best),
