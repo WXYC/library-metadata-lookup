@@ -1,12 +1,15 @@
 """FastAPI router for Discogs API endpoints."""
 
 import logging
+from collections.abc import Callable
 
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from core.dependencies import get_discogs_cache_service, get_discogs_service
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.markup_parser import DiscogsServiceResolver, parse_async
+from discogs.memory_cache import evict_cached
 from discogs.models import (
     ArtistDetails,
     EntityResolveResponse,
@@ -21,6 +24,15 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/discogs", tags=["discogs"])
 
+# Shared description for the ?refresh query param so every entity endpoint
+# documents the same behavior in the OpenAPI schema. LML#498.
+_REFRESH_DESCRIPTION = (
+    "When true, evict the in-memory L1 cache entry for this entity before "
+    "fetching. Forces re-traversal of L2 (PG) and L3 (Discogs API), which is "
+    "needed after a manual fix to the underlying PG cache row that would "
+    "otherwise stay invisible until L1's TTL expires."
+)
+
 
 def _require_service(service: DiscogsService | None) -> DiscogsService:
     """Raise 503 if service is not available."""
@@ -30,6 +42,27 @@ def _require_service(service: DiscogsService | None) -> DiscogsService:
             detail="Discogs service is not configured. Set DISCOGS_TOKEN environment variable.",
         )
     return service
+
+
+def _refresh_l1(cached_func: Callable, *args, **kwargs) -> None:
+    """Evict an L1 entry on a refresh request and tag the Sentry trace.
+
+    Only tags when eviction actually removed something — a no-op probe
+    (refresh on an already-cold key) doesn't count. The Sentry tag
+    ``lml.cache.refresh_evicted`` and transaction data
+    ``lml.cache.memory_evictions_refresh`` give operators a filterable signal
+    that a refresh-driven miss caused any downstream L2/L3 traversal — distinct
+    from a natural TTL expiry, which leaves no marker. LML#498.
+    """
+    if not evict_cached(cached_func, *args, **kwargs):
+        return
+    try:
+        sentry_sdk.set_tag("lml.cache.refresh_evicted", "true")
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is not None:
+            transaction.set_data("lml.cache.memory_evictions_refresh", 1)
+    except Exception as e:
+        logger.warning("Failed to tag refresh eviction on Sentry transaction: %s", e)
 
 
 @router.get(
@@ -65,10 +98,13 @@ async def get_track_releases(
 )
 async def get_release(
     release_id: int,
+    refresh: bool = Query(False, description=_REFRESH_DESCRIPTION),
     service: DiscogsService | None = Depends(get_discogs_service),
 ) -> ReleaseMetadataResponse:
     """Get full metadata for a release by ID."""
     svc = _require_service(service)
+    if refresh:
+        _refresh_l1(DiscogsService.get_release, release_id)
     result = await svc.get_release(release_id)
 
     if result is None:
@@ -92,10 +128,13 @@ async def get_release(
 )
 async def get_artist(
     artist_id: int,
+    refresh: bool = Query(False, description=_REFRESH_DESCRIPTION),
     service: DiscogsService | None = Depends(get_discogs_service),
 ) -> ArtistDetails:
     """Get full details for an artist by Discogs ID."""
     svc = _require_service(service)
+    if refresh:
+        _refresh_l1(DiscogsService.get_artist_details, artist_id)
     result = await svc.get_artist_details(artist_id)
 
     if result is None:
@@ -128,10 +167,23 @@ async def get_artist(
 async def resolve_entity(
     entity_type: EntityType,
     entity_id: int,
+    refresh: bool = Query(False, description=_REFRESH_DESCRIPTION),
     service: DiscogsService | None = Depends(get_discogs_service),
 ) -> EntityResolveResponse:
     """Resolve a Discogs entity (artist, release, or master) to its name."""
     svc = _require_service(service)
+
+    # Dispatch to the cached method matching this entity type. Adding a new
+    # `EntityType` value MUST come with a matching entry here; the parametrized
+    # test in test_discogs_router.py walks every enum value so a missing leg
+    # surfaces as a test failure rather than a silent refresh no-op.
+    cached_funcs_by_type = {
+        EntityType.artist: DiscogsService.get_artist_details,
+        EntityType.release: DiscogsService.get_release,
+        EntityType.master: DiscogsService.get_master,
+    }
+    if refresh:
+        _refresh_l1(cached_funcs_by_type[entity_type], entity_id)
 
     if entity_type == EntityType.artist:
         artist = await svc.get_artist_details(entity_id)

@@ -220,9 +220,48 @@ def async_cached(cache: TTLCache) -> Callable[[Callable[..., T]], Callable[..., 
 
             return result  # type: ignore[no-any-return]
 
+        # Stash the cache + name so `evict_cached` can drop a single entry
+        # using the SAME key derivation. Keeping these on the wrapper means a
+        # future change to the decorator's keying logic forces a matching
+        # change here, not a silent drift. Underscored to mark them private.
+        wrapper._lml_cache = cache  # type: ignore[attr-defined]
+        wrapper._lml_func_name = func.__name__  # type: ignore[attr-defined]
+
         return wrapper  # type: ignore[return-value]
 
     return decorator
+
+
+def evict_cached(cached_func: Callable, *args, **kwargs) -> bool:
+    """Evict the L1 entry for ``cached_func(*args, **kwargs)``.
+
+    Args:
+        cached_func: A function decorated with :func:`async_cached`. For instance
+            methods, pass the class attribute (e.g. ``DiscogsService.get_artist_details``)
+            rather than a bound method — bound-method access does not proxy the
+            stashed ``_lml_cache`` / ``_lml_func_name`` attributes.
+        *args: Positional arguments AFTER any ``self`` strip — i.e., the same
+            arguments the underlying function receives. The decorator already
+            strips ``self`` when caching, so callers should mirror that.
+        **kwargs: Keyword arguments. Same per-value normalization as the
+            decorator's key derivation (`make_normalized_cache_key`).
+
+    Returns:
+        ``True`` if a key was found and removed, ``False`` if no entry existed.
+
+    Raises:
+        TypeError: If ``cached_func`` was not decorated with ``@async_cached``.
+
+    Example:
+        >>> evict_cached(DiscogsService.get_artist_details, 6998498)
+        True  # L1 had a cached ArtistDetails for that id; now gone.
+    """
+    cache = getattr(cached_func, "_lml_cache", None)
+    func_name = getattr(cached_func, "_lml_func_name", None)
+    if cache is None or func_name is None:
+        raise TypeError(f"{cached_func!r} is not @async_cached — no eviction surface available")
+    key = make_normalized_cache_key(func_name, *args, **kwargs)
+    return cache.pop(key, None) is not None
 
 
 def get_track_cache() -> TTLCache:
