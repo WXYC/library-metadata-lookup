@@ -93,3 +93,13 @@ The `services.discogs_api` field on `GET /health` carries one of a fixed vocabul
 Any value other than `ok` / `unavailable` flips the overall status to `degraded` (or `unhealthy` if a core service like `database` is also down).
 
 The probe also projects its result onto the active Sentry trace as the `discogs_api.check` tag (e.g. `discogs_api.check=auth-error`), so historic `/health` incidents can be queried by failure mode in the Sentry trace explorer without re-pulling Railway logs.
+
+### `commit_sha` (deploy identity)
+
+`GET /health` also returns a `commit_sha` field sourced from Railway's auto-injected `RAILWAY_GIT_COMMIT_SHA` environment variable. Local dev and CI surface `null` (the variable is unset).
+
+```json
+{ "status": "healthy", "version": "0.1.0", "commit_sha": "abc123...", "services": { ... } }
+```
+
+This is the canonical "is commit X deployed?" signal for cross-repo deploy gates. `settings.app_version` is hardcoded to `"0.1.0"` and is not bumped per deploy, so it cannot serve that role. Downstream callers that depend on a specific LML behavior (e.g. WXYC/Backend-Service rotation-scoped Discogs backfills that require LML#503's `fetched_at` stub-discriminator semantics) should poll `/health` and compare `commit_sha` against the merge SHA of the feature they need before scheduling the job — short-circuiting wasted API budget when staging happens to be running an older deploy.

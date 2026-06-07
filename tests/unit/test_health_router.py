@@ -145,6 +145,70 @@ class TestHealthEndpoint:
         assert body["services"]["discogs_cache"] == "ok"
 
     @pytest.mark.asyncio
+    async def test_commit_sha_from_railway_env(
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
+    ):
+        """``commit_sha`` mirrors Railway's auto-injected ``RAILWAY_GIT_COMMIT_SHA``.
+
+        Cross-repo deploy gates (e.g. WXYC/Backend-Service#1361) need a programmatic
+        way to ask "is commit X live?". ``settings.app_version`` is hardcoded and
+        unbumped, so it cannot serve that role.
+        """
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        sha = "abc123def456abc123def456abc123def456abcd"
+        monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", sha)
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        assert resp.json()["commit_sha"] == sha
+
+    @pytest.mark.asyncio
+    async def test_commit_sha_null_when_unset(
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
+    ):
+        """Local dev / CI: no env var -> ``commit_sha`` is ``null``, not an error."""
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "commit_sha" in body
+        assert body["commit_sha"] is None
+
+    @pytest.mark.asyncio
     async def test_degraded_preserves_granular_discogs_value(self, mock_db, mock_settings):
         """Core (database) ok but optional service erroring -> degraded.
 
