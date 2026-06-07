@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
@@ -145,6 +146,12 @@ class ArtistDetails(BaseModel):
     aliases: list[ArtistRef] = []
     members: list[MemberRef] = []
     urls: list[str] = []
+    # Stamped only by `write_artist_details` (`now()` in SQL). NULL marks a
+    # rebuild-created stub row that has never been hydrated from Discogs;
+    # non-NULL means "we asked Discogs at least once," regardless of whether
+    # the API returned a profile. Used as the cache-hit discriminator in
+    # `DiscogsService.get_artist_details` (#502).
+    fetched_at: datetime | None = None
     cached: bool = False
 
 

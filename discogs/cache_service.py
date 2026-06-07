@@ -982,8 +982,12 @@ class DiscogsCacheService:
             CacheUnavailableError: If database is unreachable
         """
         try:
+            # `fetched_at` is projected so the service-layer `is_pg_hit`
+            # predicate can distinguish stub rows (rebuild-created, never
+            # hydrated from Discogs) from rows we've actually fetched. See
+            # `DiscogsService.get_artist_details` and WXYC#502.
             artist_row = await self.pool.fetchrow(
-                "SELECT id, name, profile, image_url FROM artist WHERE id = $1",
+                "SELECT id, name, profile, image_url, fetched_at FROM artist WHERE id = $1",
                 artist_id,
             )
 
@@ -1026,6 +1030,7 @@ class DiscogsCacheService:
                     for r in member_rows
                 ],
                 urls=[r["url"] for r in url_rows],
+                fetched_at=artist_row["fetched_at"],
                 cached=True,
             )
 
