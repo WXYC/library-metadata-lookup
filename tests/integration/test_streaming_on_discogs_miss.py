@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.apple_music import AppleMusicClient, AppleMusicTrackMatch
 from discogs.models import DiscogsSearchResponse
 from lookup.models import LookupRequest
 from lookup.orchestrator import perform_lookup
@@ -62,7 +62,15 @@ class TestStreamingOnDiscogsMiss:
 
         apple_url = "https://music.apple.com/us/album/aluminum-tunes/1234567890"
         apple_music = AsyncMock(spec=AppleMusicClient)
-        apple_music.find_track_url = AsyncMock(return_value=apple_url)
+        # LML#487: synthesis path now drives ``find_track_metadata`` so the
+        # same Apple Music search response can yield artwork + release_year
+        # alongside the URL. Use ``artwork_url=None`` / ``release_year=None``
+        # to pin the pre-LML#487 URL-only invariant (this test predates the
+        # artwork extraction; LML#487's TestExternalArtworkProbe covers the
+        # full-payload shape).
+        apple_music.find_track_metadata = AsyncMock(
+            return_value=AppleMusicTrackMatch(url=apple_url, artwork_url=None, release_year=None)
+        )
 
         request = LookupRequest(
             artist="Stereolab",
@@ -124,7 +132,7 @@ class TestStreamingOnDiscogsMiss:
         mock_service.validate_track_on_release = AsyncMock(return_value=False)
 
         apple_music = AsyncMock(spec=AppleMusicClient)
-        apple_music.find_track_url = AsyncMock(return_value=None)
+        apple_music.find_track_metadata = AsyncMock(return_value=None)
 
         request = LookupRequest(
             artist="Stereolab",

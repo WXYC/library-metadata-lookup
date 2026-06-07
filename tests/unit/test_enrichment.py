@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.apple_music import AppleMusicClient, AppleMusicTrackMatch
 from discogs.models import (
     ArtistDetails,
     DiscogsSearchResult,
@@ -129,11 +129,16 @@ class TestEnrichArtworkResults:
 
     @pytest.mark.asyncio
     async def test_no_discogs_match_surfaces_apple_url_via_apple_music(self):
-        """When ``AppleMusicClient.find_track_url`` clears the 80/80/80 floor
-        on a no-Discogs-match item, the synthesized artwork carries the URL.
+        """When ``AppleMusicClient.find_track_metadata`` clears the 80/80/80
+        floor on a no-Discogs-match item, the synthesized artwork carries
+        the URL.
 
         This is the Tragic Magic case from BS#1184 in miniature: an album
-        absent from the WXYC catalog but present on Apple Music.
+        absent from the WXYC catalog but present on Apple Music. Post-
+        LML#487 the probe also lands ``artwork_url`` + ``release_year`` on
+        the synthesized result; this test pins the URL-only invariant from
+        the pre-LML#487 contract — ``artist_bio`` + ``wikipedia_url`` stay
+        None because they require a real Discogs artwork (positional gate).
         """
         item = make_library_item(
             artist="Julianna Barwick & Mary Lattimore",
@@ -142,7 +147,9 @@ class TestEnrichArtworkResults:
 
         apple_url = "https://music.apple.com/us/album/tragic-magic/1843854211"
         apple_music = AsyncMock(spec=AppleMusicClient)
-        apple_music.find_track_url = AsyncMock(return_value=apple_url)
+        apple_music.find_track_metadata = AsyncMock(
+            return_value=AppleMusicTrackMatch(url=apple_url, artwork_url=None, release_year=None)
+        )
 
         results = await enrich_artwork_results(
             [(item, None)],
@@ -156,9 +163,8 @@ class TestEnrichArtworkResults:
         assert enriched is not None
         assert enriched.release_id == 0
         assert enriched.apple_music_url == apple_url
-        # Album-derived fields stay None even though Apple matched — those
-        # are positionally gated and require a real Discogs artwork.
-        assert enriched.release_year is None
+        # Discogs-derived album fields stay None — positionally gated and
+        # require a real Discogs artwork.
         assert enriched.artist_bio is None
         assert enriched.wikipedia_url is None
 
@@ -867,9 +873,12 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
     @pytest.mark.asyncio
     async def test_apple_music_client_url_propagates_to_synthesized_result(self):
         """A no-Discogs-match item paired with an ``AppleMusicClient`` that
-        returns a URL produces a synthesized ``DiscogsSearchResult`` carrying
-        that URL — mirrors LML#401 / BS#1184 (Tragic Magic on Apple Music but
-        absent from the WXYC Discogs catalog).
+        returns a metadata match produces a synthesized ``DiscogsSearchResult``
+        carrying that URL — mirrors LML#401 / BS#1184 (Tragic Magic on Apple
+        Music but absent from the WXYC Discogs catalog). Post-LML#487 the
+        synthesis path consumes ``find_track_metadata`` rather than the
+        URL-only ``find_track_url`` so artwork + release year can land on
+        the same response.
         """
         item = make_library_item(
             artist="Julianna Barwick & Mary Lattimore",
@@ -878,7 +887,9 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         apple_url = "https://music.apple.com/us/album/tragic-magic/1843854211"
 
         apple_music = AsyncMock(spec=AppleMusicClient)
-        apple_music.find_track_url = AsyncMock(return_value=apple_url)
+        apple_music.find_track_metadata = AsyncMock(
+            return_value=AppleMusicTrackMatch(url=apple_url, artwork_url=None, release_year=None)
+        )
 
         results = await enrich_artwork_results(
             [(item, None)],
@@ -888,7 +899,7 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
             apple_music=apple_music,
         )
 
-        apple_music.find_track_url.assert_awaited_once_with(
+        apple_music.find_track_metadata.assert_awaited_once_with(
             "Julianna Barwick & Mary Lattimore",
             "The Four Sleeping Princesses",
             album="Tragic Magic",
@@ -931,7 +942,7 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         item = make_library_item(artist="Obscure Artist", title="Obscure Album")
 
         apple_music = AsyncMock(spec=AppleMusicClient)
-        apple_music.find_track_url = AsyncMock(return_value=None)
+        apple_music.find_track_metadata = AsyncMock(return_value=None)
 
         results = await enrich_artwork_results(
             [(item, None)],
@@ -941,18 +952,19 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
             apple_music=apple_music,
         )
 
-        apple_music.find_track_url.assert_awaited_once()
+        apple_music.find_track_metadata.assert_awaited_once()
         _, enriched = results[0]
         assert enriched is not None
         assert enriched.apple_music_url is None
 
     @pytest.mark.asyncio
     async def test_apple_music_client_raising_does_not_sink_whole_batch(self):
-        """A single ``find_track_url`` exception must NOT propagate through
-        ``asyncio.gather`` and fail the entire enrichment. ``find_track_url``
-        has no top-level exception handler around its result-iteration loop,
-        so the orchestrator wraps the call defensively — bulk lookups would
-        otherwise regress to 500 if Apple returns a malformed result.
+        """A single ``find_track_metadata`` exception must NOT propagate
+        through ``asyncio.gather`` and fail the entire enrichment — the
+        underlying search-song loop has no top-level exception handler
+        around its result iteration, so the orchestrator wraps the call
+        defensively. Bulk lookups would otherwise regress to 500 if Apple
+        returns a malformed result. Same shape as LML#444.
         """
         items_with_artwork = [
             (make_library_item(id=1, artist="Artist 1", title="Album 1"), None),
@@ -960,14 +972,14 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         ]
 
         apple_music = AsyncMock(spec=AppleMusicClient)
-        # Item 1 raises; item 2 returns a normal URL. Without a defensive
+        # Item 1 raises; item 2 returns a normal match. Without a defensive
         # wrap at the call site, the gather() in enrich_artwork_results
         # cancels item 2's enrichment mid-flight and raises.
         item2_url = "https://music.apple.com/us/album/album-2/222"
-        apple_music.find_track_url = AsyncMock(
+        apple_music.find_track_metadata = AsyncMock(
             side_effect=[
                 AttributeError("Apple returned a non-dict item"),
-                item2_url,
+                AppleMusicTrackMatch(url=item2_url, artwork_url=None, release_year=None),
             ]
         )
 
@@ -992,12 +1004,16 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
 
     @pytest.mark.asyncio
     async def test_apple_music_find_track_url_timeout_degrades_to_none(self):
-        """LML#449 + LML#450: a single ``find_track_url`` call that exceeds
-        the call-site timeout must NOT pull the rest of the request past its
-        deadline. The orchestrator wraps the call in ``asyncio.wait_for``
+        """LML#449 + LML#450: a single Apple Music probe call that exceeds
+        the call-site timeout must NOT pull the rest of the request past
+        its deadline. The orchestrator wraps the call in ``asyncio.wait_for``
         with a tight ceiling; on TimeoutError the item degrades to no Apple
-        URL, same as the LML#444 exception path. Pins the upper bound so the
-        worst-case 4×60s retry loop in LML#450 cannot block enrichment.
+        URL, same as the LML#444 exception path. Pins the upper bound so
+        the worst-case 4×60s retry loop in LML#450 cannot block enrichment.
+        Post-LML#487 the orchestrator drives ``find_track_metadata`` in
+        the synthesis path (no library row to project) — the timeout
+        semantics are identical because both methods share the
+        ``search_song`` rate-limited endpoint.
         """
         items_with_artwork = [
             (make_library_item(id=1, artist="Mūm", title="Summer Make Good"), None),
@@ -1010,9 +1026,13 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         # before this completes; the test then verifies graceful degradation.
         async def slow_find(*_args, **_kwargs):
             await asyncio.sleep(60)
-            return "https://music.apple.com/should-never-resolve"
+            return AppleMusicTrackMatch(
+                url="https://music.apple.com/should-never-resolve",
+                artwork_url=None,
+                release_year=None,
+            )
 
-        apple_music.find_track_url = AsyncMock(side_effect=slow_find)
+        apple_music.find_track_metadata = AsyncMock(side_effect=slow_find)
 
         # Patch the call-site timeout to a tiny value so the test runs in
         # milliseconds and the asyncio.wait_for ceiling fires deterministically.
@@ -1057,9 +1077,13 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
 
         async def slow_find(*_args, **_kwargs):
             await asyncio.sleep(60)
-            return "https://music.apple.com/should-never-resolve"
+            return AppleMusicTrackMatch(
+                url="https://music.apple.com/should-never-resolve",
+                artwork_url=None,
+                release_year=None,
+            )
 
-        apple_music.find_track_url = AsyncMock(side_effect=slow_find)
+        apple_music.find_track_metadata = AsyncMock(side_effect=slow_find)
 
         transaction = MagicMock()
         scope = MagicMock()
@@ -1106,9 +1130,13 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
 
         async def slow_find(*_args, **_kwargs):
             await asyncio.sleep(60)
-            return "https://music.apple.com/should-never-resolve"
+            return AppleMusicTrackMatch(
+                url="https://music.apple.com/should-never-resolve",
+                artwork_url=None,
+                release_year=None,
+            )
 
-        apple_music.find_track_url = AsyncMock(side_effect=slow_find)
+        apple_music.find_track_metadata = AsyncMock(side_effect=slow_find)
 
         # No active transaction.
         scope = MagicMock()
@@ -1332,3 +1360,254 @@ class TestStreamingLinksTitleGate:
 
         _, enriched = results[0]
         assert enriched.spotify_url == verified_spotify
+
+
+class TestExternalArtworkProbe:
+    """LML#487 / BS#1184: when the WXYC library catalog has no row whose title
+    clears the LML#477 (PR #481) gate against the requested album, probe Apple
+    Music for the literal `(artist, song, album)` and surface the matched
+    response's ``artwork_url`` + ``release_year`` on the synthesized
+    ``DiscogsSearchResult``.
+
+    Concretely: a flowsheet entry for `Hebebeb (Zrag)` from Noura Mint
+    Seymali's *Yenbett* — when the catalog has only her earlier *Tzenni*
+    album — must surface Yenbett's cover art, not Tzenni's. Strict
+    superset of LML#401 (the no-Discogs-match case still works), and
+    strict no-regression on LML#477's gate (the gate still fires).
+
+    The probe uses the SAME ``search_song`` endpoint the existing
+    ``find_track_url`` calls — no new Apple Music API rounds vs. the
+    LML#401 quota.
+    """
+
+    @pytest.mark.asyncio
+    async def test_probe_artwork_surfaces_on_synthesized_result_when_no_discogs_match(self):
+        """LML#401 superset: when ``artwork is None`` (no Discogs match for the
+        requested release) AND the Apple Music probe returns a track-level
+        match, the synthesized result carries ``artwork_url`` +
+        ``release_year`` from that probe response. No regression vs. LML#401:
+        the URL was already surfacing; the artwork + year are the new fields.
+        """
+        from clients.streaming.apple_music import AppleMusicTrackMatch
+
+        item = make_library_item(artist="Noura Mint Seymali", title="Hebebeb (Zrag)")
+        probe_match = AppleMusicTrackMatch(
+            url="https://music.apple.com/us/song/hebebeb-zrag/9",
+            artwork_url="https://is1-ssl.mzstatic.com/image/thumb/abc/600x600bb.jpg",
+            release_year=2025,
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+        # Keep find_track_url defined so a refactor that accidentally calls
+        # the old method instead of the new one surfaces in test output.
+        apple_music.find_track_url = AsyncMock(return_value=probe_match.url)
+
+        results = await enrich_artwork_results(
+            [(item, None)],
+            AsyncMock(),
+            song="Hebebeb (Zrag)",
+            album="Yenbett",
+            apple_music=apple_music,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # BS#1185 sentinel contract preserved — synthesis path is taken.
+        assert enriched.release_id == 0
+        assert enriched.release_url == ""
+        # The new fields land on the synthesized result.
+        assert enriched.artwork_url == probe_match.artwork_url
+        assert enriched.release_year == 2025
+        assert enriched.apple_music_url == probe_match.url
+
+    @pytest.mark.asyncio
+    async def test_probe_artwork_surfaces_when_library_row_title_misses_album(self):
+        """LML#487 core: library has Tzenni; DJ requests Yenbett. The PR #481
+        gate already blocks Tzenni's streaming-URL projection; this ticket
+        ALSO discards Tzenni's Discogs artwork and probes Apple Music for
+        Yenbett. The synthesized result carries the probe's Yenbett artwork
+        — not the leaked Tzenni cover from the Discogs hit."""
+        from clients.streaming.apple_music import AppleMusicTrackMatch
+
+        item = make_library_item(id=42, artist="Noura Mint Seymali", title="Tzenni")
+        # Discogs hit for the WRONG album (Tzenni). Its artwork_url and
+        # release_year would leak through ``artwork.model_copy(update=...)``
+        # without the LML#487 fix.
+        tzenni_artwork = make_discogs_result(
+            release_id=1,
+            artist="Noura Mint Seymali",
+            album="Tzenni",
+            artwork_url="https://example.com/tzenni-WRONG.jpg",
+            release_year=2014,
+        )
+        # Apple Music probe for `(Noura, Hebebeb, Yenbett)` returns the
+        # Yenbett match (right album).
+        probe_match = AppleMusicTrackMatch(
+            url="https://music.apple.com/us/song/hebebeb-zrag/9",
+            artwork_url="https://is1-ssl.mzstatic.com/image/thumb/abc/600x600bb.jpg",
+            release_year=2025,
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+        apple_music.find_track_url = AsyncMock(return_value=probe_match.url)
+
+        discogs_service = AsyncMock()
+        # Even if get_release returns Tzenni's year, the synthesis path
+        # ignores it for the synthesized-result branch.
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Tzenni",
+            artist="Noura Mint Seymali",
+            year=2014,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, tzenni_artwork)],
+            discogs_service,
+            song="Hebebeb (Zrag)",
+            album="Yenbett",
+            apple_music=apple_music,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # Tzenni's wrong artwork is gone.
+        assert enriched.artwork_url != "https://example.com/tzenni-WRONG.jpg"
+        # Yenbett's correct artwork (from Apple) is on the result.
+        assert enriched.artwork_url == probe_match.artwork_url
+        # Yenbett's release year, not Tzenni's.
+        assert enriched.release_year == 2025
+        # Synthesized result — release_id reset to 0 so BS#1185 still
+        # branches on the no-Discogs-match write path.
+        assert enriched.release_id == 0
+        assert enriched.release_url == ""
+
+    @pytest.mark.asyncio
+    async def test_probe_not_invoked_when_library_row_title_matches(self):
+        """Happy path: when the library row title clears the LML#477 gate,
+        the synthesis path is not taken and the external album probe is
+        not invoked. Pins acceptance criterion 3 — don't waste an Apple
+        Music call on rows that already match.
+
+        ``find_track_url`` (the song-level URL probe) still runs for the
+        streaming-URL surfacing path; what this test pins is that
+        ``find_track_metadata`` (the artwork-bearing probe) is not called
+        when the gate passes."""
+        item = make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Jessica Pratt",
+            album="On Your Own Love Again",
+            artwork_url="https://example.com/oyola.jpg",
+            release_year=2015,
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock()
+        apple_music.find_track_url = AsyncMock(
+            return_value="https://music.apple.com/us/song/back-baby/123"
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="On Your Own Love Again",
+            artist="Jessica Pratt",
+            year=2015,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Back, Baby",
+            album="On Your Own Love Again",
+            apple_music=apple_music,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # Library row's Discogs artwork survives — gate passed.
+        assert enriched.artwork_url == "https://example.com/oyola.jpg"
+        assert enriched.release_year == 2015
+        # External-artwork probe (find_track_metadata) NOT invoked: don't
+        # waste an Apple Music call on a happy-path hit.
+        apple_music.find_track_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_probe_returning_none_falls_through_to_legacy_shape(self):
+        """When the Apple Music probe returns None (no acceptable match —
+        per the 80/80/80 floor inside ``find_track_metadata``), the
+        synthesized result shape matches the existing LML#401 no-Discogs-
+        match behaviour: ``artwork_url`` is None, search-URL fallbacks
+        fill streaming URLs. No regression."""
+        item = make_library_item(artist="Obscure Artist", title="Obscure Song")
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=None)
+        apple_music.find_track_url = AsyncMock(return_value=None)
+
+        results = await enrich_artwork_results(
+            [(item, None)],
+            AsyncMock(),
+            song="Obscure Song",
+            album="Obscure Album",
+            apple_music=apple_music,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.release_id == 0
+        # No artwork surfaces — synthesized result with null artwork field.
+        assert enriched.artwork_url is None
+        assert enriched.release_year is None
+        # Search-URL fallbacks still fill (legacy LML#401 contract).
+        assert enriched.spotify_url is not None
+        assert "search" in enriched.spotify_url.lower()
+
+    @pytest.mark.asyncio
+    async def test_probe_not_invoked_when_album_is_none(self):
+        """When no album is requested (artist+song-only lookup) AND the
+        library row carries Discogs artwork, the gate trivially passes
+        (no signal to gate against — preserves LML#477's
+        ``test_applies_streaming_links_when_album_not_requested``
+        edge case). The artwork-bearing probe must not fire — the legacy
+        ``find_track_url`` is what surfaces the song URL on the
+        happy-path slot.
+        """
+        item = make_library_item(id=42, artist="Juana Molina", title="DOGA")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Juana Molina",
+            album="DOGA",
+            artwork_url="https://example.com/doga.jpg",
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock()
+        apple_music.find_track_url = AsyncMock(return_value=None)
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="DOGA",
+            artist="Juana Molina",
+            year=2022,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="DOGA",
+            album=None,
+            apple_music=apple_music,
+        )
+
+        apple_music.find_track_metadata.assert_not_called()
