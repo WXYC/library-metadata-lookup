@@ -1872,91 +1872,13 @@ async def enrich_artwork_results(
         # the *right* album's artwork.
         library_row_acceptable = artwork is not None and row_title_matches_requested_album
 
-        # Apple Music probe. In the happy path (``library_row_acceptable``)
-        # we just need the song URL for the ``apple_music_url`` slot, so
-        # call ``find_track_url`` — preserves LML#401 behaviour and the
-        # existing test-call shape. When the library row is NOT acceptable
-        # (LML#487 trigger), we additionally want the matched track's
-        # artwork + release year for the synthesized result — call
-        # ``find_track_metadata`` instead. The two methods make exactly
-        # one Apple Music API call each (same ``search_song`` endpoint),
-        # so picking one or the other keeps the per-request Apple quota
-        # at exactly one call — no inflation vs. LML#401 baseline.
-        #
-        # The ``asyncio.wait_for`` ceiling caps the worst-case latency a
-        # single Apple call can impose on the request — without it, a
-        # 429/5xx storm could pin one of the Apple Music Semaphore(5)
-        # slots for up to ``_MAX_RETRIES`` × ``_RETRY_AFTER_CAP_SECONDS``
-        # seconds while still being unbounded at the call site (LML#449
-        # + LML#450). On timeout we degrade to no-Apple-anything, same
-        # as the LML#444 exception path. The Sentry-marker name stays
-        # ``apple_music.find_track_url.timeout`` to preserve LML#462
-        # trace-explorer dashboards — the underlying call may now be
-        # ``find_track_metadata`` but the failure mode is the same.
-        apple_music_url: str | None = None
-        probe_artwork_url: str | None = None
-        probe_release_year: int | None = None
-        if apple_music is not None and artist and search_term:
-            try:
-                if library_row_acceptable:
-                    apple_music_url = await asyncio.wait_for(
-                        apple_music.find_track_url(artist, search_term, album=album),
-                        timeout=_apple_music_lookup_timeout_s(),
-                    )
-                else:
-                    probe_match = await asyncio.wait_for(
-                        apple_music.find_track_metadata(artist, search_term, album=album),
-                        timeout=_apple_music_lookup_timeout_s(),
-                    )
-                    if probe_match is not None:
-                        apple_music_url = probe_match.url
-                        probe_artwork_url = probe_match.artwork_url
-                        probe_release_year = probe_match.release_year
-            except TimeoutError:
-                logger.warning(
-                    "AppleMusicClient.find_track_url timed out for %s - %s",
-                    artist,
-                    search_term,
-                )
-                # LML#462: project onto the active Sentry transaction so the
-                # trace explorer can distinguish "Apple Music timed out" from
-                # "Apple Music never ran" — the cancelled inner
-                # `apple_music.search` span never sets its `result` data, so
-                # without this marker the timeout shape is queryably
-                # indistinguishable from a no-op. Same swallow pattern as
-                # `_log_album_title_fallback` / `_log_resolver_pre_pass`.
-                try:
-                    transaction = sentry_sdk.get_current_scope().transaction
-                    if transaction is not None:
-                        transaction.set_data("apple_music.find_track_url.timeout", True)
-                except Exception as e:
-                    logger.warning(
-                        "Failed to project apple_music timeout onto Sentry transaction: %s",
-                        e,
-                    )
-            except Exception:
-                logger.exception(
-                    "AppleMusicClient.find_track_url raised for %s - %s", artist, search_term
-                )
-
-        # Album-derived fields are positionally gated: only on top-1, and
-        # only when top-1 actually carries an *acceptable* library row
-        # (LML#487 extends PR #481 gate from streaming-links to
-        # release-year/bio/wiki: a sibling-album fuzzy hit would otherwise
-        # leak Tzenni's year onto a Yenbett response). When the library
-        # row is not acceptable, fall through to the probe-derived year
-        # (Yenbett's year from Apple Music).
-        is_album_derived_eligible = is_top1 and library_row_acceptable
-        year_result = (
-            top1_year if is_album_derived_eligible else (probe_release_year if is_top1 else None)
-        )
-        artist_bio = top1_bio if is_album_derived_eligible else None
-        wikipedia_url = top1_wiki if is_album_derived_eligible else None
-
-        # Get streaming URLs: prefer direct links from DB, fall back to search URLs.
-        # Runs unconditionally — releases that ARE on streaming but ISN'T
-        # in the WXYC catalog (a Discogs miss) still surface streaming
-        # buttons via the synthesized result below (LML#401 / BS#1184).
+        # Hoist the librarian-curated streaming_links override BEFORE the
+        # Apple Music probe so the happy-path probe can short-circuit when
+        # the override would win anyway (the final assignment is
+        # ``apple_music_override or apple_music_url or None``). Saves one
+        # Apple Music quota slot + up to _apple_music_lookup_timeout_s() of
+        # wall-clock per overridden item. The override gate still requires
+        # row_title_matches_requested_album per PR #481 (LML#477).
         spotify_url = None
         apple_music_override = None
         youtube_music_url = None
@@ -1979,6 +1901,84 @@ async def enrich_artwork_results(
                 youtube_music_url = links.get("youtube_music_url")
                 bandcamp_url = links.get("bandcamp_url")
                 soundcloud_url = links.get("soundcloud_url")
+
+        # Apple Music probe. ``library_row_acceptable`` picks ``find_track_url``
+        # (URL only — preserves LML#401 baseline); the synthesis path
+        # (LML#487) needs artwork + year too, so calls ``find_track_metadata``.
+        # Both make one ``search_song`` call, so per-request quota is identical
+        # to the LML#401 baseline. Skip the happy-path probe when the
+        # librarian override would win anyway (saves one Apple call per
+        # overridden item). The ``asyncio.wait_for`` ceiling caps single-call
+        # latency under 429/5xx pressure (LML#449/#450). On timeout/error we
+        # degrade to no-Apple-anything (LML#444 swallow). The Sentry data key
+        # encodes the *method* so LML#462 dashboards can distinguish synthesis-
+        # path timeouts (artwork still leaking, high impact) from happy-path
+        # timeouts (URL only, low impact).
+        apple_music_url: str | None = None
+        probe_artwork_url: str | None = None
+        probe_release_year: int | None = None
+        probe_method = "find_track_metadata" if not library_row_acceptable else "find_track_url"
+        skip_happy_probe = library_row_acceptable and apple_music_override
+        if apple_music is not None and artist and search_term and not skip_happy_probe:
+            try:
+                if library_row_acceptable:
+                    apple_music_url = await asyncio.wait_for(
+                        apple_music.find_track_url(artist, search_term, album=album),
+                        timeout=_apple_music_lookup_timeout_s(),
+                    )
+                else:
+                    probe_match = await asyncio.wait_for(
+                        apple_music.find_track_metadata(artist, search_term, album=album),
+                        timeout=_apple_music_lookup_timeout_s(),
+                    )
+                    if probe_match is not None:
+                        apple_music_url = probe_match.url
+                        probe_artwork_url = probe_match.artwork_url
+                        probe_release_year = probe_match.release_year
+            except TimeoutError:
+                logger.warning(
+                    "AppleMusicClient.%s timed out for %s - %s",
+                    probe_method,
+                    artist,
+                    search_term,
+                )
+                # LML#462: project onto the active Sentry transaction so the
+                # trace explorer can distinguish "Apple Music timed out" from
+                # "Apple Music never ran" — the cancelled inner
+                # `apple_music.search` span never sets its `result` data, so
+                # without this marker the timeout shape is queryably
+                # indistinguishable from a no-op. The legacy key stays for
+                # dashboard continuity; the ``.method`` key disambiguates
+                # synthesis-path timeouts from happy-path timeouts.
+                try:
+                    transaction = sentry_sdk.get_current_scope().transaction
+                    if transaction is not None:
+                        transaction.set_data("apple_music.find_track_url.timeout", True)
+                        transaction.set_data("apple_music.timeout.method", probe_method)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to project apple_music timeout onto Sentry transaction: %s",
+                        e,
+                    )
+            except Exception:
+                logger.exception(
+                    "AppleMusicClient.%s raised for %s - %s",
+                    probe_method,
+                    artist,
+                    search_term,
+                )
+
+        # Album-derived fields are positionally gated: only on top-1, and
+        # only when top-1 actually carries an *acceptable* library row.
+        # LML#487 fall-through: when the row is not acceptable, the probe
+        # supplies release_year on the synthesized result. The probe
+        # already cost zero (same response that produced ``probe_artwork_url``),
+        # so the original top1-only positional rationale doesn't apply —
+        # surface ``probe_release_year`` whenever the synthesis branch ran.
+        is_album_derived_eligible = is_top1 and library_row_acceptable
+        year_result = top1_year if is_album_derived_eligible else probe_release_year
+        artist_bio = top1_bio if is_album_derived_eligible else None
+        wikipedia_url = top1_wiki if is_album_derived_eligible else None
 
         # Fall back to search URLs for any service without a direct link
         if artist and search_term:
