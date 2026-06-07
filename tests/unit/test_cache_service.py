@@ -1,6 +1,7 @@
 """Unit tests for discogs/cache_service.py."""
 
 import asyncio
+from datetime import UTC
 from unittest.mock import AsyncMock
 
 import pytest
@@ -1076,12 +1077,15 @@ class TestGetArtistDetails:
 
     @pytest.mark.asyncio
     async def test_full_details(self, cache_service, mock_asyncpg_pool):
+        from datetime import datetime
+
         mock_asyncpg_pool.fetchrow = AsyncMock(
             return_value={
                 "id": 77,
                 "name": "Autechre",
                 "profile": "Electronic duo from Rochdale.",
                 "image_url": "https://i.discogs.com/autechre.jpg",
+                "fetched_at": datetime(2026, 1, 1, tzinfo=UTC),
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -1106,6 +1110,60 @@ class TestGetArtistDetails:
         assert result.members[0].name == "Rob Brown"
         assert result.urls == ["https://autechre.ws"]
         assert result.cached is True
+
+    @pytest.mark.asyncio
+    async def test_projects_fetched_at_for_stub_discrimination(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """SELECT must project `fetched_at` so callers can distinguish stub
+        rows (rebuild-created, never asked Discogs) from fully-fetched rows.
+
+        See WXYC/library-metadata-lookup#502.
+        """
+        from datetime import datetime
+
+        stamp = datetime(2026, 1, 1, tzinfo=UTC)
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 77,
+                "name": "Stereolab",
+                "profile": "Anglo-French band.",
+                "image_url": None,
+                "fetched_at": stamp,
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=make_fetch_router())
+
+        result = await cache_service.get_artist_details(77)
+        assert result is not None
+        assert result.fetched_at == stamp
+
+        sql = mock_asyncpg_pool.fetchrow.call_args.args[0]
+        assert "fetched_at" in sql, (
+            f"get_artist_details SELECT must project fetched_at; got: {sql!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stub_row_has_null_fetched_at(self, cache_service, mock_asyncpg_pool):
+        """A stub row created by the monthly rebuild has `fetched_at IS NULL`;
+        the cache surfaces that as `ArtistDetails.fetched_at is None` so the
+        service-layer predicate can treat it as a miss (#502).
+        """
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 6998498,
+                "name": "Yetsuby",
+                "profile": None,
+                "image_url": None,
+                "fetched_at": None,
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=make_fetch_router())
+
+        result = await cache_service.get_artist_details(6998498)
+        assert result is not None
+        assert result.fetched_at is None
+        assert result.profile is None
 
 
 class TestWriteArtistDetails:

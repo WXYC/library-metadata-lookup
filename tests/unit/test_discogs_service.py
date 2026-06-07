@@ -2201,15 +2201,101 @@ class TestGetArtistDetails:
 
     @pytest.mark.asyncio
     async def test_cache_hit(self, service_with_cache):
+        from datetime import datetime
+
         from discogs.models import ArtistDetails
 
-        cached_details = ArtistDetails(artist_id=77, name="Autechre", cached=True)
+        # `fetched_at` non-NULL marks the row as fully fetched — the
+        # cache-hit discriminator added in #502. Without it the seam
+        # treats the row as a rebuild-stub and falls through to the API.
+        cached_details = ArtistDetails(
+            artist_id=77,
+            name="Autechre",
+            fetched_at=datetime(2026, 1, 1, tzinfo=UTC),
+            cached=True,
+        )
         service_with_cache.cache_service.get_artist_details = AsyncMock(return_value=cached_details)
 
         result = await service_with_cache.get_artist_details(77)
         assert result is not None
         assert result.artist_id == 77
         assert result.cached is True
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_when_fetched_but_no_profile(self, service_with_cache):
+        """Discogs answered, no profile text — still a hit, no re-fetch.
+
+        Guards against accidentally treating every Discogs-confirmed-empty
+        profile as a permanent miss, which would cost a round-trip per
+        flowsheet lookup against the no-profile tail. See #502.
+        """
+        from datetime import datetime
+
+        from discogs.models import ArtistDetails
+
+        cached_details = ArtistDetails(
+            artist_id=77,
+            name="Yetsuby",
+            profile=None,
+            fetched_at=datetime(2026, 1, 1, tzinfo=UTC),
+            cached=True,
+        )
+        service_with_cache.cache_service.get_artist_details = AsyncMock(return_value=cached_details)
+        service_with_cache.cache_service.write_artist_details = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+        ) as request_mock:
+            result = await service_with_cache.get_artist_details(77)
+
+        assert result is not None
+        assert result.cached is True
+        request_mock.assert_not_called()
+        service_with_cache.cache_service.write_artist_details.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stub_row_falls_through_to_api(self, service_with_cache):
+        """A stub row (fetched_at IS NULL, profile IS NULL — created by the
+        monthly rebuild's stub-from-release_artist path) is treated as a
+        cache miss. The seam fires `_api_fetch` + write-back so subsequent
+        calls return populated data. See #502 and #497.
+        """
+        from discogs.models import ArtistDetails
+
+        stub = ArtistDetails(
+            artist_id=6998498,
+            name="Yetsuby",
+            profile=None,
+            fetched_at=None,
+            cached=True,
+        )
+        service_with_cache.cache_service.get_artist_details = AsyncMock(return_value=stub)
+        service_with_cache.cache_service.write_artist_details = AsyncMock()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "id": 6998498,
+            "name": "Yetsuby",
+            "profile": "Live show.",
+            "images": [],
+        }
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ) as request_mock:
+            result = await service_with_cache.get_artist_details(6998498)
+
+        request_mock.assert_awaited_once()
+        service_with_cache.cache_service.write_artist_details.assert_called_once()
+        assert result is not None
+        assert result.profile == "Live show."
 
     @pytest.mark.asyncio
     async def test_writes_back_to_cache(self, service_with_cache):

@@ -927,6 +927,16 @@ class DiscogsService:
             pg_read=lambda: cache.get_artist_details(artist_id),
             api_fetch=_api_fetch,
             pg_write=cache.write_artist_details,
+            # `fetched_at IS NULL` marks a stub row created by the monthly
+            # rebuild's stub-from-`release_artist` path — `(id, name)` only,
+            # no profile / aliases / members / urls / variations. Falling
+            # through to the API + write-back is the back-fill path. Once
+            # `fetched_at` is set, both "asked, got a profile" and "asked,
+            # no profile" are full hits — we don't re-ask Discogs about the
+            # no-profile tail. Same shape of fix as the `get_release`
+            # artwork discriminator above. See WXYC#502 (and #497 for the
+            # rebuild-path fix that creates these stubs in the first place).
+            is_pg_hit=lambda v: v is not None and v.fetched_at is not None,
             breadcrumb_data={"artist_id": artist_id},
         )
 
