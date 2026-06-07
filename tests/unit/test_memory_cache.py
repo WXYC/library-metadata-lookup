@@ -9,6 +9,7 @@ from discogs.memory_cache import (
     async_cached,
     clear_all_caches,
     create_ttl_cache,
+    evict_cached,
     get_release_cache,
     get_search_cache,
     get_track_cache,
@@ -402,6 +403,128 @@ class TestAsyncCached:
         await my_func("a")
         await my_func("b")
         assert len(cache) == 2
+
+
+# ---------------------------------------------------------------------------
+# evict_cached (LML#498)
+# ---------------------------------------------------------------------------
+
+
+class TestEvictCached:
+    """`evict_cached` mirrors the @async_cached key derivation so a single
+    helper at the router seam can drop a specific entry without re-deriving
+    the cache reference or key shape. Pins parity with the decorator so the
+    two never drift (LML#498)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_miss(self):
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+
+        @async_cached(cache)
+        async def my_func(arg):
+            return arg
+
+        # Nothing primed; eviction is a no-op and reports it.
+        assert evict_cached(my_func, "never-primed") is False
+
+    @pytest.mark.asyncio
+    async def test_returns_true_and_removes_entry(self):
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+
+        @async_cached(cache)
+        async def my_func(arg):
+            return {"data": arg, "cached": False}
+
+        await my_func("a")
+        assert len(cache) == 1
+        assert evict_cached(my_func, "a") is True
+        assert len(cache) == 0
+
+    @pytest.mark.asyncio
+    async def test_next_call_repopulates(self):
+        # After eviction the wrapping decorator's miss branch re-runs the
+        # underlying function and re-fills the cache. This is the property
+        # the ?refresh=true endpoint relies on.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+
+        @async_cached(cache)
+        async def my_func(arg):
+            nonlocal call_count
+            call_count += 1
+            return {"data": arg, "cached": False}
+
+        await my_func("a")
+        await my_func("a")  # cache hit
+        assert call_count == 1
+
+        assert evict_cached(my_func, "a") is True
+        await my_func("a")  # miss after eviction → invokes underlying
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_normalization_parity_with_decorator(self):
+        # The decorator collapses diacritic/case variants to one entry; the
+        # evictor MUST use the same key derivation so passing the ASCII form
+        # drops an entry primed by the diacritic form. Otherwise a refresh
+        # path could silently fail to clear what the cache hit serves.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+
+        @async_cached(cache)
+        async def search(artist):
+            return {"artist": artist, "cached": False}
+
+        await search("Sonido Dueñez")
+        assert len(cache) == 1
+        # Evict using the ASCII spelling — should still hit the same key.
+        assert evict_cached(search, "Sonido Duenez") is True
+        assert len(cache) == 0
+
+    @pytest.mark.asyncio
+    async def test_does_not_evict_unrelated_entries(self):
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+
+        @async_cached(cache)
+        async def my_func(arg):
+            return arg
+
+        await my_func("a")
+        await my_func("b")
+        assert len(cache) == 2
+
+        assert evict_cached(my_func, "a") is True
+        assert len(cache) == 1
+        # "b" still primed.
+        assert evict_cached(my_func, "b") is True
+        assert len(cache) == 0
+
+    def test_raises_on_non_decorated_callable(self):
+        async def plain_func(arg):
+            return arg
+
+        with pytest.raises(TypeError, match="not @async_cached"):
+            evict_cached(plain_func, "x")
+
+    @pytest.mark.asyncio
+    async def test_evicts_method_using_class_attribute(self):
+        # Router-side call shape: `evict_cached(DiscogsService.method, id)`.
+        # The class attribute resolves to the wrapper directly (no bound-method
+        # __getattr__ shenanigans), so the stashed cache+func_name are visible.
+        # Args are passed AFTER `self` is stripped, matching the cache key the
+        # decorator stored.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+
+        class MyService:
+            @async_cached(cache)
+            async def fetch(self, item_id):
+                return {"id": item_id, "cached": False}
+
+        svc = MyService()
+        await svc.fetch(42)
+        assert len(cache) == 1
+
+        assert evict_cached(MyService.fetch, 42) is True
+        assert len(cache) == 0
 
 
 # ---------------------------------------------------------------------------
