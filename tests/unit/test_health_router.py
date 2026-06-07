@@ -209,6 +209,39 @@ class TestHealthEndpoint:
         assert body["commit_sha"] is None
 
     @pytest.mark.asyncio
+    async def test_commit_sha_null_when_env_var_is_empty_string(
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
+    ):
+        """A set-but-empty ``RAILWAY_GIT_COMMIT_SHA`` (dev shell `export X=`, transient
+        Railway state) must surface as ``null`` — the documented contract is "null when
+        unset", and downstream deploy-gate comparisons (``body['commit_sha'] == sha``)
+        must not be fooled by an empty string that would equal nothing but also fail an
+        ``is None`` check.
+        """
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "")
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        assert resp.json()["commit_sha"] is None
+
+    @pytest.mark.asyncio
     async def test_degraded_preserves_granular_discogs_value(self, mock_db, mock_settings):
         """Core (database) ok but optional service erroring -> degraded.
 

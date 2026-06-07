@@ -141,10 +141,15 @@ async def health_check(
     else:
         status = "unhealthy"
 
+    # Coerce a set-but-empty ``RAILWAY_GIT_COMMIT_SHA`` to ``None`` so the
+    # documented "null when unset" contract holds across (a) Railway with the
+    # var unset, (b) local dev / CI with the var unset, and (c) shells that
+    # exported the var with an empty value. Downstream deploy-gate equality
+    # checks (e.g. WXYC/Backend-Service#1361) must not be fooled by ``""``.
     body = {
         "status": status,
         "version": settings.app_version,
-        "commit_sha": os.environ.get("RAILWAY_GIT_COMMIT_SHA"),
+        "commit_sha": os.environ.get("RAILWAY_GIT_COMMIT_SHA") or None,
         "services": services,
     }
 
