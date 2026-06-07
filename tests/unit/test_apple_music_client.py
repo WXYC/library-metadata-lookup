@@ -493,6 +493,215 @@ class TestFindAlbumMatch:
         assert match.url.endswith("/456")
 
 
+def _make_song_data_full(
+    name: str = "Hebebeb (Zrag)",
+    artist_name: str = "Noura Mint Seymali",
+    album_name: str = "Yenbett",
+    url: str = "https://music.apple.com/us/song/hebebeb-zrag/9",
+    artwork_url: str | None = "https://is1-ssl.mzstatic.com/image/thumb/abc/{w}x{h}bb.jpg",
+    release_date: str | None = "2025-03-14",
+) -> dict:
+    """Song record carrying the full ``artwork`` + ``releaseDate`` payload
+    Apple Music returns for catalog tracks. Track-level artwork inherits
+    the album cover, and ``releaseDate`` is the album's release date for
+    catalog tracks (Apple does not distinguish single vs album release
+    date here for songs that ship as part of an album).
+    """
+    attrs: dict = {
+        "artistName": artist_name,
+        "name": name,
+        "albumName": album_name,
+        "url": url,
+    }
+    if artwork_url is not None:
+        attrs["artwork"] = {
+            "width": 3000,
+            "height": 3000,
+            "url": artwork_url,
+            "bgColor": "000000",
+        }
+    if release_date is not None:
+        attrs["releaseDate"] = release_date
+    return {"id": "9", "type": "songs", "attributes": attrs}
+
+
+class TestFindTrackMetadata:
+    """``find_track_metadata`` extends ``find_track_url`` (the existing lookup
+    hot-path probe) by surfacing ``artwork_url`` and ``release_year`` from the
+    SAME ``search_song`` response. Pins the LML#487 / BS#1184 fix: when the
+    WXYC catalog has no acceptable library row for the requested album, the
+    synthesized ``DiscogsSearchResult`` carries the right album's artwork
+    instead of a sibling-album cover leaking through.
+
+    No new API rounds vs. ``find_track_url`` — both call ``search_song``
+    against the same `(artist, song)` term, so per-request Apple Music quota
+    is unchanged. Reuses the same 80/80(/80) floor as ``find_track_url``
+    so the artist+title (+album) wrong-match guards stay in lockstep.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_full_metadata_for_acceptable_match(self, es256_keypair):
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([_make_song_data_full()]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/hebebeb-zrag/9"
+        # `{w}x{h}` template must be substituted with concrete pixel
+        # dimensions before surfacing — clients (iOS, dj-site) cannot
+        # render the template literal.
+        assert "{w}" not in match.artwork_url
+        assert "{h}" not in match.artwork_url
+        assert "is1-ssl.mzstatic.com" in match.artwork_url
+        assert match.release_year == 2025
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_search_empty(self, es256_keypair):
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata("Unknown", "Unknown")
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_album_below_floor(self, es256_keypair):
+        """LML#487 Tzenni-vs-Yenbett shape: when the song appears on the
+        wrong album in Apple's catalog (a compilation, a single-track
+        sampler) the 3-way 80/80/80 floor must reject. Otherwise the
+        synthesized result would carry wrong-album artwork, regressing
+        on the very bug this ticket fixes."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response([_make_song_data_full(album_name="Tzenni")])
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_artist_below_floor(self, es256_keypair):
+        """Same song title under the wrong artist — the 80/80 floor must
+        reject so a same-titled cover by another artist can't surface
+        wrong-artist artwork."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response(
+                [_make_song_data_full(artist_name="Completely Different Artist")]
+            )
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_handles_missing_artwork_block(self, es256_keypair):
+        """A catalog song with no ``artwork`` block (rare but real for
+        region-restricted records) must not raise — ``artwork_url`` falls
+        through as ``None`` while the URL still surfaces."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response([_make_song_data_full(artwork_url=None)])
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+        assert match is not None
+        assert match.artwork_url is None
+        assert match.url.endswith("/9")
+
+    @pytest.mark.asyncio
+    async def test_handles_missing_release_date(self, es256_keypair):
+        """A catalog song with no ``releaseDate`` (sparse record) must not
+        raise — ``release_year`` falls through as ``None``."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response([_make_song_data_full(release_date=None)])
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+        assert match is not None
+        assert match.release_year is None
+
+    @pytest.mark.asyncio
+    async def test_picks_best_scoring_when_multiple_clear_floor(self, es256_keypair):
+        """When several candidates clear 80/80(/80), the highest combined
+        score wins. Pins that Apple's intrinsic ranking order doesn't
+        freeze a sub-optimal hit's metadata when a stronger match sits
+        below it."""
+        client = _client(es256_keypair)
+        sub_optimal = _make_song_data_full(
+            artist_name="Noura Mint Seymalii",  # 1-char drift, clears 80
+            url="https://music.apple.com/us/song/wrong/1",
+            artwork_url="https://example.com/wrong/{w}x{h}.jpg",
+            release_date="1999-01-01",
+        )
+        canonical = _make_song_data_full(
+            url="https://music.apple.com/us/song/right/2",
+            artwork_url="https://example.com/right/{w}x{h}.jpg",
+            release_date="2025-03-14",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([sub_optimal, canonical]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/right/2"
+        assert "right" in match.artwork_url
+        assert match.release_year == 2025
+
+    @pytest.mark.asyncio
+    async def test_url_matches_find_track_url_on_acceptable_hit(self, es256_keypair):
+        """``find_track_metadata`` is a superset of ``find_track_url``: when
+        both methods are called against the same response, the URL each
+        surfaces must agree. Pins the no-regression invariant — a refactor
+        that drifts the two floors would silently break BS#1184 callers."""
+        client_a = _client(es256_keypair)
+        client_b = _client(es256_keypair)
+        # Same mock response for both clients.
+        mock_a = AsyncMock(spec=httpx.AsyncClient)
+        mock_a.get = AsyncMock(return_value=_songs_response([_make_song_data_full()]))
+        client_a._http = mock_a
+
+        mock_b = AsyncMock(spec=httpx.AsyncClient)
+        mock_b.get = AsyncMock(return_value=_songs_response([_make_song_data_full()]))
+        client_b._http = mock_b
+
+        url = await client_a.find_track_url("Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett")
+        match = await client_b.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+
+        assert url is not None
+        assert match is not None
+        assert match.url == url
+
+
 class TestRetryBehavior:
     """429 and transient 5xx are retried; terminal 4xx are not. Mirrors
     SpotifyClient's _search_with_retry shape."""

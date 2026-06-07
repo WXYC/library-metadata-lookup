@@ -14,8 +14,18 @@ Public surface:
 - `find_album_match(artist, title)` — BaseStreamingClient contract; powers
   `/streaming-check` via `streaming/router.handle_streaming_check`.
 - `find_track_url(artist, song, album=None)` — used by the lookup hot path
-  in `lookup/orchestrator.enrich_artwork_results`. 3-way fuzz floor on
+  in `lookup/orchestrator.enrich_artwork_results` when the WXYC library
+  row clears the LML#477 title gate (just need the URL for the
+  ``apple_music_url`` slot). 3-way fuzz floor on
   `attributes.{artistName,name,albumName}`.
+- `find_track_metadata(artist, song, album=None)` — used by the same hot
+  path when the library row fails the gate (LML#487) or the catalog has
+  no Discogs match (LML#401). Same `search_song` endpoint + same fuzz
+  floor as `find_track_url`; returns `AppleMusicTrackMatch` with the
+  URL plus `attributes.artwork.url` (artwork) and
+  `attributes.releaseDate` (year) so the synthesized
+  `DiscogsSearchResult` surfaces the correct album's cover art instead
+  of leaking a sibling-album library row's Discogs image.
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 
 import jwt as pyjwt
 import sentry_sdk
@@ -34,6 +45,26 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 from clients.streaming.base import BaseStreamingClient
 from clients.streaming.matching import find_best_source_match
 from streaming.models import SourceMatch
+
+
+@dataclass(frozen=True)
+class AppleMusicTrackMatch:
+    """Apple Music song-search verdict carrying the fields LML's lookup hot
+    path needs to populate a synthesized ``DiscogsSearchResult`` when the
+    WXYC catalog has no acceptable library row for the requested album
+    (LML#487 / BS#1184).
+
+    Extends ``find_track_url``'s plain ``str | None`` return with
+    ``artwork_url`` and ``release_year``, extracted from the SAME
+    ``search_song`` response payload — no extra Apple Music API rounds
+    over the existing ``find_track_url`` quota. ``url`` is the Apple Music
+    song deep-link (same value ``find_track_url`` returns).
+    """
+
+    url: str
+    artwork_url: str | None
+    release_year: int | None
+
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +381,75 @@ class AppleMusicClient(BaseStreamingClient):
             url_fn=_extract_url,
         )
 
+    async def find_track_metadata(
+        self, artist: str, song: str, album: str | None = None
+    ) -> AppleMusicTrackMatch | None:
+        """Search for `(artist, song[, album])` and return URL + artwork + year.
+
+        Sibling of ``find_track_url`` that surfaces the richer
+        ``AppleMusicTrackMatch`` shape (LML#487 / BS#1184). The lookup hot
+        path uses it to synthesize a ``DiscogsSearchResult`` carrying the
+        right album's cover art when the WXYC catalog has no acceptable
+        library row for the requested album — the Noura Mint Seymali
+        ``Hebebeb (Zrag) / Yenbett`` shape (library has Tzenni only, song
+        search would otherwise project Tzenni's artwork onto a Yenbett
+        flowsheet entry).
+
+        Reuses the SAME ``search_song`` endpoint, ``fuzz.token_set_ratio``
+        scoring, and 80/80(/80) floor as ``find_track_url`` — no extra
+        Apple Music API rounds vs. the existing ``find_track_url`` quota,
+        and the artist/title/album wrong-match guards stay in lockstep
+        with the LML#389 / LML#396 / LML#453 hardening. The artwork +
+        release-year extractors gracefully degrade to ``None`` on sparse
+        records (no ``artwork`` block, malformed ``releaseDate``) rather
+        than raising mid-iteration.
+        """
+        results = await self.search_song(artist, song)
+        if not results:
+            return None
+
+        norm_artist = normalize_for_comparison(artist)
+        norm_song = normalize_for_comparison(song)
+        norm_album = normalize_for_comparison(album) if album else None
+
+        best: dict | None = None
+        best_score = 0.0
+
+        for item in results:
+            attrs = item.get("attributes") or {}
+            url = attrs.get("url")
+            if not url:
+                continue
+            artist_score = fuzz.token_set_ratio(
+                norm_artist, normalize_for_comparison(attrs.get("artistName") or "")
+            )
+            track_score = fuzz.token_set_ratio(
+                norm_song, normalize_for_comparison(attrs.get("name") or "")
+            )
+            if artist_score < _APPLE_MUSIC_MATCH_FLOOR or track_score < _APPLE_MUSIC_MATCH_FLOOR:
+                continue
+            if norm_album is not None:
+                album_score = fuzz.token_set_ratio(
+                    norm_album, normalize_for_comparison(attrs.get("albumName") or "")
+                )
+                if album_score < _APPLE_MUSIC_MATCH_FLOOR:
+                    continue
+                combined = (artist_score + track_score + album_score) / 3
+            else:
+                combined = (artist_score + track_score) / 2
+            if combined > best_score:
+                best_score = combined
+                best = item
+
+        if best is None:
+            return None
+
+        return AppleMusicTrackMatch(
+            url=_extract_url(best),
+            artwork_url=_extract_artwork_url(best),
+            release_year=_extract_release_year(best),
+        )
+
 
 def _extract_artist_name(item: dict) -> str:
     return (item.get("attributes") or {}).get("artistName") or ""
@@ -361,6 +461,50 @@ def _extract_name(item: dict) -> str:
 
 def _extract_url(item: dict) -> str:
     return (item.get("attributes") or {}).get("url") or ""
+
+
+# Apple Music's artwork URLs are documented as `{w}x{h}` templates that the
+# client substitutes with desired pixel dimensions before display. iOS/dj-site
+# render at ~600px in flowsheet card sizing; 600x600 keeps payload tight while
+# staying above retina display thresholds.
+_ARTWORK_WIDTH = 600
+_ARTWORK_HEIGHT = 600
+
+
+def _extract_artwork_url(item: dict) -> str | None:
+    """Pull `attributes.artwork.url` and substitute the `{w}x{h}` template.
+
+    Apple Music returns artwork URLs as templates (documented at
+    developer.apple.com/documentation/applemusicapi/artwork). Clients
+    (iOS, dj-site) cannot render the template — substitute concrete
+    dimensions before surfacing. Returns ``None`` when ``artwork`` is
+    absent (region-restricted records, malformed items) so the caller
+    can synthesize a record with ``artwork_url=None``.
+    """
+    attrs = item.get("attributes") or {}
+    artwork = attrs.get("artwork") or {}
+    template = artwork.get("url")
+    if not template:
+        return None
+    return template.replace("{w}", str(_ARTWORK_WIDTH)).replace("{h}", str(_ARTWORK_HEIGHT))
+
+
+def _extract_release_year(item: dict) -> int | None:
+    """Pull the leading 4-digit year from `attributes.releaseDate`.
+
+    Apple Music's catalog albums carry ISO dates (YYYY-MM-DD), but rare
+    records ship just the year ("2025") or are missing the field entirely.
+    Return ``None`` rather than raising so a sparse record's artwork still
+    surfaces with ``release_year=None``.
+    """
+    attrs = item.get("attributes") or {}
+    raw = attrs.get("releaseDate")
+    if not raw or not isinstance(raw, str):
+        return None
+    head = raw[:4]
+    if not head.isdigit():
+        return None
+    return int(head)
 
 
 def _parse_retry_after(value: str | None) -> float:

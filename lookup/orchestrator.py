@@ -1702,12 +1702,19 @@ async def enrich_artwork_results(
     Falls back to search URLs when direct links are not available.
 
     ``apple_music`` is the authenticated Apple Music client (LML#443). When
-    provided, the orchestrator calls ``apple_music.find_track_url(...)`` to
-    surface Apple Music URLs; when None (credentials unconfigured), the
-    probe is skipped and ``apple_music_url`` is set from the library DB
+    provided, the orchestrator probes Apple Music for each item: the happy
+    path (library row clears the LML#477 / PR #481 title gate) calls
+    ``find_track_url`` to surface the Apple Music URL only; the synthesis
+    path (no Discogs match OR library row fails the title gate — LML#487)
+    calls ``find_track_metadata`` to surface URL + ``artwork_url`` +
+    ``release_year`` from the same ``search_song`` response. Exactly one
+    Apple Music API call per item either way — picking ``find_track_url``
+    vs. ``find_track_metadata`` does not inflate the per-request quota.
+    When ``apple_music`` is None (credentials unconfigured), the probe is
+    skipped and ``apple_music_url`` is set from the library DB
     ``streaming_links`` override (if present) or stays None. The DB
     override always wins over the probe — see the final assignment
-    ``apple_music_override or apple_music_result or None``.
+    ``apple_music_override or apple_music_url or None``.
 
     **Behavior change vs. v0.5.0:** release/artist details (release_year,
     artist_bio, wikipedia_url) are fetched only for ``items_with_artwork[0]``.
@@ -1732,6 +1739,20 @@ async def enrich_artwork_results(
     skip ``extractAlbumMetadata`` while still consuming streaming URLs.
     Required for the WXYC/BS#1184 fix — releases on Apple Music that aren't
     in the WXYC/Discogs catalog now surface streaming buttons on iOS.
+
+    **Behavior change vs. v0.7.0 (LML#487):** the synthesis path now also
+    fires when ``artwork`` is non-None but its library row fails the
+    LML#477 title gate (``score_match(album, item.title) < 80`` — the
+    Noura Mint Seymali Tzenni-vs-Yenbett shape). The synthesized result
+    additionally carries ``artwork_url`` and ``release_year`` from the
+    ``find_track_metadata`` probe response, so flowsheet entries for an
+    album absent from the WXYC catalog (but present on Apple Music)
+    surface the *right* album's cover art on iOS / dj-site — not a
+    sibling-album row's leaked Discogs image. ``release_year`` is sourced
+    from the Apple Music ``releaseDate`` field; the Discogs-derived
+    ``artist_bio`` / ``wikipedia_url`` / ``extended=True`` payload stay
+    None on the synthesized result because they require a verified
+    Discogs identity link (no equivalent surfaces from Apple).
 
     ``extended=True`` additionally populates the new DiscogsMatchResult
     fields LML already loaded during the release+artist fetches:
@@ -1826,24 +1847,71 @@ async def enrich_artwork_results(
         artist = item.alternate_artist_name or item.artist or ""
         search_term = song or item.title or ""
 
-        # ``find_track_url`` has no top-level exception guard around its
-        # result-iteration loop, and the enclosing ``asyncio.gather`` lacks
-        # ``return_exceptions=True``. Without this wrap a single malformed
-        # Apple payload (non-dict item, rapidfuzz dispatch error) propagates
-        # through the gather and 500s the whole /lookup or /lookup/bulk
-        # request. The ``asyncio.wait_for`` ceiling additionally caps the
-        # worst-case latency a single Apple call can impose on the request —
-        # without it, a 429/5xx storm could pin one of the Apple Music
-        # Semaphore(5) slots for up to ``_MAX_RETRIES`` × ``_RETRY_AFTER_CAP_SECONDS``
-        # seconds while still being unbounded at the call site (LML#449 + LML#450).
-        # On timeout we degrade to no-Apple-URL, same as the LML#444 exception path.
-        apple_music_result: str | None = None
+        # LML#477: only trust the library row when its title plausibly
+        # matches the requested album. ``_fuzzy_search`` in library/db.py
+        # accepts token_set_ratio >= 70 — permissive enough to surface
+        # sibling-album rows (same artist, different release) whose
+        # verified streaming URLs (and Discogs artwork) would otherwise
+        # propagate as if they pointed at the requested album. The 80
+        # floor mirrors ``is_acceptable_match`` in
+        # ``clients/streaming/matching``. When no album was requested
+        # (artist-only lookup) or the row's title is missing, there is
+        # no signal to gate against — fall through.
+        row_title_matches_requested_album = (
+            not album or not item.title or score_match(album, item.title) >= 80.0
+        )
+
+        # LML#487: the library row is "acceptable" (a real match for the
+        # requested album) only when it carries Discogs artwork AND
+        # clears the title gate. Otherwise the row's Discogs artwork /
+        # release-year would be a sibling-album leak (Noura Mint Seymali
+        # Tzenni-vs-Yenbett shape) — same risk as the PR #481 streaming-
+        # link leak, just on a different field. When not acceptable, we
+        # synthesize a streaming-only result (LML#401 / BS#1185 sentinel
+        # contract) and try the Apple Music external probe to surface
+        # the *right* album's artwork.
+        library_row_acceptable = artwork is not None and row_title_matches_requested_album
+
+        # Apple Music probe. In the happy path (``library_row_acceptable``)
+        # we just need the song URL for the ``apple_music_url`` slot, so
+        # call ``find_track_url`` — preserves LML#401 behaviour and the
+        # existing test-call shape. When the library row is NOT acceptable
+        # (LML#487 trigger), we additionally want the matched track's
+        # artwork + release year for the synthesized result — call
+        # ``find_track_metadata`` instead. The two methods make exactly
+        # one Apple Music API call each (same ``search_song`` endpoint),
+        # so picking one or the other keeps the per-request Apple quota
+        # at exactly one call — no inflation vs. LML#401 baseline.
+        #
+        # The ``asyncio.wait_for`` ceiling caps the worst-case latency a
+        # single Apple call can impose on the request — without it, a
+        # 429/5xx storm could pin one of the Apple Music Semaphore(5)
+        # slots for up to ``_MAX_RETRIES`` × ``_RETRY_AFTER_CAP_SECONDS``
+        # seconds while still being unbounded at the call site (LML#449
+        # + LML#450). On timeout we degrade to no-Apple-anything, same
+        # as the LML#444 exception path. The Sentry-marker name stays
+        # ``apple_music.find_track_url.timeout`` to preserve LML#462
+        # trace-explorer dashboards — the underlying call may now be
+        # ``find_track_metadata`` but the failure mode is the same.
+        apple_music_url: str | None = None
+        probe_artwork_url: str | None = None
+        probe_release_year: int | None = None
         if apple_music is not None and artist and search_term:
             try:
-                apple_music_result = await asyncio.wait_for(
-                    apple_music.find_track_url(artist, search_term, album=album),
-                    timeout=_apple_music_lookup_timeout_s(),
-                )
+                if library_row_acceptable:
+                    apple_music_url = await asyncio.wait_for(
+                        apple_music.find_track_url(artist, search_term, album=album),
+                        timeout=_apple_music_lookup_timeout_s(),
+                    )
+                else:
+                    probe_match = await asyncio.wait_for(
+                        apple_music.find_track_metadata(artist, search_term, album=album),
+                        timeout=_apple_music_lookup_timeout_s(),
+                    )
+                    if probe_match is not None:
+                        apple_music_url = probe_match.url
+                        probe_artwork_url = probe_match.artwork_url
+                        probe_release_year = probe_match.release_year
             except TimeoutError:
                 logger.warning(
                     "AppleMusicClient.find_track_url timed out for %s - %s",
@@ -1872,12 +1940,16 @@ async def enrich_artwork_results(
                 )
 
         # Album-derived fields are positionally gated: only on top-1, and
-        # only when top-1 actually has artwork. When ``artwork`` is None
-        # here (this branch is also taken for the synthesized no-Discogs-
-        # match streaming-only result), these stay None — preserves the
-        # docstring's positional-gating invariant.
-        is_album_derived_eligible = is_top1 and artwork is not None
-        year_result = top1_year if is_album_derived_eligible else None
+        # only when top-1 actually carries an *acceptable* library row
+        # (LML#487 extends PR #481 gate from streaming-links to
+        # release-year/bio/wiki: a sibling-album fuzzy hit would otherwise
+        # leak Tzenni's year onto a Yenbett response). When the library
+        # row is not acceptable, fall through to the probe-derived year
+        # (Yenbett's year from Apple Music).
+        is_album_derived_eligible = is_top1 and library_row_acceptable
+        year_result = (
+            top1_year if is_album_derived_eligible else (probe_release_year if is_top1 else None)
+        )
         artist_bio = top1_bio if is_album_derived_eligible else None
         wikipedia_url = top1_wiki if is_album_derived_eligible else None
 
@@ -1891,18 +1963,6 @@ async def enrich_artwork_results(
         bandcamp_url = None
         soundcloud_url = None
 
-        # LML#477: only trust the library row's stored streaming URLs when
-        # its title plausibly matches the requested album. ``_fuzzy_search``
-        # in library/db.py accepts token_set_ratio >= 70 — permissive enough
-        # to surface sibling-album rows (same artist, different release)
-        # whose verified Spotify/Apple URLs would otherwise propagate as if
-        # they pointed at the requested album. The 80 floor mirrors
-        # ``is_acceptable_match`` in ``clients/streaming/matching``. When no
-        # album was requested (artist-only lookup) or the row's title is
-        # missing, there is no signal to gate against — fall through.
-        row_title_matches_requested_album = (
-            not album or not item.title or score_match(album, item.title) >= 80.0
-        )
         if (
             library_db
             and getattr(library_db, "_has_streaming_links", None) is True
@@ -1944,7 +2004,7 @@ async def enrich_artwork_results(
             "artist_bio": artist_bio,
             "wikipedia_url": wikipedia_url,
             "spotify_url": spotify_url,
-            "apple_music_url": apple_music_override or apple_music_result or None,
+            "apple_music_url": apple_music_override or apple_music_url or None,
             "youtube_music_url": youtube_music_url,
             "bandcamp_url": bandcamp_url,
             "soundcloud_url": soundcloud_url,
@@ -1970,11 +2030,11 @@ async def enrich_artwork_results(
             )
             update["profile_tokens"] = top1_profile_tokens
 
-        if artwork is None:
-            # No Discogs match: try MusicBrainz for a tracklist before
-            # synthesizing the streaming-only result. Same positional gate
-            # as the rest of the extended payload — only the top-1 item is
-            # eligible, and only when extended mode is on.
+        if not library_row_acceptable:
+            # No acceptable Discogs match: try MusicBrainz for a tracklist
+            # before synthesizing the streaming-only result. Same positional
+            # gate as the rest of the extended payload — only the top-1 item
+            # is eligible, and only when extended mode is on.
             if is_top1 and extended and mb_pg is not None and item.artist and album:
                 mb_tracklist = await resolve_tracklist_via_musicbrainz(
                     item.artist, album, mb_pg=mb_pg
@@ -1983,10 +2043,22 @@ async def enrich_artwork_results(
                     update["tracklist"] = mb_tracklist
                 _project_mb_rescue_attrs(attempted=True, tracklist_found=bool(mb_tracklist))
 
+            # LML#487: surface the Apple Music probe's artwork URL on the
+            # synthesized result. ``probe_artwork_url`` is non-None when
+            # ``find_track_metadata`` returned a match clearing the 80/80(/80)
+            # floor; ``None`` falls through to the no-artwork shape (legacy
+            # LML#401 behaviour preserved when no probe match was found, no
+            # Apple credentials configured, or the probe timed out / raised).
+            update["artwork_url"] = probe_artwork_url
+
             # See docstring's "Behavior change vs. v0.6.0 (LML#401)"
             # section for the BS#1185 sentinel contract.
             return (item, DiscogsSearchResult(release_id=0, release_url="", **update))
 
+        # ``library_row_acceptable`` ⟹ ``artwork is not None`` (by definition
+        # on line above). Asserted for mypy narrowing — the runtime cost is
+        # nil, and the explicit precondition makes the contract local.
+        assert artwork is not None
         return (item, artwork.model_copy(update=update))
 
     enriched = await asyncio.gather(
