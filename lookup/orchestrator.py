@@ -23,7 +23,12 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats_recorder
 
 from clients.streaming.apple_music import AppleMusicClient
-from clients.streaming.matching import find_best_typed_match, score_match
+from clients.streaming.matching import (
+    SCORE_MATCH_ACCEPTANCE_FLOOR,
+    find_best_typed_match,
+    score_match,
+    strip_discogs_disambig,
+)
 from config.settings import get_settings
 from core.search import (
     execute_search_pipeline,
@@ -171,10 +176,16 @@ def _apple_music_lookup_timeout_s() -> float:
 
 
 _ARTIST_IDENTITY_SPLIT_GATE_ENV_VAR = "LML_ARTIST_IDENTITY_SPLIT_GATE"
-"""When ``false`` (case-insensitive), the LML#504 artist-scoped gate is bypassed
-and ``artist_bio`` / ``wikipedia_url`` / ``profile_tokens`` revert to the
-broader ``is_album_derived_eligible`` predicate. Emergency rollback only —
-default is ``true`` (on)."""
+"""When set to any common false spelling (``false``, ``0``, ``no``, ``off``,
+``disabled``), the LML#504 artist-scoped gate is bypassed and ``artist_bio`` /
+``wikipedia_url`` / ``profile_tokens`` revert to the broader
+``is_album_derived_eligible`` predicate. Emergency rollback only — default
+is ``true`` (on)."""
+
+_FALSE_FLAG_VALUES: frozenset[str] = frozenset({"false", "0", "no", "off", "disabled"})
+"""Strings (case-insensitive, whitespace-trimmed) that disable a default-on
+boolean env flag. Mirrors the wider Pydantic ``BoolField`` accept-set so an
+operator typing the same value across knobs gets the same result."""
 
 
 def _artist_identity_split_gate_enabled() -> bool:
@@ -184,15 +195,37 @@ def _artist_identity_split_gate_enabled() -> bool:
     raw = os.getenv(_ARTIST_IDENTITY_SPLIT_GATE_ENV_VAR)
     if raw is None:
         return True
-    return raw.strip().lower() != "false"
+    return raw.strip().lower() not in _FALSE_FLAG_VALUES
 
 
-_ARTIST_IDENTITY_SCORE_FLOOR: float = 80.0
-"""Score floor for both hops of the LML#504 artist-identity predicate
-(library row's artist vs. request; release artist vs. request). Mirrors
-``clients/streaming/matching.is_acceptable_match`` and the LML#477 title
-floor — keeps the artist-side admission criterion in lock-step with the
-album-side one."""
+def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
+    """Score-floor + V/A guard for one (request, candidate-artist) hop.
+
+    Returns True iff:
+
+    * ``query_stripped`` is non-empty (caller has already stripped),
+    * ``candidate`` is a non-empty string after stripping disambiguation
+      suffixes (``Stereolab (2)`` → ``Stereolab``) and surrounding whitespace,
+    * ``score_match(query, candidate)`` meets the shared acceptance floor, and
+    * ``candidate`` is not a compilation/V-A alias.
+
+    The disambiguation strip is the load-bearing reason this helper exists:
+    Discogs assigns ``(N)`` suffixes for any artist name with collisions,
+    and an unsuffixed user query against a suffixed Discogs string would
+    score 71-82 (verified empirically: ``Sessa`` vs ``Sessa (2)`` = 71.43;
+    ``Stereolab`` vs ``Stereolab (UK)`` = 78.26). Stripping is symmetric so
+    library-side identifiers (which usually carry no suffix) are unaffected.
+    """
+    if not query_stripped:
+        return False
+    if not isinstance(candidate, str):
+        return False
+    candidate_stripped = strip_discogs_disambig(candidate).strip()
+    if not candidate_stripped:
+        return False
+    if is_compilation_artist(candidate_stripped):
+        return False
+    return score_match(query_stripped, candidate_stripped) >= SCORE_MATCH_ACCEPTANCE_FLOOR
 
 
 CANONICAL_ARTIST_SIMILARITY_FLOOR: float = 0.70
@@ -454,6 +487,71 @@ def _log_resolver_pre_pass(outcome: ResolverOutcome, *, actual_swap: bool) -> No
             transaction.set_data("resolver_pre_pass", payload)
     except Exception as e:
         logger.warning("Failed to project resolver_pre_pass onto Sentry transaction: %s", e)
+
+
+def _log_artist_identity_split_gate(
+    *,
+    library_row_acceptable: bool,
+    artist_identity_verified: bool,
+    library_row_artist_verified: bool,
+    release_side_artist_verified: bool,
+    release_anchor_present: bool,
+    use_split_gate: bool,
+    sample_rate: float = 0.01,
+) -> None:
+    """Emit shadow-mode telemetry when LML#504's artist-identity gate
+    diverges from the legacy ``library_row_acceptable`` gate.
+
+    Fires on actual divergence in bio-surfacing intent — not on raw
+    predicate differences — so artist-only and V/A lookups (where the
+    predicates trivially diverge without affecting the response shape)
+    don't flood the signal. Runs *regardless of* ``use_split_gate`` so
+    the rollback flag preserves the divergence dataset needed to plan
+    re-enablement; ``data.use_split_gate=false`` filters the rollback
+    population.
+
+    Three surfaces (matching ``_log_resolver_pre_pass``):
+
+    1. ``set_data("artist_identity_split_gate", ...)`` on the active Sentry
+       transaction — queryable in the trace explorer at production rate.
+    2. ``add_breadcrumb`` for events that get captured (errors/sampled
+       transactions).
+    3. Structured INFO log on a 1% sample — cheap Railway-log grep target.
+
+    All SDK exceptions swallowed; same pattern as the other ``_log_*``
+    helpers in this module.
+    """
+    payload: dict[str, Any] = {
+        "library_row_acceptable": library_row_acceptable,
+        "artist_identity_verified": artist_identity_verified,
+        "library_row_artist_verified": library_row_artist_verified,
+        "release_side_artist_verified": release_side_artist_verified,
+        "release_anchor_present": release_anchor_present,
+        "use_split_gate": use_split_gate,
+        # Recovery = new gate would surface bio that old gate would not.
+        # Regression = old gate would surface bio that new gate would not.
+        "recovery": artist_identity_verified and not library_row_acceptable,
+        "regression": library_row_acceptable and not artist_identity_verified,
+    }
+    try:
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is not None:
+            transaction.set_data("artist_identity_split_gate", payload)
+    except Exception as e:
+        logger.warning(
+            "Failed to project artist_identity_split_gate onto Sentry transaction: %s", e
+        )
+    try:
+        sentry_sdk.add_breadcrumb(
+            category="artist_identity_split_gate",
+            level="info",
+            data=payload,
+        )
+    except Exception as e:
+        logger.warning("Failed to add artist_identity_split_gate breadcrumb: %s", e)
+
+    if random.random() < sample_rate:
+        logger.info("artist_identity_split_gate %s", payload)
 
 
 def is_self_titled(title: str) -> bool:
@@ -1852,6 +1950,38 @@ async def enrich_artwork_results(
 
     top1_year, top1_bio, top1_wiki, top1_release, top1_details = await fetch_top1_release_details()
 
+    # LML#504: hoist the entire artist-identity predicate outside
+    # ``enrich_one`` — every input (top1_release, request_artist, top-1
+    # item) is shared across all enriched items, so the predicate's value
+    # is identical for every call and per-item recomputation is pure waste.
+    # ``top1_release.artist`` may be a non-string in test mocks;
+    # ``_artist_pair_verified`` defends against that via ``isinstance(... str)``.
+    top1_release_artist = getattr(top1_release, "artist", None)
+    release_side_artist_verified = _artist_pair_verified(
+        request_artist_stripped, top1_release_artist
+    )
+    # When ``top1_release`` was fetched but its ``.artist`` field is empty or
+    # whitespace-only, treat the release hop as if there was nothing to verify
+    # against and fall through to library-row-only verification. Covers the
+    # LML#507 prefetch-skipped case, the artwork=None case, the
+    # get_release-errored case, AND corrupted/empty Discogs release rows.
+    release_anchor_present = isinstance(top1_release_artist, str) and bool(
+        strip_discogs_disambig(top1_release_artist).strip()
+    )
+    # Library-row hop for the top-1 item. ``artist_matches_item``
+    # (orchestrator.py:527) consults BOTH ``item.artist`` AND
+    # ``item.alternate_artist_name`` to handle catalog conventions like
+    # "The Black Dog" filed as "Black Dog Productions" — the gate must
+    # mirror that or it'd suppress bio on rows the library code surfaced
+    # via the alternate name.
+    top1_item = items_with_artwork[0][0]
+    top1_library_row_artist_verified = _artist_pair_verified(
+        request_artist_stripped, top1_item.artist
+    ) or _artist_pair_verified(request_artist_stripped, top1_item.alternate_artist_name)
+    top1_artist_identity_verified = top1_library_row_artist_verified and (
+        not release_anchor_present or release_side_artist_verified
+    )
+
     # Cache-only deep parse of the top-1 bio for the extended path. Refs
     # that miss the cache fall through; we never fire a new API call here.
     # When the PG cache is unavailable (no DATABASE_URL_DISCOGS), fall
@@ -1874,7 +2004,11 @@ async def enrich_artwork_results(
         *,
         is_top1: bool,
     ) -> tuple[LibraryItem, DiscogsSearchResult | None]:
-        artist = item.alternate_artist_name or item.artist or ""
+        # ``row_artist`` (not ``artist``) — the outer parameter ``artist``
+        # carries the request artist used by the LML#504 gate; shadowing it
+        # here would silently break the gate for any future modification
+        # that reaches for the request-side value.
+        row_artist = item.alternate_artist_name or item.artist or ""
         search_term = song or item.title or ""
 
         # LML#477: only trust the library row when its title plausibly
@@ -1949,16 +2083,16 @@ async def enrich_artwork_results(
         probe_release_year: int | None = None
         probe_method = "find_track_metadata" if not library_row_acceptable else "find_track_url"
         skip_happy_probe = library_row_acceptable and apple_music_override
-        if apple_music is not None and artist and search_term and not skip_happy_probe:
+        if apple_music is not None and row_artist and search_term and not skip_happy_probe:
             try:
                 if library_row_acceptable:
                     apple_music_url = await asyncio.wait_for(
-                        apple_music.find_track_url(artist, search_term, album=album),
+                        apple_music.find_track_url(row_artist, search_term, album=album),
                         timeout=_apple_music_lookup_timeout_s(),
                     )
                 else:
                     probe_match = await asyncio.wait_for(
-                        apple_music.find_track_metadata(artist, search_term, album=album),
+                        apple_music.find_track_metadata(row_artist, search_term, album=album),
                         timeout=_apple_music_lookup_timeout_s(),
                     )
                     if probe_match is not None:
@@ -1969,7 +2103,7 @@ async def enrich_artwork_results(
                 logger.warning(
                     "AppleMusicClient.%s timed out for %s - %s",
                     probe_method,
-                    artist,
+                    row_artist,
                     search_term,
                 )
                 # LML#462: project onto the active Sentry transaction so the
@@ -1994,7 +2128,7 @@ async def enrich_artwork_results(
                 logger.exception(
                     "AppleMusicClient.%s raised for %s - %s",
                     probe_method,
-                    artist,
+                    row_artist,
                     search_term,
                 )
 
@@ -2008,49 +2142,15 @@ async def enrich_artwork_results(
         is_album_derived_eligible = is_top1 and library_row_acceptable
         year_result = top1_year if is_album_derived_eligible else probe_release_year
 
-        # LML#504: ``artist_bio``/``wikipedia_url``/``profile_tokens`` come
-        # from ``get_artist_details(release.artist_id)`` — strictly artist-
-        # scoped, not album-scoped. The PR #500 gate over-suppressed them
-        # on the same-artist-sibling synthesis shape (Yenbett→Tzenni: the
-        # library row's artist is still Noura Mint Seymali even though the
-        # album is wrong). The artist-scoped fields gate on a composite
-        # predicate that verifies both hops of the data chain
-        # (request → item.artist → release.artist_id) match the request
-        # artist at score ≥ 80 and neither hop is a compilation alias.
-        item_artist_stripped = (item.artist or "").strip()
-        library_row_artist_verified = (
-            bool(request_artist_stripped)
-            and bool(item_artist_stripped)
-            and score_match(request_artist_stripped, item_artist_stripped)
-            >= _ARTIST_IDENTITY_SCORE_FLOOR
-            and not is_compilation_artist(item_artist_stripped)
-        )
-        # ``top1_release`` is a shared closure variable: when it's None the
-        # release hop has nothing to verify against and falls through to
-        # the library-row hop alone (covers the LML#507 prefetch-skipped
-        # case, the artwork=None case, and the get_release-errored case).
-        # ``ReleaseMetadataResponse`` has no ``is_compilation`` field, so
-        # the V/A guard runs against ``top1_release.artist`` only. The
-        # ``isinstance(... str)`` guard tolerates partially-mocked release
-        # objects in tests (an unconfigured ``AsyncMock.get_release`` returns
-        # a truthy mock whose ``.artist`` attribute is itself a mock).
-        top1_release_artist_raw = (
-            getattr(top1_release, "artist", None) if top1_release is not None else None
-        )
-        release_artist_stripped = (
-            top1_release_artist_raw.strip() if isinstance(top1_release_artist_raw, str) else ""
-        )
-        release_side_artist_verified = (
-            top1_release is not None
-            and bool(release_artist_stripped)
-            and bool(request_artist_stripped)
-            and score_match(request_artist_stripped, release_artist_stripped)
-            >= _ARTIST_IDENTITY_SCORE_FLOOR
-            and not is_compilation_artist(release_artist_stripped)
-        )
-        artist_identity_verified = library_row_artist_verified and (
-            top1_release is None or release_side_artist_verified
-        )
+        # LML#504: reuse the top-1 predicate values hoisted outside enrich_one.
+        # See the block above ``fetch_top1_release_details`` for the full
+        # rationale (artist-scoped fields, composite predicate, library-row
+        # hop consulting both ``item.artist`` and ``item.alternate_artist_name``).
+        # Non-top-1 items can never surface artist-scoped fields anyway
+        # (positional gating), so we short-circuit to False rather than
+        # computing the predicate per-item.
+        library_row_artist_verified = top1_library_row_artist_verified if is_top1 else False
+        artist_identity_verified = top1_artist_identity_verified if is_top1 else False
         # Rollout scope: the split-gate is opt-in via ``extended=True`` so
         # legacy non-extended consumers (request-o-matic request line,
         # dj-site proxy) stay on the broader ``is_album_derived_eligible``
@@ -2058,53 +2158,55 @@ async def enrich_artwork_results(
         # call (BS' ``lookup-coordinator.ts``), so the split immediately
         # exercises on all BS write-path traffic (iOS reads + flowsheet
         # writes) without exposing the request-line / picker callers.
-        use_split_gate = extended and artist_identity_split_enabled
+        # Additional fallback: when no request artist was supplied
+        # (album-only lookups — a supported path; ``parsed.artist=None``
+        # at orchestrator.py:888), the split-gate's first hop would
+        # always fail; bypass it to preserve legacy bio surfacing for
+        # those callers.
+        use_split_gate = (
+            extended and artist_identity_split_enabled and bool(request_artist_stripped)
+        )
         is_artist_derived_eligible = is_top1 and (
             artist_identity_verified if use_split_gate else library_row_acceptable
         )
         artist_bio = top1_bio if is_artist_derived_eligible else None
         wikipedia_url = top1_wiki if is_artist_derived_eligible else None
 
-        # LML#504: surface a divergence breadcrumb on the top-1 item when
-        # the new gate would land bio/wiki on a result where the legacy
-        # gate would not (the synth-recovery case this ticket exists for)
-        # or vice-versa (defends against gate-tightening surprises). The
-        # breadcrumb is the rollout monitor — query the trace explorer
-        # for ``artist_identity_split_gate`` to watch for over- or
-        # under-firing during the first weeks post-merge.
-        if is_top1 and use_split_gate and artist_identity_verified != library_row_acceptable:
-            try:
-                sentry_sdk.add_breadcrumb(
-                    category="artist_identity_split_gate",
-                    level="info",
-                    data={
-                        "library_row_acceptable": library_row_acceptable,
-                        "library_row_artist_verified": library_row_artist_verified,
-                        "release_side_artist_verified": release_side_artist_verified,
-                        "artist_identity_verified": artist_identity_verified,
-                        "top1_release_present": top1_release is not None,
-                    },
-                )
-            except Exception as e:
-                logger.warning("Failed to add artist_identity_split_gate breadcrumb: %s", e)
+        # LML#504 rollout monitor: shadow-mode telemetry whenever the new
+        # gate would land bio/wiki on a result where the legacy gate would
+        # not (the synth-recovery this ticket exists for) or vice-versa
+        # (gate-tightening regressions). Fires *regardless of*
+        # ``use_split_gate`` so the rollback flag preserves the divergence
+        # signal needed to plan re-enablement. The helper pairs
+        # ``set_data`` (queryable in trace explorer) with a 1% sampled
+        # INFO log, matching ``_log_track_validation`` / ``_log_resolver_pre_pass``.
+        if is_top1 and artist_identity_verified != library_row_acceptable:
+            _log_artist_identity_split_gate(
+                library_row_acceptable=library_row_acceptable,
+                artist_identity_verified=artist_identity_verified,
+                library_row_artist_verified=library_row_artist_verified,
+                release_side_artist_verified=release_side_artist_verified,
+                release_anchor_present=release_anchor_present,
+                use_split_gate=use_split_gate,
+            )
 
         # Fall back to search URLs for any service without a direct link
-        if artist and search_term:
+        if row_artist and search_term:
             if not spotify_url:
                 spotify_url = _build_streaming_search_url(
-                    "https://open.spotify.com/search/", artist, search_term
+                    "https://open.spotify.com/search/", row_artist, search_term
                 )
             if not youtube_music_url:
                 youtube_music_url = _build_streaming_search_url(
-                    "https://music.youtube.com/search?q=", artist, search_term
+                    "https://music.youtube.com/search?q=", row_artist, search_term
                 )
             if not bandcamp_url:
                 bandcamp_url = _build_streaming_search_url(
-                    "https://bandcamp.com/search?q=", artist, search_term
+                    "https://bandcamp.com/search?q=", row_artist, search_term
                 )
             if not soundcloud_url:
                 soundcloud_url = _build_streaming_search_url(
-                    "https://soundcloud.com/search?q=", artist, search_term
+                    "https://soundcloud.com/search?q=", row_artist, search_term
                 )
 
         update: dict[str, Any] = {
@@ -2125,7 +2227,6 @@ async def enrich_artwork_results(
         # payload bloat for results they ignore.
         if extended and is_album_derived_eligible:
             if top1_release is not None:
-                update["discogs_artist_id"] = top1_release.artist_id
                 update["tracklist"] = (
                     list(top1_release.tracklist) if top1_release.tracklist else None
                 )
@@ -2144,13 +2245,17 @@ async def enrich_artwork_results(
                 top1_details.image_url if top1_details is not None else None
             )
 
-        # ``profile_tokens`` are parsed from ``top1_bio`` — same artist-
-        # scoped source as ``artist_bio`` — so they must follow the same
-        # gate, not the album one. Without this split, bio surfaces on
-        # the synthesis path as plain text and clients can't render
-        # structured ``[a<id>]`` / ``[r<id>]`` references.
+        # ``profile_tokens`` parses from ``top1_bio``; ``discogs_artist_id``
+        # IS ``release.artist_id``. Both are strictly artist-scoped, so they
+        # ride the artist-identity gate (not the album-derived gate). This
+        # keeps the API contract coherent: any response that carries
+        # ``artist_bio`` also carries the ``discogs_artist_id`` key that
+        # iOS/BS need to key an artist-metadata cache against (see
+        # ``generated/api_models.DiscogsMatchResult.discogs_artist_id``).
         if extended and is_artist_derived_eligible:
             update["profile_tokens"] = top1_profile_tokens
+            if top1_release is not None:
+                update["discogs_artist_id"] = top1_release.artist_id
 
         if not library_row_acceptable:
             # No acceptable Discogs match: try MusicBrainz for a tracklist
@@ -2171,7 +2276,19 @@ async def enrich_artwork_results(
             # floor; ``None`` falls through to the no-artwork shape (legacy
             # LML#401 behaviour preserved when no probe match was found, no
             # Apple credentials configured, or the probe timed out / raised).
-            update["artwork_url"] = probe_artwork_url
+            #
+            # LML#504: the probe was called with ``row_artist`` — when that
+            # disagrees with the request artist (fuzzy-collision library row),
+            # the probe returned the WRONG artist's artwork. Gate on the
+            # library-row hop of the new predicate so a synth-path lookup
+            # that failed artist verification doesn't surface a stranger's
+            # cover art. When ``request_artist`` is empty the gate is moot
+            # (no anchor to verify against; fall through to legacy probe
+            # behavior).
+            if request_artist_stripped and not library_row_artist_verified:
+                update["artwork_url"] = None
+            else:
+                update["artwork_url"] = probe_artwork_url
 
             # See docstring's "Behavior change vs. v0.6.0 (LML#401)"
             # section for the BS#1185 sentinel contract.
@@ -2196,7 +2313,16 @@ async def enrich_artwork_results(
     # awaited — read-path latency is unaffected. The task reference is
     # parked in ``_background_tasks`` so the GC can't reap it mid-flight
     # (asyncio holds only weak refs to tasks).
-    if warm_cache and top1_bio:
+    #
+    # LML#504: don't warm a bio the response itself suppressed. The deep
+    # parse fires per-ref Discogs API calls (DiscogsServiceResolver: cache
+    # → API → write-back) — wasting those on a bio iOS will never render
+    # is pure quota burn. Inspect the top-1 enriched result rather than
+    # re-deriving the gate so the warm check is locked in step with the
+    # actual surfaced output.
+    top1_enriched_result = enriched[0][1] if enriched else None
+    top1_bio_surfaced = top1_enriched_result is not None and bool(top1_enriched_result.artist_bio)
+    if warm_cache and top1_bio and top1_bio_surfaced:
         task = asyncio.create_task(_warm_bio_cache(top1_bio, discogs_service))
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)

@@ -1770,8 +1770,12 @@ class TestArtistIdentitySplitGate:
         assert enriched.tracklist is None
         assert enriched.label is None
         assert enriched.full_release_date is None
-        assert enriched.discogs_artist_id is None
-        # artist_image_url stays on the album gate (no iOS mount; surfacing
+        # ``discogs_artist_id`` is strictly artist-scoped (= ``release.artist_id``)
+        # so it surfaces alongside the bio under the new artist-identity gate.
+        # API contract coherence: any response carrying ``artist_bio`` also
+        # carries the cache key clients use to dedupe artist metadata.
+        assert enriched.discogs_artist_id == 99
+        # ``artist_image_url`` stays on the album gate (no iOS mount; surfacing
         # it on the synthesis path would be pure payload waste).
         assert enriched.artist_image_url is None
 
@@ -1836,15 +1840,21 @@ class TestArtistIdentitySplitGate:
         assert enriched.profile_tokens is None
 
     @pytest.mark.asyncio
-    async def test_empty_request_artist_suppresses_bio(self):
-        """``score_match('', '')`` returns 100.0 (documented at
-        ``clients/streaming/matching.score_match``). The ``_stripped``
-        guard prevents an empty request artist from cheating its way
-        past the predicate via that score-match identity."""
-        item = make_library_item(id=42, artist="", title="Aluminum Tunes")
+    async def test_empty_request_artist_falls_back_to_legacy_gate(self):
+        """Album-only lookups (``parsed.artist=None``) — a supported path
+        per ``lookup/orchestrator.py:888`` — would silently lose bio under
+        a strict artist-identity gate (no request anchor to score against).
+        The new gate falls back to ``library_row_acceptable`` semantics
+        when ``request_artist`` is empty/whitespace, preserving the legacy
+        bio surfacing for album-only callers. Same fallback for ``artist=' '``
+        — ``score_match`` would normalize the whitespace away and score
+        ``100.0`` against anything (``normalize_for_comparison`` strips
+        whitespace before fuzzy compare), so the bool-of-stripped guard is
+        the load-bearing check that catches both cases."""
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
         artwork = make_discogs_result(
             release_id=1,
-            artist="",
+            artist="Stereolab",
             album="Aluminum Tunes",
             artwork_url="https://example.com/aluminum.jpg",
         )
@@ -1865,64 +1875,26 @@ class TestArtistIdentitySplitGate:
             urls=["https://en.wikipedia.org/wiki/Stereolab"],
         )
 
-        results = await enrich_artwork_results(
-            [(item, artwork)],
-            discogs_service,
-            song="French Disko",
-            album="Aluminum Tunes",
-            artist="",
-            extended=True,
-        )
+        for empty_artist in ("", " ", None):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                song="French Disko",
+                album="Aluminum Tunes",
+                artist=empty_artist,
+                extended=True,
+            )
 
-        _, enriched = results[0]
-        assert enriched is not None
-        # Empty request artist → both hops fail their _stripped guard.
-        assert enriched.artist_bio is None
-        assert enriched.wikipedia_url is None
-
-    @pytest.mark.asyncio
-    async def test_asymmetric_whitespace_request_artist_suppresses_bio(self):
-        """``score_match(' ', 'x')`` returns a passing score because
-        ``normalize_for_comparison`` strips whitespace before scoring.
-        The ``_stripped`` helper is what catches this case — verify the
-        predicate witnesses the catch."""
-        item = make_library_item(id=42, artist="x", title="Aluminum Tunes")
-        artwork = make_discogs_result(
-            release_id=1,
-            artist="x",
-            album="Aluminum Tunes",
-            artwork_url="https://example.com/aluminum.jpg",
-        )
-
-        discogs_service = AsyncMock()
-        discogs_service.get_release.return_value = ReleaseMetadataResponse(
-            release_id=1,
-            title="Aluminum Tunes",
-            artist="x",
-            year=1998,
-            artist_id=42,
-            release_url="https://discogs.com/release/1",
-        )
-        discogs_service.get_artist_details.return_value = ArtistDetails(
-            artist_id=42,
-            name="x",
-            profile="bio for x.",
-            urls=["https://en.wikipedia.org/wiki/X"],
-        )
-
-        results = await enrich_artwork_results(
-            [(item, artwork)],
-            discogs_service,
-            song="French Disko",
-            album="Aluminum Tunes",
-            artist=" ",
-            extended=True,
-        )
-
-        _, enriched = results[0]
-        assert enriched is not None
-        assert enriched.artist_bio is None
-        assert enriched.wikipedia_url is None
+            _, enriched = results[0]
+            assert enriched is not None
+            # library_row_acceptable=True (artwork + title match), so the
+            # legacy gate surfaces bio. The split gate falls back here
+            # because there's no request artist to anchor identity against.
+            assert enriched.artist_bio == "French-British band.", (
+                f"Empty request_artist={empty_artist!r} should fall back to "
+                f"legacy gate, surfacing bio"
+            )
+            assert enriched.wikipedia_url == "https://en.wikipedia.org/wiki/Stereolab"
 
     @pytest.mark.asyncio
     async def test_compilation_alias_on_item_artist_suppresses_bio(self):
@@ -2202,6 +2174,9 @@ class TestArtistIdentitySplitGate:
         data = divergence_calls[0].kwargs["data"]
         assert data["library_row_acceptable"] is False
         assert data["artist_identity_verified"] is True
+        assert data["recovery"] is True
+        assert data["regression"] is False
+        assert data["use_split_gate"] is True
 
     @pytest.mark.asyncio
     async def test_split_release_featured_artist_bio_suppressed(self):
@@ -2259,3 +2234,315 @@ class TestArtistIdentitySplitGate:
         # Bio for the wrong (lead) artist does NOT leak through.
         assert enriched.artist_bio is None
         assert enriched.wikipedia_url is None
+
+    @pytest.mark.asyncio
+    async def test_discogs_disambig_suffix_does_not_suppress_bio(self):
+        """Discogs assigns ``(N)`` suffixes to common-name artists (e.g.
+        ``Sessa (2)``, ``Stereolab (UK)``). ``score_match("Sessa",
+        "Sessa (2)") = 71.43`` — below the 80 floor. Without the helper's
+        disambiguation strip, bio would silently suppress for legitimate
+        matches on every common-name request. Verifies the predicate
+        strips the suffix before scoring."""
+        item = make_library_item(id=42, artist="Sessa", title="Pequena Vertigem de Amor")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Sessa",
+            album="Pequena Vertigem de Amor",
+            artwork_url="https://example.com/sessa.jpg",
+        )
+
+        discogs_service = AsyncMock()
+        # Discogs cache returns the disambiguated form.
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Pequena Vertigem de Amor",
+            artist="Sessa (2)",
+            year=2024,
+            artist_id=99,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Sessa (2)",
+            profile="Brazilian singer-songwriter.",
+            urls=["https://en.wikipedia.org/wiki/Sessa_musician"],
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Pele de Joy",
+            album="Pequena Vertigem de Amor",
+            artist="Sessa",
+            extended=True,
+        )
+
+        _, enriched = results[0]
+        # Bio MUST surface — the disambig strip lets `Sessa` ≡ `Sessa (2)`.
+        assert enriched.artist_bio == "Brazilian singer-songwriter."
+        assert enriched.wikipedia_url == "https://en.wikipedia.org/wiki/Sessa_musician"
+
+    @pytest.mark.asyncio
+    async def test_alternate_artist_name_match_surfaces_bio(self):
+        """`artist_matches_item` (orchestrator.py:527) consults BOTH
+        ``item.artist`` and ``item.alternate_artist_name``. The gate
+        must mirror that — a row filed by catalogers as 'Black Dog
+        Productions' with alternate_artist_name='The Black Dog' would
+        score 64.71 on item.artist alone but should still surface bio
+        when the request matches the alternate name."""
+        item = make_library_item(
+            id=42,
+            artist="Black Dog Productions",
+            title="Spanners",
+            alternate_artist_name="The Black Dog",
+        )
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="The Black Dog",
+            album="Spanners",
+            artwork_url="https://example.com/spanners.jpg",
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Spanners",
+            artist="The Black Dog",
+            year=1995,
+            artist_id=77,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=77,
+            name="The Black Dog",
+            profile="UK IDM trio.",
+            urls=["https://en.wikipedia.org/wiki/The_Black_Dog"],
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Bolt 4",
+            album="Spanners",
+            artist="The Black Dog",
+            extended=True,
+        )
+
+        _, enriched = results[0]
+        # alternate_artist_name match anchors the gate; bio surfaces.
+        assert enriched.artist_bio == "UK IDM trio."
+        assert enriched.wikipedia_url == "https://en.wikipedia.org/wiki/The_Black_Dog"
+
+    @pytest.mark.asyncio
+    async def test_empty_release_artist_falls_through_to_library_row_hop(self):
+        """When ``top1_release`` is non-None but ``release.artist`` is
+        empty/whitespace (corrupted bulk-import row, partial Discogs
+        payload), treat the release hop as "nothing to verify against"
+        and fall through to library-row-only verification. Otherwise the
+        predicate would require release verification it can't perform,
+        suppressing bio on otherwise-valid hits."""
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            artwork_url="https://example.com/aluminum.jpg",
+        )
+
+        discogs_service = AsyncMock()
+        # Release fetched but artist string is empty (corrupted cache).
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist="",  # empty — would otherwise force release-side verification
+            year=1998,
+            artist_id=42,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=42,
+            name="Stereolab",
+            profile="French-British band.",
+            urls=["https://en.wikipedia.org/wiki/Stereolab"],
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="French Disko",
+            album="Aluminum Tunes",
+            artist="Stereolab",
+            extended=True,
+        )
+
+        _, enriched = results[0]
+        # Library-row hop is verified; release hop falls through. Bio surfaces.
+        assert enriched.artist_bio == "French-British band."
+
+    @pytest.mark.asyncio
+    async def test_apple_probe_artwork_suppressed_on_artist_collision(self):
+        """LML#487's Apple Music probe runs with `row_artist =
+        item.alternate_artist_name or item.artist`. On a fuzzy-collision
+        library row whose artist disagrees with the request, the probe
+        returns the WRONG artist's artwork. The new gate suppresses
+        ``artwork_url`` on the synthesized result when
+        ``library_row_artist_verified=False``, preventing a stranger's
+        cover art from landing on iOS."""
+        from clients.streaming.apple_music import AppleMusicTrackMatch
+
+        # Library row that collided on song title — different artist than the request.
+        item = make_library_item(
+            id=42,
+            artist="Wrong Artist",
+            title="Different Album",
+        )
+        probe_match = AppleMusicTrackMatch(
+            url="https://music.apple.com/us/song/wrong-artwork/9",
+            artwork_url="https://is1-ssl.mzstatic.com/image/thumb/WRONG/600x600bb.jpg",
+            release_year=2025,
+        )
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+        apple_music.find_track_url = AsyncMock(return_value=probe_match.url)
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = None  # synth path
+
+        results = await enrich_artwork_results(
+            [(item, None)],  # no artwork — synth path
+            discogs_service,
+            song="Some Song",
+            album="Some Album",
+            artist="Right Artist",  # disagrees with item.artist
+            apple_music=apple_music,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # apple_music_url itself still surfaces (it's a streaming link, not
+        # an identity claim about the artist) — only artwork_url is gated.
+        assert enriched.apple_music_url == probe_match.url
+        # The wrong-artist artwork must NOT land on the response.
+        assert enriched.artwork_url is None
+
+    @pytest.mark.asyncio
+    async def test_warm_cache_skipped_when_bio_suppressed(self):
+        """``_warm_bio_cache`` fires per-ref Discogs API calls (cache → API
+        → write-back). When the response itself suppressed the bio, those
+        calls warm refs that no client will ever read. Verify the warm task
+        is gated on whether bio actually surfaced in the top-1 result."""
+        # Set up the release-side-drift shape from
+        # test_release_side_drift_suppresses_bio: bio gets suppressed,
+        # but top1_bio is non-None (so the legacy `warm_cache and top1_bio`
+        # gate would have fired).
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            artwork_url="https://example.com/aluminum.jpg",
+        )
+
+        discogs_service = AsyncMock()
+        # Release-side artist drift suppresses the bio.
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist="Completely Different Artist",
+            year=1998,
+            artist_id=99,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Completely Different Artist",
+            profile="Some other bio.",
+            urls=["https://en.wikipedia.org/wiki/Other"],
+        )
+
+        with patch("lookup.orchestrator.asyncio.create_task") as mock_create_task:
+            await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                song="French Disko",
+                album="Aluminum Tunes",
+                artist="Stereolab",
+                extended=True,
+                warm_cache=True,
+            )
+
+        # No warm task scheduled — bio was suppressed in the response, so
+        # warming its refs is pure Discogs quota burn.
+        mock_create_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_breadcrumb_fires_during_rollback_in_shadow_mode(self):
+        """The rollback flag (``LML_ARTIST_IDENTITY_SPLIT_GATE=false``) is
+        precisely when shadow-mode telemetry matters most: the team needs
+        to see whether the new gate would still be diverging from the old
+        if it were active, to decide if re-enablement is safe. Gating the
+        breadcrumb on ``use_split_gate=True`` would destroy that signal.
+        Verify breadcrumb fires regardless of the rollback flag, AND that
+        ``data.use_split_gate`` reports the actual effective gate state."""
+        from clients.streaming.apple_music import AppleMusicTrackMatch
+
+        # Same setup as test_synth_path_preserves_bio: divergence shape.
+        item = make_library_item(id=42, artist="Noura Mint Seymali", title="Tzenni")
+        tzenni_artwork = make_discogs_result(
+            release_id=1,
+            artist="Noura Mint Seymali",
+            album="Tzenni",
+            artwork_url="https://example.com/tzenni.jpg",
+        )
+        probe_match = AppleMusicTrackMatch(
+            url="https://music.apple.com/us/song/x/9",
+            artwork_url="https://is1-ssl.mzstatic.com/image/thumb/yenbett.jpg",
+            release_year=2025,
+        )
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+        apple_music.find_track_url = AsyncMock(return_value=probe_match.url)
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Tzenni",
+            artist="Noura Mint Seymali",
+            year=2014,
+            artist_id=99,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Noura Mint Seymali",
+            profile="Mauritanian singer.",
+            urls=["https://en.wikipedia.org/wiki/Noura_Mint_Seymali"],
+        )
+
+        for flag_value in ("false", "0", "no", "off", "disabled"):
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"LML_ARTIST_IDENTITY_SPLIT_GATE": flag_value},
+                ),
+                patch("lookup.orchestrator.sentry_sdk.add_breadcrumb") as mock_breadcrumb,
+            ):
+                await enrich_artwork_results(
+                    [(item, tzenni_artwork)],
+                    discogs_service,
+                    song="Hebebeb (Zrag)",
+                    album="Yenbett",
+                    artist="Noura Mint Seymali",
+                    apple_music=apple_music,
+                    extended=True,
+                )
+
+            divergence_calls = [
+                c
+                for c in mock_breadcrumb.call_args_list
+                if c.kwargs.get("category") == "artist_identity_split_gate"
+            ]
+            assert len(divergence_calls) == 1, (
+                f"Flag={flag_value!r} should still emit breadcrumb in shadow mode"
+            )
+            data = divergence_calls[0].kwargs["data"]
+            assert data["use_split_gate"] is False, f"Flag={flag_value!r} should disable split gate"

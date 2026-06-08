@@ -94,6 +94,27 @@ _FEAT_RE = re.compile(r"\s+(?:feat\.?|featuring|ft\.?)\s+.*$", re.IGNORECASE)
 _DISCOGS_DISAMBIG_RE = re.compile(r"\s*\(\d+\)\s*$")
 
 
+# Shared acceptance threshold for artist+title fuzzy matching across LML#477,
+# LML#504, the Apple Music probe, and any caller comparing a request value
+# against a candidate at the "is this the same thing" floor. Defined here so
+# all sites import the same value — drift on this constant would silently
+# admit (or reject) cross-artist/album candidates at one call site only.
+SCORE_MATCH_ACCEPTANCE_FLOOR: float = 80.0
+
+
+def strip_discogs_disambig(name: str) -> str:
+    """Strip the trailing Discogs disambiguation suffix from an artist name.
+
+    Discogs assigns suffixes like ``Stereolab (2)`` or ``Sessa (2)`` whenever
+    multiple artists share a name. The suffix is structural metadata, not a
+    semantic difference in the artist's identity, so consumers comparing a
+    user-supplied name against ``release.artist`` should strip it before
+    scoring. Returns the input unchanged when no suffix is present, or when
+    the input is empty.
+    """
+    return _DISCOGS_DISAMBIG_RE.sub("", name)
+
+
 def normalize_artist_credit(artist: str) -> list[str]:
     """Generate artist name variants for Discogs fuzzy matching.
 
@@ -139,7 +160,9 @@ def normalize_artist_credit(artist: str) -> list[str]:
 
 def is_acceptable_match(artist_score: float, title_score: float) -> bool:
     """Returns True if both artist and title scores meet the acceptance threshold (>= 80)."""
-    return artist_score >= 80.0 and title_score >= 80.0
+    return (
+        artist_score >= SCORE_MATCH_ACCEPTANCE_FLOOR and title_score >= SCORE_MATCH_ACCEPTANCE_FLOOR
+    )
 
 
 def find_best_match(
