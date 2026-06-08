@@ -2172,11 +2172,17 @@ class TestArtistIdentitySplitGate:
         ]
         assert len(divergence_calls) == 1, "Expected one divergence breadcrumb on synth-recovery"
         data = divergence_calls[0].kwargs["data"]
+        # The two terminal verdicts: legacy gate (library_row_acceptable)
+        # and new gate (artist_identity_verified). Their XOR is the
+        # divergence signal — kept as derivable from these two rather than
+        # carried as redundant payload fields.
         assert data["library_row_acceptable"] is False
         assert data["artist_identity_verified"] is True
-        assert data["new_gate_would_surface"] is True
-        assert data["new_gate_would_suppress"] is False
         assert data["use_split_gate"] is True
+        # Diagnostic flags explain how each side reached its decision.
+        assert data["library_row_artist_verified"] is True
+        assert data["release_side_artist_verified"] is True
+        assert data["release_anchor_present"] is True
 
     @pytest.mark.asyncio
     async def test_split_release_featured_artist_bio_suppressed(self):
@@ -2386,8 +2392,11 @@ class TestArtistIdentitySplitGate:
         library row whose artist disagrees with the request, the probe
         returns the WRONG artist's artwork. The new gate suppresses
         ``artwork_url`` on the synthesized result when
-        ``library_row_artist_verified=False``, preventing a stranger's
-        cover art from landing on iOS."""
+        ``library_row_artist_verified=False`` — gated on the same
+        ``use_split_gate`` predicate as bio/wiki so the rollback flag and
+        ``extended`` rollout scope apply uniformly across all LML#504 gating.
+        Non-extended callers and operators flipping the rollback flag get
+        legacy LML#487 artwork behavior back."""
         from clients.streaming.apple_music import AppleMusicTrackMatch
 
         # Library row that collided on song title — different artist than the request.
@@ -2415,6 +2424,7 @@ class TestArtistIdentitySplitGate:
             album="Some Album",
             artist="Right Artist",  # disagrees with item.artist
             apple_music=apple_music,
+            extended=True,  # LML#504 gating is opt-in via extended
         )
 
         _, enriched = results[0]
@@ -2424,6 +2434,46 @@ class TestArtistIdentitySplitGate:
         assert enriched.apple_music_url == probe_match.url
         # The wrong-artist artwork must NOT land on the response.
         assert enriched.artwork_url is None
+
+    @pytest.mark.asyncio
+    async def test_apple_probe_artwork_preserved_when_split_gate_off(self):
+        """When ``extended=False`` (non-extended callers like request-o-matic
+        request line / dj-site proxy) the LML#504 split gate is OFF, so
+        the artwork suppression must NOT fire even on artist collisions.
+        Pins the rollback contract: non-extended callers get bit-for-bit
+        legacy LML#487 behavior. Same fixture as the suppression test
+        above, only the extended flag differs."""
+        from clients.streaming.apple_music import AppleMusicTrackMatch
+
+        item = make_library_item(id=42, artist="Wrong Artist", title="Different Album")
+        probe_match = AppleMusicTrackMatch(
+            url="https://music.apple.com/us/song/wrong-artwork/9",
+            artwork_url="https://is1-ssl.mzstatic.com/image/thumb/WRONG/600x600bb.jpg",
+            release_year=2025,
+        )
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+        apple_music.find_track_url = AsyncMock(return_value=probe_match.url)
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = None
+
+        results = await enrich_artwork_results(
+            [(item, None)],
+            discogs_service,
+            song="Some Song",
+            album="Some Album",
+            artist="Right Artist",
+            apple_music=apple_music,
+            extended=False,  # legacy gate path
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.apple_music_url == probe_match.url
+        # Legacy LML#487 behaviour: probe artwork lands on the synthesized
+        # result regardless of artist verification.
+        assert enriched.artwork_url == probe_match.artwork_url
 
     @pytest.mark.asyncio
     async def test_warm_cache_skipped_when_bio_suppressed(self):
