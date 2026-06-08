@@ -127,9 +127,10 @@ def strip_discogs_disambig(name: str) -> str:
     * Single-word qualifier: ``Sade (band)``, ``Pretty Girls (rapper)``
 
     Returns the input unchanged when no suffix matches, or when the input
-    is empty. Conservative on what it strips — a 1-20 character alphanumeric
-    parenthetical at end-of-string only — so legitimate artist names with
-    longer parenthetical material aren't truncated.
+    is empty. Conservative on what it strips — a 1-19 character alphanumeric
+    parenthetical at end-of-string only (regex: leading alphanumeric, then up
+    to 18 more alphanumerics/spaces/``.``/``-``) — so legitimate artist names
+    with longer parenthetical material aren't truncated.
     """
     return _DISCOGS_DISAMBIG_BROAD_RE.sub("", name)
 
