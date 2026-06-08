@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import quote
 
 import sentry_sdk
-from wxyc_etl.text import is_compilation_artist, strip_leading_article
+from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats_recorder
 
