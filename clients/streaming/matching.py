@@ -91,7 +91,18 @@ def score_match(query: str, result: str) -> float:
 _AND_RE = re.compile(r"\band\b", re.IGNORECASE)
 _AMPERSAND_RE = re.compile(r"\s*&\s*")
 _FEAT_RE = re.compile(r"\s+(?:feat\.?|featuring|ft\.?)\s+.*$", re.IGNORECASE)
+# Narrow numeric-only disambig form ("Sessa (2)"). Kept as a separate
+# constant because some callers (``normalize_artist_credit``) only want to
+# strip the numeric form to preserve other parenthetical metadata.
 _DISCOGS_DISAMBIG_RE = re.compile(r"\s*\(\d+\)\s*$")
+# Broader disambig form Discogs uses for any name collision: numeric IDs
+# (``Sade (1)``), country codes (``Stereolab (UK)``), single-word qualifiers
+# (``Sade (band)``, ``M83 (3)``). Constrained to a bounded character class
+# so we don't accidentally strip parts of legitimate names: alphanumeric
+# only, length 1-20, no nested parens. The intent is to capture "Discogs
+# disambig metadata" while declining to touch artist names that happen to
+# end with longer parenthetical material.
+_DISCOGS_DISAMBIG_BROAD_RE = re.compile(r"\s*\(\s*[A-Za-z0-9][A-Za-z0-9\s.\-]{0,18}\)\s*$")
 
 
 # Shared acceptance threshold for artist+title fuzzy matching across LML#477,
@@ -105,14 +116,22 @@ SCORE_MATCH_ACCEPTANCE_FLOOR: float = 80.0
 def strip_discogs_disambig(name: str) -> str:
     """Strip the trailing Discogs disambiguation suffix from an artist name.
 
-    Discogs assigns suffixes like ``Stereolab (2)`` or ``Sessa (2)`` whenever
-    multiple artists share a name. The suffix is structural metadata, not a
-    semantic difference in the artist's identity, so consumers comparing a
-    user-supplied name against ``release.artist`` should strip it before
-    scoring. Returns the input unchanged when no suffix is present, or when
-    the input is empty.
+    Discogs assigns suffixes whenever multiple artists share a name. The form
+    is structural metadata, not a semantic difference in the artist's
+    identity, so consumers comparing a user-supplied name against
+    ``release.artist`` should strip it before scoring. Handles all common
+    Discogs disambig shapes:
+
+    * Numeric: ``Sessa (2)``, ``Sade (1)``
+    * Country/region: ``Stereolab (UK)``, ``Sade (US)``
+    * Single-word qualifier: ``Sade (band)``, ``Pretty Girls (rapper)``
+
+    Returns the input unchanged when no suffix matches, or when the input
+    is empty. Conservative on what it strips — a 1-20 character alphanumeric
+    parenthetical at end-of-string only — so legitimate artist names with
+    longer parenthetical material aren't truncated.
     """
-    return _DISCOGS_DISAMBIG_RE.sub("", name)
+    return _DISCOGS_DISAMBIG_BROAD_RE.sub("", name)
 
 
 def normalize_artist_credit(artist: str) -> list[str]:
