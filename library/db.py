@@ -509,9 +509,7 @@ class LibraryDB:
         unions = [f"SELECT artist AS name FROM library WHERE {column_filter}"]
         params_list = list(candidate_patterns)
         if self._has_alternate_artist:
-            column_filter = " OR ".join(
-                "alternate_artist_name LIKE ?" for _ in candidate_patterns
-            )
+            column_filter = " OR ".join("alternate_artist_name LIKE ?" for _ in candidate_patterns)
             unions.append(
                 "SELECT alternate_artist_name AS name FROM library "
                 f"WHERE alternate_artist_name IS NOT NULL AND ({column_filter})"
@@ -527,8 +525,7 @@ class LibraryDB:
         if self._has_compilation_track_artist:
             column_filter = " OR ".join("artist_name LIKE ?" for _ in candidate_patterns)
             unions.append(
-                "SELECT artist_name AS name FROM compilation_track_artist "
-                f"WHERE {column_filter}"
+                f"SELECT artist_name AS name FROM compilation_track_artist WHERE {column_filter}"
             )
             params_list.extend(candidate_patterns)
 
