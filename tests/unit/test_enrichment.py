@@ -2839,3 +2839,378 @@ class TestArtistIdentitySplitGate:
         assert len(divergence_calls) == 0, (
             "Album-only lookups must not flood the divergence breadcrumb signal"
         )
+
+
+class TestSiblingOverrideProbeDivergence:
+    """LML#505: post-hoc invalidation of sibling-row override URLs on the
+    synthesis branch.
+
+    The LML#477 title gate (token_sort_ratio >= 80) is permissive on
+    Deluxe/Remaster/Reissue/Bonus/Limited/Expanded/Anniversary suffixes —
+    ``clients/streaming/matching.score_match`` strips the parenthetical
+    before scoring, so ``score_match("Album X", "Album X (Deluxe Edition)")
+    == 100.0``. A library row for ``Album X`` (original release) with a
+    curated ``streaming_links`` payload therefore propagates its five
+    service URLs through the gate when the request is for ``Album X
+    (Deluxe Edition)``. When the Discogs hit for the Deluxe is missing
+    (synthesis branch — ``artwork is None``), the Apple Music probe
+    (LML#487) fetches the correct Deluxe release; without LML#505 the
+    override URLs from the sibling original leak through onto the
+    synthesized result and the user lands on the wrong release in their
+    streaming app.
+
+    ``find_track_metadata`` enforces ``album_score >= 80`` against the
+    *requested* album (``clients/streaming/apple_music.py:407-412``), so
+    a probe match on the synthesis branch is, by construction, for the
+    requested album whenever ``album`` was supplied. When both ``album``
+    and ``item.title`` carry signal, the override URLs must therefore
+    have come from a wrong-sibling row — clear them. The artist-only
+    path (``album=None``) and the title-less row path (``item.title is
+    None``) intentionally retain the override: in those branches the
+    probe's album-score filter never ran, so a probe match does not
+    imply the override is wrong.
+    """
+
+    @pytest.mark.asyncio
+    async def test_deluxe_shape_clears_all_five_service_overrides_when_probe_matches(self):
+        """Core bug. Library row ``Tzenni`` (sibling original) carries five
+        curated streaming URLs; request is for ``Tzenni (Deluxe Edition)``
+        with ``artwork=None`` (Discogs miss for the Deluxe). Apple Music
+        probe finds the Deluxe. None of the five override URLs may
+        propagate; ``apple_music_url`` becomes the probe URL; the other
+        four downgrade to search-URL fallbacks (not no-link).
+        """
+        item = make_library_item(id=42, artist="Noura Mint Seymali", title="Tzenni")
+
+        wrong_spotify = "https://open.spotify.com/album/tzenni-original-id"
+        wrong_apple = "https://music.apple.com/us/album/tzenni-original/111"
+        wrong_ytm = "https://music.youtube.com/playlist?list=tzenni-original"
+        wrong_bandcamp = "https://nourascuesta.bandcamp.com/album/tzenni-original"
+        wrong_soundcloud = "https://soundcloud.com/noura-mint-seymali/tzenni-original"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": wrong_spotify,
+                "apple_music_url": wrong_apple,
+                "youtube_music_url": wrong_ytm,
+                "bandcamp_url": wrong_bandcamp,
+                "soundcloud_url": wrong_soundcloud,
+            }
+        )
+
+        probe_url = "https://music.apple.com/us/album/tzenni-deluxe/999"
+        probe_match = AppleMusicTrackMatch(
+            url=probe_url,
+            artwork_url="https://is1-ssl.mzstatic.com/image/thumb/deluxe/600x600bb.jpg",
+            release_year=2015,
+        )
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+        apple_music.find_track_url = AsyncMock(return_value=probe_url)
+
+        results = await enrich_artwork_results(
+            [(item, None)],  # synthesis branch — no Discogs hit
+            AsyncMock(),
+            song="Hebebeb (Zrag)",
+            album="Tzenni (Deluxe Edition)",
+            apple_music=apple_music,
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # None of the sibling-row override URLs propagated.
+        assert enriched.spotify_url != wrong_spotify
+        assert enriched.apple_music_url != wrong_apple
+        assert enriched.youtube_music_url != wrong_ytm
+        assert enriched.bandcamp_url != wrong_bandcamp
+        assert enriched.soundcloud_url != wrong_soundcloud
+        # Apple slot now carries the probe URL — Option B's free
+        # precedence flip over the existing
+        # ``apple_music_override or apple_music_url or None`` order.
+        assert enriched.apple_music_url == probe_url
+        # The other four downgrade to search-URL placeholders, NOT
+        # no-link (the override-block-clears-by-itself level is
+        # ``search-URL``, not None — `_build_streaming_search_url`
+        # fills any unset service when artist+song are non-empty).
+        assert enriched.spotify_url is not None
+        assert "search" in enriched.spotify_url.lower()
+        assert enriched.youtube_music_url is not None
+        assert "search" in enriched.youtube_music_url.lower()
+        assert enriched.bandcamp_url is not None
+        assert "search" in enriched.bandcamp_url.lower()
+        assert enriched.soundcloud_url is not None
+        assert "search" in enriched.soundcloud_url.lower()
+
+    @pytest.mark.asyncio
+    async def test_probe_url_wins_precedence_over_override_on_synthesis_branch(self):
+        """Focused precedence pin: synthesis branch where the override is
+        set AND the probe returns a URL → the final ``apple_music_url`` is
+        the probe URL, not the override. Defends Option B's side-effect
+        bonus over the legacy
+        ``apple_music_override or apple_music_url or None`` precedence —
+        clearing the override on the synthesis branch lets the probe win.
+        Option A/A+ would not earn this; they only gate whether the
+        override fires.
+        """
+        item = make_library_item(id=42, artist="Noura Mint Seymali", title="Tzenni")
+
+        override_url = "https://music.apple.com/us/album/tzenni-original/111"
+        probe_url = "https://music.apple.com/us/album/tzenni-deluxe/999"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(return_value={"apple_music_url": override_url})
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(
+            return_value=AppleMusicTrackMatch(url=probe_url, artwork_url=None, release_year=None)
+        )
+        apple_music.find_track_url = AsyncMock(return_value=probe_url)
+
+        results = await enrich_artwork_results(
+            [(item, None)],
+            AsyncMock(),
+            song="Hebebeb (Zrag)",
+            album="Tzenni (Deluxe Edition)",
+            apple_music=apple_music,
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.apple_music_url == probe_url
+
+    @pytest.mark.asyncio
+    async def test_happy_path_override_preserved_when_library_row_acceptable(self):
+        """Regression pin across all five services. When
+        ``library_row_acceptable=True`` (Discogs artwork present AND title
+        clears the LML#477 gate), the override URLs MUST still propagate.
+        This is the librarian-curated happy path and the suppression
+        rule MUST NOT fire here. Mirrors
+        ``test_apple_music_url_does_not_override_db_streaming_link`` and
+        ``test_probe_skipped_on_happy_path_when_streaming_links_override_present``
+        across the full five-service slot.
+        """
+        item = make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Jessica Pratt",
+            album="On Your Own Love Again",
+            artwork_url="https://example.com/oyola.jpg",
+            release_year=2015,
+        )
+
+        verified_spotify = "https://open.spotify.com/album/oyola-id"
+        verified_apple = "https://music.apple.com/us/album/oyola/222"
+        verified_ytm = "https://music.youtube.com/playlist?list=oyola"
+        verified_bandcamp = "https://jessicapratt.bandcamp.com/album/oyola"
+        verified_soundcloud = "https://soundcloud.com/jessica-pratt/oyola"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": verified_spotify,
+                "apple_music_url": verified_apple,
+                "youtube_music_url": verified_ytm,
+                "bandcamp_url": verified_bandcamp,
+                "soundcloud_url": verified_soundcloud,
+            }
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        # Mock both methods so a regression that flips the branch
+        # surfaces in assertions/call-count rather than NameError.
+        apple_music.find_track_url = AsyncMock(
+            return_value="https://music.apple.com/us/song/discarded/0"
+        )
+        apple_music.find_track_metadata = AsyncMock()
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="On Your Own Love Again",
+            artist="Jessica Pratt",
+            year=2015,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Back, Baby",
+            album="On Your Own Love Again",
+            apple_music=apple_music,
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.spotify_url == verified_spotify
+        assert enriched.apple_music_url == verified_apple
+        assert enriched.youtube_music_url == verified_ytm
+        assert enriched.bandcamp_url == verified_bandcamp
+        assert enriched.soundcloud_url == verified_soundcloud
+
+    @pytest.mark.asyncio
+    async def test_artist_only_lookup_preserves_override_on_synthesis_branch(self):
+        """Artist+song-only lookup (``album=None``). The title gate falls
+        through to True (no album to gate against). The override block
+        fires, and synthesis runs because ``artwork=None``. The probe also
+        runs with ``album=None`` — in that mode ``find_track_metadata``
+        collapses to a 80/80 floor with no ``album_score`` filter
+        (``clients/streaming/apple_music.py:427-436``), so a probe match
+        does NOT imply the override is for the wrong album. Override
+        URLs preserved.
+
+        This test guards against a naive Option B implementation that
+        suppresses purely on ``not library_row_acceptable and probe_match
+        is not None`` without checking that the album-divergence signal
+        was actually meaningful.
+        """
+        item = make_library_item(id=42, artist="Juana Molina", title="DOGA")
+
+        override_spotify = "https://open.spotify.com/album/doga-id"
+        override_apple = "https://music.apple.com/us/album/doga/777"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": override_spotify,
+                "apple_music_url": override_apple,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(
+            return_value=AppleMusicTrackMatch(
+                url="https://music.apple.com/us/song/doga/888",
+                artwork_url=None,
+                release_year=None,
+            )
+        )
+        apple_music.find_track_url = AsyncMock(
+            return_value="https://music.apple.com/us/song/doga/888"
+        )
+
+        results = await enrich_artwork_results(
+            [(item, None)],  # synthesis branch
+            AsyncMock(),
+            song="DOGA",
+            album=None,
+            apple_music=apple_music,
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        # Override URLs preserved — no album-divergence signal.
+        assert enriched.spotify_url == override_spotify
+        # Apple slot: override beats probe per the legacy precedence
+        # (no album → no Option B suppression → override stays).
+        assert enriched.apple_music_url == override_apple
+
+    @pytest.mark.asyncio
+    async def test_title_less_library_row_preserves_override_on_synthesis_branch(self):
+        """Library row with ``title=None``. The title gate falls through
+        to True (no row title to compare). Override block fires;
+        synthesis runs (``artwork=None``). Even if the probe matches,
+        the library row has no title to be 'wrong' against — no signal
+        that the override URLs point at a wrong sibling. Override
+        preserved.
+
+        This test guards against a naive Option B implementation that
+        suppresses purely on ``not library_row_acceptable and probe_match
+        is not None``; the title-less branch is a latent leak per the
+        issue's open-question section but explicitly out-of-scope for
+        this fix.
+        """
+        item = make_library_item(id=42, artist="Stereolab", title=None)
+
+        override_spotify = "https://open.spotify.com/album/aluminum-tunes-id"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": override_spotify,
+                "apple_music_url": None,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(
+            return_value=AppleMusicTrackMatch(
+                url="https://music.apple.com/us/album/aluminum-tunes/999",
+                artwork_url="https://example.com/aluminum-tunes.jpg",
+                release_year=1998,
+            )
+        )
+        apple_music.find_track_url = AsyncMock(return_value=None)
+
+        results = await enrich_artwork_results(
+            [(item, None)],
+            AsyncMock(),
+            song="French Disko",
+            album="Aluminum Tunes",
+            apple_music=apple_music,
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        # Override URL preserved despite probe match — no title signal.
+        assert enriched.spotify_url == override_spotify
+
+    @pytest.mark.asyncio
+    async def test_synthesis_branch_probe_returns_none_preserves_override(self):
+        """Synthesis branch, probe returns ``None`` (Apple Music had no
+        acceptable match — the 80/80/80 floor was not cleared, or Apple
+        had no record at all). No probe signal to contradict the
+        override → override URLs preserved.
+
+        Guards against an implementation that suppresses on
+        ``not library_row_acceptable`` alone without checking
+        ``probe_match is not None``.
+        """
+        item = make_library_item(id=42, artist="Noura Mint Seymali", title="Tzenni")
+
+        override_spotify = "https://open.spotify.com/album/tzenni-original-id"
+        override_apple = "https://music.apple.com/us/album/tzenni-original/111"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": override_spotify,
+                "apple_music_url": override_apple,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=None)
+        apple_music.find_track_url = AsyncMock(return_value=None)
+
+        results = await enrich_artwork_results(
+            [(item, None)],
+            AsyncMock(),
+            song="Hebebeb (Zrag)",
+            album="Tzenni (Deluxe Edition)",
+            apple_music=apple_music,
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        # Probe gave no contradicting signal — override survives.
+        assert enriched.spotify_url == override_spotify
+        assert enriched.apple_music_url == override_apple

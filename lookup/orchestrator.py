@@ -22,7 +22,7 @@ from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats_recorder
 
-from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.apple_music import AppleMusicClient, AppleMusicTrackMatch
 from clients.streaming.matching import (
     SCORE_MATCH_ACCEPTANCE_FLOOR,
     find_best_typed_match,
@@ -2094,6 +2094,7 @@ async def enrich_artwork_results(
         # path timeouts (artwork still leaking, high impact) from happy-path
         # timeouts (URL only, low impact).
         apple_music_url: str | None = None
+        probe_match: AppleMusicTrackMatch | None = None
         probe_artwork_url: str | None = None
         probe_release_year: int | None = None
         probe_method = "find_track_metadata" if not library_row_acceptable else "find_track_url"
@@ -2146,6 +2147,41 @@ async def enrich_artwork_results(
                     row_artist,
                     search_term,
                 )
+
+        # LML#505: post-hoc invalidation of sibling-row override URLs on
+        # the synthesis branch. The LML#477 title gate
+        # (``row_title_matches_requested_album``) clears on Deluxe /
+        # Remaster / Reissue / Bonus / Limited / Expanded / Anniversary
+        # suffixes because ``clients/streaming/matching.score_match``
+        # strips the parenthetical before scoring —
+        # ``score_match("Album X", "Album X (Deluxe Edition)") == 100.0``.
+        # So a library row for the sibling original propagates its five
+        # curated streaming URLs through the override block above when
+        # the request is for the Deluxe. When Discogs lacks the Deluxe
+        # (synthesis branch, ``not library_row_acceptable``) the Apple
+        # probe fetches the *requested* album — ``find_track_metadata``
+        # enforces ``album_score >= 80`` at
+        # ``clients/streaming/apple_music.py:407-412`` — proving the
+        # row's URLs are for a sibling, not the request. Clear them so
+        # the precedence at the final ``update`` assignment lets the
+        # probe URL win the Apple slot and the other four services
+        # downgrade to ``_build_streaming_search_url`` placeholders
+        # instead of leaking the wrong release to iOS / dj-site.
+        #
+        # The ``album`` and ``item.title`` guards exclude two paths the
+        # collapse-to-``probe_match is not None`` rule mishandles:
+        # artist-only lookups (``album=None`` → probe ran without the
+        # ``album_score`` floor, so a probe match does not imply
+        # override is wrong) and title-less rows (no row title to be
+        # 'wrong' against). Both retain the override; the title-less
+        # branch is a latent leak tracked as an open question on LML#505
+        # and explicitly out of scope here.
+        if not library_row_acceptable and probe_match is not None and album and item.title:
+            apple_music_override = None
+            spotify_url = None
+            youtube_music_url = None
+            bandcamp_url = None
+            soundcloud_url = None
 
         # Album-derived fields are positionally gated: only on top-1, and
         # only when top-1 actually carries an *acceptable* library row.
