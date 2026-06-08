@@ -2174,8 +2174,8 @@ class TestArtistIdentitySplitGate:
         data = divergence_calls[0].kwargs["data"]
         assert data["library_row_acceptable"] is False
         assert data["artist_identity_verified"] is True
-        assert data["recovery"] is True
-        assert data["regression"] is False
+        assert data["new_gate_would_surface"] is True
+        assert data["new_gate_would_suppress"] is False
         assert data["use_split_gate"] is True
 
     @pytest.mark.asyncio
@@ -2546,3 +2546,200 @@ class TestArtistIdentitySplitGate:
             )
             data = divergence_calls[0].kwargs["data"]
             assert data["use_split_gate"] is False, f"Flag={flag_value!r} should disable split gate"
+
+    @pytest.mark.asyncio
+    async def test_non_top1_synth_artwork_preserved_under_per_item_gate(self):
+        """Iter2 regression fix: when a non-top-1 item hits the synth path
+        and its row's artist matches the request, its probe artwork must
+        surface. Earlier iter1 had hoisted ``library_row_artist_verified``
+        to top-1-only, so non-top-1 items unconditionally lost probe
+        artwork whenever a request artist was supplied. Per-item
+        computation restores legacy semantics for non-top-1 results."""
+        from clients.streaming.apple_music import AppleMusicTrackMatch
+
+        top1 = make_library_item(id=1, artist="Stereolab", title="Aluminum Tunes")
+        top1_artwork = make_discogs_result(
+            release_id=1,
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            artwork_url="https://example.com/top1.jpg",
+        )
+        # Non-top-1 item also for Stereolab, but synth-path (no Discogs
+        # artwork available). Its per-item probe SHOULD surface artwork.
+        non_top1 = make_library_item(id=2, artist="Stereolab", title="Dots and Loops")
+        probe_match = AppleMusicTrackMatch(
+            url="https://music.apple.com/us/song/non-top1-track/9",
+            artwork_url="https://is1-ssl.mzstatic.com/image/thumb/dots-and-loops.jpg",
+            release_year=1997,
+        )
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+        apple_music.find_track_url = AsyncMock(return_value="https://music.apple.com/top1")
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist="Stereolab",
+            year=1998,
+            artist_id=42,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(top1, top1_artwork), (non_top1, None)],
+            discogs_service,
+            song="Olv 26",
+            album="Aluminum Tunes",
+            artist="Stereolab",
+            apple_music=apple_music,
+            extended=True,
+        )
+
+        _, non_top1_enriched = results[1]
+        assert non_top1_enriched is not None
+        # Non-top-1 item's probe artwork MUST surface (per-item verification).
+        assert non_top1_enriched.artwork_url == probe_match.artwork_url
+
+    @pytest.mark.asyncio
+    async def test_broad_disambig_suffix_stripped(self):
+        """Iter2: ``Stereolab (UK)`` (country-code disambig) and
+        ``Sade (band)`` (single-word qualifier) need stripping too —
+        the iter1 regex only handled digit-only disambig. score_match
+        without strip: ``Stereolab`` vs ``Stereolab (UK)`` = 78.26 < 80.
+        After the broader strip, score is 100 and bio surfaces."""
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            artwork_url="https://example.com/aluminum.jpg",
+        )
+
+        discogs_service = AsyncMock()
+        # Discogs returns the country-code disambiguated form.
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist="Stereolab (UK)",
+            year=1998,
+            artist_id=42,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=42,
+            name="Stereolab (UK)",
+            profile="French-British band.",
+            urls=["https://en.wikipedia.org/wiki/Stereolab"],
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Olv 26",
+            album="Aluminum Tunes",
+            artist="Stereolab",
+            extended=True,
+        )
+
+        _, enriched = results[0]
+        assert enriched.artist_bio == "French-British band."
+
+    @pytest.mark.asyncio
+    async def test_empty_library_row_artist_falls_back_to_legacy_gate(self):
+        """Iter2: library row with empty/None ``item.artist`` AND
+        ``item.alternate_artist_name`` has no anchor to score against.
+        Predicate falls back to legacy ``library_row_acceptable`` rather
+        than hard-suppressing bio for what's typically a data-quality
+        glitch (the row otherwise has artwork + a title match)."""
+        item = make_library_item(
+            id=42,
+            artist=None,
+            title="Aluminum Tunes",
+            alternate_artist_name=None,
+        )
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            artwork_url="https://example.com/aluminum.jpg",
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist="Stereolab",
+            year=1998,
+            artist_id=42,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=42,
+            name="Stereolab",
+            profile="French-British band.",
+            urls=["https://en.wikipedia.org/wiki/Stereolab"],
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="French Disko",
+            album="Aluminum Tunes",
+            artist="Stereolab",
+            extended=True,
+        )
+
+        _, enriched = results[0]
+        # Library row has no artist anchor — legacy fallback surfaces bio.
+        assert enriched.artist_bio == "French-British band."
+
+    @pytest.mark.asyncio
+    async def test_breadcrumb_not_emitted_on_album_only_lookup(self):
+        """Iter2 noise fix: when no request artist is supplied (album-only
+        lookup), the split gate falls back to legacy and there is no
+        actionable divergence even when the raw predicates differ. The
+        breadcrumb must be silent on these — otherwise the dashboard
+        floods on every album-only lookup with an acceptable library row."""
+        item = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            artwork_url="https://example.com/aluminum.jpg",
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist="Stereolab",
+            year=1998,
+            artist_id=42,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=42,
+            name="Stereolab",
+            profile="French-British band.",
+            urls=["https://en.wikipedia.org/wiki/Stereolab"],
+        )
+
+        with patch("lookup.orchestrator.sentry_sdk.add_breadcrumb") as mock_breadcrumb:
+            await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                song="French Disko",
+                album="Aluminum Tunes",
+                artist=None,  # album-only lookup
+                extended=True,
+            )
+
+        divergence_calls = [
+            c
+            for c in mock_breadcrumb.call_args_list
+            if c.kwargs.get("category") == "artist_identity_split_gate"
+        ]
+        assert len(divergence_calls) == 0, (
+            "Album-only lookups must not flood the divergence breadcrumb signal"
+        )
