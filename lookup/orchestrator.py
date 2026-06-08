@@ -209,12 +209,15 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
     * ``score_match(query, candidate)`` meets the shared acceptance floor, and
     * ``candidate`` is not a compilation/V-A alias.
 
-    The disambiguation strip is the load-bearing reason this helper exists:
-    Discogs assigns ``(N)`` suffixes for any artist name with collisions,
-    and an unsuffixed user query against a suffixed Discogs string would
-    score 71-82 (verified empirically: ``Sessa`` vs ``Sessa (2)`` = 71.43;
-    ``Stereolab`` vs ``Stereolab (UK)`` = 78.26). Stripping is symmetric so
-    library-side identifiers (which usually carry no suffix) are unaffected.
+    The disambiguation strip is applied symmetrically to BOTH sides — Discogs
+    assigns ``(N)`` / ``(UK)`` / ``(band)`` suffixes for any artist name with
+    collisions, and a caller may pre-resolve the request artist to its
+    canonical Discogs form (e.g. via the LML resolver pre-pass), arriving
+    here with the suffix intact. Stripping the query side too keeps the
+    helper agnostic to whether the request value was a raw user input or a
+    canonicalized Discogs identifier. Verified empirically: ``Sessa`` vs
+    ``Sessa (2)`` = 71.43, ``Stereolab`` vs ``Stereolab (UK)`` = 78.26 — both
+    fail the 80 floor without the strip; both pass after symmetric strip.
     """
     if not query_stripped:
         return False
@@ -225,7 +228,10 @@ def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
         return False
     if is_compilation_artist(candidate_stripped):
         return False
-    return score_match(query_stripped, candidate_stripped) >= SCORE_MATCH_ACCEPTANCE_FLOOR
+    query_stripped_canonical = strip_discogs_disambig(query_stripped).strip()
+    if not query_stripped_canonical:
+        return False
+    return score_match(query_stripped_canonical, candidate_stripped) >= SCORE_MATCH_ACCEPTANCE_FLOOR
 
 
 CANONICAL_ARTIST_SIMILARITY_FLOOR: float = 0.70
@@ -521,12 +527,13 @@ def _log_artist_identity_split_gate(
     All SDK exceptions swallowed; same pattern as the other ``_log_*``
     helpers in this module.
     """
-    # Naming convention: these labels describe what each gate WOULD do for
-    # this lookup, independent of which gate is actually in effect. So
-    # ``new_gate_would_surface=True, use_split_gate=False`` means "the new
-    # gate would have surfaced bio here, but the rollback flag is in effect
-    # so the user actually saw the legacy outcome". Avoid recovery/regression
-    # labels because they read as past tense and invert under rollback.
+    # The two terminal verdicts (``library_row_acceptable`` = legacy gate's
+    # bio decision; ``artist_identity_verified`` = new gate's decision)
+    # are sufficient to compute "would surface" / "would suppress" in any
+    # downstream query — XOR them. Keeping derivable fields out of the
+    # payload prevents Sentry breadcrumb size bloat at BS write-path scale
+    # and makes the contract crisp: two verdicts, three diagnostic flags
+    # explaining how each side reached its decision.
     payload: dict[str, Any] = {
         "library_row_acceptable": library_row_acceptable,
         "artist_identity_verified": artist_identity_verified,
@@ -534,8 +541,6 @@ def _log_artist_identity_split_gate(
         "release_side_artist_verified": release_side_artist_verified,
         "release_anchor_present": release_anchor_present,
         "use_split_gate": use_split_gate,
-        "new_gate_would_surface": artist_identity_verified and not library_row_acceptable,
-        "new_gate_would_suppress": library_row_acceptable and not artist_identity_verified,
     }
     try:
         transaction = sentry_sdk.get_current_scope().transaction
@@ -2311,10 +2316,13 @@ async def enrich_artwork_results(
             # the probe returned the WRONG artist's artwork. Gate on the
             # library-row hop of the new predicate so a synth-path lookup
             # that failed artist verification doesn't surface a stranger's
-            # cover art. When ``request_artist`` is empty the gate is moot
-            # (no anchor to verify against; fall through to legacy probe
-            # behavior).
-            if request_artist_stripped and not library_row_artist_verified:
+            # cover art. Gated on the same ``use_split_gate`` predicate as
+            # ``artist_bio`` / ``wikipedia_url`` so the rollback flag and
+            # the extended-only rollout scope apply uniformly to all
+            # LML#504-introduced gating — non-extended callers and operators
+            # who flip the env-var to false get bit-for-bit legacy
+            # LML#487 behavior back.
+            if use_split_gate and not library_row_artist_verified:
                 update["artwork_url"] = None
             else:
                 update["artwork_url"] = probe_artwork_url
