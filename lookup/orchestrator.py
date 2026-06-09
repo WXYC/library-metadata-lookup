@@ -29,6 +29,7 @@ from clients.streaming.matching import (
     score_match,
     score_match_track,
     strip_discogs_disambig,
+    strip_track_suffix,
 )
 from config.settings import get_settings
 from core.search import (
@@ -2419,19 +2420,28 @@ async def enrich_artwork_results(
                 # probe (``SCORE_MATCH_ACCEPTANCE_FLOOR``); imported rather
                 # than re-declared so calibration bumps propagate uniformly.
                 song_stripped = (song or "").strip()
+                # Pre-strip the song once (loop-invariant) AND verify the
+                # post-strip form is non-empty. If the request's song was
+                # entirely variant-marker (e.g. ``song="(Live)"`` from a
+                # malformed parse), the post-strip form is "" and
+                # ``score_match("", t.title)`` returns 0 for every track —
+                # falsely dropping the rescue. Treat the all-marker case
+                # the same as ``song=None`` / whitespace-only: skip the
+                # check rather than emit a misleading rejection.
+                song_match_target = strip_track_suffix(song_stripped)
                 song_sanity_checked = False
                 song_sanity_rejected = False
-                if mb_tracklist and song_stripped and _mb_rescue_song_match_required():
+                if mb_tracklist and song_match_target and _mb_rescue_song_match_required():
                     song_sanity_checked = True
-                    # Require a non-empty track title for the iteration to
-                    # count as a hit. ``score_match_track("", "")`` returns
-                    # 100 by rapidfuzz convention, so without this guard a
-                    # corrupt MB row with all-empty titles would falsely
-                    # pass the check when ``song_stripped`` happens to
-                    # normalize to empty.
+                    # Require a non-empty stripped track title for the
+                    # iteration to count as a hit. ``score_match_track("", "")``
+                    # returns 100 by rapidfuzz convention, so without this
+                    # guard a corrupt MB row with all-empty titles would
+                    # falsely pass the check when the query side also
+                    # normalizes to empty.
                     if not any(
                         (t.title or "").strip()
-                        and score_match_track(song_stripped, t.title)
+                        and score_match_track(song_match_target, t.title)
                         >= SCORE_MATCH_ACCEPTANCE_FLOOR
                         for t in mb_tracklist
                     ):

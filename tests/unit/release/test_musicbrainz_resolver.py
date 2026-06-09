@@ -21,6 +21,30 @@ from release.musicbrainz_resolver import (
 )
 
 
+def _make_capturing_transaction():
+    """Return a Sentry-transaction stand-in whose ``set_data`` calls are
+    appended to ``._calls`` as ``(args, kwargs)`` tuples.
+
+    Shared by the LML#506 telemetry tests so the pattern doesn't drift
+    across the five test sites that need it. The instance attribute
+    ``_calls`` is initialized eagerly so a future ``set_data`` invocation
+    during ``__init__`` would still record correctly (the helper hides
+    the iter-1 init-order subtlety from individual tests).
+    """
+    instance = type(
+        "MockTransaction",
+        (),
+        {"set_data": lambda self, *args, **kwargs: self._calls.append((args, kwargs))},
+    )()
+    instance._calls = []
+    return instance
+
+
+def _captured_attrs(transaction) -> dict[str, object]:
+    """Return ``{key: value}`` for the positional-arg form of ``set_data``."""
+    return {args[0]: args[1] for args, _ in transaction._calls}
+
+
 @pytest.mark.asyncio
 async def test_returns_none_when_mb_pg_is_none():
     result = await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=None)
@@ -219,8 +243,7 @@ async def test_projects_requested_vs_returned_album_on_sentry_trace():
             }
         ]
     )
-    txn = type("T", (), {"set_data": lambda self, *a, **k: self._calls.append((a, k))})()
-    txn._calls = []
+    txn = _make_capturing_transaction()
 
     with patch("release.musicbrainz_resolver.sentry_sdk") as sentry:
         sentry.get_current_scope.return_value.transaction = txn
@@ -228,8 +251,8 @@ async def test_projects_requested_vs_returned_album_on_sentry_trace():
             "Stereolab", "Emperor Tomato Ketchup (Deluxe Edition)", mb_pg=mb_pg
         )
 
-    keys = [args[0] for args, _ in txn._calls]
-    values = {args[0]: args[1] for args, _ in txn._calls}
+    values = _captured_attrs(txn)
+    keys = list(values.keys())
     assert "lookup.mb_resolver.requested_album" in keys
     assert "lookup.mb_resolver.returned_album" in keys
     assert values["lookup.mb_resolver.requested_album"] == "Emperor Tomato Ketchup (Deluxe Edition)"
@@ -244,14 +267,13 @@ async def test_projects_returned_album_none_when_resolver_misses():
     """
     mb_pg = AsyncMock()
     mb_pg.fetchall = AsyncMock(return_value=[])
-    txn = type("T", (), {"set_data": lambda self, *a, **k: self._calls.append((a, k))})()
-    txn._calls = []
+    txn = _make_capturing_transaction()
 
     with patch("release.musicbrainz_resolver.sentry_sdk") as sentry:
         sentry.get_current_scope.return_value.transaction = txn
         await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
 
-    values = {args[0]: args[1] for args, _ in txn._calls}
+    values = _captured_attrs(txn)
     assert values["lookup.mb_resolver.requested_album"] == "Aluminum Tunes"
     assert values["lookup.mb_resolver.returned_album"] is None
 
@@ -270,8 +292,7 @@ async def test_projects_telemetry_on_pg_timeout():
 
     mb_pg = AsyncMock()
     mb_pg.fetchall = hang
-    txn = type("T", (), {"set_data": lambda self, *a, **k: self._calls.append((a, k))})()
-    txn._calls = []
+    txn = _make_capturing_transaction()
 
     with (
         patch("release.musicbrainz_resolver.sentry_sdk") as sentry,
@@ -281,7 +302,7 @@ async def test_projects_telemetry_on_pg_timeout():
         result = await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
 
     assert result is None
-    values = {args[0]: args[1] for args, _ in txn._calls}
+    values = _captured_attrs(txn)
     assert values["lookup.mb_resolver.requested_album"] == "Aluminum Tunes"
     assert values["lookup.mb_resolver.returned_album"] is None
 
@@ -293,15 +314,14 @@ async def test_projects_telemetry_on_pg_exception():
     """
     mb_pg = AsyncMock()
     mb_pg.fetchall = AsyncMock(side_effect=RuntimeError("connection refused"))
-    txn = type("T", (), {"set_data": lambda self, *a, **k: self._calls.append((a, k))})()
-    txn._calls = []
+    txn = _make_capturing_transaction()
 
     with patch("release.musicbrainz_resolver.sentry_sdk") as sentry:
         sentry.get_current_scope.return_value.transaction = txn
         result = await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
 
     assert result is None
-    values = {args[0]: args[1] for args, _ in txn._calls}
+    values = _captured_attrs(txn)
     assert values["lookup.mb_resolver.requested_album"] == "Aluminum Tunes"
     assert values["lookup.mb_resolver.returned_album"] is None
 
@@ -328,12 +348,11 @@ async def test_returned_album_none_passes_through_when_release_title_missing():
             }
         ]
     )
-    txn = type("T", (), {"set_data": lambda self, *a, **k: self._calls.append((a, k))})()
-    txn._calls = []
+    txn = _make_capturing_transaction()
 
     with patch("release.musicbrainz_resolver.sentry_sdk") as sentry:
         sentry.get_current_scope.return_value.transaction = txn
         await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
 
-    values = {args[0]: args[1] for args, _ in txn._calls}
+    values = _captured_attrs(txn)
     assert values["lookup.mb_resolver.returned_album"] is None

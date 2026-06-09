@@ -41,29 +41,60 @@ _PARENTHETICAL_SUFFIX_RE = re.compile(
 # track is being referenced — "(Live)" of Brakhage is still Brakhage). Bare
 # ``mix`` / ``edit`` / ``version`` are deliberately excluded because they
 # false-positive on legitimate parenthetical phrases like "(Original Korean
-# Version)" and "(Pre-mix)" — over-stripping would let the sanity check
-# accept wrong-edition tracklists (the exact failure mode #506 is meant to
-# prevent). Compound forms ("Single Mix", "Radio Edit", "Alternate Take")
-# are listed explicitly. ``reprise`` / ``interlude`` excluded because they
-# typically name DISTINCT tracks, not variants of the same track.
+# Version)" / "(Pre-mix)" / "(Mix Master Edit)" — over-stripping would let
+# the sanity check accept wrong-edition tracklists (the exact failure mode
+# #506 is meant to prevent). Instead, every "X Version" / "X Mix" / "X Edit"
+# form is enumerated by its prefix word, which gives a precise FN/FP trade
+# (we strip "Mono Version" but not "Original Korean Version" because
+# ``korean`` isn't in the prefix set). Similarly ``reprise`` / ``interlude``
+# are excluded because they typically name DISTINCT tracks. ``take\s+\d+``
+# (digit-required) avoids the "(Take Five)" false positive on the Brubeck
+# track title while still catching jazz outtake takes.
 #
-# Dash form accepts ASCII hyphen-minus, en-dash (U+2013), and em-dash
-# (U+2014); MB freely surfaces all three. Keyword set kept in sync with the
-# paren form so a marker the paren regex catches the dash form catches too.
+# Dash form accepts ASCII hyphen-minus, en-dash (U+2013), em-dash (U+2014).
+# Requires at least one whitespace on the leading side so word-internal
+# hyphens like ``Be-Bop`` / ``Pre-Live`` / ``Re-Demo`` don't get truncated
+# as if they were dash-suffix markers. Keyword set is shared with the paren
+# form via ``_TRACK_SUFFIX_KEYWORDS`` so dash/paren coverage stays in lockstep.
 _TRACK_SUFFIX_KEYWORDS = (
-    r"live|remix|acoustic|instrumental|demo|unplugged"
+    # Performance / rendering type — unambiguous standalone markers. The
+    # same song rendered in a different way.
+    r"live|remix|acoustic|instrumental|demo|unplugged|reworked|rework"
+    r"|a\s+cappella|acapella"
+    r"|mono|stereo"
+    # Featured-artist markers.
     r"|feat\.?|featuring"
+    # Album-side bonus-track marker (occasionally surfaces on track titles).
     r"|bonus\s+track"
-    r"|radio\s+edit|single\s+mix|album\s+mix|extended\s+mix|extended\s+version"
-    r"|album\s+version|original\s+(?:mix|version)"
-    r"|alternate\s+(?:take|version|mix)"
+    # Take-numbered alternates (jazz/blues outtakes). Digit required to
+    # avoid matching titles like "(Take Five)" / "(Take a Chance)".
+    r"|take\s+\d+"
+    # Session forms (BBC / Peel / radio sessions). Bare ``session`` is
+    # broad but acceptable — "Session Highlights" / "Studio Session" /
+    # "Recording Session" all still name a variant rendering of the same
+    # song, so over-stripping is benign here.
+    r"|session"
+    # Compound "X Mix" — explicit prefix list. Bare ``mix`` would false-
+    # positive on "(Pre-mix)" and "(Mix Master Edit)".
+    r"|(?:single|album|radio|extended|vocal|club|dub|original|alternate|rough)\s+mix"
+    # Compound "X Edit" — explicit prefix list. Bare ``edit`` would false-
+    # positive on "(Mix Master Edit)" and "(Edit Suite)".
+    r"|(?:single|album|radio|vocal|extended|alternate)\s+edit"
+    # Compound "X Version" — explicit prefix list. Bare ``version`` would
+    # false-positive on "(Original Korean Version)" / "(Version Spoken)".
+    r"|(?:single|album|radio|mono|stereo|studio|karaoke|original|extended|alternate)\s+version"
+    # Compound "X Take" — alternate takes (paired with bare "take \\d+" above).
+    r"|alternate\s+take"
 )
 _TRACK_PARENTHETICAL_SUFFIX_RE = re.compile(
     rf"\s*\([^)]*\b(?:{_TRACK_SUFFIX_KEYWORDS})\b[^)]*\)\s*$",
     re.IGNORECASE,
 )
+# Dash form: REQUIRE leading whitespace before the dash so word-internal
+# hyphens like ``Be-Bop`` / ``Pre-Live`` / ``Re-Demo`` don't get truncated.
+# Trailing whitespace is optional (the keyword may immediately follow).
 _TRACK_DASH_SUFFIX_RE = re.compile(
-    rf"\s*[-–—]\s*(?:{_TRACK_SUFFIX_KEYWORDS})\b.*$",
+    rf"\s+[-–—]\s*(?:{_TRACK_SUFFIX_KEYWORDS})\b.*$",
     re.IGNORECASE,
 )
 
@@ -117,8 +148,12 @@ def strip_track_suffix(title: str) -> str:
     (note: leading/trailing whitespace is always normalized).
 
     Mirrors the role of ``strip_format_suffix`` for albums but with a
-    disjoint regex set so callers don't accidentally strip album-side
-    markers from track titles (or vice versa).
+    disjoint *regex set*. Note that ``score_match_track`` STILL applies
+    the album-side ``strip_format_suffix`` afterward (via its delegation
+    to ``score_match``→``normalize_album_title``), so a track title that
+    happens to carry an album-side marker like "(Remastered)" gets both
+    track-side and album-side stripping in sequence. The two strip
+    surfaces are non-overlapping (disjoint keyword sets) by design.
     """
     if not title:
         return title

@@ -146,12 +146,38 @@ class TestStripTrackSuffix:
             pytest.param("Brakhage - Single Mix", "Brakhage", id="dash-single-mix"),
             pytest.param("Brakhage - Radio Edit", "Brakhage", id="dash-radio-edit"),
             pytest.param("Brakhage - feat. Other", "Brakhage", id="dash-feat-dot"),
+            # Common MB variant forms added in iter 2 of the review —
+            # fidelity markers (Mono/Stereo), session markers (BBC/Peel),
+            # take-numbered alternates (digit-required to avoid "Take Five"),
+            # compound mix/edit/version with explicit prefix lists,
+            # rework/a cappella.
+            pytest.param("Brakhage (Mono)", "Brakhage", id="paren-mono"),
+            pytest.param("Brakhage (Stereo)", "Brakhage", id="paren-stereo"),
+            pytest.param("Brakhage (Take 1)", "Brakhage", id="paren-take-digit"),
+            pytest.param("Brakhage (Take 12)", "Brakhage", id="paren-take-multi-digit"),
+            pytest.param("Brakhage (BBC Session)", "Brakhage", id="paren-bbc-session"),
+            pytest.param("Brakhage (Peel Session)", "Brakhage", id="paren-peel-session"),
+            pytest.param("Brakhage (Mono Version)", "Brakhage", id="paren-mono-version"),
+            pytest.param("Brakhage (Stereo Version)", "Brakhage", id="paren-stereo-version"),
+            pytest.param("Brakhage (Single Version)", "Brakhage", id="paren-single-version"),
+            pytest.param("Brakhage (Studio Version)", "Brakhage", id="paren-studio-version"),
+            pytest.param("Brakhage (Original Version)", "Brakhage", id="paren-original-version"),
+            pytest.param("Brakhage (Vocal Mix)", "Brakhage", id="paren-vocal-mix"),
+            pytest.param("Brakhage (Club Mix)", "Brakhage", id="paren-club-mix"),
+            pytest.param("Brakhage (Dub Mix)", "Brakhage", id="paren-dub-mix"),
+            pytest.param("Brakhage (Radio Mix)", "Brakhage", id="paren-radio-mix"),
+            pytest.param("Brakhage (Single Edit)", "Brakhage", id="paren-single-edit"),
+            pytest.param("Brakhage (Reworked)", "Brakhage", id="paren-reworked"),
+            pytest.param("Brakhage (a cappella)", "Brakhage", id="paren-a-cappella"),
+            pytest.param("Brakhage (Alternate Take)", "Brakhage", id="paren-alternate-take"),
             # Bare-word triggers DELIBERATELY excluded — these are
             # over-broad and false-positive on legitimate parenthetical
             # phrases ("(Original Korean Version)" naming a release variant,
             # "(Reprise)" / "(Interlude)" naming distinct tracks). Over-
             # stripping would let the LML#506 sanity check accept the
             # wrong-edition tracklist (the exact failure it's preventing).
+            # "(Take Five)" is the Brubeck standard; digit-required
+            # ``take\s+\d+`` keyword avoids stripping it.
             pytest.param(
                 "Brakhage (Original Korean Version)",
                 "Brakhage (Original Korean Version)",
@@ -165,6 +191,24 @@ class TestStripTrackSuffix:
                 "Brakhage (Mix Master Edit)",
                 id="no-strip-mid-keyword-only",
             ),
+            pytest.param(
+                "Brakhage (Take Five)",
+                "Brakhage (Take Five)",
+                id="no-strip-take-non-digit",
+            ),
+            # Word-internal hyphens (no whitespace before the dash) must NOT
+            # be treated as a dash suffix. iter-1 used ``\s*[-–—]\s*`` which
+            # allowed zero whitespace; iter-2 requires ``\s+`` on the leading
+            # side. ``Pre-Live`` / ``Re-Demo`` / ``Anti-Acoustic`` keep their
+            # hyphenated form rather than truncating to the prefix word.
+            pytest.param("Pre-Live", "Pre-Live", id="no-strip-word-internal-pre-live"),
+            pytest.param("Re-Demo", "Re-Demo", id="no-strip-word-internal-re-demo"),
+            pytest.param(
+                "Anti-Acoustic", "Anti-Acoustic", id="no-strip-word-internal-anti-acoustic"
+            ),
+            # Hyphenated band/title + space-dash-suffix: leading hyphen is
+            # preserved (it's part of the title), trailing dash-suffix strips.
+            pytest.param("Be-Bop - Live", "Be-Bop", id="hyphenated-title-with-dash-suffix"),
             # Album-side suffixes are NOT stripped — different concept, different
             # caller. The MB resolver returns per-track titles; album-style
             # suffixes on a track title would be noise we'd want to leave alone
@@ -234,6 +278,8 @@ class TestScoreMatchTrack:
             pytest.param("Brakhage", "Brakhage (Pre-mix)", id="bare-mix"),
             pytest.param("Brakhage", "Brakhage (Reprise)", id="reprise"),
             pytest.param("Brakhage", "Brakhage (Interlude)", id="interlude"),
+            pytest.param("Brakhage", "Brakhage (Take Five)", id="take-non-digit"),
+            pytest.param("Brakhage", "Brakhage (Mix Master Edit)", id="mid-keyword-only"),
         ],
     )
     def test_over_broad_keywords_do_not_strip(self, query, result):
