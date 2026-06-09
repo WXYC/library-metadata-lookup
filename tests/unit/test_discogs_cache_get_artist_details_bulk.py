@@ -18,6 +18,7 @@ Contract:
 
 from __future__ import annotations
 
+from datetime import UTC
 from unittest.mock import AsyncMock
 
 import pytest
@@ -66,8 +67,20 @@ class TestGetArtistDetailsBulk:
             side_effect=_make_table_router(
                 **{
                     "FROM artist ": [
-                        {"id": 2154, "name": "Stereolab", "profile": None, "image_url": None},
-                        {"id": 305253, "name": "Juana Molina", "profile": None, "image_url": None},
+                        {
+                            "id": 2154,
+                            "name": "Stereolab",
+                            "profile": None,
+                            "image_url": None,
+                            "fetched_at": None,
+                        },
+                        {
+                            "id": 305253,
+                            "name": "Juana Molina",
+                            "profile": None,
+                            "image_url": None,
+                            "fetched_at": None,
+                        },
                     ],
                     "artist_alias": [
                         {"artist_id": 2154, "alias_id": 500, "alias_name": "Stereolab Variant"},
@@ -99,7 +112,13 @@ class TestGetArtistDetailsBulk:
             side_effect=_make_table_router(
                 **{
                     "FROM artist ": [
-                        {"id": 2154, "name": "Stereolab", "profile": None, "image_url": None},
+                        {
+                            "id": 2154,
+                            "name": "Stereolab",
+                            "profile": None,
+                            "image_url": None,
+                            "fetched_at": None,
+                        },
                     ],
                     "artist_alias": [],
                     "artist_name_variation": [],
@@ -139,8 +158,20 @@ class TestGetArtistDetailsBulk:
     ):
         """Same ids in different orders → same dict (set equality + identical values)."""
         artist_rows = [
-            {"id": 2154, "name": "Stereolab", "profile": None, "image_url": None},
-            {"id": 305253, "name": "Juana Molina", "profile": None, "image_url": None},
+            {
+                "id": 2154,
+                "name": "Stereolab",
+                "profile": None,
+                "image_url": None,
+                "fetched_at": None,
+            },
+            {
+                "id": 305253,
+                "name": "Juana Molina",
+                "profile": None,
+                "image_url": None,
+                "fetched_at": None,
+            },
         ]
         mock_asyncpg_pool.fetch = AsyncMock(
             side_effect=_make_table_router(
@@ -188,3 +219,68 @@ class TestGetArtistDetailsBulk:
             bound = call[0][1]
             assert isinstance(bound, list)
             assert set(bound) == {2154, 305253}
+
+    @pytest.mark.asyncio
+    async def test_artist_select_projects_fetched_at(self, cache_service, mock_asyncpg_pool):
+        """LML#520: the bulk artist SELECT must project ``fetched_at``.
+
+        Without this projection the bulk constructor leaves
+        ``ArtistDetails.fetched_at`` at its default ``None``, so every
+        result reads as a stub regardless of the underlying row state —
+        a foot-gun for the LML#503 stub-vs-hydrated discriminator.
+        Mirrors the singular-path
+        ``test_projects_fetched_at_for_stub_discrimination``.
+        """
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        await cache_service.get_artist_details_bulk([2154])
+
+        all_sql = [call[0][0] for call in mock_asyncpg_pool.fetch.await_args_list]
+        artist_sql = next(sql for sql in all_sql if "FROM artist " in sql)
+        assert "fetched_at" in artist_sql, (
+            f"get_artist_details_bulk artist SELECT must project fetched_at; got: {artist_sql!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_passes_fetched_at_through_to_artist_details(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """LML#520: the row's ``fetched_at`` reaches the returned
+        ``ArtistDetails``. Stub row → ``None``; hydrated row → the stamp.
+
+        Pins the wiring between SELECT projection and constructor — a
+        SELECT that projects ``fetched_at`` but a constructor that
+        forgets to pass it through is the same bug from a caller's
+        perspective.
+        """
+        from datetime import datetime
+
+        stamp = datetime(2026, 1, 1, tzinfo=UTC)
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=_make_table_router(
+                **{
+                    "FROM artist ": [
+                        {
+                            "id": 2154,
+                            "name": "Stereolab",
+                            "profile": None,
+                            "image_url": None,
+                            "fetched_at": stamp,
+                        },
+                        {
+                            "id": 6998498,
+                            "name": "Yetsuby",
+                            "profile": None,
+                            "image_url": None,
+                            "fetched_at": None,
+                        },
+                    ],
+                    "artist_alias": [],
+                    "artist_name_variation": [],
+                    "artist_member": [],
+                }
+            )
+        )
+
+        result = await cache_service.get_artist_details_bulk([2154, 6998498])
+        assert result[2154].fetched_at == stamp
+        assert result[6998498].fetched_at is None

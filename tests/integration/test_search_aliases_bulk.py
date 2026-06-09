@@ -383,3 +383,61 @@ class TestSearchAliasesBulkEndpoint:
                 "discogs_alias",
                 "discogs_member",
             }
+
+
+@pytest.mark.pg
+class TestGetArtistDetailsBulkFetchedAt:
+    """LML#520: the bulk cache read must surface ``fetched_at`` faithfully.
+
+    The singular-path ``get_artist_details`` already projects ``fetched_at``
+    so the LML#503 stub-vs-hydrated discriminator works. The bulk path
+    did not, so every ``ArtistDetails`` came back with ``fetched_at = None``
+    regardless of the row's actual state. This suite pins both halves of
+    the contract through the real PG fixture.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stub_row_returns_null_fetched_at(self, pg_pool):
+        """A row inserted without ``fetched_at`` (monthly rebuild stub) reads
+        back through ``get_artist_details_bulk`` with ``fetched_at = None``.
+        """
+        from discogs.cache_service import DiscogsCacheService
+
+        # `set_up_schemas` already seeds 2154 (Stereolab) with NULL `fetched_at`
+        # — the INSERT specifies only id, name, profile, image_url.
+        cache = DiscogsCacheService(pg_pool)
+        bundle = await cache.get_artist_details_bulk([2154])
+
+        assert 2154 in bundle
+        assert bundle[2154].fetched_at is None
+
+    @pytest.mark.asyncio
+    async def test_hydrated_row_returns_non_null_fetched_at(self, pg_pool):
+        """A row with ``fetched_at = now()`` reads back through
+        ``get_artist_details_bulk`` carrying that stamp."""
+        from discogs.cache_service import DiscogsCacheService
+
+        async with pg_pool.acquire() as conn:
+            await conn.execute("UPDATE artist SET fetched_at = now() WHERE id = 305253")
+
+        cache = DiscogsCacheService(pg_pool)
+        bundle = await cache.get_artist_details_bulk([305253])
+
+        assert 305253 in bundle
+        assert bundle[305253].fetched_at is not None
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_preserves_per_row_fetched_at(self, pg_pool):
+        """In a single batch, a stub and a hydrated row each reflect their
+        own ``fetched_at`` state. The discriminator is per-row, not global."""
+        from discogs.cache_service import DiscogsCacheService
+
+        async with pg_pool.acquire() as conn:
+            # 2154 stays a stub (NULL). 305253 becomes hydrated.
+            await conn.execute("UPDATE artist SET fetched_at = now() WHERE id = 305253")
+
+        cache = DiscogsCacheService(pg_pool)
+        bundle = await cache.get_artist_details_bulk([2154, 305253])
+
+        assert bundle[2154].fetched_at is None
+        assert bundle[305253].fetched_at is not None
