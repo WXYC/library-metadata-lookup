@@ -1329,49 +1329,44 @@ class TestWriteArtistDetailsFetchedAtInvariant:
 
 
 class TestGetArtistDetailsBulkStubSemantics:
-    """Pin the bulk path's stub-vs-real semantics.
+    """Pin the bulk path's stub-vs-real semantics post-#520.
 
-    `get_artist_details_bulk` (used by the artist-search-alias composer) does
-    NOT project `fetched_at` from the artist table -- the SELECT at
-    cache_service.py:1076 reads `id, name, profile, image_url` only. The pydantic
-    default on `ArtistDetails.fetched_at` is None, so EVERY row the bulk path
-    returns -- stub or fully-fetched -- arrives at the caller with
-    `fetched_at is None`.
+    `get_artist_details_bulk` projects `fetched_at` from the artist table
+    (cache_service.py:1154) and threads the value onto each returned
+    `ArtistDetails`. The bulk path stays a faithful cache read -- both stub
+    and hydrated rows appear in the result dict -- but the caller can now
+    tell them apart using the same `fetched_at is None` discriminator the
+    singular `get_artist_details` path exposes (#503).
 
-    The decision locked in here: **the bulk path surfaces stubs as cache hits.**
-    Stubs and real rows are indistinguishable through this entrypoint, and
-    that's deliberate -- the only consumer (`search_artists_by_name` alias
-    expansion) doesn't need the discriminator. The per-id `get_artist_details`
-    is the only path that distinguishes the two, via the projected
-    `fetched_at` and the service-layer `is_pg_hit` predicate at
-    discogs/service.py:939.
+    Locked semantics:
 
-    If we ever want the bulk path to treat stubs as misses, the SELECT must
-    add `fetched_at` and the assembly loop must skip rows where it's NULL --
-    this test would then need updating, signalling the semantic shift.
+    * Stub row (DB: ``fetched_at IS NULL``) -> result entry with
+      ``fetched_at is None``. Caller treats as a stub-shaped cache hit; the
+      "is this hydrated?" judgement remains a service-layer policy.
+    * Hydrated row (DB: ``fetched_at IS NOT NULL``) -> result entry with the
+      row's actual timestamp.
+    * Both ids are present in the returned dict. Stubs are never filtered
+      out at the cache layer; that decision belongs to callers (composer
+      currently ignores the discriminator; future callers don't have to).
 
-    See WXYC/library-metadata-lookup#502 (discriminator), #511 (this pin).
+    See WXYC/library-metadata-lookup#503 (discriminator), #520 (bulk SELECT
+    projects fetched_at), #511 (this pin).
     """
 
     @pytest.mark.asyncio
-    async def test_stub_row_surfaces_as_cached_with_null_fetched_at(
-        self, cache_service, mock_asyncpg_pool
-    ):
-        """A row written by the rebuild stub path comes back as if cached.
-
-        Rebuild-created stub rows have `fetched_at IS NULL` in the DB. The
-        bulk SELECT doesn't project that column, so the assembled
-        `ArtistDetails` falls back to the model default (None) and the
-        artist_id appears in the result dict -- caller has no way to tell
-        the row is a stub.
-        """
+    async def test_stub_row_surfaces_with_null_fetched_at(self, cache_service, mock_asyncpg_pool):
+        """A stub row written by the rebuild path comes back with ``fetched_at=None``."""
         mock_asyncpg_pool.fetch = AsyncMock(
             side_effect=make_fetch_router(
                 **{
-                    # Stub row from the rebuild path -- no `fetched_at` in
-                    # the SELECT result because the query doesn't project it.
                     "FROM artist ": [
-                        {"id": 2154, "name": "Stereolab", "profile": None, "image_url": None},
+                        {
+                            "id": 2154,
+                            "name": "Stereolab",
+                            "profile": None,
+                            "image_url": None,
+                            "fetched_at": None,
+                        },
                     ],
                     "artist_alias": [],
                     "artist_name_variation": [],
@@ -1382,35 +1377,46 @@ class TestGetArtistDetailsBulkStubSemantics:
 
         result = await cache_service.get_artist_details_bulk([2154])
 
-        assert 2154 in result, "stub row must be surfaced (not treated as a miss)"
+        assert 2154 in result, "stub row must be surfaced (not filtered as a miss)"
         assert result[2154].fetched_at is None, (
-            "bulk SELECT does not project fetched_at; model defaults to None"
+            "bulk SELECT projects fetched_at; stub rows carry NULL through"
         )
         assert result[2154].cached is True, "bulk path tags every row cached=True"
 
     @pytest.mark.asyncio
-    async def test_stub_and_real_indistinguishable_by_caller(
+    async def test_stub_and_hydrated_distinguishable_by_fetched_at(
         self, cache_service, mock_asyncpg_pool
     ):
-        """Stub rows and fully-fetched rows look identical to bulk callers.
+        """Bulk callers CAN tell stubs from hydrated rows via ``fetched_at``.
 
-        Locks in the foot-gun: don't try to use `fetched_at` from a bulk
-        result as a discriminator -- it's always None regardless of the
-        underlying row's state. Discriminating between stubs and real rows
-        requires the per-id `get_artist_details` path.
+        Post-#520, the bulk SELECT carries the column through, so the same
+        ``fetched_at is None`` predicate that the singular ``is_pg_hit`` uses
+        (discogs/service.py:1014) works on bulk results too. Both rows are
+        still present in the returned dict -- filtering remains a
+        service-layer decision.
         """
+        from datetime import datetime
+
+        hydrated_ts = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
         mock_asyncpg_pool.fetch = AsyncMock(
             side_effect=make_fetch_router(
                 **{
                     "FROM artist ": [
                         # Stub (DB: fetched_at IS NULL).
-                        {"id": 2154, "name": "Stereolab", "profile": None, "image_url": None},
+                        {
+                            "id": 2154,
+                            "name": "Stereolab",
+                            "profile": None,
+                            "image_url": None,
+                            "fetched_at": None,
+                        },
                         # Fully-fetched (DB: fetched_at IS NOT NULL).
                         {
                             "id": 305253,
                             "name": "Juana Molina",
                             "profile": "Argentinian artist...",
                             "image_url": "https://example.com/jm.jpg",
+                            "fetched_at": hydrated_ts,
                         },
                     ],
                     "artist_alias": [],
@@ -1422,19 +1428,24 @@ class TestGetArtistDetailsBulkStubSemantics:
 
         result = await cache_service.get_artist_details_bulk([2154, 305253])
 
-        # Both surface; both report fetched_at=None; both report cached=True.
-        # Caller has no signal to tell them apart from the bulk path.
-        assert result[2154].fetched_at == result[305253].fetched_at is None
-        assert result[2154].cached == result[305253].cached is True
+        # Both surface (no cache-layer filtering)...
+        assert set(result.keys()) == {2154, 305253}
+        # ...but the caller can distinguish them by fetched_at.
+        assert result[2154].fetched_at is None
+        assert result[305253].fetched_at == hydrated_ts
+        assert result[2154].cached is True
+        assert result[305253].cached is True
 
     @pytest.mark.asyncio
-    async def test_bulk_select_does_not_project_fetched_at(self, cache_service, mock_asyncpg_pool):
-        """SQL contract: the bulk artist SELECT omits `fetched_at`.
+    async def test_bulk_select_projects_fetched_at(self, cache_service, mock_asyncpg_pool):
+        """SQL contract: the bulk artist SELECT projects ``fetched_at``.
 
-        This is the structural cause of the semantics pinned above. If a
-        future change adds `fetched_at` to the projection, that's a signal
-        the bulk path is about to start distinguishing stubs from real --
-        update the semantics tests above to reflect the new behavior.
+        The bulk path's stub-vs-real discriminator (pinned above) depends on
+        this column being present in the projection. If a future change drops
+        it, every bulk row would silently look like a stub -- exactly the
+        asymmetry #520 fixed. Catching the regression at the SQL layer is
+        cheap; the seed-and-advance assertion against real PG lives in
+        ``tests/integration/test_cache_service_artist_writer.py``.
         """
         mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
         await cache_service.get_artist_details_bulk([2154])
@@ -1444,10 +1455,10 @@ class TestGetArtistDetailsBulkStubSemantics:
             for call in mock_asyncpg_pool.fetch.await_args_list
             if "FROM artist " in call.args[0]
         )
-        assert "fetched_at" not in artist_table_sql, (
-            "Bulk artist SELECT must not project fetched_at -- the bulk path's "
-            "stub-vs-real semantics depend on this. If you intentionally added "
-            "the column, update TestGetArtistDetailsBulkStubSemantics."
+        assert "fetched_at" in artist_table_sql, (
+            "Bulk artist SELECT must project fetched_at so callers can carry "
+            "the stub-vs-hydrated discriminator (#503, #520). Dropping it "
+            "silently regresses every bulk row to looking like a stub."
         )
 
 
