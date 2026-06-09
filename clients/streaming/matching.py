@@ -61,7 +61,6 @@ _TRACK_SUFFIX_KEYWORDS = (
     # same song rendered in a different way.
     r"live|remix|acoustic|instrumental|demo|unplugged|reworked|rework"
     r"|a\s+cappella|acapella"
-    r"|mono|stereo"
     # Featured-artist markers.
     r"|feat\.?|featuring"
     # Album-side bonus-track marker (occasionally surfaces on track titles).
@@ -69,19 +68,23 @@ _TRACK_SUFFIX_KEYWORDS = (
     # Take-numbered alternates (jazz/blues outtakes). Digit required to
     # avoid matching titles like "(Take Five)" / "(Take a Chance)".
     r"|take\s+\d+"
-    # Session forms (BBC / Peel / radio sessions). Bare ``session`` is
-    # broad but acceptable — "Session Highlights" / "Studio Session" /
-    # "Recording Session" all still name a variant rendering of the same
-    # song, so over-stripping is benign here.
-    r"|session"
+    # Compound "X Session" — explicit prefix list. Bare ``session`` would
+    # false-positive on real titles like "(Session in Salt Lake City)" or
+    # "(Session Highlights)" (track-name suffixes, not variant markers).
+    r"|(?:bbc|peel|radio|john\s+peel|recording|studio|live|jazz)\s+session"
     # Compound "X Mix" — explicit prefix list. Bare ``mix`` would false-
-    # positive on "(Pre-mix)" and "(Mix Master Edit)".
-    r"|(?:single|album|radio|extended|vocal|club|dub|original|alternate|rough)\s+mix"
+    # positive on "(Pre-mix)" and "(Mix Master Edit)". Includes ``mono``
+    # and ``stereo`` as prefixes since those are real fidelity-mix forms.
+    r"|(?:single|album|radio|extended|vocal|club|dub|original|alternate"
+    r"|rough|mono|stereo)\s+mix"
     # Compound "X Edit" — explicit prefix list. Bare ``edit`` would false-
     # positive on "(Mix Master Edit)" and "(Edit Suite)".
     r"|(?:single|album|radio|vocal|extended|alternate)\s+edit"
     # Compound "X Version" — explicit prefix list. Bare ``version`` would
     # false-positive on "(Original Korean Version)" / "(Version Spoken)".
+    # Bare ``mono`` / ``stereo`` would false-positive on "(Mono No Aware)"
+    # / "(In Stereo)" / "(Pink Stereo)" — keep them only as compound
+    # prefixes, where the keyword pair is unambiguously a variant marker.
     r"|(?:single|album|radio|mono|stereo|studio|karaoke|original|extended|alternate)\s+version"
     # Compound "X Take" — alternate takes (paired with bare "take \\d+" above).
     r"|alternate\s+take"
@@ -90,11 +93,15 @@ _TRACK_PARENTHETICAL_SUFFIX_RE = re.compile(
     rf"\s*\([^)]*\b(?:{_TRACK_SUFFIX_KEYWORDS})\b[^)]*\)\s*$",
     re.IGNORECASE,
 )
-# Dash form: REQUIRE leading whitespace before the dash so word-internal
-# hyphens like ``Be-Bop`` / ``Pre-Live`` / ``Re-Demo`` don't get truncated.
-# Trailing whitespace is optional (the keyword may immediately follow).
+# Dash class covers ASCII hyphen-minus plus the five Unicode dashes MB
+# metadata actually surfaces: figure dash (U+2012), en-dash (U+2013),
+# em-dash (U+2014), horizontal bar (U+2015), and minus sign (U+2212).
+# REQUIRE leading whitespace so word-internal hyphens like ``Be-Bop`` /
+# ``Pre-Live`` / ``Re-Demo`` don't get truncated. Trailing whitespace is
+# optional (the keyword may immediately follow).
+_TRACK_DASH_CLASS = r"[-‒–—―−]"
 _TRACK_DASH_SUFFIX_RE = re.compile(
-    rf"\s+[-–—]\s*(?:{_TRACK_SUFFIX_KEYWORDS})\b.*$",
+    rf"\s+{_TRACK_DASH_CLASS}\s*(?:{_TRACK_SUFFIX_KEYWORDS})\b.*$",
     re.IGNORECASE,
 )
 
@@ -143,9 +150,10 @@ def strip_track_suffix(title: str) -> str:
     "- Live at Brixton", "(feat. Some Artist)", etc. The marker must
     appear at the END of the title (parenthetical or trailing dash form).
 
-    Returns the title with the variant marker stripped, surrounding
-    whitespace trimmed, or the input unchanged when no marker matches
-    (note: leading/trailing whitespace is always normalized).
+    Returns the title with any matched variant marker stripped and
+    surrounding whitespace always trimmed. There is no "input unchanged"
+    contract: even when no marker matches, the result has its outer
+    whitespace normalized.
 
     Mirrors the role of ``strip_format_suffix`` for albums but with a
     disjoint *regex set*. Note that ``score_match_track`` STILL applies

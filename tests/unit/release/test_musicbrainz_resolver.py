@@ -26,10 +26,11 @@ def _make_capturing_transaction():
     appended to ``._calls`` as ``(args, kwargs)`` tuples.
 
     Shared by the LML#506 telemetry tests so the pattern doesn't drift
-    across the five test sites that need it. The instance attribute
-    ``_calls`` is initialized eagerly so a future ``set_data`` invocation
-    during ``__init__`` would still record correctly (the helper hides
-    the iter-1 init-order subtlety from individual tests).
+    across the five test sites that need it. The mock has no ``__init__``,
+    so ``_calls`` is assigned right after construction and is guaranteed
+    present before any caller invokes ``set_data``. If a future maintainer
+    adds an ``__init__`` to this class, they must initialize ``_calls``
+    inside it before any ``set_data`` call can occur.
     """
     instance = type(
         "MockTransaction",
@@ -327,18 +328,37 @@ async def test_projects_telemetry_on_pg_exception():
 
 
 @pytest.mark.asyncio
-async def test_returned_album_none_passes_through_when_release_title_missing():
-    """LML#506 review: a row with ``release_title=None`` (column NULL or
-    schema drift) projects ``returned_album=None``, NOT ``''``. The empty
-    string would conflate this with 'candidate had empty title' and the
-    no-rows path that already projects None — three states from one value.
+@pytest.mark.parametrize(
+    ("release_title_in_row", "expected_projected"),
+    [
+        pytest.param(None, None, id="null-column-projects-none"),
+        pytest.param(
+            "",
+            "",
+            id="empty-string-column-projects-empty-string",
+        ),
+    ],
+)
+async def test_release_title_three_state_projection(release_title_in_row, expected_projected):
+    """LML#506 review: pin the three-state contract for
+    ``lookup.mb_resolver.returned_album``:
+
+    * ``None`` projection means 'no candidate row at all' (resolver miss,
+      timeout, exception, or row with NULL ``release_title``).
+    * ``''`` projection means 'candidate row found but its title was
+      literally empty' — a real corruption signal distinct from the
+      no-candidate cohort.
+
+    A future refactor adding ``or None`` to the projection would silently
+    flatten both buckets and break operator queries that join on this
+    attribute to size the Option-2 follow-up cohort.
     """
     mb_pg = AsyncMock()
     mb_pg.fetchall = AsyncMock(
         return_value=[
             {
                 "release_id": 42,
-                "release_title": None,  # NULL column
+                "release_title": release_title_in_row,
                 "album_score": 0.95,
                 "artist_score": 0.99,
                 "medium_position": 1,
@@ -355,4 +375,4 @@ async def test_returned_album_none_passes_through_when_release_title_missing():
         await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
 
     values = _captured_attrs(txn)
-    assert values["lookup.mb_resolver.returned_album"] is None
+    assert values["lookup.mb_resolver.returned_album"] == expected_projected
