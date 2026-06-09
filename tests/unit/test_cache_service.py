@@ -232,6 +232,7 @@ class TestGetRelease:
                 "artwork_url": "https://img.com/a.jpg",
                 "released": None,
                 "artwork_checked_at": None,
+                "not_found": False,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -268,6 +269,7 @@ class TestGetRelease:
                 "artwork_url": None,
                 "released": None,
                 "artwork_checked_at": None,
+                "not_found": False,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -299,6 +301,7 @@ class TestGetRelease:
                 "artwork_url": None,
                 "released": None,
                 "artwork_checked_at": None,
+                "not_found": False,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -350,6 +353,7 @@ class TestGetRelease:
                 "artwork_url": None,
                 "released": None,
                 "artwork_checked_at": None,
+                "not_found": False,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -381,6 +385,7 @@ class TestGetRelease:
                 "artwork_url": None,
                 "released": None,
                 "artwork_checked_at": None,
+                "not_found": False,
             }
         )
 
@@ -721,6 +726,7 @@ class TestGetReleaseEnriched:
                 "artwork_url": "https://img.com/a.jpg",
                 "released": "2001-04-30",
                 "artwork_checked_at": None,
+                "not_found": False,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -1086,6 +1092,7 @@ class TestGetArtistDetails:
                 "profile": "Electronic duo from Rochdale.",
                 "image_url": "https://i.discogs.com/autechre.jpg",
                 "fetched_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "not_found": False,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -1130,6 +1137,7 @@ class TestGetArtistDetails:
                 "profile": "Anglo-French band.",
                 "image_url": None,
                 "fetched_at": stamp,
+                "not_found": False,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(side_effect=make_fetch_router())
@@ -1156,6 +1164,7 @@ class TestGetArtistDetails:
                 "profile": None,
                 "image_url": None,
                 "fetched_at": None,
+                "not_found": False,
             }
         )
         mock_asyncpg_pool.fetch = AsyncMock(side_effect=make_fetch_router())

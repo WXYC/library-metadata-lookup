@@ -466,14 +466,23 @@ class CachedOnlyResolver:
     async def resolve_artist(self, id: int) -> str | None:
         try:
             details = await self._cache.get_artist_details(id)
-            return details.name if details else None
+            # LML#510: tombstones carry `name = ""` as an identifier sentinel.
+            # Without this guard the markup parser emits an `artistLink` token
+            # with `display_name=""` for any tombstoned id — not None, which
+            # is what every consumer here expects.
+            if details is None or details.not_found:
+                return None
+            return details.name
         except Exception:
             return None
 
     async def resolve_release(self, id: int) -> str | None:
         try:
             release = await self._cache.get_release(id)
-            return release.title if release else None
+            # LML#510: same tombstone guard as resolve_artist.
+            if release is None or release.not_found:
+                return None
+            return release.title
         except Exception:
             return None
 

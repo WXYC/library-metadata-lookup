@@ -6,13 +6,21 @@ import os
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, UploadFile
+from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, JSONResponse
 
 from config.settings import Settings, get_settings
-from core.dependencies import close_library_db
+from core.dependencies import (
+    close_library_db,
+    get_discogs_cache_service_from_pool,
+)
+from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
+from discogs.memory_cache import evict_cached
+from discogs.service import DiscogsService
 
 logger = logging.getLogger(__name__)
 
@@ -304,3 +312,106 @@ async def download_streaming_db(
         media_type="application/octet-stream",
         filename=STREAMING_DB_FILENAME,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tombstone recovery (LML#510)
+# ---------------------------------------------------------------------------
+#
+# When Discogs returns 404 for a release / artist id, the cache writes a
+# tombstone row (`not_found = TRUE`) so subsequent reads short-circuit
+# instead of re-burning the rate-limit budget on the same 404. False
+# tombstones happen — most plausibly during a Discogs incident that returns
+# 404s for valid ids. The endpoint below lets on-call clear them.
+#
+# The `WHERE id = $1 AND not_found = TRUE` guard at the cache-service layer
+# means a real row can never be deleted through this surface, even with a
+# typo'd id. Auth is via ADMIN_TOKEN — distinct from LML_API_KEY so
+# routine LML callers don't gain incident-grade write access.
+
+TombstoneEntityType = Literal["release", "artist"]
+
+
+@router.delete(
+    "/discogs/tombstone/{entity_type}/{entity_id}",
+    summary="Clear an LML#510 tombstone so the next call re-fetches from Discogs",
+    responses={
+        200: {"description": "Tombstoned row deleted; L1 cache entry evicted"},
+        401: {"description": "Missing authorization"},
+        403: {"description": "Invalid or missing token"},
+        404: {"description": "Row not found, or row exists but is not a tombstone"},
+        503: {"description": "Discogs cache pool not configured"},
+    },
+)
+async def delete_tombstone(
+    entity_type: TombstoneEntityType = PathParam(..., description="`release` or `artist`"),
+    entity_id: int = PathParam(..., description="Discogs id"),
+    settings: Settings = Depends(get_settings),
+    authorization: str | None = Header(None),
+    cache_service: DiscogsCacheService | None = Depends(get_discogs_cache_service_from_pool),
+):
+    """Delete a tombstoned row + evict the L1 entry.
+
+    Three response codes so a recovery script can branch without parsing
+    log volume:
+
+    * `200 {deleted: true, id, type}` — a tombstoned row matched and was
+      deleted; the next request will re-fetch from Discogs.
+    * `404 {detail: "row exists but is not a tombstone", id, type}` — the
+      id exists with `not_found = FALSE`; either the operator typo'd or
+      the tombstone was already cleared.
+    * `404 {detail: "no row for this id", id, type}` — id doesn't exist.
+
+    `?refresh=true` (LML#498) does NOT cover this: refresh evicts L1
+    only, and a tombstone lives in L2 (PG); we read it back and re-serve
+    it. This endpoint is the L2 surface.
+    """
+    _validate_auth(settings, authorization)
+
+    if cache_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Discogs cache pool not configured (DATABASE_URL_DISCOGS unset?)",
+        )
+
+    try:
+        outcome = await cache_service.delete_tombstone(entity_type, entity_id)
+    except CacheUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if outcome == "not_found":
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "detail": "no row for this id",
+                "id": entity_id,
+                "type": entity_type,
+            },
+        )
+    if outcome == "exists_not_tombstone":
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "detail": "row exists but is not a tombstone",
+                "id": entity_id,
+                "type": entity_type,
+            },
+        )
+
+    # outcome == "deleted": L2 row gone, now drop the L1 entry so a
+    # subsequent request actually re-traverses L2/L3 instead of returning
+    # the cached None from before the tombstone was cleared.
+    cached_func = (
+        DiscogsService.get_release
+        if entity_type == "release"
+        else DiscogsService.get_artist_details
+    )
+    try:
+        evict_cached(cached_func, entity_id)
+    except Exception as e:
+        # Don't fail the response — the L2 delete already succeeded, and
+        # L1's TTL will expire naturally. Log so an operator notices if
+        # the decorator surface ever drifts.
+        logger.warning("L1 evict failed after tombstone delete: %s", e)
+
+    return JSONResponse(content={"deleted": True, "id": entity_id, "type": entity_type})

@@ -30,7 +30,9 @@ _REFRESH_DESCRIPTION = (
     "When true, evict the in-memory L1 cache entry for this entity before "
     "fetching. Forces re-traversal of L2 (PG) and L3 (Discogs API), which is "
     "needed after a manual fix to the underlying PG cache row that would "
-    "otherwise stay invisible until L1's TTL expires."
+    "otherwise stay invisible until L1's TTL expires. NOTE: does NOT clear "
+    "LML#510 tombstones (`not_found = TRUE`) in L2 — use "
+    "`DELETE /admin/discogs/tombstone/{type}/{id}` for that recovery surface."
 )
 
 

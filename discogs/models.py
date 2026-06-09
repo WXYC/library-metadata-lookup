@@ -152,6 +152,15 @@ class ArtistDetails(BaseModel):
     # the API returned a profile. Used as the cache-hit discriminator in
     # `DiscogsService.get_artist_details` (#502).
     fetched_at: datetime | None = None
+    # Tombstone marker for Discogs 404s on `get_artist_details` (#510).
+    # `True` means LML hit the live API for this id and got a 404; subsequent
+    # reads short-circuit on this flag so callers don't re-burn the
+    # rate-limit budget on the same 404. Tombstone rows carry `name = ""` and
+    # otherwise-default fields — consumers of the public `DiscogsService`
+    # surface never see them (the boundary translates to `None`), but direct
+    # `cache_service` callers (`CachedOnlyResolver`, `get_artist_details_bulk`)
+    # must explicitly guard.
+    not_found: bool = False
     cached: bool = False
 
 
