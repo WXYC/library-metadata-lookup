@@ -496,13 +496,34 @@ class DiscogsCacheService:
         """
         try:
             release_row = await self.pool.fetchrow(
-                "SELECT id, title, release_year, artwork_url, released, artwork_checked_at "
+                "SELECT id, title, release_year, artwork_url, released, "
+                "artwork_checked_at, not_found "
                 "FROM release WHERE id = $1",
                 release_id,
             )
 
             if release_row is None:
                 return None
+
+            # LML#510: tombstone short-circuit. The parent row's `not_found`
+            # flag is authoritative — there are no child rows for a
+            # tombstone (the tombstone branch in write_release skips the
+            # cascade), so the 4-7 PG round-trips below would all be empty
+            # selects. Returning a tombstone-shaped model keeps the
+            # `is_pg_hit` predicate at the public boundary happy (the
+            # `artwork_checked_at` stamp is set, so the seam treats it as
+            # a hit) and the public method's tombstone translation
+            # converts it back to None for the caller.
+            if release_row["not_found"]:
+                return ReleaseMetadataResponse(
+                    release_id=release_id,
+                    title="",
+                    artist="",
+                    release_url=f"https://www.discogs.com/release/{release_id}",
+                    not_found=True,
+                    artwork_checked_at=release_row["artwork_checked_at"],
+                    cached=True,
+                )
 
             # Fetch all child tables in parallel (independent queries)
             artist_rows, label_rows, track_rows, track_artist_rows = await asyncio.gather(
@@ -670,6 +691,36 @@ class DiscogsCacheService:
             CacheUnavailableError: If database is unreachable
         """
         try:
+            # LML#510: tombstone branch. A 404-shaped write doesn't have any
+            # rich content to cascade — and crucially, we must NOT clobber
+            # any prior hydrated row's identifier columns (title / year /
+            # artwork) nor wipe the child cascade. The narrow UPSERT below
+            # only touches `not_found` + `artwork_checked_at`; the
+            # ``ON CONFLICT DO UPDATE SET`` clause intentionally OMITS
+            # title / year / artwork_url / released so a 404 after a 200
+            # leaves the parent's identifier columns intact, and the early
+            # `return` skips the child DELETE+INSERT cascade so existing
+            # `release_artist` / `release_label` / `release_track` /
+            # `release_track_artist` / `release_genre` / `release_style` /
+            # `release_video` rows survive a tombstone overwrite.
+            if release.not_found:
+                async with self.pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO release (
+                            id, title, release_year, artwork_url, released,
+                            artwork_checked_at, not_found
+                        )
+                        VALUES ($1, '', NULL, NULL, NULL, now(), TRUE)
+                        ON CONFLICT (id) DO UPDATE SET
+                            artwork_checked_at = EXCLUDED.artwork_checked_at,
+                            not_found = TRUE
+                        """,
+                        release.release_id,
+                    )
+                logger.debug(f"Tombstoned release {release.release_id}")
+                return
+
             async with self.pool.acquire() as conn, conn.transaction():
                 # Wrap the entire DELETE+INSERT cascade in a single transaction.
                 # Without this, asyncpg autocommits each statement and a
@@ -686,19 +737,24 @@ class DiscogsCacheService:
                 # avoid re-fetching genuinely-imageless releases
                 # (WXYC/library-metadata-lookup#423, backed by the schema
                 # column from WXYC/discogs-etl#239).
+                #
+                # `not_found = FALSE` in the SET clause (LML#510) clears any
+                # prior tombstone in one statement so a recovered 200 makes
+                # the row reachable again without an admin intervention.
                 await conn.execute(
                     """
                     INSERT INTO release (
                         id, title, release_year, artwork_url, released,
-                        artwork_checked_at
+                        artwork_checked_at, not_found
                     )
-                    VALUES ($1, $2, $3, $4, $5, now())
+                    VALUES ($1, $2, $3, $4, $5, now(), FALSE)
                     ON CONFLICT (id) DO UPDATE SET
                         title = EXCLUDED.title,
                         release_year = EXCLUDED.release_year,
                         artwork_url = EXCLUDED.artwork_url,
                         released = EXCLUDED.released,
-                        artwork_checked_at = EXCLUDED.artwork_checked_at
+                        artwork_checked_at = EXCLUDED.artwork_checked_at,
+                        not_found = FALSE
                     """,
                     release.release_id,
                     release.title,
@@ -986,13 +1042,29 @@ class DiscogsCacheService:
             # predicate can distinguish stub rows (rebuild-created, never
             # hydrated from Discogs) from rows we've actually fetched. See
             # `DiscogsService.get_artist_details` and WXYC#502.
+            #
+            # `not_found` (LML#510) is the tombstone discriminator — see
+            # the short-circuit just below.
             artist_row = await self.pool.fetchrow(
-                "SELECT id, name, profile, image_url, fetched_at FROM artist WHERE id = $1",
+                "SELECT id, name, profile, image_url, fetched_at, not_found "
+                "FROM artist WHERE id = $1",
                 artist_id,
             )
 
             if artist_row is None:
                 return None
+
+            # LML#510: tombstone short-circuit. Same rationale as the
+            # release path — no child rows exist for a tombstone, so
+            # the asyncio.gather below would just be empty selects.
+            if artist_row["not_found"]:
+                return ArtistDetails(
+                    artist_id=artist_id,
+                    name="",
+                    not_found=True,
+                    fetched_at=artist_row["fetched_at"],
+                    cached=True,
+                )
 
             # Fetch all child tables in parallel (independent queries)
             alias_rows, nv_rows, member_rows, url_rows = await asyncio.gather(
@@ -1143,21 +1215,46 @@ class DiscogsCacheService:
             CacheUnavailableError: If database is unreachable
         """
         try:
+            # LML#510: tombstone branch. Same shape as write_release —
+            # narrow UPSERT, early return before the child cascade so a
+            # 404 doesn't wipe rich catalog metadata; `ON CONFLICT DO
+            # UPDATE SET` intentionally omits name / profile / image_url
+            # so a 404 after a 200 leaves identifier columns intact.
+            if details.not_found:
+                async with self.pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO artist (id, name, profile, image_url, fetched_at, not_found)
+                        VALUES ($1, '', NULL, NULL, now(), TRUE)
+                        ON CONFLICT (id) DO UPDATE SET
+                            fetched_at = now(),
+                            not_found = TRUE
+                        """,
+                        details.artist_id,
+                    )
+                logger.debug(f"Tombstoned artist {details.artist_id}")
+                return
+
             async with self.pool.acquire() as conn, conn.transaction():
                 # Wrap the UPSERT + 4×(DELETE+INSERT) cascade in a single
                 # transaction so a cancellation mid-write doesn't leave the
                 # artist row updated with empty child tables. See WXYC#375.
 
-                # Upsert artist row
+                # Upsert artist row.
+                #
+                # `not_found = FALSE` in the SET clause (LML#510) clears
+                # any prior tombstone in one statement, so a recovered 200
+                # makes the row reachable again without admin intervention.
                 await conn.execute(
                     """
-                    INSERT INTO artist (id, name, profile, image_url, fetched_at)
-                    VALUES ($1, $2, $3, $4, now())
+                    INSERT INTO artist (id, name, profile, image_url, fetched_at, not_found)
+                    VALUES ($1, $2, $3, $4, now(), FALSE)
                     ON CONFLICT (id) DO UPDATE SET
                         name = EXCLUDED.name,
                         profile = EXCLUDED.profile,
                         image_url = EXCLUDED.image_url,
-                        fetched_at = now()
+                        fetched_at = now(),
+                        not_found = FALSE
                     """,
                     details.artist_id,
                     details.name,
@@ -1223,6 +1320,49 @@ class DiscogsCacheService:
         except Exception as e:
             logger.error(f"Cache write_artist_details failed: {e}")
             raise CacheUnavailableError(f"Cache write_artist_details failed: {e}") from e
+
+    async def delete_tombstone(self, entity_type: str, entity_id: int) -> str:
+        """Delete a tombstoned row so the next API call re-fetches it.
+
+        Backs the admin recovery endpoint (`DELETE /admin/discogs/tombstone/...`).
+        The `WHERE id = $1 AND not_found = TRUE` guard means a real row can
+        never be deleted through this surface — even with a typo'd id.
+
+        Args:
+            entity_type: `"release"` or `"artist"`.
+            entity_id: Discogs id.
+
+        Returns:
+            ``"deleted"`` — a tombstoned row matched and was removed.
+            ``"exists_not_tombstone"`` — `entity_id` exists but
+                ``not_found = FALSE``; refusing to delete (real data).
+            ``"not_found"`` — no row at all.
+        """
+        if entity_type not in ("release", "artist"):
+            raise ValueError(f"entity_type must be 'release' or 'artist', got {entity_type!r}")
+        table = entity_type
+        try:
+            async with self.pool.acquire() as conn:
+                # Probe the row's existence and tombstone state in one query
+                # so the response code is unambiguous. A separate DELETE …
+                # RETURNING would conflate "no row" and "row not tombstone".
+                row = await conn.fetchrow(
+                    f"SELECT not_found FROM {table} WHERE id = $1",
+                    entity_id,
+                )
+                if row is None:
+                    return "not_found"
+                if not row["not_found"]:
+                    return "exists_not_tombstone"
+                await conn.execute(
+                    f"DELETE FROM {table} WHERE id = $1 AND not_found = TRUE",
+                    entity_id,
+                )
+            logger.info("Tombstone deleted: %s/%s", entity_type, entity_id)
+            return "deleted"
+        except Exception as e:
+            logger.error("Cache delete_tombstone failed: %s", e)
+            raise CacheUnavailableError(f"Cache delete_tombstone failed: {e}") from e
 
     async def validate_track_on_release(
         self, release_id: int, track: str, artist: str

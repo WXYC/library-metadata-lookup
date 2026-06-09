@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 DISCOGS_API_BASE = "https://api.discogs.com"
 
+
 # Cap individual retry sleeps. Discogs's per-token rate-limit window is 60
 # seconds; once we cross that, the bucket has reset and there's no benefit to
 # waiting longer for the same 429.
@@ -744,6 +745,29 @@ class DiscogsService:
                     return None
 
                 get_cache_stats_recorder().record_api_call()
+
+                # LML#510: discriminate 404 from other failures before
+                # raise_for_status. A 404 means "Discogs confirms no such
+                # release id" — turn it into a tombstone-shaped row so the
+                # fallthrough seam's pg_write lands it and subsequent calls
+                # short-circuit on the cache instead of re-hitting the API.
+                if response.status_code == 404:
+                    get_cache_stats_recorder().record("release_404_tombstone_written")
+                    return ReleaseMetadataResponse(
+                        release_id=release_id,
+                        title="",
+                        artist="",
+                        release_url=f"https://www.discogs.com/release/{release_id}",
+                        not_found=True,
+                    )
+
+                # LML#510: split out 5xx so Discogs-outage signal stays
+                # legible separately from tombstone activity. Counted at
+                # the discrimination point so we measure raw incidence
+                # (not the post-retry view).
+                if 500 <= response.status_code < 600:
+                    get_cache_stats_recorder().record("release_5xx_passthrough")
+
                 response.raise_for_status()
                 data = response.json()
 
@@ -840,26 +864,52 @@ class DiscogsService:
                 return None
 
         cache = self.cache_service
+        value: ReleaseMetadataResponse | None
         if cache is None:
-            return await _api_fetch()
-        return await fallthrough(
-            label="get_release",
-            pg_read=lambda: cache.get_release(release_id),
-            api_fetch=_api_fetch,
-            pg_write=cache.write_release,
-            # `artwork_url IS NULL AND artwork_checked_at IS NULL` is the
-            # "never asked" state — the bulk loader populated the row but
-            # LML has not yet asked Discogs (~48% of release rows are like
-            # this; see WXYC/library-metadata-lookup#414 and
-            # WXYC/discogs-etl#239). Falling through to the API is the
-            # back-fill path. Once `artwork_checked_at` is set, both
-            # "asked, got a cover" and "asked, no cover" are full hits —
-            # we don't re-ask Discogs about the no-cover tail.
-            is_pg_hit=lambda v: (
-                v is not None and (v.artwork_url is not None or v.artwork_checked_at is not None)
-            ),
-            breadcrumb_data={"release_id": release_id},
-        )
+            value = await _api_fetch()
+        else:
+            value = await fallthrough(
+                label="get_release",
+                pg_read=lambda: cache.get_release(release_id),
+                api_fetch=_api_fetch,
+                # LML#510: mypy widens fallthrough's generic `T` to
+                # `T | None` when the result is assigned to a variable
+                # instead of directly returned, so `cache.write_release`
+                # (which takes `ReleaseMetadataResponse`, not the wider
+                # `ReleaseMetadataResponse | None`) trips arg-type
+                # validation. Pre-510, the call was `return await
+                # fallthrough(...)` and the return-type annotation
+                # bidirectionally constrained `T`. The runtime contract is
+                # unchanged.
+                pg_write=cache.write_release,  # type: ignore[arg-type]
+                # `artwork_url IS NULL AND artwork_checked_at IS NULL` is the
+                # "never asked" state — the bulk loader populated the row but
+                # LML has not yet asked Discogs (~48% of release rows are like
+                # this; see WXYC/library-metadata-lookup#414 and
+                # WXYC/discogs-etl#239). Falling through to the API is the
+                # back-fill path. Once `artwork_checked_at` is set, both
+                # "asked, got a cover" and "asked, no cover" are full hits —
+                # we don't re-ask Discogs about the no-cover tail.
+                #
+                # LML#510 tombstones (not_found=True) carry
+                # artwork_checked_at=now() so they satisfy this predicate too;
+                # the boundary translation below converts them to None for
+                # the public caller. Keeping the predicate type-opaque (no
+                # `not_found` check here) means the fallthrough seam stays
+                # generic — only the public `DiscogsService` methods
+                # understand the tombstone shape.
+                is_pg_hit=lambda v: (
+                    v is not None
+                    and (v.artwork_url is not None or v.artwork_checked_at is not None)
+                ),
+                breadcrumb_data={"release_id": release_id},
+            )
+        # LML#510 boundary: tombstone → None. Counter keeps the
+        # `pg_cache_hit - tombstone_returned` dashboard math interpretable.
+        if value is not None and value.not_found:
+            get_cache_stats_recorder().record("tombstone_returned")
+            return None
+        return value
 
     @async_cached(ARTIST_CACHE)
     async def get_artist_details(self, artist_id: int) -> ArtistDetails | None:
@@ -885,6 +935,20 @@ class DiscogsService:
                     return None
                 get_cache_stats_recorder().record_api_call()
                 add_discogs_breadcrumb("get_artist_details", {"artist_id": artist_id})
+
+                # LML#510: discriminate 404 from other failures. The
+                # tombstone-shaped row carries `name = ""` as the identifier
+                # sentinel; the fallthrough seam's pg_write stamps
+                # `fetched_at = now()` via cache_service so subsequent reads
+                # short-circuit on `is_pg_hit` (fetched_at != None).
+                if response.status_code == 404:
+                    get_cache_stats_recorder().record("artist_404_tombstone_written")
+                    return ArtistDetails(
+                        artist_id=artist_id,
+                        name="",
+                        not_found=True,
+                    )
+
                 response.raise_for_status()
                 data = response.json()
 
@@ -916,29 +980,44 @@ class DiscogsService:
                 )
 
             except Exception as e:
-                logger.warning(f"Failed to fetch artist details for {artist_id}: {e}")
+                # LML#510: promoted from warning → error so Sentry's default
+                # `error+` filter captures artist 404s post-deploy. The
+                # tombstone counter above counts the write side; this log
+                # is the Sentry corroboration surface.
+                logger.error(f"Failed to fetch artist details for {artist_id}: {e}")
                 return None
 
         cache = self.cache_service
+        value: ArtistDetails | None
         if cache is None:
-            return await _api_fetch()
-        return await fallthrough(
-            label="get_artist_details",
-            pg_read=lambda: cache.get_artist_details(artist_id),
-            api_fetch=_api_fetch,
-            pg_write=cache.write_artist_details,
-            # `fetched_at IS NULL` marks a stub row created by the monthly
-            # rebuild's stub-from-`release_artist` path — `(id, name)` only,
-            # no profile / aliases / members / urls / variations. Falling
-            # through to the API + write-back is the back-fill path. Once
-            # `fetched_at` is set, both "asked, got a profile" and "asked,
-            # no profile" are full hits — we don't re-ask Discogs about the
-            # no-profile tail. Same shape of fix as the `get_release`
-            # artwork discriminator above. See WXYC#502 (and #497 for the
-            # rebuild-path fix that creates these stubs in the first place).
-            is_pg_hit=lambda v: v is not None and v.fetched_at is not None,
-            breadcrumb_data={"artist_id": artist_id},
-        )
+            value = await _api_fetch()
+        else:
+            value = await fallthrough(
+                label="get_artist_details",
+                pg_read=lambda: cache.get_artist_details(artist_id),
+                api_fetch=_api_fetch,
+                # LML#510: see the note on `get_release` above.
+                pg_write=cache.write_artist_details,  # type: ignore[arg-type]
+                # `fetched_at IS NULL` marks a stub row created by the monthly
+                # rebuild's stub-from-`release_artist` path — `(id, name)` only,
+                # no profile / aliases / members / urls / variations. Falling
+                # through to the API + write-back is the back-fill path. Once
+                # `fetched_at` is set, both "asked, got a profile" and "asked,
+                # no profile" are full hits — we don't re-ask Discogs about the
+                # no-profile tail. Same shape of fix as the `get_release`
+                # artwork discriminator above. See WXYC#502 (and #497 for the
+                # rebuild-path fix that creates these stubs in the first place).
+                #
+                # LML#510 tombstones land here with `fetched_at = now()` so
+                # they hit-fall-through correctly; the boundary translation
+                # below converts `not_found=True` back to None for callers.
+                is_pg_hit=lambda v: v is not None and v.fetched_at is not None,
+                breadcrumb_data={"artist_id": artist_id},
+            )
+        if value is not None and value.not_found:
+            get_cache_stats_recorder().record("tombstone_returned")
+            return None
+        return value
 
     async def get_artist_image(self, artist_id: int) -> str | None:
         """Fetch primary image for a Discogs artist.
