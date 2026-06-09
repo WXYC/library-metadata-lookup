@@ -1145,7 +1145,14 @@ class DiscogsCacheService:
                 member_rows,
             ) = await asyncio.gather(
                 self.pool.fetch(
-                    "SELECT id, name, profile, image_url FROM artist WHERE id = ANY($1::int[])",
+                    # `fetched_at` is projected so the bulk path can carry
+                    # the LML#503 stub-vs-hydrated discriminator on the
+                    # returned `ArtistDetails`, matching the singular
+                    # `get_artist_details` shape. Bulk stays cache-only
+                    # by design (LML#520) — this is information-level
+                    # parity, not an API-escalation change.
+                    "SELECT id, name, profile, image_url, fetched_at "
+                    "FROM artist WHERE id = ANY($1::int[])",
                     artist_ids,
                 ),
                 self.pool.fetch(
@@ -1197,6 +1204,7 @@ class DiscogsCacheService:
                     name_variations=nvs_by_id.get(artist_id, []),
                     members=members_by_id.get(artist_id, []),
                     urls=[],
+                    fetched_at=row["fetched_at"],
                     cached=True,
                 )
             return result
