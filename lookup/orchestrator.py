@@ -1700,7 +1700,16 @@ async def find_library_albums_with_cached_track(
 
 
 async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id: int) -> str | None:
-    """Try the release's own cover (images[0]), then artist image, then label image."""
+    """Try the release's own cover (images[0]), then artist image, then label image.
+
+    Structurally invalid ids (``release_id <= 0``) short-circuit before the
+    Discogs round-trip — the LML#401 synthesis pattern produces a
+    ``release_id=0`` sentinel that any future caller could leak in here (see
+    issue #518). Discogs release ids start at 1, so the strict gate is also a
+    correctness check against malformed upstream payloads.
+    """
+    if release_id <= 0:
+        return None
     release = await discogs_service.get_release(release_id)
     if not release:
         return None
@@ -1932,7 +1941,12 @@ async def enrich_artwork_results(
         fields without re-fetching.
         """
         top_artwork = items_with_artwork[0][1]
-        if top_artwork is None:
+        # `release_id <= 0` short-circuits the LML#401 streaming-only
+        # synthesis sentinel (see issue #518): the synthesized result
+        # carries `release_id=0` as a BS#1185 cross-service contract,
+        # and round-tripping it through Discogs hits `/releases/0` (404)
+        # before the `if not release` branch silently swallows the response.
+        if top_artwork is None or top_artwork.release_id <= 0:
             return None, None, None, None, None
         try:
             release = await discogs_service.get_release(top_artwork.release_id)

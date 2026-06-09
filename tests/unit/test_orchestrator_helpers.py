@@ -27,6 +27,7 @@ from generated.api_models import (
 )
 from lookup.orchestrator import (
     _log_track_validation,
+    _resolve_fallback_artwork,
     artist_matches_item,
     build_context_message,
     fetch_artwork_for_items,
@@ -1627,6 +1628,34 @@ class TestFetchArtworkFallback:
         assert results[0][1].artwork_url == "https://i.discogs.com/release-cover.jpg"
         mock_discogs_service.get_artist_image.assert_not_called()
         mock_discogs_service.get_label_image.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: _resolve_fallback_artwork sentinel guard (LML#518)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveFallbackArtworkSentinelGuard:
+    """`_resolve_fallback_artwork` must reject structurally invalid release_ids
+    (the synthesized `release_id=0` sentinel from LML#401, and any negative id
+    that could arrive from a malformed upstream payload) before issuing the
+    Discogs API call. The downstream `if not release: return None` after
+    `get_release` would swallow the 404 silently — the symptom is only wasted
+    API budget and Sentry noise on `/releases/0`."""
+
+    @pytest.mark.asyncio
+    async def test_release_id_zero_returns_none_without_api_call(self, mock_discogs_service):
+        result = await _resolve_fallback_artwork(mock_discogs_service, 0)
+
+        assert result is None
+        mock_discogs_service.get_release.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_negative_release_id_returns_none_without_api_call(self, mock_discogs_service):
+        result = await _resolve_fallback_artwork(mock_discogs_service, -1)
+
+        assert result is None
+        mock_discogs_service.get_release.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
