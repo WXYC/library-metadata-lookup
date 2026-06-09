@@ -1102,6 +1102,83 @@ class TestMbTracklistRescue:
         _, enriched = results[0]
         assert not enriched.tracklist
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "song",
+        [
+            pytest.param("   ", id="whitespace-only"),
+            pytest.param("\t", id="tab-only"),
+            pytest.param(" \n ", id="mixed-whitespace"),
+        ],
+    )
+    async def test_whitespace_song_skips_sanity_check(self, song):
+        """LML#506 review: a whitespace-only ``song`` is truthy in Python.
+        Without an upfront strip, it enters the sanity check, normalizes to
+        empty inside ``score_match_track``, scores 0 against every track,
+        and drops a legitimate MB rescue. The fix strips ``song`` upfront
+        so whitespace-only inputs follow the same skip path as ``None``.
+        """
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        mb_pg = AsyncMock()
+
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(return_value=self._track_items()),
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song=song,
+                album="Emperor Tomato Ketchup",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        _, enriched = results[0]
+        # Sanity check skipped because the stripped song was blank; the
+        # tracklist surfaces just as it would for ``song=None``.
+        assert enriched.tracklist is not None
+        assert [t.title for t in enriched.tracklist] == ["Brakhage", "Cybele's Reverie"]
+
+    @pytest.mark.asyncio
+    async def test_empty_track_titles_do_not_false_pass(self):
+        """LML#506 review: ``score_match("", "")`` returns 100 by rapidfuzz
+        convention. If MB surfaces a corrupted release whose tracklist is
+        all-empty-title rows, the sanity check must NOT accept it just
+        because the score-against-empty cleared the floor. The fix requires
+        a non-empty stripped track title for the iteration to count as a
+        hit.
+        """
+        from generated.api_models import DiscogsTrackItem
+
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        mb_pg = AsyncMock()
+        # Corrupt-row shape: every title empty / whitespace-only. (The
+        # resolver coerces NULL titles to "" via ``row.get("title") or ""``
+        # before constructing the DiscogsTrackItem, so the orchestrator
+        # only ever sees empty-string titles in this cohort, not None.)
+        all_empty_titles = [
+            DiscogsTrackItem(position="1", title="", duration=None, artists=[]),
+            DiscogsTrackItem(position="2", title="   ", duration=None, artists=[]),
+        ]
+
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(return_value=all_empty_titles),
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="Brakhage",
+                album="Emperor Tomato Ketchup",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        _, enriched = results[0]
+        # No real track title to match against — sanity check rejects.
+        assert not enriched.tracklist
+
 
 class TestEnrichArtworkResultsWithAppleMusicClient:
     """LML#443/#444: orchestrator hot path consumes ``AppleMusicClient.find_track_url``.

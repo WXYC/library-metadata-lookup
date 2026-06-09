@@ -147,6 +147,13 @@ async def resolve_tracklist_via_musicbrainz(
     if _is_blank(artist) or _is_blank(album):
         return None
 
+    # Telemetry contract: every attempted resolver call (orchestrator gate
+    # passed, inputs non-blank) projects ``requested_album`` so the trace
+    # explorer's denominator for cohort sizing is complete. Timeout and
+    # exception cohorts get ``returned_album=None`` so they're filterable
+    # but visible — without this, a PG outage silently empties the
+    # denominator and the Option 2 follow-up sizing is biased toward the
+    # happy paths.
     try:
         rows: list[dict[str, Any]] = await asyncio.wait_for(
             mb_pg.fetchall(_MB_TRACKLIST_FOR_ALBUM_SQL, artist, album),
@@ -159,6 +166,7 @@ async def resolve_tracklist_via_musicbrainz(
             artist,
             album,
         )
+        _project_resolver_attrs(requested_album=album, returned_album=None)
         return None
     except Exception as e:
         logger.warning(
@@ -167,6 +175,7 @@ async def resolve_tracklist_via_musicbrainz(
             album,
             e,
         )
+        _project_resolver_attrs(requested_album=album, returned_album=None)
         return None
 
     if not rows:
@@ -179,8 +188,12 @@ async def resolve_tracklist_via_musicbrainz(
     # Capture before the floor check so the trace explorer sees both rejected
     # and accepted candidates — operator can quantify the "trigram floor
     # cleared but downstream sanity check dropped it" cohort by joining this
-    # attribute with ``lookup.mb_rescue.song_sanity_rejected``.
-    returned_album_title = first.get("release_title") or ""
+    # attribute with ``lookup.mb_rescue.song_sanity_rejected``. Pass ``None``
+    # through unmodified when the row has no title (column NULL or absent)
+    # so the trace can distinguish "no candidate" (returned_album=None) from
+    # "candidate with empty title" (returned_album="") — three states from
+    # two values are easier to query than three-from-one with overloaded "".
+    returned_album_title = first.get("release_title")
     _project_resolver_attrs(requested_album=album, returned_album=returned_album_title)
     if album_score < _SIMILARITY_FLOOR or artist_score < _SIMILARITY_FLOOR:
         logger.info(
