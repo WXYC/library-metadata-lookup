@@ -171,17 +171,20 @@ async def set_up_schemas(pg_pool):
         # nothing" case). 305253 IS in artist so cache lookup hits; we just
         # leave the child tables empty for that row.
         #
-        # ``fetched_at`` is intentionally left NULL on both rows -- the
-        # ``TestGetArtistDetailsBulkFetchedAt`` class below relies on the
-        # stub-row shape and selectively advances ``fetched_at`` per-test.
-        # Writer-side stamping of ``fetched_at`` is pinned in
-        # ``tests/integration/test_cache_service_artist_writer.py``.
+        # ``fetched_at = now()`` matches the shape ``write_artist_details``
+        # produces in production (any row LML writes has it stamped). The
+        # stub-row edge case (``fetched_at IS NULL``, the monthly-rebuild
+        # leftover) is exercised by NULL-ing the column per-test in
+        # ``TestGetArtistDetailsBulkFetchedAt`` below -- the fixture defaults
+        # to the common case so a new endpoint test added here inherits the
+        # production shape, not the edge case. Writer-side stamping is
+        # pinned in ``tests/integration/test_cache_service_artist_writer.py``.
         await conn.execute(
             """
-            INSERT INTO artist (id, name, profile, image_url)
+            INSERT INTO artist (id, name, profile, image_url, fetched_at)
             VALUES
-                (2154, 'Stereolab', NULL, NULL),
-                (305253, 'Juana Molina', NULL, NULL)
+                (2154, 'Stereolab', NULL, NULL, now()),
+                (305253, 'Juana Molina', NULL, NULL, now())
             """
         )
         await conn.execute(
@@ -404,13 +407,18 @@ class TestGetArtistDetailsBulkFetchedAt:
 
     @pytest.mark.asyncio
     async def test_stub_row_returns_null_fetched_at(self, pg_pool):
-        """A row inserted without ``fetched_at`` (monthly rebuild stub) reads
-        back through ``get_artist_details_bulk`` with ``fetched_at = None``.
+        """A row with ``fetched_at IS NULL`` (monthly rebuild stub shape)
+        reads back through ``get_artist_details_bulk`` carrying the NULL.
         """
         from discogs.cache_service import DiscogsCacheService
 
-        # `set_up_schemas` already seeds 2154 (Stereolab) with NULL `fetched_at`
-        # — the INSERT specifies only id, name, profile, image_url.
+        # Fixture seeds 2154 with ``fetched_at = now()`` (production shape).
+        # Roll it back to the stub shape for this test only -- the stub is
+        # the edge case, so it owns its own setup rather than relying on a
+        # fixture default that would silently apply to unrelated tests.
+        async with pg_pool.acquire() as conn:
+            await conn.execute("UPDATE artist SET fetched_at = NULL WHERE id = 2154")
+
         cache = DiscogsCacheService(pg_pool)
         bundle = await cache.get_artist_details_bulk([2154])
 
@@ -419,12 +427,13 @@ class TestGetArtistDetailsBulkFetchedAt:
 
     @pytest.mark.asyncio
     async def test_hydrated_row_returns_non_null_fetched_at(self, pg_pool):
-        """A row with ``fetched_at = now()`` reads back through
-        ``get_artist_details_bulk`` carrying that stamp."""
-        from discogs.cache_service import DiscogsCacheService
+        """A row with ``fetched_at = now()`` (production write shape) reads
+        back through ``get_artist_details_bulk`` carrying that stamp.
 
-        async with pg_pool.acquire() as conn:
-            await conn.execute("UPDATE artist SET fetched_at = now() WHERE id = 305253")
+        Relies on the fixture default; the production-shape case is what
+        the fixture is for, so no per-test setup is needed.
+        """
+        from discogs.cache_service import DiscogsCacheService
 
         cache = DiscogsCacheService(pg_pool)
         bundle = await cache.get_artist_details_bulk([305253])
@@ -439,8 +448,9 @@ class TestGetArtistDetailsBulkFetchedAt:
         from discogs.cache_service import DiscogsCacheService
 
         async with pg_pool.acquire() as conn:
-            # 2154 stays a stub (NULL). 305253 becomes hydrated.
-            await conn.execute("UPDATE artist SET fetched_at = now() WHERE id = 305253")
+            # Fixture seeds both as hydrated (production shape). Roll 2154
+            # back to stub shape; 305253 stays hydrated.
+            await conn.execute("UPDATE artist SET fetched_at = NULL WHERE id = 2154")
 
         cache = DiscogsCacheService(pg_pool)
         bundle = await cache.get_artist_details_bulk([2154, 305253])
