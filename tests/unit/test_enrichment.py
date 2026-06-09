@@ -292,6 +292,52 @@ class TestEnrichArtworkResults:
         assert called_ids == {1}
 
 
+class TestTop1SentinelGuard:
+    """`fetch_top1_release_details` must short-circuit when the top-1 artwork
+    carries the LML#401 `release_id=0` sentinel — otherwise it round-trips
+    `discogs_service.get_release(0)` which hits the Discogs API at
+    `/releases/0` (404) before the `if not release` branch swallows the
+    response. The sentinel is a documented cross-service contract; the
+    orchestrator owns the per-call-site gating (see issue #518)."""
+
+    @pytest.mark.asyncio
+    async def test_top1_artwork_with_release_id_zero_skips_get_release(self):
+        item = make_library_item(artist="Stereolab", title="Aluminum Tunes")
+        # The synthesized sentinel as it would arrive from LML#401's
+        # streaming-only no-Discogs-match path.
+        sentinel = DiscogsSearchResult(release_id=0, release_url="")
+
+        discogs_service = AsyncMock()
+
+        await enrich_artwork_results([(item, sentinel)], discogs_service, song="French Disko")
+
+        discogs_service.get_release.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_top1_artwork_with_real_release_id_calls_get_release_once(self):
+        """Paired positive case: the guard must not fire on a real id.
+
+        Also pins the invocation count at 1 so a regression that double-fetches
+        the release (e.g. fallback-artwork resolution leaking into the top-1
+        enrichment path) doesn't slip through."""
+        item = make_library_item(artist="Kate Bush", title="The Kick Inside")
+        artwork = make_discogs_result(release_id=12345, artist="Kate Bush", album="The Kick Inside")
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=12345,
+            title="The Kick Inside",
+            artist="Kate Bush",
+            year=1978,
+            artist_id=None,  # short-circuits before get_artist_details
+            release_url="https://discogs.com/release/12345",
+        )
+
+        await enrich_artwork_results([(item, artwork)], discogs_service, song="Wuthering Heights")
+
+        discogs_service.get_release.assert_called_once_with(12345)
+
+
 class TestEnrichArtworkResultsExtended:
     """Coverage for the ``extended=True`` path: populates the additional
     DiscogsMatchResult fields LML already loads but normally discards.
