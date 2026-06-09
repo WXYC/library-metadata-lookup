@@ -136,6 +136,35 @@ class TestStripTrackSuffix:
             pytest.param("Brakhage - Live at Brixton", "Brakhage", id="dash-live-at-venue"),
             pytest.param("Brakhage - Remix", "Brakhage", id="dash-remix"),
             pytest.param("Brakhage - Acoustic", "Brakhage", id="dash-acoustic"),
+            # Unicode dashes (U+2013 en-dash, U+2014 em-dash) — common in MB
+            # metadata. Treated the same as ASCII hyphen-minus.
+            pytest.param("Brakhage – Live at Brixton", "Brakhage", id="en-dash-live"),
+            pytest.param("Brakhage — Acoustic", "Brakhage", id="em-dash-acoustic"),
+            # Dash form keyword coverage — must include the same compound
+            # forms the paren regex catches, otherwise the dash variant
+            # asymmetrically over-rejects.
+            pytest.param("Brakhage - Single Mix", "Brakhage", id="dash-single-mix"),
+            pytest.param("Brakhage - Radio Edit", "Brakhage", id="dash-radio-edit"),
+            pytest.param("Brakhage - feat. Other", "Brakhage", id="dash-feat-dot"),
+            # Bare-word triggers DELIBERATELY excluded — these are
+            # over-broad and false-positive on legitimate parenthetical
+            # phrases ("(Original Korean Version)" naming a release variant,
+            # "(Reprise)" / "(Interlude)" naming distinct tracks). Over-
+            # stripping would let the LML#506 sanity check accept the
+            # wrong-edition tracklist (the exact failure it's preventing).
+            pytest.param(
+                "Brakhage (Original Korean Version)",
+                "Brakhage (Original Korean Version)",
+                id="no-strip-bare-version",
+            ),
+            pytest.param("Brakhage (Pre-mix)", "Brakhage (Pre-mix)", id="no-strip-bare-mix"),
+            pytest.param("Brakhage (Reprise)", "Brakhage (Reprise)", id="no-strip-reprise"),
+            pytest.param("Brakhage (Interlude)", "Brakhage (Interlude)", id="no-strip-interlude"),
+            pytest.param(
+                "Brakhage (Mix Master Edit)",
+                "Brakhage (Mix Master Edit)",
+                id="no-strip-mid-keyword-only",
+            ),
             # Album-side suffixes are NOT stripped — different concept, different
             # caller. The MB resolver returns per-track titles; album-style
             # suffixes on a track title would be noise we'd want to leave alone
@@ -170,6 +199,9 @@ class TestScoreMatchTrack:
             pytest.param("Brakhage", "Brakhage (Single Mix)", id="paren-single-mix"),
             pytest.param("Brakhage", "Brakhage (Acoustic Version)", id="paren-acoustic"),
             pytest.param("Brakhage", "Brakhage - Live", id="dash-live"),
+            pytest.param("Brakhage", "Brakhage – Live at Brixton", id="en-dash-live"),
+            pytest.param("Brakhage", "Brakhage — Acoustic", id="em-dash-acoustic"),
+            pytest.param("Brakhage", "Brakhage - Radio Edit", id="dash-radio-edit"),
             pytest.param(
                 "Cybeles Reverie",
                 "Cybele's Reverie (Live at Brixton)",
@@ -189,6 +221,27 @@ class TestScoreMatchTrack:
         # bulldozed the signal. "Brakhage" and "Cybele's Reverie" are different
         # tracks on the same Stereolab album; the sanity check must catch this.
         assert score_match_track("Brakhage", "Cybele's Reverie") < 80.0
+
+    @pytest.mark.parametrize(
+        "query, result",
+        [
+            # Bare-word triggers — over-broad parenthetical-keyword leak
+            # cases. These MUST score below the 80 floor so the LML#506
+            # sanity check correctly REJECTS wrong-edition tracklists where
+            # the only "match" is incidental keyword presence inside an
+            # unrelated parenthetical phrase.
+            pytest.param("Brakhage", "Brakhage (Original Korean Version)", id="bare-version"),
+            pytest.param("Brakhage", "Brakhage (Pre-mix)", id="bare-mix"),
+            pytest.param("Brakhage", "Brakhage (Reprise)", id="reprise"),
+            pytest.param("Brakhage", "Brakhage (Interlude)", id="interlude"),
+        ],
+    )
+    def test_over_broad_keywords_do_not_strip(self, query, result):
+        # Critical regression pin: an earlier draft of the regex included
+        # bare `mix`, `edit`, `version`, `reprise`, `interlude` and let
+        # these scores reach 100, which would defeat the entire sanity
+        # check. The narrowed keyword set keeps these below 80.
+        assert score_match_track(query, result) < 80.0
 
     def test_exact_match(self):
         assert score_match_track("Brakhage", "Brakhage") == 100.0

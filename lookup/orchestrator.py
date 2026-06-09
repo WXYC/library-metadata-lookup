@@ -141,16 +141,6 @@ with margin so the orchestrator's wait_for trips before the underlying
 
 _APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR = "LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS"
 
-_MB_RESCUE_TRACK_MATCH_FLOOR: float = 80.0
-"""Per-track acceptance floor for the LML#506 song-sanity check on the MB
-rescue path. The MB resolver's own per-row trigram floor (``_SIMILARITY_FLOOR
-= 0.70`` in ``release/musicbrainz_resolver.py``) is intentionally lenient so
-diacritic-stripped artists and Deluxe-vs-Original siblings still match —
-that's why this downstream floor is tighter. The two are co-tuned: bump
-together on calibration. Matches ``SCORE_MATCH_ACCEPTANCE_FLOOR`` (the
-shared 80 across LML#477 / LML#504 / Apple Music probe) by value so the
-sanity check is consistent with the rest of the pipeline."""
-
 
 def _apple_music_lookup_timeout_s() -> float:
     """Resolve the per-call wall-clock ceiling for ``find_track_url`` on the
@@ -409,6 +399,7 @@ def _project_mb_rescue_attrs(
     *,
     attempted: bool,
     tracklist_found: bool,
+    song_sanity_checked: bool = False,
     song_sanity_rejected: bool = False,
 ) -> None:
     """Project MusicBrainz tracklist-rescue outcome onto the active Sentry trace.
@@ -419,12 +410,21 @@ def _project_mb_rescue_attrs(
     the boolean, keeping the trace explorer's filter on ``attempted=true``
     informative.
 
-    ``song_sanity_rejected=True`` records the LML#506 case where the
-    resolver returned a tracklist but the post-rescue song-presence check
-    dropped it (likely sibling-release leak — bonus-only-track Deluxe
-    cohort). Distinct from ``tracklist_found=False`` (resolver miss) so the
-    trace explorer can split the rejection cohort from the no-candidate
-    cohort.
+    The LML#506 song-sanity check has THREE outcomes, projected via two
+    booleans so they're independently filterable:
+
+    * ``song_sanity_checked=False, song_sanity_rejected=False`` — the
+      check was skipped (request had no ``song``, or the rollback flag
+      was off). Artist+album picker calls land here.
+    * ``song_sanity_checked=True, song_sanity_rejected=False`` — the
+      check ran and the requested song appeared in the rescued
+      tracklist. Happy path.
+    * ``song_sanity_checked=True, song_sanity_rejected=True`` — the
+      check ran and dropped the tracklist (likely sibling-release leak,
+      bonus-only-track Deluxe cohort). Distinct from
+      ``tracklist_found=False`` (resolver returned nothing) so the trace
+      explorer can split the rejection cohort from the no-candidate
+      cohort.
 
     Silent on Sentry SDK errors; observability never breaks /lookup.
     """
@@ -433,6 +433,7 @@ def _project_mb_rescue_attrs(
         if transaction is not None:
             transaction.set_data("lookup.mb_rescue.attempted", attempted)
             transaction.set_data("lookup.mb_rescue.tracklist_found", tracklist_found)
+            transaction.set_data("lookup.mb_rescue.song_sanity_checked", song_sanity_checked)
             transaction.set_data("lookup.mb_rescue.song_sanity_rejected", song_sanity_rejected)
     except Exception as e:
         logger.warning("Failed to project mb_rescue attrs onto Sentry transaction: %s", e)
@@ -2409,10 +2410,29 @@ async def enrich_artwork_results(
                 # a follow-up. Telemetry from ``mb_resolver.requested_album``
                 # / ``mb_resolver.returned_album`` sizes whether the bigger
                 # swing is justified.
+                # Strip song upfront so whitespace-only inputs (``song='   '``)
+                # follow the same skip path as ``song is None`` — a truthy
+                # blank would otherwise enter the check, normalize to empty
+                # inside ``score_match_track``, score 0 against every track,
+                # and unconditionally drop the rescue. The acceptance floor
+                # is the same 80 used across LML#477 / LML#504 / Apple Music
+                # probe (``SCORE_MATCH_ACCEPTANCE_FLOOR``); imported rather
+                # than re-declared so calibration bumps propagate uniformly.
+                song_stripped = (song or "").strip()
+                song_sanity_checked = False
                 song_sanity_rejected = False
-                if mb_tracklist and song and _mb_rescue_song_match_required():
+                if mb_tracklist and song_stripped and _mb_rescue_song_match_required():
+                    song_sanity_checked = True
+                    # Require a non-empty track title for the iteration to
+                    # count as a hit. ``score_match_track("", "")`` returns
+                    # 100 by rapidfuzz convention, so without this guard a
+                    # corrupt MB row with all-empty titles would falsely
+                    # pass the check when ``song_stripped`` happens to
+                    # normalize to empty.
                     if not any(
-                        score_match_track(song, t.title or "") >= _MB_RESCUE_TRACK_MATCH_FLOOR
+                        (t.title or "").strip()
+                        and score_match_track(song_stripped, t.title)
+                        >= SCORE_MATCH_ACCEPTANCE_FLOOR
                         for t in mb_tracklist
                     ):
                         logger.info(
@@ -2420,7 +2440,7 @@ async def enrich_artwork_results(
                             "not in rescued tracks (likely sibling-release leak)",
                             item.artist,
                             album,
-                            song,
+                            song_stripped,
                         )
                         mb_tracklist = None
                         song_sanity_rejected = True
@@ -2429,6 +2449,7 @@ async def enrich_artwork_results(
                 _project_mb_rescue_attrs(
                     attempted=True,
                     tracklist_found=bool(mb_tracklist),
+                    song_sanity_checked=song_sanity_checked,
                     song_sanity_rejected=song_sanity_rejected,
                 )
 

@@ -36,15 +36,34 @@ _PARENTHETICAL_SUFFIX_RE = re.compile(
 # other's strip surface. Used by the LML#506 MB-rescue song-sanity check via
 # ``score_match_track`` — without it, the 80 acceptance floor over-rejects
 # legitimate variants (empirically: ``score_match("Brakhage", "Brakhage (Live)") == 69.6``).
+#
+# Keyword design: only true variant markers (forms that DON'T change which
+# track is being referenced — "(Live)" of Brakhage is still Brakhage). Bare
+# ``mix`` / ``edit`` / ``version`` are deliberately excluded because they
+# false-positive on legitimate parenthetical phrases like "(Original Korean
+# Version)" and "(Pre-mix)" — over-stripping would let the sanity check
+# accept wrong-edition tracklists (the exact failure mode #506 is meant to
+# prevent). Compound forms ("Single Mix", "Radio Edit", "Alternate Take")
+# are listed explicitly. ``reprise`` / ``interlude`` excluded because they
+# typically name DISTINCT tracks, not variants of the same track.
+#
+# Dash form accepts ASCII hyphen-minus, en-dash (U+2013), and em-dash
+# (U+2014); MB freely surfaces all three. Keyword set kept in sync with the
+# paren form so a marker the paren regex catches the dash form catches too.
+_TRACK_SUFFIX_KEYWORDS = (
+    r"live|remix|acoustic|instrumental|demo|unplugged"
+    r"|feat\.?|featuring"
+    r"|bonus\s+track"
+    r"|radio\s+edit|single\s+mix|album\s+mix|extended\s+mix|extended\s+version"
+    r"|album\s+version|original\s+(?:mix|version)"
+    r"|alternate\s+(?:take|version|mix)"
+)
 _TRACK_PARENTHETICAL_SUFFIX_RE = re.compile(
-    r"\s*\([^)]*\b(?:live|remix|mix|edit|version|acoustic|instrumental|demo|"
-    r"feat\.?|featuring|bonus\s+track|radio|alternate|alt\.|reprise|interlude)\b"
-    r"[^)]*\)\s*$",
+    rf"\s*\([^)]*\b(?:{_TRACK_SUFFIX_KEYWORDS})\b[^)]*\)\s*$",
     re.IGNORECASE,
 )
 _TRACK_DASH_SUFFIX_RE = re.compile(
-    r"\s*-\s*(?:live|remix|acoustic|instrumental|demo|single\s+mix|"
-    r"radio\s+edit|extended\s+mix)\b.*$",
+    rf"\s*[-–—]\s*(?:{_TRACK_SUFFIX_KEYWORDS})\b.*$",
     re.IGNORECASE,
 )
 
@@ -90,8 +109,12 @@ def strip_track_suffix(title: str) -> str:
 
     Targets the suffix shapes a DJ would NOT type but MusicBrainz
     routinely surfaces — "(Live)", "(Remix)", "(Acoustic Version)",
-    "- Live at Brixton", "(feat. Some Artist)", etc. Returns the input
-    unchanged when nothing matches.
+    "- Live at Brixton", "(feat. Some Artist)", etc. The marker must
+    appear at the END of the title (parenthetical or trailing dash form).
+
+    Returns the title with the variant marker stripped, surrounding
+    whitespace trimmed, or the input unchanged when no marker matches
+    (note: leading/trailing whitespace is always normalized).
 
     Mirrors the role of ``strip_format_suffix`` for albums but with a
     disjoint regex set so callers don't accidentally strip album-side

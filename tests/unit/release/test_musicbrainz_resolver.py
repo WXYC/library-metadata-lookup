@@ -254,3 +254,86 @@ async def test_projects_returned_album_none_when_resolver_misses():
     values = {args[0]: args[1] for args, _ in txn._calls}
     assert values["lookup.mb_resolver.requested_album"] == "Aluminum Tunes"
     assert values["lookup.mb_resolver.returned_album"] is None
+
+
+@pytest.mark.asyncio
+async def test_projects_telemetry_on_pg_timeout():
+    """LML#506 review: telemetry must fire on the timeout path too. Without
+    this, a PG outage silently empties the trace-explorer denominator and
+    the Option 2 cohort-sizing analysis is biased toward happy paths only.
+    """
+    import asyncio
+
+    async def hang(*_args, **_kwargs):
+        await asyncio.sleep(60)
+        return []
+
+    mb_pg = AsyncMock()
+    mb_pg.fetchall = hang
+    txn = type("T", (), {"set_data": lambda self, *a, **k: self._calls.append((a, k))})()
+    txn._calls = []
+
+    with (
+        patch("release.musicbrainz_resolver.sentry_sdk") as sentry,
+        patch("release.musicbrainz_resolver._PG_TIMEOUT_S", 0.05),
+    ):
+        sentry.get_current_scope.return_value.transaction = txn
+        result = await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
+
+    assert result is None
+    values = {args[0]: args[1] for args, _ in txn._calls}
+    assert values["lookup.mb_resolver.requested_album"] == "Aluminum Tunes"
+    assert values["lookup.mb_resolver.returned_album"] is None
+
+
+@pytest.mark.asyncio
+async def test_projects_telemetry_on_pg_exception():
+    """LML#506 review: telemetry must also fire when PG raises so the
+    exception cohort is filterable in the trace explorer.
+    """
+    mb_pg = AsyncMock()
+    mb_pg.fetchall = AsyncMock(side_effect=RuntimeError("connection refused"))
+    txn = type("T", (), {"set_data": lambda self, *a, **k: self._calls.append((a, k))})()
+    txn._calls = []
+
+    with patch("release.musicbrainz_resolver.sentry_sdk") as sentry:
+        sentry.get_current_scope.return_value.transaction = txn
+        result = await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
+
+    assert result is None
+    values = {args[0]: args[1] for args, _ in txn._calls}
+    assert values["lookup.mb_resolver.requested_album"] == "Aluminum Tunes"
+    assert values["lookup.mb_resolver.returned_album"] is None
+
+
+@pytest.mark.asyncio
+async def test_returned_album_none_passes_through_when_release_title_missing():
+    """LML#506 review: a row with ``release_title=None`` (column NULL or
+    schema drift) projects ``returned_album=None``, NOT ``''``. The empty
+    string would conflate this with 'candidate had empty title' and the
+    no-rows path that already projects None — three states from one value.
+    """
+    mb_pg = AsyncMock()
+    mb_pg.fetchall = AsyncMock(
+        return_value=[
+            {
+                "release_id": 42,
+                "release_title": None,  # NULL column
+                "album_score": 0.95,
+                "artist_score": 0.99,
+                "medium_position": 1,
+                "position": 1,
+                "title": "Brakhage",
+                "length_ms": 252000,
+            }
+        ]
+    )
+    txn = type("T", (), {"set_data": lambda self, *a, **k: self._calls.append((a, k))})()
+    txn._calls = []
+
+    with patch("release.musicbrainz_resolver.sentry_sdk") as sentry:
+        sentry.get_current_scope.return_value.transaction = txn
+        await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
+
+    values = {args[0]: args[1] for args, _ in txn._calls}
+    assert values["lookup.mb_resolver.returned_album"] is None
