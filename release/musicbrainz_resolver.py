@@ -35,7 +35,7 @@ from generated.api_models import DiscogsTrackItem
 logger = logging.getLogger(__name__)
 
 
-def _project_resolver_attrs(*, requested_album: str, returned_album: str | None) -> None:
+def _project_resolver_attrs(*, requested_album: str | None, returned_album: str | None) -> None:
     """Project requested-vs-returned album titles onto the active Sentry trace.
 
     LML#506 sizing: the resolver runs ``LIMIT 1`` with a lenient 0.70
