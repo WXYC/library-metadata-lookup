@@ -1131,6 +1131,10 @@ class DiscogsReleaseMetadata(BaseModel):
         None,
         description="Timestamp of the most recent live Discogs API call that resolved\nthis release's artwork. `null` means LML's bulk loader populated\nthe row but the live API has not been queried yet (the \"never\nasked\" state); a value means LML hit the live API and either\npopulated `artwork_url` or confirmed Discogs has no cover. LML\nuses this to distinguish bulk-loader gaps (which it back-fills)\nfrom genuinely-imageless releases (which it does not refetch).\nSee WXYC/discogs-etl#239 + WXYC/library-metadata-lookup#423.\n",
     )
+    not_found: bool | None = Field(
+        False,
+        description='Tombstone marker for Discogs 404s on `get_release`. `true` means\nLML hit the live Discogs API for this release id and Discogs\nreturned 404; subsequent reads short-circuit on this flag rather\nthan re-burning the rate-limit budget. The tombstone row carries\n`title = ""` and `artist = ""` as identifier sentinels;\nconsumers must guard against rendering those empty strings as\nreal values. `release_url` is identifier-derived\n(`https://www.discogs.com/release/{release_id}`) and remains\nvalid even on a tombstone. LML\'s public boundary translates\n`not_found = true` back to `None` for direct callers; this flag\nis observable only by consumers that read the cache row\ndirectly (none of which exist in LML\'s public API today, but\nthe contract is exposed here for future cross-service readers).\nSee WXYC/library-metadata-lookup#510.\n',
+    )
     release_url: str
     cached: bool | None = False
     artists: list[DiscogsArtistCredit] | None = Field([], validate_default=True)
