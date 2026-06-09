@@ -195,3 +195,62 @@ async def test_returns_none_on_pg_timeout():
 )
 def test_format_duration_ms(length_ms, expected):
     assert _format_duration_ms(length_ms) == expected
+
+
+@pytest.mark.asyncio
+async def test_projects_requested_vs_returned_album_on_sentry_trace():
+    """LML#506 telemetry: the resolver projects the requested album and the
+    returned candidate's title onto the active Sentry transaction so the
+    trace explorer can size the Deluxe-vs-Original drift cohort — needed to
+    justify the resolver-side top-K follow-up.
+    """
+    mb_pg = AsyncMock()
+    mb_pg.fetchall = AsyncMock(
+        return_value=[
+            {
+                "release_id": 42,
+                "release_title": "Emperor Tomato Ketchup",  # actually returned
+                "album_score": 0.95,
+                "artist_score": 0.99,
+                "medium_position": 1,
+                "position": 1,
+                "title": "Brakhage",
+                "length_ms": 252000,
+            }
+        ]
+    )
+    txn = type("T", (), {"set_data": lambda self, *a, **k: self._calls.append((a, k))})()
+    txn._calls = []
+
+    with patch("release.musicbrainz_resolver.sentry_sdk") as sentry:
+        sentry.get_current_scope.return_value.transaction = txn
+        await resolve_tracklist_via_musicbrainz(
+            "Stereolab", "Emperor Tomato Ketchup (Deluxe Edition)", mb_pg=mb_pg
+        )
+
+    keys = [args[0] for args, _ in txn._calls]
+    values = {args[0]: args[1] for args, _ in txn._calls}
+    assert "lookup.mb_resolver.requested_album" in keys
+    assert "lookup.mb_resolver.returned_album" in keys
+    assert values["lookup.mb_resolver.requested_album"] == "Emperor Tomato Ketchup (Deluxe Edition)"
+    assert values["lookup.mb_resolver.returned_album"] == "Emperor Tomato Ketchup"
+
+
+@pytest.mark.asyncio
+async def test_projects_returned_album_none_when_resolver_misses():
+    """When the trigram cutoff returns zero rows, telemetry still fires with
+    ``returned_album=None`` so the trace explorer can distinguish the
+    no-candidate cohort from the candidate-rejected cohort.
+    """
+    mb_pg = AsyncMock()
+    mb_pg.fetchall = AsyncMock(return_value=[])
+    txn = type("T", (), {"set_data": lambda self, *a, **k: self._calls.append((a, k))})()
+    txn._calls = []
+
+    with patch("release.musicbrainz_resolver.sentry_sdk") as sentry:
+        sentry.get_current_scope.return_value.transaction = txn
+        await resolve_tracklist_via_musicbrainz("Stereolab", "Aluminum Tunes", mb_pg=mb_pg)
+
+    values = {args[0]: args[1] for args, _ in txn._calls}
+    assert values["lookup.mb_resolver.requested_album"] == "Aluminum Tunes"
+    assert values["lookup.mb_resolver.returned_album"] is None

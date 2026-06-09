@@ -914,6 +914,194 @@ class TestMbTracklistRescue:
         # Either absent or an empty/None-equivalent tracklist — both fine.
         assert not enriched.tracklist
 
+    @pytest.mark.asyncio
+    async def test_synth_rejects_mb_tracklist_when_song_absent(self):
+        """LML#506 bonus-only-track Deluxe leak: DJ requests a bonus track
+        unique to the Deluxe Edition; MB's ``LIMIT 1`` returns the Original
+        Edition tracklist (long shared substring clears the 0.70 trigram
+        cutoff). Sanity check rejects the surfaced tracklist because the
+        requested song doesn't appear in it.
+        """
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        mb_pg = AsyncMock()
+
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(return_value=self._track_items()),
+        ) as resolver:
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="Bonus Track Only On Deluxe",
+                album="Emperor Tomato Ketchup",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        resolver.assert_awaited_once()
+        _, enriched = results[0]
+        assert enriched.release_id == 0
+        # Tracklist rejected — the requested song doesn't appear in MB's
+        # candidate. Picker UI falls back to its empty-dropdown UX (same
+        # behaviour as a hard resolver miss).
+        assert not enriched.tracklist
+
+    @pytest.mark.asyncio
+    async def test_synth_carries_mb_tracklist_when_song_present(self):
+        """Sanity check passes — requested song appears in the rescued
+        tracklist. Tracklist is surfaced (happy path)."""
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        mb_pg = AsyncMock()
+
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(return_value=self._track_items()),
+        ) as resolver:
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="Brakhage",
+                album="Emperor Tomato Ketchup",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        resolver.assert_awaited_once()
+        _, enriched = results[0]
+        assert enriched.release_id == 0
+        assert enriched.tracklist is not None
+        assert [t.title for t in enriched.tracklist] == ["Brakhage", "Cybele's Reverie"]
+
+    @pytest.mark.asyncio
+    async def test_synth_carries_mb_tracklist_when_song_is_none(self):
+        """No song in the request (artist+album picker lookup) → skip the
+        sanity check, surface the tracklist. The whole point of the check is
+        track-presence verification; without a song there's nothing to verify
+        against, and over-rejecting picker calls would silently break the
+        artist+album entry path."""
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        mb_pg = AsyncMock()
+
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(return_value=self._track_items()),
+        ) as resolver:
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song=None,
+                album="Emperor Tomato Ketchup",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        resolver.assert_awaited_once()
+        _, enriched = results[0]
+        assert enriched.tracklist is not None
+        assert [t.title for t in enriched.tracklist] == ["Brakhage", "Cybele's Reverie"]
+
+    @pytest.mark.asyncio
+    async def test_sanity_check_handles_track_side_suffix_variants(self):
+        """The sanity check uses ``score_match_track``, so requested-song
+        names match MB-side track titles even when MB carries trailing
+        ``(Live)`` / ``(Remix)`` / ``- Acoustic`` markers. Without
+        track-side suffix stripping, the 80 floor over-rejects these
+        (empirically: ``score_match("Brakhage", "Brakhage (Live)") == 69.6``).
+        """
+        from generated.api_models import DiscogsTrackItem
+
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        mb_pg = AsyncMock()
+        tracklist_with_live_marker = [
+            DiscogsTrackItem(position="1", title="Brakhage (Live)", duration="4:12", artists=[]),
+            DiscogsTrackItem(
+                position="2", title="Cybele's Reverie - Acoustic", duration="4:05", artists=[]
+            ),
+        ]
+
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(return_value=tracklist_with_live_marker),
+        ) as resolver:
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="Brakhage",
+                album="Emperor Tomato Ketchup",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        resolver.assert_awaited_once()
+        _, enriched = results[0]
+        assert enriched.tracklist is not None  # passed the floor via suffix strip
+
+    @pytest.mark.asyncio
+    async def test_sanity_check_disabled_via_env_flag(self, monkeypatch):
+        """``LML_MB_RESCUE_REQUIRE_SONG_MATCH=false`` reverts to pre-LML#506
+        behaviour — tracklist is surfaced regardless of song presence. Lets an
+        operator turn the check off via Railway env var without a redeploy
+        if it over-rejects in production."""
+        monkeypatch.setenv("LML_MB_RESCUE_REQUIRE_SONG_MATCH", "false")
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
+        mb_pg = AsyncMock()
+
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(return_value=self._track_items()),
+        ) as resolver:
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="Track Definitely Not In Tracklist",
+                album="Emperor Tomato Ketchup",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        resolver.assert_awaited_once()
+        _, enriched = results[0]
+        # Flag off → carry tracklist regardless of song-presence verdict.
+        assert enriched.tracklist is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        reason="LML#506 known limitation: the sanity check only catches the "
+        "bonus-only-track Deluxe cohort. When the DJ requests a track that "
+        "exists on BOTH Original and Deluxe editions, MB's LIMIT 1 may return "
+        "Original; the sanity check passes (track exists in Original's "
+        "tracklist) and the Deluxe-requested-Original-returned leak goes "
+        "through undetected. The fix lives in the resolver — top-K candidates "
+        "filtered by song-presence — and is filed as a follow-up.",
+        strict=True,
+    )
+    async def test_shared_track_deluxe_leak_is_known_limitation(self):
+        """Pin the known partial-fix shape so a future change that closes it
+        flips this from xfail to xpass — telling us it's time to delete the
+        pin and update the WXYC/wxyc-shared#172 provenance note.
+        """
+        item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup (Deluxe)")
+        mb_pg = AsyncMock()
+
+        with patch(
+            "lookup.orchestrator.resolve_tracklist_via_musicbrainz",
+            new=AsyncMock(return_value=self._track_items()),  # Original's tracklist
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="Brakhage",  # exists on both Original and Deluxe
+                album="Emperor Tomato Ketchup (Deluxe)",
+                extended=True,
+                mb_pg=mb_pg,
+            )
+
+        # Strict-xfail: when Option 2 (resolver-side top-K) ships, this
+        # should reject — at which point the leak is closed and the pin
+        # flips to xpass.
+        _, enriched = results[0]
+        assert not enriched.tracklist
+
 
 class TestEnrichArtworkResultsWithAppleMusicClient:
     """LML#443/#444: orchestrator hot path consumes ``AppleMusicClient.find_track_url``.
