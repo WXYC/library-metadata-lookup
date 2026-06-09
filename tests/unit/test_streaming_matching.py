@@ -136,10 +136,13 @@ class TestStripTrackSuffix:
             pytest.param("Brakhage - Live at Brixton", "Brakhage", id="dash-live-at-venue"),
             pytest.param("Brakhage - Remix", "Brakhage", id="dash-remix"),
             pytest.param("Brakhage - Acoustic", "Brakhage", id="dash-acoustic"),
-            # Unicode dashes (U+2013 en-dash, U+2014 em-dash) — common in MB
-            # metadata. Treated the same as ASCII hyphen-minus.
+            # Unicode dashes — MB surfaces six dash characters in real
+            # metadata. All treated as dash-suffix separators.
             pytest.param("Brakhage – Live at Brixton", "Brakhage", id="en-dash-live"),
             pytest.param("Brakhage — Acoustic", "Brakhage", id="em-dash-acoustic"),
+            pytest.param("Brakhage ‒ Live", "Brakhage", id="figure-dash-live"),
+            pytest.param("Brakhage ― Live", "Brakhage", id="horizontal-bar-live"),
+            pytest.param("Brakhage − Live", "Brakhage", id="minus-sign-live"),
             # Dash form keyword coverage — must include the same compound
             # forms the paren regex catches, otherwise the dash variant
             # asymmetrically over-rejects.
@@ -151,12 +154,21 @@ class TestStripTrackSuffix:
             # take-numbered alternates (digit-required to avoid "Take Five"),
             # compound mix/edit/version with explicit prefix lists,
             # rework/a cappella.
-            pytest.param("Brakhage (Mono)", "Brakhage", id="paren-mono"),
-            pytest.param("Brakhage (Stereo)", "Brakhage", id="paren-stereo"),
+            # Note: bare ``mono`` / ``stereo`` are NOT in the keyword set —
+            # they false-positive on real titles like "(Mono No Aware)" /
+            # "(In Stereo)" / "(Pink Stereo)". Only compound forms strip:
+            # "(Mono Version)" / "(Stereo Mix)" / etc.
+            pytest.param("Brakhage (Mono Mix)", "Brakhage", id="paren-mono-mix"),
+            pytest.param("Brakhage (Stereo Mix)", "Brakhage", id="paren-stereo-mix"),
             pytest.param("Brakhage (Take 1)", "Brakhage", id="paren-take-digit"),
             pytest.param("Brakhage (Take 12)", "Brakhage", id="paren-take-multi-digit"),
+            # Note: bare ``session`` is NOT in the keyword set — it false-
+            # positives on real titles like "(Session in Salt Lake City)"
+            # and "(Session Highlights)". Only compound forms strip.
             pytest.param("Brakhage (BBC Session)", "Brakhage", id="paren-bbc-session"),
             pytest.param("Brakhage (Peel Session)", "Brakhage", id="paren-peel-session"),
+            pytest.param("Brakhage (Radio Session)", "Brakhage", id="paren-radio-session"),
+            pytest.param("Brakhage (Recording Session)", "Brakhage", id="paren-recording-session"),
             pytest.param("Brakhage (Mono Version)", "Brakhage", id="paren-mono-version"),
             pytest.param("Brakhage (Stereo Version)", "Brakhage", id="paren-stereo-version"),
             pytest.param("Brakhage (Single Version)", "Brakhage", id="paren-single-version"),
@@ -195,6 +207,34 @@ class TestStripTrackSuffix:
                 "Brakhage (Take Five)",
                 "Brakhage (Take Five)",
                 id="no-strip-take-non-digit",
+            ),
+            # Bare ``mono`` / ``stereo`` / ``session`` FP guards — these
+            # CANNOT strip because they collide with real track-name
+            # parentheticals. Iter 3 narrowed all three to compound-only.
+            pytest.param(
+                "Brakhage (Mono No Aware)",
+                "Brakhage (Mono No Aware)",
+                id="no-strip-bare-mono-japanese",
+            ),
+            pytest.param(
+                "Brakhage (In Stereo)",
+                "Brakhage (In Stereo)",
+                id="no-strip-bare-stereo",
+            ),
+            pytest.param(
+                "Brakhage (Pink Stereo)",
+                "Brakhage (Pink Stereo)",
+                id="no-strip-stereo-band-name",
+            ),
+            pytest.param(
+                "Brakhage (Session in Salt Lake City)",
+                "Brakhage (Session in Salt Lake City)",
+                id="no-strip-bare-session-locative",
+            ),
+            pytest.param(
+                "Brakhage (Stereo Sessions)",
+                "Brakhage (Stereo Sessions)",
+                id="no-strip-bare-session-plural",
             ),
             # Word-internal hyphens (no whitespace before the dash) must NOT
             # be treated as a dash suffix. iter-1 used ``\s*[-–—]\s*`` which
@@ -245,6 +285,9 @@ class TestScoreMatchTrack:
             pytest.param("Brakhage", "Brakhage - Live", id="dash-live"),
             pytest.param("Brakhage", "Brakhage – Live at Brixton", id="en-dash-live"),
             pytest.param("Brakhage", "Brakhage — Acoustic", id="em-dash-acoustic"),
+            pytest.param("Brakhage", "Brakhage ‒ Live", id="figure-dash-live"),
+            pytest.param("Brakhage", "Brakhage ― Live", id="horizontal-bar-live"),
+            pytest.param("Brakhage", "Brakhage − Live", id="minus-sign-live"),
             pytest.param("Brakhage", "Brakhage - Radio Edit", id="dash-radio-edit"),
             pytest.param(
                 "Cybeles Reverie",
@@ -280,6 +323,14 @@ class TestScoreMatchTrack:
             pytest.param("Brakhage", "Brakhage (Interlude)", id="interlude"),
             pytest.param("Brakhage", "Brakhage (Take Five)", id="take-non-digit"),
             pytest.param("Brakhage", "Brakhage (Mix Master Edit)", id="mid-keyword-only"),
+            # Iter 3: bare mono/stereo/session FP guards — must stay
+            # rejected so the sanity check doesn't accept wrong-edition
+            # tracklists where the only "match" is incidental occurrence
+            # of `mono` / `stereo` / `session` inside an unrelated
+            # parenthetical noun phrase.
+            pytest.param("Brakhage", "Brakhage (Mono No Aware)", id="mono-japanese"),
+            pytest.param("Brakhage", "Brakhage (In Stereo)", id="in-stereo"),
+            pytest.param("Brakhage", "Brakhage (Session in Salt Lake City)", id="session-locative"),
         ],
     )
     def test_over_broad_keywords_do_not_strip(self, query, result):

@@ -415,8 +415,12 @@ def _project_mb_rescue_attrs(
     booleans so they're independently filterable:
 
     * ``song_sanity_checked=False, song_sanity_rejected=False`` — the
-      check was skipped (request had no ``song``, or the rollback flag
-      was off). Artist+album picker calls land here.
+      check was skipped. Three distinct scenarios collapse onto this
+      pair: (a) the request had no ``song`` (artist+album picker call),
+      (b) the rollback flag was off, OR (c) the resolver returned no
+      candidate at all (``tracklist_found=False``). To split (c) from
+      (a)+(b), join with ``tracklist_found`` and / or
+      ``lookup.mb_resolver.returned_album`` in the trace explorer.
     * ``song_sanity_checked=True, song_sanity_rejected=False`` — the
       check ran and the requested song appeared in the rescued
       tracklist. Happy path.

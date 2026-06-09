@@ -771,6 +771,19 @@ class TestMbTracklistRescue:
     Tests mock the resolver — no PG traffic.
     """
 
+    @pytest.fixture(autouse=True)
+    def _isolate_rollback_flag(self, monkeypatch):
+        """LML#506: the song-sanity check defaults to ON via
+        ``_mb_rescue_song_match_required`` reading
+        ``LML_MB_RESCUE_REQUIRE_SONG_MATCH`` at request time. A developer
+        or CI environment with the flag set to ``false`` would silently
+        invert every default-on assertion in this class. ``delenv`` the
+        flag for every test in this group so the default-on behavior is
+        what we actually exercise; tests that need flag=false set it
+        explicitly via ``monkeypatch.setenv``.
+        """
+        monkeypatch.delenv("LML_MB_RESCUE_REQUIRE_SONG_MATCH", raising=False)
+
     @staticmethod
     def _track_items():
         from generated.api_models import DiscogsTrackItem
