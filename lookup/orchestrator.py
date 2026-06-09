@@ -27,6 +27,7 @@ from clients.streaming.matching import (
     SCORE_MATCH_ACCEPTANCE_FLOOR,
     find_best_typed_match,
     score_match,
+    score_match_track,
     strip_discogs_disambig,
 )
 from config.settings import get_settings
@@ -140,6 +141,16 @@ with margin so the orchestrator's wait_for trips before the underlying
 
 _APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR = "LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS"
 
+_MB_RESCUE_TRACK_MATCH_FLOOR: float = 80.0
+"""Per-track acceptance floor for the LML#506 song-sanity check on the MB
+rescue path. The MB resolver's own per-row trigram floor (``_SIMILARITY_FLOOR
+= 0.70`` in ``release/musicbrainz_resolver.py``) is intentionally lenient so
+diacritic-stripped artists and Deluxe-vs-Original siblings still match —
+that's why this downstream floor is tighter. The two are co-tuned: bump
+together on calibration. Matches ``SCORE_MATCH_ACCEPTANCE_FLOOR`` (the
+shared 80 across LML#477 / LML#504 / Apple Music probe) by value so the
+sanity check is consistent with the rest of the pipeline."""
+
 
 def _apple_music_lookup_timeout_s() -> float:
     """Resolve the per-call wall-clock ceiling for ``find_track_url`` on the
@@ -193,6 +204,23 @@ def _artist_identity_split_gate_enabled() -> bool:
     knob can be flipped via Railway env vars without a redeploy. See
     ``LML_ARTIST_IDENTITY_SPLIT_GATE`` in ``docs/env-vars.md``."""
     raw = os.getenv(_ARTIST_IDENTITY_SPLIT_GATE_ENV_VAR)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _FALSE_FLAG_VALUES
+
+
+_MB_RESCUE_REQUIRE_SONG_MATCH_ENV_VAR = "LML_MB_RESCUE_REQUIRE_SONG_MATCH"
+"""When set to any common false spelling (``false``, ``0``, ``no``, ``off``,
+``disabled``), the LML#506 post-rescue song-sanity check is bypassed and the
+MB tracklist is surfaced unconditionally — reverting to the pre-LML#506
+``LIMIT 1``-trust behaviour. Emergency rollback only — default is ``true``
+(on)."""
+
+
+def _mb_rescue_song_match_required() -> bool:
+    """Read the LML#506 rollback flag at request time. See
+    ``LML_MB_RESCUE_REQUIRE_SONG_MATCH`` in ``docs/env-vars.md``."""
+    raw = os.getenv(_MB_RESCUE_REQUIRE_SONG_MATCH_ENV_VAR)
     if raw is None:
         return True
     return raw.strip().lower() not in _FALSE_FLAG_VALUES
@@ -377,7 +405,12 @@ def _log_album_title_fallback(
         logger.warning("Failed to project album_title_fallback onto Sentry transaction: %s", e)
 
 
-def _project_mb_rescue_attrs(*, attempted: bool, tracklist_found: bool) -> None:
+def _project_mb_rescue_attrs(
+    *,
+    attempted: bool,
+    tracklist_found: bool,
+    song_sanity_rejected: bool = False,
+) -> None:
     """Project MusicBrainz tracklist-rescue outcome onto the active Sentry trace.
 
     Called from the synth path only when the rescue was eligible (top-1 +
@@ -386,6 +419,13 @@ def _project_mb_rescue_attrs(*, attempted: bool, tracklist_found: bool) -> None:
     the boolean, keeping the trace explorer's filter on ``attempted=true``
     informative.
 
+    ``song_sanity_rejected=True`` records the LML#506 case where the
+    resolver returned a tracklist but the post-rescue song-presence check
+    dropped it (likely sibling-release leak — bonus-only-track Deluxe
+    cohort). Distinct from ``tracklist_found=False`` (resolver miss) so the
+    trace explorer can split the rejection cohort from the no-candidate
+    cohort.
+
     Silent on Sentry SDK errors; observability never breaks /lookup.
     """
     try:
@@ -393,6 +433,7 @@ def _project_mb_rescue_attrs(*, attempted: bool, tracklist_found: bool) -> None:
         if transaction is not None:
             transaction.set_data("lookup.mb_rescue.attempted", attempted)
             transaction.set_data("lookup.mb_rescue.tracklist_found", tracklist_found)
+            transaction.set_data("lookup.mb_rescue.song_sanity_rejected", song_sanity_rejected)
     except Exception as e:
         logger.warning("Failed to project mb_rescue attrs onto Sentry transaction: %s", e)
 
@@ -2350,9 +2391,46 @@ async def enrich_artwork_results(
                 mb_tracklist = await resolve_tracklist_via_musicbrainz(
                     item.artist, album, mb_pg=mb_pg
                 )
+                # LML#506 post-rescue song-sanity check. The resolver runs a
+                # pg_trgm ``LIMIT 1`` with a lenient 0.70 floor, so on the
+                # Deluxe-vs-Original sibling-album shape (long shared
+                # substring, both sides clear 0.70) it can return Original's
+                # tracklist for a Deluxe request. When the DJ's song doesn't
+                # appear in the rescued tracks, the candidate is almost
+                # certainly the wrong release; drop it rather than surface a
+                # wrong tracklist to the picker (which writes it
+                # unchallenged to the flowsheet).
+                #
+                # Known limitation: only the bonus-only-track variant is
+                # caught here. Shared-track-Deluxe leaks (DJ requests a
+                # track present on both editions) pass the check
+                # undetected. The fix lives in the resolver — top-K
+                # candidates filtered by song-presence — and is filed as
+                # a follow-up. Telemetry from ``mb_resolver.requested_album``
+                # / ``mb_resolver.returned_album`` sizes whether the bigger
+                # swing is justified.
+                song_sanity_rejected = False
+                if mb_tracklist and song and _mb_rescue_song_match_required():
+                    if not any(
+                        score_match_track(song, t.title or "") >= _MB_RESCUE_TRACK_MATCH_FLOOR
+                        for t in mb_tracklist
+                    ):
+                        logger.info(
+                            "mb_rescue: dropping tracklist for (%r, %r) — song %r "
+                            "not in rescued tracks (likely sibling-release leak)",
+                            item.artist,
+                            album,
+                            song,
+                        )
+                        mb_tracklist = None
+                        song_sanity_rejected = True
                 if mb_tracklist:
                     update["tracklist"] = mb_tracklist
-                _project_mb_rescue_attrs(attempted=True, tracklist_found=bool(mb_tracklist))
+                _project_mb_rescue_attrs(
+                    attempted=True,
+                    tracklist_found=bool(mb_tracklist),
+                    song_sanity_rejected=song_sanity_rejected,
+                )
 
             # LML#487: surface the Apple Music probe's artwork URL on the
             # synthesized result. ``probe_artwork_url`` is non-None when

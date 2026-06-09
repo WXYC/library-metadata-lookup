@@ -7,9 +7,11 @@ from clients.streaming.matching import (
     normalize_album_title,
     normalize_artist_name,
     score_match,
+    score_match_track,
     strip_discogs_suffix,
     strip_format_suffix,
     strip_the_prefix,
+    strip_track_suffix,
 )
 
 
@@ -103,6 +105,97 @@ class TestScoreMatch:
     def test_the_prefix_mismatch(self):
         """'Afros' should score well against 'The Afros'."""
         assert score_match("Afros", "The Afros") >= 80.0
+
+
+class TestStripTrackSuffix:
+    """Track-side suffix stripping for the LML#506 MB rescue song-sanity
+    check. Mirrors ``strip_format_suffix`` but targets per-track variants
+    (``(Live)``, ``(Remix)``, ``- Acoustic``...) instead of per-album
+    indicators (``(Deluxe Edition)``, ``LP``, ``12"``).
+    """
+
+    @pytest.mark.parametrize(
+        "title, expected",
+        [
+            pytest.param("Brakhage", "Brakhage", id="no-suffix"),
+            pytest.param("Brakhage (Live)", "Brakhage", id="paren-live"),
+            pytest.param("Brakhage (Live at Brixton)", "Brakhage", id="paren-live-at-venue"),
+            pytest.param("Brakhage (Remix)", "Brakhage", id="paren-remix"),
+            pytest.param("Brakhage (Single Mix)", "Brakhage", id="paren-single-mix"),
+            pytest.param("Brakhage (Album Mix)", "Brakhage", id="paren-album-mix"),
+            pytest.param("Brakhage (Radio Edit)", "Brakhage", id="paren-radio-edit"),
+            pytest.param("Brakhage (Extended Mix)", "Brakhage", id="paren-extended-mix"),
+            pytest.param("Brakhage (Acoustic Version)", "Brakhage", id="paren-acoustic-version"),
+            pytest.param("Brakhage (Acoustic)", "Brakhage", id="paren-acoustic"),
+            pytest.param("Brakhage (Instrumental)", "Brakhage", id="paren-instrumental"),
+            pytest.param("Brakhage (Demo)", "Brakhage", id="paren-demo"),
+            pytest.param("Brakhage (Bonus Track)", "Brakhage", id="paren-bonus-track"),
+            pytest.param("Brakhage (feat. Some Artist)", "Brakhage", id="paren-feat-dot"),
+            pytest.param("Brakhage (Featuring Some Artist)", "Brakhage", id="paren-featuring"),
+            pytest.param("Brakhage - Live", "Brakhage", id="dash-live"),
+            pytest.param("Brakhage - Live at Brixton", "Brakhage", id="dash-live-at-venue"),
+            pytest.param("Brakhage - Remix", "Brakhage", id="dash-remix"),
+            pytest.param("Brakhage - Acoustic", "Brakhage", id="dash-acoustic"),
+            # Album-side suffixes are NOT stripped — different concept, different
+            # caller. The MB resolver returns per-track titles; album-style
+            # suffixes on a track title would be noise we'd want to leave alone
+            # so the score reflects actual mismatch.
+            pytest.param(
+                "Brakhage (2024 Remaster)", "Brakhage (2024 Remaster)", id="no-strip-remaster"
+            ),
+            pytest.param(
+                "Brakhage (Deluxe Edition)", "Brakhage (Deluxe Edition)", id="no-strip-deluxe"
+            ),
+            # Non-suffix parentheticals stay
+            pytest.param("Brakhage (Part 1)", "Brakhage (Part 1)", id="no-strip-part"),
+            pytest.param("", "", id="empty-string"),
+        ],
+    )
+    def test_strip_track_suffix(self, title, expected):
+        assert strip_track_suffix(title) == expected
+
+
+class TestScoreMatchTrack:
+    """``score_match_track`` adds track-side suffix stripping on top of the
+    album-aware ``score_match``. The LML#506 sanity check uses it to detect
+    "song requested by DJ does NOT appear in MB-rescued tracklist" without
+    over-rejecting variants like ``"Brakhage" vs "Brakhage (Live)"``.
+    """
+
+    @pytest.mark.parametrize(
+        "query, result",
+        [
+            pytest.param("Brakhage", "Brakhage (Live)", id="paren-live"),
+            pytest.param("Brakhage", "Brakhage (Remix)", id="paren-remix"),
+            pytest.param("Brakhage", "Brakhage (Single Mix)", id="paren-single-mix"),
+            pytest.param("Brakhage", "Brakhage (Acoustic Version)", id="paren-acoustic"),
+            pytest.param("Brakhage", "Brakhage - Live", id="dash-live"),
+            pytest.param(
+                "Cybeles Reverie",
+                "Cybele's Reverie (Live at Brixton)",
+                id="combined-apostrophe-and-suffix",
+            ),
+        ],
+    )
+    def test_track_variants_clear_acceptance_floor(self, query, result):
+        # Pin: the existing 80 floor is preserved when a track-side suffix is
+        # the only difference between the requested song and the MB result.
+        # Without ``strip_track_suffix`` this fails — empirically:
+        #   ``score_match("Brakhage", "Brakhage (Live)") == 69.6``
+        assert score_match_track(query, result) >= 80.0
+
+    def test_genuinely_different_titles_still_reject(self):
+        # The whole point of the floor — make sure the suffix-stripper hasn't
+        # bulldozed the signal. "Brakhage" and "Cybele's Reverie" are different
+        # tracks on the same Stereolab album; the sanity check must catch this.
+        assert score_match_track("Brakhage", "Cybele's Reverie") < 80.0
+
+    def test_exact_match(self):
+        assert score_match_track("Brakhage", "Brakhage") == 100.0
+
+    def test_empty_strings(self):
+        # Mirrors ``score_match`` rapidfuzz convention.
+        assert score_match_track("", "") == 100.0
 
 
 class TestIsAcceptableMatch:

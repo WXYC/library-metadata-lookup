@@ -27,10 +27,35 @@ import asyncio
 import logging
 from typing import Any
 
+import sentry_sdk
+
 from entity.sources import PgSourceProtocol
 from generated.api_models import DiscogsTrackItem
 
 logger = logging.getLogger(__name__)
+
+
+def _project_resolver_attrs(*, requested_album: str, returned_album: str | None) -> None:
+    """Project requested-vs-returned album titles onto the active Sentry trace.
+
+    LML#506 sizing: the resolver runs ``LIMIT 1`` with a lenient 0.70
+    trigram floor, so on Deluxe-vs-Original sibling shapes it can return a
+    non-requested album whose tracklist still partially overlaps. The
+    downstream song-sanity check catches one cohort (bonus-only-track
+    Deluxe leaks); this attribute exposes the population needed to size
+    whether the resolver-side Option 2 follow-up (top-K candidates
+    filtered by song-presence) is worth shipping.
+
+    Silent on Sentry SDK errors; observability never breaks the resolver.
+    """
+    try:
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is not None:
+            transaction.set_data("lookup.mb_resolver.requested_album", requested_album)
+            transaction.set_data("lookup.mb_resolver.returned_album", returned_album)
+    except Exception as e:
+        logger.warning("Failed to project mb_resolver attrs onto Sentry transaction: %s", e)
+
 
 # Matches `CANONICAL_ARTIST_SIMILARITY_FLOOR` in ``lookup/orchestrator.py``.
 # Kept duplicated rather than imported to avoid a circular import with the
@@ -69,6 +94,7 @@ WITH candidate AS (
     LIMIT 1
 )
 SELECT c.release_id,
+       c.release_title,
        c.album_score,
        c.artist_score,
        m.position AS medium_position,
@@ -144,11 +170,18 @@ async def resolve_tracklist_via_musicbrainz(
         return None
 
     if not rows:
+        _project_resolver_attrs(requested_album=album, returned_album=None)
         return None
 
     first = rows[0]
     album_score = float(first.get("album_score") or 0.0)
     artist_score = float(first.get("artist_score") or 0.0)
+    # Capture before the floor check so the trace explorer sees both rejected
+    # and accepted candidates — operator can quantify the "trigram floor
+    # cleared but downstream sanity check dropped it" cohort by joining this
+    # attribute with ``lookup.mb_rescue.song_sanity_rejected``.
+    returned_album_title = first.get("release_title") or ""
+    _project_resolver_attrs(requested_album=album, returned_album=returned_album_title)
     if album_score < _SIMILARITY_FLOOR or artist_score < _SIMILARITY_FLOOR:
         logger.info(
             "MB tracklist candidate for (%r, %r) below floor: artist=%.2f album=%.2f",

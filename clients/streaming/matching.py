@@ -28,6 +28,26 @@ _PARENTHETICAL_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Track-side parenthetical/dash suffixes. Distinct from
+# ``_PARENTHETICAL_SUFFIX_RE`` (which targets album-level indicators such as
+# "(Deluxe Edition)" or "(2024 Remaster)") — these are common per-track
+# variants the MB resolver might surface ("(Live)", "(Remix)", "- Acoustic")
+# but a DJ would never type. Kept separate so neither caller bleeds into the
+# other's strip surface. Used by the LML#506 MB-rescue song-sanity check via
+# ``score_match_track`` — without it, the 80 acceptance floor over-rejects
+# legitimate variants (empirically: ``score_match("Brakhage", "Brakhage (Live)") == 69.6``).
+_TRACK_PARENTHETICAL_SUFFIX_RE = re.compile(
+    r"\s*\([^)]*\b(?:live|remix|mix|edit|version|acoustic|instrumental|demo|"
+    r"feat\.?|featuring|bonus\s+track|radio|alternate|alt\.|reprise|interlude)\b"
+    r"[^)]*\)\s*$",
+    re.IGNORECASE,
+)
+_TRACK_DASH_SUFFIX_RE = re.compile(
+    r"\s*-\s*(?:live|remix|acoustic|instrumental|demo|single\s+mix|"
+    r"radio\s+edit|extended\s+mix)\b.*$",
+    re.IGNORECASE,
+)
+
 # Bracket format tags: [single], [EP], [sampler EP], etc.
 _BRACKET_SUFFIX_RE = re.compile(
     r"\s*\[[^\]]*(?:single|EP|sampler|promo|import)\]?\s*$",
@@ -65,6 +85,25 @@ def normalize_artist_name(artist: str) -> str:
     return normalize_for_comparison(artist)
 
 
+def strip_track_suffix(title: str) -> str:
+    """Strip per-track variant markers from a track title.
+
+    Targets the suffix shapes a DJ would NOT type but MusicBrainz
+    routinely surfaces — "(Live)", "(Remix)", "(Acoustic Version)",
+    "- Live at Brixton", "(feat. Some Artist)", etc. Returns the input
+    unchanged when nothing matches.
+
+    Mirrors the role of ``strip_format_suffix`` for albums but with a
+    disjoint regex set so callers don't accidentally strip album-side
+    markers from track titles (or vice versa).
+    """
+    if not title:
+        return title
+    result = _TRACK_PARENTHETICAL_SUFFIX_RE.sub("", title)
+    result = _TRACK_DASH_SUFFIX_RE.sub("", result)
+    return result.strip()
+
+
 def score_match(query: str, result: str) -> float:
     """Score how well a query matches a result using fuzzy token sort ratio.
 
@@ -86,6 +125,21 @@ def score_match(query: str, result: str) -> float:
         return max(base_score, alt_score)
 
     return base_score
+
+
+def score_match_track(query: str, result: str) -> float:
+    """Score how well a requested song title matches a candidate track title.
+
+    Wraps ``score_match`` with track-side suffix stripping applied to both
+    sides via ``strip_track_suffix``. Used by the LML#506 MB-rescue
+    song-sanity check, where the MB resolver may return track titles
+    carrying ``(Live)`` / ``(Remix)`` / etc. markers that the DJ's request
+    text would never carry. Without the strip, the shared 80 acceptance
+    floor over-rejects these variants.
+
+    Returns a score from 0 to 100.
+    """
+    return score_match(strip_track_suffix(query), strip_track_suffix(result))
 
 
 _AND_RE = re.compile(r"\band\b", re.IGNORECASE)
