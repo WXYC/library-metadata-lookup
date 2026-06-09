@@ -320,20 +320,20 @@ class TestTop1SentinelGuard:
         Also pins the invocation count at 1 so a regression that double-fetches
         the release (e.g. fallback-artwork resolution leaking into the top-1
         enrichment path) doesn't slip through."""
-        item = make_library_item(artist="Kate Bush", title="The Kick Inside")
-        artwork = make_discogs_result(release_id=12345, artist="Kate Bush", album="The Kick Inside")
+        item = make_library_item(artist="Cat Power", title="Moon Pix")
+        artwork = make_discogs_result(release_id=12345, artist="Cat Power", album="Moon Pix")
 
         discogs_service = AsyncMock()
         discogs_service.get_release.return_value = ReleaseMetadataResponse(
             release_id=12345,
-            title="The Kick Inside",
-            artist="Kate Bush",
-            year=1978,
+            title="Moon Pix",
+            artist="Cat Power",
+            year=1998,
             artist_id=None,  # short-circuits before get_artist_details
             release_url="https://discogs.com/release/12345",
         )
 
-        await enrich_artwork_results([(item, artwork)], discogs_service, song="Wuthering Heights")
+        await enrich_artwork_results([(item, artwork)], discogs_service, song="Cross Bones Style")
 
         discogs_service.get_release.assert_called_once_with(12345)
 
