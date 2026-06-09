@@ -7,32 +7,7 @@ import pytest
 from entity.store import (
     _GET_IDENTITY_LOWER_SQL,
     EntityStore,
-    _strip_nul,
 )
-
-
-class TestStripNul:
-    """Locks the WX-3.B boundary contract on the private helper."""
-
-    def test_returns_none_for_none(self) -> None:
-        assert _strip_nul(None) is None
-
-    def test_returns_input_unchanged_when_no_nul(self) -> None:
-        assert _strip_nul("Stereolab") == "Stereolab"
-
-    def test_strips_single_nul(self) -> None:
-        assert _strip_nul("a\x00b") == "ab"
-
-    def test_strips_all_nuls(self) -> None:
-        assert _strip_nul("\x00a\x00b\x00") == "ab"
-
-    def test_empty_string_passthrough(self) -> None:
-        assert _strip_nul("") == ""
-
-    def test_idempotent(self) -> None:
-        once = _strip_nul("a\x00b\x00c")
-        twice = _strip_nul(once)
-        assert once == twice == "abc"
 
 
 @pytest.fixture
@@ -109,6 +84,45 @@ class TestUpsertIdentity:
         # Verify COALESCE is used in the UPDATE clause
         call_args = mock_pg.fetchone.call_args
         assert "COALESCE" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_upsert_with_none_external_id_does_not_clobber_existing(self, store, mock_pg):
+        """Regression: an upsert that omits an external ID must bind SQL NULL,
+        not the empty string, so ``COALESCE(EXCLUDED.col, entity.identity.col)``
+        skips the column and the previously-stored value survives.
+
+        This is the load-bearing contract that WXYC/wxyc-etl#142 changed the
+        Python boundary helper for. The old `None -> ""` coercion would have
+        bound the empty string here, causing `COALESCE('', existing)` to
+        return `''` and silently clobber every stored external ID on any
+        upsert that didn't carry one. The new ``wxyc_etl.pg.to_pg_text_form``
+        contract preserves ``None``, which asyncpg binds as SQL ``NULL``.
+        """
+        mock_pg.fetchone = AsyncMock(
+            return_value={
+                "id": 1,
+                "library_name": "Autechre",
+                "discogs_artist_id": None,
+                "wikidata_qid": "Q378288",
+                "musicbrainz_artist_id": None,
+                "spotify_artist_id": None,
+                "apple_music_artist_id": None,
+                "bandcamp_id": None,
+                "reconciliation_status": "unreconciled",
+            }
+        )
+        await store.upsert_identity(library_name="Autechre")
+        # The bound external-ID args must be exactly None, not "" or any other
+        # falsy value. positional args after `_UPSERT_IDENTITY_SQL` are:
+        #   library_name, discogs_artist_id, wikidata_qid, mb_id, spotify_id,
+        #   apple_id, bandcamp_id
+        args = mock_pg.fetchone.call_args[0]
+        # args[0] is SQL, args[1] is library_name. Indices 2..=7 are the IDs.
+        for bound in args[3:8]:
+            assert bound is None, (
+                f"upsert bound external-ID arg as {bound!r}, expected None to "
+                "preserve COALESCE-skip behavior"
+            )
 
 
 class TestGetIdentity:

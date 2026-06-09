@@ -10,27 +10,11 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from wxyc_etl.pg import to_pg_text_form
+
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
-
-
-def _strip_nul(value: str | None) -> str | None:
-    """Strip U+0000 from a string before any PostgreSQL TEXT op.
-
-    PostgreSQL TEXT cannot carry U+0000 (the SQL standard forbids it;
-    psycopg/asyncpg surface it as ``CharacterNotInRepertoireError``). Per
-    WXYC/docs#18 the org-wide policy is to strip at every PG TEXT boundary —
-    U+0000 in artist metadata is always corruption, never intent. Applied to
-    INSERT/UPDATE writes AND to SELECT-by-name lookups so a caller looking
-    up a value it just upserted finds the stored row.
-
-    Preserves ``None`` so COALESCE-based upserts continue to skip absent
-    fields rather than overwriting them with the empty string. Idempotent.
-    """
-    if value is None:
-        return None
-    return value.replace("\x00", "")
 
 
 @dataclass
@@ -261,9 +245,12 @@ class EntityStore:
         Uses ``ON CONFLICT ... DO UPDATE`` with ``COALESCE`` so that populated
         fields are never overwritten with NULL.
 
-        Every TEXT-bound argument is passed through ``_strip_nul`` before the
-        query — same WX-3.B boundary policy as the read paths in this class
-        (see ``_strip_nul`` for the rationale).
+        Every TEXT-bound argument is passed through
+        ``wxyc_etl.pg.to_pg_text_form`` before the query — same WX-3.B
+        boundary policy as the read paths in this class. The upstream helper
+        preserves ``None`` so the ``COALESCE(EXCLUDED.col, entity.identity.col)``
+        upsert continues to skip absent fields rather than overwriting them
+        with the empty string. See WXYC/docs#18 for the rationale.
 
         Storage note: this method writes ``library_name`` verbatim. The
         bulk-resolve-libraries handler reads via the three-leg
@@ -278,13 +265,13 @@ class EntityStore:
         """
         record = await self._pg.fetchone(
             _UPSERT_IDENTITY_SQL,
-            _strip_nul(library_name),
+            to_pg_text_form(library_name),
             discogs_artist_id,
-            _strip_nul(wikidata_qid),
-            _strip_nul(musicbrainz_artist_id),
-            _strip_nul(spotify_artist_id),
-            _strip_nul(apple_music_artist_id),
-            _strip_nul(bandcamp_id),
+            to_pg_text_form(wikidata_qid),
+            to_pg_text_form(musicbrainz_artist_id),
+            to_pg_text_form(spotify_artist_id),
+            to_pg_text_form(apple_music_artist_id),
+            to_pg_text_form(bandcamp_id),
         )
         if record is None:
             return None
@@ -300,7 +287,7 @@ class EntityStore:
         Returns:
             The matching Identity, or None if not found.
         """
-        record = await self._pg.fetchone(_GET_IDENTITY_SQL, _strip_nul(library_name))
+        record = await self._pg.fetchone(_GET_IDENTITY_SQL, to_pg_text_form(library_name))
         if record is None:
             return None
         return _record_to_identity(record)
@@ -343,7 +330,7 @@ class EntityStore:
         # path for store consumers that don't use this method.
         from identity.normalize import canonicalize_for_identity_lookup
 
-        verbatim = _strip_nul(library_name) or ""
+        verbatim = to_pg_text_form(library_name) or ""
 
         # Leg 1: exact match (verbatim, uses unique index).
         record = await self._pg.fetchone(_GET_IDENTITY_SQL, verbatim)
@@ -387,7 +374,7 @@ class EntityStore:
         Returns:
             List of matching identities (empty list if none or on failure).
         """
-        records = await self._pg.fetchall(_GET_BY_STATUS_SQL, _strip_nul(status))
+        records = await self._pg.fetchall(_GET_BY_STATUS_SQL, to_pg_text_form(status))
         if records is None:
             return []
         return [_record_to_identity(r) for r in records]
@@ -399,7 +386,7 @@ class EntityStore:
             identity_id: The ``entity.identity.id`` to update.
             status: New reconciliation status value.
         """
-        await self._pg.execute(_UPDATE_STATUS_SQL, identity_id, _strip_nul(status))
+        await self._pg.execute(_UPDATE_STATUS_SQL, identity_id, to_pg_text_form(status))
 
     async def get_latest_provenance_by_source(self, identity_id: int) -> dict[str, ProvenanceRow]:
         """Return the most-recent reconciliation_log row per source.
@@ -449,10 +436,10 @@ class EntityStore:
         await self._pg.execute(
             _LOG_RECONCILIATION_SQL,
             identity_id,
-            _strip_nul(source),
-            _strip_nul(external_id),
+            to_pg_text_form(source),
+            to_pg_text_form(external_id),
             confidence,
-            _strip_nul(method),
+            to_pg_text_form(method),
         )
 
     async def fetch_all_identity_library_names(self) -> set[str]:
@@ -478,7 +465,7 @@ class EntityStore:
         Returns the count of ``entity.reconciliation_log`` rows removed.
         Returns 0 (no-op) if no identity row matches ``library_name``.
         """
-        verbatim = _strip_nul(library_name)
+        verbatim = to_pg_text_form(library_name)
         async with self._pg.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(_GET_IDENTITY_SQL, verbatim)
             if row is None:
@@ -520,7 +507,7 @@ class EntityStore:
         the from row, the into row, and the log rows all in their original
         state — never partial.
         """
-        verbatim = _strip_nul(from_name)
+        verbatim = to_pg_text_form(from_name)
         async with self._pg.acquire() as conn, conn.transaction():
             from_row = await conn.fetchrow(_GET_IDENTITY_SQL, verbatim)
             if from_row is None:
@@ -599,7 +586,7 @@ class EntityStore:
         # falls all the way through.
         verbatim_by_input: dict[str, str] = {}
         for raw in names:
-            verbatim_by_input[raw] = _strip_nul(raw) or ""
+            verbatim_by_input[raw] = to_pg_text_form(raw) or ""
 
         results: dict[str, Identity] = {}
 
