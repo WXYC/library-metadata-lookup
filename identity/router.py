@@ -360,6 +360,13 @@ async def resolve_release_identity(
     (→ 422). Per-source sentinel rules (Discogs id ≤ 0, malformed Bandcamp URL)
     run via ``validate_and_canonicalize_external_id`` before any DB write, so
     no poisoned rows can be created.
+
+    Observability: wraps the handler body in an explicit ``http.server`` span
+    and emits entry/exit INFO logs. Same posture as ``bulk_resolve_libraries``
+    above — the FastApiIntegration's automatic transaction is not reliable for
+    ``/api/v1/`` handlers (LML#355 audit), and the explicit span keeps trace-
+    explorer queries like ``op:http.server span.description:*identity/resolve*``
+    accurate when the auto-instrumentation gaps out.
     """
     store = _require_entity_store(entity_store)
 
@@ -370,17 +377,39 @@ async def resolve_release_identity(
     except InvalidReleaseExternalIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from None
 
-    try:
-        identity_id, minted = await store.mint_or_get_release_identity(
-            source=request.source.value, external_id=canonical_external_id
-        )
-    except (PostgresError, OSError):
-        logger.exception(
-            "release-identity resolve failed for source=%r external_id=%r",
-            request.source.value,
-            canonical_external_id,
-        )
-        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
+    source_value = request.source.value
+    logger.info("release-identity resolve start: source=%s", source_value)
+
+    with sentry_sdk.start_span(
+        op="http.server",
+        name="POST /api/v1/identity/resolve",
+    ) as http_span:
+        http_span.set_data("http.method", "POST")
+        http_span.set_data("http.target", "/api/v1/identity/resolve")
+        http_span.set_data("lml.identity_resolve.source", source_value)
+
+        try:
+            identity_id, minted = await store.mint_or_get_release_identity(
+                source=source_value, external_id=canonical_external_id
+            )
+        except (PostgresError, OSError):
+            logger.exception(
+                "release-identity resolve failed for source=%r external_id=%r",
+                source_value,
+                canonical_external_id,
+            )
+            http_span.set_data("http.status_code", 503)
+            raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
+
+        http_span.set_data("lml.identity_resolve.minted", minted)
+        http_span.set_data("http.status_code", 200)
+
+    logger.info(
+        "release-identity resolve complete: source=%s minted=%s identity_id=%d",
+        source_value,
+        minted,
+        identity_id,
+    )
 
     return ReleaseIdentityResolveResponse(
         identity_id=identity_id,

@@ -723,13 +723,17 @@ class EntityStore:
             row = await conn.fetchrow(insert_sql, bind_value)
             if row is not None:
                 identity_id = row["id"]
+                # WX-3.B boundary policy: TEXT-bound arguments at every PG
+                # write must go through to_pg_text_form (see upsert_identity
+                # docstring). Mirrors the wrapping log_release_reconciliation
+                # applies on the public path.
                 await conn.execute(
                     _LOG_RELEASE_RECONCILIATION_SQL,
                     identity_id,
-                    source,
-                    external_id,
+                    to_pg_text_form(source),
+                    to_pg_text_form(external_id),
                     1.0,
-                    "exact_match",
+                    to_pg_text_form("exact_match"),
                 )
                 return identity_id, True
             # Conflict — the row already exists. Read it back.
