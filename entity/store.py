@@ -13,6 +13,11 @@ from typing import Any
 from wxyc_etl.pg import to_pg_text_form
 
 from entity.sources import PgSource
+from identity.release_validation import (
+    RELEASE_SOURCE_COLUMN,
+    InvalidReleaseExternalIdError,
+    coerce_external_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -432,6 +437,32 @@ class EntityStore:
             )
         return result
 
+    async def _execute_log_sql(
+        self,
+        sql: str,
+        identity_id: int,
+        source: str,
+        external_id: str,
+        method: str,
+        confidence: float | None,
+    ) -> None:
+        """Shared wrap-and-execute for the artist and release reconciliation logs.
+
+        Both log tables have the same column shape — ``(identity_id, source,
+        external_id, confidence, method)`` — and both honor WX-3.B (every TEXT
+        bind goes through ``to_pg_text_form``). The only thing that differs is
+        the target table, baked into the SQL constant. Keeping the wrap policy
+        in one place stops the two log entry points from drifting.
+        """
+        await self._pg.execute(
+            sql,
+            identity_id,
+            to_pg_text_form(source),
+            to_pg_text_form(external_id),
+            confidence,
+            to_pg_text_form(method),
+        )
+
     async def log_reconciliation(
         self,
         identity_id: int,
@@ -449,13 +480,13 @@ class EntityStore:
             method: Resolution method used (e.g., ``'exact_match'``, ``'member_group'``).
             confidence: Optional confidence score (0.0 to 1.0).
         """
-        await self._pg.execute(
+        await self._execute_log_sql(
             _LOG_RECONCILIATION_SQL,
             identity_id,
-            to_pg_text_form(source),
-            to_pg_text_form(external_id),
+            source,
+            external_id,
+            method,
             confidence,
-            to_pg_text_form(method),
         )
 
     async def fetch_all_identity_library_names(self) -> set[str]:
@@ -703,11 +734,6 @@ class EntityStore:
             A ``(identity_id, minted)`` tuple. ``minted`` is True only for the
             caller that actually inserted the row.
         """
-        from identity.release_validation import (
-            RELEASE_SOURCE_COLUMN,
-            coerce_external_id,
-        )
-
         column = RELEASE_SOURCE_COLUMN[source]
         bind_value = coerce_external_id(source, external_id)
         # WX-3.B: every TEXT-bound argument at this write boundary goes
@@ -746,10 +772,22 @@ class EntityStore:
                 return identity_id, True
             # Conflict — the row already exists. Read it back.
             row = await conn.fetchrow(select_sql, bind_value)
-            assert row is not None, (
-                "ON CONFLICT DO NOTHING returned no row but the row is also "
-                "not visible to the SELECT — broken UNIQUE constraint?"
-            )
+            if row is None:
+                # The ON CONFLICT DO NOTHING winner committed before we got
+                # here (otherwise our INSERT would still be blocking on the
+                # unique-index lock), so the SELECT *must* find the row. The
+                # only way this is None is a broken UNIQUE constraint — a
+                # schema bug, not a transient DB problem. Raise so it surfaces
+                # as 500 with a clear message rather than a silent 503 that
+                # would mask the underlying schema drift. Explicit raise (not
+                # ``assert``) so the guard survives ``python -O``.
+                raise RuntimeError(
+                    f"release-identity UNIQUE constraint on "
+                    f"entity.release_identity.{column} appears broken: "
+                    f"INSERT ON CONFLICT DO NOTHING returned no row but the "
+                    f"row is not visible to a follow-up SELECT for "
+                    f"bind_value={bind_value!r}."
+                )
             return row["id"], False
 
     async def get_release_identity_by_source(self, source: str, external_id: str) -> int | None:
@@ -762,11 +800,6 @@ class EntityStore:
         applies — a Discogs int-string must already be a positive integer,
         a Bandcamp URL must already match the parser's canonical form).
         """
-        from identity.release_validation import (
-            RELEASE_SOURCE_COLUMN,
-            coerce_external_id,
-        )
-
         column = RELEASE_SOURCE_COLUMN[source]
         bind_value = coerce_external_id(source, external_id)
         # WX-3.B parity with mint_or_get_release_identity — strip NULs from
@@ -794,12 +827,21 @@ class EntityStore:
         ``mint_or_get_release_identity`` for the mint row and exposed for the
         future cross-source join code under LML#207 to write its own evidence
         when two source legs converge on the same release identity.
+
+        Rejects unknown ``source`` values up front. The mint path already runs
+        sources through the router's ``validate_and_canonicalize_external_id``,
+        but ``log_release_reconciliation`` is a public surface for LML#207's
+        joiner — a stray ``'Discogs_Release'`` or typo would otherwise land in
+        the log as a verbatim verbatim string and confuse any ``GROUP BY
+        source`` downstream.
         """
-        await self._pg.execute(
+        if source not in RELEASE_SOURCE_COLUMN:
+            raise InvalidReleaseExternalIdError(f"unknown release-identity source: {source!r}")
+        await self._execute_log_sql(
             _LOG_RELEASE_RECONCILIATION_SQL,
             identity_id,
-            to_pg_text_form(source),
-            to_pg_text_form(external_id),
+            source,
+            external_id,
+            method,
             confidence,
-            to_pg_text_form(method),
         )

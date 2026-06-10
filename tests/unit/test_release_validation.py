@@ -56,7 +56,25 @@ class TestValidateDiscogsRelease:
         with pytest.raises(InvalidReleaseExternalIdError):
             validate_and_canonicalize_external_id("discogs_release", external_id)
 
-    @pytest.mark.parametrize("external_id", ["abc", "12.5", "1e2", "", " ", "1 2"])
+    @pytest.mark.parametrize(
+        "external_id",
+        [
+            "abc",
+            "12.5",
+            "1e2",
+            "",
+            " ",
+            "1 2",
+            # Cases bare int() would silently accept — see _DISCOGS_POSITIVE_INT_RE
+            # comment in identity/release_validation.py for the why.
+            " 12",  # leading whitespace
+            "12 ",  # trailing whitespace
+            "+12",  # leading sign
+            "12_000",  # PEP 515 underscore — int() accepts, would coerce to 12000
+            "012",  # leading zero
+            "0012345",  # leading zeros
+        ],
+    )
     def test_rejects_non_integer(self, external_id):
         with pytest.raises(InvalidReleaseExternalIdError):
             validate_and_canonicalize_external_id("discogs_release", external_id)
@@ -122,6 +140,69 @@ class TestValidateUnknownSource:
     def test_rejects_unknown_source(self):
         with pytest.raises(InvalidReleaseExternalIdError):
             validate_and_canonicalize_external_id("musicbrainz_release", "abc-123")
+
+
+class TestRegistryDriftInvariant:
+    """The set of release sources lives in four places that must stay in sync:
+
+    - ``RELEASE_SOURCE_COLUMN`` (this module).
+    - ``coerce_external_id`` if-chain (this module).
+    - ``ReleaseIdentitySource`` enum in ``generated/api_models.py`` (and the
+      ``wxyc-shared/api.yaml`` source it is generated from).
+    - DDL columns in ``entity/release_identity.sql``.
+
+    If a future PR adds a source to the enum / dict / DDL but forgets one of
+    the other places, the drift would only surface when a real request with
+    that source arrived. These tests make the drift fail at CI time.
+    """
+
+    def test_release_source_column_keys_match_pydantic_enum(self):
+        from generated.api_models import ReleaseIdentitySource
+
+        enum_values = {member.value for member in ReleaseIdentitySource}
+        assert enum_values == set(RELEASE_SOURCE_COLUMN.keys()), (
+            f"ReleaseIdentitySource enum ({enum_values}) and "
+            f"RELEASE_SOURCE_COLUMN dict ({set(RELEASE_SOURCE_COLUMN.keys())}) "
+            f"disagree. Adding a release source means updating both — and the "
+            f"DDL in entity/release_identity.sql and a sentinel rule in "
+            f"identity/release_validation.py."
+        )
+
+    def test_release_source_columns_match_ddl(self):
+        # The DDL in entity/release_identity.sql is the canonical column
+        # set. Cross-check that every column RELEASE_SOURCE_COLUMN points at
+        # actually appears in the DDL — a typo or rename in either side
+        # would otherwise silently produce a ``column does not exist`` PG
+        # error only on first mint of that source.
+        from pathlib import Path
+
+        ddl_path = Path(__file__).resolve().parent.parent.parent / "entity" / "release_identity.sql"
+        ddl = ddl_path.read_text()
+        for source, column in RELEASE_SOURCE_COLUMN.items():
+            assert column in ddl, (
+                f"RELEASE_SOURCE_COLUMN[{source!r}] = {column!r} but that "
+                f"column does not appear in entity/release_identity.sql"
+            )
+
+    def test_every_dict_entry_has_a_validator_branch(self):
+        # Exercise validate_and_canonicalize_external_id once per source
+        # with a clearly-shaped good input — if a new source is added to
+        # RELEASE_SOURCE_COLUMN without a sentinel rule, the defensive
+        # raise at the end of the validator fires here and tells the
+        # author exactly what to add next.
+        good_inputs = {
+            "discogs_release": "12345",
+            "discogs_master": "789",
+            "bandcamp": "https://autechre.bandcamp.com/album/confield",
+        }
+        for source in RELEASE_SOURCE_COLUMN:
+            assert source in good_inputs, (
+                f"New source {source!r} added to RELEASE_SOURCE_COLUMN — "
+                f"add a good-input case to this test so the validator "
+                f"branch gets exercised."
+            )
+            # Should not raise.
+            validate_and_canonicalize_external_id(source, good_inputs[source])
 
 
 class TestCoerceExternalId:
