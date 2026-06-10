@@ -361,12 +361,15 @@ async def resolve_release_identity(
     run via ``validate_and_canonicalize_external_id`` before any DB write, so
     no poisoned rows can be created.
 
-    Observability: wraps the handler body in an explicit ``http.server`` span
-    and emits entry/exit INFO logs. Same posture as ``bulk_resolve_libraries``
+    Observability: emits entry/exit INFO logs and wraps the store call in an
+    explicit ``http.server`` span. Same posture as ``bulk_resolve_libraries``
     above — the FastApiIntegration's automatic transaction is not reliable for
     ``/api/v1/`` handlers (LML#355 audit), and the explicit span keeps trace-
     explorer queries like ``op:http.server span.description:*identity/resolve*``
-    accurate when the auto-instrumentation gaps out.
+    accurate when the auto-instrumentation gaps out. The entry log fires
+    before the span opens so a hang inside the store call still leaves a log
+    trace; the exit log fires after the span closes so its timestamp reflects
+    span completion.
     """
     store = _require_entity_store(entity_store)
 
