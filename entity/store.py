@@ -115,6 +115,22 @@ INSERT INTO entity.reconciliation_log (identity_id, source, external_id, confide
 VALUES ($1, $2, $3, $4, $5)\
 """
 
+# --- release-identity (LML#526) ---------------------------------------------
+#
+# These run against the parallel `entity.release_identity` /
+# `entity.release_reconciliation_log` tables. Schema lives in
+# `entity/release_identity.sql` (and on prod via the sibling discogs-cache
+# PR). The per-source `UNIQUE` constraint on each external-id column is what
+# makes the mint protocol concurrency-safe: two concurrent inserts with the
+# same bind value race on the unique index, one wins with RETURNING id, the
+# other gets DO NOTHING and falls through to the SELECT below.
+
+_LOG_RELEASE_RECONCILIATION_SQL = """\
+INSERT INTO entity.release_reconciliation_log
+    (identity_id, source, external_id, confidence, method)
+VALUES ($1, $2, $3, $4, $5)\
+"""
+
 # Shared merge / delete primitives. Used both by `EntityDeduplicator.merge_group`
 # (for QID-collapse merges) and by the LML#377 orphan-pass helpers
 # `merge_identity_by_library_name` / `delete_identity_by_library_name`. Hoisted
@@ -655,3 +671,119 @@ class EntityStore:
                 results[raw_name] = leg_3_by_lib[canonical]
 
         return results
+
+    # ------------------------------------------------------------------ #
+    # Release identity (LML#526).
+    # ------------------------------------------------------------------ #
+
+    async def mint_or_get_release_identity(self, source: str, external_id: str) -> tuple[int, bool]:
+        """Mint a new ``entity.release_identity`` row, or return the existing one.
+
+        Idempotent: the same ``(source, external_id)`` pair always resolves to
+        the same identity_id; only the first call mints, subsequent calls
+        return ``(id, minted=False)`` and write nothing.
+
+        Concurrency-safe: per-source ``UNIQUE`` constraints on the identity
+        table make ``INSERT ... ON CONFLICT DO NOTHING RETURNING id`` win or
+        lose atomically. The fallback ``SELECT`` is reached only by the loser,
+        which sees the winner's row inside the same transaction.
+
+        The caller is expected to pass an ``external_id`` that has already been
+        validated by ``identity.release_validation.validate_and_canonicalize_external_id``
+        — sentinel rejection happens *before* this method runs so no poisoned
+        rows can be minted.
+
+        Args:
+            source: One of ``RELEASE_SOURCE_COLUMN``'s keys.
+            external_id: Already-canonicalised external identifier (positive
+                integer-shaped string for Discogs sources, canonical Bandcamp
+                album URL for ``bandcamp``).
+
+        Returns:
+            A ``(identity_id, minted)`` tuple. ``minted`` is True only for the
+            caller that actually inserted the row.
+        """
+        from identity.release_validation import (
+            RELEASE_SOURCE_COLUMN,
+            coerce_external_id,
+        )
+
+        column = RELEASE_SOURCE_COLUMN[source]
+        bind_value = coerce_external_id(source, external_id)
+
+        # Column name is interpolated from a closed dict so this is not a
+        # SQL-injection surface — but keep the bind value parameterised.
+        insert_sql = (
+            f"INSERT INTO entity.release_identity ({column}) VALUES ($1) "
+            f"ON CONFLICT ({column}) DO NOTHING RETURNING id"
+        )
+        select_sql = f"SELECT id FROM entity.release_identity WHERE {column} = $1"
+
+        async with self._pg.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(insert_sql, bind_value)
+            if row is not None:
+                identity_id = row["id"]
+                await conn.execute(
+                    _LOG_RELEASE_RECONCILIATION_SQL,
+                    identity_id,
+                    source,
+                    external_id,
+                    1.0,
+                    "exact_match",
+                )
+                return identity_id, True
+            # Conflict — the row already exists. Read it back.
+            row = await conn.fetchrow(select_sql, bind_value)
+            assert row is not None, (
+                "ON CONFLICT DO NOTHING returned no row but the row is also "
+                "not visible to the SELECT — broken UNIQUE constraint?"
+            )
+            return row["id"], False
+
+    async def get_release_identity_by_source(self, source: str, external_id: str) -> int | None:
+        """Look up an existing ``entity.release_identity`` row by source+id.
+
+        Returns ``None`` if no row matches. Pure read — never mints.
+
+        Caller is responsible for having canonicalised ``external_id`` via
+        ``identity.release_validation`` (the same coercion the mint path
+        applies — a Discogs int-string must already be a positive integer,
+        a Bandcamp URL must already match the parser's canonical form).
+        """
+        from identity.release_validation import (
+            RELEASE_SOURCE_COLUMN,
+            coerce_external_id,
+        )
+
+        column = RELEASE_SOURCE_COLUMN[source]
+        bind_value = coerce_external_id(source, external_id)
+        sql = f"SELECT id FROM entity.release_identity WHERE {column} = $1"
+        row = await self._pg.fetchone(sql, bind_value)
+        if row is None:
+            return None
+        return row["id"]
+
+    async def log_release_reconciliation(
+        self,
+        identity_id: int,
+        source: str,
+        external_id: str,
+        method: str,
+        confidence: float | None = None,
+    ) -> None:
+        """Record a release-side reconciliation attempt.
+
+        Parallel to ``log_reconciliation`` but writes to
+        ``entity.release_reconciliation_log``. Used internally by
+        ``mint_or_get_release_identity`` for the mint row and exposed for the
+        future cross-source join code under LML#207 to write its own evidence
+        when two source legs converge on the same release identity.
+        """
+        await self._pg.execute(
+            _LOG_RELEASE_RECONCILIATION_SQL,
+            identity_id,
+            to_pg_text_form(source),
+            to_pg_text_form(external_id),
+            confidence,
+            to_pg_text_form(method),
+        )

@@ -1026,6 +1026,37 @@ class BulkResolveLibrariesResponse(BaseModel):
     cache_stats: CacheStats | None = None
 
 
+class IdentityKind(StrEnum):
+    release = "release"
+
+
+class ReleaseIdentitySource(StrEnum):
+    discogs_release = "discogs_release"
+    discogs_master = "discogs_master"
+    bandcamp = "bandcamp"
+
+
+class ReleaseIdentityResolveRequest(BaseModel):
+    kind: IdentityKind
+    source: ReleaseIdentitySource
+    external_id: str = Field(
+        ...,
+        description="Source-specific identifier. For `discogs_release` / `discogs_master` it is the positive integer ID as a string; zero and negative values are rejected with 422 (Discogs uses `0` for the unknown-release sentinel). For `bandcamp` it is the canonical album URL (e.g. `https://autechre.bandcamp.com/album/confield`); LML URL-canonicalises before mint so trailing-slash and equivalent variants converge on one identity row. Non-album Bandcamp URLs (track URLs, bare subdomain) are rejected with 422.\n",
+    )
+
+
+class ReleaseIdentityResolveResponse(BaseModel):
+    identity_id: int = Field(
+        ...,
+        description="`entity.release_identity.id` for the resolved row. Stable across calls with the same `(kind, source, external_id)`.\n",
+    )
+    kind: IdentityKind
+    minted: bool = Field(
+        ...,
+        description="`true` when this call inserted a new row, `false` when an existing row was returned. Useful for callers that want to observe whether they were the first to surface a given release.\n",
+    )
+
+
 class ArtistSearchAliasSource(StrEnum):
     discogs_name_variation = "discogs_name_variation"
     discogs_alias = "discogs_alias"
