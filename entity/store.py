@@ -832,8 +832,17 @@ class EntityStore:
         sources through the router's ``validate_and_canonicalize_external_id``,
         but ``log_release_reconciliation`` is a public surface for LML#207's
         joiner — a stray ``'Discogs_Release'`` or typo would otherwise land in
-        the log as a verbatim verbatim string and confuse any ``GROUP BY
-        source`` downstream.
+        the log as a verbatim string and confuse any ``GROUP BY source``
+        downstream.
+
+        Raises:
+            InvalidReleaseExternalIdError: When ``source`` is not a key in
+                ``RELEASE_SOURCE_COLUMN``. This is a programmer error and is
+                **not** a subclass of ``asyncpg.PostgresError`` or
+                ``OSError`` — callers wrapping this method in
+                ``except (PostgresError, OSError)`` will let it escape as a
+                500. Map it to 422 (or surface it as a programmer-visible
+                crash) explicitly.
         """
         if source not in RELEASE_SOURCE_COLUMN:
             raise InvalidReleaseExternalIdError(f"unknown release-identity source: {source!r}")
