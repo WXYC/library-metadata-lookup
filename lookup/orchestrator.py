@@ -1284,9 +1284,15 @@ async def search_compilations_for_track(
                 album_fallback_response, album_fallback_error = probe_tuple
             raw_releases = list(response.releases or [])
 
-            # Only merge VA results if the artist-scoped search found no compilations
-            has_compilation = any(r.is_compilation for r in raw_releases)
-            if not has_compilation:
+            # Only merge VA results if Wave A already surfaced a *true V/A* hit.
+            # Gating on ``r.is_compilation`` alone (Discogs's ``format=Compilation``
+            # flag) over-suppresses: single-artist retrospectives are flagged
+            # ``Compilation`` too, but they are not V/A and Wave B is the only
+            # probe that surfaces real V/A releases. See WXYC#527.
+            has_va_compilation = any(
+                r.is_compilation and is_compilation_artist(r.artist or "") for r in raw_releases
+            )
+            if not has_va_compilation:
                 seen_album_keys = {r.album.lower() for r in raw_releases}
                 for r in va_response.releases or []:
                     if r.is_compilation and r.album.lower() not in seen_album_keys:
