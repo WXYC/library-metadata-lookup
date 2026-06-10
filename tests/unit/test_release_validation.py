@@ -204,6 +204,29 @@ class TestRegistryDriftInvariant:
             # Should not raise.
             validate_and_canonicalize_external_id(source, good_inputs[source])
 
+    def test_every_dict_entry_has_a_coerce_branch(self):
+        # Sibling of the validator-branch check above, but for
+        # coerce_external_id — the fourth of the "four places" the class
+        # docstring names. If a new source is added to RELEASE_SOURCE_COLUMN
+        # without a coerce if-branch, the explicit RuntimeError at the end
+        # of coerce_external_id fires here at CI time rather than at
+        # first-real-request time.
+        canonical_inputs = {
+            "discogs_release": "12345",
+            "discogs_master": "789",
+            "bandcamp": "https://autechre.bandcamp.com/album/confield",
+        }
+        for source in RELEASE_SOURCE_COLUMN:
+            assert source in canonical_inputs, (
+                f"New source {source!r} added to RELEASE_SOURCE_COLUMN — "
+                f"add a canonical-input case to this test so the coerce "
+                f"branch gets exercised."
+            )
+            # Should not raise; specifically, must not hit the
+            # "no branch for source=..." RuntimeError at the bottom of
+            # coerce_external_id.
+            coerce_external_id(source, canonical_inputs[source])
+
 
 class TestCoerceExternalId:
     """The store binds ints to INTEGER columns and strings to TEXT columns."""
