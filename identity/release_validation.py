@@ -20,7 +20,18 @@ The flow is:
 
 from __future__ import annotations
 
+import re
+
 from release.url_parser import parse_url
+
+# Strict positive-decimal-integer match. Forbids leading sign / whitespace /
+# underscores / leading zeros — bare ``int()`` quietly accepts ``" 12 "``,
+# ``"+12"`` and ``"12_000"`` (PEP 515), which would coerce to a different
+# Discogs release ID than the caller meant and the reconciliation log row
+# would carry the verbatim non-canonical string. ``[1-9][0-9]*`` also
+# rejects ``"0"`` so the dedicated sentinel error message below stays the
+# only path that explains the Discogs ``0`` placeholder.
+_DISCOGS_POSITIVE_INT_RE = re.compile(r"[1-9][0-9]*")
 
 # Map a release-identity source key to the ``entity.release_identity`` column
 # that holds its external ID. The set here is the v1 source list from LML#526;
@@ -43,21 +54,24 @@ class InvalidReleaseExternalIdError(ValueError):
 
 
 def _validate_discogs_positive_int(source: str, external_id: str) -> str:
-    """Discogs release/master IDs: positive integer, rejecting the ``0`` sentinel.
+    """Discogs release/master IDs: positive decimal integer, rejecting ``0``.
 
     Discogs uses ``0`` to mark the unknown-release / unknown-master placeholder.
-    Negative IDs are never valid. Returns the input verbatim on success.
+    Negative IDs are never valid. The match against ``[1-9][0-9]*`` is strict —
+    leading signs (``"+12"``), whitespace (``" 12 "``), and PEP 515 underscore
+    separators (``"12_000"``) are all rejected, because bare ``int()`` would
+    silently accept them and coerce to a *different* Discogs release than the
+    caller meant. Returns the input verbatim on success.
     """
-    try:
-        value = int(external_id)
-    except (TypeError, ValueError) as e:
+    if external_id == "0":
         raise InvalidReleaseExternalIdError(
-            f"{source} external_id must be a positive integer, got {external_id!r}"
-        ) from e
-    if value <= 0:
+            f"{source} external_id must be > 0; 0 is the Discogs unknown-release sentinel."
+        )
+    if not _DISCOGS_POSITIVE_INT_RE.fullmatch(external_id):
         raise InvalidReleaseExternalIdError(
-            f"{source} external_id must be > 0 (got {value}); "
-            f"0 is the Discogs unknown-release sentinel."
+            f"{source} external_id must be a positive decimal integer "
+            f"(digits only, no leading sign / whitespace / underscores / "
+            f"leading zeros), got {external_id!r}"
         )
     return external_id
 
@@ -118,6 +132,15 @@ def coerce_external_id(source: str, external_id: str) -> int | str:
     column = RELEASE_SOURCE_COLUMN[source]
     if source in ("discogs_release", "discogs_master"):
         return int(external_id)
-    # column ends in _url / _id for bandcamp_album_url; stays as str.
-    assert column == "bandcamp_album_url"
+    if column != "bandcamp_album_url":
+        # A new TEXT-bound source was added to RELEASE_SOURCE_COLUMN but the
+        # if-chain above and below were not extended. Raising explicitly
+        # (rather than a bare `assert`) keeps the guard intact under
+        # ``python -O``, which strips asserts. Programmer error — pydantic
+        # and validate_and_canonicalize_external_id both block this upstream,
+        # so end users never see it.
+        raise RuntimeError(
+            f"coerce_external_id has no branch for source={source!r} "
+            f"(column={column!r}); add it alongside the RELEASE_SOURCE_COLUMN entry."
+        )
     return external_id

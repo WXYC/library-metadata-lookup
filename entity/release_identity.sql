@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS entity.release_identity (
     bandcamp_album_url TEXT UNIQUE,
     reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- updated_at currently always equals created_at — the v1 mint protocol
+    -- never updates an existing row, only conflict-fallthrough-SELECTs it.
+    -- LML#207's cross-source joiner and the upcoming reconciliation_status
+    -- writer will start touching this; until then a poller that watches it
+    -- for change detection will see no signal beyond the original mint.
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -40,3 +45,12 @@ CREATE TABLE IF NOT EXISTS entity.release_reconciliation_log (
     method TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Postgres does not auto-index the referencing column of a FK — only the
+-- PK on the parent table. Every `WHERE identity_id = $1` lookup (LML#207's
+-- joiner, every audit query) will seq-scan without this index, and the
+-- table grows one row per mint. Add it up front; the artist-side
+-- reconciliation_log on the production discogs-etl schema has the
+-- equivalent index.
+CREATE INDEX IF NOT EXISTS idx_release_reconciliation_log_identity_id
+    ON entity.release_reconciliation_log(identity_id);

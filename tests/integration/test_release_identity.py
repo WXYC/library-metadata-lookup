@@ -115,6 +115,12 @@ async def set_up_entity_schema(pg_pool):
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
         """)
+        # Mirrors the production DDL in entity/release_identity.sql so the
+        # fixture has the same query-plan shape as prod.
+        await conn.execute(
+            "CREATE INDEX idx_release_reconciliation_log_identity_id "
+            "ON entity.release_reconciliation_log(identity_id)"
+        )
     yield
     async with pg_pool.acquire() as conn:
         await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
@@ -197,6 +203,20 @@ class TestReleaseIdentityStore:
             identity_id,
         )
         assert row["bandcamp_album_url"] == url
+        # The Bandcamp mint path must also write a reconciliation log row
+        # with the canonical URL — symmetric with the Discogs assertions in
+        # test_mint_creates_row_and_logs_reconciliation, but exercising the
+        # TEXT-bound bind path that the Discogs case does not.
+        logs = await pg_source.fetchall(
+            "SELECT source, external_id, method, confidence "
+            "FROM entity.release_reconciliation_log WHERE identity_id = $1",
+            identity_id,
+        )
+        assert len(logs) == 1
+        assert logs[0]["source"] == "bandcamp"
+        assert logs[0]["external_id"] == url
+        assert logs[0]["method"] == "exact_match"
+        assert logs[0]["confidence"] == pytest.approx(1.0)
 
     @pytest.mark.asyncio
     async def test_get_release_identity_by_source_hits_existing_row(self, pg_source):
