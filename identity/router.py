@@ -26,6 +26,8 @@ from entity.store import EntityStore, Identity
 from generated.api_models import (
     BulkResolveLibrariesRequest,
     BulkResolveLibrariesResponse,
+    ReleaseIdentityResolveRequest,
+    ReleaseIdentityResolveResponse,
 )
 from identity.bulk_resolve import compilation_result, compose_for_identity
 from identity.dependencies import get_entity_store
@@ -33,6 +35,10 @@ from identity.models import (
     BulkIdentityRequest,
     BulkIdentityResponse,
     IdentityResponse,
+)
+from identity.release_validation import (
+    InvalidReleaseExternalIdError,
+    validate_and_canonicalize_external_id,
 )
 
 # Lazy imports inside the handler:
@@ -330,3 +336,54 @@ async def bulk_resolve_libraries(
         http_span.set_data("http.status_code", 200)
 
     return BulkResolveLibrariesResponse(results=results)
+
+
+@api_v1_router.post(
+    "/identity/resolve",
+    response_model=ReleaseIdentityResolveResponse,
+    summary="Mint or resolve a stable identity for a release",
+    responses={
+        200: {"description": "Identity resolved (minted or pre-existing)."},
+        401: {"description": "Missing or invalid `LML_API_KEY` bearer token."},
+        422: {"description": "Sentinel input rejected before any DB write."},
+        503: {"description": "Entity store not available."},
+    },
+)
+async def resolve_release_identity(
+    request: ReleaseIdentityResolveRequest,
+    entity_store: EntityStore | None = Depends(get_entity_store),
+) -> ReleaseIdentityResolveResponse:
+    """Mint or look up an ``entity.release_identity`` row from `(source, external_id)`.
+
+    Idempotent — same input always returns the same ``identity_id``; only the
+    first call mints. Pydantic rejects unknown ``kind`` / ``source`` upstream
+    (→ 422). Per-source sentinel rules (Discogs id ≤ 0, malformed Bandcamp URL)
+    run via ``validate_and_canonicalize_external_id`` before any DB write, so
+    no poisoned rows can be created.
+    """
+    store = _require_entity_store(entity_store)
+
+    try:
+        canonical_external_id = validate_and_canonicalize_external_id(
+            request.source.value, request.external_id
+        )
+    except InvalidReleaseExternalIdError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from None
+
+    try:
+        identity_id, minted = await store.mint_or_get_release_identity(
+            source=request.source.value, external_id=canonical_external_id
+        )
+    except (PostgresError, OSError):
+        logger.exception(
+            "release-identity resolve failed for source=%r external_id=%r",
+            request.source.value,
+            canonical_external_id,
+        )
+        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
+
+    return ReleaseIdentityResolveResponse(
+        identity_id=identity_id,
+        kind=request.kind,
+        minted=minted,
+    )
