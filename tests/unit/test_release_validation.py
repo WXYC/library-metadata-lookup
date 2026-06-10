@@ -207,10 +207,18 @@ class TestRegistryDriftInvariant:
     def test_every_dict_entry_has_a_coerce_branch(self):
         # Sibling of the validator-branch check above, but for
         # coerce_external_id — the fourth of the "four places" the class
-        # docstring names. If a new source is added to RELEASE_SOURCE_COLUMN
-        # without a coerce if-branch, the explicit RuntimeError at the end
-        # of coerce_external_id fires here at CI time rather than at
-        # first-real-request time.
+        # docstring names. Two failure modes are covered:
+        #
+        # 1. A new source key was added to RELEASE_SOURCE_COLUMN but no
+        #    canonical input was added here — the assert fires with the
+        #    message below, telling the author exactly what's missing.
+        # 2. The author did update canonical_inputs, but coerce_external_id
+        #    has no matching if-branch — the explicit RuntimeError at the
+        #    bottom of coerce_external_id fires below, telling the author
+        #    to wire the branch.
+        #
+        # Either way the drift is caught at CI time, not at first-request
+        # time in prod.
         canonical_inputs = {
             "discogs_release": "12345",
             "discogs_master": "789",
@@ -222,9 +230,8 @@ class TestRegistryDriftInvariant:
                 f"add a canonical-input case to this test so the coerce "
                 f"branch gets exercised."
             )
-            # Should not raise; specifically, must not hit the
-            # "no branch for source=..." RuntimeError at the bottom of
-            # coerce_external_id.
+            # Will hit the "no branch for source=..." RuntimeError if
+            # coerce_external_id has no matching if-branch for this source.
             coerce_external_id(source, canonical_inputs[source])
 
 
