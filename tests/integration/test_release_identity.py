@@ -415,19 +415,25 @@ class TestReleaseIdentityResolveEndpoint:
     @pytest.mark.asyncio
     async def test_requires_auth_when_enabled(self, monkeypatch, app_client):
         """With LML_REQUIRE_AUTH=true and no header, the endpoint returns 401."""
-        import core.auth as auth_module  # noqa: F401  (kept for namespace)
         from config.settings import get_settings
 
         monkeypatch.setenv("LML_REQUIRE_AUTH", "true")
         monkeypatch.setenv("LML_API_KEY", "sekret")
+        # get_settings is @lru_cache'd — clear before the test sees the new
+        # env, and again after, so a later test that re-imports the cache
+        # doesn't pick up the LML_REQUIRE_AUTH=true settings from this one's
+        # warm cache. monkeypatch restores the env var on teardown, but the
+        # cache entry it primed survives unless we clear it here.
         get_settings.cache_clear()
-
-        resp = await app_client.post(
-            "/api/v1/identity/resolve",
-            json={
-                "kind": "release",
-                "source": "discogs_release",
-                "external_id": "12345",
-            },
-        )
-        assert resp.status_code == 401
+        try:
+            resp = await app_client.post(
+                "/api/v1/identity/resolve",
+                json={
+                    "kind": "release",
+                    "source": "discogs_release",
+                    "external_id": "12345",
+                },
+            )
+            assert resp.status_code == 401
+        finally:
+            get_settings.cache_clear()
