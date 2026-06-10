@@ -710,6 +710,14 @@ class EntityStore:
 
         column = RELEASE_SOURCE_COLUMN[source]
         bind_value = coerce_external_id(source, external_id)
+        # WX-3.B: every TEXT-bound argument at this write boundary goes
+        # through to_pg_text_form. coerce_external_id returns int for Discogs
+        # sources (passed straight to an INTEGER column) and str for Bandcamp
+        # (TEXT). Wrap the str case so the INSERT, the conflict-fallthrough
+        # SELECT, and the reconciliation log all see the same NUL-stripped
+        # form — same posture as upsert_identity's docstring documents.
+        if isinstance(bind_value, str):
+            bind_value = to_pg_text_form(bind_value)
 
         # Column name is interpolated from a closed dict so this is not a
         # SQL-injection surface — but keep the bind value parameterised.
@@ -761,6 +769,10 @@ class EntityStore:
 
         column = RELEASE_SOURCE_COLUMN[source]
         bind_value = coerce_external_id(source, external_id)
+        # WX-3.B parity with mint_or_get_release_identity — strip NULs from
+        # the TEXT-bound case so the lookup hits the same row the mint wrote.
+        if isinstance(bind_value, str):
+            bind_value = to_pg_text_form(bind_value)
         sql = f"SELECT id FROM entity.release_identity WHERE {column} = $1"
         row = await self._pg.fetchone(sql, bind_value)
         if row is None:
