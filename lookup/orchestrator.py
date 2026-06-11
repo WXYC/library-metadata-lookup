@@ -112,6 +112,28 @@ refs each still leave headroom for the read path.
 _warm_cache_semaphore: asyncio.Semaphore | None = None
 """Lazily-constructed (needs a running event loop). Re-bind on the first call."""
 
+_SONG_AS_TRACK_VALIDATE_CONCURRENCY: int = 5
+"""Per-request cap on concurrent ``validate_track_on_release`` calls inside
+``search_song_as_track``.
+
+The original SONG_AS_TRACK loop (commit ``2c913da``) awaited
+``validate_track_on_release`` once per Discogs candidate serially. With ~7
+candidates per lookup at ~1.2s each, that's an 8-10s serial chain on the
+``/api/v1/lookup`` p95/p99 hot path — the dominant slow path identified in
+the early-May regression review. Compounding: when the PG cache write path
+is degraded (Sentry LIBRARY-METADATA-LOOKUP-9), most validate calls fall
+through to the live Discogs API, amplifying the cost further.
+
+Sized to match the global Discogs semaphore in ``discogs/service.py``
+(``get_semaphore()`` returns a 5-permit semaphore — see
+``_request_with_retry``'s comment at line 377). The orchestrator-local
+semaphore here gates *fan-out per request*; the global rate limiter +
+semaphore in ``discogs/service.py`` sits underneath and gates *cross-request
+total load*. The two are compatible: a single request fans out up to 5
+validate tasks; the global limiter then serializes their underlying HTTP
+calls when concurrent requests stack up.
+"""
+
 _ProbeResult = TrackReleasesResponse | tuple[TrackReleasesResponse | None, str | None]
 """Heterogeneous return type for the gathered probes in ``search_compilations_for_track``.
 
@@ -903,19 +925,31 @@ async def search_song_as_track(
     matched_items: list[LibraryItem] = []
     matched_via_by_id: dict[int, list[TrackMatchHint]] = {}
 
-    for release in raw_releases:
+    # Bound per-request fan-out. The global Discogs rate limiter sits
+    # underneath this semaphore — see _SONG_AS_TRACK_VALIDATE_CONCURRENCY.
+    semaphore = asyncio.Semaphore(_SONG_AS_TRACK_VALIDATE_CONCURRENCY)
+
+    async def _validate_one(release: ReleaseInfo) -> list[LibraryItem] | None:
+        """Library-match + validate one Discogs release.
+
+        Returns the list of eligible library rows for this release when the
+        track is validated on it, or None when the release should be dropped
+        (too-short album title, no library hits, no eligible rows, or
+        validation rejected). Order-preserving dedup happens in the caller's
+        post-gather walk; this helper is order-agnostic.
+        """
         if not release.album or len(release.album.strip()) < 3:
-            continue
+            return None
 
         matches = await search_album_fuzzy(db, release.album)
         if not matches and release.is_compilation:
             matches = await search_album_fuzzy(db, f"Various {release.album}")
         if not matches:
-            continue
+            return None
 
         eligible = [m for m in matches if _release_matches_library_row(release, m)]
         if not eligible:
-            continue
+            return None
 
         # Validate the track actually appears on this release before surfacing
         # — Discogs's release-search index is keyword-driven and returns hits
@@ -923,23 +957,40 @@ async def search_song_as_track(
         # after library matching so we only pay the API cost for releases we'd
         # actually return, mirroring search_compilations_for_track.
         if release.release_id:
-            _validation_start = time.monotonic()
-            is_valid = await discogs_service.validate_track_on_release(
-                release.release_id, song, release.artist
-            )
-            _log_track_validation(
-                source="song_as_track",
-                release_id=release.release_id,
-                song=song,
-                artist=release.artist,
-                verdict=is_valid,
-                latency_ms=(time.monotonic() - _validation_start) * 1000,
-            )
+            async with semaphore:
+                _validation_start = time.monotonic()
+                is_valid = await discogs_service.validate_track_on_release(
+                    release.release_id, song, release.artist
+                )
+                _log_track_validation(
+                    source="song_as_track",
+                    release_id=release.release_id,
+                    song=song,
+                    artist=release.artist,
+                    verdict=is_valid,
+                    latency_ms=(time.monotonic() - _validation_start) * 1000,
+                )
             if not is_valid:
                 logger.debug(
                     f"SONG_AS_TRACK: skipping '{release.album}' — track not validated on release"
                 )
-                continue
+                return None
+
+        return eligible
+
+    # Fan out per-release library-match + validation. Order preservation comes
+    # from the post-gather walk below, NOT from gather's completion order —
+    # ``asyncio.gather(..., return_exceptions=False)`` does preserve the input
+    # order of *results*, but accumulating into ``matched_items`` /
+    # ``matched_via_by_id`` in input-index order is what guarantees that a
+    # later release's hint never gets recorded before an earlier release's.
+    per_release_eligible = await asyncio.gather(
+        *[_validate_one(release) for release in raw_releases]
+    )
+
+    for release, eligible in zip(raw_releases, per_release_eligible, strict=True):
+        if eligible is None:
+            continue
 
         for item in eligible:
             hint = TrackMatchHint(
