@@ -1916,6 +1916,299 @@ class TestSearchSongAsTrack:
         queries = [call.kwargs["query"] for call in db.search.await_args_list]
         assert any(q.startswith("Various ") for q in queries)
 
+    @pytest.mark.asyncio
+    async def test_validate_track_calls_run_concurrently(self):
+        """The per-release validate_track_on_release calls must run concurrently.
+
+        Early-May regression: the original SONG_AS_TRACK loop awaited
+        ``validate_track_on_release`` per release serially. With ~7 candidates
+        per lookup at ~1.2s each, that's an 8-10s serial chain on the
+        ``/api/v1/lookup`` p95/p99 hot path. This test pins the parallelization:
+        with 5 candidates each sleeping 200ms, the wall time must be much closer
+        to 200ms than to 1000ms (5 * 200ms).
+        """
+        import asyncio as _asyncio
+        import time as _time
+
+        db = AsyncMock()
+        releases = [
+            DiscogsReleaseInfo(
+                album=f"Album {i}",
+                artist=f"Artist {i}",
+                release_id=1000 + i,
+                release_url=f"https://discogs.com/release/{1000 + i}",
+                is_compilation=False,
+            )
+            for i in range(5)
+        ]
+        # All library rows must match all releases (per the
+        # release_matches_library_row predicate's artist prefix match) so the
+        # validate step actually fires for every release.
+        items = [
+            make_library_item(id=2000 + i, artist=f"Artist {i}", title=f"Album {i}")
+            for i in range(5)
+        ]
+
+        async def search_side_effect(query, **kwargs):
+            # Library FTS returns the row whose title matches the album query.
+            for item in items:
+                if (item.title or "").lower() == query.lower():
+                    return [item]
+            return []
+
+        db.search.side_effect = search_side_effect
+
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="t", releases=releases, total=len(releases)
+        )
+
+        async def slow_validate(release_id, track, artist):
+            await _asyncio.sleep(0.2)
+            return True
+
+        svc.validate_track_on_release.side_effect = slow_validate
+
+        start = _time.perf_counter()
+        results, _matched_via = await search_song_as_track(db, "t", discogs_service=svc)
+        elapsed = _time.perf_counter() - start
+
+        # Serial would be ~1.0s; concurrent should be ~0.2s. The 0.5s ceiling
+        # gives headroom for scheduler jitter while still catching a serial
+        # regression with comfortable margin.
+        assert elapsed < 0.5, (
+            f"validate_track_on_release calls ran serially "
+            f"(elapsed={elapsed:.3f}s, expected near 0.2s)"
+        )
+        # All releases validated true, so all rows surface (capped at MAX_SEARCH_RESULTS).
+        assert len(results) >= 1
+
+    @pytest.mark.asyncio
+    async def test_output_order_follows_input_not_completion(self):
+        """Output ``matched_items`` order must follow input order, not completion order.
+
+        Discogs returns its release-search candidates pre-sorted by relevance,
+        so the surfaced library rows must preserve that relevance ranking even
+        when the underlying validate calls finish out-of-order. With releases
+        A (slow validate, valid), B (fast validate, invalid), C (medium
+        validate, valid), the output must be [A_row, C_row] — not [C_row]
+        alone, not [C_row, A_row].
+        """
+        import asyncio as _asyncio
+
+        item_a = make_library_item(id=101, artist="Artist A", title="Album A")
+        item_c = make_library_item(id=103, artist="Artist C", title="Album C")
+        item_b = make_library_item(id=102, artist="Artist B", title="Album B")
+
+        db = AsyncMock()
+
+        async def search_side_effect(query, **kwargs):
+            q = query.lower()
+            if "album a" in q:
+                return [item_a]
+            if "album b" in q:
+                return [item_b]
+            if "album c" in q:
+                return [item_c]
+            return []
+
+        db.search.side_effect = search_side_effect
+
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="t",
+            releases=[
+                DiscogsReleaseInfo(
+                    album="Album A",
+                    artist="Artist A",
+                    release_id=1,
+                    release_url="https://discogs.com/release/1",
+                    is_compilation=False,
+                ),
+                DiscogsReleaseInfo(
+                    album="Album B",
+                    artist="Artist B",
+                    release_id=2,
+                    release_url="https://discogs.com/release/2",
+                    is_compilation=False,
+                ),
+                DiscogsReleaseInfo(
+                    album="Album C",
+                    artist="Artist C",
+                    release_id=3,
+                    release_url="https://discogs.com/release/3",
+                    is_compilation=False,
+                ),
+            ],
+            total=3,
+        )
+
+        async def validate_side_effect(release_id, track, artist):
+            # A: slow + valid, B: fast + invalid (finishes first), C: medium + valid.
+            if release_id == 1:
+                await _asyncio.sleep(0.20)
+                return True
+            if release_id == 2:
+                await _asyncio.sleep(0.02)
+                return False
+            await _asyncio.sleep(0.10)
+            return True
+
+        svc.validate_track_on_release.side_effect = validate_side_effect
+
+        results, _matched_via = await search_song_as_track(db, "t", discogs_service=svc)
+
+        # Input order is [A, B, C]; B drops on validation; output must be [A, C].
+        assert results == [item_a, item_c], (
+            f"Expected input-order [A, C], got {[r.title for r in results]}. "
+            "Output order must follow input (relevance) order, not completion order."
+        )
+
+    @pytest.mark.asyncio
+    async def test_matched_via_hint_order_follows_input(self):
+        """When one library row matches across multiple releases, the hint order
+        in ``matched_via_by_id[id]`` must follow input (relevance) order — not
+        the completion order of the underlying validate calls.
+
+        Same WXYC row referenced by releases X (slow) and Y (fast), both valid:
+        hints must be [X_hint, Y_hint], matching the input candidate order.
+        """
+        import asyncio as _asyncio
+
+        confield = make_library_item(id=60359, artist="Autechre", title="Confield")
+        db = AsyncMock()
+        db.search.return_value = [confield]
+
+        # Use the compilation path so we can vary artist_credit per release
+        # (the load-bearing distinguisher) while keeping a single library row.
+        # For compilations, the library row's artist is the VA marker and the
+        # release-level artist becomes the hint's ``artist_credit`` — that's
+        # what we read back to assert input-order accumulation.
+        va_album = make_library_item(id=60359, artist="Various Artists", title="Confield Comp")
+        db = AsyncMock()
+        db.search.return_value = [va_album]
+
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="vi scose poise",
+            releases=[
+                DiscogsReleaseInfo(
+                    album="Confield Comp",
+                    artist="Credit X",  # first in input
+                    release_id=8434,
+                    release_url="https://discogs.com/release/8434",
+                    is_compilation=True,
+                ),
+                DiscogsReleaseInfo(
+                    album="Confield Comp",
+                    artist="Credit Y",  # second in input
+                    release_id=999,
+                    release_url="https://discogs.com/release/999",
+                    is_compilation=True,
+                ),
+            ],
+            total=2,
+        )
+
+        async def validate_side_effect(release_id, track, artist):
+            if release_id == 8434:
+                await _asyncio.sleep(0.10)  # X finishes second
+            else:
+                await _asyncio.sleep(0.01)  # Y finishes first
+            return True
+
+        svc.validate_track_on_release.side_effect = validate_side_effect
+
+        results, matched_via = await search_song_as_track(db, "vi scose poise", discogs_service=svc)
+
+        assert results == [va_album]
+        hints = matched_via[60359]
+        assert len(hints) == 2
+        # Input order is [X, Y]; Y completes first but the post-gather walk
+        # must preserve input order, so the hint sequence is [X-credit, Y-credit].
+        assert [h.artist_credit for h in hints] == ["Credit X", "Credit Y"]
+
+    @pytest.mark.asyncio
+    async def test_validate_concurrency_is_bounded(self):
+        """No more than the configured cap of validate calls may be in-flight
+        at once.
+
+        Counters the naive ``asyncio.gather(*all_releases)`` shape, which can
+        explode parallelism when Discogs returns 50+ candidates. The
+        orchestrator-local semaphore bounds in-flight validate calls; the
+        global Discogs rate limiter sits underneath.
+        """
+        import asyncio as _asyncio
+
+        n_candidates = 20
+        db = AsyncMock()
+
+        # Each release maps to a distinct library row that prefix-matches it,
+        # so validate fires for every one.
+        items = [
+            make_library_item(id=5000 + i, artist=f"Artist {i}", title=f"Album {i}")
+            for i in range(n_candidates)
+        ]
+        releases = [
+            DiscogsReleaseInfo(
+                album=f"Album {i}",
+                artist=f"Artist {i}",
+                release_id=10000 + i,
+                release_url=f"https://discogs.com/release/{10000 + i}",
+                is_compilation=False,
+            )
+            for i in range(n_candidates)
+        ]
+
+        async def search_side_effect(query, **kwargs):
+            for item in items:
+                if (item.title or "").lower() == query.lower():
+                    return [item]
+            return []
+
+        db.search.side_effect = search_side_effect
+
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="t", releases=releases, total=n_candidates
+        )
+
+        in_flight = 0
+        peak_in_flight = 0
+        lock = _asyncio.Lock()
+
+        async def validate_side_effect(release_id, track, artist):
+            nonlocal in_flight, peak_in_flight
+            async with lock:
+                in_flight += 1
+                if in_flight > peak_in_flight:
+                    peak_in_flight = in_flight
+            try:
+                await _asyncio.sleep(0.05)
+                return True
+            finally:
+                async with lock:
+                    in_flight -= 1
+
+        svc.validate_track_on_release.side_effect = validate_side_effect
+
+        # Import the cap so the test tracks the constant rather than a magic
+        # number — if the value is tuned later, this test still pins the
+        # invariant "peak_in_flight <= cap".
+        from lookup.orchestrator import _SONG_AS_TRACK_VALIDATE_CONCURRENCY as _CAP
+
+        await search_song_as_track(db, "t", discogs_service=svc)
+
+        assert peak_in_flight <= _CAP, (
+            f"validate_track_on_release ran with {peak_in_flight} in-flight; "
+            f"the orchestrator-local cap is {_CAP}."
+        )
+        # Sanity: parallelism > 1 (otherwise we accidentally serialized).
+        assert peak_in_flight > 1, (
+            f"Peak in-flight was {peak_in_flight}; the validate calls did not "
+            "run concurrently at all."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: _log_track_validation (A7 / LML#344 audit instrumentation)
