@@ -31,6 +31,11 @@ COPY . .
 # Create logs and data directories
 RUN mkdir -p /app/logs /data && chown -R appuser:appuser /app/logs /data
 
+# Unbuffer Python stdout/stderr so logs reach Railway's collector in real time
+# (otherwise the StreamHandler in core/logging.py is block-buffered on the pipe).
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
 # Expose port
 EXPOSE 8000
 
