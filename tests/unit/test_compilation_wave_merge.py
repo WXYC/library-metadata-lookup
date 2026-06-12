@@ -332,3 +332,83 @@ class TestWaveMergeGate:
             "Same V/A release in both probes should be validated against Discogs once, "
             f"got {service.validate_track_on_release.await_count} calls"
         )
+
+
+class TestSearchCompilationsEarlyExit:
+    """LML#536: the gather conversion lost the pre-PR early-exit. With ~15
+    high-fanout candidates, every ``process_release`` task ran and validated
+    against Discogs even after ``MAX_SEARCH_RESULTS`` matches had already
+    landed.
+
+    These tests pin the invariant: once ``MAX_SEARCH_RESULTS`` matches
+    accumulate, no further ``validate_track_on_release`` calls fire.
+    """
+
+    @pytest.mark.asyncio
+    async def test_main_gather_early_exits_after_max_results(self):
+        """Wave A returns 15 candidates that all validate true; the post-gather
+        truncation must short-circuit dispatch so only ~``MAX_SEARCH_RESULTS``
+        validate calls fire.
+
+        With the PG cache write path degraded (Sentry
+        LIBRARY-METADATA-LOOKUP-9) each wasted validate falls through to the
+        live ``/releases/<id>`` endpoint (p95 5.87s on that span), so the
+        cost lever isn't just rate-limiter pressure — it's wall time and
+        Discogs quota.
+        """
+        from lookup.orchestrator import MAX_SEARCH_RESULTS
+
+        n_candidates = MAX_SEARCH_RESULTS * 3
+        items = [
+            make_library_item(
+                id=20000 + i,
+                artist="Vivien Goldman",
+                title=f"Album {i}",
+            )
+            for i in range(n_candidates)
+        ]
+        releases = [
+            _make_release(
+                album=f"Album {i}",
+                artist="Vivien Goldman",
+                release_id=30000 + i,
+                is_compilation=False,
+            )
+            for i in range(n_candidates)
+        ]
+
+        db = AsyncMock()
+
+        async def _search(query, limit=None, **_):
+            q = query.lower()
+            for item in items:
+                if (item.title or "").lower() == q:
+                    return [item]
+            return []
+
+        db.search = AsyncMock(side_effect=_search)
+
+        service = _make_discogs_service(wave_a=releases, wave_b=[])
+
+        parsed = ParsedRequest(
+            artist="Vivien Goldman",
+            song="Launderette",
+            raw_message="launderette by vivien goldman",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            results, _titles = await search_compilations_for_track(
+                db, parsed, discogs_service=service
+            )
+
+        assert len(results) == MAX_SEARCH_RESULTS
+        n_validate_calls = service.validate_track_on_release.await_count
+        assert n_validate_calls <= MAX_SEARCH_RESULTS, (
+            f"Expected early-exit after at most {MAX_SEARCH_RESULTS} validate calls, "
+            f"got {n_validate_calls} (LML#536: gather conversion lost early exit "
+            "in search_compilations_for_track)."
+        )

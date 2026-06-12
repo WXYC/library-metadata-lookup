@@ -11,7 +11,7 @@ import os
 import random
 import re
 import time
-from collections.abc import Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -114,25 +114,55 @@ _warm_cache_semaphore: asyncio.Semaphore | None = None
 
 _SONG_AS_TRACK_VALIDATE_CONCURRENCY: int = 5
 """Per-request cap on concurrent ``validate_track_on_release`` calls inside
-``search_song_as_track``.
+``search_song_as_track`` and ``search_compilations_for_track``.
 
-The original SONG_AS_TRACK loop (commit ``2c913da``) awaited
-``validate_track_on_release`` once per Discogs candidate serially. With ~7
-candidates per lookup at ~1.2s each, that's an 8-10s serial chain on the
-``/api/v1/lookup`` p95/p99 hot path — the dominant slow path identified in
-the early-May regression review. Compounding: when the PG cache write path
-is degraded (Sentry LIBRARY-METADATA-LOOKUP-9), most validate calls fall
-through to the live Discogs API, amplifying the cost further.
+Used as the chunk size for ``_chunked_gather`` — each chunk dispatches at most
+this many ``_validate_one`` / ``process_release`` tasks before the caller's
+accumulator is checked for early exit. The cap holds whether parallelism is
+the binding constraint (the original LML#534 motivation: serial 8-10s chain
+on ``/api/v1/lookup`` p95/p99) or the early-exit invariant is (LML#536:
+without chunking, ``asyncio.gather`` scheduled every candidate's validate
+even after the response cap had been saturated). Pinning chunk size to
+``MAX_SEARCH_RESULTS`` means the first full chunk can satisfy the
+common-case response cap on its own.
 
 Sized to match the global Discogs semaphore in ``discogs/service.py``
 (``get_semaphore()`` returns a 5-permit semaphore — see
 ``_request_with_retry``'s comment at line 377). The orchestrator-local
-semaphore here gates *fan-out per request*; the global rate limiter +
+chunking here gates *fan-out per request*; the global rate limiter +
 semaphore in ``discogs/service.py`` sits underneath and gates *cross-request
 total load*. The two are compatible: a single request fans out up to 5
-validate tasks; the global limiter then serializes their underlying HTTP
-calls when concurrent requests stack up.
+validate tasks per chunk; the global limiter then serializes their
+underlying HTTP calls when concurrent requests stack up.
 """
+
+
+async def _chunked_gather[T, R](
+    items: list[T],
+    worker: Callable[[T], Coroutine[Any, Any, R]],
+    chunk_size: int,
+) -> AsyncIterator[tuple[T, R]]:
+    """Run ``worker`` over ``items`` in chunks of ``chunk_size``, yielding
+    ``(item, result)`` pairs in input order.
+
+    The next chunk is not dispatched until the caller has finished iterating
+    the previous one, so a caller that breaks out after its accumulator
+    saturates never pays for the un-fired chunks. This restores the pre-PR
+    (#534) early-exit behavior in ``search_song_as_track`` /
+    ``search_compilations_for_track`` (LML#536) without giving up
+    within-chunk parallelism.
+
+    Wall time: ``ceil(N / chunk_size)`` × slowest task per chunk in the
+    no-exit case. With ``chunk_size == MAX_SEARCH_RESULTS`` a single chunk
+    is enough whenever the response cap is satisfied by the first batch —
+    the dominant case for high-fanout requests.
+    """
+    for start in range(0, len(items), chunk_size):
+        chunk = items[start : start + chunk_size]
+        chunk_results = await asyncio.gather(*[worker(it) for it in chunk])
+        for it, res in zip(chunk, chunk_results, strict=True):
+            yield it, res
+
 
 _ProbeResult = TrackReleasesResponse | tuple[TrackReleasesResponse | None, str | None]
 """Heterogeneous return type for the gathered probes in ``search_compilations_for_track``.
@@ -925,10 +955,6 @@ async def search_song_as_track(
     matched_items: list[LibraryItem] = []
     matched_via_by_id: dict[int, list[TrackMatchHint]] = {}
 
-    # Bound per-request fan-out. The global Discogs rate limiter sits
-    # underneath this semaphore — see _SONG_AS_TRACK_VALIDATE_CONCURRENCY.
-    semaphore = asyncio.Semaphore(_SONG_AS_TRACK_VALIDATE_CONCURRENCY)
-
     async def _validate_one(release: ReleaseInfo) -> list[LibraryItem] | None:
         """Library-match + validate one Discogs release.
 
@@ -957,19 +983,18 @@ async def search_song_as_track(
         # after library matching so we only pay the API cost for releases we'd
         # actually return, mirroring search_compilations_for_track.
         if release.release_id:
-            async with semaphore:
-                _validation_start = time.monotonic()
-                is_valid = await discogs_service.validate_track_on_release(
-                    release.release_id, song, release.artist
-                )
-                _log_track_validation(
-                    source="song_as_track",
-                    release_id=release.release_id,
-                    song=song,
-                    artist=release.artist,
-                    verdict=is_valid,
-                    latency_ms=(time.monotonic() - _validation_start) * 1000,
-                )
+            _validation_start = time.monotonic()
+            is_valid = await discogs_service.validate_track_on_release(
+                release.release_id, song, release.artist
+            )
+            _log_track_validation(
+                source="song_as_track",
+                release_id=release.release_id,
+                song=song,
+                artist=release.artist,
+                verdict=is_valid,
+                latency_ms=(time.monotonic() - _validation_start) * 1000,
+            )
             if not is_valid:
                 logger.debug(
                     f"SONG_AS_TRACK: skipping '{release.album}' — track not validated on release"
@@ -978,17 +1003,18 @@ async def search_song_as_track(
 
         return eligible
 
-    # Fan out per-release library-match + validation. Order preservation comes
-    # from the post-gather walk below, NOT from gather's completion order —
-    # ``asyncio.gather(..., return_exceptions=False)`` does preserve the input
-    # order of *results*, but accumulating into ``matched_items`` /
-    # ``matched_via_by_id`` in input-index order is what guarantees that a
-    # later release's hint never gets recorded before an earlier release's.
-    per_release_eligible = await asyncio.gather(
-        *[_validate_one(release) for release in raw_releases]
-    )
-
-    for release, eligible in zip(raw_releases, per_release_eligible, strict=True):
+    # Walk releases in input order through ``_chunked_gather``. Order
+    # preservation comes from the iteration order of the generator itself
+    # (chunks are dispatched and yielded in input order); accumulating
+    # into ``matched_items`` / ``matched_via_by_id`` in that same order
+    # guarantees a later release's hint never gets recorded before an
+    # earlier release's. Breaking out of the loop after the response cap
+    # is reached aborts the generator before un-fired chunks dispatch —
+    # the per-request validate budget stays bounded (LML#536).
+    done = False
+    async for release, eligible in _chunked_gather(
+        raw_releases, _validate_one, _SONG_AS_TRACK_VALIDATE_CONCURRENCY
+    ):
         if eligible is None:
             continue
 
@@ -1014,8 +1040,9 @@ async def search_song_as_track(
             )
 
             if len(matched_items) >= MAX_SEARCH_RESULTS:
+                done = True
                 break
-        if len(matched_items) >= MAX_SEARCH_RESULTS:
+        if done:
             break
 
     return matched_items, matched_via_by_id
@@ -1464,9 +1491,15 @@ async def search_compilations_for_track(
             )
             return [(match, release_album) for match in matches]
 
-        all_release_results = await asyncio.gather(*[process_release(ri) for ri in raw_releases])
-
-        for release_matches in all_release_results:
+        # Chunked dispatch so the per-request validate budget stays bounded
+        # once the response cap is hit. Without chunking, asyncio.gather
+        # would schedule (and pay for) every candidate's
+        # ``validate_track_on_release`` even after MAX_SEARCH_RESULTS
+        # matches had already landed — see LML#536 and the matching
+        # treatment in ``search_song_as_track``.
+        async for _release_info, release_matches in _chunked_gather(
+            raw_releases, process_release, _SONG_AS_TRACK_VALIDATE_CONCURRENCY
+        ):
             for match, discogs_album in release_matches:
                 if match.id not in seen_ids:
                     results.append(match)
@@ -1516,17 +1549,17 @@ async def search_compilations_for_track(
                     f"Album-title fallback returned {len(fallback_releases)} candidates "
                     f"for '{parsed.album}'"
                 )
-            fallback_results = await asyncio.gather(
-                *[
-                    process_release(
-                        ri,
-                        skip_self_named_album=False,
-                        skip_artist_match_filter=True,
-                    )
-                    for ri in fallback_releases
-                ]
-            )
-            for release_matches in fallback_results:
+
+            async def _fallback_worker(ri: ReleaseInfo) -> list[tuple[LibraryItem, str]]:
+                return await process_release(
+                    ri,
+                    skip_self_named_album=False,
+                    skip_artist_match_filter=True,
+                )
+
+            async for _release_info, release_matches in _chunked_gather(
+                fallback_releases, _fallback_worker, _SONG_AS_TRACK_VALIDATE_CONCURRENCY
+            ):
                 for match, discogs_album in release_matches:
                     if match.id not in seen_ids:
                         results.append(match)
