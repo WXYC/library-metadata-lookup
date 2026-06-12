@@ -1,25 +1,28 @@
 """Tests for the LML#537 rate-limiter telemetry tags.
 
-When the `fallthrough` seam falls through to the API leg, it sets a
-`_request_context_var` carrying the seam's `label` and the resolved
-`cache_state`. `_request_with_retry` reads that contextvar inside its
-`lml.discogs.semaphore` and `lml.discogs.rate_limiter` spans, tagging
-each with `lml.discogs.method` and `lml.discogs.cache_state`. This lets
-the Sentry wait-time histogram be split by which method's cache-miss
-triggered the wait and by how the cache leg resolved (`miss`, `skip`,
-`no_pg`, `cooldown`).
+When the ``fallthrough`` seam (or the ``request_context`` helper used by
+the three API-only methods that bypass it) falls through to the API leg,
+it sets ``_request_context_var`` carrying the seam's ``label`` and the
+resolved ``cache_state``. ``_request_with_retry`` reads that contextvar
+inside its ``lml.discogs.semaphore`` and ``lml.discogs.rate_limiter``
+spans, tagging each with ``lml.discogs.method`` and
+``lml.discogs.cache_state``. This lets the Sentry wait-time histogram be
+split by which method's cache-miss triggered the wait and by how the
+cache leg resolved (``miss``, ``skip``, ``no_pg``, ``cooldown``).
 
 Covered:
 
 1. **Tag presence on miss** — both spans carry method + cache_state.
-2. **All four cache_state values** — parametrized over `miss`, `skip`,
-   `no_pg`, `cooldown`.
-3. **CancelledError reset** — the contextvar's `Token` reset survives
-   `asyncio.CancelledError` so a cancelled call doesn't leak state into
-   the next one.
-4. **No contextvar set** — direct `_request_with_retry` callers (the
-   health probe, tests) don't have a contextvar set; spans should not
-   blow up and should not carry the tags.
+2. **All four cache_state values** — parametrized over ``miss``, ``skip``,
+   ``no_pg``, ``cooldown``.
+3. **CancelledError reset** — the contextvar's ``Token`` reset survives
+   ``asyncio.CancelledError``.
+4. **No contextvar set** — direct ``_request_with_retry`` callers (a
+   handful of legacy tests) don't have a contextvar set; spans should
+   not blow up and should not carry the tags.
+5. **request_context helper** — used by ``search_releases_by_album_title``,
+   ``get_label_image``, ``get_master`` (the three API-only methods that
+   bypass ``fallthrough``); spans get tagged the same as the seam path.
 """
 
 from __future__ import annotations
@@ -34,40 +37,10 @@ from discogs.fallthrough import (
     _request_context_var,
     _reset_cool_down_for_tests,
     fallthrough,
+    request_context,
 )
 from discogs.memory_cache import set_skip_cache
-
-
-class _SpanRecorder:
-    """Replacement for ``sentry_sdk.start_span`` that records every span's
-    data dict so tests can assert tag values after the fact."""
-
-    def __init__(self) -> None:
-        self.spans: list[dict[str, object]] = []
-
-    def __call__(self, *, op: str, name: str) -> _SpanRecorder._Ctx:
-        record: dict[str, object] = {"op": op, "name": name, "data": {}}
-        self.spans.append(record)
-        return self._Ctx(record)
-
-    class _Ctx:
-        def __init__(self, record: dict[str, object]) -> None:
-            self._record = record
-
-        def __enter__(self) -> _SpanRecorder._Span:
-            return _SpanRecorder._Span(self._record)
-
-        def __exit__(self, exc_type, exc, tb) -> None:
-            return None
-
-    class _Span:
-        def __init__(self, record: dict[str, object]) -> None:
-            self._record = record
-
-        def set_data(self, key: str, value: object) -> None:
-            data = self._record["data"]
-            assert isinstance(data, dict)
-            data[key] = value
+from discogs.service import DiscogsService
 
 
 @pytest.fixture(autouse=True)
@@ -87,30 +60,40 @@ def _ensure_skip_cache_clear():
 
 
 @pytest.fixture
-def span_recorder():
-    """Patch ``sentry_sdk.start_span`` (the symbol both modules use)."""
-    recorder = _SpanRecorder()
+def service():
+    """A real DiscogsService — its ``_get_client`` honors a pre-set
+    ``self._client`` (see service.py:286), letting tests inject a mock
+    client without bypassing ``__init__``."""
+    return DiscogsService(token="test-token")
+
+
+@pytest.fixture
+def captured_spans():
+    """Patch ``sentry_sdk.start_span`` (the symbol both modules reference;
+    they resolve to the same module object) with a recorder that captures
+    each span as a MagicMock keyed by ``name``. Mirrors the canonical
+    pattern used by ``test_discogs_service.py``."""
+    spans: dict[str, MagicMock] = {}
+
+    def _start_span(*, op: str, name: str, **kwargs):
+        ctx = MagicMock()
+        span = MagicMock()
+        span.op = op
+        ctx.__enter__.return_value = span
+        ctx.__exit__.return_value = False
+        spans[name] = span
+        return ctx
+
     with (
-        patch("discogs.service.sentry_sdk.start_span", recorder),
-        patch("discogs.fallthrough.sentry_sdk.start_span", recorder),
+        patch("discogs.service.sentry_sdk.start_span", side_effect=_start_span),
+        patch("discogs.fallthrough.sentry_sdk.start_span", side_effect=_start_span),
     ):
-        yield recorder
+        yield spans
 
 
-def _request_with_retry_spans(recorder: _SpanRecorder) -> list[dict[str, object]]:
-    """Filter the recorder's spans down to the two emitted by
-    ``DiscogsService._request_with_retry`` (the `lock.acquire` ones)."""
-    return [s for s in recorder.spans if s["op"] == "lock.acquire"]
-
-
-async def _drive_request_with_retry() -> None:
-    """Call `_request_with_retry` against a mocked-out semaphore +
-    rate-limiter so the test doesn't actually issue an HTTP request.
-
-    The httpx response is mocked too — we only care that the two spans
-    fire under whichever contextvar state the test set up."""
-    from discogs.service import DiscogsService
-
+async def _drive_request_with_retry(service: DiscogsService) -> None:
+    """Drive ``_request_with_retry`` against an in-memory mock client +
+    mocked semaphore/limiter. Does not issue an HTTP request."""
     fake_semaphore = MagicMock()
     fake_semaphore.acquire = AsyncMock()
     fake_semaphore.release = MagicMock()
@@ -123,17 +106,26 @@ async def _drive_request_with_retry() -> None:
     fake_response.status_code = 200
     fake_response.headers = {}
 
-    fake_client = MagicMock()
-    fake_client.request = AsyncMock(return_value=fake_response)
-
-    service = DiscogsService.__new__(DiscogsService)
-    service._get_client = AsyncMock(return_value=fake_client)  # type: ignore[method-assign]
+    mock_client = MagicMock()
+    mock_client.request = AsyncMock(return_value=fake_response)
+    service._client = mock_client
 
     with (
         patch("discogs.service.get_semaphore", return_value=fake_semaphore),
         patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
     ):
         await service._request_with_retry("GET", "/releases/12345")
+
+
+def _assert_tagged(span: MagicMock, method: str, state: str) -> None:
+    """Both wait spans must carry ``lml.discogs.method`` and ``lml.discogs.cache_state``."""
+    data = {call.args[0]: call.args[1] for call in span.set_data.call_args_list}
+    assert data.get("lml.discogs.method") == method, (
+        f"span {span} missing/wrong method tag; calls: {data}"
+    )
+    assert data.get("lml.discogs.cache_state") == state, (
+        f"span {span} missing/wrong cache_state tag; calls: {data}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,14 +135,14 @@ async def _drive_request_with_retry() -> None:
 
 @pytest.mark.asyncio
 async def test_semaphore_and_rate_limiter_spans_tagged_on_miss(
-    span_recorder, _ensure_skip_cache_clear
+    service, captured_spans, _ensure_skip_cache_clear
 ):
     """The common cache-miss flow: PG returned None, seam fell through to
     the API leg, both wait spans carry the method + state tags."""
     pg_read = AsyncMock(return_value=None)
 
     async def api_fetch():
-        await _drive_request_with_retry()
+        await _drive_request_with_retry(service)
         return "fresh-value"
 
     result = await fallthrough(
@@ -160,13 +152,13 @@ async def test_semaphore_and_rate_limiter_spans_tagged_on_miss(
     )
 
     assert result == "fresh-value"
-    spans = _request_with_retry_spans(span_recorder)
-    assert len(spans) == 2
-    for span in spans:
-        data = span["data"]
-        assert isinstance(data, dict)
-        assert data.get("lml.discogs.method") == "get_release"
-        assert data.get("lml.discogs.cache_state") == "miss"
+    sem_span = captured_spans.get("lml.discogs.semaphore")
+    rate_span = captured_spans.get("lml.discogs.rate_limiter")
+    assert sem_span is not None and rate_span is not None, (
+        f"expected both wait spans, got: {list(captured_spans)}"
+    )
+    _assert_tagged(sem_span, "get_release", "miss")
+    _assert_tagged(rate_span, "get_release", "miss")
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +177,7 @@ async def test_semaphore_and_rate_limiter_spans_tagged_on_miss(
     ],
 )
 async def test_cache_state_resolves_correctly(
-    span_recorder, _ensure_skip_cache_clear, scenario, expected_state
+    service, captured_spans, _ensure_skip_cache_clear, scenario, expected_state
 ):
     """The seam must compute cache_state from its own gating logic, not
     from the caller's inputs verbatim."""
@@ -203,7 +195,7 @@ async def test_cache_state_resolves_correctly(
         fallthrough_mod._cool_down_until = time.monotonic() + 5
 
     async def api_fetch():
-        await _drive_request_with_retry()
+        await _drive_request_with_retry(service)
         return "fresh-value"
 
     await fallthrough(
@@ -212,13 +204,10 @@ async def test_cache_state_resolves_correctly(
         api_fetch=api_fetch,
     )
 
-    spans = _request_with_retry_spans(span_recorder)
-    assert len(spans) == 2
-    for span in spans:
-        data = span["data"]
-        assert isinstance(data, dict)
-        assert data.get("lml.discogs.method") == "get_release"
-        assert data.get("lml.discogs.cache_state") == expected_state
+    for name in ("lml.discogs.semaphore", "lml.discogs.rate_limiter"):
+        span = captured_spans.get(name)
+        assert span is not None, f"expected {name} span; got: {list(captured_spans)}"
+        _assert_tagged(span, "get_release", expected_state)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +216,7 @@ async def test_cache_state_resolves_correctly(
 
 
 @pytest.mark.asyncio
-async def test_context_resets_on_cancelled_error(span_recorder, _ensure_skip_cache_clear):
+async def test_context_resets_on_cancelled_error(captured_spans, _ensure_skip_cache_clear):
     """If the API leg is cancelled mid-flight, the seam's `finally` must
     still reset the contextvar (Token-paired set/reset)."""
     pg_read = AsyncMock(return_value=None)
@@ -246,7 +235,7 @@ async def test_context_resets_on_cancelled_error(span_recorder, _ensure_skip_cac
 
 
 @pytest.mark.asyncio
-async def test_context_resets_on_normal_return(span_recorder, _ensure_skip_cache_clear):
+async def test_context_resets_on_normal_return(captured_spans, _ensure_skip_cache_clear):
     """Sibling of the cancellation case — normal return also resets so the
     next call in the same task doesn't see stale state."""
     pg_read = AsyncMock(return_value=None)
@@ -269,17 +258,41 @@ async def test_context_resets_on_normal_return(span_recorder, _ensure_skip_cache
 
 
 @pytest.mark.asyncio
-async def test_no_tag_when_called_outside_seam(span_recorder):
-    """The health probe and a handful of legacy tests call
-    `_request_with_retry` directly. Without a contextvar set, the spans
-    must not blow up and must not carry the LML#537 tags."""
+async def test_no_tag_when_called_outside_seam(service, captured_spans):
+    """A handful of legacy tests call ``_request_with_retry`` directly.
+    Without a contextvar set, the spans must not blow up and must not
+    carry the LML#537 tags."""
     assert _request_context_var.get() is None
-    await _drive_request_with_retry()
+    await _drive_request_with_retry(service)
 
-    spans = _request_with_retry_spans(span_recorder)
-    assert len(spans) == 2
-    for span in spans:
-        data = span["data"]
-        assert isinstance(data, dict)
-        assert "lml.discogs.method" not in data
-        assert "lml.discogs.cache_state" not in data
+    for name in ("lml.discogs.semaphore", "lml.discogs.rate_limiter"):
+        span = captured_spans.get(name)
+        assert span is not None
+        data_keys = {call.args[0] for call in span.set_data.call_args_list}
+        assert "lml.discogs.method" not in data_keys
+        assert "lml.discogs.cache_state" not in data_keys
+
+
+# ---------------------------------------------------------------------------
+# 5. request_context helper — tags spans for API-only methods that bypass fallthrough
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_request_context_tags_direct_caller_spans(
+    service, captured_spans, _ensure_skip_cache_clear
+):
+    """``search_releases_by_album_title``, ``get_label_image``, ``get_master``
+    each call ``_request_with_retry`` directly (no fallthrough). The
+    ``request_context`` helper they wrap their call in must propagate the
+    method tag + cache_state=no_pg the same way the seam does."""
+    with request_context("get_label_image", "no_pg"):
+        await _drive_request_with_retry(service)
+
+    for name in ("lml.discogs.semaphore", "lml.discogs.rate_limiter"):
+        span = captured_spans.get(name)
+        assert span is not None
+        _assert_tagged(span, "get_label_image", "no_pg")
+
+    # And the contextvar resets cleanly outside the with-block.
+    assert _request_context_var.get() is None

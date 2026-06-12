@@ -20,7 +20,7 @@ from wxyc_fastapi.observability import (
 )
 
 from config.settings import get_settings
-from discogs.fallthrough import _request_context_var, fallthrough
+from discogs.fallthrough import _request_context_var, fallthrough, request_context
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import (
     ARTIST_CACHE,
@@ -373,11 +373,13 @@ class DiscogsService:
         semaphore = get_semaphore()
         rate_limiter = get_rate_limiter()
 
-        # LML#537: pick up the fallthrough seam's per-call context (label +
-        # resolved cache_state) once, and tag both wait spans below. The seam
-        # is the dominant entry path; direct callers (the health probe, a few
-        # legacy tests) leave the contextvar as ``None`` — we skip tagging in
-        # that case so those callers don't have to know about the seam.
+        # LML#537: pick up the seam's per-call context (label + resolved
+        # cache_state) once, and tag both wait spans below. Production callers
+        # enter via ``fallthrough()`` (the dominant path) or via the
+        # ``request_context()`` helper (the three API-only methods that bypass
+        # the seam: ``search_releases_by_album_title``, ``get_label_image``,
+        # ``get_master``). Tests that drive ``_request_with_retry`` directly
+        # leave the contextvar as ``None`` — we skip tagging in that case.
         request_ctx = _request_context_var.get()
 
         # Explicit acquire/release (not `async with semaphore:`) so the wait
@@ -676,8 +678,11 @@ class DiscogsService:
         # Fresh per-result set means ``_process_search_result``'s album-dedup
         # branch never triggers across iterations.
         try:
-            async with timed_api():
-                response = await self._request_with_retry("GET", "/database/search", params=params)
+            with request_context("search_releases_by_album_title", "no_pg"):
+                async with timed_api():
+                    response = await self._request_with_retry(
+                        "GET", "/database/search", params=params
+                    )
             if response is not None:
                 get_cache_stats_recorder().record_api_call()
                 response.raise_for_status()
@@ -1059,8 +1064,9 @@ class DiscogsService:
             Image URI string, or None if unavailable
         """
         try:
-            async with timed_api():
-                response = await self._request_with_retry("GET", f"/labels/{label_id}")
+            with request_context("get_label_image", "no_pg"):
+                async with timed_api():
+                    response = await self._request_with_retry("GET", f"/labels/{label_id}")
             if response is None:
                 return None
             get_cache_stats_recorder().record_api_call()
@@ -1084,8 +1090,9 @@ class DiscogsService:
             MasterRelease with title and year, or None on error
         """
         try:
-            async with timed_api():
-                response = await self._request_with_retry("GET", f"/masters/{master_id}")
+            with request_context("get_master", "no_pg"):
+                async with timed_api():
+                    response = await self._request_with_retry("GET", f"/masters/{master_id}")
             if response is None:
                 return None
             get_cache_stats_recorder().record_api_call()

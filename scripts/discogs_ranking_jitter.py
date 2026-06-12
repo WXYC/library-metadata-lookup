@@ -40,9 +40,10 @@ from dataclasses import dataclass
 
 import httpx
 
+from discogs.service import DISCOGS_API_BASE
+
 logger = logging.getLogger(__name__)
 
-_DISCOGS_API_BASE = "https://api.discogs.com"
 _DEFAULT_LIMIT = 20
 
 
@@ -54,27 +55,14 @@ class JitterPair:
     call_b_ids: list[int]
     delay_seconds: float
 
-    @property
-    def set_a(self) -> set[int]:
-        return set(self.call_a_ids)
-
-    @property
-    def set_b(self) -> set[int]:
-        return set(self.call_b_ids)
-
-    @property
-    def overlap(self) -> int:
-        return len(self.set_a & self.set_b)
-
-    @property
-    def union(self) -> int:
-        return len(self.set_a | self.set_b)
-
-    @property
-    def jaccard(self) -> float:
-        if not self.union:
-            return 0.0
-        return self.overlap / self.union
+    def stats(self) -> tuple[int, int, float]:
+        """Return ``(overlap, union, jaccard)`` computed in a single pass."""
+        set_a = set(self.call_a_ids)
+        set_b = set(self.call_b_ids)
+        overlap = len(set_a & set_b)
+        union = len(set_a | set_b)
+        jaccard = overlap / union if union else 0.0
+        return overlap, union, jaccard
 
     def position_stability(self) -> float | None:
         """Average |rank_a - rank_b| for IDs present in both result lists.
@@ -87,6 +75,19 @@ class JitterPair:
         if not shared:
             return None
         return sum(abs(rank_a[r] - rank_b[r]) for r in shared) / len(shared)
+
+    def to_record(self) -> dict[str, object]:
+        """Serializable shape that includes derived metrics — used by --json."""
+        overlap, union, jaccard = self.stats()
+        return {
+            "call_a_ids": self.call_a_ids,
+            "call_b_ids": self.call_b_ids,
+            "delay_seconds": self.delay_seconds,
+            "overlap": overlap,
+            "union": union,
+            "jaccard": jaccard,
+            "position_stability": self.position_stability(),
+        }
 
 
 def _build_params(track: str, artist: str, limit: int) -> dict[str, str | int]:
@@ -108,7 +109,7 @@ async def _search_once(
 ) -> tuple[list[int], int | None]:
     """One ``/database/search`` request; returns (release_ids, ratelimit_remaining)."""
     headers = {"Authorization": f"Discogs token={token}", "User-Agent": "LML/537-jitter"}
-    resp = await client.get(f"{_DISCOGS_API_BASE}/database/search", params=params, headers=headers)
+    resp = await client.get(f"{DISCOGS_API_BASE}/database/search", params=params, headers=headers)
     resp.raise_for_status()
     remaining = resp.headers.get("X-Discogs-Ratelimit-Remaining")
     return _extract_release_ids(resp.json()), int(remaining) if remaining else None
@@ -139,7 +140,7 @@ def aggregate(pairs: list[JitterPair]) -> dict[str, float | int]:
     """Aggregate stats across N pairs."""
     if not pairs:
         return {"pairs": 0}
-    jaccards = [p.jaccard for p in pairs]
+    jaccards = [p.stats()[2] for p in pairs]
     stabilities = [s for p in pairs if (s := p.position_stability()) is not None]
     return {
         "pairs": len(pairs),
@@ -153,11 +154,12 @@ def aggregate(pairs: list[JitterPair]) -> dict[str, float | int]:
 
 
 def print_pair(pair: JitterPair, index: int) -> None:
+    overlap, union, jaccard = pair.stats()
     print(
         f"  pair {index}: "
         f"|A|={len(pair.call_a_ids)} |B|={len(pair.call_b_ids)} "
-        f"overlap={pair.overlap} union={pair.union} "
-        f"jaccard={pair.jaccard:.3f} "
+        f"overlap={overlap} union={union} "
+        f"jaccard={jaccard:.3f} "
         f"stability={pair.position_stability()}"
     )
 
@@ -204,7 +206,7 @@ async def _main_async(args: argparse.Namespace, token: str) -> int:
 
     agg = aggregate(pairs)
     if args.json:
-        print(json.dumps({"pairs": [p.__dict__ for p in pairs], "aggregate": agg}, default=list))
+        print(json.dumps({"pairs": [p.to_record() for p in pairs], "aggregate": agg}))
     else:
         print_summary(agg)
     return 0
