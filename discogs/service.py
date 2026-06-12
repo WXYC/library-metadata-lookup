@@ -20,7 +20,7 @@ from wxyc_fastapi.observability import (
 )
 
 from config.settings import get_settings
-from discogs.fallthrough import fallthrough
+from discogs.fallthrough import _request_context_var, fallthrough
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import (
     ARTIST_CACHE,
@@ -373,6 +373,13 @@ class DiscogsService:
         semaphore = get_semaphore()
         rate_limiter = get_rate_limiter()
 
+        # LML#537: pick up the fallthrough seam's per-call context (label +
+        # resolved cache_state) once, and tag both wait spans below. The seam
+        # is the dominant entry path; direct callers (the health probe, a few
+        # legacy tests) leave the contextvar as ``None`` — we skip tagging in
+        # that case so those callers don't have to know about the seam.
+        request_ctx = _request_context_var.get()
+
         # Explicit acquire/release (not `async with semaphore:`) so the wait
         # is wrapped in a Sentry span. The 5-permit semaphore is the dominant
         # source of pre-request dark time on backfill cascades — sampling the
@@ -380,10 +387,18 @@ class DiscogsService:
         # relative-load signal per call. See WXYC/library-metadata-lookup#358.
         with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
             span.set_data("lml.semaphore.queue_depth", _approx_semaphore_queue_depth(semaphore))
+            if request_ctx is not None:
+                span.set_data("lml.discogs.method", request_ctx["method"])
+                span.set_data("lml.discogs.cache_state", request_ctx["cache_state"])
             await semaphore.acquire()
         try:
             for attempt in range(max_retries + 1):
-                with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.rate_limiter"):
+                with sentry_sdk.start_span(
+                    op="lock.acquire", name="lml.discogs.rate_limiter"
+                ) as span:
+                    if request_ctx is not None:
+                        span.set_data("lml.discogs.method", request_ctx["method"])
+                        span.set_data("lml.discogs.cache_state", request_ctx["cache_state"])
                     await rate_limiter.acquire()
 
                 try:
