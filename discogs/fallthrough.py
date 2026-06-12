@@ -115,23 +115,36 @@ _request_context_var: ContextVar[dict[str, str] | None] = ContextVar(
 
 
 @contextmanager
-def request_context(method: str, cache_state: str) -> Iterator[None]:
-    """Tag downstream ``_request_with_retry`` spans for a non-seam HTTP call.
+def request_context(method: str, cache_state: str = "no_pg") -> Iterator[None]:
+    """Tag downstream ``_request_with_retry`` spans for the duration of the block.
 
-    Production methods that bypass ``fallthrough`` (``search_releases_by_album_title``,
-    ``get_label_image``, ``get_master`` — all API-only with no L2 cache leg)
-    use this context manager so their wait-time spans participate in the
-    ``cache_state`` / ``method`` histogram. ``fallthrough`` itself does not
-    call this helper — it sets the contextvar inline so its taxonomy
-    computation (``miss``/``skip``/``no_pg``/``cooldown``) stays in one place.
+    Used by ``fallthrough`` itself and by the three production methods that
+    bypass the seam (``search_releases_by_album_title``, ``get_label_image``,
+    ``get_master`` — all API-only with no L2 cache leg) plus the four seam
+    methods' ``cache is None`` fallback branches. Default ``cache_state``
+    matches the typical bypass case (no PG cache); the seam overrides with
+    the resolved state from its own taxonomy.
 
-    Token-paired set/reset survives ``CancelledError``.
+    ``ContextVar.set`` runs *before* the ``try``-block: if it raises, the
+    function aborts cleanly and no reset is attempted, sidestepping the
+    Token-unbound-on-set-failure trap. Token-paired set/reset survives
+    ``CancelledError`` via the generator protocol.
     """
     token = _request_context_var.set({"method": method, "cache_state": cache_state})
     try:
         yield
     finally:
         _request_context_var.reset(token)
+
+
+def get_request_context() -> dict[str, str] | None:
+    """Return the current ``_request_context_var`` value (or ``None``).
+
+    Public reader so ``discogs.service`` doesn't have to reach across module
+    boundaries for the private contextvar — mirrors the ``should_skip_cache``
+    pattern in ``discogs.memory_cache``.
+    """
+    return _request_context_var.get()
 
 
 # Default predicate for ``fallthrough(is_pg_hit=...)``. Hoisted to module scope
@@ -329,14 +342,8 @@ async def fallthrough[T](
         cache_state = "miss"
 
     # ----- L3 API.
-    # Token assignment is the first statement inside the try so any future
-    # edit that inserts a line between the set() and the try block cannot
-    # leak the contextvar — the reset always runs paired with the set.
-    try:
-        token = _request_context_var.set({"method": label, "cache_state": cache_state})
+    with request_context(label, cache_state):
         api_result = await api_fetch()
-    finally:
-        _request_context_var.reset(token)
 
     # ----- Write-backs (best-effort; only when not bypassing the cache).
     if api_result is not None and not skip:

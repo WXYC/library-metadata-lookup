@@ -20,7 +20,7 @@ from wxyc_fastapi.observability import (
 )
 
 from config.settings import get_settings
-from discogs.fallthrough import _request_context_var, fallthrough, request_context
+from discogs.fallthrough import fallthrough, get_request_context, request_context
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import (
     ARTIST_CACHE,
@@ -100,6 +100,20 @@ def _approx_semaphore_queue_depth(semaphore: asyncio.Semaphore) -> int:
         return len(waiters) if waiters else 0
     except AttributeError:
         return -1
+
+
+def _apply_request_ctx_tags(span: Any, ctx: dict[str, str] | None) -> None:
+    """Tag a wait span with the LML#537 method / cache_state labels.
+
+    Centralizes the per-span tag application called from both the semaphore
+    and the per-retry rate-limiter spans in ``_request_with_retry``. ``None``
+    means the caller didn't enter a seam or ``request_context`` — leave the
+    span untagged (a small handful of direct-call tests).
+    """
+    if ctx is None:
+        return
+    span.set_data("lml.discogs.method", ctx["method"])
+    span.set_data("lml.discogs.cache_state", ctx["cache_state"])
 
 
 def _compute_retry_delay(attempt: int, retry_after_header: str | None) -> float:
@@ -373,14 +387,14 @@ class DiscogsService:
         semaphore = get_semaphore()
         rate_limiter = get_rate_limiter()
 
-        # LML#537: pick up the seam's per-call context (label + resolved
-        # cache_state) once, and tag both wait spans below. Production callers
-        # enter via ``fallthrough()`` (the dominant path) or via the
+        # LML#537: read the per-call context (label + resolved cache_state)
+        # once, tag both wait spans via _apply_request_ctx_tags. Production
+        # callers enter via ``fallthrough()`` (dominant) or via the
         # ``request_context()`` helper (the three API-only methods that bypass
-        # the seam: ``search_releases_by_album_title``, ``get_label_image``,
-        # ``get_master``). Tests that drive ``_request_with_retry`` directly
-        # leave the contextvar as ``None`` — we skip tagging in that case.
-        request_ctx = _request_context_var.get()
+        # the seam and the four ``cache is None`` fallback branches). Tests
+        # that drive ``_request_with_retry`` directly leave the contextvar as
+        # ``None`` — _apply_request_ctx_tags is a no-op in that case.
+        request_ctx = get_request_context()
 
         # Explicit acquire/release (not `async with semaphore:`) so the wait
         # is wrapped in a Sentry span. The 5-permit semaphore is the dominant
@@ -389,18 +403,14 @@ class DiscogsService:
         # relative-load signal per call. See WXYC/library-metadata-lookup#358.
         with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
             span.set_data("lml.semaphore.queue_depth", _approx_semaphore_queue_depth(semaphore))
-            if request_ctx is not None:
-                span.set_data("lml.discogs.method", request_ctx["method"])
-                span.set_data("lml.discogs.cache_state", request_ctx["cache_state"])
+            _apply_request_ctx_tags(span, request_ctx)
             await semaphore.acquire()
         try:
             for attempt in range(max_retries + 1):
                 with sentry_sdk.start_span(
                     op="lock.acquire", name="lml.discogs.rate_limiter"
                 ) as span:
-                    if request_ctx is not None:
-                        span.set_data("lml.discogs.method", request_ctx["method"])
-                        span.set_data("lml.discogs.cache_state", request_ctx["cache_state"])
+                    _apply_request_ctx_tags(span, request_ctx)
                     await rate_limiter.acquire()
 
                 try:
@@ -595,7 +605,8 @@ class DiscogsService:
             return TrackReleasesResponse(track=track, artist=artist, cached=False)
 
         if cache is None:
-            return await _api_fetch() or _empty_error_response()
+            with request_context("search_releases_by_track"):
+                return await _api_fetch() or _empty_error_response()
 
         # The negative-cache check fires regardless of ``artist_as_keyword``
         # because its key includes that dimension. The PG read is only safe
@@ -678,7 +689,7 @@ class DiscogsService:
         # Fresh per-result set means ``_process_search_result``'s album-dedup
         # branch never triggers across iterations.
         try:
-            with request_context("search_releases_by_album_title", "no_pg"):
+            with request_context("search_releases_by_album_title"):
                 async with timed_api():
                     response = await self._request_with_retry(
                         "GET", "/database/search", params=params
@@ -886,7 +897,8 @@ class DiscogsService:
         cache = self.cache_service
         value: ReleaseMetadataResponse | None
         if cache is None:
-            value = await _api_fetch()
+            with request_context("get_release"):
+                value = await _api_fetch()
         else:
             value = await fallthrough(
                 label="get_release",
@@ -1010,7 +1022,8 @@ class DiscogsService:
         cache = self.cache_service
         value: ArtistDetails | None
         if cache is None:
-            value = await _api_fetch()
+            with request_context("get_artist_details"):
+                value = await _api_fetch()
         else:
             value = await fallthrough(
                 label="get_artist_details",
@@ -1064,7 +1077,7 @@ class DiscogsService:
             Image URI string, or None if unavailable
         """
         try:
-            with request_context("get_label_image", "no_pg"):
+            with request_context("get_label_image"):
                 async with timed_api():
                     response = await self._request_with_retry("GET", f"/labels/{label_id}")
             if response is None:
@@ -1090,7 +1103,7 @@ class DiscogsService:
             MasterRelease with title and year, or None on error
         """
         try:
-            with request_context("get_master", "no_pg"):
+            with request_context("get_master"):
                 async with timed_api():
                     response = await self._request_with_retry("GET", f"/masters/{master_id}")
             if response is None:
@@ -1259,7 +1272,8 @@ class DiscogsService:
 
         cache = self.cache_service
         if cache is None:
-            result = await _api_fetch()
+            with request_context("search"):
+                result = await _api_fetch()
         else:
             result = await fallthrough(
                 label="search",

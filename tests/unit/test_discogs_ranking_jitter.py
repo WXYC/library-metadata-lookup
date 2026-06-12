@@ -8,8 +8,6 @@ Discogs endpoint is never touched.
 
 from __future__ import annotations
 
-import math
-
 import httpx
 import pytest
 
@@ -86,10 +84,13 @@ def test_aggregate_means_and_min_max():
     assert agg["position_stability_mean"] == 0.0
 
 
-def test_aggregate_no_shared_ids_yields_nan_stability():
+def test_aggregate_no_shared_ids_yields_none_stability():
+    """Use ``None`` (JSON-serializes as ``null``) rather than ``float('nan')``
+    which Python's ``json.dumps`` emits as literal ``NaN`` — invalid per
+    RFC 8259 and rejected by ``jq`` / strict parsers."""
     pairs = [JitterPair(call_a_ids=[1], call_b_ids=[2], delay_seconds=30)]
     agg = aggregate(pairs)
-    assert math.isnan(agg["position_stability_mean"])
+    assert agg["position_stability_mean"] is None
 
 
 def test_aggregate_empty():
