@@ -120,10 +120,15 @@ def request_context(method: str, cache_state: str = "no_pg") -> Iterator[None]:
 
     Used by ``fallthrough`` itself and by the three production methods that
     bypass the seam (``search_releases_by_album_title``, ``get_label_image``,
-    ``get_master`` — all API-only with no L2 cache leg) plus the four seam
-    methods' ``cache is None`` fallback branches. Default ``cache_state``
-    matches the typical bypass case (no PG cache); the seam overrides with
-    the resolved state from its own taxonomy.
+    ``get_master`` — all API-only with no L2 cache leg) plus the four
+    seam methods that have a ``cache is None`` fallback branch
+    (``search_releases_by_track``, ``get_release``, ``get_artist_details``,
+    ``search``). ``validate_track_on_release`` also has a ``cache is None``
+    branch but it delegates to ``get_release``, whose own ``request_context``
+    wins for the actual HTTP wait span — so wrapping validate would not
+    change the histogram. Default ``cache_state`` matches the typical bypass
+    case (no PG cache); the seam overrides with the resolved state from its
+    own taxonomy.
 
     ``ContextVar.set`` runs *before* the ``try``-block: if it raises, the
     function aborts cleanly and no reset is attempted, sidestepping the
@@ -145,6 +150,24 @@ def get_request_context() -> dict[str, str] | None:
     pattern in ``discogs.memory_cache``.
     """
     return _request_context_var.get()
+
+
+def apply_request_ctx_tags(span: Any) -> None:
+    """Tag a wait span with the LML#537 ``lml.discogs.method`` /
+    ``lml.discogs.cache_state`` labels read from the current context.
+
+    Called from ``DiscogsService._request_with_retry`` for both the
+    semaphore-acquire and per-retry rate-limiter spans. Encapsulated in
+    this module so the dict-key contract (``"method"`` / ``"cache_state"``)
+    AND the Sentry attribute names live next to the contextvar producer —
+    a future rename only has to touch ``fallthrough.py``. No-op when no
+    context is active (direct ``_request_with_retry`` callers from tests).
+    """
+    ctx = _request_context_var.get()
+    if ctx is None:
+        return
+    span.set_data("lml.discogs.method", ctx["method"])
+    span.set_data("lml.discogs.cache_state", ctx["cache_state"])
 
 
 # Default predicate for ``fallthrough(is_pg_hit=...)``. Hoisted to module scope

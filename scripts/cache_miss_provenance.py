@@ -123,18 +123,40 @@ def extract_from_ids_csv(path: Path) -> list[MissEvent]:
     return events
 
 
-def classify(conn: psycopg.Connection, events: list[MissEvent]) -> list[dict[str, object]]:
-    """For each unique release_id, query PG for existence + release_track count.
+def compute_first_seen(events: list[MissEvent]) -> dict[int, int]:
+    """Index of the first occurrence per ``release_id`` over the input events.
 
-    The query is one round-trip with an ``= ANY`` filter — cheap even for
-    a few hundred IDs.
-
-    Returns one classified row per input event (in input order).
+    Computed over the FULL events list *before* any sampling so that
+    ``prior_seen_in_window`` stays anchored to the user's log window, not
+    to whichever subset ``rng.sample`` happened to pick.
     """
-    if not events:
+    first_seen: dict[int, int] = {}
+    for idx, event in enumerate(events):
+        first_seen.setdefault(event.release_id, idx)
+    return first_seen
+
+
+def classify(
+    conn: psycopg.Connection,
+    indexed_events: list[tuple[int, MissEvent]],
+    first_seen: dict[int, int],
+) -> list[dict[str, object]]:
+    """For each ``(original_index, event)`` pair, classify by PG state.
+
+    ``first_seen`` is precomputed over the *full* log so that
+    ``prior_seen_in_window`` reflects whether the release_id appeared
+    earlier in the user's input window — not just earlier in the sample.
+    ``rng.sample`` returns elements in random selection order and would
+    otherwise silently invert the semantic.
+
+    Returns one classified row per input event, in the input order of
+    ``indexed_events`` (caller is expected to pass them sorted by
+    ``original_index`` for a chronological CSV).
+    """
+    if not indexed_events:
         return []
 
-    unique_ids = sorted({e.release_id for e in events})
+    unique_ids = sorted({e.release_id for _, e in indexed_events})
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -149,16 +171,11 @@ def classify(conn: psycopg.Connection, events: list[MissEvent]) -> list[dict[str
         # Maps release_id -> release_track_count. Absent key = row didn't exist.
         present: dict[int, int] = {row[0]: row[1] for row in cur.fetchall()}
 
-    # First-occurrence index per release_id, for the "prior_seen_in_window" flag.
-    first_seen: dict[int, int] = {}
-    for idx, event in enumerate(events):
-        first_seen.setdefault(event.release_id, idx)
-
     classified: list[dict[str, object]] = []
-    for idx, event in enumerate(events):
+    for original_idx, event in indexed_events:
         existed = event.release_id in present
         track_count = present.get(event.release_id, 0)
-        prior = first_seen[event.release_id] < idx
+        prior = first_seen[event.release_id] < original_idx
         classified.append(
             {
                 "timestamp": event.timestamp,
@@ -272,14 +289,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    {method}: {pattern.pattern}", file=sys.stderr)
         return 1
 
-    if args.limit and len(events) > args.limit:
+    # Compute first_seen over the FULL log BEFORE sampling so the
+    # prior_seen_in_window flag stays anchored to the user's log window
+    # rather than to whichever subset rng.sample happened to pick.
+    first_seen = compute_first_seen(events)
+    indexed_events = list(enumerate(events))
+    if args.limit and len(indexed_events) > args.limit:
         rng = random.Random(args.seed)
-        events = rng.sample(events, args.limit)
+        indexed_events = sorted(rng.sample(indexed_events, args.limit), key=lambda p: p[0])
 
     import psycopg
 
     with psycopg.connect(dsn) as conn:
-        classified = classify(conn, events)
+        classified = classify(conn, indexed_events, first_seen)
 
     with args.out.open("w", newline="") as f:
         emit_csv(classified, f)
