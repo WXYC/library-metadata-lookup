@@ -2209,6 +2209,66 @@ class TestSearchSongAsTrack:
             "run concurrently at all."
         )
 
+    @pytest.mark.asyncio
+    async def test_early_exits_after_max_results_accumulated(self):
+        """No further ``validate_track_on_release`` calls fire once
+        ``MAX_SEARCH_RESULTS`` matches accumulate.
+
+        LML#536: the pre-PR (#534) serial loop short-circuited as soon as
+        ``MAX_SEARCH_RESULTS`` matches landed; the ``asyncio.gather`` conversion
+        scheduled every candidate's validate call regardless. With ~15
+        high-fanout candidates that's ~10 wasted Discogs round-trips per
+        request — each one a ``/releases/<id>`` API hit (Sentry p95 5.87s)
+        when the PG cache write path is degraded
+        (Sentry LIBRARY-METADATA-LOOKUP-9).
+
+        Pin the invariant: with 15 candidates that would all validate true,
+        the function must surface exactly ``MAX_SEARCH_RESULTS`` results and
+        fire at most ``MAX_SEARCH_RESULTS`` validate calls.
+        """
+        from lookup.orchestrator import MAX_SEARCH_RESULTS
+
+        n_candidates = MAX_SEARCH_RESULTS * 3
+        items = [
+            make_library_item(id=5000 + i, artist=f"Artist {i}", title=f"Album {i}")
+            for i in range(n_candidates)
+        ]
+        releases = [
+            DiscogsReleaseInfo(
+                album=f"Album {i}",
+                artist=f"Artist {i}",
+                release_id=10000 + i,
+                release_url=f"https://discogs.com/release/{10000 + i}",
+                is_compilation=False,
+            )
+            for i in range(n_candidates)
+        ]
+
+        db = AsyncMock()
+
+        async def search_side_effect(query, **kwargs):
+            for item in items:
+                if (item.title or "").lower() == query.lower():
+                    return [item]
+            return []
+
+        db.search.side_effect = search_side_effect
+
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="t", releases=releases, total=n_candidates
+        )
+        svc.validate_track_on_release.return_value = True
+
+        results, _matched_via = await search_song_as_track(db, "t", discogs_service=svc)
+
+        assert len(results) == MAX_SEARCH_RESULTS
+        n_validate_calls = svc.validate_track_on_release.await_count
+        assert n_validate_calls <= MAX_SEARCH_RESULTS, (
+            f"Expected early-exit after at most {MAX_SEARCH_RESULTS} validate calls, "
+            f"got {n_validate_calls} (LML#536: gather conversion lost early exit)."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: _log_track_validation (A7 / LML#344 audit instrumentation)
