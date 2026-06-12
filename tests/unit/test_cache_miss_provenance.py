@@ -29,17 +29,22 @@ def test_extract_pulls_release_ids_from_validate_log_lines():
         "2026-06-11T07:42:01.123Z INFO Validated: 'Aluminum Tunes' by 'Stereolab' found on release 9876",
         "2026-06-11T07:42:02.456Z INFO Track 'Yoshimura' by 'X' NOT found on release 11111",
         "2026-06-11T07:42:03.789Z INFO Validated (fuzzy): 'Foo' by 'Bar' on release 22222",
-        "2026-06-11T07:42:04.999Z WARNING Failed to fetch release 33333 (rate limited or error)",
         "2026-06-11T07:42:05.000Z INFO unrelated noise",
     ]
     events = extract_from_log(lines)
 
-    assert [e.release_id for e in events] == [9876, 11111, 22222, 33333]
-    assert events[0].method == "validate_track_on_release"
-    assert events[1].method == "validate_track_on_release"
-    assert events[2].method == "validate_track_on_release"
-    assert events[3].method == "get_release"
+    assert [e.release_id for e in events] == [9876, 11111, 22222]
+    assert all(e.method == "validate_track_on_release" for e in events)
     assert events[0].timestamp == "2026-06-11T07:42:01.123Z"
+
+
+def test_extract_skips_api_failure_lines():
+    """Failed-to-fetch warnings fire on API faults, not cache misses, so the
+    extractor must NOT pull them into the H1/H3' provenance sample (LML#537)."""
+    lines = [
+        "2026-06-11T07:42:04.999Z WARNING Failed to fetch release 33333 (rate limited or error)",
+    ]
+    assert extract_from_log(lines) == []
 
 
 def test_classify_release_existed_with_tracks_is_h3prime_candidate():

@@ -19,16 +19,18 @@ Input shapes accepted (pick one):
 * ``--log PATH`` — a text log file (``railway logs`` export, ``-`` for stdin).
   The script tries a default set of regexes against each line; lines that
   match contribute one row to the sample. The regex set captures the
-  INFO-level lines that already exist in production:
+  INFO-level lines that fire when ``validate_track_on_release`` reached
+  the API leg (i.e., the cache missed for that release_id):
 
     * ``Validated: 'TRACK' by 'ARTIST' found on release RELEASE_ID``
     * ``Validated (fuzzy): 'TRACK' by 'ARTIST' on release RELEASE_ID``
     * ``Track 'TRACK' by 'ARTIST' NOT found on release RELEASE_ID``
-    * ``Failed to fetch release RELEASE_ID``
 
-  Each of these fires on the API leg of ``validate_track_on_release`` —
-  i.e., the cache missed on that release_id. ``method`` is set to
-  ``validate_track_on_release`` for all four.
+  ``method`` is set to ``validate_track_on_release`` for all three. The
+  ``Failed to fetch release RELEASE_ID`` warning is *not* captured here —
+  it fires on an API failure (timeout, 5xx) rather than a clean cache
+  miss, and including it would conflate H1/H3' provenance with availability
+  faults.
 
 * ``--ids PATH`` — a CSV with columns ``release_id`` and ``method`` (and
   optional ``timestamp``). Use this when feeding the sample from a
@@ -69,10 +71,12 @@ class MissEvent:
     timestamp: str  # original log timestamp prefix or ""
 
 
-# The regex set targeting the INFO-level log lines that already exist in prod.
-# Each carries a ``release_id`` extractable group. ``method`` is fixed per
-# pattern — all four fire on the validate path which is the dominant warm-up
-# channel per the issue's H1.
+# INFO-level log lines that fire on the validate path's API leg — i.e., the
+# cache missed for that release_id and we then asked Discogs. These are the
+# dominant warm-up channel per the issue's H1. The ``Failed to fetch release``
+# warning is deliberately NOT in this set: it fires on API failures (timeout,
+# 5xx) rather than clean cache misses, and including it would conflate
+# H1/H3' provenance with availability faults.
 _LOG_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"Validated: '.+' by '.+' found on release (\d+)"), "validate_track_on_release"),
     (
@@ -80,7 +84,6 @@ _LOG_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         "validate_track_on_release",
     ),
     (re.compile(r"Track '.+' by '.+' NOT found on release (\d+)"), "validate_track_on_release"),
-    (re.compile(r"Failed to fetch release (\d+)"), "get_release"),
 )
 
 # Best-effort timestamp prefix (ISO-8601-ish or RFC 3339); empty if absent.
