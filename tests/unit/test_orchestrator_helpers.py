@@ -35,6 +35,7 @@ from lookup.orchestrator import (
     filter_results_by_track_validation,
     find_library_albums_with_cached_track,
     resolve_albums_for_track,
+    search_compilations_for_track,
     search_library_with_fallback,
     search_song_as_track,
     search_with_alternative_interpretation,
@@ -2192,10 +2193,11 @@ class TestSearchSongAsTrack:
 
         svc.validate_track_on_release.side_effect = validate_side_effect
 
-        # Import the cap so the test tracks the constant rather than a magic
-        # number — if the value is tuned later, this test still pins the
-        # invariant "peak_in_flight <= cap".
-        from lookup.orchestrator import _SONG_AS_TRACK_VALIDATE_CONCURRENCY as _CAP
+        # The per-request fan-out cap is the chunk size passed to
+        # ``_chunked_gather``, which the three call sites pin to
+        # ``MAX_SEARCH_RESULTS``. Pin the invariant against the same constant
+        # so the test still tracks if the value is tuned later.
+        from lookup.orchestrator import MAX_SEARCH_RESULTS as _CAP
 
         await search_song_as_track(db, "t", discogs_service=svc)
 
@@ -2267,6 +2269,97 @@ class TestSearchSongAsTrack:
         assert n_validate_calls <= MAX_SEARCH_RESULTS, (
             f"Expected early-exit after at most {MAX_SEARCH_RESULTS} validate calls, "
             f"got {n_validate_calls} (LML#536: gather conversion lost early exit)."
+        )
+
+
+class TestSearchCompilationsEarlyExit:
+    """LML#536: the gather conversion lost the pre-PR early-exit. With ~15
+    high-fanout candidates, every ``process_release`` task ran and validated
+    against Discogs even after ``MAX_SEARCH_RESULTS`` matches had already
+    landed.
+
+    Pins the invariant: once ``MAX_SEARCH_RESULTS`` matches accumulate, no
+    further ``validate_track_on_release`` calls fire.
+    """
+
+    @pytest.mark.asyncio
+    async def test_main_gather_early_exits_after_max_results(self):
+        """Wave A returns 15 candidates that all validate true; the post-gather
+        truncation must short-circuit dispatch so only ~``MAX_SEARCH_RESULTS``
+        validate calls fire.
+
+        With the PG cache write path degraded (Sentry
+        LIBRARY-METADATA-LOOKUP-9) each wasted validate falls through to the
+        live ``/releases/<id>`` endpoint (p95 5.87s on that span), so the
+        cost lever isn't just rate-limiter pressure — it's wall time and
+        Discogs quota.
+        """
+        from lookup.orchestrator import MAX_SEARCH_RESULTS
+
+        n_candidates = MAX_SEARCH_RESULTS * 3
+        items = [
+            make_library_item(
+                id=20000 + i,
+                artist="Vivien Goldman",
+                title=f"Album {i}",
+            )
+            for i in range(n_candidates)
+        ]
+        releases = [
+            DiscogsReleaseInfo(
+                album=f"Album {i}",
+                artist="Vivien Goldman",
+                release_id=30000 + i,
+                release_url=f"https://www.discogs.com/release/{30000 + i}",
+                is_compilation=False,
+            )
+            for i in range(n_candidates)
+        ]
+
+        db = AsyncMock()
+
+        async def _search(query, limit=None, **_):
+            q = query.lower()
+            for item in items:
+                if (item.title or "").lower() == q:
+                    return [item]
+            return []
+
+        db.search = AsyncMock(side_effect=_search)
+
+        svc = AsyncMock()
+        svc.cache_service = None
+
+        async def _track_releases(track, artist=None, artist_as_keyword=False, **_):
+            return DiscogsTrackReleasesResponse(
+                track=track,
+                artist=artist,
+                releases=[] if artist_as_keyword else list(releases),
+                total=0 if artist_as_keyword else len(releases),
+            )
+
+        svc.search_releases_by_track = AsyncMock(side_effect=_track_releases)
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+
+        parsed = ParsedRequest(
+            artist="Vivien Goldman",
+            song="Launderette",
+            raw_message="launderette by vivien goldman",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            results, _titles = await search_compilations_for_track(db, parsed, discogs_service=svc)
+
+        assert len(results) == MAX_SEARCH_RESULTS
+        n_validate_calls = svc.validate_track_on_release.await_count
+        assert n_validate_calls <= MAX_SEARCH_RESULTS, (
+            f"Expected early-exit after at most {MAX_SEARCH_RESULTS} validate calls, "
+            f"got {n_validate_calls} (LML#536: gather conversion lost early exit "
+            "in search_compilations_for_track)."
         )
 
 
