@@ -90,6 +90,47 @@ DATABASE_URL_DISCOGS=postgresql://... \
     --fp-rate-target 0.005
 ```
 
+## Cache Investigation (LML#537)
+
+Three one-shot diagnostic scripts that quantify why the Discogs cache hit ratio plateaued at ~50% (`search_releases_by_track` at 34%) after the `write_release` ON CONFLICT failure was resolved by Alembic 0009. All read-only; none modify state.
+
+### Cache miss provenance sample (`scripts/cache_miss_provenance.py`)
+
+For a sample of cache-miss → API-call events, classifies each by whether the `release` row already existed at miss time and whether it carried `release_track` rows. Separates first-time misses (H1 — ETL coverage gap) from release-row-exists-with-tracks misses (H3' — validate-as-hit poisoning).
+
+**Usage:**
+```bash
+DATABASE_URL_DISCOGS=postgresql://... python scripts/cache_miss_provenance.py --log railway-export.log
+DATABASE_URL_DISCOGS=postgresql://... python scripts/cache_miss_provenance.py --ids sentry-traces.csv --limit 50
+```
+
+Outputs `/tmp/lml-537-cache-miss-provenance.csv` and a summary table to stdout. Accepts either a Railway log file (`--log`) parsed by built-in regex patterns or a CSV of `release_id,method` (`--ids`) from a Sentry trace export.
+
+### Cache warm-up histogram (`scripts/cache_warm_histogram.py`)
+
+Buckets `release.artwork_checked_at` by day and contrasts the pre-Alembic-0009 ETL fill with the post-deploy dynamic warm-up daily mean. A small post-deploy mean confirms the warm-up channel is structurally limited (H1).
+
+**Usage:**
+```bash
+DATABASE_URL_DISCOGS=postgresql://... python scripts/cache_warm_histogram.py
+DATABASE_URL_DISCOGS=postgresql://... python scripts/cache_warm_histogram.py --csv > histogram.csv
+DATABASE_URL_DISCOGS=postgresql://... python scripts/cache_warm_histogram.py --since 2026-06-07
+```
+
+### Discogs ranking jitter (`scripts/discogs_ranking_jitter.py`)
+
+Issues two identical `/database/search?track=...&artist=...` calls separated by a short delay, measures jaccard overlap of returned release IDs and average rank-delta for shared IDs. Low jaccard confirms H2 — Discogs returns different IDs across calls, so warming the prior set doesn't help the next one.
+
+**Usage:**
+```bash
+DISCOGS_TOKEN=... python scripts/discogs_ranking_jitter.py \
+  --track "Moments of Soft Persuasion" --artist Yoshimura
+DISCOGS_TOKEN=... python scripts/discogs_ranking_jitter.py \
+  --track Coastin --artist "Quiet Force" --repeat 3 --delay-seconds 45 --json
+```
+
+Bypasses `DiscogsService` (no L1 LRU, no semaphore) to surface Discogs-side ranking behavior directly. Default delay is 30s (within Discogs's 60req/60s window); the `X-Discogs-Ratelimit-Remaining` header is logged after each call.
+
 ## Artist Name Variation Audit (`scripts/variation_audit/`)
 
 Cross-references WXYC library catalog artist name variations against local Discogs and MusicBrainz datasets. Classifies each relationship (ALIAS, MEMBER_OF_GROUP, SEPARATE_ARTIST, COLLABORATION, SPELLING_VARIANT, SPLIT_RELEASE) and identifies artists that should have their own library code. Output includes flowsheet play counts and own-release counts for prioritization.

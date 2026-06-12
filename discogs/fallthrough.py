@@ -58,6 +58,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from typing import Any
 
 import asyncpg.exceptions
@@ -94,6 +95,21 @@ _ARMING_EXCEPTIONS: tuple[type[BaseException], ...] = (
     asyncpg.exceptions.InterfaceError,
     asyncpg.exceptions.UndefinedTableError,
     CacheUnavailableError,
+)
+
+
+# Per-call context for the downstream ``DiscogsService._request_with_retry``
+# spans (LML#537). Set right before the API-fetch leg with the seam's ``label``
+# and the resolved ``cache_state``; read inside ``_request_with_retry`` so the
+# ``lml.discogs.semaphore`` and ``lml.discogs.rate_limiter`` spans can be tagged
+# without threading kwargs through 9 call sites. Token-paired set/reset
+# guarantees the contextvar resets even under ``CancelledError`` so a cancelled
+# call doesn't leak state. Default is ``None`` because direct callers of
+# ``_request_with_retry`` (the health probe, a handful of legacy tests) live
+# outside the seam and must not blow up if the var is absent. Naming mirrors
+# the local ``_skip_cache_var`` in ``discogs/memory_cache.py``.
+_request_context_var: ContextVar[dict[str, str] | None] = ContextVar(
+    "discogs_request_context", default=None
 )
 
 
@@ -216,8 +232,17 @@ async def fallthrough[T](
     # ----- Per-request skip flag (benchmarking, A/B). Bypass every cache leg.
     skip = should_skip_cache()
 
+    # Capture cool-down state at entry so the LML#537 ``cache_state`` tag below
+    # reflects the gate that actually fired — not a downstream arming triggered
+    # by *this* call's PG-read exception. ``_arm_cool_down`` runs after a PG
+    # read raises ``_ARMING_EXCEPTIONS``; reading ``_cool_down_active()`` again
+    # after the read leg would conflate "this call's PG errored, fell through
+    # to API" (a ``miss``) with "PG was already down, we skipped the read"
+    # (a ``cooldown``).
+    in_cool_down = _cool_down_active()
+
     # ----- L2 PG read (if configured, not skipped, not cooling down).
-    if pg_read is not None and not skip and not _cool_down_active():
+    if pg_read is not None and not skip and not in_cool_down:
         try:
             _add_discogs_breadcrumb(f"cache_lookup_{label}", bc_data)
             with sentry_sdk.start_span(op="cache.get", name=f"l2:{label}") as span:
@@ -269,8 +294,25 @@ async def fallthrough[T](
             # request through to the API path.
             logger.warning("Negative-cache check failed (%s): %s", label, e)
 
+    # ----- LML#537 telemetry: tag the downstream ``_request_with_retry`` spans
+    # with the seam's label + the resolved cache_state, so Sentry's wait-time
+    # histogram for ``lml.discogs.semaphore`` / ``lml.discogs.rate_limiter``
+    # can be split by which method's miss triggered the wait.
+    if skip:
+        cache_state = "skip"
+    elif pg_read is None:
+        cache_state = "no_pg"
+    elif in_cool_down:
+        cache_state = "cooldown"
+    else:
+        cache_state = "miss"
+
     # ----- L3 API.
-    api_result = await api_fetch()
+    token = _request_context_var.set({"method": label, "cache_state": cache_state})
+    try:
+        api_result = await api_fetch()
+    finally:
+        _request_context_var.reset(token)
 
     # ----- Write-backs (best-effort; only when not bypassing the cache).
     if api_result is not None and not skip:
