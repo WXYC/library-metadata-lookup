@@ -34,9 +34,9 @@ import pytest
 
 from discogs import fallthrough as fallthrough_mod
 from discogs.fallthrough import (
-    _request_context_var,
     _reset_cool_down_for_tests,
     fallthrough,
+    get_request_context,
     request_context,
 )
 from discogs.memory_cache import set_skip_cache
@@ -231,7 +231,7 @@ async def test_context_resets_on_cancelled_error(captured_spans, _ensure_skip_ca
             api_fetch=cancelling_api_fetch,
         )
 
-    assert _request_context_var.get() is None
+    assert get_request_context() is None
 
 
 @pytest.mark.asyncio
@@ -249,7 +249,7 @@ async def test_context_resets_on_normal_return(captured_spans, _ensure_skip_cach
         api_fetch=api_fetch,
     )
 
-    assert _request_context_var.get() is None
+    assert get_request_context() is None
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +262,7 @@ async def test_no_tag_when_called_outside_seam(service, captured_spans):
     """A handful of legacy tests call ``_request_with_retry`` directly.
     Without a contextvar set, the spans must not blow up and must not
     carry the LML#537 tags."""
-    assert _request_context_var.get() is None
+    assert get_request_context() is None
     await _drive_request_with_retry(service)
 
     for name in ("lml.discogs.semaphore", "lml.discogs.rate_limiter"):
@@ -286,7 +286,7 @@ async def test_request_context_tags_direct_caller_spans(
     each call ``_request_with_retry`` directly (no fallthrough). The
     ``request_context`` helper they wrap their call in must propagate the
     method tag + cache_state=no_pg the same way the seam does."""
-    with request_context("get_label_image", "no_pg"):
+    with request_context("get_label_image"):
         await _drive_request_with_retry(service)
 
     for name in ("lml.discogs.semaphore", "lml.discogs.rate_limiter"):
@@ -295,4 +295,62 @@ async def test_request_context_tags_direct_caller_spans(
         _assert_tagged(span, "get_label_image", "no_pg")
 
     # And the contextvar resets cleanly outside the with-block.
-    assert _request_context_var.get() is None
+    assert get_request_context() is None
+
+
+# ---------------------------------------------------------------------------
+# 6. ``cache is None`` fallback — the four seam methods' bypass branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cacheless_get_release_tags_with_no_pg(
+    service, captured_spans, _ensure_skip_cache_clear
+):
+    """When DiscogsService runs without a cache_service (production fallback
+    used by ``discogs/lookup.py:27`` and explicit ``service=None`` paths),
+    ``get_release`` short-circuits the seam and calls ``_api_fetch`` directly.
+    That branch is wrapped in ``request_context('get_release')`` so the
+    wait-time spans participate in the LML#537 histogram split."""
+    assert service.cache_service is None
+    # _request_with_retry needs the same mocked semaphore/limiter as the
+    # other tests; mirror _drive_request_with_retry's setup here so we can
+    # drive a real method call through the cacheless branch.
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.headers = {}
+    fake_response.json.return_value = {
+        "id": 12345,
+        "title": "Stereolab - Aluminum Tunes",
+        "artists": [{"name": "Stereolab", "id": 1}],
+        "labels": [],
+        "genres": [],
+        "styles": [],
+        "year": 1998,
+        "tracklist": [],
+    }
+
+    mock_client = MagicMock()
+    mock_client.request = AsyncMock(return_value=fake_response)
+    service._client = mock_client
+
+    fake_semaphore = MagicMock()
+    fake_semaphore.acquire = AsyncMock()
+    fake_semaphore.release = MagicMock()
+    fake_semaphore._waiters = []
+
+    fake_limiter = MagicMock()
+    fake_limiter.acquire = AsyncMock()
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=fake_semaphore),
+        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+    ):
+        await service.get_release(12345)
+
+    for name in ("lml.discogs.semaphore", "lml.discogs.rate_limiter"):
+        span = captured_spans.get(name)
+        assert span is not None
+        _assert_tagged(span, "get_release", "no_pg")

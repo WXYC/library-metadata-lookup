@@ -77,7 +77,13 @@ class JitterPair:
         return sum(abs(rank_a[r] - rank_b[r]) for r in shared) / len(shared)
 
     def to_record(self) -> dict[str, object]:
-        """Serializable shape that includes derived metrics — used by --json."""
+        """Serializable shape for ``--json`` output. Keys:
+
+        ``call_a_ids`` (list[int]), ``call_b_ids`` (list[int]),
+        ``delay_seconds`` (float), ``overlap`` (int), ``union`` (int),
+        ``jaccard`` (float), ``position_stability`` (float | None — ``None``
+        when the two result lists share no IDs).
+        """
         overlap, union, jaccard = self.stats()
         return {
             "call_a_ids": self.call_a_ids,
@@ -136,8 +142,13 @@ async def run_pair(
     return JitterPair(call_a_ids=ids_a, call_b_ids=ids_b, delay_seconds=delay_seconds)
 
 
-def aggregate(pairs: list[JitterPair]) -> dict[str, float | int]:
-    """Aggregate stats across N pairs."""
+def aggregate(pairs: list[JitterPair]) -> dict[str, float | int | None]:
+    """Aggregate stats across N pairs.
+
+    ``position_stability_mean`` is ``None`` when no pair has shared IDs —
+    JSON-serializes as ``null`` (strict-parser-safe), unlike ``float('nan')``
+    which Python's ``json.dumps`` emits as literal ``NaN``.
+    """
     if not pairs:
         return {"pairs": 0}
     jaccards = [p.stats()[2] for p in pairs]
@@ -147,9 +158,7 @@ def aggregate(pairs: list[JitterPair]) -> dict[str, float | int]:
         "jaccard_mean": sum(jaccards) / len(jaccards),
         "jaccard_min": min(jaccards),
         "jaccard_max": max(jaccards),
-        "position_stability_mean": (
-            sum(stabilities) / len(stabilities) if stabilities else float("nan")
-        ),
+        "position_stability_mean": (sum(stabilities) / len(stabilities) if stabilities else None),
     }
 
 
@@ -164,7 +173,7 @@ def print_pair(pair: JitterPair, index: int) -> None:
     )
 
 
-def print_summary(agg: dict[str, float | int]) -> None:
+def print_summary(agg: dict[str, float | int | None]) -> None:
     if not agg.get("pairs"):
         return
     print()
@@ -174,10 +183,10 @@ def print_summary(agg: dict[str, float | int]) -> None:
         f"{agg['jaccard_mean']:.3f} / {agg['jaccard_min']:.3f} / {agg['jaccard_max']:.3f}"
     )
     stability = agg["position_stability_mean"]
-    if stability == stability:  # noqa: PLR0124 — NaN check
-        print(f"position_stability_mean:  {stability:.2f}")
-    else:
+    if stability is None:
         print("position_stability_mean:  (no shared IDs across any pair)")
+    else:
+        print(f"position_stability_mean:  {stability:.2f}")
     print()
     print("Interpretation per LML#537 (H2):")
     print("  jaccard ~ 1.0 → warming this call's IDs warms the next; cache warm-up effective.")
