@@ -112,30 +112,6 @@ refs each still leave headroom for the read path.
 _warm_cache_semaphore: asyncio.Semaphore | None = None
 """Lazily-constructed (needs a running event loop). Re-bind on the first call."""
 
-_SONG_AS_TRACK_VALIDATE_CONCURRENCY: int = 5
-"""Per-request cap on concurrent ``validate_track_on_release`` calls inside
-``search_song_as_track`` and ``search_compilations_for_track``.
-
-Used as the chunk size for ``_chunked_gather`` — each chunk dispatches at most
-this many ``_validate_one`` / ``process_release`` tasks before the caller's
-accumulator is checked for early exit. The cap holds whether parallelism is
-the binding constraint (the original LML#534 motivation: serial 8-10s chain
-on ``/api/v1/lookup`` p95/p99) or the early-exit invariant is (LML#536:
-without chunking, ``asyncio.gather`` scheduled every candidate's validate
-even after the response cap had been saturated). Pinning chunk size to
-``MAX_SEARCH_RESULTS`` means the first full chunk can satisfy the
-common-case response cap on its own.
-
-Sized to match the global Discogs semaphore in ``discogs/service.py``
-(``get_semaphore()`` returns a 5-permit semaphore — see
-``_request_with_retry``'s comment at line 377). The orchestrator-local
-chunking here gates *fan-out per request*; the global rate limiter +
-semaphore in ``discogs/service.py`` sits underneath and gates *cross-request
-total load*. The two are compatible: a single request fans out up to 5
-validate tasks per chunk; the global limiter then serializes their
-underlying HTTP calls when concurrent requests stack up.
-"""
-
 
 async def _chunked_gather[T, R](
     items: list[T],
@@ -153,10 +129,14 @@ async def _chunked_gather[T, R](
     within-chunk parallelism.
 
     Wall time: ``ceil(N / chunk_size)`` × slowest task per chunk in the
-    no-exit case. With ``chunk_size == MAX_SEARCH_RESULTS`` a single chunk
-    is enough whenever the response cap is satisfied by the first batch —
-    the dominant case for high-fanout requests.
+    no-exit case. The orchestrator's three call sites pass
+    ``MAX_SEARCH_RESULTS`` as the chunk size so that one full chunk can
+    satisfy the response cap on its own — the dominant case for high-fanout
+    requests. The cap also lines up with the 5-permit global Discogs
+    semaphore in ``discogs/service.py`` (``get_semaphore()``): per-request
+    fan-out is bounded here; cross-request total load is bounded there.
     """
+    assert chunk_size > 0, f"chunk_size must be positive, got {chunk_size}"
     for start in range(0, len(items), chunk_size):
         chunk = items[start : start + chunk_size]
         chunk_results = await asyncio.gather(*[worker(it) for it in chunk])
@@ -1012,9 +992,7 @@ async def search_song_as_track(
     # is reached aborts the generator before un-fired chunks dispatch —
     # the per-request validate budget stays bounded (LML#536).
     done = False
-    async for release, eligible in _chunked_gather(
-        raw_releases, _validate_one, _SONG_AS_TRACK_VALIDATE_CONCURRENCY
-    ):
+    async for release, eligible in _chunked_gather(raw_releases, _validate_one, MAX_SEARCH_RESULTS):
         if eligible is None:
             continue
 
@@ -1497,8 +1475,8 @@ async def search_compilations_for_track(
         # ``validate_track_on_release`` even after MAX_SEARCH_RESULTS
         # matches had already landed — see LML#536 and the matching
         # treatment in ``search_song_as_track``.
-        async for _release_info, release_matches in _chunked_gather(
-            raw_releases, process_release, _SONG_AS_TRACK_VALIDATE_CONCURRENCY
+        async for _, release_matches in _chunked_gather(
+            raw_releases, process_release, MAX_SEARCH_RESULTS
         ):
             for match, discogs_album in release_matches:
                 if match.id not in seen_ids:
@@ -1550,15 +1528,13 @@ async def search_compilations_for_track(
                     f"for '{parsed.album}'"
                 )
 
-            async def _fallback_worker(ri: ReleaseInfo) -> list[tuple[LibraryItem, str]]:
-                return await process_release(
-                    ri,
-                    skip_self_named_album=False,
-                    skip_artist_match_filter=True,
-                )
-
-            async for _release_info, release_matches in _chunked_gather(
-                fallback_releases, _fallback_worker, _SONG_AS_TRACK_VALIDATE_CONCURRENCY
+            fallback_worker = partial(
+                process_release,
+                skip_self_named_album=False,
+                skip_artist_match_filter=True,
+            )
+            async for _, release_matches in _chunked_gather(
+                fallback_releases, fallback_worker, MAX_SEARCH_RESULTS
             ):
                 for match, discogs_album in release_matches:
                     if match.id not in seen_ids:
