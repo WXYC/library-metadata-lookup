@@ -316,8 +316,6 @@ async def test_cacheless_get_release_tags_with_no_pg(
     # _request_with_retry needs the same mocked semaphore/limiter as the
     # other tests; mirror _drive_request_with_retry's setup here so we can
     # drive a real method call through the cacheless branch.
-    from unittest.mock import AsyncMock, MagicMock, patch
-
     fake_response = MagicMock()
     fake_response.status_code = 200
     fake_response.headers = {}

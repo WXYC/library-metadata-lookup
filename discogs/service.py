@@ -20,7 +20,7 @@ from wxyc_fastapi.observability import (
 )
 
 from config.settings import get_settings
-from discogs.fallthrough import fallthrough, get_request_context, request_context
+from discogs.fallthrough import apply_request_ctx_tags, fallthrough, request_context
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import (
     ARTIST_CACHE,
@@ -100,20 +100,6 @@ def _approx_semaphore_queue_depth(semaphore: asyncio.Semaphore) -> int:
         return len(waiters) if waiters else 0
     except AttributeError:
         return -1
-
-
-def _apply_request_ctx_tags(span: Any, ctx: dict[str, str] | None) -> None:
-    """Tag a wait span with the LML#537 method / cache_state labels.
-
-    Centralizes the per-span tag application called from both the semaphore
-    and the per-retry rate-limiter spans in ``_request_with_retry``. ``None``
-    means the caller didn't enter a seam or ``request_context`` — leave the
-    span untagged (a small handful of direct-call tests).
-    """
-    if ctx is None:
-        return
-    span.set_data("lml.discogs.method", ctx["method"])
-    span.set_data("lml.discogs.cache_state", ctx["cache_state"])
 
 
 def _compute_retry_delay(attempt: int, retry_after_header: str | None) -> float:
@@ -387,14 +373,12 @@ class DiscogsService:
         semaphore = get_semaphore()
         rate_limiter = get_rate_limiter()
 
-        # LML#537: read the per-call context (label + resolved cache_state)
-        # once, tag both wait spans via _apply_request_ctx_tags. Production
-        # callers enter via ``fallthrough()`` (dominant) or via the
-        # ``request_context()`` helper (the three API-only methods that bypass
-        # the seam and the four ``cache is None`` fallback branches). Tests
-        # that drive ``_request_with_retry`` directly leave the contextvar as
-        # ``None`` — _apply_request_ctx_tags is a no-op in that case.
-        request_ctx = get_request_context()
+        # LML#537: tag both wait spans with the seam's method + cache_state
+        # via ``apply_request_ctx_tags`` (a no-op when no context is active —
+        # the case for the small handful of legacy direct-call tests).
+        # Production callers enter via ``fallthrough()`` (dominant) or via
+        # the ``request_context()`` helper (the three API-only methods that
+        # bypass the seam and the four ``cache is None`` fallback branches).
 
         # Explicit acquire/release (not `async with semaphore:`) so the wait
         # is wrapped in a Sentry span. The 5-permit semaphore is the dominant
@@ -403,14 +387,14 @@ class DiscogsService:
         # relative-load signal per call. See WXYC/library-metadata-lookup#358.
         with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
             span.set_data("lml.semaphore.queue_depth", _approx_semaphore_queue_depth(semaphore))
-            _apply_request_ctx_tags(span, request_ctx)
+            apply_request_ctx_tags(span)
             await semaphore.acquire()
         try:
             for attempt in range(max_retries + 1):
                 with sentry_sdk.start_span(
                     op="lock.acquire", name="lml.discogs.rate_limiter"
                 ) as span:
-                    _apply_request_ctx_tags(span, request_ctx)
+                    apply_request_ctx_tags(span)
                     await rate_limiter.acquire()
 
                 try:
