@@ -898,25 +898,39 @@ class DiscogsService:
                 # bidirectionally constrained `T`. The runtime contract is
                 # unchanged.
                 pg_write=cache.write_release,  # type: ignore[arg-type]
-                # `artwork_url IS NULL AND artwork_checked_at IS NULL` is the
-                # "never asked" state — the bulk loader populated the row but
-                # LML has not yet asked Discogs (~48% of release rows are like
-                # this; see WXYC/library-metadata-lookup#414 and
-                # WXYC/discogs-etl#239). Falling through to the API is the
-                # back-fill path. Once `artwork_checked_at` is set, both
-                # "asked, got a cover" and "asked, no cover" are full hits —
-                # we don't re-ask Discogs about the no-cover tail.
+                # LML#542 widened predicate. The cache row is a HIT when any
+                # one of three signals says "we already have something useful
+                # for this id":
                 #
-                # LML#510 tombstones (not_found=True) carry
-                # artwork_checked_at=now() so they satisfy this predicate too;
-                # the boundary translation below converts them to None for
-                # the public caller. Keeping the predicate type-opaque (no
-                # `not_found` check here) means the fallthrough seam stays
-                # generic — only the public `DiscogsService` methods
-                # understand the tombstone shape.
+                #   1. `not_found` — LML#510 tombstone; the boundary
+                #      translation below converts it to None for the caller.
+                #      Checked explicitly so a tombstone with NULL
+                #      `artwork_checked_at` (not produced by today's write
+                #      path, but cheap defense) still short-circuits.
+                #   2. `tracklist` non-empty — the bulk loader and the live
+                #      write_release path both stamp `release_track` rows
+                #      whenever the release tree is populated. If we have
+                #      tracks, the release exists and is hydrated; artwork
+                #      can be back-filled out of band without paying a
+                #      Discogs round-trip on the hot path.
+                #   3. `artwork_checked_at IS NOT NULL` — LML has hit the
+                #      live API for this release at least once, regardless
+                #      of whether Discogs returned a cover. Keeps the
+                #      "asked, no cover" tail from re-burning the
+                #      rate-limit budget (the #423 invariant).
+                #
+                # The artwork-columns-only predicate from #423 was diagnosed
+                # in #537's `cache_miss_provenance` probe as causing ~20%
+                # of `get_release` calls to fall through to the API even
+                # though the full release tree (release + release_artist +
+                # release_track + release_track_artist) was already in PG —
+                # only the artwork columns were still NULL. Widening here
+                # decouples artwork availability from cache-hit eligibility;
+                # `extended=true` consumers still surface artwork when the
+                # row has it, but we no longer FETCH purely to populate it.
                 is_pg_hit=lambda v: (
                     v is not None
-                    and (v.artwork_url is not None or v.artwork_checked_at is not None)
+                    and (bool(v.not_found) or bool(v.tracklist) or v.artwork_checked_at is not None)
                 ),
                 breadcrumb_data={"release_id": release_id},
             )

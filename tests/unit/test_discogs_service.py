@@ -916,6 +916,13 @@ class TestGetRelease:
             artist="Artist",
             release_url="https://discogs.com/release/123",
             artwork_url="https://img.com/cached.jpg",
+            # `artwork_checked_at` co-occurs with `artwork_url` in production
+            # — `cache_service.write_release` stamps both in the same write,
+            # and the bulk loader does too. Without this, the LML#542
+            # widened predicate (`not_found OR tracklist OR
+            # artwork_checked_at`) would mark this row as a miss because
+            # `artwork_url` alone is not in the predicate.
+            artwork_checked_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC),
             cached=True,
         )
         service_with_cache.cache_service.get_release = AsyncMock(return_value=cached)
@@ -1058,6 +1065,90 @@ class TestGetRelease:
         mock_request.assert_not_called()
         service_with_cache.cache_service.write_release.assert_not_called()
         assert result is cached
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_with_tracklist_and_null_artwork_columns_does_not_call_api(
+        self, service_with_cache
+    ):
+        """LML#542: a cache row with the full release tree populated
+        (`release_track` rows exist, surfaced as a non-empty ``tracklist``) is
+        a HIT regardless of whether ``artwork_url`` / ``artwork_checked_at``
+        are NULL. The artwork-columns gate from #423 was costing ~20% of
+        ``get_release`` calls a full Discogs round-trip even though every
+        column except artwork was already in PG — diagnosed in #537's
+        `cache_miss_provenance` probe. Widening the predicate to accept
+        ``release_track``-populated rows recovers that miss rate; artwork
+        backfill is decoupled.
+        """
+        cached = ReleaseMetadataResponse(
+            release_id=33696617,
+            title="Aluminum Tunes",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/33696617",
+            artwork_url=None,
+            artwork_checked_at=None,
+            tracklist=[
+                TrackItem(position="A1", title="Pop Quiz", duration="3:33", artists=[]),
+                TrackItem(position="A2", title="The Extension Trip", duration="4:12", artists=[]),
+            ],
+            cached=True,
+        )
+        service_with_cache.cache_service.get_release = AsyncMock(return_value=cached)
+        service_with_cache.cache_service.write_release = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+        ) as mock_request:
+            result = await service_with_cache.get_release(33696617)
+
+        mock_request.assert_not_called()
+        service_with_cache.cache_service.write_release.assert_not_called()
+        assert result is cached
+        # Artwork stays NULL on the cached response — the point of the
+        # widening is to stop paying a Discogs round-trip purely to populate
+        # artwork; the field remains nullable for consumers.
+        assert result.artwork_url is None
+        assert result.artwork_checked_at is None
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_tombstone_only_signal_does_not_call_api(self, service_with_cache):
+        """LML#542 tombstone wrinkle: ``not_found = True`` rows are HITs even
+        if ``artwork_checked_at`` happens to be unset and the child cascade
+        is empty. The tombstone write path in ``cache_service.write_release``
+        stamps ``artwork_checked_at = now()`` today, so in practice the
+        ``artwork_checked_at`` arm of the predicate already catches them —
+        but the predicate must not silently regress to "tombstone with NULL
+        ``artwork_checked_at`` falls through to the API" if a future code
+        path ever produces one. The boundary translates the tombstone back
+        to ``None`` for the caller (LML#510).
+        """
+        tombstone = ReleaseMetadataResponse(
+            release_id=33696618,
+            title="",
+            artist="",
+            release_url="https://www.discogs.com/release/33696618",
+            artwork_url=None,
+            artwork_checked_at=None,
+            tracklist=[],
+            not_found=True,
+            cached=True,
+        )
+        service_with_cache.cache_service.get_release = AsyncMock(return_value=tombstone)
+        service_with_cache.cache_service.write_release = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+        ) as mock_request:
+            result = await service_with_cache.get_release(33696618)
+
+        mock_request.assert_not_called()
+        service_with_cache.cache_service.write_release.assert_not_called()
+        # LML#510 boundary: tombstone → None.
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_404_returns_none(self, service):
