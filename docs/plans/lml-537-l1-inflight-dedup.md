@@ -113,7 +113,9 @@ The leader's broadcast (`future.set_result(result)`) fires **before** `cache[key
 
 ### Interaction with `evict_cached`
 
-`evict_cached` only touches the `TTLCache` (`cache.pop(key, None)`). It does **not** touch the in-flight map. Justification: if an eviction races with an in-flight fetch, the leader has already started; the right behavior is to let it finish (followers get the value), then the next post-eviction caller will miss and fetch. Evicting an in-flight entry would just orphan the followers.
+`evict_cached` only touches the `TTLCache` (`cache.pop(key, None)`). It does **not** touch the in-flight map. Justification: if an eviction races with an in-flight fetch, the leader has already started; followers awaiting the leader's future hold a direct reference to it and still receive the value. Evicting the in-flight entry would just orphan the followers.
+
+Note on ordering when `evict_cached` runs *before* the leader's write-back: the leader's eventual `cache[key] = result` will repopulate the L1 entry, so the next caller hits the just-written value — not "miss and fetch." Tombstone-clear flows that need to guarantee no stale serve should re-evict after the in-flight fetch resolves, or queue evictions through a higher-level seam that knows when leaders complete.
 
 ### Interaction with `clear_all_caches`
 

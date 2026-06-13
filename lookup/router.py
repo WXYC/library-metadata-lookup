@@ -134,7 +134,17 @@ async def handle_lookup(
     ),
 ):
     """Process a lookup request."""
-    init_cache_stats()
+    # Pre-declare LML-specific cache-stats keys so PostHog/Sentry payload shapes
+    # are stable even on requests with zero in-flight joins or zero L1 write
+    # failures (LML#544 round 2). Without extra_keys, the keys would only
+    # appear in payloads from the first request that records them.
+    init_cache_stats(
+        extra_keys=(
+            "memory_cache_inflight_join",
+            "memory_cache_inflight_retry_after_cancel",
+            "memory_cache_write_failed",
+        )
+    )
     if skip_cache:
         set_skip_cache(True)
     telemetry = RequestTelemetry(
@@ -326,7 +336,17 @@ async def handle_bulk_lookup(
     # One cache_stats context for the whole batch: the in-process caches are
     # shared, so aggregate counters reflect the batch's behavior — the property
     # that motivates this endpoint.
-    init_cache_stats()
+    # Pre-declare LML-specific cache-stats keys so PostHog/Sentry payload shapes
+    # are stable even on requests with zero in-flight joins or zero L1 write
+    # failures (LML#544 round 2). Without extra_keys, the keys would only
+    # appear in payloads from the first request that records them.
+    init_cache_stats(
+        extra_keys=(
+            "memory_cache_inflight_join",
+            "memory_cache_inflight_retry_after_cancel",
+            "memory_cache_write_failed",
+        )
+    )
 
     max_concurrent = _max_concurrency_from_env()
     semaphore = asyncio.Semaphore(max_concurrent)
