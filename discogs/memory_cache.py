@@ -1,5 +1,6 @@
 """Caching utilities for Discogs API responses using TTL-based LRU cache."""
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -171,12 +172,39 @@ def _set_cached_flag(result: Any, cached: bool) -> Any:
     return result
 
 
+def _inflight_for(cache: TTLCache) -> dict[str, "asyncio.Future[Any]"]:
+    """Per-cache map of in-flight Futures for concurrent-request coalescing.
+
+    Lazily attached to the cache instance the first time a wrapper enters the
+    fallthrough path. Each entry's lifetime spans exactly one fetch — the
+    leader pops it in its `finally` once the future is resolved (success,
+    None, or exception). Followers share the leader's value via
+    `await future` without re-entering the underlying function.
+
+    Exported as a module-level helper (parallel to `_normalize_for_cache_key`)
+    so unit tests can assert the map is empty post-resolve without reaching
+    into the cache instance's private attribute. LML#537.
+    """
+    inflight = getattr(cache, "_lml_inflight", None)
+    if inflight is None:
+        inflight = {}
+        cache._lml_inflight = inflight  # type: ignore[attr-defined]
+    return inflight
+
+
 def async_cached(cache: TTLCache) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for caching async function results.
 
     The decorated function's results are cached based on its arguments.
     If the result has a 'cached' field, it will be set to True on cache hits.
     None results are not cached.
+
+    Concurrent callers for the same key coalesce onto a single in-flight
+    Future, so the wrapped function runs once per key per in-flight window
+    (LML#537). Followers receive the leader's value (with `cached=True`
+    applied when the result shape supports it), or re-raise the leader's
+    exception. The in-flight entry is dropped in a `finally`, so a transient
+    failure or None result does not pin state.
 
     Args:
         cache: TTLCache instance to use for caching
@@ -210,15 +238,40 @@ def async_cached(cache: TTLCache) -> Callable[[Callable[..., T]], Callable[..., 
                 result = cache[key]
                 return _set_cached_flag(result, cached=True)  # type: ignore[no-any-return]
 
-            # Cache miss - call function
-            logger.debug(f"Cache miss for {func.__name__}")
-            result = await func(*args, **kwargs)  # type: ignore[misc]
+            # Coalesce concurrent callers (LML#537). If another caller is
+            # already resolving this key, await its future and return the
+            # same value — marked cached=True to match serial-hit semantics.
+            inflight = _inflight_for(cache)
+            existing = inflight.get(key)
+            if existing is not None:
+                logger.debug(f"Cache in-flight join for {func.__name__}")
+                follower_result = await existing
+                return _set_cached_flag(follower_result, cached=True)  # type: ignore[no-any-return]
 
-            # Don't cache None results
-            if result is not None:
-                cache[key] = result
-
-            return result  # type: ignore[no-any-return]
+            # Leader path: create the future, run the function, broadcast.
+            # `get_running_loop()` is safe because `wrapper` is `async def`
+            # and only runs inside an active event loop.
+            future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+            inflight[key] = future
+            try:
+                logger.debug(f"Cache miss for {func.__name__}")
+                result = await func(*args, **kwargs)  # type: ignore[misc]
+                # Don't cache None results (existing contract).
+                if result is not None:
+                    cache[key] = result
+                future.set_result(result)
+                return result  # type: ignore[no-any-return]
+            except BaseException as exc:
+                future.set_exception(exc)
+                # Mark the exception as retrieved on the future so asyncio
+                # doesn't log "Future exception was never retrieved" when no
+                # follower joined this in-flight window. Followers awaiting
+                # the future consume the exception independently; this no-op
+                # call only matters on the no-follower path.
+                future.exception()
+                raise
+            finally:
+                inflight.pop(key, None)
 
         # Stash the cache + name so `evict_cached` can drop a single entry
         # using the SAME key derivation. Keeping these on the wrapper means a

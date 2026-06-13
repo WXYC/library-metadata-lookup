@@ -1,10 +1,13 @@
 """Unit tests for discogs/memory_cache.py."""
 
+import asyncio
+
 import pytest
 from pydantic import BaseModel
 
 from discogs.memory_cache import (
     _cache_registry,
+    _inflight_for,
     _set_cached_flag,
     async_cached,
     clear_all_caches,
@@ -403,6 +406,244 @@ class TestAsyncCached:
         await my_func("a")
         await my_func("b")
         assert len(cache) == 2
+
+
+# ---------------------------------------------------------------------------
+# Concurrent request coalescing (LML#537)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncCachedInFlightDedup:
+    """`@async_cached` coalesces concurrent callers for the same key onto a
+    single in-flight Future so the wrapped function runs once per key per
+    in-flight window — closing the non-atomic check-then-set race documented
+    in LML#537. Each test creates its own isolated cache to avoid test-order
+    dependencies on a shared in-flight map."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_key_calls_underlying_once(self):
+        # The race: N concurrent callers all see L1 miss, all enter
+        # fallthrough independently. With the in-flight Future, the leader
+        # runs once and broadcasts to all followers.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+
+        @async_cached(cache)
+        async def slow_fetch(arg):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.05)
+            return {"data": arg, "cached": False}
+
+        results = await asyncio.gather(*[slow_fetch("x") for _ in range(5)])
+
+        assert call_count == 1
+        for r in results:
+            assert r["data"] == "x"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_distinct_keys_each_call_underlying(self):
+        # Dedup is key-scoped, not global: concurrent calls with distinct
+        # keys each invoke the function once.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+
+        @async_cached(cache)
+        async def slow_fetch(arg):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.01)
+            return {"data": arg, "cached": False}
+
+        keys = ["a", "b", "c", "d", "e"]
+        await asyncio.gather(*[slow_fetch(k) for k in keys])
+
+        assert call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_leader_raise_propagates_to_followers(self):
+        # Transient API failure: leader raises, all followers re-raise the
+        # same exception type, function ran exactly once. A subsequent serial
+        # call starts fresh — no exception pinned in the in-flight map.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+
+        @async_cached(cache)
+        async def raising_fetch(arg):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.01)
+            raise RuntimeError("upstream boom")
+
+        results = await asyncio.gather(
+            *[raising_fetch("x") for _ in range(4)], return_exceptions=True
+        )
+        assert call_count == 1
+        assert all(isinstance(r, RuntimeError) for r in results)
+        assert all(str(r) == "upstream boom" for r in results)
+
+        # Fresh serial call: in-flight entry was cleared, function runs again.
+        with pytest.raises(RuntimeError):
+            await raising_fetch("x")
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_leader_none_result_followers_get_none(self):
+        # None results don't get cached in the L1 TTL (existing contract).
+        # Followers must still receive the None verbatim (no timeout, no
+        # raise), and the in-flight entry must be cleared so a subsequent
+        # call re-invokes the function.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+
+        @async_cached(cache)
+        async def maybe_none(arg):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.01)
+            return None
+
+        results = await asyncio.gather(*[maybe_none("x") for _ in range(4)])
+
+        assert call_count == 1
+        for r in results:
+            assert r is None
+        assert len(cache) == 0
+
+        # Subsequent serial call invokes the function again — None wasn't pinned.
+        result = await maybe_none("x")
+        assert result is None
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_followers_get_cached_flag_true_when_result_supports_it(self):
+        # When the leader's result is a dict with a `cached` field, followers
+        # should receive it with `cached=True` set, matching the serial cache-hit
+        # path's behavior.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+
+        @async_cached(cache)
+        async def fetch(arg):
+            await asyncio.sleep(0.01)
+            return {"data": arg, "cached": False}
+
+        results = await asyncio.gather(*[fetch("x") for _ in range(3)])
+
+        # At least one of the three is the leader (cached=False on its result
+        # because the leader returns its own freshly-computed value). The
+        # followers receive the result via the future and should be marked
+        # cached=True. We don't care which order — just that at least one is
+        # marked cached=True so the seam-level instrumentation is consistent.
+        cached_count = sum(1 for r in results if r["cached"] is True)
+        assert cached_count >= 2  # at least 2 followers see cached=True
+
+    @pytest.mark.asyncio
+    async def test_skip_cache_in_follower_short_circuits_independently(self):
+        # `should_skip_cache()` short-circuits at the top of the wrapper,
+        # before any cache or in-flight bookkeeping. A skip-cache caller
+        # bypasses the dedup entirely and invokes the underlying function
+        # directly — even while a leader is mid-await on the same key.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+
+        @async_cached(cache)
+        async def fetch(arg):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.02)
+            return {"data": arg, "cached": False}
+
+        async def normal_caller():
+            return await fetch("x")
+
+        async def skip_caller():
+            set_skip_cache(True)
+            try:
+                return await fetch("x")
+            finally:
+                set_skip_cache(False)
+
+        await asyncio.gather(normal_caller(), skip_caller())
+        # Two callers entered the function: the leader (normal) and the
+        # skip-cache caller. The skip-cache caller does not share the
+        # leader's future.
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_inflight_entry_cleaned_up_after_resolve(self):
+        # After `await wrapper(...)` returns, the in-flight map for that key
+        # must be empty. Otherwise abandoned futures pile up and the next
+        # concurrent batch would still observe leader/follower coalescing,
+        # but cleanup is what makes the map memory-stable.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+
+        @async_cached(cache)
+        async def fetch(arg):
+            await asyncio.sleep(0.01)
+            return {"data": arg, "cached": False}
+
+        await fetch("x")
+        assert _inflight_for(cache) == {}
+
+        # A second concurrent batch hits the cache directly (already populated)
+        # so it never enters the in-flight branch — still must leave the map
+        # empty.
+        await asyncio.gather(*[fetch("x") for _ in range(3)])
+        assert _inflight_for(cache) == {}
+
+    @pytest.mark.asyncio
+    async def test_evict_cached_does_not_touch_inflight(self):
+        # `evict_cached` operates on the TTLCache only — it does NOT pop the
+        # in-flight Future map. So a mid-await eviction must leave the
+        # leader's future intact: the leader still resolves, followers still
+        # get the result. The downstream L1 state after the race is governed
+        # by normal evict + write ordering (covered by existing tests); the
+        # invariant this test pins is the dedup-layer one.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+
+        @async_cached(cache)
+        async def fetch(arg):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.05)
+            return {"data": arg, "cached": False}
+
+        inflight_during_evict: dict[str, asyncio.Future] = {}
+
+        async def follower():
+            return await fetch("x")
+
+        async def evictor():
+            # Wait a tick so the leader is mid-await with the future pinned.
+            await asyncio.sleep(0.01)
+            # Snapshot the in-flight map, call evict, confirm the map is
+            # unchanged. The leader's future is still in place after evict.
+            before = dict(_inflight_for(cache))
+            evict_cached(fetch, "x")
+            after = dict(_inflight_for(cache))
+            inflight_during_evict.update(after)
+            assert before == after, "evict_cached must not touch the in-flight map"
+            assert len(after) == 1, "leader's future must still be pinned"
+
+        leader_task = asyncio.create_task(fetch("x"))
+        follower_task = asyncio.create_task(follower())
+        evictor_task = asyncio.create_task(evictor())
+
+        leader_result, follower_result, _ = await asyncio.gather(
+            leader_task, follower_task, evictor_task
+        )
+
+        # Both leader and follower see the same data — eviction didn't sever
+        # the future.
+        assert leader_result["data"] == "x"
+        assert follower_result["data"] == "x"
+        # Only one underlying call — the follower joined the leader's future.
+        assert call_count == 1
+        # Leader's `finally` popped its entry; map empty post-resolve.
+        assert _inflight_for(cache) == {}
+        # The evictor saw the leader's pinned future mid-flight.
+        assert len(inflight_during_evict) == 1
 
 
 # ---------------------------------------------------------------------------
