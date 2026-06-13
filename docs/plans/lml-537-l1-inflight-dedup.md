@@ -88,9 +88,24 @@ The leader stores `result` in `cache[key]` only if non-None (preserving the exis
 
 ### Raise semantics
 
-If `await func(...)` raises, the leader propagates the exception to all followers via `future.set_exception(exc)`, then the `finally` clause pops the in-flight entry. Followers re-raise the exception to their callers. The next caller (post-pop) starts fresh.
+If `await func(...)` raises a non-cancellation `Exception`, the leader broadcasts it to followers via `future.set_exception(exc)`, then the `finally` clause pops the in-flight entry. Followers re-raise the same exception instance. The next caller (post-pop) starts fresh.
 
-This matches the orchestrator's existing error-handling expectation: a transient Discogs failure should not silently pin a bad cached entry; the next call should retry. Followers see the exact same exception the leader saw — symmetric with what would have happened if all callers had each entered the fallthrough independently. The blast radius does not grow: the same code path that would have raised once-per-caller (N raises in the old code) now raises once-per-caller in the new code (N raises). Only the underlying fetch count drops from N to 1.
+This matches the orchestrator's existing error-handling expectation: a transient Discogs failure should not silently pin a bad cached entry; the next call should retry. Followers see the exact same exception the leader saw — the future broadcasts the leader's instance, not a reconstruction, so Sentry deduplication, traceback chaining, and identity-based downstream checks behave normally.
+
+### Cancellation semantics (the asymmetric case)
+
+Cancellation is **not** a value — it's an out-of-band signal scoped to a task. In production, the leader and the followers can be in **unrelated request contexts** that happen to share a module-level singleton cache. If Request A's task is cancelled (per-request timeout, client disconnect), broadcasting the cancellation across the future would inject `CancelledError` into Request B's task tree, even though B was never cancelled. That's wrong.
+
+The implementation handles cancellation specifically:
+
+- **Leader cancelled**: the `except asyncio.CancelledError` arm cancels the future (so followers know the leader bailed) and re-raises, terminating the leader's task normally.
+- **Follower receives cancellation from `await future`**: the `except asyncio.CancelledError` arm checks `asyncio.current_task().cancelling()`. If 0, the follower's own task was not cancelled — re-enter the wrapper to either join a fresh leader or become one. If >0, the follower was actually cancelled — re-raise.
+
+This restores the asymmetry: cancellation is per-task, the dedup layer does not flatten it across unrelated requests. Cost: a cancelled leader trades one follower retry per concurrent caller (bounded by the orchestrator's concurrency cap). Benefit: one client's disconnect can't cascade into another client's failures.
+
+### Cache-write failure isolation
+
+The leader's broadcast (`future.set_result(result)`) fires **before** `cache[key] = result`. If the L1 write raises (e.g., a future cachetools eviction-callback throws), followers still see the successful fetch and only the leader's caller sees the cache-layer error. A `try/except` around the cache write logs and continues — a cache failure is not the same as a fetch failure.
 
 ### Interaction with `skip_cache` flag
 
@@ -99,6 +114,10 @@ This matches the orchestrator's existing error-handling expectation: a transient
 ### Interaction with `evict_cached`
 
 `evict_cached` only touches the `TTLCache` (`cache.pop(key, None)`). It does **not** touch the in-flight map. Justification: if an eviction races with an in-flight fetch, the leader has already started; the right behavior is to let it finish (followers get the value), then the next post-eviction caller will miss and fetch. Evicting an in-flight entry would just orphan the followers.
+
+### Interaction with `clear_all_caches`
+
+`clear_all_caches()` resets each registered cache's `_lml_inflight` map alongside the TTL contents. Without this, in-flight Futures attached lazily by `_inflight_for` would survive a clear and a post-clear caller could join a dead leader's future — defeating the point of the clear.
 
 ### Interaction with `should_skip_cache` across leader / follower
 
@@ -137,10 +156,11 @@ No behavioral changes during refactor.
 
 ## Risk surface
 
-- **Memory leak via abandoned futures.** If a task is cancelled between `in_flight[key] = future` and the `finally`, the `finally` still runs (because `try/finally` is exception-safe for `CancelledError`). Followers awaiting the future receive `CancelledError`. Mitigation already in design: `finally` always pops; followers see cancellation and re-raise (their own task tree handles it).
+- **Memory leak via abandoned futures.** The `finally` clause always pops the in-flight entry, including on `CancelledError`. Followers see cancellation via the future being cancelled and either retry (if their own task was not cancelled) or propagate (if it was) — see the cancellation semantics section above.
 - **Performance regression on serial callers.** The added `if key in in_flight` check is `O(1)` dict membership against a dict that's empty in steady-state for serial callers. Negligible.
 - **Thread safety.** asyncio coroutines are single-threaded per event loop. The in-flight dict is touched only within the wrapper's coroutine body — no `await` between read and write of the dict — so no race within the dedup logic itself.
-- **Cross-event-loop test pollution.** The in-flight map is stashed on the cache instance, which is shared across tests via the module-level registry. Each test creates its own `cache` via `create_ttl_cache`, so map isolation is automatic. The lazy-attachment shape doesn't accumulate across `clear_all_caches()` calls (the map is per-cache, and the lazy caches are reset to `None` on clear).
+- **Cross-event-loop test pollution.** The in-flight map is stashed on the cache instance, which is shared across tests via the module-level registry. `clear_all_caches()` resets the per-cache `_lml_inflight` map alongside the TTL contents, so prior-test orphans don't survive into the next test. Each test in `TestAsyncCachedInFlightDedup` also creates its own `cache` via `create_ttl_cache`, providing belt-and-suspenders isolation.
+- **Telemetry observability.** The follower path records a `memory_cache_inflight_join` event via the cache stats recorder so the dedup is visible in the cache-stats stream; without this, in-flight joins would be invisible to dashboards (the L1 hit counter wouldn't tick because the entry isn't in the TTLCache yet). The Sentry semaphore/limiter spans (`lml.discogs.semaphore`, `lml.discogs.rate_limiter`) still only attach to the leader's trace — a follower's transaction looks fast because it skipped the seam entirely. This is a deeper observability tradeoff and out of scope; the `memory_cache_inflight_join` counter is the operationally-useful signal for "is the dedup firing?"
 
 ## Acceptance
 
