@@ -792,6 +792,68 @@ class TestSearchAlbumFuzzy:
         assert len(results) == 1
         assert results[0].id == 57500
 
+    @pytest.mark.asyncio
+    async def test_matches_va_series_with_volume_against_long_subtitle(self):
+        """V/A library row catalogued as ``<base>, vol. N`` surfaces against a
+        Discogs release with a long parenthetical subtitle (WXYC#531).
+
+        Library row 58610 catalogues ``Disco Not Disco, vol. 1`` under artist
+        ``Various Artists - Rock - D``. Discogs returns the canonical release as
+        ``Disco Not Disco (Post Punk, Electro & Leftfield Disco Classics
+        1974-1986)``. The base ``Disco Not Disco`` matches as a prefix on the
+        Discogs side, and the library suffix is the recognised ``, vol. N``
+        series identifier, gated on ``is_compilation_artist`` so non-V/A albums
+        are not grandfathered through this looser path.
+        """
+        db = AsyncMock()
+        item = _item(
+            id=58610,
+            artist="Various Artists - Rock - D",
+            title="Disco Not Disco, vol. 1",
+            call_letters="V",
+        )
+
+        # FTS5 returns the V/A row on shared tokens ("disco", "not"). The new
+        # vol.-N gate must accept it instead of falling through to the
+        # length-sensitive fuzz.ratio reject in album_title_acceptable.
+        db.search = AsyncMock(return_value=[item])
+
+        results = await search_album_fuzzy(
+            db,
+            "Disco Not Disco (Post Punk, Electro & Leftfield Disco Classics 1974-1986)",
+        )
+        assert len(results) == 1
+        assert results[0].id == 58610
+
+    @pytest.mark.asyncio
+    async def test_va_series_gate_does_not_grandfather_non_compilation(self):
+        """The ``, vol. N`` special-case is gated on ``is_compilation_artist``.
+
+        A non-V/A library row with the same shape (``<base>, vol. N``) must NOT
+        be accepted against an unrelated Discogs release whose title merely
+        starts with the same ``<base>``. This is the regression guard for
+        directions (2) and (3) in WXYC#531 — option (1) is deliberately
+        narrow.
+        """
+        db = AsyncMock()
+        item = _item(
+            id=99999,
+            artist="Some Band",
+            title="Live Sessions, vol. 2",
+        )
+
+        db.search = AsyncMock(return_value=[item])
+
+        # Long descriptive Discogs title that shares the "Live Sessions" prefix
+        # but is otherwise unrelated. Without the V/A gate this would slip
+        # through the new special-case; with the gate it must be rejected by
+        # the existing length-sensitive fuzz.ratio path.
+        results = await search_album_fuzzy(
+            db,
+            "Live Sessions (Acoustic Recordings From The Greek Theatre 1998-2002)",
+        )
+        assert results == []
+
 
 # ---------------------------------------------------------------------------
 # filter_results_by_track_validation -- exception (lines 482-483)
