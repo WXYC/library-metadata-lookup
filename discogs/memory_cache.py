@@ -267,16 +267,28 @@ def async_cached(cache: TTLCache) -> Callable[[Callable[..., T]], Callable[..., 
                     logger.debug(f"Cache in-flight join for {func.__name__}")
                     get_cache_stats_recorder().record("memory_cache_inflight_join")
                     try:
-                        follower_result = await existing
+                        # `asyncio.shield` isolates each follower's `_fut_waiter`
+                        # to a per-await wrapper future (LML#544 round 3). Without
+                        # it, one follower's external task cancellation would
+                        # call `_fut_waiter.cancel()` on the SHARED `existing`
+                        # future, cascading CancelledError to every other follower
+                        # AND wedging the event loop: surviving followers retry,
+                        # find the same cancelled-done future in inflight (the
+                        # leader has not yet popped it), `await` it (which does
+                        # NOT yield for a done future), receive CancelledError,
+                        # and `continue` — a synchronous infinite loop. Shield
+                        # makes each follower's cancellation local; the shared
+                        # future stays pending until the leader actually
+                        # completes or cancels it.
+                        follower_result = await asyncio.shield(existing)
                     except asyncio.CancelledError:
-                        # Leader's task was cancelled and the future was
-                        # cancelled downstream. If WE were not cancelled
-                        # (cancelling() == 0), don't inherit the leader's
-                        # cancellation across an unrelated request boundary —
-                        # `continue` retries from the top of the loop, where
-                        # the leader's `finally` has popped the in-flight entry
-                        # and we'll either hit a fresh L1 entry, join a new
-                        # leader, or become one ourselves.
+                        # Either WE were cancelled, or the leader cancelled its
+                        # future (intentional broadcast that the leader bailed).
+                        # If our own task was asked to cancel, propagate; the
+                        # client / caller asked us to stop. Otherwise retry: the
+                        # leader's `finally` has popped the in-flight entry, so
+                        # the top of the loop sees a fresh slot and we'll either
+                        # hit a fresh L1 entry, join a new leader, or become one.
                         current = asyncio.current_task()
                         if current is None or current.cancelling() > 0:
                             raise

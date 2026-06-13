@@ -799,6 +799,87 @@ class TestAsyncCachedInFlightDedup:
         assert _inflight_for(cache) == {}
 
     @pytest.mark.asyncio
+    async def test_cancelling_one_follower_does_not_cascade_to_siblings(self):
+        # The multi-follower cancellation isolation contract (LML#544 round 3).
+        # Two followers share a leader's in-flight future. One follower is
+        # cancelled externally (the per-request budget of THAT request expired,
+        # client disconnected, sibling task in its gather failed). The OTHER
+        # follower must still receive the leader's result within a bounded
+        # time — and the event loop must not wedge.
+        #
+        # Without `asyncio.shield` on the follower's await, asyncio's
+        # task-cancel mechanism would call `_fut_waiter.cancel()` on the
+        # SHARED Future, cascading CancelledError to the surviving follower.
+        # That follower would retry, find the still-cancelled-and-pinned
+        # future in inflight (the leader has not yet popped), `await` it —
+        # which does NOT yield for a done future — and busy-loop, blocking
+        # the event loop indefinitely. The test bounds the time via
+        # `asyncio.wait_for` and verifies the leader/siblings still progress.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        call_count = 0
+        leader_in_flight = asyncio.Event()
+        leader_can_proceed = asyncio.Event()
+
+        @async_cached(cache)
+        async def fetch(arg):
+            nonlocal call_count
+            call_count += 1
+            leader_in_flight.set()
+            await leader_can_proceed.wait()
+            return {"data": arg, "cached": False}
+
+        async def follower():
+            await leader_in_flight.wait()
+            return await fetch("x")
+
+        leader_task = asyncio.create_task(fetch("x"))
+        follower_a = asyncio.create_task(follower())
+        follower_b = asyncio.create_task(follower())
+
+        # Wait for both followers to join the leader's future.
+        await leader_in_flight.wait()
+        key = make_normalized_cache_key("fetch", "x")
+        inflight = _inflight_for(cache)
+        for _ in range(50):
+            leader_future = inflight.get(key)
+            if leader_future is not None and len(leader_future._callbacks) >= 2:
+                break
+            await asyncio.sleep(0)
+        assert leader_future is not None
+        assert len(leader_future._callbacks) >= 2, "both followers must have joined"
+
+        # Cancel follower_a. With shield, this cancels follower_a's per-await
+        # wrapper Future, NOT the shared leader's future. follower_b's await
+        # stays pending. Without shield, the shared future is cancelled and
+        # follower_b busy-loops in the wrapper's retry path.
+        follower_a.cancel()
+        leader_can_proceed.set()
+
+        # Leader resolves normally; follower_b joins it; follower_a propagates
+        # its own cancellation. Bound the test on wall-clock time so the
+        # busy-loop bug surfaces as a TimeoutError rather than a hang.
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                leader_task,
+                follower_b,
+                follower_a,
+                return_exceptions=True,
+            ),
+            timeout=1.0,
+        )
+        leader_result, follower_b_result, follower_a_result = results
+
+        assert leader_result["data"] == "x"
+        assert follower_b_result["data"] == "x", (
+            "surviving follower must receive leader's value, not inherit "
+            "the cancelled sibling's cancellation"
+        )
+        assert isinstance(follower_a_result, asyncio.CancelledError)
+        # Exactly one underlying call — the dedup held even under cancellation.
+        assert call_count == 1
+        assert _inflight_for(cache) == {}
+
+    @pytest.mark.asyncio
     async def test_clear_all_caches_resets_inflight_map(self):
         # `clear_all_caches()` must drop `_lml_inflight` along with the TTL
         # contents — otherwise orphan Futures linger on the cache instance
