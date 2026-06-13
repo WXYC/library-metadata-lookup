@@ -244,85 +244,102 @@ def async_cached(cache: TTLCache) -> Callable[[Callable[..., T]], Callable[..., 
             # arguments are unchanged. The function name is identity-preserved.
             key = make_normalized_cache_key(func.__name__, *cache_args, **kwargs)
 
-            # Check cache
-            if key in cache:
-                logger.debug(f"Cache hit for {func.__name__}")
-                get_cache_stats_recorder().record_memory_cache_hit()
-                result = cache[key]
-                return _set_cached_flag(result, cached=True)  # type: ignore[no-any-return]
+            # Iterative retry on cancellation-driven coalescing failures (LML#544
+            # round 2). Each loop iteration re-runs cache/in-flight checks from
+            # the top, so a cancelled leader's pop leaves us seeing a fresh
+            # slot. A loop keeps stack depth constant under sustained
+            # cancellation cascades — recursion would grow one frame per retry
+            # and hit sys.recursionlimit under pathological conditions.
+            while True:
+                # Check cache
+                if key in cache:
+                    logger.debug(f"Cache hit for {func.__name__}")
+                    get_cache_stats_recorder().record_memory_cache_hit()
+                    result = cache[key]
+                    return _set_cached_flag(result, cached=True)  # type: ignore[no-any-return]
 
-            # Coalesce concurrent callers (LML#537). If another caller is
-            # already resolving this key, await its future and return the
-            # same value — marked cached=True to match serial-hit semantics.
-            inflight = _inflight_for(cache)
-            existing = inflight.get(key)
-            if existing is not None:
-                logger.debug(f"Cache in-flight join for {func.__name__}")
-                get_cache_stats_recorder().record("memory_cache_inflight_join")
-                try:
-                    follower_result = await existing
-                except asyncio.CancelledError:
-                    # Leader's task was cancelled and the future was cancelled
-                    # downstream. If WE were not cancelled (cancelling() == 0),
-                    # don't inherit the leader's cancellation across an unrelated
-                    # request boundary — retry by re-entering the wrapper. The
-                    # leader's `finally` has already popped the in-flight entry,
-                    # so this re-entry sees a fresh slot.
-                    current = asyncio.current_task()
-                    if current is None or current.cancelling() > 0:
-                        raise
-                    return await wrapper(*args, **kwargs)  # type: ignore[no-any-return]
-                return _set_cached_flag(follower_result, cached=True)  # type: ignore[no-any-return]
-
-            # Leader path: create the future, run the function, broadcast.
-            # `get_running_loop()` is safe because `wrapper` is `async def`
-            # and only runs inside an active event loop.
-            future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-            inflight[key] = future
-            try:
-                logger.debug(f"Cache miss for {func.__name__}")
-                result = await func(*args, **kwargs)  # type: ignore[misc]
-                # Broadcast to followers BEFORE writing to L1, so a cache-write
-                # failure does not poison the followers' view of a successful
-                # fetch. The future.done() guard handles the (edge) case where
-                # the future was externally cancelled while the fetch was in
-                # flight — we still want to return the result to the leader's
-                # caller and let the cache write surface its own error.
-                if not future.done():
-                    future.set_result(result)
-                # Don't cache None results (existing contract).
-                if result is not None:
+                # Coalesce concurrent callers (LML#537). If another caller is
+                # already resolving this key, await its future and return the
+                # same value — marked cached=True to match serial-hit semantics.
+                inflight = _inflight_for(cache)
+                existing = inflight.get(key)
+                if existing is not None:
+                    logger.debug(f"Cache in-flight join for {func.__name__}")
+                    get_cache_stats_recorder().record("memory_cache_inflight_join")
                     try:
-                        cache[key] = result
-                    except Exception:
-                        # The fetch succeeded and was broadcast; treat an L1
-                        # write failure as a cache-layer issue, not a fetch
-                        # failure. Log and continue.
-                        logger.exception(
-                            "L1 cache write failed for %s; result still served",
-                            func.__name__,
+                        follower_result = await existing
+                    except asyncio.CancelledError:
+                        # Leader's task was cancelled and the future was
+                        # cancelled downstream. If WE were not cancelled
+                        # (cancelling() == 0), don't inherit the leader's
+                        # cancellation across an unrelated request boundary —
+                        # `continue` retries from the top of the loop, where
+                        # the leader's `finally` has popped the in-flight entry
+                        # and we'll either hit a fresh L1 entry, join a new
+                        # leader, or become one ourselves.
+                        current = asyncio.current_task()
+                        if current is None or current.cancelling() > 0:
+                            raise
+                        get_cache_stats_recorder().record(
+                            "memory_cache_inflight_retry_after_cancel"
                         )
-                return result  # type: ignore[no-any-return]
-            except asyncio.CancelledError:
-                # Cancel the future so existing followers know the leader bailed.
-                # Their `except asyncio.CancelledError` arm decides whether to
-                # retry (when they themselves were not cancelled) or propagate.
-                # Do NOT broadcast cancellation via set_exception — that would
-                # inject CancelledError into every follower's task context.
-                if not future.done():
-                    future.cancel()
-                raise
-            except Exception as exc:
-                if not future.done():
-                    future.set_exception(exc)
-                    # Mark the exception as retrieved on the future so asyncio
-                    # doesn't log "Future exception was never retrieved" when no
-                    # follower joined this in-flight window. Followers awaiting
-                    # the future consume the exception independently.
-                    future.exception()
-                raise
-            finally:
-                inflight.pop(key, None)
+                        continue
+                    return _set_cached_flag(follower_result, cached=True)  # type: ignore[no-any-return]
+
+                # Leader path: create the future, run the function, broadcast.
+                # `get_running_loop()` is safe because `wrapper` is `async def`
+                # and only runs inside an active event loop.
+                future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+                inflight[key] = future
+                try:
+                    logger.debug(f"Cache miss for {func.__name__}")
+                    result = await func(*args, **kwargs)  # type: ignore[misc]
+                    # Broadcast to followers BEFORE writing to L1, so a
+                    # cache-write failure does not poison the followers' view
+                    # of a successful fetch. The future.done() guard is
+                    # defensive against future-evolution (e.g., an external
+                    # watchdog cancelling in-flight futures by reference); no
+                    # internal call site does this today.
+                    if not future.done():
+                        future.set_result(result)
+                    # Don't cache None results (existing contract).
+                    if result is not None:
+                        try:
+                            cache[key] = result
+                        except Exception:
+                            # The fetch succeeded and was broadcast; treat an
+                            # L1 write failure as a cache-layer issue, not a
+                            # fetch failure. Log and emit a counter so the
+                            # rare 'cache layer broken' state surfaces in
+                            # cache-stats dashboards instead of being silent.
+                            get_cache_stats_recorder().record("memory_cache_write_failed")
+                            logger.exception(
+                                "L1 cache write failed for %s; result still served",
+                                func.__name__,
+                            )
+                    return result  # type: ignore[no-any-return]
+                except asyncio.CancelledError:
+                    # Cancel the future so existing followers know the leader
+                    # bailed. Their `except asyncio.CancelledError` arm
+                    # decides whether to retry (when they themselves were not
+                    # cancelled) or propagate. Do NOT broadcast cancellation
+                    # via set_exception — that would inject CancelledError
+                    # into every follower's task context.
+                    if not future.done():
+                        future.cancel()
+                    raise
+                except Exception as exc:
+                    if not future.done():
+                        future.set_exception(exc)
+                        # Mark the exception as retrieved on the future so
+                        # asyncio doesn't log "Future exception was never
+                        # retrieved" when no follower joined this in-flight
+                        # window. Followers awaiting the future consume the
+                        # exception independently.
+                        future.exception()
+                    raise
+                finally:
+                    inflight.pop(key, None)
 
         # Stash the cache + name so `evict_cached` can drop a single entry
         # using the SAME key derivation. Keeping these on the wrapper means a

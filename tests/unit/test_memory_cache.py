@@ -672,7 +672,7 @@ class TestAsyncCachedInFlightDedup:
     async def test_leader_cancellation_does_not_cascade_to_followers(self):
         # The cancellation contract (LML#544 round 2): when the leader's task
         # is cancelled, the future is cancelled (not broadcast as an exception)
-        # and followers detect the cancellation and retry by re-entering the
+        # and followers detect the cancellation and retry by looping in the
         # wrapper — they do NOT inherit the leader's cancellation, because in
         # production the leader and the followers can be in unrelated request
         # contexts that share a module-level cache. One client's disconnect
@@ -698,21 +698,35 @@ class TestAsyncCachedInFlightDedup:
         leader_task = asyncio.create_task(fetch("x"))
         follower_task = asyncio.create_task(follower())
 
-        # Wait until both the leader is in-flight AND the follower has joined.
+        # Wait until the leader is in-flight.
         await leader_in_flight.wait()
-        # Give the follower a tick to register on the future.
-        await asyncio.sleep(0)
+        # Deterministically wait for the follower to have registered as an
+        # awaiter on the leader's future. `await future` adds a done-callback
+        # to the Future's internal _callbacks list, so its length growing past
+        # zero is the actual condition we care about — not a guess at how many
+        # event-loop ticks it takes the follower to get there. Polling with
+        # an upper-bound bails the test fast if the contract changes.
+        key = make_normalized_cache_key("fetch", "x")
+        inflight = _inflight_for(cache)
+        for _ in range(50):
+            leader_future = inflight.get(key)
+            if leader_future is not None and leader_future._callbacks:
+                break
+            await asyncio.sleep(0)
+        assert leader_future is not None, "leader's future disappeared"
+        assert leader_future._callbacks, "follower never joined leader's future"
+
         # Cancel ONLY the leader. The follower's task is not cancelled.
         leader_task.cancel()
         # Allow the post-retry leader (the follower, on re-entry) to proceed.
-        # We need to release the gate before the retry's call to fetch completes.
         # The follower will retry, become a NEW leader, run fetch again — call
-        # number 2 — and block on leader_can_proceed.wait(). Set it now.
+        # number 2 — and block on leader_can_proceed.wait(). Set it now so the
+        # retry-leader's await returns without waiting.
         leader_can_proceed.set()
 
         # The leader's awaited task should raise CancelledError when awaited
         # (it was cancelled). The follower's task should complete successfully
-        # because it retried via recursion in the wrapper.
+        # because it retried via the loop in the wrapper.
         with pytest.raises(asyncio.CancelledError):
             await leader_task
         follower_result = await follower_task
@@ -722,6 +736,66 @@ class TestAsyncCachedInFlightDedup:
         # cancelled mid-await), and the retry-leader's successful call.
         assert call_count == 2
         # In-flight map fully drained.
+        assert _inflight_for(cache) == {}
+
+    @pytest.mark.asyncio
+    async def test_follower_own_cancellation_propagates(self):
+        # The mirror of the prior test: when the follower's own task is
+        # cancelled (cancelling() > 0), the wrapper MUST propagate the
+        # CancelledError rather than swallowing it via retry. Without this
+        # guard, a cancelled FastAPI request task would keep running through
+        # the retry path, holding resources past the client disconnect.
+        cache = create_ttl_cache(maxsize=10, ttl=300)
+        leader_in_flight = asyncio.Event()
+        leader_can_proceed = asyncio.Event()
+
+        @async_cached(cache)
+        async def fetch(arg):
+            leader_in_flight.set()
+            await leader_can_proceed.wait()
+            return {"data": arg, "cached": False}
+
+        async def follower():
+            await leader_in_flight.wait()
+            return await fetch("x")
+
+        leader_task = asyncio.create_task(fetch("x"))
+        follower_task = asyncio.create_task(follower())
+
+        # Wait until the follower has joined the leader's future.
+        await leader_in_flight.wait()
+        key = make_normalized_cache_key("fetch", "x")
+        inflight = _inflight_for(cache)
+        for _ in range(50):
+            leader_future = inflight.get(key)
+            if leader_future is not None and leader_future._callbacks:
+                break
+            await asyncio.sleep(0)
+        assert leader_future is not None and leader_future._callbacks
+
+        # Cancel the FOLLOWER. cancelling() on the follower's task is now 1.
+        # When the leader's future eventually resolves (or is cancelled), the
+        # follower's `except asyncio.CancelledError` arm must propagate, not
+        # retry — because its OWN task was asked to stop.
+        follower_task.cancel()
+
+        # Let the leader complete so its future resolves with success. If the
+        # follower retries (regression), the retry would also propagate the
+        # task cancellation; either way the follower's task ends cancelled.
+        # We want to specifically verify that the follower does NOT block on
+        # a retry-leader's fetch — i.e., that cancellation is honored
+        # promptly. Setting leader_can_proceed lets the leader finish.
+        leader_can_proceed.set()
+
+        # Leader completes normally.
+        leader_result = await leader_task
+        assert leader_result["data"] == "x"
+
+        # Follower's task observes its own cancellation and propagates it.
+        with pytest.raises(asyncio.CancelledError):
+            await follower_task
+
+        # In-flight map fully drained (the leader's finally popped its entry).
         assert _inflight_for(cache) == {}
 
     @pytest.mark.asyncio
