@@ -112,6 +112,22 @@ class TestResolveDiscogsRelease:
         assert len(result.warnings) == 1
         mock_service.get_release.assert_not_called()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_id", ["0", "-1", "-12345"])
+    async def test_rejects_non_positive_id_without_calling_service(self, mock_service, bad_id):
+        """LML#546: Discogs release ids start at 1. A `release_id <= 0` value
+        coming from user input or upstream synthesis must short-circuit before
+        ``service.get_release`` is touched, because the 404 the service would
+        get from Discogs writes a permanent tombstone (LML#510) that poisons
+        the row for everyone. The resolver is the boundary; reject here.
+        """
+        result = await resolve_discogs_release(mock_service, bad_id)
+
+        assert result.canonical is None
+        assert len(result.warnings) == 1
+        assert "positive" in result.warnings[0].lower()
+        mock_service.get_release.assert_not_called()
+
 
 class TestResolveDiscogsMaster:
     @pytest.mark.asyncio

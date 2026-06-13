@@ -54,6 +54,18 @@ async def resolve_discogs_release(service: DiscogsService, release_id: str) -> D
             warnings=[f"Discogs release ID '{release_id}' is not a number"],
         )
 
+    # LML#546: Discogs release ids start at 1. A non-positive id forwarded to
+    # ``service.get_release`` triggers a 404 from Discogs, which the
+    # fallthrough seam tombstones (LML#510) — permanently poisoning the row
+    # for every subsequent caller. The LML#518 decision record puts this
+    # validation at the caller, not the service boundary. Reject here.
+    if rid <= 0:
+        return DiscogsResolveResult(
+            canonical=None,
+            identifiers=ReleaseIdentifiers(),
+            warnings=[f"Discogs release ID '{rid}' is not positive"],
+        )
+
     try:
         release = await service.get_release(rid)
     except Exception:

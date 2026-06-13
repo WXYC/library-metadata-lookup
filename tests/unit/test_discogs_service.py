@@ -1320,6 +1320,59 @@ class TestGetRelease:
         assert result is not None
         assert result.videos == []
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_id", [0, -1, -12345])
+    async def test_non_positive_id_logs_warning_with_stack_and_still_proceeds(
+        self, service, caplog, bad_id
+    ):
+        """LML#546 observability backstop: ``id <= 0`` reaching ``get_release``
+        means a caller skipped the LML#518 "callers validate" guard. Per the
+        decision record we do NOT raise here (boundary creep), but we emit a
+        WARN with ``stack_info=True`` so future regressions surface in Sentry
+        instead of silently tombstoning the row (LML#510). The call MUST still
+        proceed to ``_request_with_retry`` so behavior is unchanged.
+        """
+        import logging
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "x",
+            "artists": [],
+            "tracklist": [],
+            "images": [],
+            "labels": [],
+            "genres": [],
+            "styles": [],
+        }
+
+        with (
+            patch.object(
+                service,
+                "_request_with_retry",
+                new_callable=AsyncMock,
+                return_value=mock_resp,
+            ) as mock_request,
+            caplog.at_level(logging.WARNING, logger="discogs.service"),
+        ):
+            await service.get_release(bad_id)
+
+        mock_request.assert_called_once()
+        records = [
+            r
+            for r in caplog.records
+            if "get_release" in r.getMessage() and str(bad_id) in r.getMessage()
+        ]
+        assert records, (
+            f"expected WARN log for non-positive id={bad_id}, "
+            f"got: {[r.getMessage() for r in caplog.records]}"
+        )
+        # `stack_info=True` populates the record's `stack_info` attribute.
+        assert any(getattr(r, "stack_info", None) for r in records), (
+            "expected stack_info on the WARN record (set via stack_info=True)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # search_releases_by_album_title
@@ -2411,6 +2464,52 @@ class TestGetArtistDetails:
             await service_with_cache.get_artist_details(77)
 
         service_with_cache.cache_service.write_artist_details.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_id", [0, -1, -12345])
+    async def test_non_positive_id_logs_warning_with_stack_and_still_proceeds(
+        self, service, caplog, bad_id
+    ):
+        """LML#546 observability backstop: see the get_release equivalent. The
+        artist surface gets the same belt-and-suspenders WARN-with-stack so a
+        future unguarded caller (e.g. LML#525's multiplexer) is visible in
+        Sentry instead of permanently tombstoning the artist row.
+        """
+        import logging
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "id": 1,
+            "name": "x",
+            "images": [],
+        }
+
+        with (
+            patch.object(
+                service,
+                "_request_with_retry",
+                new_callable=AsyncMock,
+                return_value=mock_resp,
+            ) as mock_request,
+            caplog.at_level(logging.WARNING, logger="discogs.service"),
+        ):
+            await service.get_artist_details(bad_id)
+
+        mock_request.assert_called_once()
+        records = [
+            r
+            for r in caplog.records
+            if "get_artist_details" in r.getMessage() and str(bad_id) in r.getMessage()
+        ]
+        assert records, (
+            f"expected WARN log for non-positive id={bad_id}, "
+            f"got: {[r.getMessage() for r in caplog.records]}"
+        )
+        assert any(getattr(r, "stack_info", None) for r in records), (
+            "expected stack_info on the WARN record (set via stack_info=True)"
+        )
 
 
 # ---------------------------------------------------------------------------
