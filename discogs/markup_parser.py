@@ -176,19 +176,33 @@ def _classify_tag(tag: str, text: str, pos_after_tag: int) -> tuple[_DiscogsToke
         return (_ArtistName(name=match.group(1)), pos_after_tag)
 
     # Artist ID: [a12345]
+    # LML#546: ``\d+`` matches ``0``, so ``[a0]`` would tokenize to
+    # ``_ArtistId(0)`` and forward into DiscogsService.get_artist_details(0),
+    # whose 404 is tombstoned (LML#510) and permanently poisons the row. Drop
+    # the token at the tokenize boundary — Discogs ids start at 1. Mirrored
+    # below for release / master ids.
     match = ARTIST_ID_PATTERN.match(tag)
     if match:
-        return (_ArtistId(id=int(match.group(1))), pos_after_tag)
+        artist_id = int(match.group(1))
+        if artist_id <= 0:
+            return None
+        return (_ArtistId(id=artist_id), pos_after_tag)
 
     # Release ID: [r12345] or [r=12345]
     match = RELEASE_ID_PATTERN.match(tag)
     if match:
-        return (_ReleaseId(id=int(match.group(1))), pos_after_tag)
+        release_id = int(match.group(1))
+        if release_id <= 0:
+            return None
+        return (_ReleaseId(id=release_id), pos_after_tag)
 
     # Master ID: [m123] or [m=123]
     match = MASTER_ID_PATTERN.match(tag)
     if match:
-        return (_MasterId(id=int(match.group(1))), pos_after_tag)
+        master_id = int(match.group(1))
+        if master_id <= 0:
+            return None
+        return (_MasterId(id=master_id), pos_after_tag)
 
     # Label name: [l=Name]
     match = LABEL_NAME_PATTERN.match(tag)

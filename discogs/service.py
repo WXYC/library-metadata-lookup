@@ -749,6 +749,24 @@ class DiscogsService:
         Returns:
             ReleaseMetadataResponse with full metadata, or None on error
         """
+        # LML#546 observability backstop. The LML#518 decision record puts
+        # ``id <= 0`` validation at the caller, not at this boundary, to avoid
+        # masking LML-internal bugs in other call paths. We honor that — this
+        # log does NOT raise and does NOT change behavior. It exists so that
+        # if a future caller forgets the guard (e.g. LML#525's multiplexer),
+        # the regression is visible in Sentry breadcrumbs instead of
+        # silently tombstoning the row (LML#510). ``stack_info=True`` captures
+        # the caller chain so triage can identify the unguarded site without
+        # re-running the request.
+        if release_id <= 0:
+            logger.warning(
+                "DiscogsService.get_release received non-positive id=%d — "
+                "caller must validate (see LML#518). Proceeding per the "
+                "'callers validate' policy; the 404 from Discogs will "
+                "tombstone this id permanently. See LML#546.",
+                release_id,
+                stack_info=True,
+            )
 
         async def _api_fetch() -> ReleaseMetadataResponse | None:
             try:
@@ -942,6 +960,17 @@ class DiscogsService:
         Returns:
             ArtistDetails with full metadata, or None on error
         """
+        # LML#546 observability backstop. See get_release above for the full
+        # rationale. Log-only, does NOT raise, does NOT change behavior.
+        if artist_id <= 0:
+            logger.warning(
+                "DiscogsService.get_artist_details received non-positive id=%d — "
+                "caller must validate (see LML#518). Proceeding per the "
+                "'callers validate' policy; the 404 from Discogs will "
+                "tombstone this id permanently. See LML#546.",
+                artist_id,
+                stack_info=True,
+            )
 
         async def _api_fetch() -> ArtistDetails | None:
             try:

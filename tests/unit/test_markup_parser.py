@@ -503,6 +503,21 @@ class TestTokenize:
         assert tokens[2] == _PlainText(text=" and ")
         assert tokens[3] == _ArtistName(name="Sean Booth")
 
+    @pytest.mark.parametrize(
+        "markup",
+        ["[a0]", "[r0]", "[r=0]", "[m0]", "[m=0]"],
+    )
+    def test_rejects_zero_id_tokens_as_malformed(self, markup):
+        """LML#546: the ``[a\\d+]`` / ``[r=?\\d+]`` / ``[m=?\\d+]`` patterns accept
+        ``0`` because ``\\d+`` matches it. Discogs ids start at 1, so ``[a0]`` /
+        ``[r0]`` / ``[m0]`` are malformed tokens. Rejecting them at tokenize time
+        stops a poisoned id from reaching the service layer (where it would
+        tombstone the row per LML#510). Negative ids (``[a-1]``) already fail
+        the regex, so they don't need a separate guard.
+        """
+        tokens = tokenize(markup)
+        assert tokens == [], f"expected {markup!r} to be dropped as malformed, got {tokens!r}"
+
 
 # MARK: - Resolve Unit Tests
 
