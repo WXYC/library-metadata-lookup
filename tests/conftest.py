@@ -28,6 +28,7 @@ def mock_library_db():
     """Create a mock library database."""
     db = AsyncMock()
     db.search = AsyncMock(return_value=[])
+    db.exact_title = AsyncMock(return_value=[])
     db.find_similar_artist = AsyncMock(return_value=None)
     db.connect = AsyncMock()
     db.close = AsyncMock()

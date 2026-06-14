@@ -53,6 +53,7 @@ class TestAlbumTitleFallback:
     async def test_fallback_fires_when_results_empty_album_present_no_swap(self):
         """All three guard conditions met → ``search_releases_by_album_title`` runs."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         service = AsyncMock()
@@ -83,6 +84,7 @@ class TestAlbumTitleFallback:
     @pytest.mark.asyncio
     async def test_fallback_skipped_when_album_missing(self):
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         service = AsyncMock()
@@ -116,6 +118,7 @@ class TestAlbumTitleFallback:
         get_settings.cache_clear()
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         service = AsyncMock()
@@ -174,6 +177,7 @@ class TestAlbumTitleFallback:
             title="Orcutt-Shelley-Miller",
         )
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[library_item])
 
         # Five pressings of the trio release returned by both probes.
@@ -238,6 +242,7 @@ class TestAlbumTitleFallback:
         call was made."""
         library_item = make_library_item(id=42, artist="A Real Artist", title="An Album")
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[library_item])
 
         service = AsyncMock()
@@ -297,6 +302,7 @@ class TestAlbumTitleFallback:
             title="Orcutt Shelley Miller",
         )
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[item])
 
         service = AsyncMock()
@@ -345,6 +351,7 @@ class TestAlbumTitleFallback:
             title="Orcutt Shelley Miller",
         )
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[item])
 
         service = AsyncMock()
@@ -405,6 +412,7 @@ class TestAlbumTitleProbeConcurrency:
             return _probe
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         service = AsyncMock()
@@ -451,6 +459,7 @@ class TestAlbumTitleProbeConcurrency:
         """
         library_item = make_library_item(id=42, artist="A Real Artist", title="An Album")
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[library_item])
 
         service = AsyncMock()
@@ -521,6 +530,7 @@ class TestAlbumTitleProbeConcurrency:
             return _empty_response()
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         service = AsyncMock()

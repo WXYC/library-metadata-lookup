@@ -103,6 +103,7 @@ class TestWaveMergeGate:
         )
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
 
         # db.search call order inside search_compilations_for_track:
         # 1. keyword pre-pass ("vivien goldman launderette") → empty
@@ -183,6 +184,7 @@ class TestWaveMergeGate:
         )
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
 
         async def _search(query, limit=None, **_):
             if "disco not disco" in query.lower():
@@ -239,6 +241,7 @@ class TestWaveMergeGate:
         )
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
 
         async def _search(query, limit=None, **_):
             if "resolutionary" in query.lower():
@@ -296,6 +299,7 @@ class TestWaveMergeGate:
         )
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
 
         async def _search(query, limit=None, **_):
             if "disco not disco" in query.lower():

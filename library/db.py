@@ -387,6 +387,31 @@ class LibraryDB:
         rows = await cursor.fetchall()
         return list(rows)
 
+    async def exact_title(self, album_title: str, limit: int = 50) -> list[LibraryItem]:
+        """Return library rows whose ``title`` is literally ``album_title``.
+
+        Case-insensitive (``COLLATE NOCASE``) but no tokenization, no fuzzy
+        scoring, no prefix matching. Useful as a pre-pass before
+        :meth:`search`: a literal Discogs album title is the most reliable
+        signal of a library row, and the FTS5 path otherwise truncates
+        by rowid and can drop exact-title matches whose row was added later
+        in the catalog (see ``lookup.orchestrator.search_album_fuzzy``).
+        """
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        if not album_title:
+            return []
+
+        sql = f"""
+            SELECT {self._select_columns()}
+            FROM library
+            WHERE title = ? COLLATE NOCASE
+            LIMIT ?
+        """
+        cursor = await self._conn.execute(sql, (album_title, limit))
+        rows = await cursor.fetchall()
+        return [LibraryItem(**dict(row)) for row in rows]
+
     async def _fuzzy_search(self, query: str, limit: int, threshold: int = 70) -> list[LibraryItem]:
         """
         Fuzzy search fallback using rapidfuzz for typo tolerance.
