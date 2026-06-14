@@ -272,6 +272,108 @@ class TestReleaseIdentityStore:
         assert len(log_rows) == 1
 
 
+@pytest.mark.pg
+class TestGetReleaseIdentityProvenanceBulk:
+    """LML#525: bulk read that powers the cache-refresh dispatcher.
+
+    The dispatcher takes a batch of ``identity_id``s and needs to know which
+    ``(source, external_id)`` pairs each one carries, so it can fan out to the
+    per-source release-cache refresh paths. The store method reads each row's
+    per-source columns and returns them as a dict keyed by ``identity_id``.
+
+    Missing identity_ids are **absent** from the dict (not None-valued) — the
+    router renders absence as ``status = "not_found"``. External IDs are
+    stringified at the boundary so the router doesn't have to branch on
+    int-vs-str when serializing per-source outcomes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_input_returns_empty_dict(self, pg_source):
+        store = EntityStore(pg_source)
+        assert await store.get_release_identity_provenance_bulk([]) == {}
+
+    @pytest.mark.asyncio
+    async def test_single_discogs_release_returns_one_pair(self, pg_source):
+        store = EntityStore(pg_source)
+        identity_id, _ = await store.mint_or_get_release_identity(
+            source="discogs_release", external_id="12345"
+        )
+        result = await store.get_release_identity_provenance_bulk([identity_id])
+        assert result == {identity_id: [("discogs_release", "12345")]}
+
+    @pytest.mark.asyncio
+    async def test_row_with_both_discogs_release_and_master_returns_both_pairs(self, pg_source):
+        """A single row can carry multiple per-source IDs (cross-source join, LML#207)."""
+        store = EntityStore(pg_source)
+        # Mint via discogs_release first, then directly UPDATE the master column
+        # — emulates the LML#207 joiner setting both columns on one row.
+        identity_id, _ = await store.mint_or_get_release_identity(
+            source="discogs_release", external_id="12345"
+        )
+        await pg_source.execute(
+            "UPDATE entity.release_identity SET discogs_master_id = $1 WHERE id = $2",
+            789,
+            identity_id,
+        )
+        result = await store.get_release_identity_provenance_bulk([identity_id])
+        assert set(result[identity_id]) == {
+            ("discogs_release", "12345"),
+            ("discogs_master", "789"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_row_with_text_sources_returns_string_external_ids(self, pg_source):
+        """TEXT-typed columns (Bandcamp URL, MBID, Spotify) round-trip as strings."""
+        store = EntityStore(pg_source)
+        url = "https://autechre.bandcamp.com/album/confield"
+        identity_id, _ = await store.mint_or_get_release_identity(
+            source="bandcamp", external_id=url
+        )
+        # Hand-populate the TEXT-shaped sources that have no mint helper today
+        # (musicbrainz_release / spotify_album / apple_music_album are
+        # LML#217-era follow-ups, but the store method should already be able
+        # to read them since the columns exist on the table).
+        await pg_source.execute(
+            "UPDATE entity.release_identity "
+            "SET musicbrainz_release_id = $1, spotify_album_id = $2, apple_music_album_id = $3 "
+            "WHERE id = $4",
+            "mbid-abc",
+            "spotify-xyz",
+            "apple-456",
+            identity_id,
+        )
+        result = await store.get_release_identity_provenance_bulk([identity_id])
+        assert set(result[identity_id]) == {
+            ("bandcamp", url),
+            ("musicbrainz_release", "mbid-abc"),
+            ("spotify_album", "spotify-xyz"),
+            ("apple_music_album", "apple-456"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_missing_identity_ids_are_absent_not_none(self, pg_source):
+        store = EntityStore(pg_source)
+        identity_id, _ = await store.mint_or_get_release_identity(
+            source="discogs_release", external_id="111"
+        )
+        result = await store.get_release_identity_provenance_bulk([identity_id, 99_999])
+        assert identity_id in result
+        assert 99_999 not in result
+
+    @pytest.mark.asyncio
+    async def test_multi_id_input_returns_one_entry_per_existing_row(self, pg_source):
+        store = EntityStore(pg_source)
+        id_a, _ = await store.mint_or_get_release_identity("discogs_release", "111")
+        id_b, _ = await store.mint_or_get_release_identity("discogs_release", "222")
+        id_c, _ = await store.mint_or_get_release_identity(
+            "bandcamp", "https://x.bandcamp.com/album/y"
+        )
+        result = await store.get_release_identity_provenance_bulk([id_a, id_b, id_c])
+        assert result[id_a] == [("discogs_release", "111")]
+        assert result[id_b] == [("discogs_release", "222")]
+        assert result[id_c] == [("bandcamp", "https://x.bandcamp.com/album/y")]
+
+
 @pytest_asyncio.fixture
 async def app_client(monkeypatch):
     """ASGI client with the LML app pointed at the test PG.
