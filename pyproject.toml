@@ -9,7 +9,12 @@ authors = [
 ]
 
 dependencies = [
-    "fastapi>=0.104.0",
+    # Upper bound: FastAPI 0.137.0 (2026-06-14) reshaped `app.routes` to wrap
+    # `include_router(...)` calls in `_IncludedRouter`, breaking the
+    # route-introspection tests in `tests/unit/test_{auth,main}.py`. Drop the
+    # `<0.137` cap once those tests are migrated to walk the new shape. See
+    # WXYC/library-metadata-lookup#562 (immediate pin) and #563 (test migration).
+    "fastapi>=0.104.0,<0.137",
     "uvicorn>=0.24.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
