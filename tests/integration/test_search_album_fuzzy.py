@@ -11,9 +11,13 @@ that class of regression can't recur silently.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
-from lookup.orchestrator import search_album_fuzzy
+from discogs.models import ReleaseInfo, TrackReleasesResponse
+from lookup.orchestrator import search_album_fuzzy, search_compilations_for_track
+from services.parser import ParsedRequest
 
 
 @pytest.mark.asyncio
@@ -70,16 +74,99 @@ async def test_plain_base_query_unchanged(library_db):
 
 @pytest.mark.asyncio
 async def test_paren_on_discogs_side_with_matching_library_base(library_db):
-    """Regression guard for the existing prefix branch: a Discogs query with a
-    paren-suffix already matched a library row whose title is the base. E.g.,
-    ``OK Computer (OKNOTOK Anniversary Edition)`` should surface a library row
-    titled ``OK Computer`` via the pre-existing ``query.startswith(result)``
-    branch.
+    """Exercises the new paren-strip retry against a non-V/A library row.
 
-    Uses ``Aluminum Tunes`` from the seed because no parenthetical-suffixed
-    seed row exists; the assertion is that the un-suffixed library row
-    surfaces.
+    For ``Aluminum Tunes (Remastered)``, the un-stripped query trips FTS5's
+    special-char handling on ``(`` — ``db.search`` swallows the syntax error
+    and falls through the LIKE / fuzzy ladder. The LIKE fallback eliminates
+    the Stereolab row because ``"Remastered"`` is absent from title and
+    artist; the fuzzy fallback's longest-word 3-char prefix (``rem``) only
+    coincidentally surfaces the row via ``Stereolab``. The paren-strip
+    retry rebuilds the query as plain ``Aluminum Tunes``, which FTS5
+    answers cleanly and the existing prefix branch in
+    ``album_title_acceptable`` accepts via ``query.startswith(result)``.
     """
     results = await search_album_fuzzy(library_db, "Aluminum Tunes (Remastered)")
     titles = {r.title for r in results}
     assert "Aluminum Tunes" in titles
+
+
+@pytest.mark.asyncio
+async def test_non_va_paren_match_filtered_by_downstream_artist_gate(library_db):
+    """The widened matching layer surfaces non-V/A rows for any Discogs query
+    that shares a prefix with a library title; the downstream artist gate
+    inside ``process_release`` must drop them when artists don't match.
+
+    Seed row 60001 catalogues ``Live Sessions, vol. 2`` under ``Some Band``.
+    A Discogs release titled ``Live Sessions (Acoustic Recordings From The
+    Greek Theatre 1998-2002)`` credited to ``Some Other Band`` will be
+    surfaced by ``search_album_fuzzy`` (the paren-strip retry produces
+    ``Live Sessions``, which prefix-matches row 60001's title). Without the
+    artist gate the row would slip through to the user, despite the artist
+    mismatch.
+
+    Pins three things in one test:
+
+    1. ``search_album_fuzzy`` does widen for non-V/A rows (the strip-retry
+       is unconditional on V/A-ness — by design, since V/A-ness is a
+       library-row property unknown at query construction time).
+    2. ``process_release``'s ``artist_matches_item`` filter drops the
+       non-V/A row when ``parsed.artist`` doesn't prefix-match the
+       library-row artist, so the false positive never surfaces.
+    3. The ``Live Sessions, vol. 2`` seed row earns its keep as a
+       regression fixture — adding it to the SQLite seed without a test
+       asserting on it was the gap this test closes.
+    """
+    parsed = ParsedRequest(
+        artist="Some Other Band",
+        song="Recording 3",
+        raw_message="Recording 3 by Some Other Band",
+    )
+
+    service = AsyncMock()
+    service.cache_service = None
+
+    async def _track_releases(track, artist=None, artist_as_keyword=False, **_):
+        # Wave A returns the non-V/A release shape that the seed row's title
+        # prefix-matches after the paren-strip. Wave B returns empty (no
+        # genuine V/A surfaces; the row is a false-positive candidate).
+        releases = (
+            []
+            if artist_as_keyword
+            else [
+                ReleaseInfo(
+                    album="Live Sessions (Acoustic Recordings From The Greek Theatre 1998-2002)",
+                    artist="Some Other Band",
+                    release_id=70001,
+                    release_url="https://www.discogs.com/release/70001",
+                    is_compilation=False,
+                ),
+            ]
+        )
+        return TrackReleasesResponse(
+            track=track,
+            artist=artist,
+            releases=list(releases),
+            total=len(releases),
+        )
+
+    service.search_releases_by_track = AsyncMock(side_effect=_track_releases)
+    # Track validation would say True (track is on the release) — the artist
+    # gate must filter before we ever get here. If it didn't, the row would
+    # surface in results and this test would fail.
+    service.validate_track_on_release = AsyncMock(return_value=True)
+
+    with patch(
+        "lookup.orchestrator.lookup_releases_by_track",
+        new_callable=AsyncMock,
+        return_value=[],
+    ):
+        items, _titles = await search_compilations_for_track(
+            library_db, parsed, discogs_service=service
+        )
+
+    titles = {item.title for item in items}
+    assert "Live Sessions, vol. 2" not in titles, (
+        f"Non-V/A row paired with a non-matching Discogs artist must be filtered "
+        f"by process_release's artist gate, got: {titles}"
+    )

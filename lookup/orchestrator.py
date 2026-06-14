@@ -1678,18 +1678,21 @@ def album_title_acceptable(query_lower: str, result_lower: str) -> bool:
     return fuzz.ratio(query_lower, result_lower) >= 50
 
 
-_TRAILING_PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\)\s*$")
-"""Strip a trailing parenthetical suffix from a Discogs album query before search.
-
-Discogs ``release.title`` often carries a long descriptive subtitle in
-parentheses (e.g. ``Disco Not Disco (Post Punk, Electro & Leftfield Disco
-Classics 1974-1986)``). The library catalogues only the base (``Disco Not
-Disco, vol. 1``), and the FTS5 implicit-AND query against the full Discogs
-title returns empty — the subtitle terms aren't in the library row. Stripping
-the parenthetical produces a query that FTS5 surfaces to the right rows, and
-the existing prefix branch in ``album_title_acceptable`` accepts the
-library row via ``result.startswith(query)``.
-"""
+# Strip *all* trailing parenthetical suffixes from a Discogs album query before
+# search. See WXYC/library-metadata-lookup#531 — Discogs ``release.title`` often
+# carries a long descriptive subtitle in parentheses (e.g. ``Disco Not Disco
+# (Post Punk, Electro & Leftfield Disco Classics 1974-1986)``) and routinely
+# stacks multiple groups (``Album (Deluxe Edition) (Remastered)``, ``Album
+# (Live) (Bonus Track)``). The library catalogues only the base (``Disco Not
+# Disco, vol. 1``); the full Discogs title fails the FTS5 query in different
+# ways depending on its shape (see the block comment on the retry below).
+# Stripping the parenthetical(s) produces a query that FTS5 surfaces to the
+# right rows, and the existing prefix branch in ``album_title_acceptable``
+# accepts the library row via ``result.startswith(query)``. The ``+`` makes
+# this idempotent over stacked groups so a single ``sub`` call peels all
+# trailing parens — ``Album (Live) (Remastered)`` strips to ``Album``, not
+# ``Album (Live)`` which would still be an FTS5 syntax error.
+_TRAILING_PARENTHETICAL_RE = re.compile(r"(?:\s*\([^)]*\)\s*)+$")
 
 
 async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryItem]:
@@ -1708,12 +1711,23 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
             or album_title_acceptable(q_lower, (r.title or "").lower())
         ]
 
-    # First try the un-stripped query. If FTS5 finds candidates but the
-    # post-filter rejects them all, retry with the parenthetical stripped —
-    # this rescues the over-specific Discogs subtitle case (WXYC#531) where
-    # the LIKE/fuzzy fallback inside db.search returns a tangentially related
-    # row that the post-filter then drops, leaving the actual library row
-    # unseen because FTS5's implicit-AND on the full title returns empty.
+    # First try the un-stripped query. If it produces no surviving candidates,
+    # retry with all trailing parenthetical groups stripped — this rescues
+    # the over-specific Discogs subtitle case (WXYC#531). The full Discogs
+    # title fails the FTS5 search layer in three distinct ways depending on
+    # its shape, all of which strip-retry repairs:
+    #   1. FTS5 throws on special characters in the subtitle (``&`` is the
+    #      common offender), ``db.search`` swallows the error and falls
+    #      through to the LIKE / fuzzy fallback layers.
+    #   2. ``_fallback_like_search`` uses implicit-AND across title+artist,
+    #      requiring every significant word to appear — terse library rows
+    #      (``Disco Not Disco, vol. 1``) lack the subtitle's words and
+    #      return empty.
+    #   3. ``_fuzzy_search`` candidate-trawls on the longest word's 3-char
+    #      prefix and returns tangentially related rows that the post-filter
+    #      then drops.
+    # In all three shapes the actual library row goes unseen until the
+    # paren-strip retry produces a query FTS5 can answer cleanly.
     results = await _search_and_filter(album_title)
 
     if not results:
