@@ -876,6 +876,43 @@ class TestSearchAlbumFuzzy:
         )
         assert _va_series_title_match("disco not disco", item) is True
 
+    @pytest.mark.asyncio
+    async def test_paren_strip_handles_multiple_trailing_groups(self):
+        """Discogs titles routinely stack trailing paren groups, e.g.
+        ``Album (Deluxe Edition) (Remastered)`` or ``Album (Live) (Bonus
+        Track)``. The paren-strip retry must peel *all* trailing groups in a
+        single pass — peeling only the last one leaves ``Album (Live)``,
+        whose ``(`` still trips FTS5's syntax check and the retry's purpose
+        (a query FTS5 can answer cleanly) is defeated.
+
+        Verified by giving ``db.search`` a strict side-effect that returns the
+        V/A seed only when called with the fully-stripped base, and asserting
+        the row surfaces. If the regex peeled only the trailing group, the
+        retry query would be ``Disco Not Disco (Live)`` and ``db.search``
+        would return ``[]``.
+        """
+        db = AsyncMock()
+        seed = _item(
+            id=58610,
+            artist="Various Artists - Rock - D",
+            title="Disco Not Disco, vol. 1",
+        )
+
+        async def search(query: str, limit: int = 5) -> list:
+            # Only surface the V/A seed when the query has been fully stripped
+            # to the base. Any partially-stripped retry returns empty, so an
+            # incorrect regex (peeling only the trailing group) yields [] from
+            # the assertion below.
+            if query == "Disco Not Disco":
+                return [seed]
+            return []
+
+        db.search = AsyncMock(side_effect=search)
+
+        results = await search_album_fuzzy(db, "Disco Not Disco (Live) (Remastered)")
+        assert len(results) == 1
+        assert results[0].id == 58610
+
 
 # ---------------------------------------------------------------------------
 # filter_results_by_track_validation -- exception (lines 482-483)
