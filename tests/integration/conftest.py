@@ -118,6 +118,13 @@ SEED_ITEMS = [
     (12680, "Arkology", "Lee 'Scratch' Perry", "Pe", 1, 17, "Reggae", "CD"),
     (12684, "Dub Fire", "Lee 'Scratch' Perry", "Pe", 1, 21, "Reggae", "CD"),
     (12682, "Live at Maritime Hall", "Lee 'Scratch' Perry", "Pe", 1, 20, "Reggae", "CD"),
+    # V/A series catalogued under the librarian's <base>, vol. N convention,
+    # against which Discogs returns the canonical release with a long
+    # parenthetical subtitle. The repro shape for WXYC#531.
+    (58610, "Disco Not Disco, vol. 1", "Various Artists - Rock - D", "V", 3, 1, "Rock", "CD"),
+    (58611, "Disco Not Disco, vol. 2", "Various Artists - Rock - D", "V", 3, 2, "Rock", "CD"),
+    # Non-V/A with the same shape — regression guard so the gate stays narrow.
+    (60001, "Live Sessions, vol. 2", "Some Band", "S", 4, 2, "Rock", "CD"),
 ]
 
 

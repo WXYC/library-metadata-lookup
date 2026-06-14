@@ -1678,23 +1678,48 @@ def album_title_acceptable(query_lower: str, result_lower: str) -> bool:
     return fuzz.ratio(query_lower, result_lower) >= 50
 
 
+_TRAILING_PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\)\s*$")
+"""Strip a trailing parenthetical suffix from a Discogs album query before search.
+
+Discogs ``release.title`` often carries a long descriptive subtitle in
+parentheses (e.g. ``Disco Not Disco (Post Punk, Electro & Leftfield Disco
+Classics 1974-1986)``). The library catalogues only the base (``Disco Not
+Disco, vol. 1``), and the FTS5 implicit-AND query against the full Discogs
+title returns empty — the subtitle terms aren't in the library row. Stripping
+the parenthetical produces a query that FTS5 surfaces to the right rows, and
+the existing prefix branch in ``album_title_acceptable`` accepts the
+library row via ``result.startswith(query)``.
+"""
+
+
 async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryItem]:
     """Search for album with fuzzy keyword matching."""
     from rapidfuzz import fuzz
 
-    results = await db.search(query=album_title, limit=MAX_SEARCH_RESULTS)
-
-    # Filter exact FTS5 results by title similarity to reject subset matches
-    # (e.g., FTS5 matches "808 State" for query "The Best Of 808 State: Blueprint"
-    # because it tokenizes and matches on shared terms "808" and "State")
-    if results:
-        album_lower = album_title.lower()
-        results = [
+    async def _search_and_filter(query: str) -> list[LibraryItem]:
+        raw = await db.search(query=query, limit=MAX_SEARCH_RESULTS)
+        if not raw:
+            return []
+        q_lower = query.lower()
+        return [
             r
-            for r in results
-            if _va_series_title_match(album_lower, r)
-            or album_title_acceptable(album_lower, (r.title or "").lower())
+            for r in raw
+            if _va_series_title_match(q_lower, r)
+            or album_title_acceptable(q_lower, (r.title or "").lower())
         ]
+
+    # First try the un-stripped query. If FTS5 finds candidates but the
+    # post-filter rejects them all, retry with the parenthetical stripped —
+    # this rescues the over-specific Discogs subtitle case (WXYC#531) where
+    # the LIKE/fuzzy fallback inside db.search returns a tangentially related
+    # row that the post-filter then drops, leaving the actual library row
+    # unseen because FTS5's implicit-AND on the full title returns empty.
+    results = await _search_and_filter(album_title)
+
+    if not results:
+        stripped = _TRAILING_PARENTHETICAL_RE.sub("", album_title).strip()
+        if stripped and stripped != album_title:
+            results = await _search_and_filter(stripped)
 
     if not results:
         words = re.sub(r"[^\w\s]", " ", album_title.lower()).split()
