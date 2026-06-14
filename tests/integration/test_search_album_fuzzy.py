@@ -158,6 +158,20 @@ async def test_non_va_paren_match_filtered_by_downstream_artist_gate(library_db)
     # surface in results and this test would fail.
     service.validate_track_on_release = AsyncMock(return_value=True)
 
+    # First pin the matching layer: search_album_fuzzy must surface the row
+    # via the paren-strip retry. Without this assertion the end-to-end check
+    # below could silently pass a regression in the strip-retry (nothing to
+    # filter = nothing in titles, indistinguishable from "filtered correctly").
+    matching_layer = await search_album_fuzzy(
+        library_db,
+        "Live Sessions (Acoustic Recordings From The Greek Theatre 1998-2002)",
+    )
+    matching_layer_titles = {item.title for item in matching_layer}
+    assert "Live Sessions, vol. 2" in matching_layer_titles, (
+        f"Matching layer must widen via the paren-strip retry — without this "
+        f"the artist-gate assertion below is vacuous, got: {matching_layer_titles}"
+    )
+
     with patch(
         "lookup.orchestrator.lookup_releases_by_track",
         new_callable=AsyncMock,
