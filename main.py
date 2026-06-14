@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from wxyc_fastapi.observability import flush_posthog, init_sentry, shutdown_posthog
 
 from artists.router import router as artists_router
+from cache.router import router as cache_router
 from config.settings import get_settings
 from core.auth import require_lml_key
 from core.dependencies import (
@@ -124,6 +125,13 @@ app.include_router(
 # response into its local `artist_search_alias` cache (BS PR 4) and the
 # catalog search extends with a LATERAL JOIN (BS PR 5).
 app.include_router(artists_router, prefix="/api/v1", tags=["artists"], dependencies=_lml_protected)
+# `POST /api/v1/cache/refresh-for-identities` — source-agnostic cache warmer
+# (WXYC/library-metadata-lookup#525). Walks a batch of release identity_ids,
+# fans out per-source release-cache refreshes, and walks Discogs releases'
+# artist credits with the LML#518 / LML#546 / LML#525 caller-validates
+# sentinel guard. Consumed by Backend-Service's rotation-artist-backfill
+# cron migration (WXYC/Backend-Service#1381).
+app.include_router(cache_router, prefix="/api/v1", tags=["cache"], dependencies=_lml_protected)
 
 if __name__ == "__main__":
     import uvicorn

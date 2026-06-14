@@ -136,6 +136,42 @@ INSERT INTO entity.release_reconciliation_log
 VALUES ($1, $2, $3, $4, $5)\
 """
 
+# LML#525: bulk read of per-source external IDs for a batch of release
+# identity_ids. Reads the `entity.release_identity` row directly rather than
+# the reconciliation log — the per-source UNIQUE columns already carry the
+# canonical (source, external_id) projection, and a single round-trip vs.
+# N is what makes the cache-refresh dispatcher's fan-out economical. The
+# reconciliation_log is reserved for cases where multi-version provenance
+# per source matters; not needed for cache warming.
+#
+# Idiom matches `_BULK_GET_IDENTITY_EXACT_SQL` above: bind the input list as
+# a single int array and let PG fan it out against the PK index in one query.
+_BULK_GET_RELEASE_IDENTITY_PROVENANCE_SQL = """\
+SELECT id,
+       discogs_release_id, discogs_master_id, musicbrainz_release_id,
+       spotify_album_id, apple_music_album_id, bandcamp_album_url
+FROM entity.release_identity
+WHERE id = ANY($1::int[])\
+"""
+
+# Maps `entity.release_identity` columns to the source-key vocabulary the
+# cache-refresh dispatcher and the rest of the LML codebase use. Keep in
+# lockstep with `identity.release_validation.RELEASE_SOURCE_COLUMN`: this
+# is the inverse direction (column → source). Defining it here rather than
+# importing-and-inverting keeps the store's read path independent of the
+# validation module's load order, and lets the column-set evolve with the
+# release-identity schema without retrofitting `release_validation` for
+# read-only sources (e.g. `musicbrainz_release_id` is readable today even
+# though no write helper / sentinel rule exists for it yet).
+_RELEASE_IDENTITY_COLUMN_TO_SOURCE: tuple[tuple[str, str], ...] = (
+    ("discogs_release_id", "discogs_release"),
+    ("discogs_master_id", "discogs_master"),
+    ("musicbrainz_release_id", "musicbrainz_release"),
+    ("spotify_album_id", "spotify_album"),
+    ("apple_music_album_id", "apple_music_album"),
+    ("bandcamp_album_url", "bandcamp"),
+)
+
 # Shared merge / delete primitives. Used both by `EntityDeduplicator.merge_group`
 # (for QID-collapse merges) and by the LML#377 orphan-pass helpers
 # `merge_identity_by_library_name` / `delete_identity_by_library_name`. Hoisted
@@ -854,3 +890,47 @@ class EntityStore:
             method,
             confidence,
         )
+
+    async def get_release_identity_provenance_bulk(
+        self, identity_ids: list[int]
+    ) -> dict[int, list[tuple[str, str]]]:
+        """Return per-source ``(source, external_id)`` pairs for each identity_id.
+
+        Single round-trip against ``entity.release_identity``: PG fans the
+        input list out against the PK index, the row is decomposed in Python
+        by reading every per-source column that is non-NULL.
+
+        Missing identity_ids are **absent** from the returned dict (not
+        None-valued) — the cache-refresh dispatcher renders that absence as
+        per-id ``status = "not_found"`` (LML#525 contract).
+
+        Every external_id is stringified so callers don't have to branch on
+        ``int``-vs-``str`` types when serializing per-source outcomes. Discogs
+        IDs land as decimal strings; TEXT-shaped sources round-trip verbatim.
+
+        Args:
+            identity_ids: List of release-identity row IDs to look up. Empty
+                input returns ``{}`` without a PG round-trip.
+
+        Returns:
+            ``{identity_id: [(source, external_id), ...]}``. The list per
+            identity holds one entry per non-NULL source column on the row.
+            A row whose per-source columns are all NULL (legally possible
+            but never produced by the v1 mint protocol) yields an empty
+            list, distinguishing "row exists, nothing wired" from "row
+            absent" (which is omitted from the dict entirely).
+        """
+        if not identity_ids:
+            return {}
+        rows = await self._pg.fetchall(_BULK_GET_RELEASE_IDENTITY_PROVENANCE_SQL, identity_ids)
+        if not rows:
+            return {}
+        result: dict[int, list[tuple[str, str]]] = {}
+        for row in rows:
+            pairs: list[tuple[str, str]] = []
+            for column, source in _RELEASE_IDENTITY_COLUMN_TO_SOURCE:
+                value = row[column]
+                if value is not None:
+                    pairs.append((source, str(value)))
+            result[row["id"]] = pairs
+        return result

@@ -399,7 +399,7 @@ class TestBulkLookupEndpoint:
     ):
         """Garbage in `LML_BULK_MAX_CONCURRENT` must fall back to the default + warn.
 
-        Pins the contract documented at `_max_concurrency_from_env`: a misconfigured
+        Pins the contract documented at `max_concurrency_from_env`: a misconfigured
         env var doesn't blow up the route, it warns and uses the default.
         """
         import logging
@@ -648,7 +648,7 @@ class TestBulkLookupClientAbort:
     on disconnect, the handler cancels in-flight items, releases permits, and
     short-circuits with HTTP 499.
 
-    Tests patch ``_watch_disconnect`` directly; the receive-channel mechanism
+    Tests patch ``watch_disconnect`` directly; the receive-channel mechanism
     is exercised in production by uvicorn.
     """
 
@@ -699,7 +699,7 @@ class TestBulkLookupClientAbort:
                     new_callable=AsyncMock,
                     side_effect=slow_lookup,
                 ) as mock_lookup,
-                patch("lookup.router._watch_disconnect", self._disconnect_after()),
+                patch("lookup.router.watch_disconnect", self._disconnect_after()),
             ):
                 async with AsyncClient(
                     transport=ASGITransport(app=app), base_url="http://test"
@@ -754,7 +754,7 @@ class TestBulkLookupClientAbort:
                 new_callable=AsyncMock,
                 side_effect=slow_lookup,
             ),
-            patch("lookup.router._watch_disconnect", self._disconnect_after()),
+            patch("lookup.router.watch_disconnect", self._disconnect_after()),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app_client), base_url="http://test"
@@ -798,7 +798,7 @@ class TestBulkLookupClientAbort:
                 new_callable=AsyncMock,
                 side_effect=slow_lookup,
             ),
-            patch("lookup.router._watch_disconnect", self._disconnect_after()),
+            patch("lookup.router.watch_disconnect", self._disconnect_after()),
             patch("lookup.router.sentry_sdk.set_tag", side_effect=capture_tag),
         ):
             async with AsyncClient(
