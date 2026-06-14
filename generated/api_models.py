@@ -1117,6 +1117,49 @@ class ArtistSearchAliasesBulkResponse(BaseModel):
     cache_stats: CacheStats | None = None
 
 
+class CacheRefreshSourceOutcome(StrEnum):
+    success = "success"
+    error = "error"
+    not_implemented = "not_implemented"
+
+
+class CacheRefreshItemStatus(StrEnum):
+    warmed = "warmed"
+    not_found = "not_found"
+    not_implemented = "not_implemented"
+    error = "error"
+
+
+class CacheRefreshArtistOutcome(BaseModel):
+    external_id: str
+    outcome: CacheRefreshSourceOutcome
+    message: str | None = Field(
+        None,
+        description="Exception class name when `outcome != success`. Bare `str()` of the exception is intentionally NOT serialized — it may carry upstream error bodies, SQL fragments, or file paths. Full traceback lands in Sentry.\n",
+    )
+
+
+class CacheRefreshSourceResult(BaseModel):
+    release_outcome: CacheRefreshSourceOutcome
+    artists: list[CacheRefreshArtistOutcome] | None = Field([], validate_default=True)
+    message: str | None = None
+
+
+class CacheRefreshResultItem(BaseModel):
+    identity_id: int
+    status: CacheRefreshItemStatus
+    sources: dict[str, CacheRefreshSourceResult] | None = None
+    message: str | None = None
+
+
+class BulkCacheRefreshRequest(BaseModel):
+    identity_ids: list[int] = Field(..., min_length=1)
+
+
+class BulkCacheRefreshResponse(BaseModel):
+    results: list[CacheRefreshResultItem]
+
+
 class DiscogsTrackItem(BaseModel):
     position: str
     title: str
