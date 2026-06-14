@@ -1598,9 +1598,8 @@ def _va_series_title_match(query_lower: str, item: LibraryItem) -> bool:
     """Special-case for V/A series releases catalogued as ``<base>, vol. N``.
 
     The library files V/A compilations under a terse ``<base>, vol. N`` series
-    identifier (filing convention preserved in ``library.artist_name`` — see
-    the V/A invariant in CONTEXT.md), while Discogs returns the canonical
-    release with a long descriptive subtitle. Neither the prefix branch nor the
+    identifier (filing convention preserved in ``library.artist_name``), while
+    Discogs returns the canonical release with a long descriptive subtitle. Neither the prefix branch nor the
     length-sensitive ``fuzz.ratio`` branch of ``album_title_acceptable`` can
     bridge that asymmetry, so V/A series rows stay hidden.
 
