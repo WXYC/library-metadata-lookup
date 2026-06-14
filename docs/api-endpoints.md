@@ -13,6 +13,30 @@ The service exposes REST endpoints for querying the `entity.identity` table in t
 
 These endpoints return 503 when `DATABASE_URL_DISCOGS` is not set or the entity schema is not applied.
 
+## Cache Refresh Endpoint
+
+`POST /api/v1/cache/refresh-for-identities` warms LML's Discogs cache for a batch of `entity.release_identity.id` values. Source-agnostic by design (LML#525) — Backend hands LML the canonical identity IDs and lets LML do the source-to-external-id mapping. Used by Backend-Service's rotation-artist-backfill cron (WXYC/Backend-Service#1381) so BS no longer needs to hold Discogs IDs directly (those are unstable across Discogs reshuffles).
+
+Request: `{"identity_ids": [42, 99, 12345]}`. Max 50 ids per request — over the cap returns 400. Empty list returns 422. Duplicates are allowed; each runs independently.
+
+Behavior per id:
+1. Read `entity.release_identity` once for the whole batch (one PG round trip, not N).
+2. For each `(source, external_id)` pair on the row, dispatch to the per-source release-cache refresh. Today only `discogs_release` is wired; `discogs_master`, `musicbrainz_release`, `spotify_album`, `apple_music_album`, and `bandcamp` return `release_outcome = "not_implemented"`.
+3. For each refreshed Discogs release, walk `release.artists[*].artist_id` (skipping `artist_id <= 0` — the LML#525 sentinel guard extending the LML#518 / LML#546 caller-validates audit posture) and refresh the per-artist cache.
+4. Roll up per-source outcomes into the per-id `status`: `warmed | not_found | not_implemented | error`. `not_found` covers "no row in `entity.release_identity`" (no 500); `warmed` requires at least one source `release_outcome == "success"`; `error` is reserved for "no useful release-cache work happened" so it is the only retry signal. Tombstones (LML#510) count as `success` — the cache state is current.
+
+Response carries per-id results only — no top-level counters. Callers derive them via `Counter(r.status for r in results)`, matching the `BulkLookupResultItem` precedent.
+
+The dispatcher loop mirrors `/api/v1/lookup/bulk` (`lookup/router.py`): `asyncio.gather` under a bounded semaphore (`LML_BULK_MAX_CONCURRENT`, default 10, shared with the lookup endpoint), per-item `try/except` so one identity's failure cannot poison siblings, and a `watch_disconnect` sentinel race so a client abort cancels the gather and frees downstream Discogs rate-limit / semaphore permits. Per-replica Discogs concurrency / rate-limit gates from `discogs/ratelimit.py` apply for free through `DiscogsService.get_release` / `get_artist_details`.
+
+Implementation lives in `cache/`:
+- `cache/models.py` — Pydantic shapes (the api.yaml entry generates structurally identical types on the Backend-Service side).
+- `cache/dispatch.py` — per-identity orchestration: the per-source dispatch table, the walk-to-artists step with the `> 0` sentinel guard, and the per-id `status` rollup (all pure-logic, unit-tested in `tests/unit/test_cache_dispatch.py`).
+- `cache/router.py` — the FastAPI handler, batch concurrency primitives shared with `lookup/router.py` via `core/bulk_concurrency.py`.
+- `entity/store.py:get_release_identity_provenance_bulk` — the bulk PG read returning `{identity_id: [(source, external_id), ...]}`.
+
+Sentry spans: `cache.refresh.batch` around the gather, `cache.refresh.identity` per identity, `cache.refresh.release` per source leg, `cache.refresh.artist` per walk target. Numeric attributes (`identity_id`, `external_id`) are set on the span at open, never via late binding.
+
 ## Streaming Check Endpoint
 
 `POST /api/v1/streaming-check` checks whether an album is available on streaming platforms. Used by tubafrenzy and Backend-Service to set the `on_streaming` flag when a new release is added to the library.
