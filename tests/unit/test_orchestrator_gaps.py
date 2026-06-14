@@ -898,7 +898,7 @@ class TestSearchAlbumFuzzy:
             title="Disco Not Disco, vol. 1",
         )
 
-        async def search(query: str, limit: int = 5) -> list:
+        async def search(query, limit=None, **_):
             # Only surface the V/A seed when the query has been fully stripped
             # to the base. Any partially-stripped retry returns empty, so an
             # incorrect regex (peeling only the trailing group) yields [] from
