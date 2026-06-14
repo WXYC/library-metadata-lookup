@@ -26,10 +26,12 @@ async def test_va_series_with_volume_surfaces_against_long_paren_subtitle(librar
     surface against the Discogs canonical release whose title carries a long
     parenthetical subtitle.
 
-    The pre-fix behavior is empty results because FTS5 implicit-AND on the full
-    title cannot match the terse library row, the LIKE fallback requires every
-    significant word in title/artist, and the fuzzy fallback candidate-trawls
-    on the longest word's 3-char prefix.
+    Pre-fix behavior is empty results: FTS5 throws on ``&`` in the subtitle,
+    ``db.search`` swallows the syntax error and falls through to the LIKE /
+    fuzzy ladder, the LIKE fallback requires every significant word to appear
+    in title or artist (the subtitle's words don't), and the fuzzy fallback
+    candidate-trawls on the longest word's 3-char prefix and surfaces
+    tangentially related rows that the post-filter then drops.
     """
     results = await search_album_fuzzy(
         library_db,
