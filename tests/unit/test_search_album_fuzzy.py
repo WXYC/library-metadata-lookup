@@ -208,6 +208,114 @@ class TestSearchAlbumFuzzyExactTitle:
         )
 
     @pytest.mark.asyncio
+    async def test_strips_whitespace_around_discogs_titles(self, tmp_path):
+        """Discogs payloads occasionally carry trailing whitespace; an
+        unnormalized literal-equality check would otherwise quietly fall
+        through to the FTS5 path and re-expose the rowid-truncation bug."""
+        db = LibraryDB(db_path=_create_kaleidoscope_library(tmp_path))
+        await db.connect()
+        try:
+            results = await search_album_fuzzy(db, "  Kaleidoscope  ")
+            returned_ids = {item.id for item in results}
+        finally:
+            await db.close()
+
+        assert {100, 5000, 60000} <= returned_ids, (
+            "Whitespace-padded titles must match the literal-title pre-pass; "
+            f"got {sorted(returned_ids)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_matches_when_query_case_differs_from_library(self, tmp_path):
+        """Library cataloguing uses Title Case; Discogs occasionally hands us
+        a lower-case or all-caps title. The pre-pass must be case-insensitive
+        so a casing mismatch doesn't fall through to FTS5."""
+        # Build a tiny library with the row stored Title Case; query lower-case.
+        db_file = tmp_path / "library.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY, title TEXT, artist TEXT, call_letters TEXT,
+                artist_call_number INTEGER, release_call_number INTEGER, genre TEXT,
+                format TEXT, alternate_artist_name TEXT, label TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist, alternate_artist_name,
+                content='library', content_rowid='id'
+            )
+        """)
+        rows = [
+            (1, "Kaleidoscope", "DJ Food", "DJ", 1, 1, "Electronic", "cd", "", "Ninja Tune"),
+        ]
+        conn.executemany("INSERT INTO library VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        conn.executemany(
+            "INSERT INTO library_fts(rowid, title, artist, alternate_artist_name) VALUES (?, ?, ?, ?)",
+            [(r[0], r[1], r[2], r[8]) for r in rows],
+        )
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        try:
+            results = await search_album_fuzzy(db, "kaleidoscope")
+            ids_lower = {r.id for r in results}
+            results_upper = await search_album_fuzzy(db, "KALEIDOSCOPE")
+            ids_upper = {r.id for r in results_upper}
+        finally:
+            await db.close()
+
+        assert 1 in ids_lower, f"lower-case query must match Title Case row; got {ids_lower}"
+        assert 1 in ids_upper, f"upper-case query must match Title Case row; got {ids_upper}"
+
+    @pytest.mark.asyncio
+    async def test_does_not_truncate_common_titles(self, tmp_path):
+        """Library has 150+ "Greatest Hits" / "Best Of" / "Live" rows in
+        production; the literal-title pre-pass must return all of them so
+        downstream artist filters can find the right one. A LIMIT cap would
+        recreate the rowid-truncation bug at a higher threshold."""
+        db_file = tmp_path / "library.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY, title TEXT, artist TEXT, call_letters TEXT,
+                artist_call_number INTEGER, release_call_number INTEGER, genre TEXT,
+                format TEXT, alternate_artist_name TEXT, label TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist, alternate_artist_name,
+                content='library', content_rowid='id'
+            )
+        """)
+        rows = [
+            (i, "Greatest Hits", f"Artist {i:03d}", "X", 1, 1, "Rock", "cd", "", "Label")
+            for i in range(1, 101)  # 100 rows literally titled "Greatest Hits"
+        ]
+        conn.executemany("INSERT INTO library VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        conn.executemany(
+            "INSERT INTO library_fts(rowid, title, artist, alternate_artist_name) VALUES (?, ?, ?, ?)",
+            [(r[0], r[1], r[2], r[8]) for r in rows],
+        )
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        try:
+            results = await search_album_fuzzy(db, "Greatest Hits")
+        finally:
+            await db.close()
+
+        assert len(results) == 100, (
+            f"all 100 literal-title rows must surface so artist filtering can pick the right one; "
+            f"got {len(results)}"
+        )
+
+    @pytest.mark.asyncio
     async def test_returns_high_rowid_exact_title_match(self, tmp_path):
         """Tracer-bullet shape of the production miss.
 

@@ -387,28 +387,52 @@ class LibraryDB:
         rows = await cursor.fetchall()
         return list(rows)
 
-    async def exact_title(self, album_title: str, limit: int = 50) -> list[LibraryItem]:
+    async def exact_title(self, album_title: str) -> list[LibraryItem]:
         """Return library rows whose ``title`` is literally ``album_title``.
 
-        Case-insensitive (``COLLATE NOCASE``) but no tokenization, no fuzzy
-        scoring, no prefix matching. Useful as a pre-pass before
-        :meth:`search`: a literal Discogs album title is the most reliable
-        signal of a library row, and the FTS5 path otherwise truncates
-        by rowid and can drop exact-title matches whose row was added later
-        in the catalog (see ``lookup.orchestrator.search_album_fuzzy``).
+        Case-insensitive but no tokenization, no fuzzy scoring, no prefix
+        matching. Useful as a pre-pass before :meth:`search`: a literal Discogs
+        album title is the most reliable signal of a library row, and the FTS5
+        path otherwise truncates by rowid and can drop exact-title matches
+        whose row was added later in the catalog (see
+        ``lookup.orchestrator.search_album_fuzzy``).
+
+        Returns every match — no implicit ``LIMIT``. Library rows are
+        intrinsically bounded by catalog conventions (high-collision titles
+        like "Greatest Hits" top out around 150 in practice); a hidden cap
+        would recreate the rowid-truncation bug class this method exists to
+        avoid.
+
+        Two-phase query: a case-sensitive equality lookup runs first so the
+        ``idx_title`` BINARY index covers the common case (Title Case query
+        against Title Case catalog), then a ``COLLATE NOCASE`` scan runs only
+        on miss. The scan is ~500x slower than the index lookup on the live
+        library, so the fast path matters when ``search_album_fuzzy`` runs
+        per-Discogs-release inside a single lookup.
         """
         if not self._conn:
             raise RuntimeError("Database not connected")
         if not album_title:
             return []
+        album_title = album_title.strip()
+        if not album_title:
+            return []
 
-        sql = f"""
-            SELECT {self._select_columns()}
-            FROM library
-            WHERE title = ? COLLATE NOCASE
-            LIMIT ?
-        """
-        cursor = await self._conn.execute(sql, (album_title, limit))
+        select_cols = self._select_columns()
+        # Fast path: BINARY equality uses idx_title.
+        cursor = await self._conn.execute(
+            f"SELECT {select_cols} FROM library WHERE title = ?",
+            (album_title,),
+        )
+        rows = await cursor.fetchall()
+        if rows:
+            return [LibraryItem(**dict(row)) for row in rows]
+
+        # Slow path: case-insensitive scan, only for the rare casing mismatch.
+        cursor = await self._conn.execute(
+            f"SELECT {select_cols} FROM library WHERE title = ? COLLATE NOCASE",
+            (album_title,),
+        )
         rows = await cursor.fetchall()
         return [LibraryItem(**dict(row)) for row in rows]
 
