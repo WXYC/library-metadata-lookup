@@ -58,7 +58,15 @@ class TestAppRouterRegistration:
     def test_routes_registered(self):
         from main import app
 
-        routes = [r.path for r in app.routes]
+        # FastAPI >= 0.137 wraps include_router(...) calls in _IncludedRouter,
+        # so the underlying APIRoute objects must be reached through
+        # effective_route_contexts() rather than read off app.routes directly.
+        routes = []
+        for r in app.routes:
+            if hasattr(r, "effective_route_contexts"):
+                routes.extend(ctx.path for ctx in r.effective_route_contexts())
+            elif hasattr(r, "path"):
+                routes.append(r.path)
         assert "/health" in routes
         assert "/api/v1/lookup" in routes
         assert "/api/v1/library/search" in routes

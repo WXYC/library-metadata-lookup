@@ -384,8 +384,23 @@ class TestProtectedRouteRegistration:
         )
 
 
-def _find_route(app, method, path):
+def _iter_effective_routes(app):
+    """Yield route-like objects for every concrete endpoint reachable from ``app.routes``.
+
+    FastAPI >= 0.137 wraps each ``include_router(...)`` call in an ``_IncludedRouter``
+    so the underlying ``APIRoute`` objects no longer live directly in ``app.routes``;
+    they are exposed via ``effective_route_contexts()`` with prefix + include-dependencies
+    merged in. Older FastAPI flattens them and is handled by the else branch.
+    """
     for r in app.routes:
+        if hasattr(r, "effective_route_contexts"):
+            yield from r.effective_route_contexts()
+        else:
+            yield r
+
+
+def _find_route(app, method, path):
+    for r in _iter_effective_routes(app):
         if getattr(r, "path", None) == path and method in getattr(r, "methods", set()):
             return r
     return None
