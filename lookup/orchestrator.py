@@ -1699,6 +1699,16 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
     """Search for album with fuzzy keyword matching."""
     from rapidfuzz import fuzz
 
+    # Exact-title pre-pass. The FTS5 path below truncates to
+    # ``MAX_SEARCH_RESULTS`` rows in implementation-defined (rowid) order, which
+    # silently drops literal-title matches whose library row was added later in
+    # the catalog. Discogs typically hands us the album title verbatim, so a
+    # literal hit is the most reliable signal — surface it before falling
+    # through to fuzzy scoring.
+    exact = await db.exact_title(album_title)
+    if exact:
+        return exact
+
     async def _search_and_filter(query: str) -> list[LibraryItem]:
         raw = await db.search(query=query, limit=MAX_SEARCH_RESULTS)
         if not raw:

@@ -1671,6 +1671,7 @@ class TestSearchSongAsTrack:
     @pytest.mark.asyncio
     async def test_no_song_returns_empty(self):
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         results, matched_via = await search_song_as_track(db, None)
         assert results == []
         assert matched_via == {}
@@ -1679,6 +1680,7 @@ class TestSearchSongAsTrack:
     @pytest.mark.asyncio
     async def test_blank_song_returns_empty(self):
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         results, matched_via = await search_song_as_track(db, "")
         assert results == []
         assert matched_via == {}
@@ -1687,6 +1689,7 @@ class TestSearchSongAsTrack:
     async def test_no_discogs_service_returns_empty(self):
         """Without a Discogs service, the strategy can't run and must no-op."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         results, matched_via = await search_song_as_track(
             db, "vi scose poise", discogs_service=None
         )
@@ -1697,6 +1700,7 @@ class TestSearchSongAsTrack:
     @pytest.mark.asyncio
     async def test_no_discogs_releases_returns_empty(self):
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         svc = AsyncMock()
         svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
             track="vi scose poise", artist=None, releases=[], total=0
@@ -1712,6 +1716,7 @@ class TestSearchSongAsTrack:
     async def test_library_miss_returns_empty(self):
         """Discogs returns releases but none match in library — empty result."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search.return_value = []
         svc = AsyncMock()
         svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
@@ -1743,6 +1748,7 @@ class TestSearchSongAsTrack:
         """
         confield = make_library_item(id=60359, artist="Autechre", title="Confield")
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search.return_value = [confield]
         svc = AsyncMock()
         svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
@@ -1784,6 +1790,7 @@ class TestSearchSongAsTrack:
             title="Trax Records 20th Anniversary Collection",
         )
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search.return_value = [va_album]
         svc = AsyncMock()
         svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
@@ -1815,6 +1822,7 @@ class TestSearchSongAsTrack:
         """
         confield = make_library_item(id=60359, artist="Autechre", title="Confield")
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search.return_value = [confield]
         svc = AsyncMock()
         svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
@@ -1848,6 +1856,7 @@ class TestSearchSongAsTrack:
         """
         confield = make_library_item(id=60359, artist="Autechre", title="Confield")
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search.return_value = [confield]
         svc = AsyncMock()
         svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
@@ -1889,6 +1898,7 @@ class TestSearchSongAsTrack:
             title="Trax Records 20th Anniversary Collection",
         )
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
 
         async def search_side_effect(query, **kwargs):
             return [va_album] if query.startswith("Various ") else []
@@ -1932,6 +1942,7 @@ class TestSearchSongAsTrack:
         import time as _time
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         releases = [
             DiscogsReleaseInfo(
                 album=f"Album {i}",
@@ -2002,6 +2013,7 @@ class TestSearchSongAsTrack:
         item_b = make_library_item(id=102, artist="Artist B", title="Album B")
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
 
         async def search_side_effect(query, **kwargs):
             q = query.lower()
@@ -2078,6 +2090,7 @@ class TestSearchSongAsTrack:
 
         confield = make_library_item(id=60359, artist="Autechre", title="Confield")
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search.return_value = [confield]
 
         # Use the compilation path so we can vary artist_credit per release
@@ -2087,6 +2100,7 @@ class TestSearchSongAsTrack:
         # what we read back to assert input-order accumulation.
         va_album = make_library_item(id=60359, artist="Various Artists", title="Confield Comp")
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search.return_value = [va_album]
 
         svc = AsyncMock()
@@ -2143,6 +2157,7 @@ class TestSearchSongAsTrack:
 
         n_candidates = 20
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
 
         # Each release maps to a distinct library row that prefix-matches it,
         # so validate fires for every one.
@@ -2247,6 +2262,7 @@ class TestSearchSongAsTrack:
         ]
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
 
         async def search_side_effect(query, **kwargs):
             for item in items:
@@ -2317,6 +2333,7 @@ class TestSearchCompilationsEarlyExit:
         ]
 
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
 
         async def _search(query, limit=None, **_):
             q = query.lower()

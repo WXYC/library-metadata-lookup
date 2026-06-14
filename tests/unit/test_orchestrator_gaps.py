@@ -55,6 +55,7 @@ class TestAlternativeInterpretationBothResults:
     async def test_combines_and_deduplicates(self):
         """When both interpretations match, results are combined and deduplicated."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item1 = _item(id=1, artist="Foo", title="Bar")
         item2 = _item(id=2, artist="Bar", title="Foo")
         shared = _item(id=3, artist="Foo", title="Shared")
@@ -83,6 +84,7 @@ class TestSearchSongAsArtist:
     async def test_direct_artist_match(self):
         """Direct library search with song-as-artist returns results."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item = _item(id=1, artist="Stereolab", title="Dots and Loops")
         db.search = AsyncMock(return_value=[item])
 
@@ -94,6 +96,7 @@ class TestSearchSongAsArtist:
     async def test_discogs_fallback(self):
         """When direct search fails, looks up Discogs for releases by that artist."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item = _item(id=2, artist="Stereolab", title="Emperor Tomato Ketchup")
 
         # Direct search returns nothing; album search finds it
@@ -114,6 +117,7 @@ class TestSearchSongAsArtist:
     async def test_discogs_returns_no_releases(self):
         """When Discogs also finds nothing, returns empty."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         with patch(
@@ -129,6 +133,7 @@ class TestSearchSongAsArtist:
     async def test_compilation_match_via_discogs(self):
         """Discogs cross-reference matches compilation albums."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         comp_item = _item(id=3, artist="Various Artists", title="Indie Comp 2020")
 
         # Direct search returns nothing; album search finds compilation
@@ -148,6 +153,7 @@ class TestSearchSongAsArtist:
     async def test_skips_empty_album_title(self):
         """Discogs releases with empty album titles are skipped."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         with patch(
@@ -170,6 +176,7 @@ class TestSearchLibraryWithFallbackSongPath:
     async def test_artist_plus_song_fallback_when_no_discogs_albums(self):
         """When Discogs found no albums (empty list), falls back to artist+song."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item1 = _item(id=1, artist="Queen", title="Greatest Hits")
         item2 = _item(id=2, artist="Queen", title="Bohemian Rhapsody Single")
 
@@ -195,6 +202,7 @@ class TestSearchLibraryWithFallbackSongPath:
         handles rejecting false positives from the fallback results.
         """
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item = _item(id=1, artist="Queen", title="Greatest Hits")
 
         db.search = AsyncMock(
@@ -226,6 +234,7 @@ class TestSearchCompilationsForTrack:
     @pytest.mark.asyncio
     async def test_no_song_returns_empty(self):
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         parsed = ParsedRequest(artist="Queen", raw_message="Queen")
         results, titles = await search_compilations_for_track(db, parsed)
         assert results == []
@@ -234,6 +243,7 @@ class TestSearchCompilationsForTrack:
     @pytest.mark.asyncio
     async def test_no_artist_returns_empty(self):
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         parsed = ParsedRequest(song="Bohemian Rhapsody", raw_message="Bohemian Rhapsody")
         results, titles = await search_compilations_for_track(db, parsed)
         assert results == []
@@ -242,6 +252,7 @@ class TestSearchCompilationsForTrack:
     async def test_keyword_search_with_compilation_filter(self):
         """Keyword search returns results filtered by artist or compilation."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         comp = _item(id=1, artist="Various Artists", title="Rock Hits")
         match = _item(id=2, artist="Queen", title="Best of Queen")
 
@@ -268,6 +279,7 @@ class TestSearchCompilationsForTrack:
     async def test_discogs_cross_reference(self):
         """Finds track on a compilation via Discogs cross-reference."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         comp = _item(id=1, artist="Various Artists", title="Rock Classics")
 
         # First call: keyword search (no results)
@@ -295,6 +307,7 @@ class TestSearchCompilationsForTrack:
     async def test_remix_detection(self):
         """Detects remix info in raw message and uses it for search."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         parsed = ParsedRequest(
@@ -318,6 +331,7 @@ class TestSearchCompilationsForTrack:
     async def test_skips_artist_named_albums(self):
         """Skips Discogs releases where album name matches artist name."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         parsed = ParsedRequest(
@@ -339,6 +353,7 @@ class TestSearchCompilationsForTrack:
     async def test_skips_short_album_names(self):
         """Skips Discogs releases with very short album names."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         parsed = ParsedRequest(
@@ -360,6 +375,7 @@ class TestSearchCompilationsForTrack:
     async def test_compilation_artist_filter(self):
         """Discogs compilation artist + library compilation artist both pass filter."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         comp = _item(id=1, artist="Various Artists", title="Rock Comp")
 
         # keyword: no results; album search: compilation item
@@ -389,6 +405,7 @@ class TestSearchCompilationsForTrack:
         compilation series). fuzz.ratio = 73.5, below the 80 threshold.
         """
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         wrong_item = _item(
             id=3288,
             artist="Various Artists - Hiphop",
@@ -417,6 +434,7 @@ class TestSearchCompilationsForTrack:
     async def test_max_results_break(self):
         """Stops collecting once MAX_SEARCH_RESULTS reached."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         items_by_title = {
             f"Comp {i}": _item(id=i, artist="Various Artists", title=f"Comp {i}") for i in range(30)
         }
@@ -460,6 +478,7 @@ class TestSearchCompilationsForTrack:
     async def test_discogs_exception_falls_back_to_keyword(self):
         """When Discogs search raises, falls back to keyword matches."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         keyword_item = _item(id=1, artist="Queen", title="Best Hits")
 
         # keyword search succeeds
@@ -491,6 +510,7 @@ class TestSearchCompilationsForTrack:
         The keyword fallback then returns "808 State" anyway — a false positive.
         """
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         false_positive = _item(id=958, artist="808 State", title="808 State")
 
         # First call (keyword search): returns the false positive
@@ -526,6 +546,7 @@ class TestSearchCompilationsForTrack:
         incorrectly accepts it because the fuzz.ratio is high (~84%).
         """
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         chicago_v = _item(id=100, artist="Chicago", title="Chicago V")
 
         # Keyword search returns Chicago V; search_album_fuzzy also returns it
@@ -564,6 +585,7 @@ class TestSearchCompilationsForTrack:
         fallback does not fire.
         """
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         self_titled = _item(id=1, artist="Weird Al Yankovic", title="Weird Al Yankovic")
         db.search = AsyncMock(return_value=[self_titled])
 
@@ -595,6 +617,7 @@ class TestSearchCompilationsForTrack:
         where we search the library before validating each Discogs release.
         """
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         comp = _item(
             id=46602,
             artist="Various Artists",
@@ -708,6 +731,7 @@ class TestSearchAlbumFuzzy:
     async def test_exact_match(self):
         """Exact match returns results directly."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item = _item(id=1, title="OK Computer")
         db.search = AsyncMock(return_value=[item])
 
@@ -718,6 +742,7 @@ class TestSearchAlbumFuzzy:
     async def test_fuzzy_fallback(self):
         """When exact match fails, tries fuzzy keyword search."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item = _item(id=1, title="The Very Best Greatest Hits Collection")
 
         # First search: no results. Second search: fuzzy match found.
@@ -731,6 +756,7 @@ class TestSearchAlbumFuzzy:
     async def test_fuzzy_threshold_filters(self):
         """Fuzzy results below threshold are filtered out."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item = _item(id=1, title="Completely Different Title")
 
         # Exact: empty; all fuzzy attempts return unrelated item (filtered each time)
@@ -744,6 +770,7 @@ class TestSearchAlbumFuzzy:
     async def test_no_significant_words(self):
         """Short album title with no significant words skips fuzzy search."""
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
 
         results = await search_album_fuzzy(db, "The")
@@ -759,6 +786,7 @@ class TestSearchAlbumFuzzy:
         Dropping to 3 words ("trax 20th anniversary") should find it.
         """
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item = _item(id=46602, title="Trax Records 20th Anniversary Collection")
 
         # First call: exact match (full title) -> empty
@@ -781,6 +809,7 @@ class TestSearchAlbumFuzzy:
         enough to accept this.
         """
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item = _item(id=57500, title="Nao Wave- Brazilian Punk 82-88")
 
         # Call 1: exact FTS5 search -> empty (diacritics mismatch)
@@ -807,6 +836,7 @@ class TestSearchAlbumFuzzy:
         are not grandfathered through this looser path.
         """
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         item = _item(
             id=58610,
             artist="Various Artists - Rock - D",
@@ -892,6 +922,7 @@ class TestSearchAlbumFuzzy:
         would return ``[]``.
         """
         db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
         seed = _item(
             id=58610,
             artist="Various Artists - Rock - D",
