@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from lookup.orchestrator import (
+    _va_series_title_match,
     album_title_acceptable,
     fetch_artwork_for_items,
     filter_results_by_track_validation,
@@ -825,34 +826,55 @@ class TestSearchAlbumFuzzy:
         assert len(results) == 1
         assert results[0].id == 58610
 
-    @pytest.mark.asyncio
-    async def test_va_series_gate_does_not_grandfather_non_compilation(self):
+    def test_va_series_gate_does_not_grandfather_non_compilation(self):
         """The ``, vol. N`` special-case is gated on ``is_compilation_artist``.
 
         A non-V/A library row with the same shape (``<base>, vol. N``) must NOT
-        be accepted against an unrelated Discogs release whose title merely
-        starts with the same ``<base>``. This is the regression guard for
-        directions (2) and (3) in WXYC#531 — option (1) is deliberately
-        narrow.
+        be accepted through the ``_va_series_title_match`` looser path. Asserts
+        the gate directly rather than through ``search_album_fuzzy`` end-to-end
+        — the latter can reach the row via the existing prefix branch in
+        ``album_title_acceptable`` once the search query is paren-stripped
+        (the broader matching layer is gated downstream by
+        ``_release_matches_library_row``'s artist check in ``process_release``,
+        so a non-V/A row paired with a different Discogs artist is filtered
+        out before it surfaces to the user).
         """
-        db = AsyncMock()
         item = _item(
             id=99999,
             artist="Some Band",
             title="Live Sessions, vol. 2",
         )
 
-        db.search = AsyncMock(return_value=[item])
-
-        # Long descriptive Discogs title that shares the "Live Sessions" prefix
-        # but is otherwise unrelated. Without the V/A gate this would slip
-        # through the new special-case; with the gate it must be rejected by
-        # the existing length-sensitive fuzz.ratio path.
-        results = await search_album_fuzzy(
-            db,
-            "Live Sessions (Acoustic Recordings From The Greek Theatre 1998-2002)",
+        # The V/A helper must reject regardless of whether the query has a
+        # paren subtitle or has been stripped to the base — the artist gate
+        # is what keeps non-V/A rows out of the looser path.
+        assert (
+            _va_series_title_match(
+                "live sessions (acoustic recordings from the greek theatre 1998-2002)",
+                item,
+            )
+            is False
         )
-        assert results == []
+        assert _va_series_title_match("live sessions", item) is False
+
+    def test_va_series_gate_accepts_va_artist_with_matching_base(self):
+        """Companion to the gate-narrowness test: confirm the helper *does*
+        accept V/A rows with a matching base. Pins the positive contract that
+        the gate exists to widen.
+        """
+        item = _item(
+            id=58610,
+            artist="Various Artists - Rock - D",
+            title="Disco Not Disco, vol. 1",
+        )
+        assert (
+            _va_series_title_match(
+                "disco not disco (post punk, electro & leftfield disco classics 1974-1986)",
+                item,
+            )
+            is True
+        )
+        assert _va_series_title_match("disco not disco", item) is True
 
 
 # ---------------------------------------------------------------------------
