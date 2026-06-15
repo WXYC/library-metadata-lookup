@@ -10,9 +10,24 @@ so callers can pass raw request strings and rely on case / diacritic / extra-
 whitespace symmetry. The TTL parameter is the staleness threshold for known
 misses (``apple_music_url IS NULL``); hits never go stale.
 
+LML#576 collapsed the cache's return shape from ``CacheResult(url,
+is_known_miss, is_stale)`` to ``str | None``. Staleness moved into the SQL
+``WHERE`` clause (``last_checked_at > now() - miss_ttl``), mirroring
+``discogs/cache_service.py::lookup_negative_hit``. Callers see one of:
+
+* a non-null URL (cache hit), or
+* ``None`` for any of (a) absent row, (b) fresh known miss, or (c) stale
+  miss — the SQL filter already excluded (c) so the resolver's
+  ``_fetch_cached_row`` ``was_present`` bit is enough to tell (b) from
+  (a)+(c).
+
+The unit tests pin both the public ``str | None`` contract and the SQL
+bind-shape (third bind = ``now - miss_ttl``) so a careless edit to the
+SELECT can't silently regress to the pre-#576 behavior.
+
 PG interaction is mocked with ``AsyncMock(spec=PgSource)``; the integration
 tests at ``tests/integration/test_apple_music_persistent_lookup.py`` cover
-the real SQL behavior.
+the real SQL behavior end-to-end.
 """
 
 from __future__ import annotations
@@ -24,7 +39,6 @@ import pytest
 
 from entity.apple_music_album_cache import (
     DEFAULT_MISS_TTL,
-    CacheResult,
     get_cached_apple_music_url,
     set_cached_apple_music_url,
     set_up_apple_music_cache_schema,
@@ -34,82 +48,72 @@ from entity.sources import PgSource
 
 @pytest.mark.asyncio
 class TestGetCachedAppleMusicURL:
-    """``get_cached_apple_music_url`` returns ``CacheResult`` carrying the URL,
-    whether the row is a known miss, and whether the entry is stale."""
+    """``get_cached_apple_music_url`` returns ``str | None``.
 
-    async def test_returns_empty_result_when_row_absent(self):
+    Hits return the URL. Absent rows, stale misses (excluded by the SQL
+    filter), and fresh known misses all return ``None``. The fresh-vs-
+    stale-vs-absent distinction is no longer surfaced — callers that
+    need it use the ``_fetch_cached_row`` internal seam (the resolver
+    does this to decide whether to call Apple).
+    """
+
+    async def test_returns_none_when_row_absent(self):
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
 
         result = await get_cached_apple_music_url(pg, artist="Hyd", album="Hold Onto Me Infinity")
 
-        assert result == CacheResult(url=None, is_known_miss=False, is_stale=False)
+        assert result is None
 
     async def test_returns_url_when_row_carries_url(self):
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(
             return_value={
                 "apple_music_url": "https://music.apple.com/us/album/foo/1234567890",
-                "last_checked_at": datetime.now(UTC),
             }
         )
 
         result = await get_cached_apple_music_url(pg, artist="Stereolab", album="Aluminum Tunes")
 
-        assert result.url == "https://music.apple.com/us/album/foo/1234567890"
-        assert result.is_known_miss is False
-        assert result.is_stale is False
+        assert result == "https://music.apple.com/us/album/foo/1234567890"
 
-    async def test_flags_known_miss_when_url_null(self):
+    async def test_returns_none_for_fresh_known_miss(self):
+        # A row whose URL is NULL but inside the TTL still returns a row from
+        # the SQL filter — the public API surface ``get_cached_apple_music_url``
+        # collapses it to ``None`` because the URL is None. The resolver
+        # distinguishes fresh-miss from absent via the private
+        # ``_fetch_cached_row.was_present`` seam.
         pg = AsyncMock(spec=PgSource)
-        pg.fetchone = AsyncMock(
-            return_value={
-                "apple_music_url": None,
-                "last_checked_at": datetime.now(UTC),
-            }
-        )
+        pg.fetchone = AsyncMock(return_value={"apple_music_url": None})
 
         result = await get_cached_apple_music_url(pg, artist="Sessa", album="Estrela Acesa")
 
-        assert result.url is None
-        assert result.is_known_miss is True
-        assert result.is_stale is False
+        assert result is None
 
-    async def test_flags_stale_when_known_miss_past_ttl(self):
-        now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
-        # 8 days back: past the 7d default miss TTL.
-        last_checked = now - timedelta(days=8)
+    async def test_sql_bind_carries_now_minus_miss_ttl_cutoff(self):
+        # LML#576: the SQL ``WHERE`` clause filters known-misses to those
+        # with ``last_checked_at > $3``. Bind ``$3`` must be ``now - miss_ttl``
+        # so the DB-side filter matches the public TTL semantic.
         pg = AsyncMock(spec=PgSource)
-        pg.fetchone = AsyncMock(
-            return_value={"apple_music_url": None, "last_checked_at": last_checked}
-        )
-
-        result = await get_cached_apple_music_url(
-            pg, artist="Sessa", album="Estrela Acesa", now=now
-        )
-
-        assert result.url is None
-        assert result.is_known_miss is True
-        assert result.is_stale is True
-
-    async def test_hits_never_go_stale(self):
-        # Even a year-old hit should still report fresh — durable storage,
-        # only misses get a TTL.
+        pg.fetchone = AsyncMock(return_value=None)
         now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
-        last_checked = now - timedelta(days=400)
-        pg = AsyncMock(spec=PgSource)
-        pg.fetchone = AsyncMock(
-            return_value={
-                "apple_music_url": "https://music.apple.com/us/album/foo/1",
-                "last_checked_at": last_checked,
-            }
+        miss_ttl = timedelta(days=7)
+
+        await get_cached_apple_music_url(
+            pg, artist="Hyd", album="Hold Onto Me Infinity", miss_ttl=miss_ttl, now=now
         )
 
-        result = await get_cached_apple_music_url(
-            pg, artist="Stereolab", album="Aluminum Tunes", now=now
-        )
-
-        assert result.is_stale is False
+        assert pg.fetchone.await_count == 1
+        call = pg.fetchone.await_args
+        # SQL first; then artist, album, cutoff.
+        sql = call.args[0]
+        assert "WHERE artist_normalized = $1 AND album_normalized = $2" in sql
+        # The TTL filter must be DB-side, not Python-side.
+        assert "last_checked_at > $3" in sql
+        assert "apple_music_url IS NOT NULL OR" in sql
+        # The cutoff bind is ``now - miss_ttl``.
+        cutoff_bind = call.args[3]
+        assert cutoff_bind == now - miss_ttl
 
     async def test_normalizes_artist_and_album_via_to_match_form(self):
         # Cache lookup with diacritics + casing variants should query the SAME
@@ -123,14 +127,14 @@ class TestGetCachedAppleMusicURL:
         # Exactly one query, bind-args 2 and 3 are the normalized strings.
         assert pg.fetchone.await_count == 1
         call_args = pg.fetchone.await_args
-        # First positional arg is the SQL; the rest are the bind values.
+        # First positional arg is the SQL; bind values follow.
         bind_artist = call_args.args[1]
         bind_album = call_args.args[2]
         # ``to_match_form`` strips diacritics + lowercases.
         assert bind_artist == "nilufer yanya"
         assert bind_album == "painless"
 
-    async def test_returns_empty_result_on_pg_error(self):
+    async def test_returns_none_on_pg_error(self):
         # PG outage must not break the lookup; the cache layer degrades to
         # "no cached value" so the caller falls through to the live probe.
         pg = AsyncMock(spec=PgSource)
@@ -138,7 +142,7 @@ class TestGetCachedAppleMusicURL:
 
         result = await get_cached_apple_music_url(pg, artist="Hyd", album="Hold Onto Me Infinity")
 
-        assert result == CacheResult(url=None, is_known_miss=False, is_stale=False)
+        assert result is None
 
 
 @pytest.mark.asyncio

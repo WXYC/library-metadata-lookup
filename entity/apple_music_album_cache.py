@@ -13,19 +13,24 @@ applies ``wxyc_etl.text.to_match_form`` (NFC + diacritic stripping +
 lowercasing + whitespace collapse). The cache module is the single owner
 of normalization; callers pass raw request strings.
 
-Hit/miss semantics:
+Hit/miss semantics (LML#576: staleness is now a SQL-side filter, mirroring
+``discogs/cache_service.py::lookup_negative_hit``):
 
 * ``apple_music_url IS NOT NULL`` — durable hit. Hits never expire; the
   ``last_checked_at`` column is informational. Manual eviction is a
   single ``DELETE`` if a URL goes bad.
-* ``apple_music_url IS NULL`` with recent ``last_checked_at`` — known
-  miss inside the ``DEFAULT_MISS_TTL`` window. Skip the Apple call.
-* ``apple_music_url IS NULL`` with old ``last_checked_at`` — stale miss.
-  Re-check Apple; Apple may have ingested the album since.
+* ``apple_music_url IS NULL`` AND ``last_checked_at > now() - miss_ttl`` —
+  known miss inside the TTL window. The SELECT returns this row; the
+  caller short-circuits and skips the Apple call.
+* ``apple_music_url IS NULL`` AND ``last_checked_at <= now() - miss_ttl`` —
+  stale miss. The SELECT filter excludes the row, so callers see the same
+  "no row" shape as an absent entry and fall through to the live probe.
+  The stale row stays in the table and the next live probe's UPSERT
+  refreshes it in place.
 
-PG failures degrade to a no-op: ``get`` returns an empty ``CacheResult``,
-``set`` swallows the exception. The caller (``lookup/orchestrator.py``)
-then falls through to the live Apple Music probe as if no cache were
+PG failures degrade to a no-op: ``get`` returns ``None``, ``set``
+swallows the exception. The caller (``lookup/orchestrator.py``) then
+falls through to the live Apple Music probe as if no cache were
 configured. Schema bootstrap (``set_up_apple_music_cache_schema``) is
 called from ``main.py`` lifespan; the DDL is ``IF NOT EXISTS`` so
 re-running on every boot is safe.
@@ -65,10 +70,16 @@ CREATE TABLE IF NOT EXISTS entity.album_apple_music_lookup_cache (
 )\
 """
 
+# Staleness lives in the WHERE clause (LML#576). ``$3`` is the lower
+# bound on ``last_checked_at`` for a "fresh" known miss — typically
+# ``now - miss_ttl`` computed by the caller. A hit (URL not null) is
+# always returned; a stale miss is filtered out and the caller sees
+# the same "no row" shape as an absent entry.
 _SELECT_SQL = """\
-SELECT apple_music_url, last_checked_at
+SELECT apple_music_url
 FROM entity.album_apple_music_lookup_cache
-WHERE artist_normalized = $1 AND album_normalized = $2\
+WHERE artist_normalized = $1 AND album_normalized = $2
+  AND (apple_music_url IS NOT NULL OR last_checked_at > $3)\
 """
 
 # UPSERT: keep the latest URL and refresh ``last_checked_at`` on conflict.
@@ -82,26 +93,6 @@ ON CONFLICT (artist_normalized, album_normalized) DO UPDATE
 SET apple_music_url = EXCLUDED.apple_music_url,
     last_checked_at = EXCLUDED.last_checked_at\
 """
-
-
-@dataclass(frozen=True)
-class CacheResult:
-    """Outcome of a cache lookup.
-
-    Three independent flags so callers can branch precisely:
-
-    * ``url`` — the cached Apple Music URL, or ``None`` for unknown / miss.
-    * ``is_known_miss`` — ``True`` when a row exists with ``apple_music_url IS NULL``.
-      Distinguishes a *recorded* miss from a *missing* row. ``url is None``
-      can mean either; the flag disambiguates.
-    * ``is_stale`` — ``True`` only when ``is_known_miss`` AND ``last_checked_at``
-      is past the miss TTL. Tells the caller to ignore the recorded miss and
-      re-check Apple. Hits never report ``is_stale=True``.
-    """
-
-    url: str | None
-    is_known_miss: bool
-    is_stale: bool
 
 
 async def set_up_apple_music_cache_schema(pg: PgSource) -> None:
@@ -120,6 +111,21 @@ async def set_up_apple_music_cache_schema(pg: PgSource) -> None:
     await pg.execute(_DDL)
 
 
+@dataclass(frozen=True)
+class _CachedRow:
+    """Internal carrier for a cache SELECT outcome.
+
+    The cache's public surface is ``str | None`` — the resolver only needs
+    the URL. ``_CachedRow`` carries the extra "was a row returned" bit
+    that the resolver uses to distinguish a fresh known miss (skip Apple)
+    from a stale or absent entry (call Apple). Kept private to this
+    module so its shape can evolve without leaking into call sites.
+    """
+
+    url: str | None
+    was_present: bool
+
+
 async def get_cached_apple_music_url(
     pg: PgSource,
     *,
@@ -127,41 +133,60 @@ async def get_cached_apple_music_url(
     album: str,
     miss_ttl: timedelta = DEFAULT_MISS_TTL,
     now: datetime | None = None,
-) -> CacheResult:
+) -> str | None:
     """Look up a previously resolved Apple Music URL for ``(artist, album)``.
 
-    Returns an empty ``CacheResult(None, False, False)`` when no row exists
-    or the PG call fails (caller falls through to the live probe). For
-    matched rows, ``is_known_miss`` reflects whether ``apple_music_url``
-    is null in the row; ``is_stale`` only flips True when a known miss
-    is older than ``miss_ttl``.
+    Returns the cached URL, or ``None`` for absent / stale / not-found rows.
+    The SQL ``WHERE`` clause excludes stale known-misses (rows whose
+    ``apple_music_url IS NULL`` and ``last_checked_at`` is past the
+    ``miss_ttl`` window) so callers can't tell a stale miss from an absent
+    entry — both render as ``None`` and the caller falls through to a
+    live probe.
+
+    PG failures return ``None`` (same posture as the discogs negative-cache
+    helper); the caller treats it as a miss and falls through to the
+    live probe.
 
     ``now`` is exposed for testability (no freezegun dependency); callers
     in production should leave it at the default and let the function
     compute ``datetime.now(timezone.utc)`` itself.
     """
+    result = await _fetch_cached_row(pg, artist=artist, album=album, miss_ttl=miss_ttl, now=now)
+    return result.url
+
+
+async def _fetch_cached_row(
+    pg: PgSource,
+    *,
+    artist: str,
+    album: str,
+    miss_ttl: timedelta,
+    now: datetime | None,
+) -> _CachedRow:
+    """Read the cache row keyed by ``(artist, album)`` honoring the TTL filter.
+
+    Module-private helper that powers both ``get_cached_apple_music_url``
+    (which returns just the URL) and ``resolve_apple_music_url_with_cache``
+    (which needs ``was_present`` to distinguish a fresh known miss from a
+    stale/absent row before deciding whether to call Apple).
+    """
     artist_key = to_match_form(artist)
     album_key = to_match_form(album)
+    reference_now = now or datetime.now(UTC)
+    miss_cutoff = reference_now - miss_ttl
     try:
-        row = await pg.fetchone(_SELECT_SQL, artist_key, album_key)
+        row = await pg.fetchone(_SELECT_SQL, artist_key, album_key, miss_cutoff)
     except Exception:
         logger.exception("apple_music_album_cache get failed for %s / %s", artist_key, album_key)
-        return CacheResult(url=None, is_known_miss=False, is_stale=False)
+        return _CachedRow(url=None, was_present=False)
 
     if row is None:
-        return CacheResult(url=None, is_known_miss=False, is_stale=False)
+        # Either no row at all, or a stale known-miss filtered out by the
+        # SQL WHERE. Both render the same way to callers; the resolver
+        # treats either as "call Apple."
+        return _CachedRow(url=None, was_present=False)
 
-    url = row["apple_music_url"]
-    last_checked = row["last_checked_at"]
-
-    if url is not None:
-        # Hit: durable, never stale.
-        return CacheResult(url=url, is_known_miss=False, is_stale=False)
-
-    # Known miss: stale iff past the TTL.
-    reference_now = now or datetime.now(UTC)
-    is_stale = (reference_now - last_checked) >= miss_ttl
-    return CacheResult(url=None, is_known_miss=True, is_stale=is_stale)
+    return _CachedRow(url=row["apple_music_url"], was_present=True)
 
 
 ResolveSource = Literal[
@@ -227,12 +252,12 @@ async def resolve_apple_music_url_with_cache(
     429/5xx storm cannot pin a request past its budget — same bound as
     the in-line probe at ``lookup/orchestrator.py:2336-2346``.
     """
-    cached = await get_cached_apple_music_url(
-        pg, artist=artist, album=album, miss_ttl=miss_ttl, now=now
-    )
+    cached = await _fetch_cached_row(pg, artist=artist, album=album, miss_ttl=miss_ttl, now=now)
     if cached.url is not None:
         return ResolveOutcome(url=cached.url, source="cache_hit")
-    if cached.is_known_miss and not cached.is_stale:
+    if cached.was_present:
+        # SQL filter already excluded stale misses; a present row with
+        # NULL URL is necessarily an in-TTL known miss — skip Apple.
         return ResolveOutcome(url=None, source="cache_miss_recent")
 
     # Cache empty or stale — call Apple with REQUEST values, wrapped in

@@ -47,11 +47,22 @@ from lookup.apple_music_postprocess import apply_apple_music_postprocess
 _RESOLVE_SOURCE_VALUES: set[str] = set(get_args(ResolveSource))
 
 
+def _make_pg():
+    """Build a ``PgSource`` AsyncMock for the cache layer."""
+    return AsyncMock(spec=PgSource)
+
+
 def _make_entity_store():
-    """Build an EntityStore stub that exposes a PgSource AsyncMock."""
-    store = MagicMock(spec=EntityStore)
-    store.pg = AsyncMock(spec=PgSource)
-    return store
+    """Build an ``EntityStore`` stub for the mint side-effect.
+
+    The post-process takes ``pg`` and ``entity_store`` as independent
+    arguments (LML#576): the cache layer reads/writes through ``pg``,
+    the mint side-effect runs through ``entity_store``. The store stub
+    no longer needs to expose a ``.pg`` property — that property was
+    dropped from ``EntityStore`` so it doesn't carry a ``PgSource`` for
+    non-identity callers.
+    """
+    return MagicMock(spec=EntityStore)
 
 
 def _make_sentry_scope():
@@ -69,11 +80,13 @@ class TestApplyAppleMusicPostprocess:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
 
         with patch("lookup.apple_music_postprocess.resolve_apple_music_url_with_cache") as resolve:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -88,11 +101,13 @@ class TestApplyAppleMusicPostprocess:
         update = {"apple_music_url": "https://music.apple.com/us/album/existing/1"}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
 
         with patch("lookup.apple_music_postprocess.resolve_apple_music_url_with_cache") as resolve:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -110,11 +125,13 @@ class TestApplyAppleMusicPostprocess:
         update = {"apple_music_url": ""}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
 
         with patch("lookup.apple_music_postprocess.resolve_apple_music_url_with_cache") as resolve:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -127,11 +144,13 @@ class TestApplyAppleMusicPostprocess:
     async def test_skips_when_apple_music_client_missing(self):
         update = {"apple_music_url": None}
         entity_store = _make_entity_store()
+        pg = _make_pg()
 
         with patch("lookup.apple_music_postprocess.resolve_apple_music_url_with_cache") as resolve:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=None,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -141,16 +160,38 @@ class TestApplyAppleMusicPostprocess:
         resolve.assert_not_called()
 
     async def test_skips_when_entity_store_missing(self):
-        # No PG → no place to cache; degrade to no-op so the request still
-        # succeeds (the existing per-item probe already ran).
+        # No entity store → no place to mint to; degrade to no-op so the
+        # request still succeeds (the existing per-item probe already ran).
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
+        pg = _make_pg()
 
         with patch("lookup.apple_music_postprocess.resolve_apple_music_url_with_cache") as resolve:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=None,
+                request_artist="Hyd",
+                request_album="Hold Onto Me Infinity",
+                feature_enabled=True,
+            )
+
+        resolve.assert_not_called()
+
+    async def test_skips_when_pg_missing(self):
+        # No PG → no place to cache; degrade to no-op so the request still
+        # succeeds (the existing per-item probe already ran).
+        update = {"apple_music_url": None}
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        entity_store = _make_entity_store()
+
+        with patch("lookup.apple_music_postprocess.resolve_apple_music_url_with_cache") as resolve:
+            await apply_apple_music_postprocess(
+                update,
+                apple_music=apple_music,
+                pg=None,
+                entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
                 feature_enabled=True,
@@ -162,11 +203,13 @@ class TestApplyAppleMusicPostprocess:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
 
         with patch("lookup.apple_music_postprocess.resolve_apple_music_url_with_cache") as resolve:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="",
                 request_album="Hold Onto Me Infinity",
@@ -180,11 +223,13 @@ class TestApplyAppleMusicPostprocess:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
 
         with patch("lookup.apple_music_postprocess.resolve_apple_music_url_with_cache") as resolve:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album=None,
@@ -199,6 +244,7 @@ class TestApplyAppleMusicPostprocess:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         resolved_url = "https://music.apple.com/us/album/foo/1234567890"
 
         with patch(
@@ -208,6 +254,7 @@ class TestApplyAppleMusicPostprocess:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -228,6 +275,7 @@ class TestApplyAppleMusicPostprocess:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         cached_url = "https://music.apple.com/us/album/foo/9999999"
 
         with patch(
@@ -237,6 +285,7 @@ class TestApplyAppleMusicPostprocess:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -249,6 +298,7 @@ class TestApplyAppleMusicPostprocess:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
 
         with patch(
             "lookup.apple_music_postprocess.resolve_apple_music_url_with_cache",
@@ -257,6 +307,7 @@ class TestApplyAppleMusicPostprocess:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -271,6 +322,7 @@ class TestApplyAppleMusicPostprocess:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
 
         with patch(
             "lookup.apple_music_postprocess.resolve_apple_music_url_with_cache",
@@ -279,6 +331,7 @@ class TestApplyAppleMusicPostprocess:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -309,6 +362,7 @@ class TestApplyAppleMusicPostprocessMint:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         entity_store.mint_or_get_release_identity = AsyncMock(return_value=(42, True))
         resolved_url = "https://music.apple.com/us/album/foo/1234567890"
 
@@ -319,6 +373,7 @@ class TestApplyAppleMusicPostprocessMint:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -337,6 +392,7 @@ class TestApplyAppleMusicPostprocessMint:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         entity_store.mint_or_get_release_identity = AsyncMock(return_value=(42, False))
         cached_url = "https://music.apple.com/us/album/foo/9999999"
 
@@ -347,6 +403,7 @@ class TestApplyAppleMusicPostprocessMint:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -361,6 +418,7 @@ class TestApplyAppleMusicPostprocessMint:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         entity_store.mint_or_get_release_identity = AsyncMock(return_value=(42, True))
 
         with patch(
@@ -370,6 +428,7 @@ class TestApplyAppleMusicPostprocessMint:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -383,6 +442,7 @@ class TestApplyAppleMusicPostprocessMint:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         entity_store.mint_or_get_release_identity = AsyncMock(return_value=(42, True))
 
         with patch(
@@ -392,6 +452,7 @@ class TestApplyAppleMusicPostprocessMint:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -406,6 +467,7 @@ class TestApplyAppleMusicPostprocessMint:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         entity_store.mint_or_get_release_identity = AsyncMock(return_value=(42, True))
 
         with patch(
@@ -415,6 +477,7 @@ class TestApplyAppleMusicPostprocessMint:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -430,6 +493,7 @@ class TestApplyAppleMusicPostprocessMint:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         entity_store.mint_or_get_release_identity = AsyncMock(
             side_effect=RuntimeError("PG timeout")
         )
@@ -442,6 +506,7 @@ class TestApplyAppleMusicPostprocessMint:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -460,6 +525,7 @@ class TestApplyAppleMusicPostprocessMint:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         entity_store.mint_or_get_release_identity = AsyncMock(return_value=(42, True))
         # URL that doesn't match the album_id regex (no trailing numeric ID).
         unparseable_url = "https://music.apple.com/us/album/foo"
@@ -471,6 +537,7 @@ class TestApplyAppleMusicPostprocessMint:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -494,6 +561,7 @@ class TestApplyAppleMusicPostprocessMint:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         entity_store.mint_or_get_release_identity = AsyncMock(return_value=(42, True))
         # URL whose album_id is "000000" — passes the URL parser's
         # `\d{6,}` floor but the validator rejects on leading zero.
@@ -506,6 +574,7 @@ class TestApplyAppleMusicPostprocessMint:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -561,6 +630,7 @@ class TestPersistentLookupSentryTags:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         scope, transaction = _make_sentry_scope()
 
         with (
@@ -576,6 +646,7 @@ class TestPersistentLookupSentryTags:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -603,6 +674,7 @@ class TestPersistentLookupSentryTags:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         scope = Mock()
         scope.transaction = None
 
@@ -624,6 +696,7 @@ class TestPersistentLookupSentryTags:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -641,6 +714,7 @@ class TestPersistentLookupSentryTags:
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
         transaction = Mock()
         transaction.set_data = Mock(side_effect=RuntimeError("boom"))
         scope = Mock()
@@ -664,6 +738,7 @@ class TestPersistentLookupSentryTags:
             await apply_apple_music_postprocess(
                 update,
                 apple_music=apple_music,
+                pg=pg,
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
@@ -689,6 +764,7 @@ class TestPersistentLookupSentryTags:
         scope, transaction = _make_sentry_scope()
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
+        pg = _make_pg()
 
         # Two items resolved with different outcomes; one resolved with the
         # same outcome as the first (the idempotent re-set case).
@@ -720,6 +796,7 @@ class TestPersistentLookupSentryTags:
                     apply_apple_music_postprocess(
                         u,
                         apple_music=apple_music,
+                        pg=pg,
                         entity_store=entity_store,
                         request_artist="Hyd",
                         request_album="Hold Onto Me Infinity",

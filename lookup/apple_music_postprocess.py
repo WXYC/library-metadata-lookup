@@ -5,8 +5,9 @@ regardless of the album's status in ``library.db``.
 Called by ``lookup/orchestrator.py::enrich_one`` after the existing
 per-item enrichment has assembled the ``update`` dict. When the dict's
 ``apple_music_url`` came out null AND the feature flag is on AND we have
-both an Apple Music client and an entity store with PG access AND the
-request supplied both artist and album, this module:
+an Apple Music client, a discogs-cache ``PgSource`` (for the cache layer),
+and an entity store (for the mint side-effect), AND the request supplied
+both artist and album, this module:
 
 1. Runs ``entity.apple_music_album_cache.resolve_apple_music_url_with_cache``
    with the REQUEST's ``(artist, album)`` — not the library row's. This
@@ -54,62 +55,26 @@ failure.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import sentry_sdk
 
 from clients.streaming.apple_music import AppleMusicClient
 from entity.apple_music_album_cache import ResolveSource, resolve_apple_music_url_with_cache
+from entity.sources import PgSource
 from entity.store import EntityStore
 from identity.release_validation import validate_and_canonicalize_external_id
+from lookup.timeouts import apple_music_lookup_timeout_s
 from release.apple_music_url_parser import apple_album_id_from_url
 
 logger = logging.getLogger(__name__)
-
-_APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S = 4.0
-_APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR = "LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS"
-
-
-def _probe_timeout_s() -> float:
-    """Per-call wall-clock ceiling for the cache-backed Apple probe.
-
-    Mirrors the in-line probe's helper at
-    ``lookup/orchestrator.py::_apple_music_lookup_timeout_s`` so a single
-    Apple 429/5xx storm can't pin the post-process past the request
-    budget. Read at request time (not via ``Settings``) so the knob can
-    be tuned via Railway env vars without a redeploy. A misconfigured
-    value (negative, zero, unparseable) falls back to 4s with a WARN —
-    same fallback semantics the orchestrator's helper has.
-    """
-    raw = os.getenv(_APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR)
-    if not raw:
-        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
-    try:
-        ms = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r, falling back to %.1fs",
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
-            raw,
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S,
-        )
-        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
-    if ms <= 0:
-        logger.warning(
-            "Invalid %s=%d (must be positive), falling back to %.1fs",
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
-            ms,
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S,
-        )
-        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
-    return ms / 1000
 
 
 async def apply_apple_music_postprocess(
     update: dict[str, Any],
     *,
     apple_music: AppleMusicClient | None,
+    pg: PgSource | None,
     entity_store: EntityStore | None,
     request_artist: str | None,
     request_album: str | None,
@@ -118,7 +83,7 @@ async def apply_apple_music_postprocess(
     """Backstop ``update["apple_music_url"]`` via cache + live probe.
 
     Mutates ``update`` in place. No-op when any precondition fails (flag
-    off, URL already set, no client/store/PG, no request artist or album).
+    off, URL already set, no client/pg/store, no request artist or album).
 
     Args:
         update: The item's ``update`` dict from ``enrich_one``. Must
@@ -126,8 +91,15 @@ async def apply_apple_music_postprocess(
             successful resolution this is overwritten with the URL.
         apple_music: The Apple Music client. ``None`` (credentials
             unconfigured) skips the post-process.
-        entity_store: The entity store; required for the cache PG handle.
-            ``None`` skips the post-process.
+        pg: The discogs-cache ``PgSource`` backing the persistent Apple
+            Music URL cache (``entity.album_apple_music_lookup_cache``).
+            ``None`` skips the post-process; the cache layer has nowhere
+            to read or write.
+        entity_store: The entity store, used solely for the
+            ``apple_music_album`` mint side-effect on ``live_resolved``
+            outcomes. ``None`` skips the post-process — the mint is
+            structurally part of the contract, so callers without a
+            store should not run the cache+probe either.
         request_artist: The lookup request's artist (not the library
             row's artist — that's the whole point).
         request_album: The lookup request's album. ``None``/empty skips.
@@ -141,17 +113,17 @@ async def apply_apple_music_postprocess(
     # nothing to surface" override) must NOT trigger the post-process.
     if update.get("apple_music_url") is not None:
         return
-    if apple_music is None or entity_store is None:
+    if apple_music is None or pg is None or entity_store is None:
         return
     if not request_artist or not request_album:
         return
 
     outcome = await resolve_apple_music_url_with_cache(
-        entity_store.pg,
+        pg,
         apple_music,
         artist=request_artist,
         album=request_album,
-        probe_timeout_s=_probe_timeout_s(),
+        probe_timeout_s=apple_music_lookup_timeout_s(),
     )
 
     _mark_fired(outcome.source)
