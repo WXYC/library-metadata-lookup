@@ -286,6 +286,18 @@ class EntityStore:
     def __init__(self, pg: PgSource) -> None:
         self._pg = pg
 
+    @property
+    def pg(self) -> PgSource:
+        """The underlying ``PgSource``.
+
+        Exposed for helpers that wrap the same connection pool (e.g. the
+        Apple Music URL cache at ``entity/apple_music_album_cache.py``)
+        without reproducing the store's dependency-injection plumbing.
+        Treat as read-only — call sites should not mutate connection
+        state through this handle.
+        """
+        return self._pg
+
     async def upsert_identity(
         self,
         library_name: str,

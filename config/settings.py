@@ -164,6 +164,23 @@ class Settings(BaseSettings):
             "See WXYC/library-metadata-lookup#318."
         ),
     )
+    lml_persist_apple_music_url: bool = Field(
+        default=False,
+        description=(
+            "When True, /api/v1/lookup post-processes every item whose "
+            "apple_music_url came out null and runs an Apple Music probe using "
+            "the request's (artist, album, song) — independent of the item's "
+            "library row. Successful resolutions are persisted to "
+            "entity.album_apple_music_lookup_cache keyed by (artist_normalized, "
+            "album_normalized) so subsequent lookups hit the cache instead of "
+            "Apple's API. Known misses are recorded with a 7-day TTL so unknown "
+            "albums don't repeatedly hammer Apple. Off by default so the "
+            "rollout is reversible without a re-deploy; flip True in Railway "
+            "after one staging tick confirms the post-process is healthy. "
+            "Rollback: flip False (no re-deploy required). "
+            "See WXYC/library-metadata-lookup#570."
+        ),
+    )
 
     # Streaming Webhook Configuration
     streaming_webhook_urls: str | None = Field(

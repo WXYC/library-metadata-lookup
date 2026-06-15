@@ -58,6 +58,29 @@ async def lifespan(app: FastAPI):
     logger.info(f"Log level: {settings.log_level}")
     logger.info(f"Discogs cache: {'configured' if settings.database_url_discogs else 'disabled'}")
 
+    # Bootstrap the persistent Apple Music URL cache table. ``CREATE TABLE
+    # IF NOT EXISTS`` makes this idempotent across boots. If the
+    # discogs-cache PG is unavailable, log and continue — the cache
+    # layer's get/set wrap their queries in try/except and return "miss"
+    # on any PG error, so /lookup degrades to one extra Apple call per
+    # request (today's behavior) rather than failing startup.
+    if settings.database_url_discogs:
+        try:
+            from entity.apple_music_album_cache import set_up_apple_music_cache_schema
+            from identity.dependencies import get_entity_store
+
+            entity_store = await get_entity_store(settings=settings)
+            if entity_store is not None:
+                await set_up_apple_music_cache_schema(entity_store.pg)
+                logger.info("Apple Music album cache schema ready")
+            else:
+                logger.info(
+                    "Entity store unavailable at startup — Apple Music album cache disabled "
+                    "(cache layer will no-op until next deploy)"
+                )
+        except Exception:
+            logger.exception("Apple Music album cache schema bootstrap failed — cache disabled")
+
     yield
 
     logger.info("Shutting down application")
