@@ -53,6 +53,8 @@ logger = logging.getLogger(__name__)
 # short enough that a newly-released album becomes visible within a week.
 DEFAULT_MISS_TTL = timedelta(days=7)
 
+_DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS entity"
+
 _DDL = """\
 CREATE TABLE IF NOT EXISTS entity.album_apple_music_lookup_cache (
     artist_normalized TEXT NOT NULL,
@@ -105,11 +107,16 @@ class CacheResult:
 async def set_up_apple_music_cache_schema(pg: PgSource) -> None:
     """Apply the idempotent DDL.
 
-    Called once from ``main.py`` lifespan. ``CREATE TABLE IF NOT EXISTS``
-    is safe to re-run on every boot. If the discogs-cache PG is unreachable
-    at startup, the caller logs and continues; the cache layer degrades to
+    Called once from ``main.py`` lifespan. The schema and table creation
+    are both ``IF NOT EXISTS`` so re-running on every boot is safe. The
+    schema-creation step lets a fresh discogs-cache PG (local dev via
+    ``setup-dev-environment.sh``, test fixtures, future docker-compose
+    stacks) boot LML cleanly without first running the discogs-cache
+    repo's own schema setup. If the discogs-cache PG is unreachable at
+    startup, the caller logs and continues; the cache layer degrades to
     a no-op until the next deploy.
     """
+    await pg.execute(_DDL_SCHEMA)
     await pg.execute(_DDL)
 
 

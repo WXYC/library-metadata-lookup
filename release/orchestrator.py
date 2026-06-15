@@ -37,7 +37,7 @@ from clients.streaming.deezer import DeezerClient
 from clients.streaming.spotify import SpotifyClient
 from discogs.service import DiscogsService
 from entity.store import EntityStore
-from release.apple_music_url_parser import APPLE_ALBUM_ID_RE, apple_album_id_from_url
+from release.apple_music_url_parser import apple_album_id_from_url
 from release.bandcamp_resolver import resolve_bandcamp_album
 from release.discogs_resolver import (
     resolve_discogs_master,
@@ -214,12 +214,13 @@ def _spotify_album_id_from_url(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-# Apple Music URL parsing lives in ``release.apple_music_url_parser`` so the
-# lookup orchestrator can import the public helper without reaching across
-# modules for a ``_``-prefixed name. The aliases below preserve the
-# pre-extraction import path for any callers we missed.
-_APPLE_ALBUM_ID_RE = APPLE_ALBUM_ID_RE
-_apple_album_id_from_url = apple_album_id_from_url
+# Apple Music URL parsing lives in ``release.apple_music_url_parser``.
+# The extraction landed when the lookup post-process needed to mint
+# release-identity rows from Apple URLs; that mint was deferred (see
+# ``lookup/apple_music_postprocess.py`` module docstring), so the parser
+# module's only current caller is this file. Keep the extraction intact
+# — when the mint follow-up reopens, the public helper is right where
+# the new caller expects it.
 
 
 def _merge_streaming_identifiers(
@@ -231,7 +232,7 @@ def _merge_streaming_identifiers(
 
     sources: StreamingCheckSources = streaming.sources
     spotify_id = _spotify_album_id_from_url(sources.spotify.url) if sources.spotify else None
-    apple_id = _apple_album_id_from_url(sources.apple_music.url) if sources.apple_music else None
+    apple_id = apple_album_id_from_url(sources.apple_music.url) if sources.apple_music else None
     bandcamp_url = sources.bandcamp.url if sources.bandcamp else None
 
     return identifiers.model_copy(
