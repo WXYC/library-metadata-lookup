@@ -37,6 +37,7 @@ from clients.streaming.matching import (
 )
 from config.settings import get_settings
 from core.search import (
+    SEARCH_API_CALL_CAP_FIRED_STAT_KEY,
     execute_search_pipeline,
     get_search_type_from_state,
     resolve_positive_int_env,
@@ -132,15 +133,6 @@ to make this request-wide."""
 
 _SEARCH_MAX_API_CALLS_ENV_VAR = "LML_SEARCH_MAX_API_CALLS"
 
-_SEARCH_API_CALL_CAP_FIRED_STAT_KEY = "search_api_call_cap_fired"
-"""Per-request cache-stats key flipped to ``1`` on the first cap-fire of the
-request. Read by ``core.search.execute_search_pipeline`` after each strategy
-to propagate ``state.timed_out=True`` (the same projection LML#370's hard cap
-uses), and projected onto the Sentry transaction so the existing
-``transaction:/api/v1/lookup AND lookup.timeout:true`` query covers the new
-cap-fire population. Idempotent: re-firings within the same request don't
-re-bump the value (avoids double-counting in PostHog aggregates)."""
-
 
 async def _chunked_gather[T, R](
     items: list[T],
@@ -175,6 +167,11 @@ async def _chunked_gather[T, R](
     * ``search_compilations_for_track`` invokes us twice — main loop, then
       the LML#319/#237 album-title fallback. A request-wide cap means the
       fallback never gets a chunk dispatched once the main loop has spent.
+
+    The cross-strategy stop is handled at the runner layer
+    (:func:`core.search.execute_search_pipeline`) via a baseline-delta read of
+    :data:`core.search.SEARCH_API_CALL_CAP_FIRED_STAT_KEY` — also localised
+    per-lookup so a bulk item can't poison its siblings.
 
     Wall time: ``ceil(N / chunk_size)`` × slowest task per chunk in the
     no-exit case. The orchestrator's three call sites pass
@@ -215,50 +212,37 @@ async def _chunked_gather[T, R](
 def _record_search_api_call_cap_fired(
     *, cap: int, spent: int, items_remaining: int, items_total: int
 ) -> None:
-    """Record the LML#543 cap-fire for telemetry and propagation.
+    """Record an LML#543 cap-fire for telemetry and runner-side propagation.
 
-    Idempotent within a request: the stat key flips to ``1`` on first fire
-    and stays there. PostHog and Sentry aggregations over the field then
-    measure the *rate of cap-firing requests*, not the *number of strategy
-    legs that bailed in those requests* — the per-leg count is uninteresting
-    once a single fire has already been logged.
+    The stat is a *counter* on the per-request cache-stats dict (each leg that
+    trips its own per-invocation cap adds 1) so the runner's baseline-delta
+    check can localise the signal to one lookup even when the dict is shared
+    across bulk items. The router's existing :func:`_project_cache_stats_to_transaction`
+    propagates the counter onto the Sentry transaction as
+    ``lml.cache.search_api_call_cap_fired`` — no direct ``set_data`` call from
+    here, which kept the two surfaces (bare vs. ``lml.cache.``-prefixed) from
+    drifting.
 
-    Side effects:
-
-    * Logs one WARN per request describing the leg that triggered the cap
-      (subsequent legs that re-trip the same baseline are suppressed via the
-      idempotency check).
-    * Projects ``lookup.timeout=True`` onto the active Sentry transaction so
-      the issue's acceptance-criterion query
-      (``transaction:/api/v1/lookup AND lookup.timeout:true``) covers the
-      cap-fire population alongside LML#370's hard-cap timeouts.
-    * Reads ``state.timed_out`` via the cache-stats dict in
-      ``core.search.execute_search_pipeline``; the runner sets the flag
-      after the next strategy returns.
+    Logs one WARN per cap-fire describing the leg. With the runner-side break,
+    at most one WARN fires per lookup in the common case (cap-fire short-
+    circuits the cascade before another strategy can re-enter ``_chunked_gather``).
+    ``search_compilations_for_track``'s own two-invocation shape can yield two
+    WARNs in the worst case — acceptable noise for the cost of unambiguous
+    per-leg attribution.
     """
     stats = get_cache_stats()
-    if stats is None or stats.get(_SEARCH_API_CALL_CAP_FIRED_STAT_KEY):
+    if stats is None:
         return
-    stats[_SEARCH_API_CALL_CAP_FIRED_STAT_KEY] = 1
+    stats[SEARCH_API_CALL_CAP_FIRED_STAT_KEY] = stats.get(SEARCH_API_CALL_CAP_FIRED_STAT_KEY, 0) + 1
     logger.warning(
         "%s reached (cap=%d, spent=%d in this leg, %d/%d items remaining) — "
-        "bailing _chunked_gather; LookupResponse.timeout will project True",
+        "bailing _chunked_gather",
         _SEARCH_MAX_API_CALLS_ENV_VAR,
         cap,
         spent,
         items_remaining,
         items_total,
     )
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data(_SEARCH_API_CALL_CAP_FIRED_STAT_KEY, True)
-    except Exception as e:
-        logger.warning(
-            "Failed to project %s onto Sentry transaction: %s",
-            _SEARCH_API_CALL_CAP_FIRED_STAT_KEY,
-            e,
-        )
 
 
 _ProbeResult = TrackReleasesResponse | tuple[TrackReleasesResponse | None, str | None]
