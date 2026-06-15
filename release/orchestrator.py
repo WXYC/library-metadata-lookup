@@ -37,6 +37,7 @@ from clients.streaming.deezer import DeezerClient
 from clients.streaming.spotify import SpotifyClient
 from discogs.service import DiscogsService
 from entity.store import EntityStore
+from release.apple_music_url_parser import APPLE_ALBUM_ID_RE, apple_album_id_from_url
 from release.bandcamp_resolver import resolve_bandcamp_album
 from release.discogs_resolver import (
     resolve_discogs_master,
@@ -205,7 +206,6 @@ async def _check_streaming(
 
 
 _SPOTIFY_ALBUM_ID_RE = re.compile(r"open\.spotify\.com/album/([A-Za-z0-9]+)")
-_APPLE_ALBUM_ID_RE = re.compile(r"music\.apple\.com/[a-z]{2}/album/[^/?#]+/(?:id)?(\d{6,})")
 
 
 def _spotify_album_id_from_url(url: str) -> str | None:
@@ -214,14 +214,12 @@ def _spotify_album_id_from_url(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _apple_album_id_from_url(url: str) -> str | None:
-    """``music.apple.com/<locale>/album/<slug>/<id>`` (or ``/id<id>``) → ``<id>``.
-
-    Anchored on the Apple host so a slug containing digits cannot be mistaken
-    for the album ID.
-    """
-    match = _APPLE_ALBUM_ID_RE.search(url)
-    return match.group(1) if match else None
+# Apple Music URL parsing lives in ``release.apple_music_url_parser`` so the
+# lookup orchestrator can import the public helper without reaching across
+# modules for a ``_``-prefixed name. The aliases below preserve the
+# pre-extraction import path for any callers we missed.
+_APPLE_ALBUM_ID_RE = APPLE_ALBUM_ID_RE
+_apple_album_id_from_url = apple_album_id_from_url
 
 
 def _merge_streaming_identifiers(

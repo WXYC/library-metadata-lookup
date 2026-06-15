@@ -66,6 +66,7 @@ from generated.api_models import (
 )
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
+from lookup.apple_music_postprocess import apply_apple_music_postprocess
 from lookup.external_search import (
     search_external_albums,
     search_external_artists,
@@ -2069,6 +2070,7 @@ async def enrich_artwork_results(
     discogs_cache: DiscogsCacheService | None = None,
     mb_pg: PgSourceProtocol | None = None,
     apple_music: AppleMusicClient | None = None,
+    entity_store: EntityStore | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
@@ -2535,6 +2537,27 @@ async def enrich_artwork_results(
             "soundcloud_url": soundcloud_url,
         }
 
+        # LML "Apple Music for non-library albums" — when the existing
+        # per-item probe + override couldn't surface an Apple Music URL,
+        # the post-process runs a cache-backed probe with the REQUEST's
+        # (artist, album, song) — not the library row's. Fixes the
+        # wrong-fallback-row attack (non-library album like Hyd /
+        # "Hold Onto Me Infinity" falls back to a same-titled library row
+        # by a different artist, in-line probe runs with the wrong
+        # artist name → null). Result is persisted to
+        # ``entity.album_apple_music_lookup_cache`` so future lookups
+        # short-circuit Apple's API. Feature-flagged off by default so
+        # the rollout is reversible without a re-deploy.
+        await apply_apple_music_postprocess(
+            update,
+            apple_music=apple_music,
+            entity_store=entity_store,
+            request_artist=artist,
+            request_album=album,
+            request_song=song,
+            feature_enabled=get_settings().lml_persist_apple_music_url,
+        )
+
         # Extended fields land on the top-1 result only and require artwork
         # (same positional + artwork gating as the album-derived scalars).
         # The non-top-1 items keep their lean shape so non-iOS lookup
@@ -2979,6 +3002,7 @@ async def perform_lookup(
                 discogs_cache=discogs_cache,
                 mb_pg=mb_pg,
                 apple_music=apple_music,
+                entity_store=entity_store,
             )
 
     # Project the request-side flags and result-quality signals onto the
