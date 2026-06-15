@@ -36,7 +36,7 @@ import sentry_sdk
 
 from clients.streaming.apple_music import AppleMusicClient
 from entity.apple_music_album_cache import (
-    ResolveOutcome,
+    ResolveSource,
     resolve_apple_music_url_with_cache,
 )
 from entity.store import EntityStore
@@ -127,7 +127,7 @@ async def apply_apple_music_postprocess(
         )
 
 
-def _set_sentry_source(source: ResolveOutcome) -> None:
+def _set_sentry_source(source: ResolveSource) -> None:
     """Project ``apple_music.persistent_lookup.source`` onto the active
     Sentry transaction. Observability must not break the request — every
     failure mode is logged and swallowed."""
