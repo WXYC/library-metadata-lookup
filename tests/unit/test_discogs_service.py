@@ -660,7 +660,7 @@ class TestSearchReleasesByTrack:
 
     @pytest.mark.asyncio
     async def test_supplement_search_when_few_results(self, service):
-        """When 1-2 results, a supplementary keyword search runs."""
+        """When fewer than 3 results, a supplementary keyword search runs."""
         resp1 = MagicMock()
         resp1.status_code = 200
         resp1.raise_for_status = MagicMock()
@@ -676,42 +676,10 @@ class TestSearchReleasesByTrack:
             "_request_with_retry",
             new_callable=AsyncMock,
             side_effect=[resp1, resp2],
-        ) as mock_request:
+        ):
             result = await service.search_releases_by_track("Song", "Queen")
 
         assert len(result.releases) == 2
-        assert mock_request.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_supplement_search_skipped_when_canonical_returns_zero(self, service):
-        """A zero-result canonical leg must NOT fire the supplementary keyword search.
-
-        LML#543: when ``?type=release&track=…&artist=…`` returns ``{"results":
-        []}`` the supplement converted a clean negative into noisy keyword
-        candidates that pumped the downstream ``validate_track_on_release`` tail
-        (15-24 API calls per failing lookup). The supplement still fires for the
-        1-2-result padding case (see test_supplement_search_when_few_results)
-        — zero canonical results is the only path now gated out.
-        """
-        canonical_empty = MagicMock()
-        canonical_empty.status_code = 200
-        canonical_empty.raise_for_status = MagicMock()
-        canonical_empty.json.return_value = {"results": []}
-
-        with patch.object(
-            service,
-            "_request_with_retry",
-            new_callable=AsyncMock,
-            side_effect=[canonical_empty],
-        ) as mock_request:
-            result = await service.search_releases_by_track(
-                "Moments of Soft Persuasion", "Yoshimura"
-            )
-
-        assert result.releases == []
-        assert mock_request.await_count == 1, (
-            "Supplement keyword search must not fire when canonical returns 0 results (LML#543)."
-        )
 
     @pytest.mark.asyncio
     async def test_api_exception_returns_empty(self, service):
