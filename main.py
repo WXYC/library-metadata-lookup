@@ -58,25 +58,33 @@ async def lifespan(app: FastAPI):
     logger.info(f"Log level: {settings.log_level}")
     logger.info(f"Discogs cache: {'configured' if settings.database_url_discogs else 'disabled'}")
 
-    # Bootstrap the persistent Apple Music URL cache table. ``CREATE TABLE
-    # IF NOT EXISTS`` makes this idempotent across boots. If the
-    # discogs-cache PG is unavailable, log and continue — the cache
-    # layer's get/set wrap their queries in try/except and return "miss"
-    # on any PG error, so /lookup degrades to one extra Apple call per
-    # request (today's behavior) rather than failing startup.
+    # Bootstrap the persistent Apple Music URL cache table directly off
+    # the discogs-cache pool. Going through ``get_entity_store`` (and its
+    # ``entity.identity`` probe) would gate the cache on an unrelated
+    # table's health — a missing-but-recoverable ``entity.identity`` row
+    # set would silently disable the Apple Music cache for the process
+    # lifetime even though the cache schema could have been created
+    # against the same pool. ``set_up_apple_music_cache_schema`` runs
+    # ``CREATE SCHEMA IF NOT EXISTS entity`` first, so a fresh PG without
+    # any entity schema applied still bootstraps cleanly. If the pool
+    # itself is unavailable, log and continue — the cache layer's
+    # get/set wrap their queries in try/except and return "miss" on any
+    # PG error, so /lookup degrades to one extra Apple call per request
+    # (today's behavior) rather than failing startup.
     if settings.database_url_discogs:
         try:
+            from core.dependencies import get_discogs_pool
             from entity.apple_music_album_cache import set_up_apple_music_cache_schema
-            from identity.dependencies import get_entity_store
+            from entity.sources import PgSource
 
-            entity_store = await get_entity_store(settings=settings)
-            if entity_store is not None:
-                await set_up_apple_music_cache_schema(entity_store.pg)
+            pool = await get_discogs_pool()
+            if pool is not None:
+                await set_up_apple_music_cache_schema(PgSource(pool=pool))
                 logger.info("Apple Music album cache schema ready")
             else:
                 logger.info(
-                    "Entity store unavailable at startup — Apple Music album cache disabled "
-                    "(cache layer will no-op until next deploy)"
+                    "Discogs cache pool unavailable at startup — Apple Music album cache "
+                    "disabled (cache layer will no-op until next deploy)"
                 )
         except Exception:
             logger.exception("Apple Music album cache schema bootstrap failed — cache disabled")
