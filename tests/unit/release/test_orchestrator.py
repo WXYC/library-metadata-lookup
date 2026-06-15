@@ -10,9 +10,9 @@ from generated.api_models import (
     DiscogsLabelCredit,
     DiscogsReleaseMetadata,
 )
+from release.apple_music_url_parser import apple_album_id_from_url
 from release.models import ReleaseResolveRequest
 from release.orchestrator import (
-    _apple_album_id_from_url,
     _ResolverDependencies,
     _spotify_album_id_from_url,
     resolve_release,
@@ -101,7 +101,7 @@ class TestAppleAlbumIdExtraction:
         ],
     )
     def test_extraction(self, url, expected):
-        assert _apple_album_id_from_url(url) == expected
+        assert apple_album_id_from_url(url) == expected
 
 
 class TestParsedUrlRouting:

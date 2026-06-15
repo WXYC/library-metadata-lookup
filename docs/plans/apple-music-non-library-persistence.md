@@ -1,5 +1,13 @@
 # Plan: persistent Apple Music URL lookup for albums regardless of library status
 
+> **Amendment (post code-review iter-1 + iter-2).** The shipped implementation diverges from the original plan in three ways:
+> 1. The resolver calls ``apple_music.find_album_match`` (album-search), not ``find_track_metadata`` (song-search). ``find_track_metadata`` returns per-track URLs with ``?i=<track-id>`` query suffixes, which would be wrong-track URLs when cached under an (artist, album) key. ``find_album_match`` returns album-level URLs that match the cache table name and key shape, and works for album-only lookups (no song required) — the original plan's song-floor assumption was incorrect.
+> 2. The mint into ``entity.release_identity.apple_music_album_id`` is **deferred**. ``apple_music_album`` isn't in ``identity.release_validation.RELEASE_SOURCE_COLUMN``; the dispatch table needs a TEXT-column entry + a sentinel rule + a ``coerce_external_id`` branch first. ``mint_or_get_release_identity`` would raise ``KeyError`` today; the surrounding ``except Exception`` would swallow it silently. Follow-up: wire the source through validation before re-introducing the mint call. The ``release/apple_music_url_parser.py`` extraction stays in place so the helper is ready when the follow-up lands.
+> 3. The per-item Sentry source enum (``cache_hit | cache_miss_recent | live_resolved | live_miss``) is replaced by a request-scoped boolean ``apple_music.persistent_lookup.fired = True``. ``enrich_one`` runs concurrently across N items via ``asyncio.gather``; per-item ``set_data`` on the same scalar key would race and the dashboard would see a non-deterministic last-completer-wins value. ``live_error`` was added as a distinct source value (catalog-miss vs. outage signal in the cache layer's logs).
+>
+> The schema also acquired a ``CREATE SCHEMA IF NOT EXISTS entity`` companion statement so a fresh discogs-cache PG (local dev, test fixtures) can bootstrap without first running the discogs-cache repo's own setup.
+
+
 ## Goal
 
 For every `/api/v1/lookup` request, return a non-null `apple_music_url` whenever Apple Music has the album — independent of whether the album has a `library.db` row. Persist the resolved URL so subsequent lookups for the same (artist, album) hit a cache rather than re-querying Apple Music.

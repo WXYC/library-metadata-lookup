@@ -198,17 +198,21 @@ class TestSetUpAppleMusicCacheSchema:
     are swallowed by the caller's lifespan hook, but the helper itself must
     actually call execute when given a working PG."""
 
-    async def test_executes_create_table_if_not_exists(self):
+    async def test_executes_schema_then_create_table_if_not_exists(self):
         pg = AsyncMock(spec=PgSource)
         pg.execute = AsyncMock(return_value="CREATE TABLE")
 
         await set_up_apple_music_cache_schema(pg)
 
-        assert pg.execute.await_count == 1
-        sql = pg.execute.await_args.args[0]
-        assert "CREATE TABLE IF NOT EXISTS entity.album_apple_music_lookup_cache" in sql
+        # Two calls: schema first (so a fresh PG without the entity schema
+        # applied can still bootstrap LML), then the table.
+        assert pg.execute.await_count == 2
+        schema_sql = pg.execute.await_args_list[0].args[0]
+        table_sql = pg.execute.await_args_list[1].args[0]
+        assert "CREATE SCHEMA IF NOT EXISTS entity" in schema_sql
+        assert "CREATE TABLE IF NOT EXISTS entity.album_apple_music_lookup_cache" in table_sql
         # PK matches the design: (artist_normalized, album_normalized).
-        assert "PRIMARY KEY (artist_normalized, album_normalized)" in sql
+        assert "PRIMARY KEY (artist_normalized, album_normalized)" in table_sql
 
 
 def test_default_miss_ttl_is_seven_days():
