@@ -533,8 +533,13 @@ class DiscogsService:
 
                 logger.info(f"Track search found {len(releases)} releases")
 
-                # Supplement with keyword search if few results
-                if len(releases) < 3:
+                # Supplement with keyword search when the canonical leg surfaced
+                # 1-2 hits — we want to pad to >= 3 candidates. Zero hits is
+                # gated out: the keyword supplement converts a clean negative
+                # into noisy candidates that pump the downstream
+                # ``validate_track_on_release`` tail (LML#543). The orchestrator
+                # cap covers the symptom; this gate removes the cause.
+                if 0 < len(releases) < 3:
                     query_parts = [track]
                     if artist:
                         query_parts.append(artist)

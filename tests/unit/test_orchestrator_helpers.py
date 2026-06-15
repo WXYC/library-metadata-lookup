@@ -2380,6 +2380,97 @@ class TestSearchCompilationsEarlyExit:
         )
 
 
+class TestApiCallCap:
+    """LML#543: cumulative-API-call cap on the orchestrator fallback cascade.
+
+    When ``search_releases_by_track`` returns 0 canonical results for a real
+    lookup, the orchestrator's chunked validation tail used to burn 15-24
+    Discogs API calls per failing lookup (16-17s wall time). The cap
+    short-circuits ``_chunked_gather`` between chunks once the per-request
+    ``CacheStatsRecorder.api_calls`` counter crosses
+    ``LML_SEARCH_MAX_API_CALLS`` (default ~10).
+    """
+
+    @pytest.mark.asyncio
+    async def test_chunked_gather_bails_after_api_call_cap(self, monkeypatch):
+        """A lookup whose validation tail would otherwise fire N >> cap calls
+        must stop dispatching once ``api_calls`` crosses
+        ``LML_SEARCH_MAX_API_CALLS``.
+
+        Setup: 15 candidate releases, each library-matched and would-validate
+        true. Cap pinned at 3 via env var. Each ``validate_track_on_release``
+        increments the recorder. ``_chunked_gather`` dispatches in chunks of
+        ``MAX_SEARCH_RESULTS`` (5), checking the cap before each chunk — so
+        chunk 1 runs (5 validates → ``api_calls=5``), then chunk 2 is gated
+        out (``5 >= cap``). Without the cap all 15 would fire.
+
+        The probe call (``search_releases_by_track``) also bumps the counter
+        when patched to do so, but isn't strictly required for this test —
+        the validates alone exceed the cap.
+        """
+        from wxyc_fastapi.observability import (
+            get_cache_stats_recorder,
+            init_cache_stats,
+        )
+
+        from lookup.orchestrator import MAX_SEARCH_RESULTS
+
+        monkeypatch.setenv("LML_SEARCH_MAX_API_CALLS", "3")
+        init_cache_stats()
+
+        n_candidates = MAX_SEARCH_RESULTS * 3
+        items = [
+            make_library_item(id=7000 + i, artist=f"Artist {i}", title=f"Album {i}")
+            for i in range(n_candidates)
+        ]
+        releases = [
+            DiscogsReleaseInfo(
+                album=f"Album {i}",
+                artist=f"Artist {i}",
+                release_id=40000 + i,
+                release_url=f"https://discogs.com/release/{40000 + i}",
+                is_compilation=False,
+            )
+            for i in range(n_candidates)
+        ]
+
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+
+        async def _search(query, limit=None, **_):
+            q = query.lower()
+            for item in items:
+                if (item.title or "").lower() == q:
+                    return [item]
+            return []
+
+        db.search = AsyncMock(side_effect=_search)
+
+        svc = AsyncMock()
+        svc.search_releases_by_track.return_value = DiscogsTrackReleasesResponse(
+            track="t", releases=releases, total=n_candidates
+        )
+
+        async def _validate(*_args, **_kwargs):
+            # Every validate call counts against the request's API-call budget.
+            get_cache_stats_recorder().record_api_call()
+            return False  # never surface results, so the early-exit-on-results path is inert
+
+        svc.validate_track_on_release.side_effect = _validate
+
+        await search_song_as_track(db, "t", discogs_service=svc)
+
+        n_validate_calls = svc.validate_track_on_release.await_count
+        assert n_validate_calls <= MAX_SEARCH_RESULTS, (
+            f"Cap should fire after first chunk (5 validates, api_calls=5 >= "
+            f"cap=3) — saw {n_validate_calls} validate calls. LML#543."
+        )
+        assert n_validate_calls < n_candidates, (
+            f"Cap did not fire — saw all {n_candidates} candidates validated "
+            f"({n_validate_calls} calls)."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tests: _log_track_validation (A7 / LML#344 audit instrumentation)
 # ---------------------------------------------------------------------------
