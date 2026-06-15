@@ -638,7 +638,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.29.0" },
     { name = "cachetools", specifier = ">=5.0.0" },
     { name = "datamodel-code-generator", extras = ["http"], marker = "extra == 'dev'", specifier = "==0.56.1" },
-    { name = "fastapi", specifier = ">=0.104.0" },
+    { name = "fastapi", specifier = ">=0.104.0,<0.137" },
     { name = "httpx", specifier = ">=0.25.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = "==1.19.1" },
     { name = "pydantic", specifier = ">=2.0.0" },
@@ -653,7 +653,7 @@ requires-dist = [
     { name = "rapidfuzz", specifier = ">=3.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.6" },
     { name = "uvicorn", specifier = ">=0.24.0" },
-    { name = "wxyc-etl", specifier = ">=0.6.0,<0.7.0" },
+    { name = "wxyc-etl", specifier = ">=0.8.0,<0.9.0" },
     { name = "wxyc-fastapi", extras = ["posthog"], specifier = ">=1.0.0,<2.0.0" },
 ]
 provides-extras = ["dev"]
@@ -1387,17 +1387,17 @@ wheels = [
 
 [[package]]
 name = "wxyc-etl"
-version = "0.6.0"
+version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "python-json-logger" },
     { name = "sentry-sdk" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/05/bb/9b2a1f4d9f8f071f5228aa58d0362b4e80d3812b21fd29715a0663b82f57/wxyc_etl-0.6.0.tar.gz", hash = "sha256:cc43f2ec4f0b3386ecd685b20829b7007d3193b5638471a67798cd18cc4ee81c", size = 155099, upload-time = "2026-06-02T16:43:17.617Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/49/dba95d0cb957da098886fdb0d4b8abe5852232171fa53bd938b615e1c54f/wxyc_etl-0.8.0.tar.gz", hash = "sha256:271b10060ac794b5423353facce75d234bf8eac5a16df4a073aa477b1644ac98", size = 146632, upload-time = "2026-06-09T03:12:00.45Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c6/4f/cafd9d717a5eab9a21db6ed3d37a3c7fd62f3e1667970dc2582175bae891/wxyc_etl-0.6.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:b636a45c0be2b6c1f038357b38995531e351412fbbfea283cdbc9492f0731a88", size = 846269, upload-time = "2026-06-02T16:43:13.679Z" },
-    { url = "https://files.pythonhosted.org/packages/de/88/c1031ac22811c4a544f26f440f2b02b8488678a6c32fdfe7632e62b0e46c/wxyc_etl-0.6.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:54a0421e8a18c331db063f8660ff5effe2f366d0fb6b4f1eaf3b9d25631a859b", size = 875145, upload-time = "2026-06-02T16:43:15.029Z" },
-    { url = "https://files.pythonhosted.org/packages/34/35/842f67d0753cc9641e5b199400325fc196ac4575cf2162d6239ddd135ef3/wxyc_etl-0.6.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:419db74011a908d56145bb30e1469ac08cd1b35e32a7e27a35537f0e9c9dd121", size = 1099623, upload-time = "2026-06-02T16:43:16.461Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/7d/977534b3e45237fe97bea8d17e02b95bc20389c955f8ac46b39bcd2b1f3f/wxyc_etl-0.8.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:8470f3018c460b71d84fe75fde8ccf3825ceaffab71d411371643295e1ab004e", size = 845128, upload-time = "2026-06-09T03:11:55.553Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/33/b5e6a6d6de7af27f9abdd30173222436c455fabd524465221db61cd1481c/wxyc_etl-0.8.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:576262f698c616530a56650b5b0236661afcd7ea40f4582e9655d49d4674b2a4", size = 872111, upload-time = "2026-06-09T03:11:57.309Z" },
+    { url = "https://files.pythonhosted.org/packages/56/31/f960feec0b19c3bad4070f4c9bc842595a9a3d83d03b7bd7c8f9076b562a/wxyc_etl-0.8.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:52f399b4d59603a09428aa39deefcc1f8fbddc5c1d03b66eeb02cfc981602e3c", size = 1097213, upload-time = "2026-06-09T03:11:58.914Z" },
 ]
 
 [[package]]

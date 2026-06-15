@@ -167,11 +167,11 @@ def reset_caches():
     from core.search import _cap_fire_count_var
 
     cache_stats_token = _cache_stats_var.set(None)
-    # LML#543 per-pipeline-invocation counter — keep test isolation symmetric
-    # with cache_stats. Each test calling execute_search_pipeline (which calls
-    # _cap_fire_count_var.set on its own task copy) is unaffected by the
-    # parent-test reset; this just clears any prior test's binding.
-    cap_fire_token = _cap_fire_count_var.set([0])
+    # Match prod's 'no runner active = no-op' semantics: when a test exercises
+    # ``_chunked_gather`` directly (bypassing ``execute_search_pipeline``), the
+    # recorder's ``_record_cap_fire_for_runner`` sees a None counter and bails
+    # cleanly. Tests that drive the runner have their own ``set([0])`` on top.
+    cap_fire_token = _cap_fire_count_var.set(None)
     set_skip_cache(False)
     yield
     clear_all_caches()
