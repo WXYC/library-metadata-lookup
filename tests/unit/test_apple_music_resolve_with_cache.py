@@ -12,13 +12,18 @@ one of ``"cache_hit"``, ``"cache_miss_recent"`` (known miss inside TTL),
 returned no match), or ``"live_error"`` (Apple raised / probe timed
 out). The caller branches on the URL; dashboards branch on the source.
 
+LML#576 moved staleness from a Python check on ``last_checked_at`` into
+the SQL ``WHERE`` clause. Mocked SELECT rows are now ``{"apple_music_url":
+...}`` only — no ``last_checked_at`` field — and a stale miss is
+represented by the mock returning ``None`` from ``fetchone`` (the SQL
+filter would have excluded the row in production).
+
 PG and the Apple client are mocked. Integration tests cover the SQL.
 """
 
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -43,10 +48,7 @@ class TestResolveAppleMusicURLWithCache:
         # without touching Apple's API.
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(
-            return_value={
-                "apple_music_url": "https://music.apple.com/us/album/cached/9",
-                "last_checked_at": datetime.now(UTC),
-            }
+            return_value={"apple_music_url": "https://music.apple.com/us/album/cached/9"}
         )
         apple_music = AsyncMock(spec=AppleMusicClient)
 
@@ -67,14 +69,10 @@ class TestResolveAppleMusicURLWithCache:
 
     async def test_recent_known_miss_skips_apple_call(self):
         # Cache has a row with apple_music_url=NULL and last_checked_at recent
-        # → respect the recorded miss, don't re-query Apple.
+        # → the SQL filter let it through → respect the recorded miss, don't
+        # re-query Apple.
         pg = AsyncMock(spec=PgSource)
-        pg.fetchone = AsyncMock(
-            return_value={
-                "apple_music_url": None,
-                "last_checked_at": datetime.now(UTC),
-            }
-        )
+        pg.fetchone = AsyncMock(return_value={"apple_music_url": None})
         apple_music = AsyncMock(spec=AppleMusicClient)
 
         outcome = await resolve_apple_music_url_with_cache(
@@ -83,6 +81,29 @@ class TestResolveAppleMusicURLWithCache:
 
         assert outcome == ResolveOutcome(url=None, source="cache_miss_recent")
         apple_music.find_album_match.assert_not_called()
+
+    async def test_stale_known_miss_falls_through_to_apple(self):
+        # LML#576: a stale known miss is filtered out by the SQL WHERE
+        # (``last_checked_at <= now() - miss_ttl``) so the cache returns
+        # no row. The resolver treats this the same as an absent entry
+        # and calls Apple — no Python-side staleness check survives.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_album_match = AsyncMock(return_value=_album_match())
+
+        outcome = await resolve_apple_music_url_with_cache(
+            pg, apple_music, artist="Sessa", album="Estrela Acesa"
+        )
+
+        # The stale miss path looks indistinguishable from an absent row
+        # at this layer — both end as ``live_resolved`` after Apple
+        # returns a URL, and the UPSERT refreshes the stale row in place.
+        assert outcome.url == "https://music.apple.com/us/album/foo/1234567890"
+        assert outcome.source == "live_resolved"
+        apple_music.find_album_match.assert_awaited_once_with("Sessa", "Estrela Acesa")
+        pg.execute.assert_awaited_once()
 
     async def test_no_cache_row_calls_apple_with_request_values(self):
         # No row → live probe with REQUEST artist/album (NOT a fallback

@@ -56,7 +56,7 @@ from discogs.models import (
     TrackReleasesResponse,
 )
 from discogs.service import DiscogsService
-from entity.sources import PgSourceProtocol
+from entity.sources import PgSource, PgSourceProtocol
 from entity.store import EntityStore, Identity
 from generated.api_models import (
     LibraryCatalogItem,
@@ -74,6 +74,7 @@ from lookup.external_search import (
 )
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.strategies import build_strategies
+from lookup.timeouts import apple_music_lookup_timeout_s
 from release.musicbrainz_resolver import resolve_tracklist_via_musicbrainz
 from services.parser import MessageType, ParsedRequest
 
@@ -165,49 +166,6 @@ silently drops. The standard pattern is a module-level set; each task
 removes itself in a done_callback. See
 https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
 """
-
-
-_APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S = 4.0
-"""Default wall-clock ceiling for a single ``find_track_url`` call from the
-lookup hot path. Sized to the legacy iTunes Search ``httpx`` timeout (5s)
-with margin so the orchestrator's wait_for trips before the underlying
-``BaseStreamingClient`` httpx timeout. LML#449 + LML#450."""
-
-_APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR = "LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS"
-
-
-def _apple_music_lookup_timeout_s() -> float:
-    """Resolve the per-call wall-clock ceiling for ``find_track_url`` on the
-    lookup hot path. Read at request time (not via ``Settings``) so the knob
-    can be tuned via Railway env vars without a redeploy — mirrors the
-    ``LML_BULK_MAX_CONCURRENT`` and ``LML_SEARCH_BUDGET_MS`` patterns.
-
-    A misconfigured value (negative, zero, or unparseable) falls back to the
-    default with a WARN. The default is ``_APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S``
-    (4s). See LML#449 + LML#450.
-    """
-    raw = os.getenv(_APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR)
-    if not raw:
-        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
-    try:
-        ms = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r, falling back to %.1fs",
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
-            raw,
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S,
-        )
-        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
-    if ms <= 0:
-        logger.warning(
-            "%s=%d must be > 0, falling back to %.1fs",
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
-            ms,
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S,
-        )
-        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
-    return ms / 1000.0
 
 
 _ARTIST_IDENTITY_SPLIT_GATE_ENV_VAR = "LML_ARTIST_IDENTITY_SPLIT_GATE"
@@ -2071,6 +2029,7 @@ async def enrich_artwork_results(
     mb_pg: PgSourceProtocol | None = None,
     apple_music: AppleMusicClient | None = None,
     entity_store: EntityStore | None = None,
+    discogs_cache_pg: PgSource | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
@@ -2288,7 +2247,7 @@ async def enrich_artwork_results(
         # Apple Music probe so the happy-path probe can short-circuit when
         # the override would win anyway (the final assignment is
         # ``apple_music_override or apple_music_url or None``). Saves one
-        # Apple Music quota slot + up to _apple_music_lookup_timeout_s() of
+        # Apple Music quota slot + up to apple_music_lookup_timeout_s() of
         # wall-clock per overridden item. The override gate still requires
         # row_title_matches_requested_album per PR #481 (LML#477).
         spotify_url = None
@@ -2337,12 +2296,12 @@ async def enrich_artwork_results(
                 if library_row_acceptable:
                     apple_music_url = await asyncio.wait_for(
                         apple_music.find_track_url(row_artist, search_term, album=album),
-                        timeout=_apple_music_lookup_timeout_s(),
+                        timeout=apple_music_lookup_timeout_s(),
                     )
                 else:
                     probe_match = await asyncio.wait_for(
                         apple_music.find_track_metadata(row_artist, search_term, album=album),
-                        timeout=_apple_music_lookup_timeout_s(),
+                        timeout=apple_music_lookup_timeout_s(),
                     )
                     if probe_match is not None:
                         apple_music_url = probe_match.url
@@ -2551,6 +2510,7 @@ async def enrich_artwork_results(
         await apply_apple_music_postprocess(
             update,
             apple_music=apple_music,
+            pg=discogs_cache_pg,
             entity_store=entity_store,
             request_artist=artist,
             request_album=album,
@@ -2837,6 +2797,7 @@ async def perform_lookup(
     discogs_cache: DiscogsCacheService | None = None,
     mb_pg: PgSourceProtocol | None = None,
     apple_music: AppleMusicClient | None = None,
+    discogs_cache_pg: PgSource | None = None,
     caller_budget_ms: int | None = None,
 ) -> LookupResponse:
     """Orchestrate the full lookup pipeline.
@@ -3002,6 +2963,7 @@ async def perform_lookup(
                 mb_pg=mb_pg,
                 apple_music=apple_music,
                 entity_store=entity_store,
+                discogs_cache_pg=discogs_cache_pg,
             )
 
     # Project the request-side flags and result-quality signals onto the

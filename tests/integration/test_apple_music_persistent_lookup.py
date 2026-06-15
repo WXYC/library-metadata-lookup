@@ -7,13 +7,20 @@ is unit-level with ``AsyncMock(spec=PgSource)``; this file is the matching
 ``@pytest.mark.pg`` layer that drives the real schema, the real UPSERT,
 and the real TTL math against an actual PostgreSQL connection.
 
+LML#576 collapsed the cache's public surface to ``str | None`` and pushed
+staleness into the SQL ``WHERE`` clause. The integration tests below
+assert the new shape directly: the SQL filter must exclude stale known
+misses without a Python-side check, and ``get_cached_apple_music_url``
+returns ``None`` for absent rows, fresh known misses, AND stale misses
+(the SQL filter erases the distinction between the latter two).
+
 Concrete production risks the unit tests cannot catch:
 
 * TIMESTAMPTZ codec drift -- asyncpg returns ``TIMESTAMPTZ`` as aware
   ``datetime`` by default, but a custom type codec could return naive
-  ``datetime`` and break the ``reference_now - last_checked`` arithmetic
-  in ``get_cached_apple_music_url``. We pin the contract by asserting
-  ``last_checked.tzinfo is not None`` on a freshly inserted row.
+  ``datetime`` and break the SQL ``last_checked_at > $3`` comparison.
+  We pin the contract by asserting ``last_checked.tzinfo is not None``
+  on a freshly inserted row.
 * Schema bootstrap against a missing entity schema -- the autouse fixture
   DROPs the schema between tests so each scenario boots from zero.
 * UPSERT semantics -- only a real PG round-trip proves the
@@ -21,6 +28,9 @@ Concrete production risks the unit tests cannot catch:
   ``last_checked_at`` instead of inserting a second row.
 * ``to_match_form`` normalization parity -- the SELECT and UPSERT must
   pick the same row when callers pass different case/diacritic input.
+* SQL-side TTL filter (LML#576) -- staleness moved out of Python and into
+  the ``WHERE`` clause. Only a real PG round-trip proves the bind +
+  comparison work end-to-end against ``TIMESTAMPTZ`` values.
 
 Run with: pytest -m pg -v tests/integration/test_apple_music_persistent_lookup.py
 """
@@ -132,14 +142,15 @@ class TestRoundTrip:
             pg_source, artist="Stereolab", album="Aluminum Tunes"
         )
 
-        assert result.url == url
-        assert result.is_known_miss is False
-        assert result.is_stale is False
+        assert result == url
 
     @pytest.mark.asyncio
-    async def test_set_null_url_then_get_flags_known_miss(self, pg_source):
-        # ``url=None`` records a known miss; ``get`` reports it as such
-        # without flipping ``is_stale`` (the row was just written).
+    async def test_set_null_url_then_get_returns_none(self, pg_source):
+        # LML#576: ``url=None`` records a known miss; ``get`` reports
+        # ``None`` regardless of whether the row is a fresh miss or
+        # absent. Callers that need to distinguish use the resolver
+        # (which branches on the private ``was_present`` bit), not this
+        # public API.
         await set_cached_apple_music_url(
             pg_source, artist="ObscureArtist", album="ObscureAlbum", url=None
         )
@@ -148,20 +159,17 @@ class TestRoundTrip:
             pg_source, artist="ObscureArtist", album="ObscureAlbum"
         )
 
-        assert result.url is None
-        assert result.is_known_miss is True
-        assert result.is_stale is False
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_last_checked_at_is_timezone_aware(self, pg_source, pg_pool):
         """asyncpg TIMESTAMPTZ -> aware datetime contract.
 
-        ``resolve_apple_music_url_with_cache`` computes
-        ``reference_now - last_checked``; if asyncpg ever returned a
-        naive datetime, that subtraction would raise
-        ``TypeError: can't subtract offset-naive and offset-aware
-        datetimes`` and the broad ``except Exception`` in
-        ``get_cached_apple_music_url`` would silently 100% miss.
+        The SQL filter compares ``last_checked_at`` to a TIMESTAMPTZ bind
+        from Python (``now - miss_ttl``). If asyncpg ever returned a naive
+        datetime, that comparison would silently misbehave (PG would
+        infer a session-local timezone). Pin the contract by asserting
+        the value comes out aware.
         """
         await set_cached_apple_music_url(
             pg_source,
@@ -181,14 +189,17 @@ class TestRoundTrip:
 
 @pytest.mark.pg
 class TestTTLStaleness:
-    """A known-miss row past ``miss_ttl`` reports ``is_stale=True``."""
+    """LML#576: staleness is enforced by the SQL ``WHERE`` clause, not by
+    Python. A known-miss row past ``miss_ttl`` is filtered out by the
+    SELECT and surfaces as ``None`` — the resolver then falls through to
+    the live probe, which UPSERTs and refreshes ``last_checked_at``.
+    """
 
     @pytest.mark.asyncio
-    async def test_known_miss_past_ttl_is_stale(self, pg_source, pg_pool):
+    async def test_known_miss_past_ttl_is_filtered_by_sql(self, pg_source, pg_pool):
         # Seed a known miss, then UPDATE ``last_checked_at`` 8 days back.
         # Using a direct UPDATE instead of freezegun (not a project dep)
-        # and instead of waiting -- the cache module exposes a ``now=``
-        # injection seam, but exercising the SQL clock too is the point
+        # and instead of waiting -- exercising the SQL clock is the point
         # of the integration test.
         await set_cached_apple_music_url(pg_source, artist="Sessa", album="Estrela Acesa", url=None)
         now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
@@ -205,13 +216,50 @@ class TestTTLStaleness:
             pg_source, artist="Sessa", album="Estrela Acesa", now=now
         )
 
-        assert result.url is None
-        assert result.is_known_miss is True
-        assert result.is_stale is True
+        # The stale known miss is filtered out by the SQL WHERE; callers
+        # see the same "no row" shape as an absent entry.
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_known_miss_within_ttl_passes_sql_filter(self, pg_source, pg_pool):
+        # A fresh known miss is still surfaced by the SQL filter — the
+        # resolver uses the ``_fetch_cached_row`` private seam to decide
+        # whether to call Apple. ``get_cached_apple_music_url`` only
+        # exposes the URL, so a fresh known miss returns ``None`` here
+        # too — but the resolver's ``cache_miss_recent`` branch is the
+        # tested-everywhere coverage of the fresh-vs-stale distinction.
+        await set_cached_apple_music_url(pg_source, artist="Sessa", album="Estrela Acesa", url=None)
+        # Confirm the SELECT actually returns the row (vs filtering it
+        # out, which would re-introduce the live probe path).
+        now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
+        recent = now - timedelta(hours=1)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE entity.album_apple_music_lookup_cache "
+                "SET last_checked_at = $1 "
+                "WHERE artist_normalized = 'sessa' AND album_normalized = 'estrela acesa'",
+                recent,
+            )
+
+        # Drive the resolver — it must short-circuit Apple because the
+        # SQL filter let the in-TTL row through.
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        outcome = await resolve_apple_music_url_with_cache(
+            pg_source,
+            apple_music,
+            artist="Sessa",
+            album="Estrela Acesa",
+            now=now,
+        )
+        assert outcome.url is None
+        assert outcome.source == "cache_miss_recent"
+        apple_music.find_album_match.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_hit_past_ttl_never_goes_stale(self, pg_source, pg_pool):
-        # Hits are durable: an ancient hit must still report fresh.
+        # Hits are durable: an ancient hit must still report fresh. The
+        # SQL filter is ``apple_music_url IS NOT NULL OR last_checked_at
+        # > $cutoff`` — the OR keeps hits unconditional.
         url = "https://music.apple.com/us/album/durable-hit/1"
         await set_cached_apple_music_url(
             pg_source, artist="Stereolab", album="Aluminum Tunes", url=url
@@ -230,9 +278,7 @@ class TestTTLStaleness:
             pg_source, artist="Stereolab", album="Aluminum Tunes", now=now
         )
 
-        assert result.url == url
-        assert result.is_known_miss is False
-        assert result.is_stale is False
+        assert result == url
 
 
 @pytest.mark.pg
@@ -300,8 +346,7 @@ class TestNormalizationSymmetry:
         result = await get_cached_apple_music_url(
             pg_source, artist="Nilufer Yanya", album="painless"
         )
-        assert result.url == url
-        assert result.is_known_miss is False
+        assert result == url
         # And only one row exists -- not two collated under different keys.
         async with pg_pool.acquire() as conn:
             rows = await conn.fetch(

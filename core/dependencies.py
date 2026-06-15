@@ -214,6 +214,31 @@ async def get_discogs_cache_service_from_pool(
     return DiscogsCacheService(pool)
 
 
+async def get_discogs_cache_pg(
+    settings: Settings = Depends(get_settings),
+) -> PgSource | None:
+    """Get a ``PgSource`` borrowing the shared discogs-cache pool.
+
+    Sibling of ``get_discogs_cache_service_from_pool`` for callers that
+    need a raw ``PgSource`` against the same pool (e.g. the persistent
+    Apple Music URL cache at ``entity.album_apple_music_lookup_cache``).
+    Same posture as the other shared-pool consumers (WXYC#395): one pool,
+    one timeout/sizing policy, one degradation signal on ``/health``.
+
+    Returns ``None`` when ``DATABASE_URL_DISCOGS`` is unset or the shared
+    pool is unavailable; callers degrade gracefully (the cache layer
+    short-circuits to "miss" so /lookup still serves).
+
+    The ``settings`` argument looks dead but is preserved for FastAPI DI
+    compatibility — ``get_discogs_pool`` reads from ``get_settings()``
+    directly via its singleton factory.
+    """
+    pool = await get_discogs_pool()
+    if pool is None:
+        return None
+    return PgSource(pool=pool)
+
+
 async def _build_musicbrainz_pg() -> PgSource | None:
     """Build the PgSource backing the musicbrainz-cache external-cache fallback.
 

@@ -19,6 +19,7 @@ from core.bulk_concurrency import (
     watch_disconnect,
 )
 from core.dependencies import (
+    get_discogs_cache_pg,
     get_discogs_cache_service,
     get_discogs_service,
     get_library_db,
@@ -122,6 +123,7 @@ async def handle_lookup(
     discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service),
     mb_pg: PgSource | None = Depends(get_musicbrainz_pg),
     entity_store: EntityStore | None = Depends(get_entity_store),
+    discogs_cache_pg: PgSource | None = Depends(get_discogs_cache_pg),
     posthog_client: Posthog | None = Depends(get_posthog_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     skip_cache: bool = False,
@@ -166,6 +168,7 @@ async def handle_lookup(
             discogs_cache=discogs_cache,
             mb_pg=mb_pg,
             apple_music=apple_music,
+            discogs_cache_pg=discogs_cache_pg,
             caller_budget_ms=x_caller_budget_ms,
         )
 
@@ -235,6 +238,7 @@ async def handle_bulk_lookup(
     discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service),
     mb_pg: PgSource | None = Depends(get_musicbrainz_pg),
     entity_store: EntityStore | None = Depends(get_entity_store),
+    discogs_cache_pg: PgSource | None = Depends(get_discogs_cache_pg),
     posthog_client: Posthog | None = Depends(get_posthog_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     skip_cache: bool = False,
@@ -329,6 +333,7 @@ async def handle_bulk_lookup(
                         discogs_cache=discogs_cache,
                         mb_pg=mb_pg,
                         apple_music=apple_music,
+                        discogs_cache_pg=discogs_cache_pg,
                         caller_budget_ms=x_caller_budget_ms,
                     )
             except Exception as e:
