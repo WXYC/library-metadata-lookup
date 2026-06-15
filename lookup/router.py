@@ -56,6 +56,19 @@ _BULK_LOOKUP_INPUT_CAP = 100
 
 _BULK_LOOKUP_DEFAULT_CONCURRENCY = 10
 
+_LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
+    "memory_cache_inflight_join",
+    "memory_cache_inflight_retry_after_cancel",
+    "memory_cache_write_failed",
+    "search_api_call_cap_fired",
+)
+"""LML-specific keys seeded into every request's cache_stats dict so PostHog
+and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and
+``handle_bulk_lookup`` so the two endpoints emit identical shapes. See
+``init_cache_stats`` and LML#544 round 2 for the shape-stability rationale.
+Adding a new key here is the single point of update; LML#543's
+``search_api_call_cap_fired`` was the most recent addition."""
+
 # Canonical full path for the bulk endpoint. Referenced by the explicit
 # `http.server` span (name + `http.target` data field) so the two stay in
 # lockstep; the FastAPI route decorator below uses the relative `/lookup/bulk`
@@ -141,14 +154,7 @@ async def handle_lookup(
     # are stable even on requests with zero in-flight joins or zero L1 write
     # failures (LML#544 round 2). Without extra_keys, the keys would only
     # appear in payloads from the first request that records them.
-    init_cache_stats(
-        extra_keys=(
-            "memory_cache_inflight_join",
-            "memory_cache_inflight_retry_after_cancel",
-            "memory_cache_write_failed",
-            "search_api_call_cap_fired",
-        )
-    )
+    init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
     if skip_cache:
         set_skip_cache(True)
     telemetry = RequestTelemetry(
@@ -293,14 +299,7 @@ async def handle_bulk_lookup(
     # are stable even on requests with zero in-flight joins or zero L1 write
     # failures (LML#544 round 2). Without extra_keys, the keys would only
     # appear in payloads from the first request that records them.
-    init_cache_stats(
-        extra_keys=(
-            "memory_cache_inflight_join",
-            "memory_cache_inflight_retry_after_cancel",
-            "memory_cache_write_failed",
-            "search_api_call_cap_fired",
-        )
-    )
+    init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
 
     max_concurrent = max_concurrency_from_env(_BULK_LOOKUP_DEFAULT_CONCURRENCY)
     semaphore = asyncio.Semaphore(max_concurrent)

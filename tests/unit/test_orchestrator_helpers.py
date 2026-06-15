@@ -2505,52 +2505,182 @@ class TestApiCallCap:
         )
 
     @pytest.mark.asyncio
-    async def test_cap_fire_propagates_to_state_timed_out(self, monkeypatch):
-        """The cap-fire stat must flip ``state.timed_out=True`` after the
-        strategy returns, so ``LookupResponse.timeout`` projects True and the
-        issue's acceptance Sentry query (``lookup.timeout:true``) covers the
-        cap-fire population. Mirrors the LML#370 hard-cap projection."""
+    async def test_cap_fire_propagates_to_state_timed_out_via_runner(self, monkeypatch):
+        """Drive the runner end-to-end: a strategy whose attempt fires the cap
+        must cause ``execute_search_pipeline`` to set ``state.timed_out=True``
+        and short-circuit subsequent strategies.
+
+        Exercises the real propagation path (``core.search.execute_search_pipeline``
+        baseline-delta read), not a re-implementation of it.
+        """
+        from dataclasses import dataclass
+
         from wxyc_fastapi.observability import init_cache_stats
 
-        from core.search import SearchState
-        from lookup.orchestrator import _record_search_api_call_cap_fired
-
-        init_cache_stats(extra_keys=("search_api_call_cap_fired",))
-
-        # Simulate _chunked_gather firing the cap.
-        _record_search_api_call_cap_fired(cap=3, spent=5, items_remaining=10, items_total=15)
-
-        # Mirror the runner's post-strategy check from core/search.py.
-        from wxyc_fastapi.observability import get_cache_stats
-
-        state = SearchState(results=[], strategies_tried=[])
-        stats = get_cache_stats()
-        assert stats is not None
-        assert stats.get("search_api_call_cap_fired") == 1, (
-            "Cap-fire must flip the stat to 1 (idempotent)."
+        from core.search import (
+            SEARCH_API_CALL_CAP_FIRED_STAT_KEY,
+            Outcome,
+            SearchStrategyType,
+            execute_search_pipeline,
         )
-        # Mirror core.search.execute_search_pipeline's post-_apply propagation.
-        if stats.get("search_api_call_cap_fired"):
-            state.timed_out = True
-        assert state.timed_out is True
+        from lookup.orchestrator import _record_search_api_call_cap_fired
+        from services.parser import ParsedRequest
+
+        init_cache_stats(extra_keys=(SEARCH_API_CALL_CAP_FIRED_STAT_KEY,))
+
+        second_strategy_ran = False
+
+        async def _fire_cap_attempt(_parsed, _state, _raw):
+            _record_search_api_call_cap_fired(cap=3, spent=5, items_remaining=10, items_total=15)
+            return Outcome.empty()
+
+        async def _second_attempt(_parsed, _state, _raw):
+            nonlocal second_strategy_ran
+            second_strategy_ran = True
+            return Outcome.empty()
+
+        @dataclass(frozen=True)
+        class _StubStrategy:
+            name: SearchStrategyType
+            attempt_func: object
+
+            def should_attempt(self, _parsed, _state, _raw):
+                return True
+
+            async def attempt(self, parsed, state, raw):
+                return await self.attempt_func(parsed, state, raw)  # type: ignore[operator]
+
+        strategies = [
+            _StubStrategy(SearchStrategyType.SONG_AS_TRACK, _fire_cap_attempt),
+            _StubStrategy(SearchStrategyType.KEYWORD_MATCH, _second_attempt),
+        ]
+        parsed = ParsedRequest(artist="a", song="s", raw_message="a - s")
+        state = await execute_search_pipeline(parsed, "a - s", strategies)
+
+        assert state.timed_out is True, (
+            "Cap-fire in strategy 1 must propagate to state.timed_out=True."
+        )
+        assert second_strategy_ran is False, (
+            "Cap-fire must short-circuit the cascade — strategy 2 should not run."
+        )
 
     @pytest.mark.asyncio
-    async def test_cap_fire_is_idempotent(self, monkeypatch):
-        """Re-firing the cap-fire record within a single request must not
-        double-count the stat — PostHog/Sentry aggregations measure the rate
-        of cap-firing requests, not the per-leg count."""
-        from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
+    async def test_cap_fire_does_not_override_results(self, monkeypatch):
+        """When a strategy populated ``state.results`` AND fired the cap (e.g.
+        compilations main loop succeeded, fallback tail tripped the cap), the
+        runner's natural-completion break must win — ``state.timed_out`` stays
+        ``False`` so ``LookupResponse.timeout`` doesn't falsely report a
+        cap-fired success as a timeout. Mirrors LML#347's ``not state.results``
+        gate."""
+        from dataclasses import dataclass
 
+        from wxyc_fastapi.observability import init_cache_stats
+
+        from core.search import (
+            SEARCH_API_CALL_CAP_FIRED_STAT_KEY,
+            Outcome,
+            SearchStrategyType,
+            execute_search_pipeline,
+        )
         from lookup.orchestrator import _record_search_api_call_cap_fired
+        from services.parser import ParsedRequest
 
-        init_cache_stats(extra_keys=("search_api_call_cap_fired",))
-        for _ in range(3):
+        init_cache_stats(extra_keys=(SEARCH_API_CALL_CAP_FIRED_STAT_KEY,))
+
+        async def _attempt_succeed_and_fire(_parsed, _state, _raw):
             _record_search_api_call_cap_fired(cap=3, spent=5, items_remaining=10, items_total=15)
-        stats = get_cache_stats()
-        assert stats is not None
-        assert stats.get("search_api_call_cap_fired") == 1, (
-            f"Cap-fire is not idempotent: got {stats.get('search_api_call_cap_fired')}, "
-            f"expected 1 (any non-zero positive int after 3 fires)."
+            return Outcome.found([make_library_item(id=9000, artist="A", title="T")])
+
+        @dataclass(frozen=True)
+        class _StubStrategy:
+            name: SearchStrategyType
+            attempt_func: object
+
+            def should_attempt(self, _parsed, _state, _raw):
+                return True
+
+            async def attempt(self, parsed, state, raw):
+                return await self.attempt_func(parsed, state, raw)  # type: ignore[operator]
+
+        strategies = [
+            _StubStrategy(SearchStrategyType.SONG_AS_TRACK, _attempt_succeed_and_fire),
+        ]
+        parsed = ParsedRequest(artist="a", song="s", raw_message="a - s")
+        state = await execute_search_pipeline(parsed, "a - s", strategies)
+
+        assert state.results, "Strategy populated results — they must survive."
+        assert state.timed_out is False, (
+            "Cap-fire with non-empty results must NOT project timeout=True "
+            "(preserves the pre-PR invariant; LML#347 caller-budget gate "
+            "shape)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_cap_fire_does_not_leak_across_bulk_items(self, monkeypatch):
+        """Bulk-mode regression: two sequential ``execute_search_pipeline``
+        invocations against the SAME (shared) cache_stats dict — the first
+        cap-fires, the second must NOT inherit the timeout. Pins the
+        baseline-delta narrowing in :func:`execute_search_pipeline`.
+
+        Without this property, the runner's request-wide flag read would let
+        item 1's cap-fire poison every later item in
+        ``/api/v1/lookup/bulk`` — the failure mode iter-2 review flagged.
+        """
+        from dataclasses import dataclass
+
+        from wxyc_fastapi.observability import init_cache_stats
+
+        from core.search import (
+            SEARCH_API_CALL_CAP_FIRED_STAT_KEY,
+            Outcome,
+            SearchStrategyType,
+            execute_search_pipeline,
+        )
+        from lookup.orchestrator import _record_search_api_call_cap_fired
+        from services.parser import ParsedRequest
+
+        # Single shared cache_stats dict for both pipeline runs (mirrors the
+        # bulk endpoint's one-init-many-items shape).
+        init_cache_stats(extra_keys=(SEARCH_API_CALL_CAP_FIRED_STAT_KEY,))
+
+        async def _fire_cap_attempt(_parsed, _state, _raw):
+            _record_search_api_call_cap_fired(cap=3, spent=5, items_remaining=10, items_total=15)
+            return Outcome.empty()
+
+        async def _no_fire_attempt(_parsed, _state, _raw):
+            return Outcome.empty()
+
+        @dataclass(frozen=True)
+        class _StubStrategy:
+            name: SearchStrategyType
+            attempt_func: object
+
+            def should_attempt(self, _parsed, _state, _raw):
+                return True
+
+            async def attempt(self, parsed, state, raw):
+                return await self.attempt_func(parsed, state, raw)  # type: ignore[operator]
+
+        parsed = ParsedRequest(artist="a", song="s", raw_message="a - s")
+
+        # Item 1: cap fires, runner sets timed_out=True.
+        state_a = await execute_search_pipeline(
+            parsed,
+            "a - s",
+            [_StubStrategy(SearchStrategyType.SONG_AS_TRACK, _fire_cap_attempt)],
+        )
+        assert state_a.timed_out is True
+
+        # Item 2: shares the cache_stats dict (counter still > 0 from item 1),
+        # but its own attempt doesn't fire the cap → delta from item 2's
+        # baseline is 0 → runner must NOT set timed_out.
+        state_b = await execute_search_pipeline(
+            parsed,
+            "a - s",
+            [_StubStrategy(SearchStrategyType.KEYWORD_MATCH, _no_fire_attempt)],
+        )
+        assert state_b.timed_out is False, (
+            "Item 2 inherited item 1's cap-fire flag — bulk endpoint regression (iter-2 review)."
         )
 
 

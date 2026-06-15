@@ -94,6 +94,16 @@ def resolve_positive_int_env(env_var: str, default: int) -> int:
     return value
 
 
+SEARCH_API_CALL_CAP_FIRED_STAT_KEY = "search_api_call_cap_fired"
+"""Per-request cache-stats key incremented on every LML#543 ``_chunked_gather``
+cap-fire. A *counter*, not a flag: each leg that trips its own per-invocation
+cap adds 1, so the runner's baseline-delta check can distinguish
+'fires originated in THIS lookup' from 'fires inherited from sibling bulk items
+via the shared cache_stats ContextVar'. Defined here (not in
+``lookup/orchestrator``) so :func:`execute_search_pipeline` can read it without
+creating a circular import."""
+
+
 def resolve_search_budget_ms() -> int:
     """Return the active search budget in ms, honoring ``LML_SEARCH_BUDGET_MS``.
 
@@ -694,6 +704,18 @@ async def execute_search_pipeline(
 
     budget_ms = resolve_effective_search_budget_ms(caller_budget_ms)
     hard_cap_ms = resolve_search_hard_timeout_ms()
+    # Baseline for the LML#543 cap-fire propagation. The
+    # ``search_api_call_cap_fired`` stat is a counter on the request-scoped
+    # cache-stats dict, which the bulk endpoint shares across all items in a
+    # batch (intentional, for batch-aggregate PostHog). Capturing the count
+    # at entry and checking the DELTA after each strategy localises the
+    # signal to THIS lookup — fires from sibling bulk items are invisible.
+    _initial_stats = get_cache_stats()
+    cap_fired_baseline = (
+        _initial_stats.get(SEARCH_API_CALL_CAP_FIRED_STAT_KEY, 0)
+        if _initial_stats is not None
+        else 0
+    )
     # Project the caller-budget value when present so Sentry trace explorer can
     # split header-driven vs env-driven cutoffs (A8 / LML#345). The
     # effective-budget computation already clamps to env, so we record the raw
@@ -799,17 +821,31 @@ async def execute_search_pipeline(
         # happens here, driven by the outcome's flags. See :func:`_apply`.
         _apply(state, outcome)
 
-        # LML#543 cap-fire propagation. ``_chunked_gather`` records the
-        # ``search_api_call_cap_fired`` stat on the per-request cache-stats
-        # dict when it bails between chunks. Mirror it onto ``state.timed_out``
-        # so the existing ``LookupResponse.timeout`` projection (the issue's
-        # acceptance-criterion Sentry query, ``lookup.timeout:true``) covers
-        # the cap-fire population alongside LML#370's hard-cap timeouts. Once
-        # set, the soft-budget gate at the top of the next loop iteration
-        # short-circuits the cascade — the same shape the LML#347 caller-budget
-        # gate uses.
-        stats = get_cache_stats()
-        if stats is not None and stats.get("search_api_call_cap_fired"):
+        # LML#543 cap-fire propagation. ``_chunked_gather`` increments
+        # ``search_api_call_cap_fired`` on the request-scoped cache-stats dict
+        # when it bails between chunks. Mirror onto ``state.timed_out`` so the
+        # PostHog/Sentry slice ``lml.cache.search_api_call_cap_fired>0`` lines
+        # up with the response's ``timeout`` field, and break the cascade so
+        # subsequent strategies don't keep grinding past the budget the cap was
+        # meant to bound. Two narrowings vs a naïve flag check:
+        #
+        # 1. **Baseline-delta**: only fires propagate that happened *in this
+        #    lookup* (delta > 0) — the bulk endpoint shares one cache_stats
+        #    dict across items, so a sticky flag would let item 1's cap-fire
+        #    poison items 2..N's cascades.
+        # 2. **Gated on ``not state.results``**: when the same strategy
+        #    surfaced matches before tripping the cap on its tail, the
+        #    natural-completion break below handles them. Cap-fire only
+        #    short-circuits the empty case (mirroring the LML#347
+        #    caller-budget gate's ``not state.results`` clause). Pre-PR
+        #    ``state.timed_out=True with state.results=non-empty`` was
+        #    impossible; keep that invariant.
+        _stats_now = get_cache_stats()
+        if (
+            _stats_now is not None
+            and _stats_now.get(SEARCH_API_CALL_CAP_FIRED_STAT_KEY, 0) > cap_fired_baseline
+            and not state.results
+        ):
             state.timed_out = True
             break
 
