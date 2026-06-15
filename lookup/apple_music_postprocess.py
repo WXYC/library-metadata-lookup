@@ -25,14 +25,23 @@ request supplied both artist and album, this module:
    ``mint_or_get_release_identity`` failures (PG outage, validation
    rejection, unparseable URL) are logged and swallowed so the
    user-visible URL still surfaces in the response.
-4. Tags ``apple_music.persistent_lookup.fired = True`` on the active
-   Sentry transaction. The per-item outcome is intentionally NOT tagged
-   on the transaction because ``enrich_one`` runs concurrently across
-   N items via ``asyncio.gather``; per-item ``set_data`` on the same key
-   would clobber itself N-1 times and the dashboard would see a
-   non-deterministic last-completer-wins value. The cache layer's own
-   logging is the per-call signal; the transaction-level boolean tells
-   dashboards "this request exercised the post-process at least once."
+4. Tags two booleans on the active Sentry transaction:
+
+   * ``apple_music.persistent_lookup.fired = True`` — "post-process ran
+     at least once on this request" (back-compat for any dashboard that
+     already keys off this signal).
+   * ``apple_music.persistent_lookup.<source> = True`` (LML#575) where
+     ``<source>`` is the ``ResolveOutcome.source`` returned by the cache
+     layer: ``cache_hit``, ``cache_miss_recent``, ``live_resolved``,
+     ``live_miss``, or ``live_error``. Each invocation sets one outcome
+     key; across the ``enrich_one`` gather fan-out, multiple keys can
+     land on the same transaction (one per distinct outcome observed).
+     Race-free because different keys never overwrite each other, and
+     the same key set to ``True`` repeatedly is idempotent. The
+     cardinality budget is 5 boolean keys, well under Sentry's per-span
+     attribute ceiling. Dashboards can query the cache hit rate, live
+     error rate (Apple outage signal), and total firings without
+     scraping per-item logs.
 
 Side effects degrade gracefully. PG errors swallow inside the cache
 layer; the live probe is wrapped in ``asyncio.wait_for`` so a single
@@ -51,7 +60,7 @@ from typing import Any
 import sentry_sdk
 
 from clients.streaming.apple_music import AppleMusicClient
-from entity.apple_music_album_cache import resolve_apple_music_url_with_cache
+from entity.apple_music_album_cache import ResolveSource, resolve_apple_music_url_with_cache
 from entity.store import EntityStore
 from identity.release_validation import validate_and_canonicalize_external_id
 from release.apple_music_url_parser import apple_album_id_from_url
@@ -145,7 +154,7 @@ async def apply_apple_music_postprocess(
         probe_timeout_s=_probe_timeout_s(),
     )
 
-    _mark_fired()
+    _mark_fired(outcome.source)
 
     if outcome.url is None:
         return
@@ -190,23 +199,30 @@ async def apply_apple_music_postprocess(
         )
 
 
-def _mark_fired() -> None:
-    """Project ``apple_music.persistent_lookup.fired = True`` onto the
-    active Sentry transaction. Idempotent — concurrent ``enrich_one``
-    tasks setting the same boolean is race-free. Observability must not
-    break the request — every failure mode is logged and swallowed.
+def _mark_fired(source: ResolveSource) -> None:
+    """Project the per-request Sentry attributes for the post-process.
 
-    The richer per-call signal (``cache_hit`` / ``live_resolved`` / ...)
-    is left to the cache layer's logs because a per-item ``set_data``
-    on the shared transaction would race the way described in the
-    module docstring.
+    Two booleans land on the active transaction (LML#575):
+
+    * ``apple_music.persistent_lookup.fired = True`` — back-compat
+      "post-process ran at least once" signal.
+    * ``apple_music.persistent_lookup.<source> = True`` — per-outcome
+      boolean keyed by the cache layer's ``ResolveOutcome.source``
+      enum (``cache_hit``, ``cache_miss_recent``, ``live_resolved``,
+      ``live_miss``, ``live_error``).
+
+    Both keys are set idempotently per item, so concurrent ``enrich_one``
+    tasks writing the same key with the same value are race-free.
+    Observability must not break the request — every failure mode is
+    logged and swallowed.
     """
     try:
         scope = sentry_sdk.get_current_scope()
         if scope.transaction is not None:
             scope.transaction.set_data("apple_music.persistent_lookup.fired", True)
+            scope.transaction.set_data(f"apple_music.persistent_lookup.{source}", True)
     except Exception as e:
         logger.warning(
-            "Failed to project apple_music.persistent_lookup.fired onto Sentry transaction: %s",
+            "Failed to project apple_music.persistent_lookup tags onto Sentry transaction: %s",
             e,
         )
