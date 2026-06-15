@@ -2409,11 +2409,13 @@ def _fire_cap_via_recorder():
     _record_search_api_call_cap_fired(cap=3, spent=5, items_remaining=10, items_total=15)
 
 
-_PARSED_AB = ParsedRequest(artist="a", song="s", raw_message="a - s")
-"""Shared bare-bones parsed request for the cap-fire integration tests.
-None of the cap-fire tests inspect the parsed fields — the strategies are
-stubs and the runner just threads it through — so a single shared instance
-keeps boilerplate down."""
+_PARSED_AB = ParsedRequest(
+    artist="Stereolab", song="Aluminum Tunes", raw_message="Stereolab - Aluminum Tunes"
+)
+"""Shared parsed request for the cap-fire integration tests. None of these
+tests inspects the parsed fields — the stub strategies just thread it
+through — so a single shared instance keeps boilerplate down. Uses a WXYC-
+representative artist per CLAUDE.md fixture convention."""
 
 
 class TestApiCallCap:
@@ -2436,9 +2438,10 @@ class TestApiCallCap:
 
     @pytest.fixture(autouse=True)
     def _seed_cache_stats(self):
-        """Initialise cache_stats with the LML#543 key seeded — required so
-        the recorder's increments don't get silently dropped by extra_keys
-        gating in init_cache_stats."""
+        """Initialise cache_stats with the LML#543 key seeded so PostHog
+        payload shapes are stable when the counter is read at request end.
+        The recorder ``record(key)`` always increments regardless of seeding;
+        seeding only fixes the *shape* of the payload."""
         from wxyc_fastapi.observability import init_cache_stats
 
         from core.search import SEARCH_API_CALL_CAP_FIRED_STAT_KEY
@@ -2555,7 +2558,7 @@ class TestApiCallCap:
         )
 
     @pytest.mark.asyncio
-    async def test_cap_fire_propagates_to_state_timed_out_via_runner(self, monkeypatch):
+    async def test_cap_fire_propagates_to_state_timed_out_via_runner(self):
         """Drive the runner end-to-end: a strategy whose attempt fires the cap
         must cause ``execute_search_pipeline`` to set ``state.timed_out=True``
         and short-circuit subsequent strategies."""
@@ -2574,7 +2577,7 @@ class TestApiCallCap:
 
         state = await execute_search_pipeline(
             _PARSED_AB,
-            "a - s",
+            _PARSED_AB.raw_message,
             [
                 _StubStrategy(SearchStrategyType.SONG_AS_TRACK, _fire),
                 _StubStrategy(SearchStrategyType.KEYWORD_MATCH, _second),
@@ -2587,7 +2590,7 @@ class TestApiCallCap:
         )
 
     @pytest.mark.asyncio
-    async def test_cap_fire_does_not_override_natural_completion(self, monkeypatch):
+    async def test_cap_fire_does_not_override_natural_completion(self):
         """When a strategy fires the cap AND surfaced a confirmed song match
         (``Outcome.found``, which clears ``song_not_found``), the natural-
         completion break wins — ``state.timed_out`` stays ``False`` so
@@ -2602,7 +2605,7 @@ class TestApiCallCap:
 
         state = await execute_search_pipeline(
             _PARSED_AB,
-            "a - s",
+            _PARSED_AB.raw_message,
             [_StubStrategy(SearchStrategyType.SONG_AS_TRACK, _succeed_and_fire)],
         )
 
@@ -2610,7 +2613,7 @@ class TestApiCallCap:
         assert state.timed_out is False
 
     @pytest.mark.asyncio
-    async def test_cap_fire_propagates_under_artist_fallback_shape(self, monkeypatch):
+    async def test_cap_fire_propagates_under_artist_fallback_shape(self):
         """``Outcome.artist_fallback(items)`` sets both ``state.results`` and
         ``state.song_not_found=True``. The natural-completion break (which
         requires ``not state.song_not_found``) does NOT fire — so a cap-fire
@@ -2633,7 +2636,7 @@ class TestApiCallCap:
 
         state = await execute_search_pipeline(
             _PARSED_AB,
-            "a - s",
+            _PARSED_AB.raw_message,
             [
                 _StubStrategy(SearchStrategyType.ARTIST_PLUS_ALBUM, _artist_fallback_and_fire),
                 _StubStrategy(SearchStrategyType.TRACK_ON_COMPILATION, _followup),
@@ -2649,7 +2652,7 @@ class TestApiCallCap:
         )
 
     @pytest.mark.asyncio
-    async def test_cap_fire_does_not_leak_across_concurrent_bulk_items(self, monkeypatch):
+    async def test_cap_fire_does_not_leak_across_concurrent_bulk_items(self):
         """The bulk endpoint runs items CONCURRENTLY via ``asyncio.gather`` —
         the iter-2 sequential-only test missed this. Drive two pipelines in
         flight at the same time: only the one whose strategy fires the cap
@@ -2662,34 +2665,36 @@ class TestApiCallCap:
 
         from core.search import Outcome, SearchStrategyType, execute_search_pipeline
 
-        # Two items take turns at await points; item A fires the cap, item B
-        # never does. With per-task ContextVar isolation, A.timed_out=True
-        # and B.timed_out=False.
+        # Two items take turns at await points: B enters its attempt and
+        # signals; A waits for that signal before firing the cap, ensuring both
+        # are live in their respective tasks when A's increment happens. A
+        # `wait_for(timeout=2.0)` guards against a regression that drops B's
+        # `.set()` and would otherwise hang the suite.
         item_b_started = _asyncio.Event()
+        item_a_fired = _asyncio.Event()
 
         async def _attempt_a(_p, _s, _r):
-            # Wait until item B has also entered its strategy attempt so the
-            # two are genuinely in flight when A fires the cap — closes the
-            # race window the iter-2 design left open.
-            await item_b_started.wait()
+            await _asyncio.wait_for(item_b_started.wait(), timeout=2.0)
             _fire_cap_via_recorder()
+            item_a_fired.set()
             return Outcome.empty()
 
         async def _attempt_b(_p, _s, _r):
             item_b_started.set()
-            # Yield long enough that A's fire lands before B returns.
-            await _asyncio.sleep(0.01)
+            # Wait for A's fire so the test pins the property 'A's increment
+            # is invisible to B' rather than the wall-clock 'A finished first'.
+            await _asyncio.wait_for(item_a_fired.wait(), timeout=2.0)
             return Outcome.empty()
 
         state_a, state_b = await _asyncio.gather(
             execute_search_pipeline(
                 _PARSED_AB,
-                "a - s",
+                _PARSED_AB.raw_message,
                 [_StubStrategy(SearchStrategyType.SONG_AS_TRACK, _attempt_a)],
             ),
             execute_search_pipeline(
                 _PARSED_AB,
-                "a - s",
+                _PARSED_AB.raw_message,
                 [_StubStrategy(SearchStrategyType.KEYWORD_MATCH, _attempt_b)],
             ),
         )

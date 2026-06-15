@@ -102,36 +102,21 @@ control-flow propagation so concurrent bulk items don't race through the
 shared cache_stats dict."""
 
 
-_cap_fire_count_var: ContextVar[list[int]] = ContextVar("lml_cap_fire_count")
-"""Per-:func:`execute_search_pipeline`-invocation cap-fire counter, used as the
-control-flow channel between ``_chunked_gather``'s cap-fire site and the
-runner's post-strategy propagation check.
-
-Why a ContextVar (and not the cache_stats dict): the bulk endpoint runs items
-concurrently via ``asyncio.gather`` under one cache_stats dict; if the
-propagation signal lived on that shared dict, item A firing the cap mid-flight
-would race-poison item B's post-strategy read. ``ContextVar.set`` inside an
-``asyncio.Task`` mutates only the task's own context copy, so each item's
-``execute_search_pipeline`` call gets its own isolated counter. PostHog/Sentry
-keep using the shared cache_stats counter (:data:`SEARCH_API_CALL_CAP_FIRED_STAT_KEY`)
-for batch-aggregate telemetry — those two channels are deliberately separate.
-
-The value is a single-element ``list[int]`` so the writer
-(:func:`_record_cap_fire_for_runner`) can ``counter[0] += 1`` without calling
-``.set()`` again (which would re-bind the var to a new list and lose the
-parent reference the runner holds). Outside ``execute_search_pipeline`` the
-var is unbound and the writer is a no-op — warm-path callers and direct unit
-tests of ``_chunked_gather`` are unaffected."""
+_cap_fire_count_var: ContextVar[list[int] | None] = ContextVar("lml_cap_fire_count", default=None)
+"""Per-:func:`execute_search_pipeline` cap-fire counter for runner control flow,
+isolated from sibling pipeline calls via ``ContextVar.set`` on each entry
+(mutates only the current task's context copy). The shared cache_stats counter
+keyed by :data:`SEARCH_API_CALL_CAP_FIRED_STAT_KEY` covers batch-aggregate
+PostHog/Sentry telemetry; this var covers control flow — two channels by
+design. Stored as a single-element ``list[int]`` (mutable box) so the writer
+can ``counter[0] += 1`` without re-binding the var, which would lose the
+parent reference the runner holds. ``default=None`` so an unset read in a
+warm-path or direct-``_chunked_gather`` unit test is structurally a no-op."""
 
 
 def _record_cap_fire_for_runner() -> None:
-    """Bump the per-pipeline-invocation cap-fire counter, if a runner is active.
-
-    Called by ``lookup.orchestrator._record_search_api_call_cap_fired`` alongside
-    the cache-stats telemetry write. Outside :func:`execute_search_pipeline`
-    (no counter set in the current task's context), this is a no-op.
-    """
-    counter = _cap_fire_count_var.get(None)
+    """Bump the per-pipeline cap-fire counter if a runner is active; no-op otherwise."""
+    counter = _cap_fire_count_var.get()
     if counter is None:
         return
     counter[0] += 1
@@ -741,7 +726,38 @@ async def execute_search_pipeline(
     # ContextVar (not the shared cache_stats dict) so concurrent bulk items
     # don't race. See :data:`_cap_fire_count_var` for the rationale.
     cap_fire_counter: list[int] = [0]
-    _cap_fire_count_var.set(cap_fire_counter)
+    cap_fire_token = _cap_fire_count_var.set(cap_fire_counter)
+    try:
+        return await _run_strategy_pipeline(
+            state,
+            strategies,
+            parsed,
+            raw_message,
+            caller_budget_ms,
+            budget_ms,
+            hard_cap_ms,
+            cap_fire_counter,
+        )
+    finally:
+        _cap_fire_count_var.reset(cap_fire_token)
+
+
+async def _run_strategy_pipeline(
+    state: SearchState,
+    strategies: list[Strategy],
+    parsed: ParsedRequest,
+    raw_message: str,
+    caller_budget_ms: int | None,
+    budget_ms: int,
+    hard_cap_ms: int,
+    cap_fire_counter: list[int],
+) -> SearchState:
+    """Inner loop of :func:`execute_search_pipeline`.
+
+    Extracted purely so the outer function can wrap the per-task ContextVar
+    set/reset in a try/finally without indenting the entire cascade. Callers
+    use the outer function exclusively.
+    """
     # Project the caller-budget value when present so Sentry trace explorer can
     # split header-driven vs env-driven cutoffs (A8 / LML#345). The
     # effective-budget computation already clamps to env, so we record the raw
@@ -848,18 +864,13 @@ async def execute_search_pipeline(
         # happens here, driven by the outcome's flags. See :func:`_apply`.
         _apply(state, outcome)
 
-        # LML#543 cap-fire propagation. ``_chunked_gather`` bumps
-        # ``cap_fire_counter[0]`` (per-task ContextVar; see
-        # :data:`_cap_fire_count_var`) when it bails between chunks. We
-        # short-circuit the cascade when the strategy that just ran fired the
-        # cap AND we're not in the natural-completion state — the latter
-        # condition mirrors the success break below, so a strategy that
-        # surfaced an actionable result (results populated AND song matched)
-        # still wins. The artist-fallback shape (results populated AND
-        # ``song_not_found=True``) does NOT win the natural break, so cap-fire
-        # legitimately short-circuits that cascade too (the cap is the
-        # ``how-much-have-we-spent`` signal; the fallback won't get cheaper if
-        # we keep grinding).
+        # LML#543 cap-fire propagation. ``_chunked_gather`` bumps the per-task
+        # ``cap_fire_counter`` when it bails between chunks. We short-circuit
+        # the cascade exactly when the strategy fired the cap AND the natural-
+        # completion gate below would NOT have stopped us — so the artist-
+        # fallback shape (results + song_not_found) propagates, but a confirmed
+        # song match doesn't. See ``LML_SEARCH_MAX_API_CALLS`` in
+        # ``docs/env-vars.md`` for the full rationale.
         if cap_fire_counter[0] > strategy_cap_fire_baseline and not (
             state.results and not state.song_not_found
         ):
