@@ -34,6 +34,9 @@ class TestSourceColumnDispatch:
     def test_bandcamp_maps_to_bandcamp_album_url(self):
         assert RELEASE_SOURCE_COLUMN["bandcamp"] == "bandcamp_album_url"
 
+    def test_apple_music_album_maps_to_apple_music_album_id(self):
+        assert RELEASE_SOURCE_COLUMN["apple_music_album"] == "apple_music_album_id"
+
     def test_unknown_source_is_absent(self):
         assert "musicbrainz_release" not in RELEASE_SOURCE_COLUMN
         assert "spotify_album" not in RELEASE_SOURCE_COLUMN
@@ -133,6 +136,53 @@ class TestValidateBandcamp:
             validate_and_canonicalize_external_id("bandcamp", "")
 
 
+class TestValidateAppleMusicAlbum:
+    """Apple Music album IDs are numeric strings; reject empty / non-numeric / zero.
+
+    Apple's URL parser (release/apple_music_url_parser.py) admits IDs of 6 or
+    more digits. The validator mirrors that floor: positive decimal integer,
+    no leading sign / whitespace / underscores / leading zeros, no zero
+    sentinel. Same posture as the Discogs sentinel rule — see the docstring
+    on ``_validate_discogs_positive_int`` for the rationale.
+    """
+
+    @pytest.mark.parametrize("external_id", ["123456", "1234567890", "999999999999"])
+    def test_accepts_positive_integer_strings(self, external_id):
+        assert (
+            validate_and_canonicalize_external_id("apple_music_album", external_id) == external_id
+        )
+
+    def test_rejects_zero(self):
+        with pytest.raises(InvalidReleaseExternalIdError):
+            validate_and_canonicalize_external_id("apple_music_album", "0")
+
+    @pytest.mark.parametrize("external_id", ["-1", "-12345"])
+    def test_rejects_negative(self, external_id):
+        with pytest.raises(InvalidReleaseExternalIdError):
+            validate_and_canonicalize_external_id("apple_music_album", external_id)
+
+    @pytest.mark.parametrize(
+        "external_id",
+        [
+            "abc",
+            "12.5",
+            "1e2",
+            "",
+            " ",
+            "1 2",
+            " 12",  # leading whitespace
+            "12 ",  # trailing whitespace
+            "+12",  # leading sign
+            "12_000",  # PEP 515 underscore
+            "012",  # leading zero
+            "0012345",  # leading zeros
+        ],
+    )
+    def test_rejects_non_integer(self, external_id):
+        with pytest.raises(InvalidReleaseExternalIdError):
+            validate_and_canonicalize_external_id("apple_music_album", external_id)
+
+
 class TestValidateUnknownSource:
     """An unrecognised source is a programmer error — pydantic blocks it upstream,
     but the validator must still refuse rather than silently mint a bad row."""
@@ -142,13 +192,27 @@ class TestValidateUnknownSource:
             validate_and_canonicalize_external_id("musicbrainz_release", "abc-123")
 
 
+# Sources known to the entity store but not yet exposed via the public
+# ``POST /api/v1/identity/resolve`` endpoint. The dispatch table accepts
+# these for internal callers (e.g. ``lookup/apple_music_postprocess.py``'s
+# mint-on-live-resolve) while the matching ``ReleaseIdentitySource`` enum
+# entry in ``wxyc-shared/api.yaml`` is being negotiated. Adding to this
+# set is a load-bearing tradeoff: it lets the LML-side mint ship without
+# blocking on a cross-repo schema change, but it also means the source
+# is NOT callable via the documented HTTP surface. Drain this set in
+# lockstep with the wxyc-shared enum updates.
+_INTERNAL_ONLY_SOURCES = frozenset({"apple_music_album"})
+
+
 class TestRegistryDriftInvariant:
     """The set of release sources lives in four places that must stay in sync:
 
     - ``RELEASE_SOURCE_COLUMN`` (this module).
     - ``coerce_external_id`` if-chain (this module).
     - ``ReleaseIdentitySource`` enum in ``generated/api_models.py`` (and the
-      ``wxyc-shared/api.yaml`` source it is generated from).
+      ``wxyc-shared/api.yaml`` source it is generated from). Exception:
+      sources in ``_INTERNAL_ONLY_SOURCES`` are known to the store but
+      not yet exposed via the public endpoint.
     - DDL columns in ``entity/release_identity.sql``.
 
     If a future PR adds a source to the enum / dict / DDL but forgets one of
@@ -160,12 +224,29 @@ class TestRegistryDriftInvariant:
         from generated.api_models import ReleaseIdentitySource
 
         enum_values = {member.value for member in ReleaseIdentitySource}
-        assert enum_values == set(RELEASE_SOURCE_COLUMN.keys()), (
-            f"ReleaseIdentitySource enum ({enum_values}) and "
-            f"RELEASE_SOURCE_COLUMN dict ({set(RELEASE_SOURCE_COLUMN.keys())}) "
-            f"disagree. Adding a release source means updating both — and the "
-            f"DDL in entity/release_identity.sql and a sentinel rule in "
-            f"identity/release_validation.py."
+        column_keys = set(RELEASE_SOURCE_COLUMN.keys())
+        # ``column_keys`` may be a superset of ``enum_values`` while internal-
+        # only sources are not yet wired through the API. The invariant is:
+        # every enum value must have a RELEASE_SOURCE_COLUMN entry (so any
+        # source the public endpoint accepts will dispatch), and every column
+        # key not in the enum must be on the explicit internal-only allow-list
+        # (so a forgotten enum update can't silently make a source unreachable).
+        missing_from_dict = enum_values - column_keys
+        assert not missing_from_dict, (
+            f"ReleaseIdentitySource enum has {missing_from_dict!r} that "
+            f"RELEASE_SOURCE_COLUMN does not — the public endpoint would 500 "
+            f"on those sources. Add the dict entry + a sentinel rule in "
+            f"identity/release_validation.py + a DDL column in "
+            f"entity/release_identity.sql."
+        )
+        unsanctioned_internal = column_keys - enum_values - _INTERNAL_ONLY_SOURCES
+        assert not unsanctioned_internal, (
+            f"RELEASE_SOURCE_COLUMN has {unsanctioned_internal!r} not in the "
+            f"ReleaseIdentitySource enum and not on the _INTERNAL_ONLY_SOURCES "
+            f"allow-list. Either add the source to wxyc-shared/api.yaml's "
+            f"ReleaseIdentitySource enum and regenerate generated/api_models.py, "
+            f"or add it to _INTERNAL_ONLY_SOURCES with a comment explaining "
+            f"why it's deliberately not on the public endpoint."
         )
 
     def test_release_source_columns_match_ddl(self):
@@ -194,6 +275,7 @@ class TestRegistryDriftInvariant:
             "discogs_release": "12345",
             "discogs_master": "789",
             "bandcamp": "https://autechre.bandcamp.com/album/confield",
+            "apple_music_album": "1234567890",
         }
         for source in RELEASE_SOURCE_COLUMN:
             assert source in good_inputs, (
@@ -223,6 +305,7 @@ class TestRegistryDriftInvariant:
             "discogs_release": "12345",
             "discogs_master": "789",
             "bandcamp": "https://autechre.bandcamp.com/album/confield",
+            "apple_music_album": "1234567890",
         }
         for source in RELEASE_SOURCE_COLUMN:
             assert source in canonical_inputs, (
@@ -247,6 +330,11 @@ class TestCoerceExternalId:
     def test_bandcamp_stays_string(self):
         url = "https://autechre.bandcamp.com/album/confield"
         assert coerce_external_id("bandcamp", url) == url
+
+    def test_apple_music_album_stays_string(self):
+        # apple_music_album_id is a TEXT column (Apple's numeric IDs can grow
+        # past INT32 — the column is TEXT so the bind value also stays str).
+        assert coerce_external_id("apple_music_album", "1234567890") == "1234567890"
 
     def test_unknown_source_raises(self):
         # Defense-in-depth — should never happen post-validation.

@@ -219,6 +219,68 @@ class TestReleaseIdentityStore:
         assert logs[0]["confidence"] == pytest.approx(1.0)
 
     @pytest.mark.asyncio
+    async def test_mint_apple_music_album_persists_album_id(self, pg_source):
+        store = EntityStore(pg_source)
+        album_id = "1234567890"
+        identity_id, minted = await store.mint_or_get_release_identity(
+            source="apple_music_album", external_id=album_id
+        )
+        assert minted is True
+        row = await pg_source.fetchone(
+            "SELECT apple_music_album_id FROM entity.release_identity WHERE id = $1",
+            identity_id,
+        )
+        assert row["apple_music_album_id"] == album_id
+        # The apple_music_album mint path must also write a reconciliation
+        # log row with the canonical album_id — symmetric with Bandcamp
+        # (the other TEXT-bound source) and Discogs (the integer-bound
+        # sources). Exercises the TEXT bind path for the
+        # apple_music_album_id column.
+        logs = await pg_source.fetchall(
+            "SELECT source, external_id, method, confidence "
+            "FROM entity.release_reconciliation_log WHERE identity_id = $1",
+            identity_id,
+        )
+        assert len(logs) == 1
+        assert logs[0]["source"] == "apple_music_album"
+        assert logs[0]["external_id"] == album_id
+        assert logs[0]["method"] == "exact_match"
+        assert logs[0]["confidence"] == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_mint_apple_music_album_idempotent(self, pg_source):
+        # Second resolve must return the same identity_id and write no new
+        # reconciliation row — re-resolves carry no new evidence.
+        store = EntityStore(pg_source)
+        album_id = "1234567890"
+        first_id, first_minted = await store.mint_or_get_release_identity(
+            source="apple_music_album", external_id=album_id
+        )
+        second_id, second_minted = await store.mint_or_get_release_identity(
+            source="apple_music_album", external_id=album_id
+        )
+        assert first_minted is True
+        assert second_minted is False
+        assert first_id == second_id
+        logs = await pg_source.fetchall(
+            "SELECT id FROM entity.release_reconciliation_log WHERE identity_id = $1",
+            first_id,
+        )
+        assert len(logs) == 1
+
+    @pytest.mark.asyncio
+    async def test_get_release_identity_by_source_round_trips_apple_music_album(self, pg_source):
+        store = EntityStore(pg_source)
+        album_id = "9876543210"
+        minted_id, _ = await store.mint_or_get_release_identity(
+            source="apple_music_album", external_id=album_id
+        )
+        found = await store.get_release_identity_by_source(
+            source="apple_music_album", external_id=album_id
+        )
+        assert found == minted_id
+
+    @pytest.mark.asyncio
     async def test_get_release_identity_by_source_hits_existing_row(self, pg_source):
         store = EntityStore(pg_source)
         minted_id, _ = await store.mint_or_get_release_identity(
@@ -485,6 +547,19 @@ class TestReleaseIdentityResolveEndpoint:
         assert bare.status_code == 200 and trailing.status_code == 200
         assert trailing.json()["minted"] is False
         assert trailing.json()["identity_id"] == bare.json()["identity_id"]
+
+    # NOTE: A public-endpoint round-trip test for source=apple_music_album
+    # (mirroring test_bandcamp_round_trip above) requires
+    # ``apple_music_album`` to land in the ``ReleaseIdentitySource`` enum
+    # in ``wxyc-shared/api.yaml``. Pydantic blocks the unknown source with
+    # 422 today so a roundtrip test would only assert the 422 — not the
+    # mint we actually want. Coverage for the apple_music_album mint path
+    # lives at the store level in
+    # ``TestReleaseIdentityStore::test_mint_apple_music_album_persists_album_id``
+    # (and friends), which exercise ``mint_or_get_release_identity``
+    # directly — the same code path the post-process invokes from
+    # ``lookup/apple_music_postprocess.py``. The public-endpoint test
+    # gets added in the wxyc-shared enum follow-up.
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

@@ -18,7 +18,14 @@ request supplied both artist and album, this module:
    the cache stores album URLs that are reused across different song
    lookups on the same album.
 2. Mutates the ``update`` dict in place when the resolver returns a URL.
-3. Tags ``apple_music.persistent_lookup.fired = True`` on the active
+3. Mints the parsed album_id into ``entity.release_identity.apple_music_album_id``
+   on ``live_resolved`` outcomes only. Cache hits already minted on
+   their original resolution; re-minting writes redundant
+   reconciliation log rows for no benefit. The mint is best-effort —
+   ``mint_or_get_release_identity`` failures (PG outage, validation
+   rejection, unparseable URL) are logged and swallowed so the
+   user-visible URL still surfaces in the response.
+4. Tags ``apple_music.persistent_lookup.fired = True`` on the active
    Sentry transaction. The per-item outcome is intentionally NOT tagged
    on the transaction because ``enrich_one`` runs concurrently across
    N items via ``asyncio.gather``; per-item ``set_data`` on the same key
@@ -29,17 +36,10 @@ request supplied both artist and album, this module:
 
 Side effects degrade gracefully. PG errors swallow inside the cache
 layer; the live probe is wrapped in ``asyncio.wait_for`` so a single
-Apple 429/5xx storm cannot pin the request past its budget; Sentry
-projection errors log and continue. The response shape is unaffected
-by any observability or persistence failure.
-
-**Mint is intentionally not invoked here.** Wiring ``apple_music_album``
-through ``identity.release_validation.RELEASE_SOURCE_COLUMN`` +
-``coerce_external_id`` is a separate change — calling
-``mint_or_get_release_identity`` today would raise ``KeyError`` on
-every successful resolution and silently log via the surrounding
-``except`` block. The cache-write side persists the URL; the
-release-identity hop is filed as a follow-up.
+Apple 429/5xx storm cannot pin the request past its budget; mint
+failures log and continue; Sentry projection errors log and continue.
+The response shape is unaffected by any observability or persistence
+failure.
 """
 
 from __future__ import annotations
@@ -53,6 +53,7 @@ import sentry_sdk
 from clients.streaming.apple_music import AppleMusicClient
 from entity.apple_music_album_cache import resolve_apple_music_url_with_cache
 from entity.store import EntityStore
+from release.apple_music_url_parser import apple_album_id_from_url
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,33 @@ async def apply_apple_music_postprocess(
         return
 
     update["apple_music_url"] = outcome.url
+
+    # Mint only on a brand-new live resolution. Cache hits already minted
+    # on their original resolution; re-minting writes redundant
+    # reconciliation log rows for no benefit. The mint is best-effort —
+    # a PG error, validation rejection, or unparseable URL here must NOT
+    # undo the user-visible URL surfacing above.
+    if outcome.source != "live_resolved":
+        return
+
+    album_id = apple_album_id_from_url(outcome.url)
+    if album_id is None:
+        # Apple returned a URL we can't parse for an album_id (slug-only,
+        # malformed locale, novel format). Surface the URL but don't
+        # mint — keying the entity graph on an unparseable ID would
+        # corrupt downstream joins.
+        return
+
+    try:
+        await entity_store.mint_or_get_release_identity(
+            source="apple_music_album", external_id=album_id
+        )
+    except Exception:
+        logger.exception(
+            "apple_music_album mint failed for album_id=%s (url=%s) — URL still surfaced",
+            album_id,
+            outcome.url,
+        )
 
 
 def _mark_fired() -> None:
