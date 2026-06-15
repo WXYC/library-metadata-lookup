@@ -53,6 +53,7 @@ import sentry_sdk
 from clients.streaming.apple_music import AppleMusicClient
 from entity.apple_music_album_cache import resolve_apple_music_url_with_cache
 from entity.store import EntityStore
+from identity.release_validation import validate_and_canonicalize_external_id
 from release.apple_music_url_parser import apple_album_id_from_url
 
 logger = logging.getLogger(__name__)
@@ -167,9 +168,19 @@ async def apply_apple_music_postprocess(
         # corrupt downstream joins.
         return
 
+    # Run the sentinel rule before the mint. ``mint_or_get_release_identity``
+    # documents that callers must validate first (the public endpoint at
+    # ``identity/router.py`` does this); the post-process is the second
+    # caller and must honor the same contract. The URL parser's ``\d{6,}``
+    # floor is looser than the validator's ``[1-9][0-9]*`` rule (the parser
+    # admits all-zero / leading-zero IDs the validator rejects), so this
+    # is real defense-in-depth, not a coincidental no-op. Pulled inside
+    # the try/except so a validation rejection is treated the same way
+    # as a PG outage — log + continue; URL still surfaces.
     try:
+        canonical_album_id = validate_and_canonicalize_external_id("apple_music_album", album_id)
         await entity_store.mint_or_get_release_identity(
-            source="apple_music_album", external_id=album_id
+            source="apple_music_album", external_id=canonical_album_id
         )
     except Exception:
         logger.exception(

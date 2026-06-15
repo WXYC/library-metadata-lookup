@@ -460,3 +460,38 @@ class TestApplyAppleMusicPostprocessMint:
 
         assert update["apple_music_url"] == unparseable_url
         entity_store.mint_or_get_release_identity.assert_not_called()
+
+    async def test_zero_padded_id_is_validated_before_mint_and_url_still_surfaces(self):
+        # Defense-in-depth: the URL parser regex ``\d{6,}`` admits
+        # all-zero / leading-zero IDs that the validator's
+        # ``[1-9][0-9]*`` rule rejects. The post-process must call
+        # ``validate_and_canonicalize_external_id`` BEFORE the mint so a
+        # poisoned id never lands in entity.release_identity. Validation
+        # rejection is a best-effort failure mode (same posture as the
+        # PG-outage and unparseable-URL paths): the URL must still
+        # surface on the update dict. This test would pass-by-coincidence
+        # if the validator were skipped — the assertion that mint is
+        # NOT called is what locks the contract in.
+        update = {"apple_music_url": None}
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        entity_store = _make_entity_store()
+        entity_store.mint_or_get_release_identity = AsyncMock(return_value=(42, True))
+        # URL whose album_id is "000000" — passes the URL parser's
+        # `\d{6,}` floor but the validator rejects on leading zero.
+        zero_padded_url = "https://music.apple.com/us/album/foo/000000"
+
+        with patch(
+            "lookup.apple_music_postprocess.resolve_apple_music_url_with_cache",
+            new=AsyncMock(return_value=ResolveOutcome(url=zero_padded_url, source="live_resolved")),
+        ):
+            await apply_apple_music_postprocess(
+                update,
+                apple_music=apple_music,
+                entity_store=entity_store,
+                request_artist="Hyd",
+                request_album="Hold Onto Me Infinity",
+                feature_enabled=True,
+            )
+
+        assert update["apple_music_url"] == zero_padded_url
+        entity_store.mint_or_get_release_identity.assert_not_called()
