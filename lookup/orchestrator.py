@@ -2554,7 +2554,6 @@ async def enrich_artwork_results(
             entity_store=entity_store,
             request_artist=artist,
             request_album=album,
-            request_song=song,
             feature_enabled=get_settings().lml_persist_apple_music_url,
         )
 
