@@ -10,9 +10,14 @@ place.
 
 Side effects:
 * Cache write through ``resolve_apple_music_url_with_cache``.
-* ``EntityStore.mint_or_get_release_identity`` mint when a real URL is
-  resolved (so ``entity.release_identity`` accumulates ``apple_music_album_id``s).
-* Sentry attribute on the active transaction: ``apple_music.persistent_lookup.source``.
+* Sentry attribute on the active transaction:
+  ``apple_music.persistent_lookup.fired = True`` (per-item outcome is
+  intentionally NOT tagged on the transaction — concurrent ``enrich_one``
+  tasks would race the ``set_data`` key).
+
+Mint into ``entity.release_identity`` is intentionally not invoked here
+until ``apple_music_album`` is wired through ``identity.release_validation``.
+The test list reflects that: there are no mint assertions in this file.
 """
 
 from __future__ import annotations
@@ -32,7 +37,6 @@ def _make_entity_store():
     """Build an EntityStore stub that exposes a PgSource AsyncMock."""
     store = MagicMock(spec=EntityStore)
     store.pg = AsyncMock(spec=PgSource)
-    store.mint_or_get_release_identity = AsyncMock(return_value=(1, True))
     return store
 
 
@@ -50,13 +54,11 @@ class TestApplyAppleMusicPostprocess:
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
-                request_song="Angel",
                 feature_enabled=False,
             )
 
         assert update["apple_music_url"] is None
         resolve.assert_not_called()
-        entity_store.mint_or_get_release_identity.assert_not_called()
 
     async def test_skips_when_apple_music_url_already_set(self):
         # Existing enrichment populated the URL; don't double-process.
@@ -71,11 +73,32 @@ class TestApplyAppleMusicPostprocess:
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
-                request_song="Angel",
                 feature_enabled=True,
             )
 
         assert update["apple_music_url"] == "https://music.apple.com/us/album/existing/1"
+        resolve.assert_not_called()
+
+    async def test_skips_when_apple_music_url_is_empty_string_sentinel(self):
+        # An empty-string sentinel ("explicitly checked, nothing to surface")
+        # must be preserved. Truthiness checks would treat "" as falsy and
+        # overwrite it with a fresh probe; ``is not None`` correctly leaves
+        # it alone.
+        update = {"apple_music_url": ""}
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        entity_store = _make_entity_store()
+
+        with patch("lookup.apple_music_postprocess.resolve_apple_music_url_with_cache") as resolve:
+            await apply_apple_music_postprocess(
+                update,
+                apple_music=apple_music,
+                entity_store=entity_store,
+                request_artist="Hyd",
+                request_album="Hold Onto Me Infinity",
+                feature_enabled=True,
+            )
+
+        assert update["apple_music_url"] == ""
         resolve.assert_not_called()
 
     async def test_skips_when_apple_music_client_missing(self):
@@ -89,7 +112,6 @@ class TestApplyAppleMusicPostprocess:
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
-                request_song="Angel",
                 feature_enabled=True,
             )
 
@@ -108,7 +130,6 @@ class TestApplyAppleMusicPostprocess:
                 entity_store=None,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
-                request_song="Angel",
                 feature_enabled=True,
             )
 
@@ -126,7 +147,6 @@ class TestApplyAppleMusicPostprocess:
                 entity_store=entity_store,
                 request_artist="",
                 request_album="Hold Onto Me Infinity",
-                request_song="Angel",
                 feature_enabled=True,
             )
 
@@ -145,15 +165,14 @@ class TestApplyAppleMusicPostprocess:
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album=None,
-                request_song="Angel",
                 feature_enabled=True,
             )
 
         resolve.assert_not_called()
 
-    async def test_live_resolved_writes_url_and_mints(self):
-        # Hyd-shape happy path: request values reach the probe, URL surfaces
-        # in the update dict, entity.release_identity gets the album_id.
+    async def test_live_resolved_writes_url_to_update(self):
+        # Hyd-shape happy path: request values reach the probe and the URL
+        # surfaces in the update dict.
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
@@ -169,7 +188,6 @@ class TestApplyAppleMusicPostprocess:
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
-                request_song="Angel",
                 feature_enabled=True,
             )
 
@@ -179,15 +197,11 @@ class TestApplyAppleMusicPostprocess:
         call_kwargs = resolve.await_args.kwargs
         assert call_kwargs["artist"] == "Hyd"
         assert call_kwargs["album"] == "Hold Onto Me Infinity"
-        assert call_kwargs["song"] == "Angel"
-        # Album_id extracted from the URL is minted into release_identity.
-        entity_store.mint_or_get_release_identity.assert_awaited_once_with(
-            source="apple_music_album", external_id="1234567890"
-        )
+        # probe_timeout_s passed through — wall-clock ceiling.
+        assert "probe_timeout_s" in call_kwargs
+        assert call_kwargs["probe_timeout_s"] > 0
 
-    async def test_cache_hit_sets_url_no_mint(self):
-        # Cache already minted on the original resolution — re-minting on
-        # every cache hit would double-write the reconciliation log.
+    async def test_cache_hit_sets_url(self):
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
@@ -203,12 +217,10 @@ class TestApplyAppleMusicPostprocess:
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
-                request_song="Angel",
                 feature_enabled=True,
             )
 
         assert update["apple_music_url"] == cached_url
-        entity_store.mint_or_get_release_identity.assert_not_called()
 
     async def test_live_miss_leaves_url_null(self):
         update = {"apple_music_url": None}
@@ -225,25 +237,21 @@ class TestApplyAppleMusicPostprocess:
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
-                request_song="Angel",
                 feature_enabled=True,
             )
 
         assert update["apple_music_url"] is None
-        entity_store.mint_or_get_release_identity.assert_not_called()
 
-    async def test_mint_failure_does_not_clear_resolved_url(self):
-        # Mint is best-effort: a PG error here must not undo the user-visible
-        # win of having an Apple Music URL surfaced.
+    async def test_live_error_leaves_url_null(self):
+        # Live_error is distinct from live_miss but the post-process
+        # treats both the same way at the call site: surface no URL.
         update = {"apple_music_url": None}
         apple_music = AsyncMock(spec=AppleMusicClient)
         entity_store = _make_entity_store()
-        entity_store.mint_or_get_release_identity = AsyncMock(side_effect=RuntimeError("PG flake"))
-        resolved_url = "https://music.apple.com/us/album/foo/1234567890"
 
         with patch(
             "lookup.apple_music_postprocess.resolve_apple_music_url_with_cache",
-            new=AsyncMock(return_value=ResolveOutcome(url=resolved_url, source="live_resolved")),
+            new=AsyncMock(return_value=ResolveOutcome(url=None, source="live_error")),
         ):
             await apply_apple_music_postprocess(
                 update,
@@ -251,35 +259,7 @@ class TestApplyAppleMusicPostprocess:
                 entity_store=entity_store,
                 request_artist="Hyd",
                 request_album="Hold Onto Me Infinity",
-                request_song="Angel",
                 feature_enabled=True,
             )
 
-        assert update["apple_music_url"] == resolved_url
-
-    async def test_unparseable_apple_url_does_not_attempt_mint(self):
-        # Defensive: if Apple returned a URL that doesn't match the
-        # album_id regex (slug-only, malformed locale), the mint step is
-        # skipped silently. The URL still surfaces in the response so the
-        # user gets the link.
-        update = {"apple_music_url": None}
-        apple_music = AsyncMock(spec=AppleMusicClient)
-        entity_store = _make_entity_store()
-        weird_url = "https://music.apple.com/album/foo"  # no locale + no id
-
-        with patch(
-            "lookup.apple_music_postprocess.resolve_apple_music_url_with_cache",
-            new=AsyncMock(return_value=ResolveOutcome(url=weird_url, source="live_resolved")),
-        ):
-            await apply_apple_music_postprocess(
-                update,
-                apple_music=apple_music,
-                entity_store=entity_store,
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                request_song="Angel",
-                feature_enabled=True,
-            )
-
-        assert update["apple_music_url"] == weird_url
-        entity_store.mint_or_get_release_identity.assert_not_called()
+        assert update["apple_music_url"] is None

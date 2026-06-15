@@ -33,6 +33,7 @@ re-running on every boot is safe.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -156,7 +157,13 @@ async def get_cached_apple_music_url(
     return CacheResult(url=None, is_known_miss=True, is_stale=is_stale)
 
 
-ResolveSource = Literal["cache_hit", "cache_miss_recent", "live_resolved", "live_miss"]
+ResolveSource = Literal[
+    "cache_hit",
+    "cache_miss_recent",
+    "live_resolved",
+    "live_miss",
+    "live_error",
+]
 
 
 @dataclass(frozen=True)
@@ -165,7 +172,9 @@ class ResolveOutcome:
 
     Carries both the URL and the path taken so callers can tag Sentry without
     reproducing the resolution's branch logic. ``url is None`` whenever
-    ``source`` is ``"cache_miss_recent"`` or ``"live_miss"``.
+    ``source`` is ``"cache_miss_recent"``, ``"live_miss"``, or
+    ``"live_error"`` — but ``live_error`` is a distinct signal so dashboards
+    can tell a genuine Apple-catalog miss from an upstream outage.
     """
 
     url: str | None
@@ -178,29 +187,38 @@ async def resolve_apple_music_url_with_cache(
     *,
     artist: str,
     album: str,
-    song: str | None,
+    probe_timeout_s: float | None = None,
     miss_ttl: timedelta = DEFAULT_MISS_TTL,
     now: datetime | None = None,
 ) -> ResolveOutcome:
-    """Read-through cache around ``apple_music.find_track_metadata``.
+    """Read-through cache around ``apple_music.find_album_match``.
 
     Branch order:
 
     1. Cache row exists with a non-null URL → return ``cache_hit`` (no API).
     2. Cache row exists with a NULL URL and ``last_checked_at`` inside
        ``miss_ttl`` → return ``cache_miss_recent`` (no API).
-    3. Otherwise call ``apple_music.find_track_metadata`` using the
-       REQUEST's ``(artist, song, album=album)`` — NOT the library row's
-       artist. The Hyd fix lives here.
+    3. Otherwise call ``apple_music.find_album_match(artist, album)`` and
+       record the outcome:
        - Apple returns a match → ``live_resolved`` and UPSERT the URL.
        - Apple returns ``None`` → ``live_miss`` and UPSERT a null entry so
          subsequent requests inside the TTL short-circuit.
-       - Apple raises → ``live_miss`` with NO cache write so a transient
-         flake doesn't lock in a spurious null.
+       - Apple raises (or the probe times out) → ``live_error`` with NO
+         cache write so a transient flake doesn't lock in a spurious null,
+         and Sentry can tell the outage apart from a genuine catalog miss.
 
-    ``song=None`` becomes ``""`` so the AppleMusicClient surface stays
-    uniform; the 80/80(/80) match floor still applies — when no song is
-    supplied the floor collapses to 80/80 against artist+album.
+    Uses ``find_album_match`` rather than ``find_track_metadata`` because
+    the cache key is the album, the cache table name is album-shaped, and
+    Apple's song-search returns per-track deep-links (``…?i=<track-id>``)
+    that would cache wrong-track URLs against the (artist, album) key on
+    every song-search request. ``find_album_match`` returns a SourceMatch
+    whose ``url`` is the album page.
+
+    The live probe is wrapped in ``asyncio.wait_for`` with
+    ``probe_timeout_s`` (caller supplies; the orchestrator passes
+    ``LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS / 1000``) so a single Apple
+    429/5xx storm cannot pin a request past its budget — same bound as
+    the in-line probe at ``lookup/orchestrator.py:2336-2346``.
     """
     cached = await get_cached_apple_music_url(
         pg, artist=artist, album=album, miss_ttl=miss_ttl, now=now
@@ -210,15 +228,27 @@ async def resolve_apple_music_url_with_cache(
     if cached.is_known_miss and not cached.is_stale:
         return ResolveOutcome(url=None, source="cache_miss_recent")
 
-    # Cache empty or stale — call Apple with REQUEST values.
+    # Cache empty or stale — call Apple with REQUEST values, wrapped in
+    # the same per-call wall-clock ceiling the in-line probe uses.
     try:
-        match = await apple_music.find_track_metadata(artist, song or "", album=album)
+        probe = apple_music.find_album_match(artist, album)
+        if probe_timeout_s is not None:
+            match = await asyncio.wait_for(probe, timeout=probe_timeout_s)
+        else:
+            match = await probe
+    except TimeoutError:
+        # Timed out — same posture as in-line probe (LML#449/#450): do not
+        # poison the cache; surface as live_error so dashboards distinguish.
+        logger.warning(
+            "apple_music_album_cache live probe timed out for %s / %s", artist, album
+        )
+        return ResolveOutcome(url=None, source="live_error")
     except Exception:
         # Transient Apple-side failure: do not poison the cache with a
         # permanent "not found" sentinel — leave the row alone and let the
         # next request retry.
         logger.exception("apple_music_album_cache live probe raised for %s / %s", artist, album)
-        return ResolveOutcome(url=None, source="live_miss")
+        return ResolveOutcome(url=None, source="live_error")
 
     if match is None:
         await set_cached_apple_music_url(pg, artist=artist, album=album, url=None)
