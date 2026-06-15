@@ -248,6 +248,27 @@ class TestRegistryDriftInvariant:
             f"or add it to _INTERNAL_ONLY_SOURCES with a comment explaining "
             f"why it's deliberately not on the public endpoint."
         )
+        # Drain check: once a previously-internal source lands in the
+        # ``ReleaseIdentitySource`` enum (the cross-repo wxyc-shared
+        # follow-up the allow-list exists to bridge), its allow-list
+        # entry becomes stale and must be removed in the same PR that
+        # regenerates ``generated/api_models.py``. A stale entry is
+        # functionally harmless today (the public endpoint accepts the
+        # source via the enum at that point) but invites later
+        # confusion: future readers see an "internal-only" label on a
+        # source that the documented HTTP surface already exposes. Fail
+        # at CI time so the cleanup can't be forgotten.
+        stale_allow_list = _INTERNAL_ONLY_SOURCES & enum_values
+        assert not stale_allow_list, (
+            f"_INTERNAL_ONLY_SOURCES contains {stale_allow_list!r} which "
+            f"is also present in the ReleaseIdentitySource enum — the "
+            f"public endpoint already accepts this source, so the "
+            f"internal-only label is stale. Drop {stale_allow_list!r} "
+            f"from _INTERNAL_ONLY_SOURCES (and update the NOTE comment "
+            f"in tests/integration/test_release_identity.py + the plan "
+            f"doc to reflect that the public-endpoint round-trip test "
+            f"is no longer deferred)."
+        )
 
     def test_release_source_columns_match_ddl(self):
         # The DDL in entity/release_identity.sql is the canonical column
