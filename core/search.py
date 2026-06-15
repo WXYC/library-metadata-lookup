@@ -12,12 +12,12 @@ import os
 import re
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import ClassVar, Protocol
 
 import sentry_sdk
-from wxyc_fastapi.observability import get_cache_stats
 
 from generated.api_models import TrackMatchHint
 from library.models import LibraryItem
@@ -96,12 +96,45 @@ def resolve_positive_int_env(env_var: str, default: int) -> int:
 
 SEARCH_API_CALL_CAP_FIRED_STAT_KEY = "search_api_call_cap_fired"
 """Per-request cache-stats key incremented on every LML#543 ``_chunked_gather``
-cap-fire. A *counter*, not a flag: each leg that trips its own per-invocation
-cap adds 1, so the runner's baseline-delta check can distinguish
-'fires originated in THIS lookup' from 'fires inherited from sibling bulk items
-via the shared cache_stats ContextVar'. Defined here (not in
-``lookup/orchestrator``) so :func:`execute_search_pipeline` can read it without
-creating a circular import."""
+cap-fire. A counter for batch-aggregate PostHog/Sentry telemetry — the runner
+uses a *separate* per-task ContextVar (:data:`_cap_fire_count_var` below) for
+control-flow propagation so concurrent bulk items don't race through the
+shared cache_stats dict."""
+
+
+_cap_fire_count_var: ContextVar[list[int]] = ContextVar("lml_cap_fire_count")
+"""Per-:func:`execute_search_pipeline`-invocation cap-fire counter, used as the
+control-flow channel between ``_chunked_gather``'s cap-fire site and the
+runner's post-strategy propagation check.
+
+Why a ContextVar (and not the cache_stats dict): the bulk endpoint runs items
+concurrently via ``asyncio.gather`` under one cache_stats dict; if the
+propagation signal lived on that shared dict, item A firing the cap mid-flight
+would race-poison item B's post-strategy read. ``ContextVar.set`` inside an
+``asyncio.Task`` mutates only the task's own context copy, so each item's
+``execute_search_pipeline`` call gets its own isolated counter. PostHog/Sentry
+keep using the shared cache_stats counter (:data:`SEARCH_API_CALL_CAP_FIRED_STAT_KEY`)
+for batch-aggregate telemetry — those two channels are deliberately separate.
+
+The value is a single-element ``list[int]`` so the writer
+(:func:`_record_cap_fire_for_runner`) can ``counter[0] += 1`` without calling
+``.set()`` again (which would re-bind the var to a new list and lose the
+parent reference the runner holds). Outside ``execute_search_pipeline`` the
+var is unbound and the writer is a no-op — warm-path callers and direct unit
+tests of ``_chunked_gather`` are unaffected."""
+
+
+def _record_cap_fire_for_runner() -> None:
+    """Bump the per-pipeline-invocation cap-fire counter, if a runner is active.
+
+    Called by ``lookup.orchestrator._record_search_api_call_cap_fired`` alongside
+    the cache-stats telemetry write. Outside :func:`execute_search_pipeline`
+    (no counter set in the current task's context), this is a no-op.
+    """
+    counter = _cap_fire_count_var.get(None)
+    if counter is None:
+        return
+    counter[0] += 1
 
 
 def resolve_search_budget_ms() -> int:
@@ -704,18 +737,11 @@ async def execute_search_pipeline(
 
     budget_ms = resolve_effective_search_budget_ms(caller_budget_ms)
     hard_cap_ms = resolve_search_hard_timeout_ms()
-    # Baseline for the LML#543 cap-fire propagation. The
-    # ``search_api_call_cap_fired`` stat is a counter on the request-scoped
-    # cache-stats dict, which the bulk endpoint shares across all items in a
-    # batch (intentional, for batch-aggregate PostHog). Capturing the count
-    # at entry and checking the DELTA after each strategy localises the
-    # signal to THIS lookup — fires from sibling bulk items are invisible.
-    _initial_stats = get_cache_stats()
-    cap_fired_baseline = (
-        _initial_stats.get(SEARCH_API_CALL_CAP_FIRED_STAT_KEY, 0)
-        if _initial_stats is not None
-        else 0
-    )
+    # Per-invocation cap-fire counter for LML#543 propagation. Lives on a
+    # ContextVar (not the shared cache_stats dict) so concurrent bulk items
+    # don't race. See :data:`_cap_fire_count_var` for the rationale.
+    cap_fire_counter: list[int] = [0]
+    _cap_fire_count_var.set(cap_fire_counter)
     # Project the caller-budget value when present so Sentry trace explorer can
     # split header-driven vs env-driven cutoffs (A8 / LML#345). The
     # effective-budget computation already clamps to env, so we record the raw
@@ -803,6 +829,7 @@ async def execute_search_pipeline(
         # Outcome-returning contract (attempt cannot mutate state) makes a
         # cancelled attempt a structural no-op against SearchState — no need
         # for an await-then-commit discipline inside the strategy body.
+        strategy_cap_fire_baseline = cap_fire_counter[0]
         try:
             outcome = await asyncio.wait_for(
                 strategy.attempt(parsed, state, raw_message),
@@ -821,30 +848,20 @@ async def execute_search_pipeline(
         # happens here, driven by the outcome's flags. See :func:`_apply`.
         _apply(state, outcome)
 
-        # LML#543 cap-fire propagation. ``_chunked_gather`` increments
-        # ``search_api_call_cap_fired`` on the request-scoped cache-stats dict
-        # when it bails between chunks. Mirror onto ``state.timed_out`` so the
-        # PostHog/Sentry slice ``lml.cache.search_api_call_cap_fired>0`` lines
-        # up with the response's ``timeout`` field, and break the cascade so
-        # subsequent strategies don't keep grinding past the budget the cap was
-        # meant to bound. Two narrowings vs a naïve flag check:
-        #
-        # 1. **Baseline-delta**: only fires propagate that happened *in this
-        #    lookup* (delta > 0) — the bulk endpoint shares one cache_stats
-        #    dict across items, so a sticky flag would let item 1's cap-fire
-        #    poison items 2..N's cascades.
-        # 2. **Gated on ``not state.results``**: when the same strategy
-        #    surfaced matches before tripping the cap on its tail, the
-        #    natural-completion break below handles them. Cap-fire only
-        #    short-circuits the empty case (mirroring the LML#347
-        #    caller-budget gate's ``not state.results`` clause). Pre-PR
-        #    ``state.timed_out=True with state.results=non-empty`` was
-        #    impossible; keep that invariant.
-        _stats_now = get_cache_stats()
-        if (
-            _stats_now is not None
-            and _stats_now.get(SEARCH_API_CALL_CAP_FIRED_STAT_KEY, 0) > cap_fired_baseline
-            and not state.results
+        # LML#543 cap-fire propagation. ``_chunked_gather`` bumps
+        # ``cap_fire_counter[0]`` (per-task ContextVar; see
+        # :data:`_cap_fire_count_var`) when it bails between chunks. We
+        # short-circuit the cascade when the strategy that just ran fired the
+        # cap AND we're not in the natural-completion state — the latter
+        # condition mirrors the success break below, so a strategy that
+        # surfaced an actionable result (results populated AND song matched)
+        # still wins. The artist-fallback shape (results populated AND
+        # ``song_not_found=True``) does NOT win the natural break, so cap-fire
+        # legitimately short-circuits that cascade too (the cap is the
+        # ``how-much-have-we-spent`` signal; the fallback won't get cheaper if
+        # we keep grinding).
+        if cap_fire_counter[0] > strategy_cap_fire_baseline and not (
+            state.results and not state.song_not_found
         ):
             state.timed_out = True
             break
