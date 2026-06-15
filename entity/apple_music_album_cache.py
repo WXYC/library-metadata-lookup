@@ -246,9 +246,7 @@ async def resolve_apple_music_url_with_cache(
     except TimeoutError:
         # Timed out — same posture as in-line probe (LML#449/#450): do not
         # poison the cache; surface as live_error so dashboards distinguish.
-        logger.warning(
-            "apple_music_album_cache live probe timed out for %s / %s", artist, album
-        )
+        logger.warning("apple_music_album_cache live probe timed out for %s / %s", artist, album)
         return ResolveOutcome(url=None, source="live_error")
     except Exception:
         # Transient Apple-side failure: do not poison the cache with a
