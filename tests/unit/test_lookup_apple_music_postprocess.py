@@ -10,10 +10,16 @@ place.
 
 Side effects:
 * Cache write through ``resolve_apple_music_url_with_cache``.
-* Sentry attribute on the active transaction:
-  ``apple_music.persistent_lookup.fired = True`` (per-item outcome is
-  intentionally NOT tagged on the transaction — concurrent ``enrich_one``
-  tasks would race the ``set_data`` key).
+* Sentry attributes on the active transaction (LML#575):
+  - ``apple_music.persistent_lookup.fired = True`` — "post-process ran at
+    least once on this request" (back-compat boolean).
+  - ``apple_music.persistent_lookup.<source> = True`` — per-outcome
+    boolean, one of ``cache_hit``, ``cache_miss_recent``, ``live_resolved``,
+    ``live_miss``, ``live_error``. Each invocation sets one outcome key;
+    across the gather fan-out, multiple keys can land on the same
+    transaction (one per distinct outcome observed). Race-free because
+    different keys never overwrite each other, and the same key set to
+    ``True`` repeatedly is idempotent.
 
 Mint into ``entity.release_identity.apple_music_album_id`` fires on
 ``live_resolved`` outcomes. The mint is best-effort: failures (PG
@@ -26,15 +32,19 @@ in ``lookup/apple_music_postprocess.py`` for the contract.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio
+from typing import get_args
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
 from clients.streaming.apple_music import AppleMusicClient
-from entity.apple_music_album_cache import ResolveOutcome
+from entity.apple_music_album_cache import ResolveOutcome, ResolveSource
 from entity.sources import PgSource
 from entity.store import EntityStore
 from lookup.apple_music_postprocess import apply_apple_music_postprocess
+
+_RESOLVE_SOURCE_VALUES: set[str] = set(get_args(ResolveSource))
 
 
 def _make_entity_store():
@@ -42,6 +52,15 @@ def _make_entity_store():
     store = MagicMock(spec=EntityStore)
     store.pg = AsyncMock(spec=PgSource)
     return store
+
+
+def _make_sentry_scope():
+    """Build a Sentry scope + transaction pair that records every set_data."""
+    transaction = Mock()
+    transaction.set_data = Mock()
+    scope = Mock()
+    scope.transaction = transaction
+    return scope, transaction
 
 
 @pytest.mark.asyncio
@@ -495,3 +514,233 @@ class TestApplyAppleMusicPostprocessMint:
 
         assert update["apple_music_url"] == zero_padded_url
         entity_store.mint_or_get_release_identity.assert_not_called()
+
+
+_PARAMETRIZED_SOURCES: list[tuple[str, str | None]] = [
+    ("cache_hit", "https://music.apple.com/us/album/foo/9999999"),
+    ("cache_miss_recent", None),
+    ("live_resolved", "https://music.apple.com/us/album/foo/1234567890"),
+    ("live_miss", None),
+    ("live_error", None),
+]
+
+
+def test_parametrized_sources_cover_every_resolve_source_variant():
+    """Completeness guard for the parametrized Sentry-tag test.
+
+    The parametrize list is hand-maintained. If a new value is added to
+    ``ResolveSource`` (e.g. a future ``live_throttled`` for 429 storms) the
+    parametrized cases below would silently keep passing without exercising
+    the new variant. This assertion fails fast in that case and forces a
+    follow-up to add the missing parametrize tuple.
+    """
+    parametrized = {source for source, _ in _PARAMETRIZED_SOURCES}
+    assert parametrized == _RESOLVE_SOURCE_VALUES, (
+        f"Parametrize list drifted from ResolveSource. "
+        f"Missing from parametrize: {_RESOLVE_SOURCE_VALUES - parametrized}; "
+        f"extra in parametrize: {parametrized - _RESOLVE_SOURCE_VALUES}"
+    )
+
+
+@pytest.mark.asyncio
+class TestPersistentLookupSentryTags:
+    """LML#575: each ResolveOutcome.source projects a per-outcome boolean
+    tag onto the active Sentry transaction, alongside the back-compat
+    ``apple_music.persistent_lookup.fired = True`` boolean.
+
+    Why per-outcome: PR #571's single ``fired`` boolean only answered "did
+    the post-process run at all" but dashboards need cache hit rate, live
+    error rate (Apple outage signal), and live-call cost. Same `set_data`
+    pattern as ``lookup/orchestrator.py:3013-3022``. Concurrent
+    ``enrich_one`` tasks setting the same key with the same value (True)
+    are race-free.
+    """
+
+    @pytest.mark.parametrize(("source", "resolved_url"), _PARAMETRIZED_SOURCES)
+    async def test_per_outcome_boolean_set_for_each_source(self, source, resolved_url):
+        update = {"apple_music_url": None}
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        entity_store = _make_entity_store()
+        scope, transaction = _make_sentry_scope()
+
+        with (
+            patch(
+                "lookup.apple_music_postprocess.resolve_apple_music_url_with_cache",
+                new=AsyncMock(return_value=ResolveOutcome(url=resolved_url, source=source)),
+            ),
+            patch(
+                "lookup.apple_music_postprocess.sentry_sdk.get_current_scope",
+                return_value=scope,
+            ),
+        ):
+            await apply_apple_music_postprocess(
+                update,
+                apple_music=apple_music,
+                entity_store=entity_store,
+                request_artist="Hyd",
+                request_album="Hold Onto Me Infinity",
+                feature_enabled=True,
+            )
+
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        # Back-compat: the original boolean still fires.
+        assert calls.get("apple_music.persistent_lookup.fired") is True
+        # New: a per-outcome boolean for the source the resolver returned.
+        assert calls.get(f"apple_music.persistent_lookup.{source}") is True
+        # Per-invocation isolation: a single ``apply_apple_music_postprocess``
+        # call must only set the key for its own outcome. The cross-item case
+        # (multiple ``enrich_one`` invocations on the same request setting
+        # different keys → all five could end ``True``) is the intended
+        # production behavior and is covered in
+        # ``test_concurrent_invocations_set_per_outcome_keys_idempotently``.
+        for other in _RESOLVE_SOURCE_VALUES - {source}:
+            assert f"apple_music.persistent_lookup.{other}" not in calls
+
+    async def test_per_outcome_tag_survives_no_active_transaction(self):
+        """When the SDK has no active transaction, the projection is a
+        no-op — same swallow contract as the existing ``fired`` boolean.
+        """
+        update = {"apple_music_url": None}
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        entity_store = _make_entity_store()
+        scope = Mock()
+        scope.transaction = None
+
+        with (
+            patch(
+                "lookup.apple_music_postprocess.resolve_apple_music_url_with_cache",
+                new=AsyncMock(
+                    return_value=ResolveOutcome(
+                        url="https://music.apple.com/us/album/foo/1",
+                        source="live_resolved",
+                    )
+                ),
+            ),
+            patch(
+                "lookup.apple_music_postprocess.sentry_sdk.get_current_scope",
+                return_value=scope,
+            ),
+        ):
+            await apply_apple_music_postprocess(
+                update,
+                apple_music=apple_music,
+                entity_store=entity_store,
+                request_artist="Hyd",
+                request_album="Hold Onto Me Infinity",
+                feature_enabled=True,
+            )
+
+        # User-visible URL still set; the missing transaction must not crash.
+        assert update["apple_music_url"] == "https://music.apple.com/us/album/foo/1"
+
+    async def test_per_outcome_tag_failure_does_not_break_request(self):
+        """If ``set_data`` raises, the request must still succeed. Same
+        observability-must-not-break-request contract as the existing
+        ``fired`` boolean and the orchestrator cache-stats projection.
+        """
+        update = {"apple_music_url": None}
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        entity_store = _make_entity_store()
+        transaction = Mock()
+        transaction.set_data = Mock(side_effect=RuntimeError("boom"))
+        scope = Mock()
+        scope.transaction = transaction
+
+        with (
+            patch(
+                "lookup.apple_music_postprocess.resolve_apple_music_url_with_cache",
+                new=AsyncMock(
+                    return_value=ResolveOutcome(
+                        url="https://music.apple.com/us/album/foo/1",
+                        source="live_resolved",
+                    )
+                ),
+            ),
+            patch(
+                "lookup.apple_music_postprocess.sentry_sdk.get_current_scope",
+                return_value=scope,
+            ),
+        ):
+            await apply_apple_music_postprocess(
+                update,
+                apple_music=apple_music,
+                entity_store=entity_store,
+                request_artist="Hyd",
+                request_album="Hold Onto Me Infinity",
+                feature_enabled=True,
+            )
+
+        # URL still applied — observability failure doesn't roll back the
+        # resolution result.
+        assert update["apple_music_url"] == "https://music.apple.com/us/album/foo/1"
+
+    async def test_concurrent_invocations_set_per_outcome_keys_idempotently(self):
+        """Cross-item fan-out: ``enrich_one`` runs N apply calls in
+        ``asyncio.gather``; different items can return different outcomes
+        and each item's invocation can independently project its outcome
+        key onto the *shared* transaction.
+
+        The race-free claim is two-fold:
+        1. Different keys never overwrite each other (the keys are
+           disjoint, one per ``ResolveSource`` variant).
+        2. The same key set repeatedly to ``True`` is idempotent — two
+           items with the same outcome don't clobber the boolean.
+        """
+        scope, transaction = _make_sentry_scope()
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        entity_store = _make_entity_store()
+
+        # Two items resolved with different outcomes; one resolved with the
+        # same outcome as the first (the idempotent re-set case).
+        outcomes = [
+            ResolveOutcome(url="https://music.apple.com/us/album/a/1", source="cache_hit"),
+            ResolveOutcome(url=None, source="live_error"),
+            ResolveOutcome(url="https://music.apple.com/us/album/c/3", source="cache_hit"),
+        ]
+        # Each gather task gets its own update dict — ``apply`` mutates in
+        # place, and items don't share state in prod either.
+        updates = [{"apple_music_url": None} for _ in outcomes]
+        resolver_results = iter(outcomes)
+
+        async def fake_resolve(*args, **kwargs):
+            return next(resolver_results)
+
+        with (
+            patch(
+                "lookup.apple_music_postprocess.resolve_apple_music_url_with_cache",
+                new=AsyncMock(side_effect=fake_resolve),
+            ),
+            patch(
+                "lookup.apple_music_postprocess.sentry_sdk.get_current_scope",
+                return_value=scope,
+            ),
+        ):
+            await asyncio.gather(
+                *(
+                    apply_apple_music_postprocess(
+                        u,
+                        apple_music=apple_music,
+                        entity_store=entity_store,
+                        request_artist="Hyd",
+                        request_album="Hold Onto Me Infinity",
+                        feature_enabled=True,
+                    )
+                    for u in updates
+                )
+            )
+
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        # Both observed outcome keys land on the shared transaction.
+        assert calls.get("apple_music.persistent_lookup.cache_hit") is True
+        assert calls.get("apple_music.persistent_lookup.live_error") is True
+        # The unobserved outcomes stay absent.
+        for unobserved in _RESOLVE_SOURCE_VALUES - {"cache_hit", "live_error"}:
+            assert f"apple_music.persistent_lookup.{unobserved}" not in calls
+        # The duplicate cache_hit invocation re-set the key idempotently.
+        cache_hit_set_calls = [
+            c
+            for c in transaction.set_data.call_args_list
+            if c.args[0] == "apple_music.persistent_lookup.cache_hit"
+        ]
+        assert len(cache_hit_set_calls) == 2
+        assert all(c.args[1] is True for c in cache_hit_set_calls)
