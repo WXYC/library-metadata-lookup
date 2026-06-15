@@ -20,7 +20,11 @@ from urllib.parse import quote
 import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
-from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats_recorder
+from wxyc_fastapi.observability import (
+    RequestTelemetry,
+    get_cache_stats,
+    get_cache_stats_recorder,
+)
 
 from clients.streaming.apple_music import AppleMusicClient, AppleMusicTrackMatch
 from clients.streaming.matching import (
@@ -115,6 +119,49 @@ _warm_cache_semaphore: asyncio.Semaphore | None = None
 """Lazily-constructed (needs a running event loop). Re-bind on the first call."""
 
 
+_SEARCH_MAX_API_CALLS_DEFAULT = 10
+"""Default per-request cap on cumulative Discogs API calls in the fallback
+cascade. Sized so the warm-cache ``extended=true`` happy path (8-14 calls in
+measurement) only trips on the upper end — the dominant cost lever is the
+zero-canonical validation tail (#543), which used to burn 15-24 calls. See
+``LML_SEARCH_MAX_API_CALLS`` in ``docs/env-vars.md``."""
+
+_SEARCH_MAX_API_CALLS_ENV_VAR = "LML_SEARCH_MAX_API_CALLS"
+
+
+def _search_max_api_calls() -> int:
+    """Resolve the per-request Discogs API-call cap for the fallback cascade.
+
+    Read at request time (no ``Settings`` indirection) so the knob can be
+    tuned via Railway env vars without a redeploy — mirrors
+    ``LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS`` / ``LML_BULK_MAX_CONCURRENT``.
+    Misconfigured values (negative, zero, unparseable) fall back to
+    ``_SEARCH_MAX_API_CALLS_DEFAULT`` with a WARN.
+    """
+    raw = os.getenv(_SEARCH_MAX_API_CALLS_ENV_VAR)
+    if not raw:
+        return _SEARCH_MAX_API_CALLS_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r, falling back to %d",
+            _SEARCH_MAX_API_CALLS_ENV_VAR,
+            raw,
+            _SEARCH_MAX_API_CALLS_DEFAULT,
+        )
+        return _SEARCH_MAX_API_CALLS_DEFAULT
+    if n <= 0:
+        logger.warning(
+            "%s=%d must be > 0, falling back to %d",
+            _SEARCH_MAX_API_CALLS_ENV_VAR,
+            n,
+            _SEARCH_MAX_API_CALLS_DEFAULT,
+        )
+        return _SEARCH_MAX_API_CALLS_DEFAULT
+    return n
+
+
 async def _chunked_gather[T, R](
     items: list[T],
     worker: Callable[[T], Coroutine[Any, Any, R]],
@@ -130,6 +177,14 @@ async def _chunked_gather[T, R](
     ``search_compilations_for_track`` (LML#536) without giving up
     within-chunk parallelism.
 
+    Between chunks the per-request Discogs API-call counter
+    (``CacheStatsRecorder.api_calls``) is consulted against
+    ``LML_SEARCH_MAX_API_CALLS``. When the counter has crossed the cap, the
+    generator returns early so the remaining chunks never dispatch — the
+    safety floor for the zero-canonical validation tail flagged in LML#543.
+    Calls that have already started in the current chunk are awaited to
+    completion; the gate is between chunks, not mid-chunk.
+
     Wall time: ``ceil(N / chunk_size)`` × slowest task per chunk in the
     no-exit case. The orchestrator's three call sites pass
     ``MAX_SEARCH_RESULTS`` as the chunk size so that one full chunk can
@@ -139,7 +194,28 @@ async def _chunked_gather[T, R](
     fan-out is bounded here; cross-request total load is bounded there.
     """
     assert chunk_size > 0, f"chunk_size must be positive, got {chunk_size}"
+    api_call_cap = _search_max_api_calls()
     for start in range(0, len(items), chunk_size):
+        # Per-request API-call cap (LML#543). Checked here, not inside the
+        # worker, so calls already dispatched in the current chunk finish
+        # cleanly. The counter is request-scoped via ContextVar — outside a
+        # request context ``get_cache_stats()`` returns ``None`` and the gate
+        # is inert, which is the right behaviour for warm-path callers and
+        # unit tests that don't initialize cache stats.
+        stats = get_cache_stats()
+        if stats is not None:
+            api_calls = stats.get("api_calls", 0)
+            if api_calls >= api_call_cap:
+                logger.warning(
+                    "LML_SEARCH_MAX_API_CALLS=%d reached (api_calls=%d) — "
+                    "bailing _chunked_gather with %d/%d items remaining",
+                    api_call_cap,
+                    int(api_calls),
+                    len(items) - start,
+                    len(items),
+                )
+                get_cache_stats_recorder().record("search_api_call_cap_fired")
+                return
         chunk = items[start : start + chunk_size]
         chunk_results = await asyncio.gather(*[worker(it) for it in chunk])
         for it, res in zip(chunk, chunk_results, strict=True):
