@@ -17,6 +17,7 @@ from enum import StrEnum
 from typing import ClassVar, Protocol
 
 import sentry_sdk
+from wxyc_fastapi.observability import get_cache_stats
 
 from generated.api_models import TrackMatchHint
 from library.models import LibraryItem
@@ -64,7 +65,7 @@ a tighter bound, narrow this constant rather than the caller-side header.
 """
 
 
-def _resolve_positive_int_env(env_var: str, default: int) -> int:
+def resolve_positive_int_env(env_var: str, default: int) -> int:
     """Read a positive integer from ``env_var``, falling back to ``default`` with a WARN.
 
     Shared by :func:`resolve_search_budget_ms` and
@@ -98,7 +99,7 @@ def resolve_search_budget_ms() -> int:
 
     See :data:`DEFAULT_SEARCH_BUDGET_MS` for the contract.
     """
-    return _resolve_positive_int_env(SEARCH_BUDGET_ENV_VAR, DEFAULT_SEARCH_BUDGET_MS)
+    return resolve_positive_int_env(SEARCH_BUDGET_ENV_VAR, DEFAULT_SEARCH_BUDGET_MS)
 
 
 def resolve_search_hard_timeout_ms() -> int:
@@ -110,7 +111,7 @@ def resolve_search_hard_timeout_ms() -> int:
     callers raise it would defeat its purpose. See
     :data:`DEFAULT_SEARCH_HARD_TIMEOUT_MS` for the contract.
     """
-    return _resolve_positive_int_env(SEARCH_HARD_TIMEOUT_ENV_VAR, DEFAULT_SEARCH_HARD_TIMEOUT_MS)
+    return resolve_positive_int_env(SEARCH_HARD_TIMEOUT_ENV_VAR, DEFAULT_SEARCH_HARD_TIMEOUT_MS)
 
 
 def resolve_effective_search_budget_ms(caller_budget_ms: int | None) -> int:
@@ -797,6 +798,20 @@ async def execute_search_pipeline(
         # The one write site: every per-strategy ``SearchState`` mutation
         # happens here, driven by the outcome's flags. See :func:`_apply`.
         _apply(state, outcome)
+
+        # LML#543 cap-fire propagation. ``_chunked_gather`` records the
+        # ``search_api_call_cap_fired`` stat on the per-request cache-stats
+        # dict when it bails between chunks. Mirror it onto ``state.timed_out``
+        # so the existing ``LookupResponse.timeout`` projection (the issue's
+        # acceptance-criterion Sentry query, ``lookup.timeout:true``) covers
+        # the cap-fire population alongside LML#370's hard-cap timeouts. Once
+        # set, the soft-budget gate at the top of the next loop iteration
+        # short-circuits the cascade — the same shape the LML#347 caller-budget
+        # gate uses.
+        stats = get_cache_stats()
+        if stats is not None and stats.get("search_api_call_cap_fired"):
+            state.timed_out = True
+            break
 
         # Stop when results are populated AND we're not still in the
         # song-not-found cascade. The pre-#391 ``strategy.name !=

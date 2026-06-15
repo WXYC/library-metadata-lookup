@@ -146,6 +146,7 @@ async def handle_lookup(
             "memory_cache_inflight_join",
             "memory_cache_inflight_retry_after_cancel",
             "memory_cache_write_failed",
+            "search_api_call_cap_fired",
         )
     )
     if skip_cache:
@@ -297,6 +298,7 @@ async def handle_bulk_lookup(
             "memory_cache_inflight_join",
             "memory_cache_inflight_retry_after_cancel",
             "memory_cache_write_failed",
+            "search_api_call_cap_fired",
         )
     )
 

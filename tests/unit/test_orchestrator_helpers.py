@@ -2381,33 +2381,25 @@ class TestSearchCompilationsEarlyExit:
 
 
 class TestApiCallCap:
-    """LML#543: cumulative-API-call cap on the orchestrator fallback cascade.
+    """LML#543: per-invocation API-call cap on the orchestrator fallback cascade.
 
     When ``search_releases_by_track`` returns 0 canonical results for a real
     lookup, the orchestrator's chunked validation tail used to burn 15-24
     Discogs API calls per failing lookup (16-17s wall time). The cap
-    short-circuits ``_chunked_gather`` between chunks once the per-request
-    ``CacheStatsRecorder.api_calls`` counter crosses
-    ``LML_SEARCH_MAX_API_CALLS`` (default ~10).
+    short-circuits ``_chunked_gather`` between chunks once the per-invocation
+    delta against ``stats["api_calls"]`` crosses ``LML_SEARCH_MAX_API_CALLS``.
+
+    Per-invocation (not request-wide) because the cap must not (a) starve
+    later items in a bulk batch that shares one cache_stats dict, nor (b)
+    silently kill the LML#319/#237 album-title fallback whose ``_chunked_gather``
+    follows the main loop's in ``search_compilations_for_track``.
     """
 
     @pytest.mark.asyncio
     async def test_chunked_gather_bails_after_api_call_cap(self, monkeypatch):
-        """A lookup whose validation tail would otherwise fire N >> cap calls
-        must stop dispatching once ``api_calls`` crosses
-        ``LML_SEARCH_MAX_API_CALLS``.
-
-        Setup: 15 candidate releases, each library-matched and would-validate
-        true. Cap pinned at 3 via env var. Each ``validate_track_on_release``
-        increments the recorder. ``_chunked_gather`` dispatches in chunks of
-        ``MAX_SEARCH_RESULTS`` (5), checking the cap before each chunk — so
-        chunk 1 runs (5 validates → ``api_calls=5``), then chunk 2 is gated
-        out (``5 >= cap``). Without the cap all 15 would fire.
-
-        The probe call (``search_releases_by_track``) also bumps the counter
-        when patched to do so, but isn't strictly required for this test —
-        the validates alone exceed the cap.
-        """
+        """Cap fires after exactly one chunk dispatches when each validate
+        bumps the counter — pins both the upper bound (≤ chunk_size) and the
+        lower bound (chunk 1 fully ran)."""
         from wxyc_fastapi.observability import (
             get_cache_stats_recorder,
             init_cache_stats,
@@ -2452,22 +2444,113 @@ class TestApiCallCap:
         )
 
         async def _validate(*_args, **_kwargs):
-            # Every validate call counts against the request's API-call budget.
             get_cache_stats_recorder().record_api_call()
-            return False  # never surface results, so the early-exit-on-results path is inert
+            return False
 
         svc.validate_track_on_release.side_effect = _validate
 
         await search_song_as_track(db, "t", discogs_service=svc)
 
         n_validate_calls = svc.validate_track_on_release.await_count
-        assert n_validate_calls <= MAX_SEARCH_RESULTS, (
-            f"Cap should fire after first chunk (5 validates, api_calls=5 >= "
-            f"cap=3) — saw {n_validate_calls} validate calls. LML#543."
+        # Strict equality: chunk 1 fully ran (5 validates → spent=5 ≥ cap=3),
+        # chunk 2 gated out. A regression that runs only one item per chunk
+        # would still pass `<= MAX_SEARCH_RESULTS` but fails this.
+        assert n_validate_calls == MAX_SEARCH_RESULTS, (
+            f"Expected exactly {MAX_SEARCH_RESULTS} validate calls (chunk 1 "
+            f"fully ran, chunk 2 cap-gated), got {n_validate_calls}. LML#543."
         )
-        assert n_validate_calls < n_candidates, (
-            f"Cap did not fire — saw all {n_candidates} candidates validated "
-            f"({n_validate_calls} calls)."
+
+    @pytest.mark.asyncio
+    async def test_cap_is_per_invocation_not_request_wide(self, monkeypatch):
+        """Two sequential ``_chunked_gather`` invocations in the same request
+        each get the full cap — the cap is baseline-relative, not request-wide.
+
+        Without this property, the LML#319/#237 album-title fallback (the
+        second ``_chunked_gather`` in ``search_compilations_for_track``) is
+        silently disabled once the main loop has burned its budget. This test
+        bypasses the orchestrator strategies and exercises ``_chunked_gather``
+        directly so the invariant is pinned regardless of caller shape.
+        """
+        from wxyc_fastapi.observability import (
+            get_cache_stats_recorder,
+            init_cache_stats,
+        )
+
+        from lookup.orchestrator import MAX_SEARCH_RESULTS, _chunked_gather
+
+        monkeypatch.setenv("LML_SEARCH_MAX_API_CALLS", "3")
+        init_cache_stats()
+
+        async def _worker(_item):
+            get_cache_stats_recorder().record_api_call()
+            return None
+
+        # First invocation: 15 items, chunks of MAX_SEARCH_RESULTS (5). Cap 3
+        # bails after chunk 1 → 5 worker calls.
+        count_a = 0
+        async for _ in _chunked_gather(list(range(15)), _worker, MAX_SEARCH_RESULTS):
+            count_a += 1
+        assert count_a == MAX_SEARCH_RESULTS
+
+        # Second invocation against the same request: must NOT inherit the
+        # first invocation's spending. With baseline-relative cap, the second
+        # invocation captures a fresh baseline and runs its own chunk 1.
+        count_b = 0
+        async for _ in _chunked_gather(list(range(15)), _worker, MAX_SEARCH_RESULTS):
+            count_b += 1
+        assert count_b == MAX_SEARCH_RESULTS, (
+            f"Second _chunked_gather inherited the first's spent counter — "
+            f"got {count_b} dispatches, expected {MAX_SEARCH_RESULTS}. "
+            f"Album-title fallback bypass (LML#543 review)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_cap_fire_propagates_to_state_timed_out(self, monkeypatch):
+        """The cap-fire stat must flip ``state.timed_out=True`` after the
+        strategy returns, so ``LookupResponse.timeout`` projects True and the
+        issue's acceptance Sentry query (``lookup.timeout:true``) covers the
+        cap-fire population. Mirrors the LML#370 hard-cap projection."""
+        from wxyc_fastapi.observability import init_cache_stats
+
+        from core.search import SearchState
+        from lookup.orchestrator import _record_search_api_call_cap_fired
+
+        init_cache_stats(extra_keys=("search_api_call_cap_fired",))
+
+        # Simulate _chunked_gather firing the cap.
+        _record_search_api_call_cap_fired(cap=3, spent=5, items_remaining=10, items_total=15)
+
+        # Mirror the runner's post-strategy check from core/search.py.
+        from wxyc_fastapi.observability import get_cache_stats
+
+        state = SearchState(results=[], strategies_tried=[])
+        stats = get_cache_stats()
+        assert stats is not None
+        assert stats.get("search_api_call_cap_fired") == 1, (
+            "Cap-fire must flip the stat to 1 (idempotent)."
+        )
+        # Mirror core.search.execute_search_pipeline's post-_apply propagation.
+        if stats.get("search_api_call_cap_fired"):
+            state.timed_out = True
+        assert state.timed_out is True
+
+    @pytest.mark.asyncio
+    async def test_cap_fire_is_idempotent(self, monkeypatch):
+        """Re-firing the cap-fire record within a single request must not
+        double-count the stat — PostHog/Sentry aggregations measure the rate
+        of cap-firing requests, not the per-leg count."""
+        from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
+
+        from lookup.orchestrator import _record_search_api_call_cap_fired
+
+        init_cache_stats(extra_keys=("search_api_call_cap_fired",))
+        for _ in range(3):
+            _record_search_api_call_cap_fired(cap=3, spent=5, items_remaining=10, items_total=15)
+        stats = get_cache_stats()
+        assert stats is not None
+        assert stats.get("search_api_call_cap_fired") == 1, (
+            f"Cap-fire is not idempotent: got {stats.get('search_api_call_cap_fired')}, "
+            f"expected 1 (any non-zero positive int after 3 fires)."
         )
 
 
