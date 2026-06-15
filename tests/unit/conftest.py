@@ -164,7 +164,14 @@ def reset_caches():
     """Clear all in-memory caches, rate limiting state, and ContextVars between tests."""
     from wxyc_fastapi.observability.cache_stats import _cache_stats_var
 
+    from core.search import _cap_fire_count_var
+
     cache_stats_token = _cache_stats_var.set(None)
+    # LML#543 per-pipeline-invocation counter — keep test isolation symmetric
+    # with cache_stats. Each test calling execute_search_pipeline (which calls
+    # _cap_fire_count_var.set on its own task copy) is unaffected by the
+    # parent-test reset; this just clears any prior test's binding.
+    cap_fire_token = _cap_fire_count_var.set([0])
     set_skip_cache(False)
     yield
     clear_all_caches()
@@ -173,5 +180,6 @@ def reset_caches():
     from library.db import clear_library_caches
 
     clear_library_caches()
-    # Restore the ContextVar to its state before the test
+    # Restore the ContextVars to their state before the test
     _cache_stats_var.reset(cache_stats_token)
+    _cap_fire_count_var.reset(cap_fire_token)

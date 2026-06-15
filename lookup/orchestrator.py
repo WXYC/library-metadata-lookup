@@ -38,6 +38,7 @@ from clients.streaming.matching import (
 from config.settings import get_settings
 from core.search import (
     SEARCH_API_CALL_CAP_FIRED_STAT_KEY,
+    _record_cap_fire_for_runner,
     execute_search_pipeline,
     get_search_type_from_state,
     resolve_positive_int_env,
@@ -169,9 +170,9 @@ async def _chunked_gather[T, R](
       fallback never gets a chunk dispatched once the main loop has spent.
 
     The cross-strategy stop is handled at the runner layer
-    (:func:`core.search.execute_search_pipeline`) via a baseline-delta read of
-    :data:`core.search.SEARCH_API_CALL_CAP_FIRED_STAT_KEY` — also localised
-    per-lookup so a bulk item can't poison its siblings.
+    (:func:`core.search.execute_search_pipeline`) via the per-task
+    :data:`core.search._cap_fire_count_var` ContextVar — isolated per
+    pipeline invocation so concurrent bulk items can't poison each other.
 
     Wall time: ``ceil(N / chunk_size)`` × slowest task per chunk in the
     no-exit case. The orchestrator's three call sites pass
@@ -212,28 +213,27 @@ async def _chunked_gather[T, R](
 def _record_search_api_call_cap_fired(
     *, cap: int, spent: int, items_remaining: int, items_total: int
 ) -> None:
-    """Record an LML#543 cap-fire for telemetry and runner-side propagation.
+    """Record an LML#543 cap-fire on both observability surfaces.
 
-    The stat is a *counter* on the per-request cache-stats dict (each leg that
-    trips its own per-invocation cap adds 1) so the runner's baseline-delta
-    check can localise the signal to one lookup even when the dict is shared
-    across bulk items. The router's existing :func:`_project_cache_stats_to_transaction`
-    propagates the counter onto the Sentry transaction as
-    ``lml.cache.search_api_call_cap_fired`` — no direct ``set_data`` call from
-    here, which kept the two surfaces (bare vs. ``lml.cache.``-prefixed) from
-    drifting.
+    Telemetry — counter on the request-scoped cache-stats dict (each leg that
+    trips its own per-invocation cap adds 1). Projects onto the Sentry
+    transaction as ``lml.cache.search_api_call_cap_fired`` via the router's
+    :func:`_project_cache_stats_to_transaction`; filter on
+    ``lml.cache.search_api_call_cap_fired:>0`` for the cap-fire slice in
+    PostHog/Sentry.
 
-    Logs one WARN per cap-fire describing the leg. With the runner-side break,
-    at most one WARN fires per lookup in the common case (cap-fire short-
-    circuits the cascade before another strategy can re-enter ``_chunked_gather``).
-    ``search_compilations_for_track``'s own two-invocation shape can yield two
-    WARNs in the worst case — acceptable noise for the cost of unambiguous
-    per-leg attribution.
+    Control flow — bumps the per-pipeline-invocation counter the runner reads
+    (:data:`core.search._cap_fire_count_var`). That channel is a per-task
+    ContextVar, isolated from sibling bulk items even when they fire the cap
+    concurrently. The control channel is intentionally separate from the
+    telemetry counter so the latter can stay batch-aggregated for PostHog.
+
+    Logs one WARN per cap-fire; ``search_compilations_for_track`` can yield
+    up to two per lookup (main loop + LML#319/#237 album-title fallback) on
+    a pathological case.
     """
-    stats = get_cache_stats()
-    if stats is None:
-        return
-    stats[SEARCH_API_CALL_CAP_FIRED_STAT_KEY] = stats.get(SEARCH_API_CALL_CAP_FIRED_STAT_KEY, 0) + 1
+    get_cache_stats_recorder().record(SEARCH_API_CALL_CAP_FIRED_STAT_KEY)
+    _record_cap_fire_for_runner()
     logger.warning(
         "%s reached (cap=%d, spent=%d in this leg, %d/%d items remaining) — "
         "bailing _chunked_gather",

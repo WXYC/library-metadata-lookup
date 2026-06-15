@@ -26,6 +26,7 @@ from core.dependencies import (
     get_musicbrainz_pg,
     get_posthog_client,
 )
+from core.search import SEARCH_API_CALL_CAP_FIRED_STAT_KEY
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
 from discogs.service import DiscogsService
@@ -61,7 +62,7 @@ _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     "memory_cache_inflight_join",
     "memory_cache_inflight_retry_after_cancel",
     "memory_cache_write_failed",
-    "search_api_call_cap_fired",
+    SEARCH_API_CALL_CAP_FIRED_STAT_KEY,
 )
 """LML-specific keys seeded into every request's cache_stats dict so PostHog
 and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and
