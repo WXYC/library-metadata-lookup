@@ -548,18 +548,34 @@ class TestReleaseIdentityResolveEndpoint:
         assert trailing.json()["minted"] is False
         assert trailing.json()["identity_id"] == bare.json()["identity_id"]
 
-    # NOTE: A public-endpoint round-trip test for source=apple_music_album
-    # (mirroring test_bandcamp_round_trip above) requires
-    # ``apple_music_album`` to land in the ``ReleaseIdentitySource`` enum
-    # in ``wxyc-shared/api.yaml``. Pydantic blocks the unknown source with
-    # 422 today so a roundtrip test would only assert the 422 — not the
-    # mint we actually want. Coverage for the apple_music_album mint path
-    # lives at the store level in
-    # ``TestReleaseIdentityStore::test_mint_apple_music_album_persists_album_id``
-    # (and friends), which exercise ``mint_or_get_release_identity``
-    # directly — the same code path the post-process invokes from
-    # ``lookup/apple_music_postprocess.py``. The public-endpoint test
-    # gets added in the wxyc-shared enum follow-up.
+    @pytest.mark.asyncio
+    async def test_apple_music_album_round_trip(self, app_client):
+        album_id = "1234567890"
+        resp = await app_client.post(
+            "/api/v1/identity/resolve",
+            json={"kind": "release", "source": "apple_music_album", "external_id": album_id},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["minted"] is True
+        assert body["kind"] == "release"
+
+    @pytest.mark.asyncio
+    async def test_apple_music_album_round_trip_idempotent(self, app_client):
+        # Second resolve of the same album_id returns the same identity_id
+        # with minted=False — same posture as the Bandcamp idempotency test.
+        album_id = "9876543210"
+        first = await app_client.post(
+            "/api/v1/identity/resolve",
+            json={"kind": "release", "source": "apple_music_album", "external_id": album_id},
+        )
+        second = await app_client.post(
+            "/api/v1/identity/resolve",
+            json={"kind": "release", "source": "apple_music_album", "external_id": album_id},
+        )
+        assert first.status_code == 200 and second.status_code == 200
+        assert second.json()["minted"] is False
+        assert second.json()["identity_id"] == first.json()["identity_id"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -571,6 +587,9 @@ class TestReleaseIdentityResolveEndpoint:
             ("discogs_master", "0"),
             ("bandcamp", "not a url"),
             ("bandcamp", "https://autechre.bandcamp.com/track/foo"),
+            ("apple_music_album", "0"),
+            ("apple_music_album", "abc"),
+            ("apple_music_album", "0012345"),
         ],
     )
     async def test_invalid_external_id_is_rejected_before_mint(

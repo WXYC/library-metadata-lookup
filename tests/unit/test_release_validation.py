@@ -192,27 +192,13 @@ class TestValidateUnknownSource:
             validate_and_canonicalize_external_id("musicbrainz_release", "abc-123")
 
 
-# Sources known to the entity store but not yet exposed via the public
-# ``POST /api/v1/identity/resolve`` endpoint. The dispatch table accepts
-# these for internal callers (e.g. ``lookup/apple_music_postprocess.py``'s
-# mint-on-live-resolve) while the matching ``ReleaseIdentitySource`` enum
-# entry in ``wxyc-shared/api.yaml`` is being negotiated. Adding to this
-# set is a load-bearing tradeoff: it lets the LML-side mint ship without
-# blocking on a cross-repo schema change, but it also means the source
-# is NOT callable via the documented HTTP surface. Drain this set in
-# lockstep with the wxyc-shared enum updates.
-_INTERNAL_ONLY_SOURCES = frozenset({"apple_music_album"})
-
-
 class TestRegistryDriftInvariant:
-    """The set of release sources lives in four places that must stay in sync:
+    """The set of release sources lives in three places that must stay in sync:
 
     - ``RELEASE_SOURCE_COLUMN`` (this module).
     - ``coerce_external_id`` if-chain (this module).
     - ``ReleaseIdentitySource`` enum in ``generated/api_models.py`` (and the
-      ``wxyc-shared/api.yaml`` source it is generated from). Exception:
-      sources in ``_INTERNAL_ONLY_SOURCES`` are known to the store but
-      not yet exposed via the public endpoint.
+      ``wxyc-shared/api.yaml`` source it is generated from).
     - DDL columns in ``entity/release_identity.sql``.
 
     If a future PR adds a source to the enum / dict / DDL but forgets one of
@@ -225,49 +211,15 @@ class TestRegistryDriftInvariant:
 
         enum_values = {member.value for member in ReleaseIdentitySource}
         column_keys = set(RELEASE_SOURCE_COLUMN.keys())
-        # ``column_keys`` may be a superset of ``enum_values`` while internal-
-        # only sources are not yet wired through the API. The invariant is:
-        # every enum value must have a RELEASE_SOURCE_COLUMN entry (so any
-        # source the public endpoint accepts will dispatch), and every column
-        # key not in the enum must be on the explicit internal-only allow-list
-        # (so a forgotten enum update can't silently make a source unreachable).
-        missing_from_dict = enum_values - column_keys
-        assert not missing_from_dict, (
-            f"ReleaseIdentitySource enum has {missing_from_dict!r} that "
-            f"RELEASE_SOURCE_COLUMN does not — the public endpoint would 500 "
-            f"on those sources. Add the dict entry + a sentinel rule in "
-            f"identity/release_validation.py + a DDL column in "
-            f"entity/release_identity.sql."
-        )
-        unsanctioned_internal = column_keys - enum_values - _INTERNAL_ONLY_SOURCES
-        assert not unsanctioned_internal, (
-            f"RELEASE_SOURCE_COLUMN has {unsanctioned_internal!r} not in the "
-            f"ReleaseIdentitySource enum and not on the _INTERNAL_ONLY_SOURCES "
-            f"allow-list. Either add the source to wxyc-shared/api.yaml's "
+        assert column_keys == enum_values, (
+            f"RELEASE_SOURCE_COLUMN keys and ReleaseIdentitySource enum diverged. "
+            f"In dict but not enum: {column_keys - enum_values!r}; "
+            f"in enum but not dict: {enum_values - column_keys!r}. "
+            f"Either add the source to wxyc-shared/api.yaml's "
             f"ReleaseIdentitySource enum and regenerate generated/api_models.py, "
-            f"or add it to _INTERNAL_ONLY_SOURCES with a comment explaining "
-            f"why it's deliberately not on the public endpoint."
-        )
-        # Drain check: once a previously-internal source lands in the
-        # ``ReleaseIdentitySource`` enum (the cross-repo wxyc-shared
-        # follow-up the allow-list exists to bridge), its allow-list
-        # entry becomes stale and must be removed in the same PR that
-        # regenerates ``generated/api_models.py``. A stale entry is
-        # functionally harmless today (the public endpoint accepts the
-        # source via the enum at that point) but invites later
-        # confusion: future readers see an "internal-only" label on a
-        # source that the documented HTTP surface already exposes. Fail
-        # at CI time so the cleanup can't be forgotten.
-        stale_allow_list = _INTERNAL_ONLY_SOURCES & enum_values
-        assert not stale_allow_list, (
-            f"_INTERNAL_ONLY_SOURCES contains {stale_allow_list!r} which "
-            f"is also present in the ReleaseIdentitySource enum — the "
-            f"public endpoint already accepts this source, so the "
-            f"internal-only label is stale. Drop {stale_allow_list!r} "
-            f"from _INTERNAL_ONLY_SOURCES (and update the NOTE comment "
-            f"in tests/integration/test_release_identity.py + the plan "
-            f"doc to reflect that the public-endpoint round-trip test "
-            f"is no longer deferred)."
+            f"or add the dispatch entry to RELEASE_SOURCE_COLUMN + a sentinel "
+            f"rule in identity/release_validation.py + a DDL column in "
+            f"entity/release_identity.sql."
         )
 
     def test_release_source_columns_match_ddl(self):

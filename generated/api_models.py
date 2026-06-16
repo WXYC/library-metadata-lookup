@@ -1034,6 +1034,7 @@ class ReleaseIdentitySource(StrEnum):
     discogs_release = "discogs_release"
     discogs_master = "discogs_master"
     bandcamp = "bandcamp"
+    apple_music_album = "apple_music_album"
 
 
 class ReleaseIdentityResolveRequest(BaseModel):
@@ -1041,7 +1042,7 @@ class ReleaseIdentityResolveRequest(BaseModel):
     source: ReleaseIdentitySource
     external_id: str = Field(
         ...,
-        description="Source-specific identifier. For `discogs_release` / `discogs_master` it is the positive integer ID as a string; zero and negative values are rejected with 422 (Discogs uses `0` for the unknown-release sentinel). For `bandcamp` it is the canonical album URL (e.g. `https://autechre.bandcamp.com/album/confield`); LML URL-canonicalises before mint so trailing-slash and equivalent variants converge on one identity row. Non-album Bandcamp URLs (track URLs, bare subdomain) are rejected with 422.\n",
+        description="Source-specific identifier. For `discogs_release` / `discogs_master` it is the positive integer ID as a string; zero and negative values are rejected with 422 (Discogs uses `0` for the unknown-release sentinel). For `bandcamp` it is the canonical album URL (e.g. `https://autechre.bandcamp.com/album/confield`); LML URL-canonicalises before mint so trailing-slash and equivalent variants converge on one identity row. Non-album Bandcamp URLs (track URLs, bare subdomain) are rejected with 422. For `apple_music_album` it is the numeric Apple Music album ID as a string (e.g. `1234567890`); zero, negative, and non-numeric values are rejected with 422.\n",
     )
 
 
