@@ -1140,6 +1140,64 @@ def _filter_results_by_album_match(
     return kept
 
 
+async def _library_miss_discogs_search(
+    parsed: ParsedRequest,
+    discogs_service: DiscogsService | None,
+) -> tuple[LibraryItem, DiscogsSearchResult] | None:
+    """Search Discogs for a library-miss (artist, album) pair.
+
+    Called only when the library search returned no results AND both
+    ``parsed.artist`` and ``parsed.album`` are non-empty (after strip). Uses the
+    existing ``discogs_service.search()`` fallthrough seam (cache-first, API on
+    miss, outage degradation) so a Discogs outage degrades gracefully.
+
+    Applies the same 80/80-floor as ``find_best_typed_match`` (LML#400) on both
+    artist AND album jointly — different from the contamination shape in LML#400
+    which was artist-fallback returning any release for any album. The new risk
+    shape is near-miss typed albums (typed "Anthology" → "Anthology, Vol. 1");
+    see regression tests for pinned cases.
+
+    Returns ``None`` when:
+    - ``discogs_service`` is not available
+    - ``parsed.artist`` or ``parsed.album`` is empty / whitespace-only
+    - Discogs returns no candidates
+    - No candidate clears the 80/80 floor
+    - Discogs raises (outage, rate-limit exhaustion) — logged and swallowed
+    """
+    if discogs_service is None:
+        return None
+    artist = (parsed.artist or "").strip()
+    album = (parsed.album or "").strip()
+    if not artist or not album:
+        return None
+
+    try:
+        response = await discogs_service.search(DiscogsSearchRequest(album=album, artist=artist))
+    except Exception:
+        logger.warning("library-miss Discogs search failed for artist=%r album=%r", artist, album)
+        return None
+
+    if not response or not response.results:
+        return None
+
+    best = find_best_typed_match(
+        response.results,
+        query_artist=artist,
+        query_title=album,
+        artist_fn=lambda r: r.artist,
+        title_fn=lambda r: r.album,
+    )
+    if best is None:
+        return None
+
+    library_item = LibraryItem(
+        id=0,
+        artist=best.artist or artist,
+        title=best.album or album,
+    )
+    return library_item, best
+
+
 async def search_library_with_fallback(
     db: LibraryDB,
     parsed: ParsedRequest,
@@ -2985,13 +3043,40 @@ async def perform_lookup(
         if found_on_compilation:
             telemetry.record_api_call("discogs")
 
+    # Step 3a: Library-miss Discogs search (LML#583).
+    # When the entire search pipeline returned no library results AND the request
+    # carries both artist and album, probe Discogs directly. A confident match
+    # (80/80-floor via find_best_typed_match) is synthesized into a
+    # LibraryItem(id=0) + DiscogsSearchResult pair and handed directly to Step
+    # 4b (enrich_artwork_results) — bypassing fetch_artwork_for_items (which
+    # would re-search and risk a second floor mis-selection) and bypassing Step
+    # 3b track validation (the synthesized item is already 80-floored on
+    # (artist, album) jointly; routing it through an unfloored top-1 re-search
+    # has non-zero probability of flipping to a different release).
+    library_miss_outcome: str | None = None
+    if not library_results and parsed.artist and parsed.album and parsed.album.strip():
+        with telemetry.track_step("library_miss_discogs_search"):
+            miss_match = await _library_miss_discogs_search(parsed, discogs_service)
+        if miss_match is not None:
+            synthesized_lib_item, discogs_result = miss_match
+            items_with_artwork = [(synthesized_lib_item, discogs_result)]
+            library_miss_outcome = "library_miss_discogs_match"
+            telemetry.record_api_call("discogs")
+        else:
+            library_miss_outcome = "library_miss_no_discogs_match"
+
     # Step 3b: Validate results against Discogs track data.
-    if library_results and parsed.song and parsed.artist:
+    # Synthesized id=0 items from Step 3a are excluded: library_results is empty
+    # on that path, so the gate below never fires. The filter on real_results is
+    # a defensive guard for any future path that might add id=0 items to
+    # library_results.
+    real_results = [r for r in library_results if r.id != 0]
+    if real_results and parsed.song and parsed.artist:
         if not found_on_compilation:
             # Normal case: validate all results against Discogs tracklists
             with telemetry.track_step("track_validation"):
                 validated = await filter_results_by_track_validation(
-                    library_results, parsed.song, parsed.artist, discogs_service
+                    real_results, parsed.song, parsed.artist, discogs_service
                 )
                 if validated:
                     library_results = validated
@@ -3077,6 +3162,8 @@ async def perform_lookup(
             scope.transaction.set_data("lml.lookup.warm_cache", warm_cache_mode)
             scope.transaction.set_data("lookup.results_count", len(library_results))
             scope.transaction.set_data("lookup.match_type", search_type)
+            if library_miss_outcome is not None:
+                scope.transaction.set_data("lookup.outcome", library_miss_outcome)
     except Exception:
         # Observability must not break the request path.
         pass
@@ -3104,9 +3191,24 @@ async def perform_lookup(
     result_items = []
     if items_with_artwork:
         for item, artwork in items_with_artwork:
+            # Synthesized items (id=0, from Step 3a) have no library call-number
+            # components; build LibraryCatalogItem directly with the "(external)"
+            # sentinel that Backend-Service already understands (same contract as
+            # the Step 7 include_external_caches path).
+            catalog_item = (
+                LibraryCatalogItem(
+                    id=0,
+                    artist=item.artist,
+                    title=item.title,
+                    call_number="(external)",
+                    library_url="",
+                )
+                if item.id == 0
+                else item.to_catalog_item()
+            )
             result_items.append(
                 LookupResultItem(
-                    library_item=item.to_catalog_item(),
+                    library_item=catalog_item,
                     artwork=artwork.to_match_result() if artwork else None,
                     reconciled_identity=_identity_for(item),
                     matched_via=matched_via_by_id.get(item.id),
