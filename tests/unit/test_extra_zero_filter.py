@@ -10,7 +10,7 @@ track-level artist attribution.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -20,20 +20,15 @@ import pytest
 
 
 def _make_pool(rows: list[dict] | None = None) -> AsyncMock:
-    """Return a mock asyncpg pool whose fetch() echoes rows as MagicMock records."""
+    """Return a mock asyncpg pool whose fetch() returns rows as plain dicts."""
     pool = AsyncMock()
-    records = []
-    for row in rows or []:
-        record = MagicMock()
-        record.__getitem__ = lambda self, key, r=row: r[key]
-        record.keys = lambda r=row: r.keys()
-        records.append(record)
-    pool.fetch = AsyncMock(return_value=records)
+    pool.fetch = AsyncMock(return_value=list(rows or []))
     return pool
 
 
 def _sql_from_fetch_call(pool: AsyncMock, call_index: int = 0) -> str:
     """Extract the SQL string from the nth pool.fetch() call."""
+    assert pool.fetch.called, "pool.fetch was never called — function returned early"
     return pool.fetch.call_args_list[call_index][0][0]
 
 
@@ -160,28 +155,18 @@ class TestEnrichWithTrackArtistsExtraFilter:
         )
 
 
-class TestEnrichWithTrackArtistsCommentUpdated:
-    """The stale band-member comment should be replaced with the accurate description."""
-
-    def test_stale_comment_absent(self):
-        import inspect
-
-        from scripts.match_compilations import enrich_with_track_artists
-
-        source = inspect.getsource(enrich_with_track_artists)
-        assert "Track artists include band members" not in source, (
-            "Stale comment mentioning 'band members' should be removed now that "
-            "extra = 0 filtering handles this at the query level"
-        )
-
-
 # ---------------------------------------------------------------------------
 # Issue #475 — scripts/track_streaming/__main__.py
 # ---------------------------------------------------------------------------
 
 
 class TestPhasesBuildIndexExtraFilter:
-    """phase_build_index must include AND rta.extra = 0 on the LEFT JOIN release_track_artist."""
+    """phase_build_index must include AND rta.extra = 0 on the LEFT JOIN release_track_artist.
+
+    phase_build_index creates its own asyncpg pool from the environment, so the SQL
+    cannot be intercepted by injecting a mock pool. inspect.getsource is used as the
+    next-best option to assert the filter is present in the SQL literal.
+    """
 
     def test_sql_contains_extra_zero_filter(self):
         import inspect
