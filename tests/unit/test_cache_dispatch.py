@@ -372,3 +372,59 @@ class TestRefreshIdentity:
         )
         assert result.status == "not_implemented"
         assert result.sources[source].release_outcome == "not_implemented"
+
+    # ----------------------------------------------------------------------
+    # LML#589 — signature-prep commit
+    #
+    # The four cache legs (musicbrainz_release / spotify_album /
+    # apple_music_album / bandcamp) each get their own implementation issue
+    # (LML#547, #548, #549, #550) blocked on #589. This prep commit extends
+    # the dispatcher signature now so all four leg PRs can be developed in
+    # parallel without colliding on signature edits, while preserving the
+    # existing "not_implemented" behavior when the corresponding client is
+    # None (the dependency-injection short-circuit for missing creds).
+    # ----------------------------------------------------------------------
+
+    async def test_musicbrainz_release_still_not_implemented_when_mb_pg_is_none(self):
+        discogs = AsyncMock()
+        result = await refresh_identity(
+            identity_id=1,
+            source_pairs=[("musicbrainz_release", "ext-id")],
+            discogs_service=discogs,
+            mb_pg=None,
+        )
+        assert result.status == "not_implemented"
+        assert result.sources["musicbrainz_release"].release_outcome == "not_implemented"
+
+    async def test_spotify_album_still_not_implemented_when_spotify_client_is_none(self):
+        discogs = AsyncMock()
+        result = await refresh_identity(
+            identity_id=1,
+            source_pairs=[("spotify_album", "ext-id")],
+            discogs_service=discogs,
+            spotify_client=None,
+        )
+        assert result.status == "not_implemented"
+        assert result.sources["spotify_album"].release_outcome == "not_implemented"
+
+    async def test_apple_music_album_still_not_implemented_when_apple_music_client_is_none(self):
+        discogs = AsyncMock()
+        result = await refresh_identity(
+            identity_id=1,
+            source_pairs=[("apple_music_album", "ext-id")],
+            discogs_service=discogs,
+            apple_music_client=None,
+        )
+        assert result.status == "not_implemented"
+        assert result.sources["apple_music_album"].release_outcome == "not_implemented"
+
+    async def test_bandcamp_still_not_implemented_when_bandcamp_client_is_none(self):
+        discogs = AsyncMock()
+        result = await refresh_identity(
+            identity_id=1,
+            source_pairs=[("bandcamp", "ext-id")],
+            discogs_service=discogs,
+            bandcamp_client=None,
+        )
+        assert result.status == "not_implemented"
+        assert result.sources["bandcamp"].release_outcome == "not_implemented"
