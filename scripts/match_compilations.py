@@ -265,6 +265,7 @@ async def enrich_with_track_artists(
             JOIN release_track rt ON rt.release_id = rta.release_id
                 AND rt.sequence = rta.track_sequence
             WHERE rta.release_id = ANY($1)
+              AND rta.extra = 0
             ORDER BY rta.release_id, rta.track_sequence
             """,
             batch_ids,
@@ -286,8 +287,7 @@ async def enrich_with_track_artists(
     for match in matches:
         tracks = track_data.get(match.discogs_release_id, [])
 
-        # Deduplicate: group by sequence, pick primary artist (skip individual members)
-        # Track artists include band members — we want the primary credited artist
+        # Deduplicate: group by sequence, pick primary credited artist per track
         track_artists: dict[int, dict] = {}
         for t in tracks:
             seq = t["sequence"]

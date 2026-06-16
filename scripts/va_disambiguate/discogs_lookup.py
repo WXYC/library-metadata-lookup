@@ -89,6 +89,7 @@ async def resolve_track_artist_exact(pool, song_title: str, release_title: str) 
         JOIN release r ON r.id = rt.release_id
         JOIN release_track_artist rta ON rta.release_id = rt.release_id
                                      AND rta.track_sequence = rt.sequence
+                                     AND rta.extra = 0
         WHERE lower(rt.title) = lower($1)
           AND lower(f_unaccent(r.title)) = lower(f_unaccent($2))
         LIMIT 10
@@ -125,6 +126,7 @@ async def resolve_track_artist_fuzzy(pool, song_title: str, release_title: str) 
             JOIN release r ON r.id = rt.release_id
             JOIN release_track_artist rta ON rta.release_id = rt.release_id
                                          AND rta.track_sequence = rt.sequence
+                                         AND rta.extra = 0
             WHERE lower(f_unaccent(rt.title)) % lower(f_unaccent($1))
               AND lower(f_unaccent(r.title)) % lower(f_unaccent($2))
         ) sub
@@ -156,6 +158,7 @@ async def resolve_track_artist_song_only(pool, song_title: str) -> list[dict]:
         JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
         JOIN release_track_artist rta ON rta.release_id = rt.release_id
                                      AND rta.track_sequence = rt.sequence
+                                     AND rta.extra = 0
         WHERE lower(f_unaccent(rt.title)) % lower(f_unaccent($1))
           AND lower(ra.artist_name) LIKE '%various%'
         LIMIT 10
@@ -185,6 +188,7 @@ async def collect_track_artists_for_release(pool, release_title: str) -> list[di
         JOIN release_track rt ON rt.release_id = r.id
         JOIN release_track_artist rta ON rta.release_id = rt.release_id
                                      AND rta.track_sequence = rt.sequence
+                                     AND rta.extra = 0
         WHERE lower(f_unaccent(r.title)) = lower(f_unaccent($1))
           AND lower(ra.artist_name) LIKE '%various%'
         ORDER BY rt.sequence
