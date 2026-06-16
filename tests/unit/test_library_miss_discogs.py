@@ -44,13 +44,6 @@ def telemetry():
     return make_lml_telemetry()
 
 
-@pytest.fixture
-def mock_discogs_cache():
-    cache = AsyncMock()
-    cache.search_releases = AsyncMock(return_value=[])
-    return cache
-
-
 # ---------------------------------------------------------------------------
 # _library_miss_discogs_search — unit tests
 # ---------------------------------------------------------------------------
@@ -336,6 +329,35 @@ class TestPerformLookupLibraryMissPath:
 
         assert isinstance(response, LookupResponse)
         assert len(response.results) == 0
+
+    @pytest.mark.asyncio
+    async def test_song_not_found_preserved_when_step_3a_finds_nothing(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Step 3a runs but finds no match → song_not_found stays True (not clobbered).
+
+        Symmetric to test_song_not_found_cleared_when_step_3a_finds_match: this pins
+        that song_not_found is only reset on a successful match, not unconditionally
+        whenever Step 3a runs. Guards against a future refactor that lifts the
+        `song_not_found = False` line out of the `if miss_match is not None:` branch.
+        """
+        mock_library_db.search.return_value = []
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Nonexistent Band",
+            album="Nonexistent Album",
+            song="Nonexistent Song",
+            raw_message="Nonexistent Band - Nonexistent Song - Nonexistent Album",
+        )
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert len(response.results) == 0
+        # song_not_found stays at whatever the pipeline set it to (typically True for
+        # a song that didn't surface anywhere). The critical invariant is that the
+        # Step 3a no-match branch does NOT clobber it to False.
+        assert response.song_not_found is True
 
     @pytest.mark.asyncio
     async def test_step_3a_skipped_when_library_has_results(
