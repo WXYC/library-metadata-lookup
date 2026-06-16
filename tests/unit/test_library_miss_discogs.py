@@ -276,13 +276,10 @@ class TestPerformLookupLibraryMissPath:
         assert "37008771" in item.artwork.release_url
         assert item.matched_via is None
         # Step 3a finding a match resolves the request — song_not_found must be False
-        # and context_message must not be a "not found" string (regression for LML#583
-        # where song_not_found stayed True and context_message said "not found").
+        # and no context_message should be emitted (this request has no song field,
+        # so build_context_message returns None when song_not_found=False + has_results=True).
         assert response.song_not_found is False
-        assert (
-            response.context_message
-            != '"Heart of Darkness" by My New Band Believe not found in library.'
-        )
+        assert response.context_message is None
 
     @pytest.mark.asyncio
     async def test_song_not_found_cleared_when_step_3a_finds_match(
