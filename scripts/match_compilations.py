@@ -287,7 +287,7 @@ async def enrich_with_track_artists(
     for match in matches:
         tracks = track_data.get(match.discogs_release_id, [])
 
-        # Deduplicate: group by sequence, pick primary credited artist per track
+        # Group by track sequence; collect all primary (extra=0) credited artists per track.
         track_artists: dict[int, dict] = {}
         for t in tracks:
             seq = t["sequence"]
