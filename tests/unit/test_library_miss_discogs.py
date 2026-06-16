@@ -275,6 +275,51 @@ class TestPerformLookupLibraryMissPath:
         assert item.artwork.release_url is not None
         assert "37008771" in item.artwork.release_url
         assert item.matched_via is None
+        # Step 3a finding a match resolves the request — song_not_found must be False
+        # and context_message must not be a "not found" string (regression for LML#583
+        # where song_not_found stayed True and context_message said "not found").
+        assert response.song_not_found is False
+        assert (
+            response.context_message
+            != '"Heart of Darkness" by My New Band Believe not found in library.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_song_not_found_cleared_when_step_3a_finds_match(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Step 3a match clears song_not_found even when the search pipeline set it True.
+
+        Regression test for the bug where library_results=[] left song_not_found=True
+        from the pipeline, and Step 3a never reset it — causing LookupResponse to
+        carry song_not_found=True alongside a non-empty results list.
+        """
+        mock_library_db.search.return_value = []
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=37008771,
+                    artist="My New Band Believe",
+                    album="My New Band Believe",
+                )
+            ]
+        )
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="My New Band Believe",
+            album="My New Band Believe",
+            song="Heart of Darkness",
+            raw_message="My New Band Believe - Heart of Darkness - My New Band Believe",
+        )
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert len(response.results) == 1
+        assert response.song_not_found is False
+        # context_message must not say "not found" when a result was returned
+        if response.context_message is not None:
+            assert "not found" not in response.context_message.lower()
 
     @pytest.mark.asyncio
     async def test_library_miss_no_discogs_hit_returns_empty(

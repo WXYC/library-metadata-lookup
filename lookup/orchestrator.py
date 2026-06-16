@@ -3060,9 +3060,13 @@ async def perform_lookup(
         if miss_match is not None:
             synthesized_lib_item, discogs_result = miss_match
             items_with_artwork = [(synthesized_lib_item, discogs_result)]
+            # A synthesized Discogs match resolves the request — clear song_not_found so
+            # build_context_message and LookupResponse.song_not_found reflect reality.
+            song_not_found = False
             library_miss_outcome = "library_miss_discogs_match"
             telemetry.record_api_call("discogs")
-        else:
+        elif discogs_service is not None:
+            # Discogs was available and searched but found no confident match.
             library_miss_outcome = "library_miss_no_discogs_match"
 
     # Step 3b: Validate results against Discogs track data.
@@ -3160,7 +3164,10 @@ async def perform_lookup(
         if scope.transaction is not None:
             scope.transaction.set_data("lml.lookup.extended", extended_mode)
             scope.transaction.set_data("lml.lookup.warm_cache", warm_cache_mode)
-            scope.transaction.set_data("lookup.results_count", len(library_results))
+            scope.transaction.set_data(
+                "lookup.results_count",
+                len(items_with_artwork) if items_with_artwork else len(library_results),
+            )
             scope.transaction.set_data("lookup.match_type", search_type)
             if library_miss_outcome is not None:
                 scope.transaction.set_data("lookup.outcome", library_miss_outcome)
@@ -3170,16 +3177,23 @@ async def perform_lookup(
 
     # Step 5: Build context message
     context = build_context_message(
-        parsed, found_on_compilation, song_not_found, has_results=bool(library_results)
+        parsed,
+        found_on_compilation,
+        song_not_found,
+        has_results=bool(library_results) or bool(items_with_artwork),
     )
 
-    # Step 6: Resolve external identifiers for each result's artist
+    # Step 6: Resolve external identifiers for each result's artist.
+    # Collect artist names from library_results (normal path) and from
+    # items_with_artwork (synthesized Step 3a path, where library_results is empty
+    # but the synthesized LibraryItem carries a real artist name worth resolving).
     identities_by_artist: dict[str, ReconciledIdentity] = {}
-    if entity_store is not None and library_results:
+    _identity_artist_names = [item.artist for item in library_results if item.artist] + [
+        item.artist for item, _ in items_with_artwork if item.id == 0 and item.artist
+    ]
+    if entity_store is not None and _identity_artist_names:
         with telemetry.track_step("identity_resolution"):
-            identities_by_artist = await _resolve_identities(
-                [item.artist for item in library_results if item.artist], entity_store
-            )
+            identities_by_artist = await _resolve_identities(_identity_artist_names, entity_store)
 
     def _identity_for(item: LibraryItem) -> ReconciledIdentity | None:
         if not item.artist:
@@ -3211,7 +3225,10 @@ async def perform_lookup(
                     library_item=catalog_item,
                     artwork=artwork.to_match_result() if artwork else None,
                     reconciled_identity=_identity_for(item),
-                    matched_via=matched_via_by_id.get(item.id),
+                    # Synthesized items (id=0) carry no track-title-provenance hint;
+                    # do not look up key 0 in matched_via_by_id to prevent accidental
+                    # collision with any future strategy that might write to that key.
+                    matched_via=None if item.id == 0 else matched_via_by_id.get(item.id),
                 )
             )
     elif library_results:
