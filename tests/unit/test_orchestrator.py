@@ -653,6 +653,80 @@ class TestPerformLookupFallback:
             "Promoting a confirmed track-bearing album should clear song_not_found"
         )
 
+    @pytest.mark.asyncio
+    async def test_song_matching_album_title_clears_song_not_found(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """When the requested "song" is the title of an album by the artist,
+        treat it as a direct album match — not a song-not-found fallback.
+
+        Reproduces "on patrol, sun araw": request-o-matic routed it as
+        ``song="On Patrol"`` / ``artist="Sun Araw"``. The Sun Araw album
+        "On Patrol" is in the library and surfaced by the artist+song FTS
+        branch, but Discogs has no track called "On Patrol" on any Sun Araw
+        release, so per-result validation + cached-track promotion both
+        fail and ``song_not_found`` stays True. The bot then says
+        '"On Patrol" is not on any album in the library' — about the album
+        sitting in its own result list.
+        """
+        on_patrol = LibraryItem(
+            id=42,
+            artist="Sun Araw",
+            title="On Patrol",
+            call_letters="SU",
+            artist_call_number=138,
+            release_call_number=1,
+            genre="Rock",
+            format="cd",
+        )
+
+        mock_library_db.find_similar_artist.return_value = None
+
+        # search_library_with_fallback call order for (artist + song, no album):
+        #   1. artist + song FTS -> finds "On Patrol" (title matches the song term)
+        async def fake_search(query=None, **kwargs):
+            q = (query or "").lower()
+            if "sun araw" in q:
+                return [on_patrol]
+            return []
+
+        mock_library_db.search.side_effect = fake_search
+
+        # Per-result validation fails: no track named "On Patrol" on this release.
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        mock_discogs_service.validate_track_on_release.return_value = False
+
+        # Cache-known-track promotion also turns up empty (no Sun Araw release
+        # in the cache contains a track titled "On Patrol").
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+
+        request = LookupRequest(
+            artist="Sun Araw",
+            song="On Patrol",
+            raw_message="on patrol, sun araw",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert len(response.results) == 1
+        assert response.results[0].library_item.title == "On Patrol"
+        assert response.song_not_found is False, (
+            "The album titled 'On Patrol' is in results — the user wanted "
+            "that album, not a track. song_not_found should be cleared."
+        )
+        assert response.context_message is None, (
+            "Should not emit the misleading 'not on any album' message when "
+            "results contain an album titled the same as the requested song."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - compilation search
