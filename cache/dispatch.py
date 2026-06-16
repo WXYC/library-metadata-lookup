@@ -43,7 +43,11 @@ from cache.models import (
 from discogs.models import ReleaseMetadataResponse
 
 if TYPE_CHECKING:
+    from clients.bandcamp import BandcampClient
+    from clients.streaming.apple_music import AppleMusicClient
+    from clients.streaming.spotify import SpotifyClient
     from discogs.service import DiscogsService
+    from entity.sources import PgSourceProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +191,11 @@ async def _dispatch_source(
     identity_id: int,
     source: str,
     external_id: str,
+    *,
+    mb_pg: PgSourceProtocol | None = None,
+    spotify_client: SpotifyClient | None = None,
+    apple_music_client: AppleMusicClient | None = None,
+    bandcamp_client: BandcampClient | None = None,
 ) -> SourceRefreshOutcome:
     """Run the release leg for one source and walk its artists if any."""
     with sentry_sdk.start_span(op="cache.refresh.release", name=f"{source}:{external_id}") as span:
@@ -238,6 +247,10 @@ async def refresh_identity(
     identity_id: int,
     source_pairs: list[tuple[str, str]],
     discogs_service: DiscogsService,
+    mb_pg: PgSourceProtocol | None = None,
+    spotify_client: SpotifyClient | None = None,
+    apple_music_client: AppleMusicClient | None = None,
+    bandcamp_client: BandcampClient | None = None,
 ) -> CacheRefreshResultItem:
     """Run all source legs for one identity_id and roll up the per-id status.
 
@@ -250,6 +263,24 @@ async def refresh_identity(
             not gate concurrency itself; the per-replica Discogs semaphore /
             rate limiter in ``discogs/ratelimit.py`` apply through
             ``get_release`` / ``get_artist_details``.
+        mb_pg: Optional ``musicbrainz-cache`` ``PgSource`` for the
+            ``musicbrainz_release`` leg (LML#547). ``None`` (the default and
+            DI short-circuit when ``DATABASE_URL_MUSICBRAINZ`` is unset)
+            preserves the existing ``not_implemented`` outcome.
+        spotify_client: Optional ``SpotifyClient`` for the ``spotify_album``
+            leg (LML#549). ``None`` (the default and DI short-circuit when
+            Spotify credentials are unset) preserves the existing
+            ``not_implemented`` outcome.
+        apple_music_client: Optional ``AppleMusicClient`` for the
+            ``apple_music_album`` leg (LML#550). ``None`` (the default and DI
+            short-circuit when Apple Music credentials are unset) preserves
+            the existing ``not_implemented`` outcome.
+        bandcamp_client: Optional ``BandcampClient`` for the ``bandcamp``
+            leg (LML#548). ``None`` (the default) preserves the existing
+            ``not_implemented`` outcome. Bandcamp has no auth requirement
+            so the DI singleton always builds a client at runtime; the
+            ``| None`` shape exists for unit-test substitutability and to
+            mirror the other three optional clients.
 
     Returns:
         A ``CacheRefreshResultItem`` with per-source outcomes and the
@@ -264,7 +295,14 @@ async def refresh_identity(
         sources: dict[str, SourceRefreshOutcome] = {}
         for source, external_id in source_pairs:
             sources[source] = await _dispatch_source(
-                discogs_service, identity_id, source, external_id
+                discogs_service,
+                identity_id,
+                source,
+                external_id,
+                mb_pg=mb_pg,
+                spotify_client=spotify_client,
+                apple_music_client=apple_music_client,
+                bandcamp_client=bandcamp_client,
             )
 
         status = compute_per_id_status(sources)

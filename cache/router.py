@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import sentry_sdk
 from asyncpg.exceptions import PostgresError
@@ -51,10 +51,21 @@ from core.bulk_concurrency import (
     max_concurrency_from_env,
     watch_disconnect,
 )
-from core.dependencies import get_discogs_service
+from core.dependencies import get_discogs_service, get_musicbrainz_pg
 from discogs.service import DiscogsService
 from entity.store import EntityStore
 from identity.dependencies import get_entity_store
+from streaming.dependencies import (
+    get_apple_music_client,
+    get_bandcamp_client,
+    get_spotify_client,
+)
+
+if TYPE_CHECKING:
+    from clients.bandcamp import BandcampClient
+    from clients.streaming.apple_music import AppleMusicClient
+    from clients.streaming.spotify import SpotifyClient
+    from entity.sources import PgSourceProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +144,10 @@ async def handle_refresh_for_identities(
     http_request: Request,
     entity_store: EntityStore | None = Depends(get_entity_store),
     discogs_service: DiscogsService | None = Depends(get_discogs_service),
+    mb_pg: PgSourceProtocol | None = Depends(get_musicbrainz_pg),
+    spotify_client: SpotifyClient | None = Depends(get_spotify_client),
+    apple_music_client: AppleMusicClient | None = Depends(get_apple_music_client),
+    bandcamp_client: BandcampClient | None = Depends(get_bandcamp_client),
 ) -> BulkCacheRefreshResponse:
     """Bulk cache refresh. See route docstring for protocol."""
     # Manual 400-on-overflow before Pydantic so oversize doesn't get 422'd.
@@ -194,6 +209,10 @@ async def handle_refresh_for_identities(
                     identity_id=identity_id,
                     source_pairs=provenance[identity_id],
                     discogs_service=discogs,
+                    mb_pg=mb_pg,
+                    spotify_client=spotify_client,
+                    apple_music_client=apple_music_client,
+                    bandcamp_client=bandcamp_client,
                 )
             except asyncio.CancelledError:
                 # Cancellation always propagates. Without this re-raise, a
