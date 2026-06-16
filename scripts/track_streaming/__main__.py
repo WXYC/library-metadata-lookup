@@ -194,7 +194,7 @@ async def phase_build_index(results_db: ResultsDB) -> LocalStreamingIndex:
                    FROM release_track rt
                    JOIN release_artist ra ON ra.release_id = rt.release_id AND ra.extra = 0
                    LEFT JOIN release_track_artist rta ON rta.release_id = rt.release_id
-                             AND rta.track_sequence = rt.sequence
+                             AND rta.track_sequence = rt.sequence AND rta.extra = 0
                    WHERE rt.release_id = ANY($1)""",
                 batch,
             )
