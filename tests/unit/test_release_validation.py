@@ -193,7 +193,7 @@ class TestValidateUnknownSource:
 
 
 class TestRegistryDriftInvariant:
-    """The set of release sources lives in three places that must stay in sync:
+    """The set of release sources lives in four places that must stay in sync:
 
     - ``RELEASE_SOURCE_COLUMN`` (this module).
     - ``coerce_external_id`` if-chain (this module).
