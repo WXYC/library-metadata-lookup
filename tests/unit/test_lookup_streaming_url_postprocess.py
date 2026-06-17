@@ -449,9 +449,12 @@ class TestConcurrencyAndTimeout:
                 return ResolveOutcome(url="unreachable", source="live_resolved")
             return ResolveOutcome(url=_CASES[fast]["resolved_url"], source="live_resolved")
 
-        # Shrink the per-service timeouts so the slow leg trips fast.
+        # Shrink the per-service timeouts so the slow leg trips fast. Also
+        # strip timeout_env_var: Apple's entry honors LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS
+        # via _effective_probe_timeout_s, so an ambient env var would otherwise
+        # override the 0.05 ceiling and make this test environment-coupled.
         fast_config = {
-            k: dataclasses.replace(v, probe_timeout_s=0.05)
+            k: dataclasses.replace(v, probe_timeout_s=0.05, timeout_env_var=None)
             for k, v in STREAMING_URL_CACHE_CONFIG.items()
         }
         with (
