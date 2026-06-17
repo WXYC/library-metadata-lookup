@@ -35,12 +35,14 @@ out ``None`` in ``update``, and whose client is present in ``clients``, this:
      ``apple_music.persistent_lookup.*`` namespace with NO parallel emission.
 
 **Concurrency (preempts #594).** Each service's resolver is wrapped in its own
-``asyncio.wait_for(cfg.probe_timeout_s)`` inside one
-``gather(return_exceptions=True)`` — no shared outer wallclock. One service
-timing out cannot cancel another; the timed-out service yields no URL and
-projects ``live_error`` (the cache module's "don't poison on timeout" posture
-holds because the resolver is cancelled before its UPSERT). Sentry attributes
-are projected sequentially after the gather, per ``(service, outcome)`` pair.
+``asyncio.wait_for(_effective_probe_timeout_s(cfg))`` inside one
+``gather(return_exceptions=True)`` — no shared outer wallclock. The per-service
+ceiling is the registry's static ``probe_timeout_s``, overridable at request
+time via ``cfg.timeout_env_var`` (Apple only). One service timing out cannot
+cancel another; the timed-out service yields no URL and projects ``live_error``
+(the cache module's "don't poison on timeout" posture holds because the
+resolver is cancelled before its UPSERT). Sentry attributes are projected
+sequentially after the gather, per ``(service, outcome)`` pair.
 
 Side effects degrade gracefully: PG errors swallow inside the cache layer;
 mint failures log and continue; Sentry projection errors log and continue. The

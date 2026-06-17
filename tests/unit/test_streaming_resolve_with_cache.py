@@ -20,6 +20,7 @@ PG and the streaming client are mocked. Integration tests cover the SQL.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -157,4 +158,33 @@ class TestResolveStreamingURLWithCache:
         )
 
         assert outcome == ResolveOutcome(url=None, source="live_error")
+        pg.execute.assert_not_called()
+
+    async def test_external_timeout_cancels_before_upsert_no_poison(self, service, sample_url):
+        # The load-bearing safety property (LML#573): the per-call ceiling lives
+        # at the post-process gather level, so a wait_for timeout cancels the
+        # REAL resolver mid-probe. CancelledError is a BaseException, so the
+        # resolver's `except Exception` does NOT swallow it — it propagates, and
+        # the cancellation interrupts before any UPSERT. Exercises the actual
+        # resolver (not a stubbed one) to lock the "don't poison the cache on
+        # timeout" posture against a future `except BaseException` slip.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock()
+        client = AsyncMock(spec=BaseStreamingClient)
+
+        async def hang(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        client.find_album_match = AsyncMock(side_effect=hang)
+
+        with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+            await asyncio.wait_for(
+                resolve_streaming_url_with_cache(
+                    pg, client, service=service, artist="Hyd", album="Hold Onto Me Infinity"
+                ),
+                timeout=0.05,
+            )
+
+        # No cache write — the probe was cancelled before reaching any UPSERT.
         pg.execute.assert_not_called()

@@ -6,14 +6,16 @@ storm can't pin a request past its budget. Read at request time (not via
 redeploy — mirrors the ``LML_BULK_MAX_CONCURRENT`` and
 ``LML_SEARCH_BUDGET_MS`` patterns.
 
-Hoisted out of ``lookup/orchestrator.py`` so the in-line per-item Apple
-Music probe (``lookup/orchestrator.py::enrich_artwork_results``) has a
-single tunable source of truth for its wall-clock ceiling. The persistent
-streaming-URL post-process (``lookup/streaming_url_postprocess.py``) no
-longer shares this helper: since LML#573 it sources a per-service
-``probe_timeout_s`` from ``STREAMING_URL_CACHE_CONFIG`` and applies it at
-the gather level (preempting #594), so the two ceilings are now
-independently tunable.
+``probe_timeout_s_from_env`` is the shared resolver: the in-line per-item
+Apple probe (``lookup/orchestrator.py::enrich_artwork_results``) uses it via
+the ``apple_music_lookup_timeout_s`` wrapper, and the persistent streaming-URL
+post-process (``lookup/streaming_url_postprocess.py``) uses it too — its
+``STREAMING_URL_CACHE_CONFIG`` Apple entry carries ``timeout_env_var =
+APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR``, so ``LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS``
+tunes BOTH Apple call sites from one knob (LML#573 preserved this back-compat).
+The post-process applies a per-service ceiling at the gather level (preempting
+#594): services without a ``timeout_env_var`` (e.g. Spotify) use the static
+``probe_timeout_s`` on their registry entry; Apple's is env-overridable.
 """
 
 from __future__ import annotations
