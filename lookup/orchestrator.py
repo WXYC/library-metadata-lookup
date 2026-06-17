@@ -35,6 +35,7 @@ from clients.streaming.matching import (
     strip_discogs_disambig,
     strip_track_suffix,
 )
+from clients.streaming.spotify import SpotifyClient
 from config.settings import get_settings
 from core.search import (
     SEARCH_API_CALL_CAP_FIRED_STAT_KEY,
@@ -73,7 +74,6 @@ from generated.api_models import (
 )
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
-from lookup.apple_music_postprocess import apply_apple_music_postprocess
 from lookup.external_search import (
     search_external_albums,
     search_external_artists,
@@ -81,6 +81,7 @@ from lookup.external_search import (
 )
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.strategies import build_strategies
+from lookup.streaming_url_postprocess import apply_streaming_url_postprocess
 from lookup.timeouts import apple_music_lookup_timeout_s
 from release.musicbrainz_resolver import resolve_tracklist_via_musicbrainz
 from services.parser import MessageType, ParsedRequest
@@ -2231,6 +2232,7 @@ async def enrich_artwork_results(
     discogs_cache: DiscogsCacheService | None = None,
     mb_pg: PgSourceProtocol | None = None,
     apple_music: AppleMusicClient | None = None,
+    spotify: SpotifyClient | None = None,
     entity_store: EntityStore | None = None,
     discogs_cache_pg: PgSource | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
@@ -2669,12 +2671,13 @@ async def enrich_artwork_results(
                 use_split_gate=use_split_gate,
             )
 
-        # Fall back to search URLs for any service without a direct link
+        # Fall back to search URLs for any service without a direct link.
+        # Spotify's templated fallback was deleted in LML#573 — the persistent
+        # streaming-URL cache post-process below now backstops spotify_url with
+        # a real album page (and mints the identity) instead of a generic
+        # search URL. YouTube Music / Bandcamp / SoundCloud keep their templated
+        # fallbacks (no album-cache tier for them in PR-1; Bandcamp joins in PR-3).
         if row_artist and search_term:
-            if not spotify_url:
-                spotify_url = _build_streaming_search_url(
-                    "https://open.spotify.com/search/", row_artist, search_term
-                )
             if not youtube_music_url:
                 youtube_music_url = _build_streaming_search_url(
                     "https://music.youtube.com/search?q=", row_artist, search_term
@@ -2699,25 +2702,26 @@ async def enrich_artwork_results(
             "soundcloud_url": soundcloud_url,
         }
 
-        # LML "Apple Music for non-library albums" — when the existing
-        # per-item probe + override couldn't surface an Apple Music URL,
-        # the post-process runs a cache-backed probe with the REQUEST's
-        # (artist, album, song) — not the library row's. Fixes the
-        # wrong-fallback-row attack (non-library album like Hyd /
-        # "Hold Onto Me Infinity" falls back to a same-titled library row
-        # by a different artist, in-line probe runs with the wrong
-        # artist name → null). Result is persisted to
-        # ``entity.album_apple_music_lookup_cache`` so future lookups
-        # short-circuit Apple's API. Feature-flagged off by default so
-        # the rollout is reversible without a re-deploy.
-        await apply_apple_music_postprocess(
+        # LML "streaming URLs for non-library albums" (LML#573) — when the
+        # existing per-item probe + override couldn't surface a service URL,
+        # the polymorphic post-process runs a cache-backed probe per configured
+        # service (Apple + Spotify) with the REQUEST's (artist, album) — not the
+        # library row's. Fixes the wrong-fallback-row attack (non-library album
+        # like Hyd / "Hold Onto Me Infinity" falls back to a same-titled library
+        # row by a different artist, in-line probe runs with the wrong artist
+        # name → null). Results persist to ``lml_cache.album_streaming_url_cache``
+        # so future lookups short-circuit the upstream API, and live resolutions
+        # mint the parsed ID into ``entity.release_identity``. The ``clients``
+        # dict may carry ``None`` values (e.g. Spotify creds unconfigured) — the
+        # post-process filters them. Gated by the master + per-service flags.
+        await apply_streaming_url_postprocess(
             update,
-            apple_music=apple_music,
+            clients={"apple_music": apple_music, "spotify": spotify},
             pg=discogs_cache_pg,
             entity_store=entity_store,
             request_artist=artist,
             request_album=album,
-            feature_enabled=get_settings().lml_persist_apple_music_url,
+            settings=get_settings(),
         )
 
         # Extended fields land on the top-1 result only and require artwork
@@ -3000,6 +3004,7 @@ async def perform_lookup(
     discogs_cache: DiscogsCacheService | None = None,
     mb_pg: PgSourceProtocol | None = None,
     apple_music: AppleMusicClient | None = None,
+    spotify: SpotifyClient | None = None,
     discogs_cache_pg: PgSource | None = None,
     caller_budget_ms: int | None = None,
 ) -> LookupResponse:
@@ -3215,6 +3220,7 @@ async def perform_lookup(
                 discogs_cache=discogs_cache,
                 mb_pg=mb_pg,
                 apple_music=apple_music,
+                spotify=spotify,
                 entity_store=entity_store,
                 discogs_cache_pg=discogs_cache_pg,
             )

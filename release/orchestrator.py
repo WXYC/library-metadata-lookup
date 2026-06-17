@@ -214,13 +214,10 @@ def _spotify_album_id_from_url(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-# Apple Music URL parsing lives in ``release.apple_music_url_parser``.
-# The extraction landed when the lookup post-process needed to mint
-# release-identity rows from Apple URLs; that mint was deferred (see
-# ``lookup/apple_music_postprocess.py`` module docstring), so the parser
-# module's only current caller is this file. Keep the extraction intact
-# — when the mint follow-up reopens, the public helper is right where
-# the new caller expects it.
+# Apple Music URL parsing lives in ``release.apple_music_url_parser``. Since
+# LML#573 the streaming-URL post-process (``lookup/streaming_url_postprocess.py``)
+# is the other caller: its ``apple_music_album`` registry entry uses the same
+# parser to extract the album_id it mints into ``entity.release_identity``.
 
 
 def _merge_streaming_identifiers(

@@ -6,12 +6,14 @@ storm can't pin a request past its budget. Read at request time (not via
 redeploy — mirrors the ``LML_BULK_MAX_CONCURRENT`` and
 ``LML_SEARCH_BUDGET_MS`` patterns.
 
-Hoisted out of ``lookup/orchestrator.py`` so the persistent post-process
-(``lookup/apple_music_postprocess.py``) and the in-line per-item probe
-(``lookup/orchestrator.py::enrich_artwork_results``) share one source of
-truth for the Apple Music wall-clock ceiling. Pre-LML#576 the two
-helpers were 1:1 duplicates of each other — a future tuning change to
-one would silently desync the other.
+Hoisted out of ``lookup/orchestrator.py`` so the in-line per-item Apple
+Music probe (``lookup/orchestrator.py::enrich_artwork_results``) has a
+single tunable source of truth for its wall-clock ceiling. The persistent
+streaming-URL post-process (``lookup/streaming_url_postprocess.py``) no
+longer shares this helper: since LML#573 it sources a per-service
+``probe_timeout_s`` from ``STREAMING_URL_CACHE_CONFIG`` and applies it at
+the gather level (preempting #594), so the two ceilings are now
+independently tunable.
 """
 
 from __future__ import annotations

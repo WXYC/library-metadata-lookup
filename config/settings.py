@@ -164,24 +164,41 @@ class Settings(BaseSettings):
             "See WXYC/library-metadata-lookup#318."
         ),
     )
-    lml_persist_apple_music_url: bool = Field(
-        default=False,
+    # Persistent streaming-URL cache flags (LML#573). A service is persisted
+    # only when BOTH the master kill switch AND its per-service flag are true
+    # (AND-gate). The master defaults True and the per-service flags default
+    # False, so the feature is OFF until Railway sets a per-service flag —
+    # matching the off-by-default posture of the LML#571 apple flag this
+    # replaces. The master is the single-flip kill switch.
+    lml_persist_streaming_urls: bool = Field(
+        default=True,
         description=(
-            "When True, /api/v1/lookup post-processes every item whose "
-            "apple_music_url came out null and runs an Apple Music probe using "
-            "the request's (artist, album, song) — independent of the item's "
-            "library row. Successful resolutions are persisted to "
-            "entity.album_apple_music_lookup_cache keyed by (artist_normalized, "
-            "album_normalized) so subsequent lookups hit the cache instead of "
-            "Apple's API. Known misses are recorded with a 7-day TTL so unknown "
-            "albums don't repeatedly hammer Apple. Off by default so the "
-            "rollout is reversible without a re-deploy; flip True in Railway "
-            "after one staging tick confirms the post-process is healthy. "
-            "Rollback: flip False (no re-deploy required). "
-            "See WXYC/library-metadata-lookup#570."
+            "Master kill switch for the persistent streaming-URL cache "
+            "post-process in /api/v1/lookup. When False, the whole post-process "
+            "short-circuits regardless of the per-service flags. Default True; "
+            "flip False in Railway to disable Apple + Spotify persistence in one "
+            "move without a re-deploy. See WXYC/library-metadata-lookup#573."
         ),
     )
-
+    lml_persist_streaming_url_apple_music: bool = Field(
+        default=False,
+        description=(
+            "Per-service flag for Apple Music in the streaming-URL cache "
+            "post-process. A service persists only when this AND "
+            "LML_PERSIST_STREAMING_URLS are both True. Default False; Railway "
+            "supplies True. Replaces the LML#571 LML_PERSIST_APPLE_MUSIC_URL "
+            "(renamed at deploy, no alias). See WXYC/library-metadata-lookup#573."
+        ),
+    )
+    lml_persist_streaming_url_spotify: bool = Field(
+        default=False,
+        description=(
+            "Per-service flag for Spotify in the streaming-URL cache "
+            "post-process. A service persists only when this AND "
+            "LML_PERSIST_STREAMING_URLS are both True. Default False; Railway "
+            "supplies True. New in PR-1. See WXYC/library-metadata-lookup#573."
+        ),
+    )
     # Streaming Webhook Configuration
     streaming_webhook_urls: str | None = Field(
         None,

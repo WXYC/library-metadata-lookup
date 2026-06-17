@@ -16,10 +16,21 @@ import pytest
 
 from identity.release_validation import (
     RELEASE_SOURCE_COLUMN,
+    RELEASE_SOURCE_CONFIG,
     InvalidReleaseExternalIdError,
+    ReleaseSourceConfig,
     coerce_external_id,
     validate_and_canonicalize_external_id,
 )
+
+# A canonical 22-char base62 Spotify album ID, reused across the
+# spotify_album validator + registry-completeness cases below.
+_VALID_SPOTIFY_ALBUM_ID = "1A2GTWGt0LBTGQAyA3OKAf"
+
+# Sources minted internally (e.g. by the streaming-URL post-process) but
+# deliberately NOT exposed on the public POST /api/v1/identity/resolve enum.
+# Widening ReleaseIdentitySource is a wxyc-shared change tracked by #593.
+_INTERNAL_ONLY_MINT_SOURCES = {"spotify_album"}
 
 
 class TestSourceColumnDispatch:
@@ -37,9 +48,45 @@ class TestSourceColumnDispatch:
     def test_apple_music_album_maps_to_apple_music_album_id(self):
         assert RELEASE_SOURCE_COLUMN["apple_music_album"] == "apple_music_album_id"
 
+    def test_spotify_album_maps_to_spotify_album_id(self):
+        # spotify_album joined RELEASE_SOURCE_CONFIG in #573 (internally
+        # minted by the streaming-URL post-process).
+        assert RELEASE_SOURCE_COLUMN["spotify_album"] == "spotify_album_id"
+
     def test_unknown_source_is_absent(self):
+        # musicbrainz_release is read-only today (no write helper / sentinel
+        # rule) so it never enters RELEASE_SOURCE_CONFIG, hence absent here.
         assert "musicbrainz_release" not in RELEASE_SOURCE_COLUMN
-        assert "spotify_album" not in RELEASE_SOURCE_COLUMN
+
+
+class TestReleaseSourceConfigDerivedView:
+    """``RELEASE_SOURCE_COLUMN`` is a derived view of ``RELEASE_SOURCE_CONFIG``.
+
+    #573 introduced the dataclass-keyed registry; ``RELEASE_SOURCE_COLUMN``
+    stays as a backward-compat view so the store's read path and all 12
+    existing call sites keep working unchanged.
+    """
+
+    def test_release_source_column_is_derived_view(self):
+        assert RELEASE_SOURCE_COLUMN == {
+            k: v.identity_column for k, v in RELEASE_SOURCE_CONFIG.items()
+        }
+
+    def test_config_entries_are_release_source_config_instances(self):
+        for source, cfg in RELEASE_SOURCE_CONFIG.items():
+            assert isinstance(cfg, ReleaseSourceConfig), source
+
+    def test_config_carries_five_entries(self):
+        # discogs ×2, bandcamp, apple_music_album, spotify_album. The cache
+        # registry (STREAMING_URL_CACHE_CONFIG) is a deliberately smaller
+        # subset — see lookup/streaming_url_postprocess.py.
+        assert set(RELEASE_SOURCE_CONFIG) == {
+            "discogs_release",
+            "discogs_master",
+            "bandcamp",
+            "apple_music_album",
+            "spotify_album",
+        }
 
 
 class TestValidateDiscogsRelease:
@@ -183,6 +230,39 @@ class TestValidateAppleMusicAlbum:
             validate_and_canonicalize_external_id("apple_music_album", external_id)
 
 
+class TestValidateSpotifyAlbum:
+    """Spotify album IDs are 22-char base62 strings.
+
+    Spotify's open-graph album URL carries a 22-character base62 ID
+    (``open.spotify.com/album/<id>``). The validator pins that exact shape:
+    reject anything that is not exactly 22 ``[0-9A-Za-z]`` characters. Unlike
+    the Discogs / Apple rules there is no zero-sentinel concept — base62 IDs
+    are opaque, not ordinal.
+    """
+
+    def test_accepts_canonical_id(self):
+        assert (
+            validate_and_canonicalize_external_id("spotify_album", _VALID_SPOTIFY_ALBUM_ID)
+            == _VALID_SPOTIFY_ALBUM_ID
+        )
+
+    @pytest.mark.parametrize(
+        "external_id",
+        [
+            "1A2GTWGt0LBTGQAyA3OKA",  # 21 chars — too short
+            "1A2GTWGt0LBTGQAyA3OKAfX",  # 23 chars — too long
+            "1A2GTWGt0LBTGQAyA3OK-f",  # 22 chars with a hyphen (not base62)
+            "1A2GTWGt0LBTGQAyA3OK_f",  # 22 chars with an underscore
+            "1A2GTWGt0LBTGQAyA3OK f",  # 22 chars with a space
+            "",
+            " ",
+        ],
+    )
+    def test_rejects_wrong_shape(self, external_id):
+        with pytest.raises(InvalidReleaseExternalIdError):
+            validate_and_canonicalize_external_id("spotify_album", external_id)
+
+
 class TestValidateUnknownSource:
     """An unrecognised source is a programmer error — pydantic blocks it upstream,
     but the validator must still refuse rather than silently mint a bad row."""
@@ -206,20 +286,28 @@ class TestRegistryDriftInvariant:
     that source arrived. These tests make the drift fail at CI time.
     """
 
-    def test_release_source_column_keys_match_pydantic_enum(self):
+    def test_release_source_config_keys_match_pydantic_enum(self):
+        # #573: spotify_album is minted internally by the streaming-URL
+        # post-process but deliberately NOT exposed on the public
+        # ReleaseIdentitySource enum (that widening is a wxyc-shared change
+        # tracked by #593). Subtract the documented exception set so the
+        # guard stays loud about any *other* divergence while recording the
+        # one intentional gap.
         from generated.api_models import ReleaseIdentitySource
 
         enum_values = {member.value for member in ReleaseIdentitySource}
-        column_keys = set(RELEASE_SOURCE_COLUMN.keys())
-        assert column_keys == enum_values, (
-            f"RELEASE_SOURCE_COLUMN keys and ReleaseIdentitySource enum diverged. "
-            f"In dict but not enum: {column_keys - enum_values!r}; "
-            f"in enum but not dict: {enum_values - column_keys!r}. "
+        public_config_keys = set(RELEASE_SOURCE_CONFIG.keys()) - _INTERNAL_ONLY_MINT_SOURCES
+        assert public_config_keys == enum_values, (
+            f"RELEASE_SOURCE_CONFIG keys (minus internal-only mint sources "
+            f"{_INTERNAL_ONLY_MINT_SOURCES!r}) and ReleaseIdentitySource enum diverged. "
+            f"In config but not enum: {public_config_keys - enum_values!r}; "
+            f"in enum but not config: {enum_values - public_config_keys!r}. "
             f"Either add the source to wxyc-shared/api.yaml's "
             f"ReleaseIdentitySource enum and regenerate generated/api_models.py, "
-            f"or add the dispatch entry to RELEASE_SOURCE_COLUMN + a sentinel "
+            f"or add the dispatch entry to RELEASE_SOURCE_CONFIG + a sentinel "
             f"rule in identity/release_validation.py + a DDL column in "
-            f"entity/release_identity.sql."
+            f"entity/release_identity.sql. If the source is intentionally "
+            f"internal-only, add it to _INTERNAL_ONLY_MINT_SOURCES with a note."
         )
 
     def test_release_source_columns_match_ddl(self):
@@ -249,6 +337,7 @@ class TestRegistryDriftInvariant:
             "discogs_master": "789",
             "bandcamp": "https://autechre.bandcamp.com/album/confield",
             "apple_music_album": "1234567890",
+            "spotify_album": _VALID_SPOTIFY_ALBUM_ID,
         }
         for source in RELEASE_SOURCE_COLUMN:
             assert source in good_inputs, (
@@ -279,6 +368,7 @@ class TestRegistryDriftInvariant:
             "discogs_master": "789",
             "bandcamp": "https://autechre.bandcamp.com/album/confield",
             "apple_music_album": "1234567890",
+            "spotify_album": _VALID_SPOTIFY_ALBUM_ID,
         }
         for source in RELEASE_SOURCE_COLUMN:
             assert source in canonical_inputs, (
@@ -308,6 +398,12 @@ class TestCoerceExternalId:
         # apple_music_album_id is a TEXT column (Apple's numeric IDs can grow
         # past INT32 — the column is TEXT so the bind value also stays str).
         assert coerce_external_id("apple_music_album", "1234567890") == "1234567890"
+
+    def test_spotify_album_stays_string(self):
+        # spotify_album_id is a TEXT column; the base62 ID binds verbatim.
+        assert (
+            coerce_external_id("spotify_album", _VALID_SPOTIFY_ALBUM_ID) == _VALID_SPOTIFY_ALBUM_ID
+        )
 
     def test_unknown_source_raises(self):
         # Defense-in-depth — should never happen post-validation.

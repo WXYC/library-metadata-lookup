@@ -70,7 +70,10 @@ class TestEnrichArtworkResults:
         assert enriched.release_year == 1978
         assert enriched.artist_bio == "English singer-songwriter."
         assert enriched.wikipedia_url == "https://en.wikipedia.org/wiki/Kate_Bush"
-        assert "Kate+Bush" in enriched.spotify_url or "Kate%20Bush" in enriched.spotify_url
+        # Spotify's templated search-URL fallback was deleted in LML#573 (the
+        # persistent cache replaces it); with no Spotify client / flag here,
+        # spotify_url stays None. YTM / Bandcamp / SoundCloud still fall back.
+        assert enriched.spotify_url is None
         assert enriched.youtube_music_url is not None
         assert enriched.bandcamp_url is not None
         assert enriched.soundcloud_url is not None
@@ -121,8 +124,9 @@ class TestEnrichArtworkResults:
         assert enriched.wikipedia_url is None
         # apple_music_url stays None because apple_music is None.
         assert enriched.apple_music_url is None
-        # Search-URL fallbacks fill (artist + song are non-empty).
-        assert enriched.spotify_url is not None
+        # YTM / Bandcamp / SoundCloud search-URL fallbacks fill (artist + song
+        # non-empty). Spotify's fallback was deleted in LML#573 → None here.
+        assert enriched.spotify_url is None
         assert enriched.youtube_music_url is not None
         assert enriched.bandcamp_url is not None
         assert enriched.soundcloud_url is not None
@@ -236,7 +240,10 @@ class TestEnrichArtworkResults:
         # Enriched fields should be None but streaming URLs still generated
         assert enriched.release_year is None
         assert enriched.artist_bio is None
-        assert enriched.spotify_url is not None  # search URL still works
+        # Spotify templated fallback deleted (LML#573); the retained YTM/BC/SC
+        # fallbacks still generate. spotify_url stays None with no client/flag.
+        assert enriched.spotify_url is None
+        assert enriched.youtube_music_url is not None  # retained fallback still works
 
     @pytest.mark.asyncio
     async def test_top1_gating_only_release_details_for_first_item(self):
@@ -279,8 +286,10 @@ class TestEnrichArtworkResults:
         for i, (item, enriched) in enumerate(results, start=1):
             assert item.id == i, f"Item order not preserved at position {i}"
             assert enriched is not None
-            # Streaming URLs still built per-result (cheap; no I/O).
-            assert enriched.spotify_url is not None
+            # Streaming URLs still built per-result (cheap; no I/O). Spotify's
+            # templated fallback was deleted in LML#573 → None; YTM still fills.
+            assert enriched.spotify_url is None
+            assert enriched.youtube_music_url is not None
 
         # Top-1 gets the release year; the rest don't.
         assert results[0][1].release_year == 2001
@@ -1296,8 +1305,10 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         _, enriched = results[0]
         assert enriched is not None
         assert enriched.apple_music_url is None
-        # Search-URL fallbacks for the OTHER services still fill.
-        assert enriched.spotify_url is not None
+        # Search-URL fallbacks for YTM/BC/SC still fill; Spotify's fallback was
+        # deleted in LML#573 → None (no Spotify client/flag here).
+        assert enriched.spotify_url is None
+        assert enriched.youtube_music_url is not None
 
     @pytest.mark.asyncio
     async def test_apple_music_client_returning_none_leaves_url_unset(self):
@@ -1636,9 +1647,11 @@ class TestStreamingLinksTitleGate:
         assert enriched.youtube_music_url != "https://music.youtube.com/wrong"
         assert enriched.bandcamp_url != "https://wrong.bandcamp.com/album/tzenni"
         assert enriched.soundcloud_url != "https://soundcloud.com/wrong/tzenni"
-        # Synthesized search-URL fallback fills in instead.
-        assert enriched.spotify_url is not None
-        assert "search" in enriched.spotify_url.lower()
+        # Synthesized search-URL fallback fills in instead — for the services
+        # that still have one. Spotify's was deleted in LML#573 → None here.
+        assert enriched.spotify_url is None
+        assert enriched.youtube_music_url is not None
+        assert "search" in enriched.youtube_music_url.lower()
         # And we never even queried the DB for streaming links — the gate
         # short-circuits before the lookup.
         library_db.get_streaming_links.assert_not_awaited()
@@ -1933,9 +1946,11 @@ class TestExternalArtworkProbe:
         # No artwork surfaces — synthesized result with null artwork field.
         assert enriched.artwork_url is None
         assert enriched.release_year is None
-        # Search-URL fallbacks still fill (legacy LML#401 contract).
-        assert enriched.spotify_url is not None
-        assert "search" in enriched.spotify_url.lower()
+        # Search-URL fallbacks still fill (legacy LML#401 contract) for YTM/BC/SC.
+        # Spotify's fallback was deleted in LML#573 → None (no client/flag here).
+        assert enriched.spotify_url is None
+        assert enriched.youtube_music_url is not None
+        assert "search" in enriched.youtube_music_url.lower()
 
     @pytest.mark.asyncio
     async def test_probe_not_invoked_when_album_is_none(self):
@@ -3192,8 +3207,11 @@ class TestSiblingOverrideProbeDivergence:
         curated streaming URLs; request is for ``Tzenni (Deluxe Edition)``
         with ``artwork=None`` (Discogs miss for the Deluxe). Apple Music
         probe finds the Deluxe. None of the five override URLs may
-        propagate; ``apple_music_url`` becomes the probe URL; the other
-        four downgrade to search-URL fallbacks (not no-link).
+        propagate; ``apple_music_url`` becomes the probe URL; YouTube Music /
+        Bandcamp / SoundCloud downgrade to search-URL fallbacks (not no-link).
+        Spotify's templated fallback was deleted in LML#573 (the persistent
+        streaming-URL cache replaces it), so with no Spotify client passed and
+        its per-service flag off, ``spotify_url`` stays None here.
         """
         item = make_library_item(id=42, artist="Noura Mint Seymali", title="Tzenni")
 
@@ -3246,18 +3264,18 @@ class TestSiblingOverrideProbeDivergence:
         # precedence flip over the existing
         # ``apple_music_override or apple_music_url or None`` order.
         assert enriched.apple_music_url == probe_url
-        # The other four downgrade to search-URL placeholders, NOT
-        # no-link (the override-block-clears-by-itself level is
-        # ``search-URL``, not None — `_build_streaming_search_url`
-        # fills any unset service when artist+song are non-empty).
-        assert enriched.spotify_url is not None
-        assert "search" in enriched.spotify_url.lower()
+        # YouTube Music / Bandcamp / SoundCloud downgrade to search-URL
+        # placeholders, NOT no-link (`_build_streaming_search_url` fills any
+        # unset service when artist+song are non-empty).
         assert enriched.youtube_music_url is not None
         assert "search" in enriched.youtube_music_url.lower()
         assert enriched.bandcamp_url is not None
         assert "search" in enriched.bandcamp_url.lower()
         assert enriched.soundcloud_url is not None
         assert "search" in enriched.soundcloud_url.lower()
+        # Spotify's templated fallback is gone (LML#573); nothing fills the
+        # slot in this no-Spotify-client / flag-off setup.
+        assert enriched.spotify_url is None
 
     @pytest.mark.asyncio
     async def test_probe_url_wins_precedence_over_override_on_synthesis_branch(self):
