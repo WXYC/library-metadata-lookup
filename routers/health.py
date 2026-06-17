@@ -32,6 +32,7 @@ collapse to ``app.include_router(readiness_router(...))``.
 import asyncio
 import logging
 import os
+from pathlib import Path
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
@@ -47,6 +48,40 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["health"])
 
 CORE_SERVICES = {"database"}
+
+# A blank ``COMMIT_SHA`` placeholder is tracked at the repo root; CI overwrites
+# it with the deployed commit (``echo "$SHA" > COMMIT_SHA``) before ``railway up``
+# uploads the working directory. It must stay tracked (not ``.gitignore``d) —
+# ``railway up`` honors ``.gitignore`` and would otherwise drop it from the
+# upload. See ``_resolve_commit_sha`` and WXYC/library-metadata-lookup#509.
+COMMIT_SHA_PATH = Path(__file__).resolve().parent.parent / "COMMIT_SHA"
+
+
+def _resolve_commit_sha(commit_sha_path: Path = COMMIT_SHA_PATH) -> str | None:
+    """Resolve the deployed commit SHA for ``/health``, in priority order.
+
+    1. A ``COMMIT_SHA`` file baked into the image by CI before ``railway up``.
+       This is the authoritative source: the deploy actually serving prod and
+       staging traffic is a ``railway up`` CLI source-deploy, which Railway
+       does *not* tag with git metadata, so ``RAILWAY_GIT_COMMIT_SHA`` is
+       absent there. See WXYC/library-metadata-lookup#509.
+    2. ``RAILWAY_GIT_COMMIT_SHA`` — set only on Railway's git-native deploys;
+       a useful fallback for a local-Railway deploy or if the CI wiring above
+       regresses.
+    3. ``None`` — local dev, CI, and tests (no file, no env var).
+
+    Empty / whitespace-only values at any tier are treated as absent so the
+    documented "null when unset" contract holds, and downstream deploy-gate
+    equality checks (e.g. WXYC/Backend-Service#1361) are never fooled by ``""``.
+    """
+    try:
+        file_sha = commit_sha_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        file_sha = ""
+    if file_sha:
+        return file_sha
+    env_sha = (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "").strip()
+    return env_sha or None
 
 
 async def _check_database(db: LibraryDB) -> str:
@@ -141,15 +176,12 @@ async def health_check(
     else:
         status = "unhealthy"
 
-    # Coerce a set-but-empty ``RAILWAY_GIT_COMMIT_SHA`` to ``None`` so the
-    # documented "null when unset" contract holds across (a) Railway with the
-    # var unset, (b) local dev / CI with the var unset, and (c) shells that
-    # exported the var with an empty value. Downstream deploy-gate equality
-    # checks (e.g. WXYC/Backend-Service#1361) must not be fooled by ``""``.
+    # ``COMMIT_SHA_PATH`` is read as a module global (not bound as the helper's
+    # default arg) so tests can redirect it via ``monkeypatch.setattr``.
     body = {
         "status": status,
         "version": settings.app_version,
-        "commit_sha": os.environ.get("RAILWAY_GIT_COMMIT_SHA") or None,
+        "commit_sha": _resolve_commit_sha(COMMIT_SHA_PATH),
         "services": services,
     }
 
