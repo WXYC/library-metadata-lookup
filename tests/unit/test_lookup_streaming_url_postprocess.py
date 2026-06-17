@@ -611,10 +611,11 @@ class TestRegistryInvariants:
         assert cfg.url_field == case["url_field"]
         assert cfg.client_attr == case["client_attr"]
         assert cfg.flag_setting == case["flag_setting"]
-        # mint_source keys back into RELEASE_SOURCE_CONFIG (same as the service key).
-        assert cfg.mint_source == service
-        assert cfg.mint_source in RELEASE_SOURCE_CONFIG
         assert cfg.probe_timeout_s == 4.0
+        # The service key doubles as the mint source; the subset invariant
+        # (test_cache_config_is_subset_of_release_source_config) guarantees it
+        # keys into RELEASE_SOURCE_CONFIG, so there's no mint_source field.
+        assert service in RELEASE_SOURCE_CONFIG
 
     def test_every_flag_setting_is_a_real_settings_attribute(self):
         # `apply_streaming_url_postprocess` reads `getattr(settings,

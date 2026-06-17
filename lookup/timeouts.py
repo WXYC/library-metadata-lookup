@@ -20,10 +20,7 @@ The post-process applies a per-service ceiling at the gather level (preempting
 
 from __future__ import annotations
 
-import logging
-import os
-
-logger = logging.getLogger(__name__)
+from core.search import resolve_positive_int_env
 
 _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S = 4.0
 """Default wall-clock ceiling for a single Apple Music probe from the
@@ -42,21 +39,12 @@ def probe_timeout_s_from_env(env_var: str, default_s: float) -> float:
 
     Read at request time (not via ``Settings``) so the knob can be tuned via
     Railway env vars without a redeploy — mirrors the ``LML_BULK_MAX_CONCURRENT``
-    and ``LML_SEARCH_BUDGET_MS`` patterns. A misconfigured value (unset,
-    unparseable, zero, or negative) falls back to ``default_s`` with a WARN.
+    and ``LML_SEARCH_BUDGET_MS`` patterns. Delegates the integer parse +
+    unparseable/zero/negative fallback (with WARN) to the shared
+    ``core.search.resolve_positive_int_env`` so there is one env-int policy,
+    then converts the ms value to seconds.
     """
-    raw = os.getenv(env_var)
-    if not raw:
-        return default_s
-    try:
-        ms = int(raw)
-    except ValueError:
-        logger.warning("Invalid %s=%r, falling back to %.1fs", env_var, raw, default_s)
-        return default_s
-    if ms <= 0:
-        logger.warning("%s=%d must be > 0, falling back to %.1fs", env_var, ms, default_s)
-        return default_s
-    return ms / 1000.0
+    return resolve_positive_int_env(env_var, round(default_s * 1000)) / 1000.0
 
 
 def apple_music_lookup_timeout_s() -> float:

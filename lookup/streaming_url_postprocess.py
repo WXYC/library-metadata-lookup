@@ -93,10 +93,12 @@ class StreamingUrlCacheConfig:
     Holds *only* cache/postprocess concerns — disjoint from
     ``identity.release_validation.ReleaseSourceConfig`` (identity-mint
     concerns) so neither registry carries Optional fields for the other's
-    members. ``mint_source`` keys back into ``RELEASE_SOURCE_CONFIG`` (it is
-    the same string as this registry's key today); ``flag_setting`` names the
-    per-service ``Settings`` attribute; ``url_to_external_id`` extracts the
-    mintable ID from a resolved URL (``None`` → surface URL, skip mint).
+    members. ``flag_setting`` names the per-service ``Settings`` attribute;
+    ``url_to_external_id`` extracts the mintable ID from a resolved URL
+    (``None`` → surface URL, skip mint). The registry *key* doubles as the
+    mint source (a key into ``RELEASE_SOURCE_CONFIG``) — the post-process
+    threads it into ``_mint_identity`` directly, so there is no separate
+    ``mint_source`` field to keep in sync.
 
     ``probe_timeout_s`` is the static per-service wall-clock ceiling.
     ``timeout_env_var`` (optional) names an integer-ms env var that overrides
@@ -111,7 +113,6 @@ class StreamingUrlCacheConfig:
     url_to_external_id: Callable[[str], str | None]
     url_field: str
     client_attr: str
-    mint_source: str
     flag_setting: str
     timeout_env_var: str | None = None
 
@@ -131,7 +132,6 @@ STREAMING_URL_CACHE_CONFIG: dict[str, StreamingUrlCacheConfig] = {
         url_to_external_id=apple_album_id_from_url,
         url_field="apple_music_url",
         client_attr="apple_music",
-        mint_source="apple_music_album",
         flag_setting="lml_persist_streaming_url_apple_music",
         # Back-compat: the pre-LML#573 Apple post-process honored this env var
         # (via apple_music_lookup_timeout_s); keep it tuning this leg too.
@@ -143,7 +143,6 @@ STREAMING_URL_CACHE_CONFIG: dict[str, StreamingUrlCacheConfig] = {
         url_to_external_id=spotify_album_id_from_url,
         url_field="spotify_url",
         client_attr="spotify",
-        mint_source="spotify_album",
         flag_setting="lml_persist_streaming_url_spotify",
     ),
 }
@@ -217,9 +216,10 @@ async def apply_streaming_url_postprocess(
         if isinstance(result, ResolveOutcome) and result.url is not None:
             update[cfg.url_field] = result.url
             # Mint only on a brand-new live resolution — cache hits already
-            # minted, re-minting writes redundant reconciliation rows.
+            # minted, re-minting writes redundant reconciliation rows. The
+            # service key IS the mint source (a key into RELEASE_SOURCE_CONFIG).
             if result.source == "live_resolved":
-                await _mint_identity(cfg, result.url, entity_store)
+                await _mint_identity(service_key, cfg, result.url, entity_store)
 
 
 def _effective_probe_timeout_s(cfg: StreamingUrlCacheConfig) -> float:
@@ -253,17 +253,20 @@ async def _resolve_one(
 
 
 async def _mint_identity(
+    source: str,
     cfg: StreamingUrlCacheConfig,
     url: str,
     entity_store: EntityStore,
 ) -> None:
     """Best-effort mint of the resolved URL's external_id into release_identity.
 
-    Parses the external_id from the URL, validates+canonicalizes it (the same
-    contract ``identity/router.py`` honors — the URL parsers' floors are looser
-    than the validators' rules, so this is real defense-in-depth), then mints.
-    Any failure (unparseable URL, validation rejection, PG outage) is logged
-    and swallowed — the user-visible URL has already been surfaced.
+    ``source`` is the service key — also the key into ``RELEASE_SOURCE_CONFIG``
+    that selects the validator + identity column. Parses the external_id from
+    the URL, validates+canonicalizes it (the same contract ``identity/router.py``
+    honors — the URL parsers' floors are looser than the validators' rules, so
+    this is real defense-in-depth), then mints. Any failure (unparseable URL,
+    validation rejection, PG outage) is logged and swallowed — the user-visible
+    URL has already been surfaced.
     """
     external_id = cfg.url_to_external_id(url)
     if external_id is None:
@@ -272,16 +275,14 @@ async def _mint_identity(
         # corrupt downstream joins.
         return
     try:
-        canonical = validate_and_canonicalize_external_id(cfg.mint_source, external_id)
-        await entity_store.mint_or_get_release_identity(
-            source=cfg.mint_source, external_id=canonical
-        )
+        canonical = validate_and_canonicalize_external_id(source, external_id)
+        await entity_store.mint_or_get_release_identity(source=source, external_id=canonical)
     except Exception:
         # Swallows both InvalidReleaseExternalIdError (validation rejection)
         # and any PG-side failure — both are best-effort; the URL stays.
         logger.exception(
             "%s mint failed for external_id=%s (url=%s) — URL still surfaced",
-            cfg.mint_source,
+            source,
             external_id,
             url,
         )
