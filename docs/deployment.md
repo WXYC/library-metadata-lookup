@@ -96,10 +96,24 @@ The probe also projects its result onto the active Sentry trace as the `discogs_
 
 ### `commit_sha` (deploy identity)
 
-`GET /health` also returns a `commit_sha` field sourced from Railway's auto-injected `RAILWAY_GIT_COMMIT_SHA` environment variable. Local dev and CI surface `null` (the variable is unset).
+`GET /health` returns a `commit_sha` field identifying the deployed commit. It is resolved in priority order by `_resolve_commit_sha` in `routers/health.py`:
+
+1. **A `COMMIT_SHA` file baked into the image.** A blank `COMMIT_SHA` placeholder is tracked at the repo root; CI overwrites it with `echo "$GITHUB_SHA" > COMMIT_SHA` immediately before `railway up` in both `deploy-staging` and `deploy-production`, and `railway up` uploads the working directory, so the file ships inside the image. This is the authoritative source in prod and staging. The placeholder is deliberately **not** `.gitignore`d: `railway up` honors `.gitignore` and would drop a gitignored file from the upload, silently defeating the whole mechanism. It ships blank, so a checkout (local dev / CI) reads empty content, which coerces to `null` per the tier rules below.
+2. **`RAILWAY_GIT_COMMIT_SHA`** — Railway auto-injects this, but only on its *git-native* deploys (not on `railway up`). Used as a fallback.
+3. **`null`** — local dev, CI, and tests (no file, no env var).
+
+Empty or whitespace-only values at any tier coerce to `null`, so the "null when unset" contract holds and downstream equality checks are never fooled by `""`.
 
 ```json
 { "status": "healthy", "version": "0.1.0", "commit_sha": "abc123...", "services": { ... } }
 ```
+
+#### Why a baked file rather than `RAILWAY_GIT_COMMIT_SHA` (LML#509)
+
+Every push to `main`/`prod` produces **two** deployments: Railway's git-native trigger (carries the SHA) and the CI `railway up` source-deploy (no git metadata). The CI deploy lands ~3 min later — after the lint/typecheck/test/pg gates — and supersedes the git-native one, so the deploy actually serving traffic has no `RAILWAY_GIT_COMMIT_SHA`. Reading only the env var left `commit_sha` permanently `null` in prod, which wedged WXYC/Backend-Service's `rotation-artist-backfill` cron (its deploy guard refused to run against an unidentifiable deploy). Baking the SHA into the uploaded working directory attaches deploy identity to the deploy that wins.
+
+> **Operational follow-up (manual, not in this repo):** disable Railway's native GitHub auto-deploy on the prod and staging services so each push produces a single CI-gated deploy instead of a two-deploy race. Until that's done both deploys still run; the baked file just guarantees that whichever one wins reports a SHA. This is a Railway dashboard/API change, not a code change.
+
+#### Cross-repo deploy gating
 
 This is the canonical "is commit X deployed?" signal for cross-repo deploy gates. `settings.app_version` is hardcoded to `"0.1.0"` and is not bumped per deploy, so it cannot serve that role. Downstream callers that depend on a specific LML behavior (e.g. WXYC/Backend-Service rotation-scoped Discogs backfills that require LML#503's `fetched_at` stub-discriminator semantics) should poll `/health` and compare `commit_sha` against the merge SHA of the feature they need before scheduling the job — short-circuiting wasted API budget when staging happens to be running an older deploy.
