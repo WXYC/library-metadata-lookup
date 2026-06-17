@@ -19,6 +19,29 @@ class TestResolvedLibraryDbPath:
         assert s.resolved_library_db_path == Path("/data/my_library.db")
 
 
+class TestStreamingUrlPersistFlags:
+    """LML#573 AND-gate: a service persists only when the master AND its
+    per-service flag are both true. Master defaults True, per-service default
+    False, so the feature is OFF out of the box (Railway supplies the
+    per-service True values)."""
+
+    def test_master_defaults_true(self):
+        assert Settings().lml_persist_streaming_urls is True
+
+    def test_per_service_flags_default_false(self):
+        s = Settings()
+        assert s.lml_persist_streaming_url_apple_music is False
+        assert s.lml_persist_streaming_url_spotify is False
+
+    def test_master_true_per_service_false_means_feature_off(self):
+        # The subtle AND-gate: master defaulting True alone does NOT enable
+        # any service. Both gates must be open.
+        s = Settings()
+        assert s.lml_persist_streaming_urls is True
+        assert s.lml_persist_streaming_url_apple_music is False
+        assert s.lml_persist_streaming_url_spotify is False
+
+
 class TestGetSettings:
     def test_returns_settings_instance(self):
         get_settings.cache_clear()

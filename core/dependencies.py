@@ -221,7 +221,7 @@ async def get_discogs_cache_pg(
 
     Sibling of ``get_discogs_cache_service_from_pool`` for callers that
     need a raw ``PgSource`` against the same pool (e.g. the persistent
-    Apple Music URL cache at ``entity.album_apple_music_lookup_cache``).
+    streaming-URL cache at ``lml_cache.album_streaming_url_cache``).
     Same posture as the other shared-pool consumers (WXYC#395): one pool,
     one timeout/sizing policy, one degradation signal on ``/health``.
 

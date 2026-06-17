@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats, init_cache_stats
 
 from clients.streaming.apple_music import AppleMusicClient
+from clients.streaming.spotify import SpotifyClient
 from core.bulk_concurrency import (
     cancel_and_drain,
     max_concurrency_from_env,
@@ -43,7 +44,7 @@ from lookup.models import (
     LookupResponse,
 )
 from lookup.orchestrator import perform_lookup
-from streaming.dependencies import get_apple_music_client
+from streaming.dependencies import get_apple_music_client, get_spotify_client
 
 if TYPE_CHECKING:
     from posthog import Posthog
@@ -140,6 +141,7 @@ async def handle_lookup(
     discogs_cache_pg: PgSource | None = Depends(get_discogs_cache_pg),
     posthog_client: Posthog | None = Depends(get_posthog_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
+    spotify: SpotifyClient | None = Depends(get_spotify_client),
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
         default=None,
@@ -176,6 +178,7 @@ async def handle_lookup(
             discogs_cache=discogs_cache,
             mb_pg=mb_pg,
             apple_music=apple_music,
+            spotify=spotify,
             discogs_cache_pg=discogs_cache_pg,
             caller_budget_ms=x_caller_budget_ms,
         )
@@ -249,6 +252,7 @@ async def handle_bulk_lookup(
     discogs_cache_pg: PgSource | None = Depends(get_discogs_cache_pg),
     posthog_client: Posthog | None = Depends(get_posthog_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
+    spotify: SpotifyClient | None = Depends(get_spotify_client),
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
         default=None,
@@ -335,6 +339,7 @@ async def handle_bulk_lookup(
                         discogs_cache=discogs_cache,
                         mb_pg=mb_pg,
                         apple_music=apple_music,
+                        spotify=spotify,
                         discogs_cache_pg=discogs_cache_pg,
                         caller_budget_ms=x_caller_budget_ms,
                     )

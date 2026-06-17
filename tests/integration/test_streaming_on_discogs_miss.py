@@ -101,8 +101,11 @@ class TestStreamingOnDiscogsMiss:
         assert top.artwork.release_year is None
         assert top.artwork.artist_bio is None
         assert top.artwork.wikipedia_url is None
-        # Search-URL fallbacks fill (artist + song are non-empty).
-        assert top.artwork.spotify_url is not None
+        # Search-URL fallbacks fill (artist + song are non-empty) for YTM/BC/SC.
+        # Spotify's templated fallback was deleted in LML#573 (the persistent
+        # streaming-URL cache replaces it); with no Spotify client passed and
+        # the per-service flag off, spotify_url stays None.
+        assert top.artwork.spotify_url is None
         assert top.artwork.youtube_music_url is not None
         assert top.artwork.bandcamp_url is not None
         assert top.artwork.soundcloud_url is not None
@@ -116,8 +119,10 @@ class TestStreamingOnDiscogsMiss:
     @pytest.mark.asyncio
     async def test_search_urls_fill_when_apple_match_fails(self, library_db):
         """When Apple Music has no clearable match either, the synthesized
-        artwork still carries the Spotify/YT/BC/SC search URLs so iOS isn't
-        stuck with all-greyed streaming buttons.
+        artwork still carries the YT/BC/SC search URLs so iOS isn't stuck with
+        all-greyed streaming buttons. Spotify's templated fallback was deleted
+        in LML#573 (the persistent cache replaces it), so its slot stays None
+        here (no Spotify client passed, per-service flag off).
         """
         from wxyc_fastapi.observability import init_cache_stats
 
@@ -160,8 +165,9 @@ class TestStreamingOnDiscogsMiss:
         assert top.artwork is not None
         assert top.artwork.release_id == 0
         assert top.artwork.apple_music_url is None  # Apple Music had no match
-        # But search-URL fallbacks still fill — iOS gets at least four buttons.
-        assert top.artwork.spotify_url is not None
+        # YTM/BC/SC search-URL fallbacks still fill — iOS gets three buttons.
+        # Spotify's fallback was deleted in LML#573 → None here.
+        assert top.artwork.spotify_url is None
         assert top.artwork.youtube_music_url is not None
         assert top.artwork.bandcamp_url is not None
         assert top.artwork.soundcloud_url is not None

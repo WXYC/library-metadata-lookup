@@ -21,6 +21,8 @@ The flow is:
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from release.url_parser import parse_url
 
@@ -37,16 +39,35 @@ from release.url_parser import parse_url
 # is TEXT and the bind value stays str).
 _DISCOGS_POSITIVE_INT_RE = re.compile(r"[1-9][0-9]*")
 
-# Map a release-identity source key to the ``entity.release_identity`` column
-# that holds its external ID. The set here is the v1 source list from LML#526;
-# new sources (e.g. ``musicbrainz_release``, ``spotify_album``) get added in
-# lockstep with their column on the table and a matching sentinel rule below.
-RELEASE_SOURCE_COLUMN: dict[str, str] = {
-    "discogs_release": "discogs_release_id",
-    "discogs_master": "discogs_master_id",
-    "bandcamp": "bandcamp_album_url",
-    "apple_music_album": "apple_music_album_id",
-}
+# Spotify album IDs are exactly 22 base62 characters (the ID embedded in
+# ``open.spotify.com/album/<id>``). Opaque, not ordinal — no zero sentinel.
+_SPOTIFY_ALBUM_ID_RE = re.compile(r"[0-9A-Za-z]{22}")
+
+
+@dataclass(frozen=True)
+class ReleaseSourceConfig:
+    """Per-source identity-mint dispatch for ``entity.release_identity``.
+
+    Holds *only* identity concerns — the column the source's external ID
+    lands in, the sentinel ``validator`` run before any DB write, and the
+    ``coercer`` that produces the asyncpg bind type. Cache/post-process
+    concerns (TTL, probe timeout, URL parsing) live in the separate
+    ``lookup.streaming_url_postprocess.StreamingUrlCacheConfig`` registry so
+    Discogs entries (identity-only) don't carry Optional cache fields. The
+    two registries have different cardinality on purpose — see
+    ``RELEASE_SOURCE_CONFIG`` below.
+
+    ``validator`` takes ``(source, external_id)`` (uniform across sources;
+    the ``source`` arg lets one validator body serve multiple keys, e.g. the
+    two Discogs entries) and returns the canonical external_id or raises
+    ``InvalidReleaseExternalIdError``. ``coercer`` takes the post-validation
+    external_id and returns its bind value (``int`` for INTEGER columns, the
+    string verbatim for TEXT columns).
+    """
+
+    identity_column: str
+    validator: Callable[[str, str], str]
+    coercer: Callable[[str], int | str]
 
 
 class InvalidReleaseExternalIdError(ValueError):
@@ -81,7 +102,7 @@ def _validate_discogs_positive_int(source: str, external_id: str) -> str:
     return external_id
 
 
-def _validate_apple_music_album_id(external_id: str) -> str:
+def _validate_apple_music_album_id(source: str, external_id: str) -> str:
     """Apple Music album IDs: positive decimal integer.
 
     Apple's URLs of the form
@@ -108,7 +129,7 @@ def _validate_apple_music_album_id(external_id: str) -> str:
     return external_id
 
 
-def _validate_bandcamp_album_url(external_id: str) -> str:
+def _validate_bandcamp_album_url(source: str, external_id: str) -> str:
     """Bandcamp: must parse via ``release.url_parser.parse_url`` as a bandcamp album.
 
     Returns the parser's canonical form (trailing slash stripped, lowercased
@@ -123,65 +144,111 @@ def _validate_bandcamp_album_url(external_id: str) -> str:
     return parsed.identifier
 
 
+def _validate_spotify_album_id(source: str, external_id: str) -> str:
+    """Spotify album IDs: exactly 22 base62 characters.
+
+    Spotify's album open-graph URL (``open.spotify.com/album/<id>``) carries
+    a 22-character base62 ID. The validator pins that exact shape so a
+    malformed ID — surfaced by the looser URL parsers upstream, or handed in
+    by a future caller — never lands in
+    ``entity.release_identity.spotify_album_id``. Base62 IDs are opaque, not
+    ordinal, so there is no zero-sentinel concept (unlike the Discogs / Apple
+    rules). Returns the input verbatim on success; the column is TEXT.
+    """
+    if not _SPOTIFY_ALBUM_ID_RE.fullmatch(external_id):
+        raise InvalidReleaseExternalIdError(
+            f"{source} external_id must be a 22-character base62 Spotify album ID "
+            f"(letters and digits only), got {external_id!r}"
+        )
+    return external_id
+
+
+# Identity-mint dispatch registry. Each entry binds a source key to its
+# ``entity.release_identity`` column, sentinel ``validator`` (uniform
+# ``(source, external_id) -> str`` signature), and bind-type ``coercer``.
+# Discogs columns are INTEGER (coerce to ``int``); Bandcamp / Apple / Spotify
+# are TEXT (the string binds verbatim).
+#
+# This registry is deliberately a *superset* of
+# ``lookup.streaming_url_postprocess.STREAMING_URL_CACHE_CONFIG``: Discogs
+# release/master are identity-mintable but never URL-cached (they aren't
+# resolved from a live streaming probe), and Bandcamp is identity-mintable
+# but only joins the cache registry in PR-3. The parity test asserts
+# ``STREAMING_URL_CACHE_CONFIG.keys() ⊆ RELEASE_SOURCE_CONFIG.keys()``.
+# ``musicbrainz_release`` is intentionally absent — it is read-only today
+# (no write helper / sentinel rule), readable via the store's
+# ``_RELEASE_IDENTITY_COLUMN_TO_SOURCE`` tuple but not mintable here.
+RELEASE_SOURCE_CONFIG: dict[str, ReleaseSourceConfig] = {
+    "discogs_release": ReleaseSourceConfig(
+        identity_column="discogs_release_id",
+        validator=_validate_discogs_positive_int,
+        coercer=int,
+    ),
+    "discogs_master": ReleaseSourceConfig(
+        identity_column="discogs_master_id",
+        validator=_validate_discogs_positive_int,
+        coercer=int,
+    ),
+    "bandcamp": ReleaseSourceConfig(
+        identity_column="bandcamp_album_url",
+        validator=_validate_bandcamp_album_url,
+        coercer=lambda external_id: external_id,
+    ),
+    "apple_music_album": ReleaseSourceConfig(
+        identity_column="apple_music_album_id",
+        # apple_music_album_id is TEXT — Apple's numeric IDs can grow past
+        # INT32, and the column type matches Bandcamp's TEXT posture. The
+        # bind value stays str so the INSERT, the conflict-fallthrough
+        # SELECT, and the reconciliation log all see the same canonical form.
+        validator=_validate_apple_music_album_id,
+        coercer=lambda external_id: external_id,
+    ),
+    "spotify_album": ReleaseSourceConfig(
+        identity_column="spotify_album_id",
+        validator=_validate_spotify_album_id,
+        coercer=lambda external_id: external_id,
+    ),
+}
+
+# Backward-compat derived view: ``source -> column``. All existing call sites
+# (entity/store.py, tests) read this; it stays in lockstep with the registry
+# automatically. Do NOT hand-maintain it separately.
+RELEASE_SOURCE_COLUMN: dict[str, str] = {
+    source: cfg.identity_column for source, cfg in RELEASE_SOURCE_CONFIG.items()
+}
+
+
 def validate_and_canonicalize_external_id(source: str, external_id: str) -> str:
     """Run per-source sentinel rules and return the canonical external_id form.
 
     Args:
-        source: One of the keys in ``RELEASE_SOURCE_COLUMN``.
+        source: One of the keys in ``RELEASE_SOURCE_CONFIG``.
         external_id: The raw input from the request body.
 
     Returns:
         The canonical form of ``external_id`` — Bandcamp URLs are
-        URL-canonicalised; Discogs IDs are returned verbatim (already
-        integer-shaped after validation).
+        URL-canonicalised; Discogs / Apple / Spotify IDs are returned verbatim
+        (already canonically shaped after validation).
 
     Raises:
         InvalidReleaseExternalIdError: If ``source`` is unknown or the input fails
             its per-source sentinel rule.
     """
-    if source not in RELEASE_SOURCE_COLUMN:
+    cfg = RELEASE_SOURCE_CONFIG.get(source)
+    if cfg is None:
         raise InvalidReleaseExternalIdError(f"unknown release-identity source: {source!r}")
-    if source in ("discogs_release", "discogs_master"):
-        return _validate_discogs_positive_int(source, external_id)
-    if source == "bandcamp":
-        return _validate_bandcamp_album_url(external_id)
-    if source == "apple_music_album":
-        return _validate_apple_music_album_id(external_id)
-    # Defensive — would only fire on a future source added to the dict but
-    # not wired here. Keeps the type-checker happy and surfaces gaps fast.
-    raise InvalidReleaseExternalIdError(f"no sentinel rule registered for source: {source!r}")
+    return cfg.validator(source, external_id)
 
 
 def coerce_external_id(source: str, external_id: str) -> int | str:
     """Coerce a (post-validation) external_id to its asyncpg bind type.
 
-    Discogs columns are ``INTEGER``; Bandcamp and Apple Music are ``TEXT``.
-    asyncpg's column-type binding rejects a string passed to an INTEGER
-    column, so the store must hand it the right Python type up front.
+    Discogs columns are ``INTEGER``; Bandcamp / Apple Music / Spotify are
+    ``TEXT``. asyncpg's column-type binding rejects a string passed to an
+    INTEGER column, so the store must hand it the right Python type up front.
 
     Assumes the input already passed ``validate_and_canonicalize_external_id``.
     Raises ``KeyError`` on an unknown source (programmer error — pydantic and
     validation both block this upstream).
     """
-    column = RELEASE_SOURCE_COLUMN[source]
-    if source in ("discogs_release", "discogs_master"):
-        return int(external_id)
-    if source == "bandcamp":
-        return external_id
-    if source == "apple_music_album":
-        # apple_music_album_id is TEXT — Apple's numeric IDs can grow past
-        # INT32 in the future, and the column type matches Bandcamp's TEXT
-        # posture. The bind value stays str so the INSERT, the
-        # conflict-fallthrough SELECT, and the reconciliation log all see
-        # the same canonical form (the store wraps str binds via
-        # ``to_pg_text_form`` at the write boundary).
-        return external_id
-    # A new source was added to RELEASE_SOURCE_COLUMN but the if-chain above
-    # was not extended. Raising explicitly (rather than a bare `assert`)
-    # keeps the guard intact under ``python -O``, which strips asserts.
-    # Programmer error — pydantic and validate_and_canonicalize_external_id
-    # both block this upstream, so end users never see it.
-    raise RuntimeError(
-        f"coerce_external_id has no branch for source={source!r} "
-        f"(column={column!r}); add it alongside the RELEASE_SOURCE_COLUMN entry."
-    )
+    return RELEASE_SOURCE_CONFIG[source].coercer(external_id)
