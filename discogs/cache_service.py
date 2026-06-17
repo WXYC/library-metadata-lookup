@@ -549,11 +549,15 @@ class DiscogsCacheService:
                     """,
                     release_id,
                 ),
-                # extra=0 → main-performer credits only; producers/remixers/
-                # writers excluded so TrackItem.artists is safe for
-                # _scan_tracklist_for_match's (artist, track) validation.
-                # See L217-228 for the full rationale (#333, #585, #588).
                 self.pool.fetch(
+                    # `extra = 0` keeps TrackItem.artists tight on main-performer
+                    # credits; extras (writer/producer/remixer) live with
+                    # `extra = 1` and would otherwise cross-pollinate the
+                    # `(artist, track)` validation `_scan_tracklist_for_match`
+                    # runs over this list in `discogs/service.py`. Mirrors the
+                    # filter `validate_track_on_release` already applies; see
+                    # #333 for the precision/recall trade-off and #588 for this
+                    # call site.
                     """
                     SELECT track_sequence, artist_name
                     FROM release_track_artist

@@ -291,18 +291,20 @@ class TestGetRelease:
         assert result.tracklist[0].artists == ["Some Artist"]
 
     @pytest.mark.asyncio
-    async def test_excludes_extra_artists_from_track_artists(
+    async def test_query_filters_release_track_artist_to_extra_zero(
         self, cache_service, mock_asyncpg_pool
     ):
-        """LML#588: TrackItem.artists must include only performers (extra=0),
-        not producers/writers/remixers (extra=1). _scan_tracklist_for_match
-        iterates this list for (artist, track) validation; a non-performer
-        name credited as e.g. producer would otherwise validate a track they
-        never performed on.
+        """get_release's per-track credit query must restrict to main credits.
+
+        LML#588: without ``AND extra = 0``, producer/writer/remixer credits
+        (``extra = 1``) cross-pollinate ``TrackItem.artists`` and contaminate
+        ``_scan_tracklist_for_match``'s (artist, track) validation. Mirrors
+        the SQL-presence pattern at ``TestValidateTrackOnRelease``'s
+        ``test_query_filters_release_track_artist_to_extra_zero`` (#333).
         """
         mock_asyncpg_pool.fetchrow = AsyncMock(
             return_value={
-                "id": 42,
+                "id": 1,
                 "title": "On Your Own Love Again",
                 "release_year": 2015,
                 "artwork_url": None,
@@ -311,38 +313,33 @@ class TestGetRelease:
                 "not_found": False,
             }
         )
+        captured_queries: list[str] = []
 
-        track_artist_rows = [
-            {"track_sequence": 1, "artist_name": "Jessica Pratt", "extra": 0},
-            {"track_sequence": 1, "artist_name": "Al Carlson", "extra": 1},
-        ]
-
-        async def route(query, *args):
-            if "release_track_artist" in query:
-                # Mimic PG: when the query asks for `extra = 0`, return only
-                # the performer rows. Without the filter, both rows leak through.
-                if "extra = 0" in query:
-                    return [r for r in track_artist_rows if r["extra"] == 0]
-                return track_artist_rows
-            if "release_track" in query:
-                return [{"position": "1", "title": "Back, Baby", "duration": None, "sequence": 1}]
-            if "release_artist" in query:
-                return [
-                    {
-                        "artist_id": None,
-                        "artist_name": "Jessica Pratt",
-                        "extra": 0,
-                        "role": None,
-                    }
-                ]
+        async def capture_fetch(query, *args):
+            captured_queries.append(query)
             return []
 
-        mock_asyncpg_pool.fetch = AsyncMock(side_effect=route)
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=capture_fetch)
 
-        result = await cache_service.get_release(42)
-        assert result is not None
-        assert result.tracklist[0].artists == ["Jessica Pratt"]
-        assert "Al Carlson" not in result.tracklist[0].artists
+        await cache_service.get_release(1)
+
+        rta_queries = [q for q in captured_queries if "release_track_artist" in q]
+        assert rta_queries, (
+            f"Expected a query against release_track_artist; got: {captured_queries!r}"
+        )
+        # Normalize whitespace before the adjacency check — get_release uses
+        # a multi-line triple-quoted SQL string, so ``release_track_artist``
+        # and ``WHERE`` are separated by newlines + indentation in the raw
+        # text. Pin the *complete* WHERE clause adjacency (not just the
+        # substring ``extra = 0``, which could co-occur in an unrelated CTE
+        # branch, whitespace-different variant, or a ``-- extra = 0``
+        # comment) so a future refactor that drops the filter can't slip
+        # through.
+        normalized = " ".join(rta_queries[0].split())
+        assert "release_track_artist WHERE release_id = $1 AND extra = 0" in normalized, (
+            "Expected `release_track_artist WHERE release_id = $1 AND extra = 0` "
+            f"in the release_track_artist query (see #588); got: {rta_queries[0]!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_reads_videos(self, cache_service, mock_asyncpg_pool):
