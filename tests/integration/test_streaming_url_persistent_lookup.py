@@ -5,8 +5,8 @@ LML#573 generalized the Apple-only ``entity.album_apple_music_lookup_cache``
 the cache module ``entity/streaming_url_cache.py``, and the read-through
 resolver ``resolve_streaming_url_with_cache``. All unit coverage mocks
 ``PgSource``; this file is the matching ``@pytest.mark.pg`` layer that drives
-the real schema, the real UPSERT, the real TTL math, and the cross-schema
-backfill against an actual PostgreSQL connection.
+the real schema, the real UPSERT, and the real TTL math against an actual
+PostgreSQL connection.
 
 Concrete production risks the unit tests cannot catch:
 
@@ -15,8 +15,6 @@ Concrete production risks the unit tests cannot catch:
   would break the SQL ``last_checked_at > $4`` comparison.
 * UPSERT semantics — the composite-PK ``ON CONFLICT`` updates in place.
 * ``to_match_form`` normalization parity between SELECT and UPSERT.
-* The backfill preserves each row's ``last_checked_at`` (the TTL-preservation
-  AC) instead of resetting it to ``now()``.
 
 Run with: pytest -m pg -v tests/integration/test_streaming_url_persistent_lookup.py
 """
@@ -46,18 +44,6 @@ DATABASE_URL = os.getenv(
     "postgresql://discogs:discogs@localhost:5433/discogs",
 )
 
-# Old apple-only table DDL (LML#571) — recreated by the backfill test so it
-# can drive the cross-schema copy. Mirrors entity/apple_music_album_cache.py.
-_OLD_APPLE_TABLE_DDL = """\
-CREATE TABLE IF NOT EXISTS entity.album_apple_music_lookup_cache (
-    artist_normalized TEXT NOT NULL,
-    album_normalized TEXT NOT NULL,
-    apple_music_url TEXT,
-    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (artist_normalized, album_normalized)
-)
-"""
-
 _SERVICE_CASES = [
     ("apple_music_album", "https://music.apple.com/us/album/aluminum-tunes/1234567890"),
     ("spotify_album", "https://open.spotify.com/album/1A2GTWGt0LBTGQAyA3OKAf"),
@@ -86,22 +72,15 @@ async def set_up_cache_schema(pg_pool, pg_source):
     """Reset to a clean ``lml_cache`` schema and apply the cache DDL.
 
     Surgical (not ``DROP SCHEMA entity CASCADE``): only the LML-owned
-    ``lml_cache`` schema and the grandfathered apple-only table are touched, so
-    the discogs-cache-owned ``entity.*`` identity tables in the shared test PG
-    stay intact. With the old apple table dropped, the bootstrap's
-    ``to_regclass`` guard sees it absent and the backfill is a no-op for the
-    round-trip tests (the backfill test recreates + seeds it, then re-runs the
-    idempotent bootstrap).
+    ``lml_cache`` schema is touched, so the discogs-cache-owned ``entity.*``
+    identity tables in the shared test PG stay intact.
     """
     async with pg_pool.acquire() as conn:
         await conn.execute("DROP SCHEMA IF EXISTS lml_cache CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS entity.album_apple_music_lookup_cache")
-        await conn.execute("CREATE SCHEMA IF NOT EXISTS entity")
     await set_up_streaming_url_cache_schema(pg_source)
     yield
     async with pg_pool.acquire() as conn:
         await conn.execute("DROP SCHEMA IF EXISTS lml_cache CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS entity.album_apple_music_lookup_cache")
 
 
 @pytest.mark.pg
@@ -243,82 +222,3 @@ class TestRoundTrip:
             pg_source, service=service, artist="Nilufer Yanya", album="painless"
         )
         assert result == sample_url
-
-
-@pytest.mark.pg
-class TestAppleBackfill:
-    """The lifespan backfill copies the grandfathered apple-only rows into the
-    new table, keyed under ``service = 'apple_music_album'``, preserving each
-    row's ``last_checked_at`` (the TTL-preservation AC)."""
-
-    @pytest.mark.asyncio
-    async def test_backfill_preserves_last_checked_at(self, pg_source, pg_pool):
-        # Recreate + seed the OLD apple table: one hit, one known-miss with an
-        # 8-day-old timestamp. The known-miss timestamp is the load-bearing
-        # assertion — a naive backfill resetting it to now() would resurrect a
-        # stale miss for another 7 days.
-        old_miss_ts = datetime(2026, 6, 9, 9, 0, 0, tzinfo=UTC)
-        async with pg_pool.acquire() as conn:
-            await conn.execute(_OLD_APPLE_TABLE_DDL)
-            await conn.execute(
-                "INSERT INTO entity.album_apple_music_lookup_cache "
-                "(artist_normalized, album_normalized, apple_music_url, last_checked_at) "
-                "VALUES ('stereolab', 'aluminum tunes', "
-                "'https://music.apple.com/us/album/aluminum-tunes/1', now())"
-            )
-            await conn.execute(
-                "INSERT INTO entity.album_apple_music_lookup_cache "
-                "(artist_normalized, album_normalized, apple_music_url, last_checked_at) "
-                "VALUES ('sessa', 'estrela acesa', NULL, $1)",
-                old_miss_ts,
-            )
-
-        # Re-run the idempotent bootstrap — now the to_regclass guard fires and
-        # the backfill copies both rows.
-        await set_up_streaming_url_cache_schema(pg_source)
-
-        async with pg_pool.acquire() as conn:
-            hit = await conn.fetchrow(
-                "SELECT url FROM lml_cache.album_streaming_url_cache "
-                "WHERE service = 'apple_music_album' AND artist_normalized = 'stereolab' "
-                "AND album_normalized = 'aluminum tunes'"
-            )
-            miss = await conn.fetchrow(
-                "SELECT url, last_checked_at FROM lml_cache.album_streaming_url_cache "
-                "WHERE service = 'apple_music_album' AND artist_normalized = 'sessa' "
-                "AND album_normalized = 'estrela acesa'"
-            )
-        assert hit is not None
-        assert hit["url"] == "https://music.apple.com/us/album/aluminum-tunes/1"
-        assert miss is not None
-        assert miss["url"] is None
-        # The original timestamp survived — NOT reset to now().
-        assert miss["last_checked_at"] == old_miss_ts
-
-    @pytest.mark.asyncio
-    async def test_backfill_does_not_clobber_existing_rows(self, pg_source, pg_pool):
-        # ON CONFLICT DO NOTHING: a row already present in the new table wins
-        # over the backfill source (idempotent re-runs never overwrite).
-        await set_cached_streaming_url(
-            pg_source,
-            service="apple_music_album",
-            artist="Stereolab",
-            album="Aluminum Tunes",
-            url="https://music.apple.com/us/album/new/2",
-        )
-        async with pg_pool.acquire() as conn:
-            await conn.execute(_OLD_APPLE_TABLE_DDL)
-            await conn.execute(
-                "INSERT INTO entity.album_apple_music_lookup_cache "
-                "(artist_normalized, album_normalized, apple_music_url) "
-                "VALUES ('stereolab', 'aluminum tunes', "
-                "'https://music.apple.com/us/album/old/1')"
-            )
-        await set_up_streaming_url_cache_schema(pg_source)
-        async with pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT url FROM lml_cache.album_streaming_url_cache "
-                "WHERE service = 'apple_music_album' AND artist_normalized = 'stereolab' "
-                "AND album_normalized = 'aluminum tunes'"
-            )
-        assert row["url"] == "https://music.apple.com/us/album/new/2"

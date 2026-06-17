@@ -57,7 +57,7 @@ The shared Discogs-cache PostgreSQL database has two schemas LML touches, with a
 - **`entity.*` is discogs-cache-owned** — the cross-service identity contract (`entity.identity`, `entity.release_identity`, and their reconciliation logs). It is created and migrated **only** via discogs-cache alembic migrations. LML reads/writes rows but must **not** `CREATE TABLE` in `entity.*`. Adding a new release-identity column still pays the three-repo dance (wxyc-shared enum → discogs-cache alembic → LML); see [WXYC/wiki#83](https://github.com/WXYC/wiki/issues/83).
 - **`lml_cache.*` is LML-owned** — application caches with no external readers and no wire contract (e.g. `lml_cache.album_streaming_url_cache`). LML bootstraps these from the FastAPI lifespan in `main.py` (`CREATE SCHEMA IF NOT EXISTS lml_cache` + `CREATE TABLE IF NOT EXISTS`), with no discogs-cache coordination. discogs-cache tooling never touches `lml_cache.*` (its truncate guard at `scripts/import_csv.py` rejects schema-qualified names outright).
 
-Rule of thumb: if another repo reads it, it belongs in `entity.*` and goes through alembic; if it's a private LML cache, it belongs in `lml_cache.*` and is lifespan-bootstrapped. (Migration in progress via LML#573: the new streaming-URL cache lands in `lml_cache.*`; the grandfathered `entity.album_apple_music_lookup_cache` is dropped in #573's PR-2.)
+Rule of thumb: if another repo reads it, it belongs in `entity.*` and goes through alembic; if it's a private LML cache, it belongs in `lml_cache.*` and is lifespan-bootstrapped. (Completed via LML#573: the streaming-URL cache lives in `lml_cache.album_streaming_url_cache`; the grandfathered `entity.album_apple_music_lookup_cache` was dropped in #573's PR-2.)
 
 ## Example Music Data for Tests
 

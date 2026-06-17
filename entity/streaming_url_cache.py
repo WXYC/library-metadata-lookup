@@ -98,29 +98,6 @@ CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
 )\
 """
 
-# Idempotent cross-schema backfill from the grandfathered apple-only table
-# (LML#571). Runs only when ``entity.album_apple_music_lookup_cache`` still
-# exists (the caller guards with ``to_regclass``); PR-2 drops the old table
-# and removes this. ``last_checked_at`` is projected EXPLICITLY (not left to
-# the column default) so each backfilled known-miss row keeps its original
-# TTL — relying on ``now()`` would extend every known miss by up to 7 days.
-_BACKFILL_SQL = """\
-INSERT INTO lml_cache.album_streaming_url_cache
-    (service, artist_normalized, album_normalized, url, last_checked_at)
-SELECT 'apple_music_album', artist_normalized, album_normalized,
-       apple_music_url, last_checked_at
-FROM entity.album_apple_music_lookup_cache
-ON CONFLICT (service, artist_normalized, album_normalized) DO NOTHING\
-"""
-
-# Probe for the grandfathered table before running the backfill. ``to_regclass``
-# returns NULL (not an error) when the table is absent, so a fresh PG that
-# never had the apple-only table makes the backfill a clean no-op. Aliased so
-# the ``PgSource.fetchone`` dict carries a stable ``source_exists`` key.
-_BACKFILL_SOURCE_EXISTS_SQL = (
-    "SELECT to_regclass('entity.album_apple_music_lookup_cache') IS NOT NULL AS source_exists"
-)
-
 # Staleness lives in the WHERE clause (LML#576). ``$1`` is the service key,
 # ``$4`` the lower bound on ``last_checked_at`` for a "fresh" known miss
 # (typically ``now - miss_ttl``). A hit (url not null) is always returned; a
@@ -147,7 +124,7 @@ SET url = EXCLUDED.url,
 
 
 async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
-    """Apply the idempotent DDL and run the one-time apple-table backfill.
+    """Apply the idempotent cache-schema DDL.
 
     Called once from ``main.py`` lifespan. The schema and table creation are
     both ``IF NOT EXISTS`` so re-running on every boot is safe. The
@@ -156,18 +133,9 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
     boot LML cleanly. If the discogs-cache PG is unreachable at startup, the
     caller logs and continues; the cache layer degrades to a no-op until the
     next deploy.
-
-    The backfill is guarded by ``to_regclass`` so it is a no-op on a fresh PG
-    that never had ``entity.album_apple_music_lookup_cache``. PR-2 removes the
-    backfill after the old table is dropped.
     """
     await pg.execute(_DDL_SCHEMA)
     await pg.execute(_DDL_TABLE)
-    # Guard in Python (not a SQL DO block) so the backfill is a clean no-op
-    # on a PG that never had the old apple-only table.
-    row = await pg.fetchone(_BACKFILL_SOURCE_EXISTS_SQL)
-    if row is not None and row["source_exists"]:
-        await pg.execute(_BACKFILL_SQL)
 
 
 @dataclass(frozen=True)

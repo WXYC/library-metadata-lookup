@@ -67,12 +67,10 @@ async def lifespan(app: FastAPI):
     # ``set_up_streaming_url_cache_schema`` runs ``CREATE SCHEMA IF NOT EXISTS
     # lml_cache`` first (the LML-owned application-cache schema, per
     # discogs-etl#288 Option 3), so a fresh PG without any LML schema applied
-    # still bootstraps cleanly, then runs a ``to_regclass``-guarded backfill
-    # from the grandfathered ``entity.album_apple_music_lookup_cache`` (dropped
-    # by PR-2). If the pool itself is unavailable, log and continue — the cache
-    # layer's get/set wrap their queries in try/except and return "miss" on any
-    # PG error, so /lookup degrades to one extra probe per request rather than
-    # failing startup.
+    # still bootstraps cleanly. If the pool itself is unavailable, log and
+    # continue — the cache layer's get/set wrap their queries in try/except and
+    # return "miss" on any PG error, so /lookup degrades to one extra probe per
+    # request rather than failing startup.
     if settings.database_url_discogs:
         try:
             from core.dependencies import get_discogs_pool
