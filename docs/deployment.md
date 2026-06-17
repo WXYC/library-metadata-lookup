@@ -2,7 +2,7 @@
 
 ## Infrastructure
 
-- Hosted on Railway with CI-driven deploys (automatic deploys disabled)
+- Hosted on Railway. Deploys are CI-driven via `railway up`; Railway's native GitHub auto-deploy *also* currently fires a second deploy per push (a known race the [`commit_sha`](#commit_sha-deploy-identity) section documents — disabling it is a pending operational follow-up, after which this becomes single-deploy)
 - Railway volume mounted at `/data` stores `library.db` persistently across deploys
 - Optional PostgreSQL cache for Discogs data via `DATABASE_URL_DISCOGS` (gracefully degrades to API-only)
 - `LIBRARY_DB_PATH=/data/library.db` on Railway
@@ -98,7 +98,7 @@ The probe also projects its result onto the active Sentry trace as the `discogs_
 
 `GET /health` returns a `commit_sha` field identifying the deployed commit. It is resolved in priority order by `_resolve_commit_sha` in `routers/health.py`:
 
-1. **A `COMMIT_SHA` file baked into the image.** A blank `COMMIT_SHA` placeholder is tracked at the repo root; CI overwrites it with `echo "$GITHUB_SHA" > COMMIT_SHA` immediately before `railway up` in both `deploy-staging` and `deploy-production`, and `railway up` uploads the working directory, so the file ships inside the image. This is the authoritative source in prod and staging. The placeholder is deliberately **not** `.gitignore`d: `railway up` honors `.gitignore` and would drop a gitignored file from the upload, silently defeating the whole mechanism. It ships blank, so a checkout (local dev / CI) reads empty content, which coerces to `null` per the tier rules below.
+1. **A `COMMIT_SHA` file baked into the image.** A blank `COMMIT_SHA` placeholder is tracked at the repo root; CI overwrites it with `echo "${{ github.sha }}" > COMMIT_SHA` (the "Record deployed commit SHA" step) immediately before `railway up` in both `deploy-staging` and `deploy-production`. This is the authoritative source in prod and staging. For the file to reach the running image it must clear **two** filters, so it is deliberately listed in **neither**: `.gitignore` (`railway up` honors it and would drop the file from the upload tarball) and `.dockerignore` (the Dockerfile build — `railway.toml` `builder = "DOCKERFILE"`, `COPY . .` — honors it and would drop the file from the image). It ships blank, so a checkout (local dev / CI) reads empty content, which coerces to `null` per the tier rules below.
 2. **`RAILWAY_GIT_COMMIT_SHA`** — Railway auto-injects this, but only on its *git-native* deploys (not on `railway up`). Used as a fallback.
 3. **`null`** — local dev, CI, and tests (no file, no env var).
 
@@ -110,9 +110,11 @@ Empty or whitespace-only values at any tier coerce to `null`, so the "null when 
 
 #### Why a baked file rather than `RAILWAY_GIT_COMMIT_SHA` (LML#509)
 
-Every push to `main`/`prod` produces **two** deployments: Railway's git-native trigger (carries the SHA) and the CI `railway up` source-deploy (no git metadata). The CI deploy lands ~3 min later — after the lint/typecheck/test/pg gates — and supersedes the git-native one, so the deploy actually serving traffic has no `RAILWAY_GIT_COMMIT_SHA`. Reading only the env var left `commit_sha` permanently `null` in prod, which wedged WXYC/Backend-Service's `rotation-artist-backfill` cron (its deploy guard refused to run against an unidentifiable deploy). Baking the SHA into the uploaded working directory attaches deploy identity to the deploy that wins.
+Every push to `main`/`prod` produces **two** deployments: Railway's git-native trigger (carries the SHA) and the CI `railway up` source-deploy (no git metadata). The CI deploy lands ~3 min later — after the lint/typecheck/test/pg gates — and supersedes the git-native one, so the deploy actually serving traffic has no `RAILWAY_GIT_COMMIT_SHA`. Reading only the env var left `commit_sha` permanently `null` in prod, which wedged WXYC/Backend-Service's `rotation-artist-backfill` cron (its deploy guard refused to run against an unidentifiable deploy). The baked file attaches deploy identity to the `railway up` deploy.
 
-> **Operational follow-up (manual, not in this repo):** disable Railway's native GitHub auto-deploy on the prod and staging services so each push produces a single CI-gated deploy instead of a two-deploy race. Until that's done both deploys still run; the baked file just guarantees that whichever one wins reports a SHA. This is a Railway dashboard/API change, not a code change.
+The two tiers together make the deploy race safe either way: if the `railway up` deploy wins, the baked **file** carries the SHA; if the git-native deploy wins instead (it has no baked file — that step only runs in the CI job), it *does* carry `RAILWAY_GIT_COMMIT_SHA`, so the **env tier** carries the SHA. Both branches report the same commit, so `commit_sha` is non-null regardless of who wins. The env tier is therefore load-bearing, not dead code.
+
+> **Operational follow-up (manual, not in this repo):** disable Railway's native GitHub auto-deploy on the prod and staging services so each push produces a single CI-gated deploy instead of a two-deploy race. This is a Railway dashboard/API change, not a code change; the two-tier resolution above keeps `commit_sha` correct until it's done.
 
 #### Cross-repo deploy gating
 

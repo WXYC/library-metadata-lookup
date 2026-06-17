@@ -1,3 +1,7 @@
+# Do NOT add COMMIT_SHA here. The Dockerfile build (railway.toml builder=DOCKERFILE)
+# COPYs the build context into the image, and GET /health reads /app/COMMIT_SHA to
+# report the deployed commit. A .dockerignore entry would drop it and re-null
+# commit_sha in prod, re-wedging downstream deploy gates. See LML#509.
 .git
 .github
 tests/

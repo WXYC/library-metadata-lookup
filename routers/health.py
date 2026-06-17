@@ -49,15 +49,18 @@ router = APIRouter(tags=["health"])
 
 CORE_SERVICES = {"database"}
 
-# A blank ``COMMIT_SHA`` placeholder is tracked at the repo root; CI overwrites
-# it with the deployed commit (``echo "$SHA" > COMMIT_SHA``) before ``railway up``
-# uploads the working directory. It must stay tracked (not ``.gitignore``d) —
-# ``railway up`` honors ``.gitignore`` and would otherwise drop it from the
-# upload. See ``_resolve_commit_sha`` and WXYC/library-metadata-lookup#509.
+# A blank ``COMMIT_SHA`` placeholder is tracked at the repo root; CI's "Record
+# deployed commit SHA" step overwrites it with the deployed commit before
+# ``railway up``. Two filters must NOT exclude it, or it silently never reaches
+# the running image (re-null-ing commit_sha): ``.gitignore`` — ``railway up``
+# honors it and would drop the file from the upload tarball; and ``.dockerignore``
+# — the Dockerfile build (``railway.toml`` builder=DOCKERFILE, ``COPY . .``)
+# honors it and would drop the file from the image. See ``_resolve_commit_sha``
+# and WXYC/library-metadata-lookup#509.
 COMMIT_SHA_PATH = Path(__file__).resolve().parent.parent / "COMMIT_SHA"
 
 
-def _resolve_commit_sha(commit_sha_path: Path = COMMIT_SHA_PATH) -> str | None:
+def _resolve_commit_sha(commit_sha_path: Path | None = None) -> str | None:
     """Resolve the deployed commit SHA for ``/health``, in priority order.
 
     1. A ``COMMIT_SHA`` file baked into the image by CI before ``railway up``.
@@ -65,18 +68,31 @@ def _resolve_commit_sha(commit_sha_path: Path = COMMIT_SHA_PATH) -> str | None:
        staging traffic is a ``railway up`` CLI source-deploy, which Railway
        does *not* tag with git metadata, so ``RAILWAY_GIT_COMMIT_SHA`` is
        absent there. See WXYC/library-metadata-lookup#509.
-    2. ``RAILWAY_GIT_COMMIT_SHA`` — set only on Railway's git-native deploys;
-       a useful fallback for a local-Railway deploy or if the CI wiring above
-       regresses.
+    2. ``RAILWAY_GIT_COMMIT_SHA`` — set only on Railway's git-native deploys.
+       This tier is load-bearing for the deploy race: if the git-native deploy
+       (which carries no baked file) wins, it *does* have this env var, so
+       ``commit_sha`` is still non-null. See ``docs/deployment.md``.
     3. ``None`` — local dev, CI, and tests (no file, no env var).
+
+    ``commit_sha_path`` defaults to the module global ``COMMIT_SHA_PATH``,
+    resolved at call time (not bound as a default arg) so tests can redirect
+    it with ``monkeypatch.setattr(health, "COMMIT_SHA_PATH", ...)``.
 
     Empty / whitespace-only values at any tier are treated as absent so the
     documented "null when unset" contract holds, and downstream deploy-gate
     equality checks (e.g. WXYC/Backend-Service#1361) are never fooled by ``""``.
     """
+    if commit_sha_path is None:
+        commit_sha_path = COMMIT_SHA_PATH
     try:
-        file_sha = commit_sha_path.read_text(encoding="utf-8").strip()
-    except OSError:
+        # utf-8-sig drops a leading BOM if some editor/tool wrote one; plain
+        # ``.strip()`` would leave ``﻿`` and break exact-equality gates.
+        file_sha = commit_sha_path.read_text(encoding="utf-8-sig").strip()
+    except (OSError, ValueError):
+        # OSError: missing file / dir-at-path / permission. ValueError covers
+        # UnicodeDecodeError (a corrupt, non-UTF-8 file). ``/health`` is the
+        # Railway healthcheck path and must never 500 on a bad identity file —
+        # degrade to the env / None tiers instead.
         file_sha = ""
     if file_sha:
         return file_sha
@@ -176,12 +192,10 @@ async def health_check(
     else:
         status = "unhealthy"
 
-    # ``COMMIT_SHA_PATH`` is read as a module global (not bound as the helper's
-    # default arg) so tests can redirect it via ``monkeypatch.setattr``.
     body = {
         "status": status,
         "version": settings.app_version,
-        "commit_sha": _resolve_commit_sha(COMMIT_SHA_PATH),
+        "commit_sha": _resolve_commit_sha(),
         "services": services,
     }
 
