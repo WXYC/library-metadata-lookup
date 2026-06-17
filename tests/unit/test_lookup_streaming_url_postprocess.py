@@ -10,10 +10,11 @@ cache-backed resolver with the REQUEST's ``(artist, album)``, mutates the
 ``live_resolved`` outcomes only.
 
 Concurrency model (preempts #594): each service's resolver is wrapped in its
-own ``asyncio.wait_for(cfg.probe_timeout_s)`` inside one
+own ``asyncio.wait_for(_effective_probe_timeout_s(cfg))`` inside one
 ``gather(return_exceptions=True)`` — one service timing out does NOT cancel
 the others, and a timeout surfaces as the ``live_error`` outcome with no URL
-and no cache write.
+and no cache write. The per-service ceiling is the static ``probe_timeout_s``,
+env-overridable via ``cfg.timeout_env_var`` (Apple only).
 
 Sentry: ``streaming_url.persistent_lookup.fired.<service>`` plus
 ``streaming_url.persistent_lookup.<outcome>.<service>`` via
