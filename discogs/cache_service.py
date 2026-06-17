@@ -549,11 +549,16 @@ class DiscogsCacheService:
                     """,
                     release_id,
                 ),
+                # extra=0 → main-performer credits only; producers/remixers/
+                # writers excluded so TrackItem.artists is safe for
+                # _scan_tracklist_for_match's (artist, track) validation.
+                # See L217-228 for the full rationale (#333, #585, #588).
                 self.pool.fetch(
                     """
                     SELECT track_sequence, artist_name
                     FROM release_track_artist
                     WHERE release_id = $1
+                      AND extra = 0
                     ORDER BY track_sequence
                     """,
                     release_id,
