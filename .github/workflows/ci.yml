@@ -197,13 +197,18 @@ jobs:
               errors.append(f\"database: {services['database']}\")
           if services['discogs_api'] != 'ok':
               errors.append(f\"discogs_api: {services['discogs_api']}\")
+          # Deploy identity must be present: a null commit_sha is the LML#509
+          # regression (file dropped from the image, or the SHA-less deploy won).
+          commit_sha = data.get('commit_sha')
+          if not commit_sha:
+              errors.append(f'commit_sha is {commit_sha!r} (deploy identity missing -- LML#509)')
           cache = services.get('discogs_cache', 'unavailable')
           if cache not in ('ok', 'unavailable'):
               print(f'WARNING: discogs_cache: {cache}')
           if errors:
               print('Smoke test FAILED:', ', '.join(errors))
               sys.exit(1)
-          print('Smoke test passed:', json.dumps(services))
+          print('Smoke test passed: commit_sha=', commit_sha, json.dumps(services))
           "
 
   deploy-production:
@@ -245,11 +250,16 @@ jobs:
               errors.append(f\"database: {services['database']}\")
           if services['discogs_api'] != 'ok':
               errors.append(f\"discogs_api: {services['discogs_api']}\")
+          # Deploy identity must be present: a null commit_sha is the LML#509
+          # regression (file dropped from the image, or the SHA-less deploy won).
+          commit_sha = data.get('commit_sha')
+          if not commit_sha:
+              errors.append(f'commit_sha is {commit_sha!r} (deploy identity missing -- LML#509)')
           cache = services.get('discogs_cache', 'unavailable')
           if cache not in ('ok', 'unavailable'):
               print(f'WARNING: discogs_cache: {cache}')
           if errors:
               print('Smoke test FAILED:', ', '.join(errors))
               sys.exit(1)
-          print('Smoke test passed:', json.dumps(services))
+          print('Smoke test passed: commit_sha=', commit_sha, json.dumps(services))
           "

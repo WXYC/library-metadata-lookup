@@ -178,6 +178,38 @@ class TestResolveCommitSha:
 
         assert _resolve_commit_sha(tmp_path / "COMMIT_SHA") is None
 
+    def test_non_utf8_file_degrades_instead_of_raising(self, tmp_path, monkeypatch):
+        """A corrupt / non-UTF-8 ``COMMIT_SHA`` must not crash ``_resolve_commit_sha``.
+
+        ``/health`` is the Railway healthcheck path; a 500 there fails the deploy.
+        A malformed identity file must degrade to the env / ``None`` tiers, never
+        raise. (Unreachable via the ``echo``-written ASCII SHA, but the health
+        path must be total.) #509 review.
+        """
+        from routers.health import _resolve_commit_sha
+
+        monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+        commit_file = tmp_path / "COMMIT_SHA"
+        commit_file.write_bytes(b"\xff\xfe not valid utf-8 \x80")
+
+        assert _resolve_commit_sha(commit_file) is None
+
+    def test_utf8_bom_file_is_stripped(self, tmp_path, monkeypatch):
+        """A ``COMMIT_SHA`` written with a UTF-8 BOM yields a clean SHA.
+
+        ``str.strip()`` does not remove ``\\ufeff``; a leading BOM would otherwise
+        break downstream exact-equality deploy gates (``commit_sha == sha``). #509
+        review.
+        """
+        from routers.health import _resolve_commit_sha
+
+        monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+        sha = "abcabcabcabcabcabcabcabcabcabcabcabcabca"
+        commit_file = tmp_path / "COMMIT_SHA"
+        commit_file.write_bytes(b"\xef\xbb\xbf" + (sha + "\n").encode("utf-8"))
+
+        assert _resolve_commit_sha(commit_file) == sha
+
     def test_committed_placeholder_resolves_to_none(self, monkeypatch):
         """The ``COMMIT_SHA`` file checked into the repo is a blank placeholder
         that CI overwrites at deploy time.
@@ -217,6 +249,22 @@ class TestHealthEndpoint:
         svc.cache_service = AsyncMock()
         svc.cache_service.is_available = AsyncMock(return_value=True)
         return svc
+
+    @pytest.fixture(autouse=True)
+    def _isolate_commit_sha(self, monkeypatch, tmp_path):
+        """Resolve ``commit_sha`` against controlled state in every endpoint test.
+
+        Without this, tests read the real on-disk ``COMMIT_SHA`` placeholder and
+        an ambient ``RAILWAY_GIT_COMMIT_SHA`` (e.g. when the suite runs on a
+        Railway shell), which would make ``commit_sha`` assertions — and even the
+        non-asserting tests — depend on uncontrolled state. Default is "no file,
+        no env" -> ``commit_sha`` is ``null``; individual tests opt into a baked
+        file or an env value.
+        """
+        import routers.health as health_module
+
+        monkeypatch.setattr(health_module, "COMMIT_SHA_PATH", tmp_path / "absent-COMMIT_SHA")
+        monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
 
     @pytest.mark.asyncio
     async def test_healthy(self, mock_db, mock_discogs, mock_settings):
@@ -265,7 +313,6 @@ class TestHealthEndpoint:
         commit_file = tmp_path / "COMMIT_SHA"
         commit_file.write_text(sha + "\n")
         monkeypatch.setattr(health_module, "COMMIT_SHA_PATH", commit_file)
-        monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
 
         with override_deps(
             app,
@@ -285,23 +332,61 @@ class TestHealthEndpoint:
         assert resp.json()["commit_sha"] == sha
 
     @pytest.mark.asyncio
-    async def test_commit_sha_from_railway_env(
+    async def test_commit_sha_file_wins_over_env(
         self, mock_db, mock_discogs, mock_settings, monkeypatch, tmp_path
     ):
-        """Fallback tier: with no baked file, ``commit_sha`` mirrors Railway's
-        auto-injected ``RAILWAY_GIT_COMMIT_SHA`` (git-native deploys).
+        """End-to-end, the baked file beats a present ``RAILWAY_GIT_COMMIT_SHA``.
 
-        Cross-repo deploy gates (e.g. WXYC/Backend-Service#1361) need a programmatic
-        way to ask "is commit X live?". ``settings.app_version`` is hardcoded and
-        unbumped, so it cannot serve that role.
+        Locks the endpoint→helper wiring at the integration tier: a regression
+        that resolved env before file (both present) would pass the unit test
+        but is caught here. Distinct sentinels make the winning source explicit.
         """
         import routers.health as health_module
         from config.settings import get_settings
         from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
         from main import app
 
+        file_sha = "f11ef11ef11ef11ef11ef11ef11ef11ef11ef11e"
+        env_sha = "e0ee0ee0ee0ee0ee0ee0ee0ee0ee0ee0ee0ee0ee"
+        commit_file = tmp_path / "COMMIT_SHA"
+        commit_file.write_text(file_sha + "\n")
+        monkeypatch.setattr(health_module, "COMMIT_SHA_PATH", commit_file)
+        monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", env_sha)
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        assert resp.json()["commit_sha"] == file_sha
+
+    @pytest.mark.asyncio
+    async def test_commit_sha_from_railway_env(
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
+    ):
+        """Fallback tier: with no baked file, ``commit_sha`` mirrors Railway's
+        auto-injected ``RAILWAY_GIT_COMMIT_SHA`` (git-native deploys).
+
+        Cross-repo deploy gates (e.g. WXYC/Backend-Service#1361) need a programmatic
+        way to ask "is commit X live?". ``settings.app_version`` is hardcoded and
+        unbumped, so it cannot serve that role. (The ``_isolate_commit_sha``
+        autouse fixture already points ``COMMIT_SHA_PATH`` at an absent file.)
+        """
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
         sha = "abc123def456abc123def456abc123def456abcd"
-        monkeypatch.setattr(health_module, "COMMIT_SHA_PATH", tmp_path / "absent")
         monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", sha)
 
         with override_deps(
@@ -322,18 +407,12 @@ class TestHealthEndpoint:
         assert resp.json()["commit_sha"] == sha
 
     @pytest.mark.asyncio
-    async def test_commit_sha_null_when_unset(
-        self, mock_db, mock_discogs, mock_settings, monkeypatch, tmp_path
-    ):
+    async def test_commit_sha_null_when_unset(self, mock_db, mock_discogs, mock_settings):
         """Local dev / CI: no file and no env var -> ``commit_sha`` is ``null``,
-        not an error."""
-        import routers.health as health_module
+        not an error. State is established by the ``_isolate_commit_sha`` fixture."""
         from config.settings import get_settings
         from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
         from main import app
-
-        monkeypatch.setattr(health_module, "COMMIT_SHA_PATH", tmp_path / "absent")
-        monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
 
         with override_deps(
             app,
@@ -356,20 +435,19 @@ class TestHealthEndpoint:
 
     @pytest.mark.asyncio
     async def test_commit_sha_null_when_env_var_is_empty_string(
-        self, mock_db, mock_discogs, mock_settings, monkeypatch, tmp_path
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
     ):
         """A set-but-empty ``RAILWAY_GIT_COMMIT_SHA`` (dev shell `export X=`, transient
         Railway state) with no baked file must surface as ``null`` — the documented
         contract is "null when unset", and downstream deploy-gate comparisons
         (``body['commit_sha'] == sha``) must not be fooled by an empty string that would
-        equal nothing but also fail an ``is None`` check.
+        equal nothing but also fail an ``is None`` check. (Absent file via the
+        ``_isolate_commit_sha`` fixture.)
         """
-        import routers.health as health_module
         from config.settings import get_settings
         from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
         from main import app
 
-        monkeypatch.setattr(health_module, "COMMIT_SHA_PATH", tmp_path / "absent")
         monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "")
 
         with override_deps(
