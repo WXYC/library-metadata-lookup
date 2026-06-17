@@ -291,6 +291,60 @@ class TestGetRelease:
         assert result.tracklist[0].artists == ["Some Artist"]
 
     @pytest.mark.asyncio
+    async def test_excludes_extra_artists_from_track_artists(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """LML#588: TrackItem.artists must include only performers (extra=0),
+        not producers/writers/remixers (extra=1). _scan_tracklist_for_match
+        iterates this list for (artist, track) validation; a non-performer
+        name credited as e.g. producer would otherwise validate a track they
+        never performed on.
+        """
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 42,
+                "title": "On Your Own Love Again",
+                "release_year": 2015,
+                "artwork_url": None,
+                "released": None,
+                "artwork_checked_at": None,
+                "not_found": False,
+            }
+        )
+
+        track_artist_rows = [
+            {"track_sequence": 1, "artist_name": "Jessica Pratt", "extra": 0},
+            {"track_sequence": 1, "artist_name": "Al Carlson", "extra": 1},
+        ]
+
+        async def route(query, *args):
+            if "release_track_artist" in query:
+                # Mimic PG: when the query asks for `extra = 0`, return only
+                # the performer rows. Without the filter, both rows leak through.
+                if "extra = 0" in query:
+                    return [r for r in track_artist_rows if r["extra"] == 0]
+                return track_artist_rows
+            if "release_track" in query:
+                return [{"position": "1", "title": "Back, Baby", "duration": None, "sequence": 1}]
+            if "release_artist" in query:
+                return [
+                    {
+                        "artist_id": None,
+                        "artist_name": "Jessica Pratt",
+                        "extra": 0,
+                        "role": None,
+                    }
+                ]
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=route)
+
+        result = await cache_service.get_release(42)
+        assert result is not None
+        assert result.tracklist[0].artists == ["Jessica Pratt"]
+        assert "Al Carlson" not in result.tracklist[0].artists
+
+    @pytest.mark.asyncio
     async def test_reads_videos(self, cache_service, mock_asyncpg_pool):
         """get_release returns videos fetched from release_video table."""
         mock_asyncpg_pool.fetchrow = AsyncMock(
