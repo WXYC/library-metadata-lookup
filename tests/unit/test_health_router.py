@@ -210,24 +210,40 @@ class TestResolveCommitSha:
 
         assert _resolve_commit_sha(commit_file) == sha
 
-    def test_committed_placeholder_resolves_to_none(self, monkeypatch):
-        """The ``COMMIT_SHA`` file checked into the repo is a blank placeholder
-        that CI overwrites at deploy time.
+    def test_committed_placeholder_is_tracked_and_blank(self):
+        """The ``COMMIT_SHA`` committed to git must be tracked and blank.
 
-        It must ship empty so local/CI ``/health`` reports ``null`` rather than
-        advertising a deploy that isn't running. If someone commits a real SHA
-        into it, this fails. (The file is tracked — not ``.gitignore``d — because
-        ``railway up`` honors ``.gitignore`` and would otherwise drop it from the
-        upload; see WXYC/library-metadata-lookup#509.)
+        CI overwrites it with the real SHA at deploy time; a real SHA committed
+        into it would make local/CI ``/health`` advertise a deploy that isn't
+        running, and a *deleted* placeholder would leave ``railway up`` nothing
+        to upload (re-null-ing prod). It must stay tracked — not ``.gitignore``d —
+        because ``railway up`` honors ``.gitignore``. See #509.
+
+        Reads the committed blob (``git show HEAD:COMMIT_SHA``), not the working
+        tree, so a locally-dirty ``COMMIT_SHA`` (e.g. after running CI's bake
+        step by hand) never spuriously fails this.
         """
+        import subprocess
+
         import routers.health as health_module
 
-        monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+        repo_root = health_module.COMMIT_SHA_PATH.parent
+        try:
+            result = subprocess.run(
+                ["git", "show", "HEAD:COMMIT_SHA"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            pytest.skip("git not available")
 
-        assert health_module.COMMIT_SHA_PATH.is_file(), (
-            "tracked COMMIT_SHA placeholder must exist for railway up to upload it"
+        assert result.returncode == 0, (
+            "COMMIT_SHA must be tracked at HEAD so `railway up` uploads it (LML#509)"
         )
-        assert health_module._resolve_commit_sha(health_module.COMMIT_SHA_PATH) is None
+        assert result.stdout.strip() == "", (
+            "committed COMMIT_SHA must be blank — CI overwrites it at deploy time"
+        )
 
 
 # ---------------------------------------------------------------------------
