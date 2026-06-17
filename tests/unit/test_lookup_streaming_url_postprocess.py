@@ -611,3 +611,58 @@ class TestRegistryInvariants:
         assert cfg.mint_source == service
         assert cfg.mint_source in RELEASE_SOURCE_CONFIG
         assert cfg.probe_timeout_s == 4.0
+
+    def test_every_flag_setting_is_a_real_settings_attribute(self):
+        # `apply_streaming_url_postprocess` reads `getattr(settings,
+        # cfg.flag_setting, False)` — a typo'd flag_setting would silently
+        # default to False and disable the service with no error. Assert each
+        # names a real Settings field so a typo fails CI, not prod.
+        from config.settings import Settings
+
+        settings = Settings()
+        for service, cfg in STREAMING_URL_CACHE_CONFIG.items():
+            assert hasattr(settings, cfg.flag_setting), (
+                f"{service}: flag_setting {cfg.flag_setting!r} is not a Settings attribute"
+            )
+
+
+class TestPerServiceTimeoutResolution:
+    """LML#573 preserves the `LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS` back-compat
+    knob for the Apple post-process leg (the old apply_apple_music_postprocess
+    honored it). The effective per-service ceiling is env-overridable only for
+    services whose registry entry carries a `timeout_env_var`."""
+
+    def test_apple_entry_carries_back_compat_env_var(self):
+        from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
+
+        assert (
+            STREAMING_URL_CACHE_CONFIG["apple_music_album"].timeout_env_var
+            == APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
+        )
+
+    def test_spotify_entry_has_no_env_var(self):
+        # New service — no back-compat env knob; static per-service default.
+        assert STREAMING_URL_CACHE_CONFIG["spotify_album"].timeout_env_var is None
+
+    def test_apple_effective_timeout_honors_env_override(self, monkeypatch):
+        from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
+
+        monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
+        assert (
+            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG["apple_music_album"]) == 1.5
+        )
+
+    def test_apple_effective_timeout_defaults_without_env(self, monkeypatch):
+        from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
+
+        monkeypatch.delenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, raising=False)
+        assert (
+            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG["apple_music_album"]) == 4.0
+        )
+
+    def test_spotify_effective_timeout_ignores_apple_env(self, monkeypatch):
+        from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
+
+        # Apple's env must not bleed into a service without a timeout_env_var.
+        monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
+        assert mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG["spotify_album"]) == 4.0

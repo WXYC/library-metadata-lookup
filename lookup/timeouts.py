@@ -29,39 +29,41 @@ lookup hot path. Sized to the legacy iTunes Search ``httpx`` timeout (5s)
 with margin so the orchestrator's ``asyncio.wait_for`` trips before the
 underlying ``BaseStreamingClient`` httpx timeout. LML#449 + LML#450."""
 
-_APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR = "LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS"
+APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR = "LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS"
+"""Public so the streaming-URL post-process registry can wire it onto the
+Apple cache entry's ``timeout_env_var`` (LML#573), keeping this knob tuning
+BOTH the in-line probe and the post-process probe of the same Apple client."""
+
+
+def probe_timeout_s_from_env(env_var: str, default_s: float) -> float:
+    """Resolve a per-call wall-clock ceiling (seconds) from an integer-ms env var.
+
+    Read at request time (not via ``Settings``) so the knob can be tuned via
+    Railway env vars without a redeploy — mirrors the ``LML_BULK_MAX_CONCURRENT``
+    and ``LML_SEARCH_BUDGET_MS`` patterns. A misconfigured value (unset,
+    unparseable, zero, or negative) falls back to ``default_s`` with a WARN.
+    """
+    raw = os.getenv(env_var)
+    if not raw:
+        return default_s
+    try:
+        ms = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r, falling back to %.1fs", env_var, raw, default_s)
+        return default_s
+    if ms <= 0:
+        logger.warning("%s=%d must be > 0, falling back to %.1fs", env_var, ms, default_s)
+        return default_s
+    return ms / 1000.0
 
 
 def apple_music_lookup_timeout_s() -> float:
     """Per-call wall-clock ceiling for a single Apple Music probe.
 
-    Read at request time (not via ``Settings``) so the knob can be tuned
-    via Railway env vars without a redeploy — mirrors the
-    ``LML_BULK_MAX_CONCURRENT`` and ``LML_SEARCH_BUDGET_MS`` patterns.
-
-    A misconfigured value (negative, zero, or unparseable) falls back to
-    the default with a WARN. The default is
-    ``_APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S`` (4s). See LML#449 + LML#450.
+    Thin back-compat wrapper over ``probe_timeout_s_from_env`` for the in-line
+    per-item Apple probe (``lookup/orchestrator.py``). The default is 4s. See
+    LML#449 + LML#450.
     """
-    raw = os.getenv(_APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR)
-    if not raw:
-        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
-    try:
-        ms = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r, falling back to %.1fs",
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
-            raw,
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S,
-        )
-        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
-    if ms <= 0:
-        logger.warning(
-            "%s=%d must be > 0, falling back to %.1fs",
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
-            ms,
-            _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S,
-        )
-        return _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
-    return ms / 1000.0
+    return probe_timeout_s_from_env(
+        APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
+    )

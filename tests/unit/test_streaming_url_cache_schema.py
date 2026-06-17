@@ -49,6 +49,24 @@ class TestCanonicalDDLReference:
         assert "'apple_music_album'" in ddl
         assert "'spotify_album'" in ddl
 
+    def test_check_constraint_allowlist_matches_pr1_services(self):
+        # The .sql is a hand-maintained mirror of the runtime DDL, which
+        # generates its IN-list from ``_PR1_SERVICES``. A substring check would
+        # stay green if PR-3 edited ``_PR1_SERVICES`` but forgot the .sql; parse
+        # the IN-list and assert exact-set equality so the mirror can't drift.
+        import re
+
+        from entity.streaming_url_cache import _PR1_SERVICES
+
+        ddl = _SQL_REFERENCE.read_text()
+        match = re.search(r"service\s+IN\s*\(([^)]*)\)", ddl)
+        assert match is not None, "CHECK constraint IN-list not found in the .sql reference"
+        sql_services = set(re.findall(r"'([^']+)'", match.group(1)))
+        assert sql_services == set(_PR1_SERVICES), (
+            f".sql CHECK allowlist {sql_services} drifted from _PR1_SERVICES "
+            f"{set(_PR1_SERVICES)} — update entity/streaming_url_cache.sql"
+        )
+
     def test_has_composite_primary_key(self):
         ddl = _SQL_REFERENCE.read_text()
         assert "PRIMARY KEY (service, artist_normalized, album_normalized)" in ddl

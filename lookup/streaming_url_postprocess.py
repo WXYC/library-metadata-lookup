@@ -67,6 +67,7 @@ from entity.streaming_url_cache import (
     resolve_streaming_url_with_cache,
 )
 from identity.release_validation import validate_and_canonicalize_external_id
+from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, probe_timeout_s_from_env
 from release.apple_music_url_parser import apple_album_id_from_url
 from release.spotify_url_parser import spotify_album_id_from_url
 
@@ -77,8 +78,9 @@ logger = logging.getLogger(__name__)
 
 # Default per-service wall-clock ceiling for a single live probe from the
 # lookup hot path. 4s fits comfortably under request-o-matic's 10s per-attempt
-# SLA. Sourced onto the registry so each service can diverge (PR-3's Bandcamp
-# may run looser); see lookup/timeouts.py for the env-var override seam.
+# SLA. Carried per-entry on the registry so each service can diverge (PR-3's
+# Bandcamp may run looser). A service whose entry also sets ``timeout_env_var``
+# can be retuned at request time via that env var (see _effective_probe_timeout_s).
 _DEFAULT_PROBE_TIMEOUT_S = 4.0
 
 
@@ -93,6 +95,13 @@ class StreamingUrlCacheConfig:
     the same string as this registry's key today); ``flag_setting`` names the
     per-service ``Settings`` attribute; ``url_to_external_id`` extracts the
     mintable ID from a resolved URL (``None`` → surface URL, skip mint).
+
+    ``probe_timeout_s`` is the static per-service wall-clock ceiling.
+    ``timeout_env_var`` (optional) names an integer-ms env var that overrides
+    it at request time — set for Apple to preserve the LML#449/#450
+    ``LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS`` knob that the pre-LML#573 Apple
+    post-process honored; ``None`` (the default, e.g. Spotify) means the
+    static ceiling is authoritative.
     """
 
     miss_ttl: timedelta
@@ -102,6 +111,7 @@ class StreamingUrlCacheConfig:
     client_attr: str
     mint_source: str
     flag_setting: str
+    timeout_env_var: str | None = None
 
 
 # Cache + post-process registry. Deliberately a SUBSET of
@@ -121,6 +131,9 @@ STREAMING_URL_CACHE_CONFIG: dict[str, StreamingUrlCacheConfig] = {
         client_attr="apple_music",
         mint_source="apple_music_album",
         flag_setting="lml_persist_streaming_url_apple_music",
+        # Back-compat: the pre-LML#573 Apple post-process honored this env var
+        # (via apple_music_lookup_timeout_s); keep it tuning this leg too.
+        timeout_env_var=APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
     ),
     "spotify_album": StreamingUrlCacheConfig(
         miss_ttl=DEFAULT_MISS_TTL,
@@ -186,11 +199,12 @@ async def apply_streaming_url_postprocess(
         return
 
     # Per-service deadline, no shared outer wallclock. ``return_exceptions``
-    # keeps one service's TimeoutError from cancelling the others.
+    # keeps one service's TimeoutError from cancelling the others. The ceiling
+    # is env-overridable per service (Apple back-compat) via the registry.
     coros = [
         asyncio.wait_for(
             _resolve_one(service_key, cfg, client, pg, request_artist, request_album),
-            timeout=cfg.probe_timeout_s,
+            timeout=_effective_probe_timeout_s(cfg),
         )
         for service_key, cfg, client in active
     ]
@@ -204,6 +218,17 @@ async def apply_streaming_url_postprocess(
             # minted, re-minting writes redundant reconciliation rows.
             if result.source == "live_resolved":
                 await _mint_identity(cfg, result.url, entity_store)
+
+
+def _effective_probe_timeout_s(cfg: StreamingUrlCacheConfig) -> float:
+    """Resolve a service's per-call ceiling, honoring its env override if set.
+
+    Services with a ``timeout_env_var`` (Apple, for LML#449/#450 back-compat)
+    are tunable at request time; others use the static ``probe_timeout_s``.
+    """
+    if cfg.timeout_env_var is not None:
+        return probe_timeout_s_from_env(cfg.timeout_env_var, cfg.probe_timeout_s)
+    return cfg.probe_timeout_s
 
 
 async def _resolve_one(
