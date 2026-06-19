@@ -45,7 +45,11 @@ from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from clients.streaming.base import BaseStreamingClient
-from clients.streaming.matching import find_best_source_match
+from clients.streaming.matching import (
+    SCORE_MATCH_ACCEPTANCE_FLOOR,
+    find_best_source_match,
+    record_match_telemetry,
+)
 from streaming.models import SourceMatch
 
 
@@ -71,12 +75,13 @@ class AppleMusicTrackMatch:
 logger = logging.getLogger(__name__)
 
 # Minimum fuzzy score (0-100) for accepting an Apple Music search result as a
-# genuine match. Mirrors the 80/80 floor every other provider uses inside
-# `clients/streaming/matching.is_acceptable_match`. Stops the wrong link from
-# freezing onto a flowsheet row when Apple's search ranking is unstable for
+# genuine match. Bound to the shared `SCORE_MATCH_ACCEPTANCE_FLOOR` every other
+# provider uses inside `clients/streaming/matching.is_acceptable_match` — not a
+# re-declared literal, so the two can't drift (LML#592). Stops the wrong link
+# from freezing onto a flowsheet row when Apple's search ranking is unstable for
 # obscure artists (LML#389) or returns a same-titled track from the wrong
 # album (LML#396).
-_APPLE_MUSIC_MATCH_FLOOR = 80.0
+_APPLE_MUSIC_MATCH_FLOOR = SCORE_MATCH_ACCEPTANCE_FLOOR
 
 # Apple Music developer-token lifetime. Apple permits `exp` up to ~6 months;
 # we sign per-request with a short window so a leaked token's blast radius
@@ -388,8 +393,10 @@ class AppleMusicClient(BaseStreamingClient):
 
         best_overall: dict | None = None
         best_overall_score = 0.0
+        best_overall_axes: tuple[float, float] = (0.0, 0.0)
         best_with_artwork: dict | None = None
         best_with_artwork_score = 0.0
+        best_with_artwork_axes: tuple[float, float] = (0.0, 0.0)
 
         for item in results:
             attrs = item.get("attributes") or {}
@@ -416,13 +423,29 @@ class AppleMusicClient(BaseStreamingClient):
             if combined > best_overall_score:
                 best_overall_score = combined
                 best_overall = item
+                best_overall_axes = (artist_score, track_score)
             if (attrs.get("artwork") or {}).get("url") and combined > best_with_artwork_score:
                 best_with_artwork_score = combined
                 best_with_artwork = item
+                best_with_artwork_axes = (artist_score, track_score)
 
         best = best_with_artwork or best_overall
         if best is None:
             return None
+
+        # LML#592: emit the CHOSEN winner's axis scores (track surface). Scores
+        # are stashed in lockstep with each candidate so they describe whichever
+        # record `best_with_artwork or best_overall` actually selected — not the
+        # higher-fuzz record that artwork preference may have passed over.
+        artist_axis, track_axis = (
+            best_with_artwork_axes if best is best_with_artwork else best_overall_axes
+        )
+        record_match_telemetry(
+            artist_score=artist_axis,
+            title_score=track_axis,
+            service="apple_music",
+            surface="track",
+        )
 
         # When ``album`` was not supplied the 80/80(/80) floor collapses to
         # 80/80 — any artist+song match clears regardless of album, and

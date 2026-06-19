@@ -1,5 +1,7 @@
 """Unit tests for clients/streaming/matching.py."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from clients.streaming.matching import (
@@ -407,6 +409,30 @@ class TestFindBestMatch:
         assert best["url"] == "http://b"
         assert best["matched_title"] == "Aluminum Tunes"
 
+    def test_returns_per_axis_scores(self):
+        """find_best_match surfaces the winning candidate's artist/title scores.
+
+        LML#592: callers emit these to Sentry to measure how often a match
+        clears the floor with a marginal artist score against a high title.
+        Uses the Wand/Wanda short-name collision (artist 88.89, title 100).
+        """
+        from clients.streaming.matching import find_best_match, score_match
+
+        results = [
+            {"artist": "Wanda", "album": "DOGA", "url": "http://w"},
+        ]
+        best = find_best_match(
+            results,
+            "Wand",
+            "DOGA",
+            artist_fn=lambda r: r["artist"],
+            title_fn=lambda r: r["album"],
+            url_fn=lambda r: r["url"],
+        )
+        assert best is not None
+        assert best["artist_score"] == score_match("Wand", "Wanda")
+        assert best["title_score"] == score_match("DOGA", "DOGA")
+
     def test_returns_none_when_no_acceptable_match(self):
         from clients.streaming.matching import find_best_match
 
@@ -496,6 +522,162 @@ class TestFindBestMatch:
         assert best["url"] == "https://open.spotify.com/album/xyz"
         assert best["id"] == "xyz"
         assert best["confidence"] > 0
+
+
+class TestRecordMatchTelemetry:
+    """LML#592: emit the winning match's per-axis scores to Sentry.
+
+    Instrumentation only — measures how often a match clears the 80/80 floor
+    with a marginal artist score (80-90) against a high title (~100), the
+    short-name-collision signature (Wand/Wanda). No threshold change.
+    """
+
+    def test_noop_without_active_transaction(self):
+        """Outside a Sentry transaction the helper must not raise."""
+        from clients.streaming.matching import record_match_telemetry
+
+        # The real sentry_sdk.start_span returns a no-op span when uninitialized;
+        # the helper must tolerate that (and any error) silently.
+        record_match_telemetry(
+            artist_score=88.89, title_score=100.0, service="apple_music", surface="album"
+        )
+
+    def test_emits_expected_span_data(self):
+        from clients.streaming.matching import record_match_telemetry
+
+        with patch("clients.streaming.matching.sentry_sdk") as mock_sentry:
+            mock_span = MagicMock()
+            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
+            record_match_telemetry(
+                artist_score=88.89, title_score=100.0, service="apple_music", surface="album"
+            )
+
+        assert mock_sentry.start_span.call_args.kwargs["op"] == "matcher.match"
+        data = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
+        assert data["matcher.service"] == "apple_music"
+        assert data["matcher.surface"] == "album"
+        assert data["matcher.artist_score"] == 88.89
+        assert data["matcher.title_score"] == 100.0
+        assert data["matcher.marginal_artist_clear"] is True
+
+    def test_telemetry_failure_is_swallowed(self):
+        """A telemetry error must never propagate into the lookup path."""
+        from clients.streaming.matching import record_match_telemetry
+
+        with patch("clients.streaming.matching.sentry_sdk") as mock_sentry:
+            mock_sentry.start_span.side_effect = RuntimeError("sentry down")
+            # Must not raise.
+            record_match_telemetry(
+                artist_score=88.89, title_score=100.0, service="spotify", surface="album"
+            )
+
+    @pytest.mark.parametrize(
+        "artist_score, title_score, expected",
+        [
+            pytest.param(88.89, 100.0, True, id="wand-wanda-marginal"),
+            pytest.param(85.71, 100.0, True, id="hyd-hyde-marginal"),
+            pytest.param(95.0, 100.0, False, id="artist-clearly-above-band"),
+            pytest.param(85.0, 80.0, False, id="title-not-high"),
+            pytest.param(80.0, 80.0, False, id="both-at-floor"),
+            pytest.param(88.0, 96.0, True, id="inside-both-bands"),
+            pytest.param(90.0, 100.0, False, id="artist-at-ceiling-excluded"),
+        ],
+    )
+    def test_marginal_artist_clear_classification(self, artist_score, title_score, expected):
+        from clients.streaming.matching import record_match_telemetry
+
+        with patch("clients.streaming.matching.sentry_sdk") as mock_sentry:
+            mock_span = MagicMock()
+            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
+            record_match_telemetry(
+                artist_score=artist_score,
+                title_score=title_score,
+                service="apple_music",
+                surface="track",
+            )
+
+        data = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
+        assert data["matcher.marginal_artist_clear"] is expected
+
+
+class TestFindBestSourceMatchEmits:
+    """LML#592: the album chokepoint emits match telemetry for the winner."""
+
+    _WAND = [{"artist": "Wanda", "album": "DOGA", "url": "http://w"}]
+
+    def test_emits_marginal_clear_for_album_winner(self):
+        from clients.streaming.matching import find_best_source_match
+
+        with patch("clients.streaming.matching.sentry_sdk") as mock_sentry:
+            mock_span = MagicMock()
+            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
+            match = find_best_source_match(
+                self._WAND,
+                "Wand",
+                "DOGA",
+                artist_fn=lambda r: r["artist"],
+                title_fn=lambda r: r["album"],
+                url_fn=lambda r: r["url"],
+                service="deezer",
+            )
+
+        assert match is not None  # still clears — this PR instruments, it does not reject
+        data = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
+        assert data["matcher.surface"] == "album"
+        assert data["matcher.service"] == "deezer"
+        assert data["matcher.marginal_artist_clear"] is True
+
+    def test_no_emit_when_nothing_clears(self):
+        from clients.streaming.matching import find_best_source_match
+
+        with patch("clients.streaming.matching.sentry_sdk") as mock_sentry:
+            match = find_best_source_match(
+                [{"artist": "Cat Power", "album": "Moon Pix", "url": "http://x"}],
+                "Autechre",
+                "Confield",
+                artist_fn=lambda r: r["artist"],
+                title_fn=lambda r: r["album"],
+                url_fn=lambda r: r["url"],
+                service="deezer",
+            )
+        assert match is None
+        mock_sentry.start_span.assert_not_called()
+
+
+class TestAcceptanceFloorUnchanged:
+    """LML#592 is instrument-only: the 80/80 floor is NOT tightened in this PR.
+
+    These pins fail loudly if a future edit changes acceptance while only
+    telemetry was intended. The Wand/Wanda short-name collision must still
+    CLEAR — we measure it now; rejecting it is a gated follow-up.
+    """
+
+    def test_floor_constant_unchanged(self):
+        from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR
+
+        assert SCORE_MATCH_ACCEPTANCE_FLOOR == 80.0
+
+    def test_wand_wanda_still_clears_predicate(self):
+        from clients.streaming.matching import is_acceptable_match, score_match
+
+        artist = score_match("Wand", "Wanda")
+        assert artist == pytest.approx(88.89, abs=0.01)
+        assert is_acceptable_match(artist, score_match("DOGA", "DOGA")) is True
+
+    def test_wand_wanda_still_selected_as_album_match(self):
+        from clients.streaming.matching import find_best_source_match
+
+        match = find_best_source_match(
+            [{"artist": "Wanda", "album": "DOGA", "url": "http://w"}],
+            "Wand",
+            "DOGA",
+            artist_fn=lambda r: r["artist"],
+            title_fn=lambda r: r["album"],
+            url_fn=lambda r: r["url"],
+            service="deezer",
+        )
+        assert match is not None
+        assert match.url == "http://w"
 
 
 class TestFindBestTypedMatch:
