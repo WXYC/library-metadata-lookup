@@ -154,7 +154,11 @@ def clear_all_caches() -> None:
         inflight = getattr(cache, "_lml_inflight", None)
         if inflight is not None:
             inflight.clear()
-    # Reset lazy caches so they get recreated with fresh settings
+    # Reset lazy caches so they get recreated with fresh settings. These back
+    # @async_cached *methods* on DiscogsService, whose decorators capture the
+    # cache object at class-definition time; the cleared-via-registry instance
+    # above is what those decorators keep using, so resetting the global here
+    # only affects future direct getter callers — benign.
     _track_cache = None
     _release_cache = None
     _search_cache = None
@@ -162,6 +166,14 @@ def clear_all_caches() -> None:
     _label_cache = None
     _master_cache = None
     _validation_cache = None
+    # NOTE: _release_resolution_cache is deliberately NOT reset here. It backs a
+    # *module-level* @async_cached (resolve_release_for_track_cached) whose
+    # decorator captured the instance at import. Its contents are still cleared
+    # via the registry loop above (test isolation holds), but resetting the
+    # global to None would make get_release_resolution_cache() hand out a NEW
+    # object while the decorator keeps writing the old one — a getter-vs-decorator
+    # divergence the method-backed caches above tolerate only because nothing
+    # reads their getter post-clear. Leave it bound so getter == decorator.
 
 
 def _set_cached_flag(result: Any, cached: bool) -> Any:

@@ -222,32 +222,49 @@ async def resolve_release_for_track(
         return []
 
     fire_album = also_probe_album_title and bool(album)
-    probes = [
-        discogs_service.search_releases_by_track(song, artist),
-        discogs_service.search_releases_by_track(song, artist, artist_as_keyword=True),
-    ]
-    if fire_album:
-        assert album is not None  # narrowed by ``bool(album)`` above
-        probes.append(discogs_service.search_releases_by_album_title(album))
+
+    async def _album_title_probe_safe() -> Any:
+        """Catch-and-return wrapper so a Discogs failure on the album-title probe
+        doesn't take down the artist-scoped track probes sharing the gather —
+        mirrors ``search_compilations_for_track._album_title_probe_safe``. Returns
+        ``None`` on failure; the track waves alone then gate the empty path."""
+        assert album is not None  # narrowed by ``fire_album``
+        try:
+            return await discogs_service.search_releases_by_album_title(album)
+        except Exception as exc:
+            logger.warning("Release-resolution album-title probe failed for %r: %s", album, exc)
+            return None
 
     try:
-        responses = await asyncio.gather(*probes)
+        if fire_album:
+            wave_a, wave_b, album_response = await asyncio.gather(
+                discogs_service.search_releases_by_track(song, artist),
+                discogs_service.search_releases_by_track(song, artist, artist_as_keyword=True),
+                _album_title_probe_safe(),
+            )
+        else:
+            wave_a, wave_b = await asyncio.gather(
+                discogs_service.search_releases_by_track(song, artist),
+                discogs_service.search_releases_by_track(song, artist, artist_as_keyword=True),
+            )
+            album_response = None
     except Exception as exc:
         logger.warning("Release-resolution probe failed for %r by %r: %s", song, artist, exc)
         return []
-    wave_a, wave_b = responses[0], responses[1]
     candidates = merge_wave_b_compilations(list(wave_a.releases or []), list(wave_b.releases or []))
-    if fire_album:
-        # Append album-title candidates not already present by title. Unlike the
-        # Wave B merge this is not V/A-only: the #237 trio repro is *not* a
-        # compilation, so per-track validation (not a compilation flag) is what
-        # gates precision here.
-        seen_titles = {(r.album or "").lower() for r in candidates}
-        for r in responses[2].releases or []:
-            key = (r.album or "").lower()
-            if key not in seen_titles:
+    if album_response is not None:
+        # Append album-title candidates not already present by release_id. Dedup
+        # by id (not title) so a DISTINCT same-titled pressing survives to
+        # per-track validation — a track-wave release that fails validation must
+        # not suppress a same-titled album-wave release that would pass. Unlike
+        # the Wave B merge this is not V/A-only: the #237 trio repro is *not* a
+        # compilation, so per-track validation (not a compilation flag) gates
+        # precision here.
+        seen_ids = {r.release_id for r in candidates if r.release_id}
+        for r in album_response.releases or []:
+            if r.release_id and r.release_id not in seen_ids:
                 candidates.append(r)
-                seen_titles.add(key)
+                seen_ids.add(r.release_id)
 
     validated: list[ResolvedRelease] = []
     for release in candidates:
