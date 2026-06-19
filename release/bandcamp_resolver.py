@@ -17,14 +17,13 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import urlparse
 
 import httpx
 
 from clients.bandcamp import BandcampClient
-from release.models import CanonicalRelease, ReleaseIdentifiers
+from release.models import CanonicalRelease, ReleaseIdentifiers, ResolveResult
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +32,6 @@ _LD_JSON_BLOCK_RE = re.compile(
     r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
     re.DOTALL,
 )
-
-
-@dataclass
-class BandcampResolveResult:
-    """Result of resolving a single Bandcamp album URL."""
-
-    canonical: CanonicalRelease | None
-    identifiers: ReleaseIdentifiers
-    warnings: list[str]
 
 
 def _host(url: str | None) -> str | None:
@@ -69,7 +59,7 @@ def _parse_year(date_published: str | None) -> int | None:
         return int(match.group()) if match else None
 
 
-def parse_bandcamp_album_html(html: str, album_url: str) -> BandcampResolveResult:
+def parse_bandcamp_album_html(html: str, album_url: str) -> ResolveResult:
     """Pull the JSON-LD blob out of an album page and project to canonical form.
 
     Pure function — separated from the HTTP fetch so tests run against committed
@@ -79,7 +69,7 @@ def parse_bandcamp_album_html(html: str, album_url: str) -> BandcampResolveResul
 
     blocks = _LD_JSON_BLOCK_RE.findall(html)
     if not blocks:
-        return BandcampResolveResult(
+        return ResolveResult(
             canonical=None,
             identifiers=ReleaseIdentifiers(bandcamp_album_url=album_url),
             warnings=["Bandcamp page did not contain a JSON-LD MusicAlbum block"],
@@ -103,7 +93,7 @@ def parse_bandcamp_album_html(html: str, album_url: str) -> BandcampResolveResul
             break
 
     if album_data is None:
-        return BandcampResolveResult(
+        return ResolveResult(
             canonical=None,
             identifiers=ReleaseIdentifiers(bandcamp_album_url=album_url),
             warnings=["Bandcamp page JSON-LD did not contain a MusicAlbum entry"],
@@ -113,7 +103,7 @@ def parse_bandcamp_album_html(html: str, album_url: str) -> BandcampResolveResul
     by_artist = album_data.get("byArtist") or {}
     artist_name = by_artist.get("name") if isinstance(by_artist, dict) else None
     if not name or not artist_name:
-        return BandcampResolveResult(
+        return ResolveResult(
             canonical=None,
             identifiers=ReleaseIdentifiers(bandcamp_album_url=album_url),
             warnings=["Bandcamp JSON-LD missing required name or byArtist.name"],
@@ -141,7 +131,7 @@ def parse_bandcamp_album_html(html: str, album_url: str) -> BandcampResolveResul
 
     identifiers = ReleaseIdentifiers(bandcamp_album_url=album_url)
 
-    return BandcampResolveResult(canonical=canonical, identifiers=identifiers, warnings=warnings)
+    return ResolveResult(canonical=canonical, identifiers=identifiers, warnings=warnings)
 
 
 async def fetch_bandcamp_album_html(client: BandcampClient, album_url: str) -> str | None:
@@ -170,11 +160,11 @@ async def fetch_bandcamp_album_html(client: BandcampClient, album_url: str) -> s
     return response.text
 
 
-async def resolve_bandcamp_album(client: BandcampClient, album_url: str) -> BandcampResolveResult:
+async def resolve_bandcamp_album(client: BandcampClient, album_url: str) -> ResolveResult:
     """Fetch + parse an album page in one call. Wraps the two helpers above."""
     html = await fetch_bandcamp_album_html(client, album_url)
     if html is None:
-        return BandcampResolveResult(
+        return ResolveResult(
             canonical=None,
             identifiers=ReleaseIdentifiers(bandcamp_album_url=album_url),
             warnings=[f"Bandcamp page could not be fetched: {album_url}"],

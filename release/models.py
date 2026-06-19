@@ -8,6 +8,7 @@ its rotation-release create form in one round trip.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -110,3 +111,20 @@ class ReleaseResolveResponse(BaseModel):
             "to the user but still allow them to save."
         ),
     )
+
+
+@dataclass
+class ResolveResult:
+    """Result of resolving a single source (Discogs release/master or Bandcamp album).
+
+    Shared by every per-source resolver in ``release/`` so there is one shape to
+    maintain. The orchestrator field-unpacks ``canonical``/``identifiers``/``warnings``
+    and discriminates the source via ``parsed.source``, so this type carries no
+    source tag of its own. ``canonical`` is None when the source could not be
+    fetched (rate-limited, not found, network error); ``warnings`` then explains
+    why so the form can fall back to manual entry without hiding the failure.
+    """
+
+    canonical: CanonicalRelease | None
+    identifiers: ReleaseIdentifiers
+    warnings: list[str]
