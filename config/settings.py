@@ -164,6 +164,24 @@ class Settings(BaseSettings):
             "See WXYC/library-metadata-lookup#318."
         ),
     )
+    lml_resolve_compilation_release: bool = Field(
+        default=False,
+        description=(
+            "When True, the artwork binding step lazily runs "
+            "resolve_release_for_track() as a fallback when its floor search "
+            "returns None and a song is present — binding the validated release "
+            "(typically a Various-Artists compilation) without the artist floor — "
+            "and trust-and-binds a release the search strategy already carried on "
+            "the discogs_titles seam (skipping the re-search). When False, a "
+            "floor-rejected release stays unbound and carried releases re-search "
+            "exactly as before (pre-PR2 behavior). The lazy fallback honors "
+            "lml_resolve_artist_canonical for the canonical-swap and fires the "
+            "album-title probe, matching the live search_compilations_for_track "
+            "probe. Default False; roll staging -> prod, watch the Discogs call "
+            "rate. Never enabled on the /lookup/bulk path. "
+            "See WXYC/library-metadata-lookup#604."
+        ),
+    )
     # Persistent streaming-URL cache flags (LML#573). A service is persisted
     # only when BOTH the master kill switch AND its per-service flag are true
     # (AND-gate). The master defaults True and the per-service flags default

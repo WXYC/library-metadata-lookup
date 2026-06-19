@@ -42,6 +42,15 @@ class TestStreamingUrlPersistFlags:
         assert s.lml_persist_streaming_url_spotify is False
 
 
+class TestResolveCompilationReleaseFlag:
+    """LML#604: gate the artwork binding step's lazy release-resolution
+    fallback (and carried-release trust-and-bind) behind a default-off flag so
+    flag-off behavior stays byte-identical to pre-PR2."""
+
+    def test_defaults_false(self):
+        assert Settings().lml_resolve_compilation_release is False
+
+
 class TestGetSettings:
     def test_returns_settings_instance(self):
         get_settings.cache_clear()
