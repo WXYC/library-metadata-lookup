@@ -64,20 +64,6 @@ _ENTITY_STORE_UNAVAILABLE_DETAIL = (
 )
 
 
-def _identity_to_response(identity: Identity) -> IdentityResponse:
-    """Convert an EntityStore Identity dataclass to a Pydantic response model."""
-    return IdentityResponse(
-        library_name=identity.library_name,
-        discogs_artist_id=identity.discogs_artist_id,
-        wikidata_qid=identity.wikidata_qid,
-        musicbrainz_artist_id=identity.musicbrainz_artist_id,
-        spotify_artist_id=identity.spotify_artist_id,
-        apple_music_artist_id=identity.apple_music_artist_id,
-        bandcamp_id=identity.bandcamp_id,
-        reconciliation_status=identity.reconciliation_status,
-    )
-
-
 def _require_entity_store(store: EntityStore | None) -> EntityStore:
     """Raise 503 if the entity store is not available."""
     if store is None:
@@ -108,7 +94,7 @@ async def resolve_identity(
         raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
     if identity is None:
         raise HTTPException(status_code=404, detail=f"No identity found for '{name}'")
-    return _identity_to_response(identity)
+    return IdentityResponse.from_identity(identity)
 
 
 @router.post(
@@ -143,7 +129,7 @@ async def bulk_resolve_identities(
             logger.exception("Entity store query failed mid-bulk for name=%r", name)
             raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
         if identity is not None:
-            identities.append(_identity_to_response(identity))
+            identities.append(IdentityResponse.from_identity(identity))
         else:
             unresolved.append(name)
 
