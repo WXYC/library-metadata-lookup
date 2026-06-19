@@ -12,10 +12,10 @@ from generated.api_models import (
     DiscogsReleaseMetadata,
 )
 from release.discogs_resolver import (
-    DiscogsResolveResult,
     resolve_discogs_master,
     resolve_discogs_release,
 )
+from release.models import ResolveResult
 
 
 def _make_release(**overrides) -> DiscogsReleaseMetadata:
@@ -47,7 +47,7 @@ class TestResolveDiscogsRelease:
         result = await resolve_discogs_release(mock_service, "12345")
 
         mock_service.get_release.assert_awaited_once_with(12345)
-        assert isinstance(result, DiscogsResolveResult)
+        assert isinstance(result, ResolveResult)
         assert result.canonical is not None
         assert result.canonical.artist == "Juana Molina"
         assert result.canonical.title == "DOGA"

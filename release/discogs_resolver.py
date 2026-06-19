@@ -18,24 +18,14 @@ rate-limit budget for v1 of this endpoint.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 
 from discogs.service import DiscogsService
-from release.models import CanonicalRelease, ReleaseIdentifiers
+from release.models import CanonicalRelease, ReleaseIdentifiers, ResolveResult
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class DiscogsResolveResult:
-    """Result of resolving a single Discogs release ID."""
-
-    canonical: CanonicalRelease | None
-    identifiers: ReleaseIdentifiers
-    warnings: list[str]
-
-
-async def resolve_discogs_release(service: DiscogsService, release_id: str) -> DiscogsResolveResult:
+async def resolve_discogs_release(service: DiscogsService, release_id: str) -> ResolveResult:
     """Look up a Discogs release and project to canonical form.
 
     Returns a result whose ``canonical`` is None when the release could not
@@ -48,7 +38,7 @@ async def resolve_discogs_release(service: DiscogsService, release_id: str) -> D
     try:
         rid = int(release_id)
     except ValueError:
-        return DiscogsResolveResult(
+        return ResolveResult(
             canonical=None,
             identifiers=ReleaseIdentifiers(),
             warnings=[f"Discogs release ID '{release_id}' is not a number"],
@@ -60,7 +50,7 @@ async def resolve_discogs_release(service: DiscogsService, release_id: str) -> D
     # for every subsequent caller. The LML#518 decision record puts this
     # validation at the caller, not the service boundary. Reject here.
     if rid <= 0:
-        return DiscogsResolveResult(
+        return ResolveResult(
             canonical=None,
             identifiers=ReleaseIdentifiers(),
             warnings=[f"Discogs release ID '{rid}' is not positive"],
@@ -70,7 +60,7 @@ async def resolve_discogs_release(service: DiscogsService, release_id: str) -> D
         release = await service.get_release(rid)
     except Exception:
         logger.exception("Discogs release fetch failed for %s", rid)
-        return DiscogsResolveResult(
+        return ResolveResult(
             canonical=None,
             identifiers=ReleaseIdentifiers(discogs_release_id=rid),
             warnings=[f"Discogs lookup failed for release {rid}"],
@@ -81,7 +71,7 @@ async def resolve_discogs_release(service: DiscogsService, release_id: str) -> D
             f"Discogs release {rid} could not be fetched "
             "(rate-limited, not found, or temporarily unavailable)"
         )
-        return DiscogsResolveResult(
+        return ResolveResult(
             canonical=None,
             identifiers=ReleaseIdentifiers(discogs_release_id=rid),
             warnings=warnings,
@@ -108,17 +98,17 @@ async def resolve_discogs_release(service: DiscogsService, release_id: str) -> D
         discogs_artist_id=release.artist_id,
     )
 
-    return DiscogsResolveResult(canonical=canonical, identifiers=identifiers, warnings=warnings)
+    return ResolveResult(canonical=canonical, identifiers=identifiers, warnings=warnings)
 
 
-async def resolve_discogs_master(_service: DiscogsService, master_id: str) -> DiscogsResolveResult:
+async def resolve_discogs_master(_service: DiscogsService, master_id: str) -> ResolveResult:
     """Master URLs are not yet supported.
 
     The Discogs API would let us pivot ``master_id`` → ``main_release_id`` →
     full release, but that adds a second API call per paste. Defer until
     we see real demand for master-URL pastes.
     """
-    return DiscogsResolveResult(
+    return ResolveResult(
         canonical=None,
         identifiers=ReleaseIdentifiers(discogs_master_id=_safe_int(master_id)),
         warnings=[

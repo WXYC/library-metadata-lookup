@@ -203,11 +203,10 @@ class TestBandcampBranch:
                 new=AsyncMock(return_value=_stream(on_streaming=False)),
             ),
         ):
-            from release.bandcamp_resolver import BandcampResolveResult
-            from release.models import CanonicalRelease, ReleaseIdentifiers
+            from release.models import CanonicalRelease, ReleaseIdentifiers, ResolveResult
 
             url = "https://juana-molina.bandcamp.com/album/doga"
-            mock_resolve.return_value = BandcampResolveResult(
+            mock_resolve.return_value = ResolveResult(
                 canonical=CanonicalRelease(artist="Juana Molina", title="DOGA", label=None),
                 identifiers=ReleaseIdentifiers(bandcamp_album_url=url),
                 warnings=[],
@@ -237,11 +236,10 @@ class TestBandcampBranch:
             patch("release.orchestrator.resolve_bandcamp_album", new=AsyncMock()) as mock_resolve,
             patch("release.orchestrator.check_streaming_availability", new=check_mock),
         ):
-            from release.bandcamp_resolver import BandcampResolveResult
-            from release.models import CanonicalRelease, ReleaseIdentifiers
+            from release.models import CanonicalRelease, ReleaseIdentifiers, ResolveResult
 
             url = "https://juana-molina.bandcamp.com/album/doga"
-            mock_resolve.return_value = BandcampResolveResult(
+            mock_resolve.return_value = ResolveResult(
                 canonical=CanonicalRelease(artist="Juana Molina", title="DOGA"),
                 identifiers=ReleaseIdentifiers(bandcamp_album_url=url),
                 warnings=[],
@@ -279,10 +277,9 @@ class TestBandcampBranch:
             ) as mock_resolve,
             patch("release.orchestrator.check_streaming_availability") as cs,
         ):
-            from release.bandcamp_resolver import BandcampResolveResult
-            from release.models import ReleaseIdentifiers
+            from release.models import ReleaseIdentifiers, ResolveResult
 
-            mock_resolve.return_value = BandcampResolveResult(
+            mock_resolve.return_value = ResolveResult(
                 canonical=None,
                 identifiers=ReleaseIdentifiers(bandcamp_album_url="https://x.bandcamp.com/album/y"),
                 warnings=["could not be fetched"],
@@ -312,11 +309,10 @@ class TestBandcampBranch:
                 new=AsyncMock(return_value=_stream()),
             ),
         ):
-            from release.bandcamp_resolver import BandcampResolveResult
-            from release.models import CanonicalRelease, ReleaseIdentifiers
+            from release.models import CanonicalRelease, ReleaseIdentifiers, ResolveResult
 
             url = "https://juana-molina.bandcamp.com/album/doga"
-            mock_resolve.return_value = BandcampResolveResult(
+            mock_resolve.return_value = ResolveResult(
                 canonical=CanonicalRelease(artist="Juana Molina", title="DOGA"),
                 identifiers=ReleaseIdentifiers(bandcamp_album_url=url),
                 warnings=[],
