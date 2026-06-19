@@ -27,6 +27,7 @@ _artist_cache: TTLCache | None = None
 _label_cache: TTLCache | None = None
 _master_cache: TTLCache | None = None
 _validation_cache: TTLCache | None = None
+_release_resolution_cache: TTLCache | None = None
 
 T = TypeVar("T")
 
@@ -493,6 +494,26 @@ def get_validation_cache() -> TTLCache:
             ttl=settings.discogs_track_cache_ttl,
         )
     return _validation_cache
+
+
+def get_release_resolution_cache() -> TTLCache:
+    """Get or create the release-resolution cache using settings (LML#604).
+
+    Backs the L1 negative cache around ``resolve_release_for_track`` — pinning
+    the empty result for an unbindable compilation row so a steady poll does not
+    re-probe Discogs every time (the LML#370-372 cascade-shape guard). Track-
+    shaped, so it reuses the track maxsize/ttl.
+    """
+    global _release_resolution_cache
+    if _release_resolution_cache is None:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        _release_resolution_cache = create_ttl_cache(
+            maxsize=settings.discogs_cache_maxsize,
+            ttl=settings.discogs_track_cache_ttl,
+        )
+    return _release_resolution_cache
 
 
 # Convenience constants for backwards compatibility

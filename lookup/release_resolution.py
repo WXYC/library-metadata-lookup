@@ -25,6 +25,7 @@ import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
 
 from clients.streaming.matching import score_match
+from discogs.memory_cache import async_cached, get_release_resolution_cache
 from discogs.models import ReleaseInfo
 from discogs.service import DiscogsService
 
@@ -161,13 +162,19 @@ async def validate_release_for_track(
     return verdict
 
 
-def _rank(releases: list[ResolvedRelease], album: str | None) -> list[ResolvedRelease]:
+def rank_resolved_releases(
+    releases: list[ResolvedRelease], album: str | None
+) -> list[ResolvedRelease]:
     """Rank validated releases by title match to ``album`` (stable id tie-break).
 
     Deliberately scores TITLE ONLY (not ``find_best_typed_match``, whose artist
     floor is what this module bypasses — artist is settled by track-credit
     validation). When ``album`` is empty there is nothing to rank against, so
     the stable ``release_id`` ordering stands alone.
+
+    Public so the carried path (``search_compilations_for_track``) can rank its
+    per-item releases the same way the lazy fallback ranks its candidate list,
+    keeping the two binding paths in agreement (LML#604 deferred finding #2).
     """
     album_query = (album or "").strip()
     if not album_query:
@@ -183,6 +190,8 @@ async def resolve_release_for_track(
     artist: str,
     album: str | None,
     discogs_service: DiscogsService | None,
+    *,
+    also_probe_album_title: bool = False,
 ) -> list[ResolvedRelease]:
     """Find and validate the Discogs release(s) a track sits on.
 
@@ -191,6 +200,16 @@ async def resolve_release_for_track(
     via ``validate_track_on_release`` (which matches the per-track credit, not the
     release credit), and returns the validated releases ranked by title match to
     ``album``. Empty when nothing validates.
+
+    When ``also_probe_album_title`` is set and ``album`` is non-empty, a third
+    album-title probe (``search_releases_by_album_title``) joins the Wave A/B
+    gather — parity with ``search_compilations_for_track``'s album-title wave
+    (#319/#237). It surfaces releases the track-artist probe misses (trio
+    collaborations; V/A comps whose track-artist credit Discogs files oddly).
+    Its candidates are deduped by album title against Wave A/B and gated by the
+    same per-track ``validate_track_on_release``. Callers fire it only when the
+    artist was *not* canonically swapped (a high-confidence swap makes the
+    artist-scoped probe authoritative), mirroring the strategy's gate.
 
     Degrades gracefully on Discogs failures, matching the resilience of the
     ``search_compilations_for_track`` path this was lifted from: a probe failure
@@ -202,15 +221,33 @@ async def resolve_release_for_track(
     if discogs_service is None or not song or not artist:
         return []
 
+    fire_album = also_probe_album_title and bool(album)
+    probes = [
+        discogs_service.search_releases_by_track(song, artist),
+        discogs_service.search_releases_by_track(song, artist, artist_as_keyword=True),
+    ]
+    if fire_album:
+        assert album is not None  # narrowed by ``bool(album)`` above
+        probes.append(discogs_service.search_releases_by_album_title(album))
+
     try:
-        wave_a, wave_b = await asyncio.gather(
-            discogs_service.search_releases_by_track(song, artist),
-            discogs_service.search_releases_by_track(song, artist, artist_as_keyword=True),
-        )
+        responses = await asyncio.gather(*probes)
     except Exception as exc:
         logger.warning("Release-resolution probe failed for %r by %r: %s", song, artist, exc)
         return []
+    wave_a, wave_b = responses[0], responses[1]
     candidates = merge_wave_b_compilations(list(wave_a.releases or []), list(wave_b.releases or []))
+    if fire_album:
+        # Append album-title candidates not already present by title. Unlike the
+        # Wave B merge this is not V/A-only: the #237 trio repro is *not* a
+        # compilation, so per-track validation (not a compilation flag) is what
+        # gates precision here.
+        seen_titles = {(r.album or "").lower() for r in candidates}
+        for r in responses[2].releases or []:
+            key = (r.album or "").lower()
+            if key not in seen_titles:
+                candidates.append(r)
+                seen_titles.add(key)
 
     validated: list[ResolvedRelease] = []
     for release in candidates:
@@ -236,4 +273,35 @@ async def resolve_release_for_track(
             )
         )
 
-    return _rank(validated, album)
+    return rank_resolved_releases(validated, album)
+
+
+@async_cached(get_release_resolution_cache())
+async def resolve_release_for_track_cached(
+    discogs_service: DiscogsService | None,
+    song: str,
+    artist: str,
+    album: str | None,
+    also_probe_album_title: bool = False,
+) -> list[ResolvedRelease]:
+    """L1-cached ``resolve_release_for_track`` (LML#604 negative-cache guard).
+
+    Wraps the uncached resolver in the shared ``@async_cached`` null-pinning +
+    request-coalescing pattern. The empty-list result for an unbindable row is
+    cached — the decorator's write guard skips only ``None`` and the resolver
+    returns ``[]`` (never ``None``) when nothing validates — so a steady poll of
+    an unbindable compilation does not re-probe Discogs every time. This is the
+    LML#370-372 cascade-shape guard; the binding step's lazy fallback must call
+    *this*, not the uncached resolver.
+
+    ``discogs_service`` leads the signature deliberately. ``@async_cached`` keys
+    on the full argument tuple, but the service is a per-process singleton, so
+    the effective key is ``(song, artist, album, also_probe_album_title)`` —
+    folded through ``to_match_form`` by ``make_normalized_cache_key`` so
+    diacritic/case variants collapse to a single entry. ``also_probe_album_title``
+    joins the key so swapped (no album wave) and unswapped (album wave) probes
+    for the same track cache independently.
+    """
+    return await resolve_release_for_track(
+        song, artist, album, discogs_service, also_probe_album_title=also_probe_album_title
+    )

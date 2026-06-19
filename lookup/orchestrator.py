@@ -82,6 +82,8 @@ from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.release_resolution import (
     ResolvedRelease,
     merge_wave_b_compilations,
+    rank_resolved_releases,
+    resolve_release_for_track_cached,
     validate_release_for_track,
 )
 from lookup.strategies import build_strategies
@@ -489,6 +491,42 @@ def _log_album_title_fallback(
             transaction.set_data("album_title_fallback", payload)
     except Exception as e:
         logger.warning("Failed to project album_title_fallback onto Sentry transaction: %s", e)
+
+
+def _log_release_resolution_bind(
+    *,
+    song: str,
+    artist: str,
+    album: str | None,
+    bound: bool,
+    release_id: int | None,
+) -> None:
+    """Emit telemetry each time the lazy release-resolution fallback fires (LML#604).
+
+    Mirrors ``_log_album_title_fallback``: an INFO log line plus a Sentry
+    transaction ``data.release_resolution_bind`` attribute. Logged on every
+    fire (whether or not it bound) so the trace explorer can answer "what
+    fraction of lookups trigger the compilation fallback, and what's its bind
+    rate?" — the adoption + Discogs-cost signal for the staged rollout — without
+    re-pulling Railway logs.
+
+    No-op when there's no active Sentry transaction. Any SDK error is swallowed
+    so observability never breaks /lookup.
+    """
+    payload: dict[str, Any] = {
+        "song": song,
+        "artist": artist,
+        "album": album,
+        "bound": bound,
+        "release_id": release_id,
+    }
+    logger.info("release_resolution_bind %s", payload)
+    try:
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is not None:
+            transaction.set_data("release_resolution_bind", payload)
+    except Exception as e:
+        logger.warning("Failed to project release_resolution_bind onto Sentry transaction: %s", e)
 
 
 def _project_mb_rescue_attrs(
@@ -1327,6 +1365,20 @@ async def search_compilations_for_track(
     seen_ids = set()
     discogs_titles: dict[int, ResolvedRelease] = {}
 
+    # Carried-release ranking (LML#604 deferred finding #2). When the flag is on,
+    # a library row matched by multiple releases binds the title-best one — the
+    # same ranking the lazy fallback applies — so both binding paths agree. When
+    # off, first-seen (Wave A / library-match order) wins, preserving pre-PR2
+    # behavior. The rank target is the matched library row's own title.
+    rank_carried = get_settings().lml_resolve_compilation_release
+
+    def _record_resolved(match: LibraryItem, resolved: ResolvedRelease) -> None:
+        existing = discogs_titles.get(match.id)
+        if existing is None:
+            discogs_titles[match.id] = resolved
+        elif rank_carried:
+            discogs_titles[match.id] = rank_resolved_releases([existing, resolved], match.title)[0]
+
     keyword_matches = []
     try:
         artist_words = (
@@ -1584,7 +1636,7 @@ async def search_compilations_for_track(
                 if match.id not in seen_ids:
                     results.append(match)
                     seen_ids.add(match.id)
-                    discogs_titles[match.id] = resolved
+                _record_resolved(match, resolved)
             if len(results) >= MAX_SEARCH_RESULTS:
                 break
 
@@ -1642,7 +1694,7 @@ async def search_compilations_for_track(
                     if match.id not in seen_ids:
                         results.append(match)
                         seen_ids.add(match.id)
-                        discogs_titles[match.id] = resolved
+                    _record_resolved(match, resolved)
                 if len(results) >= MAX_SEARCH_RESULTS:
                     break
             if fallback_releases:
@@ -2061,16 +2113,61 @@ async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id:
     return None
 
 
+async def _bind_resolved_release(
+    discogs_service: DiscogsService,
+    release: ResolvedRelease,
+    item: LibraryItem,
+) -> DiscogsSearchResult:
+    """Trust-and-bind an already-validated ``ResolvedRelease`` (LML#604).
+
+    The release was validated this same request — either carried on the
+    ``discogs_titles`` seam by the search strategy or just validated by
+    ``resolve_release_for_track`` — so the artist-floor re-search is skipped
+    entirely. Art comes from the release's own cover via
+    ``_resolve_fallback_artwork``; downstream ``enrich_artwork_results`` fills
+    year/label/genres via ``get_release`` exactly as for a floor-matched result.
+
+    The floor was never a validation backstop — it is a search disambiguator,
+    and validation already settled the artist — so ``confidence`` is the
+    maximum 1.0.
+    """
+    artwork_url = await _resolve_fallback_artwork(discogs_service, release.release_id)
+    return DiscogsSearchResult(
+        release_id=release.release_id,
+        release_url=release.release_url,
+        album=release.album_title,
+        artist=item.artist,
+        artwork_url=artwork_url,
+        confidence=1.0,
+    )
+
+
 async def fetch_artwork_for_items(
     items: list[LibraryItem],
     discogs_service: DiscogsService | None,
     discogs_titles: dict[int, ResolvedRelease] | None = None,
+    *,
+    song: str | None = None,
+    allow_release_resolution_fallback: bool = True,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
-    """Fetch artwork for multiple library items in parallel."""
+    """Fetch artwork for multiple library items in parallel.
+
+    ``song`` (the request-level track, when present) and the
+    ``lml_resolve_compilation_release`` flag enable the LML#604 lazy
+    release-resolution fallback in ``fetch_one``: when the artist-floor search
+    rejects a Various-Artists compilation row, resolve and trust-bind the
+    validated release instead of leaving ``discogs_url`` unbound.
+    ``allow_release_resolution_fallback`` is the bulk kill switch — the
+    /lookup/bulk drain passes ``False`` so the 35k-album backfill never triggers
+    the per-row Discogs fan-out.
+    """
     if not discogs_service:
         return [(item, None) for item in items]
 
     discogs_titles = discogs_titles or {}
+    settings = get_settings()
+    resolve_compilation_release = settings.lml_resolve_compilation_release
+    resolve_artist_canonical = settings.lml_resolve_artist_canonical
 
     async def fetch_one(item: LibraryItem) -> DiscogsSearchResult | None:
         try:
@@ -2078,6 +2175,15 @@ async def fetch_artwork_for_items(
             # value the seam used to carry as a bare string. Falls back to the
             # library row's own title when no release was resolved for this id.
             resolved = discogs_titles.get(item.id)
+
+            # Carried-release trust-and-bind (LML#604): the search strategy
+            # already resolved and validated this release this same request, so
+            # bind it by id and skip the artist-floor re-search. Flag-gated so
+            # flag-off re-searches exactly as before (the release's album_title
+            # still seeds that search below).
+            if resolve_compilation_release and resolved is not None:
+                return await _bind_resolved_release(discogs_service, resolved, item)
+
             album = resolved.album_title if resolved is not None else item.title
 
             # Self-titled albums stored as "S/t" should use the artist name
@@ -2085,7 +2191,12 @@ async def fetch_artwork_for_items(
             if is_self_titled(album or ""):
                 album = item.artist
 
-            artist = item.alternate_artist_name or item.artist or ""
+            # The *track* artist (pre-compilation-form mutation). The lazy
+            # release-resolution fallback validates the per-track credit, so it
+            # must probe with this — never the bare "Various" search form below.
+            track_artist = item.alternate_artist_name or item.artist or ""
+
+            artist = track_artist
             if is_compilation_artist(artist):
                 artist = COMPILATION_ARTIST_SEARCH_FORM
 
@@ -2133,6 +2244,54 @@ async def fetch_artwork_for_items(
                 title_fn=lambda r: r.album,
             )
             if result is None:
+                # Lazy release-resolution fallback (LML#604): the artist floor
+                # rejected every candidate — the systematic failure for a V/A
+                # compilation row filed under the track artist. When the flag is
+                # on, a song is present, no release was carried on the seam, and
+                # the bulk kill switch allows it, resolve and trust-bind the
+                # validated release (bypassing the floor — validation settles the
+                # artist via the per-track credit). resolve_release_for_track
+                # returns [] on probe failure, so a transient Discogs error can
+                # never abort the request here.
+                if (
+                    resolve_compilation_release
+                    and resolved is None
+                    and song
+                    and allow_release_resolution_fallback
+                ):
+                    # Probe parity with search_compilations_for_track (LML#604
+                    # deferred finding #1): apply the resolver canonical-swap
+                    # when lml_resolve_artist_canonical is on, and fire the
+                    # album-title wave only when the artist was NOT swapped (a
+                    # high-confidence swap makes the artist-scoped probe
+                    # authoritative — same gate the strategy uses).
+                    probe_artist = track_artist
+                    swapped = False
+                    if resolve_artist_canonical:
+                        cache_service = getattr(discogs_service, "cache_service", None)
+                        outcome = await resolve_canonical_artist(
+                            track_artist, cache_service=cache_service
+                        )
+                        if outcome.swapped:
+                            probe_artist = outcome.canonical
+                            swapped = True
+                    candidates = await resolve_release_for_track_cached(
+                        discogs_service,
+                        song,
+                        probe_artist,
+                        album,
+                        bool(album) and not swapped,
+                    )
+                    best = candidates[0] if candidates else None
+                    _log_release_resolution_bind(
+                        song=song,
+                        artist=track_artist,
+                        album=album,
+                        bound=best is not None,
+                        release_id=best.release_id if best is not None else None,
+                    )
+                    if best is not None:
+                        return await _bind_resolved_release(discogs_service, best, item)
                 return None
             if not result.artwork_url:
                 fallback = await _resolve_fallback_artwork(discogs_service, result.release_id)
@@ -2941,6 +3100,7 @@ async def perform_lookup(
     spotify: SpotifyClient | None = None,
     discogs_cache_pg: PgSource | None = None,
     caller_budget_ms: int | None = None,
+    allow_release_resolution_fallback: bool = True,
 ) -> LookupResponse:
     """Orchestrate the full lookup pipeline.
 
@@ -3130,7 +3290,11 @@ async def perform_lookup(
             for _ in library_results:
                 telemetry.record_api_call("discogs")
             items_with_artwork = await fetch_artwork_for_items(
-                library_results, discogs_service, discogs_titles
+                library_results,
+                discogs_service,
+                discogs_titles,
+                song=parsed.song,
+                allow_release_resolution_fallback=allow_release_resolution_fallback,
             )
 
     # The generated LookupRequest models these as bool | None (api.yaml

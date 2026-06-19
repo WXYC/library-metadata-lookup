@@ -105,6 +105,36 @@ class TestBulkLookupEndpoint:
         assert mock_lookup.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_bulk_excludes_release_resolution_fallback(self, app_client):
+        """Every per-item perform_lookup call from the bulk drain must pass
+        allow_release_resolution_fallback=False so the 35k-album backfill never
+        triggers the LML#604 lazy Discogs fan-out (cascade-shape guard)."""
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_no_match_response(),
+        ) as mock_lookup:
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={
+                        "items": [
+                            {
+                                "artist": "A Guy Called Gerald",
+                                "album": "When There Is No Sun",
+                                "song": "Message to Black Youth",
+                            }
+                        ]
+                    },
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_count == 1
+        assert mock_lookup.await_args.kwargs.get("allow_release_resolution_fallback") is False
+
+    @pytest.mark.asyncio
     async def test_results_preserve_input_order(self, app_client):
         """Even with mixed match/no_match/error, response[i] corresponds to request[i]."""
 

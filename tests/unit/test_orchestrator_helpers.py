@@ -19,7 +19,9 @@ import pytest
 from discogs.models import (
     DiscogsSearchRequest,
     DiscogsSearchResponse,
+    ReleaseInfo,
     ReleaseMetadataResponse,
+    TrackReleasesResponse,
 )
 from generated.api_models import (
     DiscogsReleaseInfo,
@@ -1472,6 +1474,261 @@ class TestFetchArtworkForItems:
         assert results[0][1].release_id == 2
 
 
+def _va_comp_release(
+    release_id: int = 36907527, album: str = "When There Is No Sun"
+) -> ReleaseInfo:
+    """A Various-Artists compilation ReleaseInfo for the LML#604 spine case."""
+    return ReleaseInfo(
+        album=album,
+        artist="Various",
+        release_id=release_id,
+        release_url=f"https://www.discogs.com/release/{release_id}",
+        is_compilation=True,
+    )
+
+
+class TestFetchArtworkLazyReleaseResolution:
+    """LML#604 PR2: when the floor search rejects (returns None) and a song is
+    present, fetch_one lazily resolves the Various-Artists compilation release
+    the track sits on and trust-and-binds it — the symptom fix for the missing
+    compilation ``discogs_url``.
+
+    Spine throughout: A Guy Called Gerald — "Message to Black Youth" on the
+    V/A compilation "When There Is No Sun" (discogs release 36907527). The
+    library row is filed under the *track* artist (the root-cause shape), so
+    the artist floor can never clear "Various" and the floor returns None.
+    """
+
+    @pytest.fixture
+    def enable_compilation_release(self, monkeypatch):
+        """Turn on lml_resolve_compilation_release for the binding fallback."""
+        monkeypatch.setenv("LML_RESOLVE_COMPILATION_RELEASE", "true")
+        from config.settings import get_settings
+
+        get_settings.cache_clear()
+        yield
+        get_settings.cache_clear()
+
+    def _spine_service(self) -> AsyncMock:
+        svc = AsyncMock()
+        svc.cache_service = None
+        # Floor search returns nothing usable -> find_best_typed_match -> None.
+        svc.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
+        # The lazy resolve_release_for_track probes by track and validates.
+        svc.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Message to Black Youth",
+                artist="A Guy Called Gerald",
+                releases=[_va_comp_release()],
+                total=1,
+            )
+        )
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+        # Album-title wave (parity probe) — empty by default; the track wave
+        # carries the spine case.
+        svc.search_releases_by_album_title = AsyncMock(
+            return_value=TrackReleasesResponse(track="", artist="", releases=[], total=0)
+        )
+        svc.get_release = AsyncMock(
+            return_value=ReleaseMetadataResponse(
+                release_id=36907527,
+                title="When There Is No Sun",
+                artist="Various",
+                release_url="https://www.discogs.com/release/36907527",
+                artwork_url="https://i.discogs.com/sun.jpg",
+            )
+        )
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_binds_va_compilation_release_when_floor_rejects(
+        self, enable_compilation_release
+    ):
+        item = make_library_item(id=1, artist="A Guy Called Gerald", title="When There Is No Sun")
+        svc = self._spine_service()
+
+        results = await fetch_artwork_for_items([item], svc, song="Message to Black Youth")
+
+        assert len(results) == 1
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.release_id == 36907527
+        assert bound.release_url == "https://www.discogs.com/release/36907527"
+        # Art comes from the resolved release's own cover via _resolve_fallback_artwork.
+        assert bound.artwork_url == "https://i.discogs.com/sun.jpg"
+
+    @pytest.mark.asyncio
+    async def test_lazy_fallback_passes_raw_track_artist_not_various(
+        self, enable_compilation_release
+    ):
+        """The probe must use the track artist (validated per-track), never the
+        bare 'Various' search form the floor uses for compilation rows."""
+        item = make_library_item(id=1, artist="A Guy Called Gerald", title="When There Is No Sun")
+        svc = self._spine_service()
+
+        await fetch_artwork_for_items([item], svc, song="Message to Black Youth")
+
+        # search_releases_by_track was called with the real track artist.
+        assert svc.search_releases_by_track.await_count >= 1
+        first = svc.search_releases_by_track.await_args_list[0]
+        # signature: search_releases_by_track(track, artist, *, artist_as_keyword=False)
+        artist_arg = first.kwargs.get("artist")
+        if artist_arg is None and len(first.args) >= 2:
+            artist_arg = first.args[1]
+        assert artist_arg == "A Guy Called Gerald"
+
+    @pytest.mark.asyncio
+    async def test_flag_off_leaves_floor_rejection_unbound(self):
+        """Flag default-off: a floor-rejected row stays unbound (pre-PR2) and the
+        lazy probe never fires — guaranteeing flag-off is byte-identical."""
+        item = make_library_item(id=1, artist="A Guy Called Gerald", title="When There Is No Sun")
+        svc = self._spine_service()
+
+        results = await fetch_artwork_for_items([item], svc, song="Message to Black Youth")
+
+        assert results[0][1] is None
+        svc.search_releases_by_track.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lazy_fallback_applies_canonical_swap(
+        self, enable_compilation_release, monkeypatch
+    ):
+        """Probe parity (deferred finding #1): when lml_resolve_artist_canonical
+        is on and the resolver swaps, the lazy probe uses the canonical artist —
+        the same swap the live search_compilations_for_track probe applies."""
+        monkeypatch.setenv("LML_RESOLVE_ARTIST_CANONICAL", "true")
+        from config.settings import get_settings
+
+        get_settings.cache_clear()
+        item = make_library_item(id=1, artist="A Guy Calld Gerald", title="When There Is No Sun")
+        svc = self._spine_service()
+        cache_service = AsyncMock()
+        cache_service.search_artists_by_name = AsyncMock(
+            return_value=[{"id": 1, "name": "A Guy Called Gerald", "score": 0.99}]
+        )
+        svc.cache_service = cache_service
+
+        await fetch_artwork_for_items([item], svc, song="Message to Black Youth")
+
+        artists_probed = {
+            (c.kwargs.get("artist") or (c.args[1] if len(c.args) >= 2 else None))
+            for c in svc.search_releases_by_track.await_args_list
+        }
+        assert artists_probed == {"A Guy Called Gerald"}
+
+    @pytest.mark.asyncio
+    async def test_lazy_fallback_fires_album_title_wave(self, enable_compilation_release):
+        """Probe parity (deferred finding #1): a comp the track probe misses but
+        the album-title probe surfaces still binds — the album-title wave runs
+        (lml_resolve_artist_canonical off, so no swap → wave fires)."""
+        item = make_library_item(id=1, artist="A Guy Called Gerald", title="When There Is No Sun")
+        svc = self._spine_service()
+        # Track probe finds nothing...
+        svc.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Message to Black Youth",
+                artist="A Guy Called Gerald",
+                releases=[],
+                total=0,
+            )
+        )
+        # ...but the album-title probe surfaces the V/A comp.
+        svc.search_releases_by_album_title = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="",
+                artist="",
+                releases=[_va_comp_release()],
+                total=1,
+            )
+        )
+
+        results = await fetch_artwork_for_items([item], svc, song="Message to Black Youth")
+
+        svc.search_releases_by_album_title.assert_awaited()
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.release_id == 36907527
+
+    @pytest.mark.asyncio
+    async def test_carried_release_trust_binds_without_research(self, enable_compilation_release):
+        """Flag on + a ResolvedRelease carried on the seam (TRACK_ON_COMPILATION
+        already resolved it this request) → trust-and-bind by id, skipping the
+        floor re-search entirely."""
+        item = make_library_item(
+            id=20, artist="Various Artists - Rock - D", title="Disco Not Disco"
+        )
+        discogs_titles = {
+            20: ResolvedRelease(
+                release_id=99999,
+                release_url="https://www.discogs.com/release/99999",
+                is_compilation=True,
+                album_title="Disco Not Disco (Post Punk, Electro & Leftfield Disco Classics)",
+            )
+        }
+        svc = AsyncMock()
+        svc.cache_service = None
+        svc.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
+        svc.get_release = AsyncMock(
+            return_value=ReleaseMetadataResponse(
+                release_id=99999,
+                title="Disco Not Disco",
+                artist="Various",
+                release_url="https://www.discogs.com/release/99999",
+                artwork_url="https://i.discogs.com/disco.jpg",
+            )
+        )
+
+        results = await fetch_artwork_for_items(
+            [item], svc, discogs_titles=discogs_titles, song="Some Track"
+        )
+
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.release_id == 99999
+        assert bound.release_url == "https://www.discogs.com/release/99999"
+        assert bound.artwork_url == "https://i.discogs.com/disco.jpg"
+        # The whole point: no artist-floor re-search on the carried path.
+        svc.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_negative_cache_skips_reprobe_on_second_identical_call(
+        self, enable_compilation_release
+    ):
+        """An unresolvable row (probe found a candidate but it fails track-credit
+        validation) must not re-probe Discogs on a second identical lookup — the
+        L1 negative cache pins the empty result. Guards the LML#370-372
+        cascade shape: a steady poll of an unbindable comp must not fan out
+        every time."""
+        item = make_library_item(id=1, artist="A Guy Called Gerald", title="When There Is No Sun")
+        svc = self._spine_service()
+        # Probe surfaces a candidate, but it fails per-track validation → [].
+        svc.validate_track_on_release = AsyncMock(return_value=False)
+
+        first = await fetch_artwork_for_items([item], svc, song="Message to Black Youth")
+        probes_after_first = svc.search_releases_by_track.await_count
+        second = await fetch_artwork_for_items([item], svc, song="Message to Black Youth")
+
+        assert first[0][1] is None
+        assert second[0][1] is None
+        # No new track probes on the second pass — the empty result was cached.
+        assert svc.search_releases_by_track.await_count == probes_after_first
+
+    @pytest.mark.asyncio
+    async def test_bulk_kill_switch_suppresses_lazy_fallback(self, enable_compilation_release):
+        """allow_release_resolution_fallback=False (the /lookup/bulk drain) must
+        suppress the lazy fan-out even with the flag on — the 35k-album backfill
+        can never trigger a per-row Discogs probe."""
+        item = make_library_item(id=1, artist="A Guy Called Gerald", title="When There Is No Sun")
+        svc = self._spine_service()
+
+        results = await fetch_artwork_for_items(
+            [item], svc, song="Message to Black Youth", allow_release_resolution_fallback=False
+        )
+
+        assert results[0][1] is None
+        svc.search_releases_by_track.assert_not_called()
+
+
 class TestFetchArtworkFallback:
     """Tests for artwork fallback to artist/label images."""
 
@@ -2294,6 +2551,139 @@ class TestSearchSongAsTrack:
             f"Expected early-exit after at most {MAX_SEARCH_RESULTS} validate calls, "
             f"got {n_validate_calls} (LML#536: gather conversion lost early exit)."
         )
+
+
+class TestLogReleaseResolutionBind:
+    """LML#604 telemetry: every time the lazy release-resolution fallback fires
+    it records whether it bound, so adoption + cost (fired-vs-bound rate) are
+    observable in Railway logs and the Sentry trace without a wire field."""
+
+    def test_logs_payload_on_bind(self):
+        from lookup.orchestrator import _log_release_resolution_bind
+
+        with patch("lookup.orchestrator.logger") as mock_logger:
+            _log_release_resolution_bind(
+                song="Message to Black Youth",
+                artist="A Guy Called Gerald",
+                album="When There Is No Sun",
+                bound=True,
+                release_id=36907527,
+            )
+
+        mock_logger.info.assert_called_once()
+        fmt, payload = mock_logger.info.call_args.args
+        assert fmt == "release_resolution_bind %s"
+        assert payload["bound"] is True
+        assert payload["release_id"] == 36907527
+        assert payload["song"] == "Message to Black Youth"
+        assert payload["artist"] == "A Guy Called Gerald"
+
+    def test_swallows_sentry_failure(self):
+        from lookup.orchestrator import _log_release_resolution_bind
+
+        with patch(
+            "lookup.orchestrator.sentry_sdk.get_current_scope",
+            side_effect=RuntimeError("boom"),
+        ):
+            # Observability must never break /lookup — no exception escapes.
+            _log_release_resolution_bind(
+                song="s", artist="a", album=None, bound=False, release_id=None
+            )
+
+
+class TestSearchCompilationsCarriedTitleRank:
+    """LML#604 deferred finding #2: the carried path (TRACK_ON_COMPILATION) must
+    title-rank the release it binds per library item — the same ranking the lazy
+    fallback applies — so the two binding paths agree on which release wins. The
+    title-rank is gated by lml_resolve_compilation_release; flag-off keeps the
+    pre-PR2 first-seen behavior.
+
+    Setup: one library row matched by two pressings of the same comp with equal
+    titles but differing release ids. First-seen (Wave A order) would bind the
+    higher id; title-rank resolves the title tie by the stable lowest id.
+    """
+
+    @pytest.fixture
+    def enable_compilation_release(self, monkeypatch):
+        monkeypatch.setenv("LML_RESOLVE_COMPILATION_RELEASE", "true")
+        from config.settings import get_settings
+
+        get_settings.cache_clear()
+        yield
+        get_settings.cache_clear()
+
+    def _setup(self):
+        item = make_library_item(
+            id=500, artist="Various Artists - Rock - D", title="When There Is No Sun"
+        )
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[item])
+        db.search = AsyncMock(return_value=[])
+        # Wave A: two pressings, equal title, id=99 first (first-seen), id=10 second.
+        releases = [
+            ReleaseInfo(
+                album="When There Is No Sun",
+                artist="Various",
+                release_id=99,
+                release_url="https://www.discogs.com/release/99",
+                is_compilation=True,
+            ),
+            ReleaseInfo(
+                album="When There Is No Sun",
+                artist="Various",
+                release_id=10,
+                release_url="https://www.discogs.com/release/10",
+                is_compilation=True,
+            ),
+        ]
+        svc = AsyncMock()
+        svc.cache_service = None
+
+        async def _track_releases(track, artist=None, artist_as_keyword=False, **_):
+            return TrackReleasesResponse(
+                track=track,
+                artist=artist,
+                releases=[] if artist_as_keyword else list(releases),
+                total=0 if artist_as_keyword else len(releases),
+            )
+
+        svc.search_releases_by_track = AsyncMock(side_effect=_track_releases)
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+        parsed = ParsedRequest(
+            artist="A Guy Called Gerald",
+            song="Message to Black Youth",
+            raw_message="message to black youth a guy called gerald",
+        )
+        return db, svc, parsed, item
+
+    @pytest.mark.asyncio
+    async def test_title_ranks_when_flag_on(self, enable_compilation_release):
+        db, svc, parsed, item = self._setup()
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            _results, titles = await search_compilations_for_track(db, parsed, discogs_service=svc)
+
+        # Title tie → stable lowest release id, NOT first-seen (99).
+        assert titles[item.id].release_id == 10
+
+    @pytest.mark.asyncio
+    async def test_first_seen_when_flag_off(self):
+        from config.settings import get_settings
+
+        get_settings.cache_clear()  # default-off
+        db, svc, parsed, item = self._setup()
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            _results, titles = await search_compilations_for_track(db, parsed, discogs_service=svc)
+
+        # Pre-PR2: first-seen (Wave A order) wins.
+        assert titles[item.id].release_id == 99
 
 
 class TestSearchCompilationsEarlyExit:

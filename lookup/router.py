@@ -342,6 +342,9 @@ async def handle_bulk_lookup(
                         spotify=spotify,
                         discogs_cache_pg=discogs_cache_pg,
                         caller_budget_ms=x_caller_budget_ms,
+                        # The 35k-album bulk drain must never trigger the LML#604
+                        # lazy release-resolution fan-out (per-row Discogs probe).
+                        allow_release_resolution_fallback=False,
                     )
             except Exception as e:
                 # Per-item isolation: one failure must not poison siblings.
