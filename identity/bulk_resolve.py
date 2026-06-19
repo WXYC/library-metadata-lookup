@@ -97,7 +97,32 @@ def _identity_to_external_ids(identity: Identity) -> dict[IdentitySource, str]:
 
 @dataclass(frozen=True)
 class _ComposedRow:
-    """Per-source row, post Rule 6 floor and method/confidence resolution."""
+    """The *normalize* stage of the per-source provenance pipeline.
+
+    Three superficially-similar row types make up a deliberate
+    parse -> normalize -> validate pipeline. They are NOT duplication — each
+    layer changes the types, so do NOT try to "deduplicate" them into one:
+
+    1. ``ProvenanceRow`` (``entity/store.py``) — *parse*. The raw DB read-model
+       straight off ``entity.reconciliation_log``: ``source``/``method`` are
+       loose ``str`` (whatever the matcher logged, incl. the internal-only
+       ``inherited`` method), ``confidence`` is ``float | None``.
+    2. ``_ComposedRow`` (this class) — *normalize*. ``source``/``method`` are
+       now api.yaml enums, ``confidence`` is a required ``float`` (the ``None``
+       case is defaulted upstream), the Rule 6 floor has been applied, and the
+       added ``is_inherited`` bool carries the one piece of state that has no
+       wire representation: ``method == "inherited"`` has no ``IdentityMethod``
+       enum value, so it rides as a bool here and gates Rule 3 (it never
+       reaches the wire — see ``_row_to_provenance``).
+    3. ``BulkResolveProvenanceEntry`` (``generated/api_models.py``) — *validate*.
+       The wire contract, generated from ``wxyc-shared/api.yaml``:
+       ``confidence`` is a ``confloat(ge=0, le=1)`` and ``is_inherited`` is
+       gone (it was never part of the contract).
+
+    Collapsing any pair would either leak the loose DB strings onto the wire,
+    drop the internal ``is_inherited`` gate, or couple the generated wire model
+    to LML-internal composition state.
+    """
 
     source: IdentitySource
     method: IdentityMethod
