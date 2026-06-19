@@ -3,6 +3,7 @@
 from discogs.models import DiscogsSearchResult
 from generated.api_models import DiscogsMatchResult, LibraryCatalogItem
 from library.models import LibraryItem
+from lookup.release_resolution import ResolvedRelease
 
 
 def make_library_item(id=1, artist="Stereolab", title="Aluminum Tunes", **kwargs):
@@ -59,6 +60,20 @@ def make_match_result(release_id=123, **kwargs):
     }
     defaults.update(kwargs)
     return DiscogsMatchResult(release_id=release_id, **defaults)
+
+
+def make_resolved_release(release_id=123, album_title="Aluminum Tunes", **kwargs):
+    """Build a ResolvedRelease (the widened ``discogs_titles`` seam value).
+
+    Defaults to a compilation since that is the seam's primary case; override
+    ``is_compilation`` / ``release_url`` via kwargs as needed.
+    """
+    defaults = {
+        "release_url": f"https://www.discogs.com/release/{release_id}",
+        "is_compilation": True,
+    }
+    defaults.update(kwargs)
+    return ResolvedRelease(release_id=release_id, album_title=album_title, **defaults)
 
 
 LOOKUP_BODY = {
