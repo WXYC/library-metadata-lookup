@@ -2,7 +2,7 @@
 
 ## Infrastructure
 
-- Hosted on Railway. Deploys are CI-driven via `railway up`; Railway's native GitHub auto-deploy *also* currently fires a second deploy per push (a known race the [`commit_sha`](#commit_sha-deploy-identity) section documents — disabling it is a pending operational follow-up, after which this becomes single-deploy)
+- Hosted on Railway. Each push to `main`/`prod` produces a single CI-gated deploy via `railway up`. Railway's native GitHub auto-deploy is disabled on both the staging and production `library-metadata-lookup` environments (LML#602), so the two-deploy race the [`commit_sha`](#commit_sha-deploy-identity) section describes no longer occurs
 - Railway volume mounted at `/data` stores `library.db` persistently across deploys
 - Optional PostgreSQL cache for Discogs data via `DATABASE_URL_DISCOGS` (gracefully degrades to API-only)
 - `LIBRARY_DB_PATH=/data/library.db` on Railway
@@ -110,11 +110,11 @@ Empty or whitespace-only values at any tier coerce to `null`, so the "null when 
 
 #### Why a baked file rather than `RAILWAY_GIT_COMMIT_SHA` (LML#509)
 
-Every push to `main`/`prod` produces **two** deployments: Railway's git-native trigger (carries the SHA) and the CI `railway up` source-deploy (no git metadata). The CI deploy lands ~3 min later — after the lint/typecheck/test/pg gates — and supersedes the git-native one, so the deploy actually serving traffic has no `RAILWAY_GIT_COMMIT_SHA`. Reading only the env var left `commit_sha` permanently `null` in prod, which wedged WXYC/Backend-Service's `rotation-artist-backfill` cron (its deploy guard refused to run against an unidentifiable deploy). The baked file attaches deploy identity to the `railway up` deploy.
+Before LML#602, every push to `main`/`prod` produced **two** deployments: Railway's git-native trigger (carries the SHA) and the CI `railway up` source-deploy (no git metadata). The CI deploy landed ~3 min later — after the lint/typecheck/test/pg gates — and superseded the git-native one, so the deploy actually serving traffic had no `RAILWAY_GIT_COMMIT_SHA`. Reading only the env var left `commit_sha` permanently `null` in prod, which wedged WXYC/Backend-Service's `rotation-artist-backfill` cron (its deploy guard refused to run against an unidentifiable deploy). The baked file attaches deploy identity to the `railway up` deploy — the only deploy now, since LML#602 disabled the git-native trigger.
 
-The two tiers together make the deploy race safe either way: if the `railway up` deploy wins, the baked **file** carries the SHA; if the git-native deploy wins instead (it has no baked file — that step only runs in the CI job), it *does* carry `RAILWAY_GIT_COMMIT_SHA`, so the **env tier** carries the SHA. Both branches report the same commit, so `commit_sha` is non-null regardless of who wins. The env tier is therefore load-bearing, not dead code.
+The two tiers were originally what made the deploy race safe either way: if the `railway up` deploy won, the baked **file** carried the SHA; if the git-native deploy won instead (it has no baked file — that step only runs in the CI job), it *does* carry `RAILWAY_GIT_COMMIT_SHA`, so the **env tier** carried it. With the git-native trigger disabled (LML#602) there is no longer a race — `commit_sha` always comes from the baked file, and the `RAILWAY_GIT_COMMIT_SHA` env tier is now inert. It is kept as a harmless fallback that would re-arm automatically if the GitHub source were ever re-connected.
 
-> **Operational follow-up (manual, not in this repo):** disable Railway's native GitHub auto-deploy on the prod and staging services so each push produces a single CI-gated deploy instead of a two-deploy race. This is a Railway dashboard/API change, not a code change; the two-tier resolution above keeps `commit_sha` correct until it's done.
+> **Single CI-gated deploy (LML#602, done):** Railway's native GitHub auto-deploy is disabled on both the prod and staging `library-metadata-lookup` services (the GitHub source was disconnected from each environment), so each push now produces exactly one deploy — the CI-gated `railway up` one. `commit_sha` therefore comes solely from the baked **file** tier; the `RAILWAY_GIT_COMMIT_SHA` env tier is inert (harmless). This was a Railway dashboard/API change, not a code change, and is reversible — re-connecting the GitHub source restores the two-deploy behavior.
 
 #### Cross-repo deploy gating
 
