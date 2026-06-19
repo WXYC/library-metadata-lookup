@@ -28,13 +28,7 @@ def mock_sparql():
     return sparql
 
 
-@pytest.fixture
-def mock_wikidata_pg():
-    """Mock PgSource for wikidata-cache."""
-    pg = AsyncMock()
-    pg.fetchall = AsyncMock(return_value=[])
-    pg.fetchone = AsyncMock(return_value=None)
-    return pg
+# ``mock_wikidata_pg`` is provided by tests/unit/conftest.py.
 
 
 @pytest.fixture

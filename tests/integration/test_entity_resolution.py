@@ -9,10 +9,8 @@ Requires: DATABASE_URL_TEST env var or Docker postgres on port 5433.
 
 from __future__ import annotations
 
-import os
 from typing import ClassVar
 
-import asyncpg
 import pytest
 import pytest_asyncio
 
@@ -26,22 +24,9 @@ from scripts.entity_resolution.__main__ import (
 from scripts.entity_resolution.dedup import EntityDeduplicator
 from scripts.entity_resolution.discogs import DiscogsReconciler
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL_TEST",
-    "postgresql://discogs:discogs@localhost:5433/discogs",
-)
-
-
-@pytest_asyncio.fixture
-async def pg_pool():
-    """Create a connection pool to the test database."""
-    try:
-        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
-    except Exception as e:
-        pytest.skip(f"Cannot connect to test PostgreSQL: {e}")
-        return
-    yield pool
-    await pool.close()
+# ``pg_pool`` (max_size=3) lives in conftest; ``DATABASE_URL`` is imported from
+# there for the ``source._dsn`` wiring and ``monkeypatch.setenv`` calls below.
+from tests.integration.conftest import DATABASE_URL
 
 
 @pytest_asyncio.fixture

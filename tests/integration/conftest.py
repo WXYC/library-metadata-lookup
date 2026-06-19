@@ -4,9 +4,11 @@ Provides a real LibraryDB backed by in-memory SQLite with FTS5,
 seeded with representative catalog items.
 """
 
+import os
 from unittest.mock import AsyncMock
 
 import aiosqlite
+import asyncpg
 import pytest
 import pytest_asyncio
 
@@ -14,6 +16,61 @@ from config.settings import Settings
 from discogs.models import DiscogsSearchResponse
 from library.db import LibraryDB
 from tests.factories import make_discogs_result
+
+# ---------------------------------------------------------------------------
+# PostgreSQL test pool (shared by the ``@pytest.mark.pg`` integration suite)
+# ---------------------------------------------------------------------------
+
+# Centralized DSN for the real PostgreSQL container the ``pg`` suite runs
+# against. Modules that also need the DSN directly -- for ``source._dsn``
+# wiring or ``monkeypatch.setenv("DATABASE_URL_DISCOGS", ...)`` -- import it
+# from here instead of re-deriving the ``os.getenv`` default.
+DATABASE_URL = os.getenv(
+    "DATABASE_URL_TEST",
+    "postgresql://discogs:discogs@localhost:5433/discogs",
+)
+
+
+async def _make_pg_pool(max_size: int):
+    """Yield a real asyncpg pool, or ``pytest.skip`` when PostgreSQL is absent.
+
+    Async-generator helper backing :func:`pg_pool` and :func:`pg_pool_large`.
+    The skip-on-connect-failure contract keeps the ``pg`` suite green
+    (all-skipped) on a host with no test PostgreSQL -- exactly what the
+    previously-per-file copies did.
+    """
+    try:
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=max_size)
+    except Exception as e:
+        pytest.skip(f"Cannot connect to test PostgreSQL: {e}")
+        return
+    yield pool
+    await pool.close()
+
+
+@pytest_asyncio.fixture
+async def pg_pool():
+    """Real asyncpg pool (``max_size=3``); skips on connect failure.
+
+    The common case across the ``pg`` integration suite. Modules needing the
+    larger cap depend on :func:`pg_pool_large` instead.
+    """
+    async for pool in _make_pg_pool(max_size=3):
+        yield pool
+
+
+@pytest_asyncio.fixture
+async def pg_pool_large():
+    """Real asyncpg pool (``max_size=4``); skips on connect failure.
+
+    Identical to :func:`pg_pool` apart from the connection cap. Modules whose
+    fixtures historically created a ``max_size=4`` pool alias their local
+    ``pg_pool`` to this one, so downstream consumers keep the larger cap
+    without re-typing every request.
+    """
+    async for pool in _make_pg_pool(max_size=4):
+        yield pool
+
 
 # ---------------------------------------------------------------------------
 # Seed data -- representative catalog items

@@ -14,27 +14,12 @@ Run with: ``pytest -m pg -v``
 
 from __future__ import annotations
 
-import os
-
-import asyncpg
 import pytest
 import pytest_asyncio
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL_TEST",
-    "postgresql://discogs:discogs@localhost:5433/discogs",
-)
-
-
-@pytest_asyncio.fixture
-async def pg_pool():
-    try:
-        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
-    except Exception as e:
-        pytest.skip(f"Cannot connect to test PostgreSQL: {e}")
-        return
-    yield pool
-    await pool.close()
+# ``pg_pool`` (max_size=3) lives in conftest; ``DATABASE_URL`` is imported from
+# there for the ``monkeypatch.setenv("DATABASE_URL_DISCOGS", ...)`` wiring below.
+from tests.integration.conftest import DATABASE_URL
 
 
 @pytest_asyncio.fixture(autouse=True)

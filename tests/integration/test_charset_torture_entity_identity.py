@@ -15,9 +15,6 @@ or a normalization step is silently inserted.
 
 from __future__ import annotations
 
-import os
-
-import asyncpg
 import pytest
 import pytest_asyncio
 
@@ -25,10 +22,9 @@ from entity.sources import PgSource
 from entity.store import EntityStore
 from tests.charset_torture import CharsetTortureEntry, entry_id, iter_entries
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL_TEST",
-    "postgresql://discogs:discogs@localhost:5433/discogs",
-)
+# ``pg_pool`` (max_size=3) lives in conftest; ``DATABASE_URL`` is imported from
+# there for the ``source._dsn`` wiring below.
+from tests.integration.conftest import DATABASE_URL
 
 CORPUS_ENTRIES = list(iter_entries())
 
@@ -43,18 +39,6 @@ CORPUS_ENTRIES = list(iter_entries())
 PG_TEXT_STRIP_OVERRIDES: dict[tuple[str, str], str] = {
     ("quoting", "null\x00byte"): "nullbyte",
 }
-
-
-@pytest_asyncio.fixture
-async def pg_pool():
-    """Create a connection pool to the test database, or skip on connect failure."""
-    try:
-        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
-    except Exception as e:
-        pytest.skip(f"Cannot connect to test PostgreSQL: {e}")
-        return
-    yield pool
-    await pool.close()
 
 
 @pytest_asyncio.fixture

@@ -6,22 +6,7 @@ import pytest
 
 from scripts.entity_resolution.musicbrainz import MusicBrainzReconciler
 
-
-@pytest.fixture
-def mock_mb_pg():
-    """Mock PgSource for musicbrainz-cache."""
-    pg = AsyncMock()
-    pg.fetchall = AsyncMock(return_value=[])
-    pg.fetchone = AsyncMock(return_value=None)
-    return pg
-
-
-@pytest.fixture
-def mock_wikidata_pg():
-    """Mock PgSource for wikidata-cache (P434 bridge)."""
-    pg = AsyncMock()
-    pg.fetchall = AsyncMock(return_value=[])
-    return pg
+# ``mock_mb_pg`` and ``mock_wikidata_pg`` are provided by tests/unit/conftest.py.
 
 
 @pytest.fixture

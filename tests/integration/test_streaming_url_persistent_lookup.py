@@ -21,7 +21,6 @@ Run with: pytest -m pg -v tests/integration/test_streaming_url_persistent_lookup
 
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -39,11 +38,6 @@ from entity.streaming_url_cache import (
 )
 from streaming.models import SourceMatch
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL_TEST",
-    "postgresql://discogs:discogs@localhost:5433/discogs",
-)
-
 _SERVICE_CASES = [
     ("apple_music_album", "https://music.apple.com/us/album/aluminum-tunes/1234567890"),
     ("spotify_album", "https://open.spotify.com/album/1A2GTWGt0LBTGQAyA3OKAf"),
@@ -51,14 +45,14 @@ _SERVICE_CASES = [
 
 
 @pytest_asyncio.fixture
-async def pg_pool():
-    try:
-        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
-    except Exception as e:
-        pytest.skip(f"Cannot connect to test PostgreSQL: {e}")
-        return
-    yield pool
-    await pool.close()
+async def pg_pool(pg_pool_large):
+    """Alias to the conftest ``max_size=4`` pool.
+
+    This module's downstream fixtures and tests request ``pg_pool`` by name and
+    historically got a ``max_size=4`` pool; aliasing keeps that cap without
+    re-typing every request.
+    """
+    yield pg_pool_large
 
 
 @pytest_asyncio.fixture

@@ -150,6 +150,34 @@ def es256_keypair() -> tuple[str, str]:
 
 
 @pytest.fixture
+def mock_mb_pg():
+    """Mock ``PgSource`` for the musicbrainz-cache PostgreSQL DB.
+
+    Superset of the two historical shapes: exposes both ``fetchall`` (artist /
+    release / track fallback queries) and ``fetchone`` (reconciliation single
+    -row lookups). Callers that only read ``fetchall`` never touch ``fetchone``,
+    so the extra attribute is inert for them.
+    """
+    pg = AsyncMock()
+    pg.fetchall = AsyncMock(return_value=[])
+    pg.fetchone = AsyncMock(return_value=None)
+    return pg
+
+
+@pytest.fixture
+def mock_wikidata_pg():
+    """Mock ``PgSource`` for the wikidata-cache PostgreSQL DB (P434 bridge).
+
+    Same superset shape as :func:`mock_mb_pg`: both ``fetchall`` and
+    ``fetchone`` are present so the 2-attr and 3-attr call sites share one def.
+    """
+    pg = AsyncMock()
+    pg.fetchall = AsyncMock(return_value=[])
+    pg.fetchone = AsyncMock(return_value=None)
+    return pg
+
+
+@pytest.fixture
 def mock_posthog_client():
     """Mock PostHog client."""
     client = Mock()
