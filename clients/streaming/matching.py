@@ -364,6 +364,14 @@ def record_match_telemetry(
         matched_artist: Matched-candidate artist string (labeling).
         query_title: Request title string (labeling).
         matched_title: Matched-candidate title string (labeling).
+
+    Unlike ``service`` (a *required* kwarg, so a forgotten label fails loudly
+    instead of rotting telemetry — see ``find_best_source_match``), the four
+    label strings are optional: they're emitted only on the marginal subset, so
+    requiring them on every call would over-couple non-marginal callers. The
+    same silent-null risk is instead guarded at use: a marginal clear that
+    arrives without them logs a warning (telemetry is best-effort, so this can
+    warn but never raise).
     """
     try:
         marginal = (
@@ -377,6 +385,22 @@ def record_match_telemetry(
             span.set_data("matcher.title_score", title_score)
             span.set_data("matcher.marginal_artist_clear", marginal)
             if marginal:
+                if None in (query_artist, matched_artist, query_title, matched_title):
+                    # The labels are what make the marginal sample usable; a
+                    # marginal clear that reaches here without them is the
+                    # silent-unattributable-telemetry mode that the required
+                    # ``service=`` kwarg was added to reject (see
+                    # ``find_best_source_match``). The labels stay optional
+                    # because they're conditional (marginal-only) — requiring
+                    # them on every call would over-couple non-marginal callers
+                    # — so the gap is guarded here with a warning rather than at
+                    # the signature. Best-effort telemetry must never raise.
+                    logger.warning(
+                        "matcher.match marginal clear emitted without label strings "
+                        "(service=%s surface=%s); sample will be unlabelable",
+                        service,
+                        surface,
+                    )
                 span.set_data("matcher.query_artist", query_artist)
                 span.set_data("matcher.matched_artist", matched_artist)
                 span.set_data("matcher.query_title", query_title)
