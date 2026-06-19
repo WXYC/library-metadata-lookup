@@ -27,7 +27,6 @@ from generated.api_models import (
     TrackMatchSource,
 )
 from lookup.orchestrator import (
-    _log_track_validation,
     _resolve_fallback_artwork,
     artist_matches_item,
     build_context_message,
@@ -41,6 +40,7 @@ from lookup.orchestrator import (
     search_song_as_track,
     search_with_alternative_interpretation,
 )
+from lookup.release_resolution import ResolvedRelease
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_discogs_result, make_library_item
 
@@ -1192,7 +1192,14 @@ class TestFetchArtworkForItems:
         )
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[artwork])
 
-        discogs_titles = {20: "Disco Not Disco (Post Punk, Electro & Leftfield Disco Classics)"}
+        discogs_titles = {
+            20: ResolvedRelease(
+                release_id=99999,
+                release_url="https://www.discogs.com/release/99999",
+                is_compilation=True,
+                album_title="Disco Not Disco (Post Punk, Electro & Leftfield Disco Classics)",
+            )
+        }
         results = await fetch_artwork_for_items(
             items=[item], discogs_service=mock_discogs_service, discogs_titles=discogs_titles
         )
@@ -2704,130 +2711,3 @@ class TestApiCallCap:
             "Item B never fired the cap but inherited A's signal — concurrent "
             "bulk regression (iter-3 review)."
         )
-
-
-# ---------------------------------------------------------------------------
-# Tests: _log_track_validation (A7 / LML#344 audit instrumentation)
-# ---------------------------------------------------------------------------
-
-
-class TestLogTrackValidation:
-    """Audit instrumentation for the two validate_track_on_release call sites.
-
-    LML#344 wants to know how often the step-3b validation runs after
-    TRACK_ON_COMPILATION's inline validation already vetted the same release,
-    and how often the two verdicts diverge. The helper records each
-    validation call with a source label so downstream Sentry analysis can
-    split (release_id, verdict) pairs by source.
-
-    Two surfaces:
-      - Sentry breadcrumb every call (always-on; trace explorer queries against it).
-      - Structured INFO log on a 1% sample (cheap Railway-log grep target).
-
-    Sample rate is parameterizable so tests can force the deterministic branch.
-    """
-
-    def test_records_breadcrumb_on_every_call(self):
-        """Every call must produce a Sentry breadcrumb (always-on for trace explorer)."""
-        with patch("lookup.orchestrator.sentry_sdk.add_breadcrumb") as mock_breadcrumb:
-            _log_track_validation(
-                source="compilation_inline",
-                release_id=12345,
-                song="VI Scose Poise",
-                artist="Autechre",
-                verdict=True,
-                latency_ms=42.5,
-                sample_rate=0.0,  # disable log sampling; only breadcrumb path
-            )
-        mock_breadcrumb.assert_called_once()
-        call = mock_breadcrumb.call_args
-        assert call.kwargs["category"] == "track_validation"
-        data = call.kwargs["data"]
-        assert data["source"] == "compilation_inline"
-        assert data["release_id"] == 12345
-        assert data["song"] == "VI Scose Poise"
-        assert data["artist"] == "Autechre"
-        assert data["verdict"] is True
-        assert data["latency_ms"] == 42.5
-
-    def test_samples_info_log_at_configured_rate(self):
-        """When the random sample fires, an INFO log is emitted alongside the breadcrumb."""
-        with (
-            patch("lookup.orchestrator.random.random", return_value=0.005),  # 0.5% < 1% → fires
-            patch("lookup.orchestrator.logger") as mock_logger,
-            patch("lookup.orchestrator.sentry_sdk.add_breadcrumb"),
-        ):
-            _log_track_validation(
-                source="step_3b",
-                release_id=1,
-                song="x",
-                artist="y",
-                verdict=False,
-                latency_ms=1.0,
-                sample_rate=0.01,
-            )
-        # logger.info called with the structured payload
-        info_calls = [c for c in mock_logger.info.call_args_list if "track_validation" in str(c)]
-        assert len(info_calls) == 1
-
-    def test_does_not_sample_info_log_when_rate_misses(self):
-        """When the random draw exceeds the sample rate, no INFO log fires.
-
-        Even at 1% sampling we still need the *deterministic* off-path so
-        Railway logs aren't flooded by every /lookup. The breadcrumb path
-        runs unconditionally; only the structured log is gated.
-        """
-        with (
-            patch("lookup.orchestrator.random.random", return_value=0.99),  # 99% > 1% → no fire
-            patch("lookup.orchestrator.logger") as mock_logger,
-            patch("lookup.orchestrator.sentry_sdk.add_breadcrumb"),
-        ):
-            _log_track_validation(
-                source="step_3b",
-                release_id=1,
-                song="x",
-                artist="y",
-                verdict=False,
-                latency_ms=1.0,
-                sample_rate=0.01,
-            )
-        info_calls = [c for c in mock_logger.info.call_args_list if "track_validation" in str(c)]
-        assert len(info_calls) == 0
-
-    def test_handles_sentry_sdk_failure(self):
-        """A Sentry SDK exception must not break /lookup.
-
-        Mirrors the swallow-and-log pattern in _log_album_title_fallback /
-        _log_resolver_pre_pass / _log_search_budget_exceeded. The audit
-        layer is non-essential — it cannot be allowed to take down the
-        request path.
-        """
-        with patch(
-            "lookup.orchestrator.sentry_sdk.add_breadcrumb",
-            side_effect=RuntimeError("sentry exploded"),
-        ):
-            # Must not raise.
-            _log_track_validation(
-                source="compilation_inline",
-                release_id=1,
-                song="x",
-                artist="y",
-                verdict=True,
-                latency_ms=1.0,
-                sample_rate=0.0,
-            )
-
-    def test_handles_null_artist(self):
-        """Some call paths pass artist=None; the helper must accept it."""
-        with patch("lookup.orchestrator.sentry_sdk.add_breadcrumb") as mock_breadcrumb:
-            _log_track_validation(
-                source="step_3b",
-                release_id=1,
-                song="x",
-                artist=None,
-                verdict=False,
-                latency_ms=1.0,
-                sample_rate=0.0,
-            )
-        data = mock_breadcrumb.call_args.kwargs["data"]
-        assert data["artist"] is None

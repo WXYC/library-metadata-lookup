@@ -80,6 +80,12 @@ from lookup.external_search import (
     search_external_tracks,
 )
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
+from lookup.release_resolution import (
+    ResolvedRelease,
+    _log_track_validation,
+    merge_wave_b_compilations,
+    validate_release_for_track,
+)
 from lookup.strategies import build_strategies
 from lookup.streaming_url_postprocess import apply_streaming_url_postprocess
 from lookup.timeouts import apple_music_lookup_timeout_s
@@ -535,64 +541,6 @@ def _project_mb_rescue_attrs(
         logger.warning("Failed to project mb_rescue attrs onto Sentry transaction: %s", e)
 
 
-def _log_track_validation(
-    *,
-    source: str,
-    release_id: int,
-    song: str,
-    artist: str | None,
-    verdict: bool,
-    latency_ms: float,
-    sample_rate: float = 0.01,
-) -> None:
-    """Audit instrumentation for ``DiscogsService.validate_track_on_release`` (A7 / LML#344).
-
-    The cascade has two validation call sites: the inline check inside
-    ``TRACK_ON_COMPILATION``'s ``process_release`` and the post-cascade
-    sweep in ``filter_results_by_track_validation``. The audit ticket wants
-    to know how often the second call runs after the first already vetted
-    the same release, and how often the two verdicts disagree.
-
-    This helper records each call with a ``source`` label so downstream
-    Sentry analysis can split (release_id, verdict) pairs by source.
-    Two surfaces:
-
-    - **Sentry breadcrumb on every call** — trace explorer queries against
-      ``category:track_validation`` to count divergences without log-pipeline
-      tooling. Always-on; cost is microseconds per call.
-    - **Structured INFO log on a 1% sample** — cheap Railway-log grep target
-      for spot-checking. The full population is too large to log at INFO,
-      so the sample is randomized per call.
-
-    Both surfaces are non-essential; any SDK exception is swallowed and the
-    request proceeds. Same swallow pattern as :func:`_log_album_title_fallback`
-    / :func:`_log_resolver_pre_pass`.
-
-    The acceptance criterion from #344 is "7 days of data" — this helper
-    ships the instrumentation; the decision about whether to delete one of
-    the call sites is a follow-up after the data is in.
-    """
-    payload: dict[str, Any] = {
-        "source": source,
-        "release_id": release_id,
-        "song": song,
-        "artist": artist,
-        "verdict": verdict,
-        "latency_ms": round(latency_ms, 2),
-    }
-    try:
-        sentry_sdk.add_breadcrumb(
-            category="track_validation",
-            level="info",
-            data=payload,
-        )
-    except Exception as e:
-        logger.warning("Failed to add track_validation breadcrumb: %s", e)
-
-    if random.random() < sample_rate:
-        logger.info("track_validation %s", payload)
-
-
 def _log_resolver_pre_pass(outcome: ResolverOutcome, *, actual_swap: bool) -> None:
     """Emit shadow-mode telemetry for the resolver pre-pass.
 
@@ -1022,17 +970,12 @@ async def search_song_as_track(
         # after library matching so we only pay the API cost for releases we'd
         # actually return, mirroring search_compilations_for_track.
         if release.release_id:
-            _validation_start = time.monotonic()
-            is_valid = await discogs_service.validate_track_on_release(
-                release.release_id, song, release.artist
-            )
-            _log_track_validation(
+            is_valid = await validate_release_for_track(
+                discogs_service,
+                release.release_id,
+                song,
+                release.artist,
                 source="song_as_track",
-                release_id=release.release_id,
-                song=song,
-                artist=release.artist,
-                verdict=is_valid,
-                latency_ms=(time.monotonic() - _validation_start) * 1000,
             )
             if not is_valid:
                 logger.debug(
@@ -1370,8 +1313,13 @@ async def search_compilations_for_track(
     db: LibraryDB,
     parsed: ParsedRequest,
     discogs_service: DiscogsService | None = None,
-) -> tuple[list[LibraryItem], dict[int, str]]:
-    """Search for track on compilation albums using Discogs and library keyword search."""
+) -> tuple[list[LibraryItem], dict[int, ResolvedRelease]]:
+    """Search for track on compilation albums using Discogs and library keyword search.
+
+    The second tuple element maps each surfaced library id to the
+    :class:`~lookup.release_resolution.ResolvedRelease` it matched — the widened
+    ``discogs_titles`` seam consumed by the artwork-binding step.
+    """
     if not parsed.song or not parsed.artist:
         return [], {}
 
@@ -1379,7 +1327,7 @@ async def search_compilations_for_track(
 
     results = []
     seen_ids = set()
-    discogs_titles: dict[int, str] = {}
+    discogs_titles: dict[int, ResolvedRelease] = {}
 
     keyword_matches = []
     try:
@@ -1501,22 +1449,14 @@ async def search_compilations_for_track(
                 probe_tuple = gathered[2]
                 assert isinstance(probe_tuple, tuple)
                 album_fallback_response, album_fallback_error = probe_tuple
-            raw_releases = list(response.releases or [])
 
-            # Only merge VA results if Wave A already surfaced a *true V/A* hit.
-            # Gating on ``r.is_compilation`` alone (Discogs's ``format=Compilation``
-            # flag) over-suppresses: single-artist retrospectives are flagged
-            # ``Compilation`` too, but they are not V/A and Wave B is the only
-            # probe that surfaces real V/A releases. See WXYC#527.
-            has_va_compilation = any(
-                r.is_compilation and is_compilation_artist(r.artist or "") for r in raw_releases
+            # Merge Wave B's V/A compilations into Wave A unless Wave A already
+            # surfaced a true-V/A hit (WXYC#527). The merge logic is owned by
+            # ``lookup.release_resolution.merge_wave_b_compilations`` so the
+            # release-resolution module and this strategy can't drift apart.
+            raw_releases = merge_wave_b_compilations(
+                list(response.releases or []), list(va_response.releases or [])
             )
-            if not has_va_compilation:
-                seen_album_keys = {r.album.lower() for r in raw_releases}
-                for r in va_response.releases or []:
-                    if r.is_compilation and r.album.lower() not in seen_album_keys:
-                        raw_releases.append(r)
-                        seen_album_keys.add(r.album.lower())
         else:
             # No injected service — fall back to lookup helper (validates all)
             tuples = await lookup_releases_by_track(song_search, parsed.artist, service=None)
@@ -1539,7 +1479,7 @@ async def search_compilations_for_track(
             *,
             skip_self_named_album: bool = True,
             skip_artist_match_filter: bool = False,
-        ) -> list[tuple[LibraryItem, str]]:
+        ) -> list[tuple[LibraryItem, ResolvedRelease]]:
             """Process one Discogs release: library search, filter, validate.
 
             ``skip_self_named_album`` defaults True to preserve existing behavior
@@ -1606,19 +1546,14 @@ async def search_compilations_for_track(
 
             # Validate that the track actually exists on this release.
             # Deferred until after library matching so we only validate
-            # releases we might actually return — saving API calls.
+            # releases we might actually return — saving API calls (LML#536).
             if discogs_service and release_info.release_id and parsed.artist:
-                _validation_start = time.monotonic()
-                is_valid = await discogs_service.validate_track_on_release(
-                    release_info.release_id, song_search, parsed.artist
-                )
-                _log_track_validation(
+                is_valid = await validate_release_for_track(
+                    discogs_service,
+                    release_info.release_id,
+                    song_search,
+                    parsed.artist,
                     source="compilation_inline",
-                    release_id=release_info.release_id,
-                    song=song_search,
-                    artist=parsed.artist,
-                    verdict=is_valid,
-                    latency_ms=(time.monotonic() - _validation_start) * 1000,
                 )
                 if not is_valid:
                     logger.info(
@@ -1630,7 +1565,13 @@ async def search_compilations_for_track(
                 f"Found '{parsed.song}' in library on '{matches[0].title}' "
                 f"(matched from Discogs: '{release_album}')"
             )
-            return [(match, release_album) for match in matches]
+            resolved = ResolvedRelease(
+                release_id=release_info.release_id,
+                release_url=release_info.release_url,
+                is_compilation=bool(release_info.is_compilation),
+                album_title=release_album,
+            )
+            return [(match, resolved) for match in matches]
 
         # Chunked dispatch so the per-request validate budget stays bounded
         # once the response cap is hit. Without chunking, asyncio.gather
@@ -1641,11 +1582,11 @@ async def search_compilations_for_track(
         async for _, release_matches in _chunked_gather(
             raw_releases, process_release, MAX_SEARCH_RESULTS
         ):
-            for match, discogs_album in release_matches:
+            for match, resolved in release_matches:
                 if match.id not in seen_ids:
                     results.append(match)
                     seen_ids.add(match.id)
-                    discogs_titles[match.id] = discogs_album
+                    discogs_titles[match.id] = resolved
             if len(results) >= MAX_SEARCH_RESULTS:
                 break
 
@@ -1699,11 +1640,11 @@ async def search_compilations_for_track(
             async for _, release_matches in _chunked_gather(
                 fallback_releases, fallback_worker, MAX_SEARCH_RESULTS
             ):
-                for match, discogs_album in release_matches:
+                for match, resolved in release_matches:
                     if match.id not in seen_ids:
                         results.append(match)
                         seen_ids.add(match.id)
-                        discogs_titles[match.id] = discogs_album
+                        discogs_titles[match.id] = resolved
                 if len(results) >= MAX_SEARCH_RESULTS:
                     break
             if fallback_releases:
@@ -2134,7 +2075,7 @@ async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id:
 async def fetch_artwork_for_items(
     items: list[LibraryItem],
     discogs_service: DiscogsService | None,
-    discogs_titles: dict[int, str] | None = None,
+    discogs_titles: dict[int, ResolvedRelease] | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Fetch artwork for multiple library items in parallel."""
     if not discogs_service:
@@ -2144,7 +2085,11 @@ async def fetch_artwork_for_items(
 
     async def fetch_one(item: LibraryItem) -> DiscogsSearchResult | None:
         try:
-            album = discogs_titles.get(item.id, item.title)
+            # The widened seam carries a ResolvedRelease; its album_title is the
+            # value the seam used to carry as a bare string. Falls back to the
+            # library row's own title when no release was resolved for this id.
+            resolved = discogs_titles.get(item.id)
+            album = resolved.album_title if resolved is not None else item.title
 
             # Self-titled albums stored as "S/t" should use the artist name
             # for Discogs search instead of the abbreviation
@@ -3033,7 +2978,7 @@ async def perform_lookup(
     items_with_artwork: list[tuple[LibraryItem, DiscogsSearchResult | None]] = []
     song_not_found = False
     found_on_compilation = False
-    discogs_titles: dict[int, str] = {}
+    discogs_titles: dict[int, ResolvedRelease] = {}
     corrected_artist: str | None = None
 
     # Steps 1+2: Correct artist spelling and resolve albums (parallel)

@@ -22,7 +22,24 @@ import pytest
 
 from core.search import Outcome, SearchState, _apply
 from generated.api_models import TrackMatchHint, TrackMatchSource
+from lookup.release_resolution import ResolvedRelease
 from tests.factories import make_library_item as _item
+
+
+def _rr(release_id: int, album_title: str) -> ResolvedRelease:
+    """Build a ResolvedRelease for the widened ``discogs_titles`` seam.
+
+    The seam carries ResolvedRelease values; these plumbing tests only thread
+    the dict through Outcome / _apply, so the release_url / compilation flag are
+    incidental — ``album_title`` is the field artwork binding reads.
+    """
+    return ResolvedRelease(
+        release_id=release_id,
+        release_url=f"https://www.discogs.com/release/{release_id}",
+        is_compilation=True,
+        album_title=album_title,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Outcome constructors
@@ -103,7 +120,7 @@ class TestOutcomeConstructors:
           - `song_not_found_after=False` (we DID match the song, just on a compilation)
         """
         item = _item(id=46602, artist="Various", title="Trax Records 20th Anniversary")
-        titles = {46602: "Trax Records 20th Anniversary"}
+        titles = {46602: _rr(46602, "Trax Records 20th Anniversary")}
         o = Outcome.compilation([item], discogs_titles=titles)
         assert o.items == [item]
         assert o.song_not_found_after is False
@@ -240,7 +257,7 @@ class TestApplyCompilation:
 
     def test_writes_results_titles_flag(self):
         item = _item(id=46602, artist="Various", title="Trax Comp")
-        titles = {46602: "Trax Records 20th"}
+        titles = {46602: _rr(46602, "Trax Records 20th")}
         state = SearchState(results=[], song_not_found=True)
         _apply(state, Outcome.compilation([item], discogs_titles=titles))
         assert state.results == [item]
@@ -261,7 +278,7 @@ class TestApplyCompilation:
         state = SearchState(results=[artist_fallback], song_not_found=True)
         _apply(
             state,
-            Outcome.compilation([compilation], discogs_titles={46602: "Trax Comp"}),
+            Outcome.compilation([compilation], discogs_titles={46602: _rr(46602, "Trax Comp")}),
         )
         assert state.results == [compilation]
         assert state.artist_fallback_results == [artist_fallback]
@@ -275,7 +292,7 @@ class TestApplyCompilation:
         state = SearchState(results=[], song_not_found=True)
         _apply(
             state,
-            Outcome.compilation([compilation], discogs_titles={46602: "Trax Comp"}),
+            Outcome.compilation([compilation], discogs_titles={46602: _rr(46602, "Trax Comp")}),
         )
         assert state.artist_fallback_results == []
         assert state.results == [compilation]
@@ -287,7 +304,7 @@ class TestApplyCompilation:
         state = SearchState(results=[prior], song_not_found=False)
         _apply(
             state,
-            Outcome.compilation([compilation], discogs_titles={46602: "Trax Comp"}),
+            Outcome.compilation([compilation], discogs_titles={46602: _rr(46602, "Trax Comp")}),
         )
         # Direct hit prior + compilation hit now: nothing to stash as "fallback".
         assert state.artist_fallback_results == []

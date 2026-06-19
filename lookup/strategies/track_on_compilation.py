@@ -28,11 +28,12 @@ from core.search import (
 )
 from library.db import LibraryDB
 from library.models import LibraryItem
+from lookup.release_resolution import ResolvedRelease
 from services.parser import ParsedRequest
 
 TrackOnCompilationExecute = Callable[
     [LibraryDB, ParsedRequest],
-    Awaitable[tuple[list[LibraryItem], dict[int, str]]],
+    Awaitable[tuple[list[LibraryItem], dict[int, ResolvedRelease]]],
 ]
 
 
