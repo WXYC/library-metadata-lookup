@@ -39,6 +39,7 @@ class DeezerClient(BaseStreamingClient):
             artist_fn=lambda x: x["artist"]["name"],
             title_fn=lambda x: x["title"],
             url_fn=lambda x: x["link"],
+            service="deezer",
         )
 
     async def search_album(self, artist: str, title: str) -> list[dict]:

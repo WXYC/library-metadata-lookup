@@ -818,6 +818,74 @@ class TestFindTrackMetadata:
         assert match.url == url
 
 
+class TestFindTrackMetadataEmits:
+    """LML#592: the Apple track probe (``token_set_ratio``) emits match
+    telemetry for the winner under ``surface="track"``.
+
+    This path inlines its own floor and never calls the shared predicate, so
+    it must be instrumented separately. ``record_match_telemetry`` itself is
+    unit-tested in test_streaming_matching.py; here we pin the WIRING — that
+    the track path calls it once, with surface/service set and the *chosen*
+    winner's per-axis scores.
+    """
+
+    @pytest.mark.asyncio
+    async def test_emits_marginal_clear_for_track_winner(self, es256_keypair):
+        client = _client(es256_keypair)
+        # Request "Wand" / "DOGA"; Apple returns "Wanda" on a same-titled
+        # track + album. token_set_ratio("wand","wanda") == 88.89 (marginal).
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response(
+                [_make_song_data(name="DOGA", artist_name="Wanda", album_name="DOGA")]
+            )
+        )
+        client._http = mock_http
+
+        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
+            match = await client.find_track_metadata("Wand", "DOGA", album="DOGA")
+
+        assert match is not None  # still clears — this PR instruments, it does not reject
+        rec.assert_called_once()
+        kwargs = rec.call_args.kwargs
+        assert kwargs["surface"] == "track"
+        assert kwargs["service"] == "apple_music"
+        assert 80.0 <= kwargs["artist_score"] < 90.0  # marginal artist axis
+        assert kwargs["title_score"] >= 95.0  # high title axis
+
+    @pytest.mark.asyncio
+    async def test_emits_scores_of_chosen_winner_not_top_fuzz(self, es256_keypair):
+        """``best = best_with_artwork or best_overall`` — the emitted scores
+        must describe the CHOSEN winner (artwork-preferred), not the
+        higher-fuzz artworkless record. Guards the lockstep-stash fix."""
+        client = _client(es256_keypair)
+        # A: exact artist, NO artwork -> higher combined -> best_overall.
+        a = _make_song_data(
+            name="DOGA",
+            artist_name="Wand",
+            album_name="DOGA",
+            url="https://music.apple.com/us/song/a/1",
+        )
+        # B: marginal artist, WITH artwork -> best_with_artwork -> chosen as best.
+        b = _make_song_data_full(
+            name="DOGA",
+            artist_name="Wanda",
+            album_name="DOGA",
+            url="https://music.apple.com/us/song/b/2",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([a, b]))
+        client._http = mock_http
+
+        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
+            match = await client.find_track_metadata("Wand", "DOGA", album="DOGA")
+
+        assert match is not None
+        assert match.url.endswith("/b/2")  # artwork-preferred winner chosen
+        # Emitted artist score is B's marginal 88.89, NOT A's exact 100.0.
+        assert 80.0 <= rec.call_args.kwargs["artist_score"] < 90.0
+
+
 class TestRetryBehavior:
     """429 and transient 5xx are retried; terminal 4xx are not. Mirrors
     SpotifyClient's _search_with_retry shape."""

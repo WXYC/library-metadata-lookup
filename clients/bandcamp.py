@@ -124,6 +124,7 @@ class BandcampClient(BaseStreamingClient):
             artist_fn=lambda _: matched_artist_name,
             title_fn=lambda x: x["title"],
             url_fn=lambda x: x["url"],
+            service="bandcamp",
         )
 
     async def search_artist(self, artist_name: str) -> list[dict]:

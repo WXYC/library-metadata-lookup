@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Iterable
 
+import sentry_sdk
 from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison  # noqa: F401
 
 from discogs.matching import strip_discogs_suffix  # noqa: F401
 from streaming.models import SourceMatch
+
+logger = logging.getLogger(__name__)
 
 # Trailing format indicators: 12", 7", 10", LP, EP, CD, and multi-disc (x 2, x 3, ...)
 _FORMAT_SUFFIX_RE = re.compile(
@@ -305,6 +309,54 @@ def is_acceptable_match(artist_score: float, title_score: float) -> bool:
     )
 
 
+# LML#592 telemetry bands. The 80/80 floor admits organic short-name artist
+# collisions on a shared album title ("Wand" vs "Wanda" scores 88.89 against
+# an identical title at 100). These bands classify the *signature* of such a
+# clear — a marginal artist score against a high title — so we can measure how
+# often it happens in production BEFORE deciding whether to tighten the floor.
+# Raw scores are emitted alongside the boolean, so the bands can be re-tuned in
+# Sentry queries without a code change. NOT acceptance thresholds: nothing here
+# rejects a match. The artist axis is the discriminator; titles collide cheaply.
+MARGINAL_ARTIST_CEILING: float = 90.0  # artist in [floor, ceiling) is "marginal"
+HIGH_TITLE_FLOOR: float = 95.0  # title >= this is "high" — the collision tell
+
+
+def record_match_telemetry(
+    *, artist_score: float, title_score: float, service: str, surface: str
+) -> None:
+    """Emit a winning match's per-axis fuzzy scores to Sentry (LML#592).
+
+    Opens a lightweight ``matcher.match`` span carrying the raw artist/title
+    scores plus a derived ``marginal_artist_clear`` flag (artist in
+    ``[SCORE_MATCH_ACCEPTANCE_FLOOR, MARGINAL_ARTIST_CEILING)`` while title is
+    ``>= HIGH_TITLE_FLOOR``). Called once per resolved match, so the count of
+    these spans is the denominator and the flagged subset is the numerator of
+    the marginal-clear rate.
+
+    Telemetry must never break a lookup: any failure is swallowed with a warning
+    (mirrors ``_project_cache_stats_to_transaction`` in ``lookup/router.py``).
+
+    Args:
+        artist_score: Fuzzy score of the request artist vs the matched artist.
+        title_score: Fuzzy score of the request title vs the matched title.
+        service: Streaming service that produced the match ("apple_music", ...).
+        surface: Match surface — "album" or "track".
+    """
+    try:
+        with sentry_sdk.start_span(op="matcher.match", name=f"{service}:{surface}") as span:
+            span.set_data("matcher.service", service)
+            span.set_data("matcher.surface", surface)
+            span.set_data("matcher.artist_score", artist_score)
+            span.set_data("matcher.title_score", title_score)
+            span.set_data(
+                "matcher.marginal_artist_clear",
+                SCORE_MATCH_ACCEPTANCE_FLOOR <= artist_score < MARGINAL_ARTIST_CEILING
+                and title_score >= HIGH_TITLE_FLOOR,
+            )
+    except Exception as e:  # defensive; telemetry is best-effort, never fatal
+        logger.warning("Failed to emit matcher telemetry: %s", e)
+
+
 def find_best_match(
     results: list[dict],
     query_artist: str,
@@ -351,6 +403,10 @@ def find_best_match(
                 "confidence": combined,
                 "matched_artist": result_artist,
                 "matched_title": result_title,
+                # Per-axis scores so callers can emit match telemetry (LML#592):
+                # the artist axis is the discriminator on shared-title collisions.
+                "artist_score": artist_score,
+                "title_score": title_score,
             }
             if id_fn is not None:
                 match["id"] = id_fn(item)
@@ -432,6 +488,7 @@ def find_best_source_match(
     artist_fn: Callable[[dict], str],
     title_fn: Callable[[dict], str],
     url_fn: Callable[[dict], str],
+    service: str = "unknown",
 ) -> SourceMatch | None:
     """Run ``find_best_match`` and wrap the verdict as a ``SourceMatch``.
 
@@ -442,6 +499,10 @@ def find_best_source_match(
     the ``best is None / SourceMatch(url=..., confidence=...)`` boilerplate
     here. ``id_fn`` deliberately omitted — ``SourceMatch`` doesn't carry an
     id, so the extra extractor was dead weight in adapter bodies.
+
+    ``service`` labels the LML#592 match telemetry emitted for the winning
+    candidate (album surface). It defaults to ``"unknown"`` so a caller that
+    forgets it still records — telemetry is never load-bearing.
     """
     best = find_best_match(
         results,
@@ -453,4 +514,10 @@ def find_best_source_match(
     )
     if best is None:
         return None
+    record_match_telemetry(
+        artist_score=best["artist_score"],
+        title_score=best["title_score"],
+        service=service,
+        surface="album",
+    )
     return SourceMatch(url=best["url"], confidence=best["confidence"])

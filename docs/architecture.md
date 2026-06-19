@@ -103,3 +103,14 @@ Wiring:
 - `DATABASE_URL_DISCOGS` (already required for the standard cache) covers the discogs leg.
 - `DATABASE_URL_MUSICBRAINZ` is new — when unset the MB leg is skipped silently.
 - Existing callers (no flag) see no behavior change and no extra queries.
+
+## Streaming-match telemetry (LML#592)
+
+Every winning streaming match emits a lightweight `matcher.match` Sentry span (via `record_match_telemetry` in `clients/streaming/matching.py`) carrying the per-axis fuzzy scores. It is emitted once per resolved match on both surfaces: the album path (`find_best_source_match`, all adapters) and the Apple track path (`find_track_metadata`, which inlines its own `token_set_ratio` floor). Span data keys:
+
+- `matcher.service` — `"apple_music" | "spotify" | "deezer" | "bandcamp"`
+- `matcher.surface` — `"album" | "track"`
+- `matcher.artist_score` / `matcher.title_score` — raw fuzzy scores (0-100) of the winner
+- `matcher.marginal_artist_clear` — `true` when the artist score is marginal (`[SCORE_MATCH_ACCEPTANCE_FLOOR, MARGINAL_ARTIST_CEILING)`) against a high title (`>= HIGH_TITLE_FLOOR`) — the short-name-collision signature (e.g. "Wand" matching "Wanda" on a shared album title)
+
+The count of `matcher.match` spans is the denominator and the `marginal_artist_clear` subset is the numerator of the marginal-clear rate. This is **instrumentation only** — it measures the 80/80 floor's behavior so the artist-axis floor can be tightened later on evidence, not assumption. Telemetry failures are swallowed (best-effort), so they never break a lookup.
