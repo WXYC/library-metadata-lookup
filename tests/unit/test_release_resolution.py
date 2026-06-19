@@ -88,6 +88,64 @@ class TestResolveReleaseForTrack:
 
         assert [r.release_id for r in resolved] == [36907527]
 
+    @pytest.mark.asyncio
+    async def test_skips_candidate_with_falsy_release_id(self):
+        """A probed release with release_id=0 (malformed Discogs row) is skipped
+        before validation — never validated, never resolved."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        zero = ReleaseInfo(
+            album="When There Is No Sun",
+            artist="Various",
+            release_id=0,
+            release_url="",
+            is_compilation=True,
+        )
+        good = _va_comp(release_id=36907527, album="When There Is No Sun")
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(zero, good))
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+        )
+
+        assert [r.release_id for r in resolved] == [36907527]
+        # The zero-id row was skipped before the validate probe ran.
+        assert svc.validate_track_on_release.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_wave_b_keyword_probe_surfaces_va_comp_when_wave_a_has_none(self):
+        """End-to-end wave routing: Wave A (artist-field probe) returns a non-V/A
+        release; only Wave B (artist_as_keyword=True) surfaces the V/A comp, which
+        the merge pulls in and validates. Catches a wave-swap or dropped-keyword-probe
+        wiring bug that the isolated merge unit test cannot see."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        def _route(track, artist, artist_as_keyword=False):
+            if artist_as_keyword:
+                return _track_response(_va_comp(release_id=36907527, album="When There Is No Sun"))
+            return _track_response(_single_artist(1, "An Unrelated Solo Album"))
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(side_effect=_route)
+        # Only the V/A comp validates the per-track credit.
+        svc.validate_track_on_release = AsyncMock(
+            side_effect=lambda rid, song, artist: rid == 36907527
+        )
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+        )
+
+        assert [r.release_id for r in resolved] == [36907527]
+
 
 def _single_artist(release_id: int, album: str, *, is_compilation: bool = False) -> ReleaseInfo:
     return ReleaseInfo(
@@ -137,6 +195,16 @@ class TestMergeWaveBCompilations:
         merged = merge_wave_b_compilations(wave_a, wave_b)
 
         assert [r.release_id for r in merged] == [1, 3]
+
+    def test_dedups_wave_b_against_wave_a_by_album_title(self):
+        from lookup.release_resolution import merge_wave_b_compilations
+
+        wave_a = [_single_artist(1, "Shared Title")]
+        wave_b = [_va_comp(release_id=2, album="Shared Title")]
+
+        merged = merge_wave_b_compilations(wave_a, wave_b)
+
+        assert [r.release_id for r in merged] == [1]
 
 
 class TestRanking:
@@ -273,15 +341,67 @@ class TestEmptyCases:
 
         assert resolved == []
 
-    def test_dedups_wave_b_against_wave_a_by_album_title(self):
-        from lookup.release_resolution import merge_wave_b_compilations
+    @pytest.mark.asyncio
+    async def test_returns_empty_for_blank_song_or_artist_without_probing(self):
+        """The song/artist guard short-circuits before any Discogs probe."""
+        from lookup.release_resolution import resolve_release_for_track
 
-        wave_a = [_single_artist(1, "Shared Title")]
-        wave_b = [_va_comp(release_id=2, album="Shared Title")]
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock()
 
-        merged = merge_wave_b_compilations(wave_a, wave_b)
+        assert await resolve_release_for_track("", "A Guy Called Gerald", "X", svc) == []
+        assert await resolve_release_for_track("Message to Black Youth", "", "X", svc) == []
 
-        assert [r.release_id for r in merged] == [1]
+        svc.search_releases_by_track.assert_not_awaited()
+
+
+class TestErrorHandling:
+    """Release resolution degrades gracefully on Discogs failures (matches the
+    resilience of the search_compilations_for_track path it was lifted from)."""
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_returns_empty(self):
+        from lookup.release_resolution import resolve_release_for_track
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(side_effect=RuntimeError("discogs 503"))
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+        )
+
+        assert resolved == []
+
+    @pytest.mark.asyncio
+    async def test_single_validation_failure_preserves_other_releases(self):
+        """One candidate's validation raising must not discard already-validated
+        releases — the divergence the lift could otherwise introduce."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        good = _va_comp(release_id=36907527, album="When There Is No Sun")
+        boom = _va_comp(release_id=111, album="When There Is No Sun")
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(good, boom))
+
+        async def _validate(rid, song, artist):
+            if rid == 111:
+                raise RuntimeError("discogs timeout")
+            return True
+
+        svc.validate_track_on_release = AsyncMock(side_effect=_validate)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+        )
+
+        assert [r.release_id for r in resolved] == [36907527]
 
 
 # ---------------------------------------------------------------------------

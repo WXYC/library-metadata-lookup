@@ -39,25 +39,10 @@ from core.search import (
     song_not_found_with_artist_and_song,
 )
 from generated.api_models import TrackMatchHint, TrackMatchSource
-from lookup.release_resolution import ResolvedRelease
 from lookup.strategies import build_strategies
 from services.parser import ParsedRequest
 from tests.factories import make_library_item as _item
-
-
-def _rr(release_id: int, album_title: str) -> ResolvedRelease:
-    """Build a ResolvedRelease for the widened ``discogs_titles`` seam.
-
-    TRACK_ON_COMPILATION's execute func returns ``dict[int, ResolvedRelease]``;
-    these runner tests assert that map threads through the pipeline unchanged.
-    """
-    return ResolvedRelease(
-        release_id=release_id,
-        release_url=f"https://www.discogs.com/release/{release_id}",
-        is_compilation=True,
-        album_title=album_title,
-    )
-
+from tests.factories import make_resolved_release as _rr
 
 # ---------------------------------------------------------------------------
 # Test helpers: tiny strategy stand-ins for runner-level tests

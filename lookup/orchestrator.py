@@ -10,7 +10,6 @@ import logging
 import os
 import random
 import re
-import time
 from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass
 from functools import partial
@@ -82,7 +81,6 @@ from lookup.external_search import (
 from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.release_resolution import (
     ResolvedRelease,
-    _log_track_validation,
     merge_wave_b_compilations,
     validate_release_for_track,
 )
@@ -1945,17 +1943,8 @@ async def filter_results_by_track_validation(
                     )
                     return None
 
-                _validation_start = time.monotonic()
-                is_valid = await discogs_service.validate_track_on_release(
-                    best_result.release_id, song, artist
-                )
-                _log_track_validation(
-                    source="step_3b",
-                    release_id=best_result.release_id,
-                    song=song,
-                    artist=artist,
-                    verdict=is_valid,
-                    latency_ms=(time.monotonic() - _validation_start) * 1000,
+                is_valid = await validate_release_for_track(
+                    discogs_service, best_result.release_id, song, artist, source="step_3b"
                 )
                 if is_valid:
                     logger.info(

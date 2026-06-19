@@ -22,24 +22,8 @@ import pytest
 
 from core.search import Outcome, SearchState, _apply
 from generated.api_models import TrackMatchHint, TrackMatchSource
-from lookup.release_resolution import ResolvedRelease
 from tests.factories import make_library_item as _item
-
-
-def _rr(release_id: int, album_title: str) -> ResolvedRelease:
-    """Build a ResolvedRelease for the widened ``discogs_titles`` seam.
-
-    The seam carries ResolvedRelease values; these plumbing tests only thread
-    the dict through Outcome / _apply, so the release_url / compilation flag are
-    incidental — ``album_title`` is the field artwork binding reads.
-    """
-    return ResolvedRelease(
-        release_id=release_id,
-        release_url=f"https://www.discogs.com/release/{release_id}",
-        is_compilation=True,
-        album_title=album_title,
-    )
-
+from tests.factories import make_resolved_release as _rr
 
 # ---------------------------------------------------------------------------
 # Outcome constructors

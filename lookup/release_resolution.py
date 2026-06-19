@@ -191,23 +191,41 @@ async def resolve_release_for_track(
     via ``validate_track_on_release`` (which matches the per-track credit, not the
     release credit), and returns the validated releases ranked by title match to
     ``album``. Empty when nothing validates.
+
+    Degrades gracefully on Discogs failures, matching the resilience of the
+    ``search_compilations_for_track`` path this was lifted from: a probe failure
+    yields an empty list (no candidates to resolve), and a single candidate's
+    validation failure drops only that candidate — releases already validated in
+    the same call survive. The live-worker caller (PR2's lazy bind) must never
+    have a transient Discogs error abort the whole request.
     """
     if discogs_service is None or not song or not artist:
         return []
 
-    wave_a, wave_b = await asyncio.gather(
-        discogs_service.search_releases_by_track(song, artist),
-        discogs_service.search_releases_by_track(song, artist, artist_as_keyword=True),
-    )
+    try:
+        wave_a, wave_b = await asyncio.gather(
+            discogs_service.search_releases_by_track(song, artist),
+            discogs_service.search_releases_by_track(song, artist, artist_as_keyword=True),
+        )
+    except Exception as exc:
+        logger.warning("Release-resolution probe failed for %r by %r: %s", song, artist, exc)
+        return []
     candidates = merge_wave_b_compilations(list(wave_a.releases or []), list(wave_b.releases or []))
 
     validated: list[ResolvedRelease] = []
     for release in candidates:
         if not release.release_id:
             continue
-        if not await validate_release_for_track(
-            discogs_service, release.release_id, song, artist, source="release_resolution"
-        ):
+        try:
+            is_valid = await validate_release_for_track(
+                discogs_service, release.release_id, song, artist, source="release_resolution"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Release-resolution validation failed for release %s: %s", release.release_id, exc
+            )
+            continue
+        if not is_valid:
             continue
         validated.append(
             ResolvedRelease(

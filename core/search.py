@@ -15,14 +15,20 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import sentry_sdk
 
 from generated.api_models import TrackMatchHint
 from library.models import LibraryItem
-from lookup.release_resolution import ResolvedRelease
 from services.parser import ParsedRequest
+
+if TYPE_CHECKING:
+    # Type-only import: ``core`` referencing ``lookup`` at runtime would invert the
+    # layering and risk an import cycle. ``release_resolution`` is a leaf today, but
+    # keeping this reference annotation-only (quoted below) makes the boundary
+    # structural, not just a convention defended by a comment.
+    from lookup.release_resolution import ResolvedRelease
 
 logger = logging.getLogger(__name__)
 
@@ -331,7 +337,7 @@ class SearchState:
     strategies_tried: list[SearchStrategyType] = field(default_factory=list)
     """List of strategies that have been executed."""
 
-    discogs_titles: dict[int, ResolvedRelease] = field(default_factory=dict)
+    discogs_titles: "dict[int, ResolvedRelease]" = field(default_factory=dict)
     """Map of library item ID to the resolved Discogs release (for artwork lookup).
 
     Widened from ``dict[int, str]`` (bare album title) to carry the full
@@ -434,7 +440,7 @@ class Outcome:
     after the compilation hit replaces them.
     """
 
-    discogs_titles: dict[int, ResolvedRelease] | None = None
+    discogs_titles: "dict[int, ResolvedRelease] | None" = None
     """Per-id resolved Discogs releases (for artwork lookup). ``None`` = no-op."""
 
     matched_via_by_id: dict[int, list[TrackMatchHint]] | None = None
@@ -496,7 +502,7 @@ class Outcome:
 
     @classmethod
     def compilation(
-        cls, items: list[LibraryItem], *, discogs_titles: dict[int, ResolvedRelease]
+        cls, items: list[LibraryItem], *, discogs_titles: "dict[int, ResolvedRelease]"
     ) -> "Outcome":
         """TRACK_ON_COMPILATION's full signal.
 
