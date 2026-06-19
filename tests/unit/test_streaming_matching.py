@@ -599,6 +599,68 @@ class TestRecordMatchTelemetry:
         data = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
         assert data["matcher.marginal_artist_clear"] is expected
 
+    def test_marginal_clear_attaches_query_and_matched_strings(self):
+        """LML#592 labeling: a marginal clear carries the actual name pair.
+
+        The score alone can't separate an organic false match (Wand -> Wanda)
+        from a legitimate one (Wand -> WAND with a casing/punctuation diff) —
+        both can land at ~88. Attaching the request-vs-matched strings to the
+        marginal sample is what lets us hand-label the false-positive rate
+        before deciding whether to tighten the floor (Part 2).
+        """
+        from clients.streaming.matching import record_match_telemetry
+
+        with patch("clients.streaming.matching.sentry_sdk") as mock_sentry:
+            mock_span = MagicMock()
+            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
+            record_match_telemetry(
+                artist_score=88.89,
+                title_score=100.0,
+                service="apple_music",
+                surface="album",
+                query_artist="Wand",
+                matched_artist="Wanda",
+                query_title="DOGA",
+                matched_title="DOGA",
+            )
+
+        data = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
+        assert data["matcher.marginal_artist_clear"] is True
+        assert data["matcher.query_artist"] == "Wand"
+        assert data["matcher.matched_artist"] == "Wanda"
+        assert data["matcher.query_title"] == "DOGA"
+        assert data["matcher.matched_title"] == "DOGA"
+
+    def test_non_marginal_clear_omits_strings(self):
+        """Strings ride only the marginal sample — not every winning match.
+
+        A strong artist score (>= ceiling) is not the collision signature, so
+        attaching names there would add name data to the whole match stream for
+        no labeling value. Keep the common path scores-only.
+        """
+        from clients.streaming.matching import record_match_telemetry
+
+        with patch("clients.streaming.matching.sentry_sdk") as mock_sentry:
+            mock_span = MagicMock()
+            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
+            record_match_telemetry(
+                artist_score=100.0,
+                title_score=100.0,
+                service="apple_music",
+                surface="album",
+                query_artist="Stereolab",
+                matched_artist="Stereolab",
+                query_title="Aluminum Tunes",
+                matched_title="Aluminum Tunes",
+            )
+
+        data = {c.args[0]: c.args[1] for c in mock_span.set_data.call_args_list}
+        assert data["matcher.marginal_artist_clear"] is False
+        assert "matcher.query_artist" not in data
+        assert "matcher.matched_artist" not in data
+        assert "matcher.query_title" not in data
+        assert "matcher.matched_title" not in data
+
 
 class TestFindBestSourceMatchEmits:
     """LML#592: the album chokepoint emits match telemetry for the winner."""
@@ -626,6 +688,12 @@ class TestFindBestSourceMatchEmits:
         assert data["matcher.surface"] == "album"
         assert data["matcher.service"] == "deezer"
         assert data["matcher.marginal_artist_clear"] is True
+        # LML#592 labeling: the request value and the matched-row value, so a
+        # production sample of these marginal clears can be hand-labeled.
+        assert data["matcher.query_artist"] == "Wand"
+        assert data["matcher.matched_artist"] == "Wanda"
+        assert data["matcher.query_title"] == "DOGA"
+        assert data["matcher.matched_title"] == "DOGA"
 
     def test_no_emit_when_nothing_clears(self):
         from clients.streaming.matching import find_best_source_match

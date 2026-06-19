@@ -446,6 +446,12 @@ class AppleMusicClient(BaseStreamingClient):
             title_score=track_axis,
             service="apple_music",
             surface="track",
+            # LML#592 labeling: request values vs the CHOSEN winner's strings
+            # (same record the axes were stashed from), for the marginal sample.
+            query_artist=artist,
+            matched_artist=_extract_artist_name(best),
+            query_title=song,
+            matched_title=_extract_name(best),
         )
 
         # When ``album`` was not supplied the 80/80(/80) floor collapses to
