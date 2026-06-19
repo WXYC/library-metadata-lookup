@@ -12,12 +12,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import signal
-import sys
 from argparse import ArgumentParser
 
 import aiosqlite
-from dotenv import load_dotenv
 
 from clients.streaming.matching import (
     find_best_match,
@@ -25,19 +22,13 @@ from clients.streaming.matching import (
     score_match,
     strip_format_suffix,
 )
+from scripts._lib.runtime import set_up_script_runtime
+from scripts._lib.signals import ShutdownFlag
 from scripts.track_streaming.compilation_search import build_compilation_query
 
 logger = logging.getLogger("search_compilations")
 
-_shutdown_requested = False
-
-
-def _handle_signal(signum, frame):
-    global _shutdown_requested
-    if _shutdown_requested:
-        sys.exit(1)
-    logger.info("Shutdown requested, finishing current item...")
-    _shutdown_requested = True
+_shutdown = ShutdownFlag(logger=logger, unit="item", log_force_quit=False)
 
 
 # Deezer/Spotify accessors for album search
@@ -132,7 +123,7 @@ async def run(args) -> None:
 
         try:
             for i, row in enumerate(rows, 1):
-                if _shutdown_requested:
+                if _shutdown.requested:
                     break
 
                 _, search_title = build_compilation_query(
@@ -189,7 +180,7 @@ async def run(args) -> None:
         logger.warning("DATABASE_URL_DISCOGS not set, skipping Discogs search")
         discogs_misses = rows
 
-    if _shutdown_requested or args.discogs_only:
+    if _shutdown.requested or args.discogs_only:
         await db.close()
         return
 
@@ -213,7 +204,7 @@ async def run(args) -> None:
 
     try:
         for i, row in enumerate(discogs_misses, 1):
-            if _shutdown_requested:
+            if _shutdown.requested:
                 break
 
             search_artist, search_title = build_compilation_query(
@@ -339,8 +330,8 @@ async def run(args) -> None:
     await db.close()
 
 
-def main():
-    load_dotenv()
+def main() -> None:
+    global _shutdown
     parser = ArgumentParser(description="Search unmatched compilations by title")
     parser.add_argument("--db-path", default="streaming_availability.db")
     parser.add_argument("--limit", type=int, default=100000)
@@ -349,16 +340,14 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
+    _shutdown = set_up_script_runtime(
+        logger=logger,
+        verbose=args.verbose,
+        shutdown_unit="item",
+        log_force_quit=False,
+        quiet_httpx=True,
+        include_logger_name=False,
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
 
     asyncio.run(run(args))
 

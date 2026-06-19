@@ -17,11 +17,8 @@ if TYPE_CHECKING:
 import asyncio
 import logging
 import os
-import signal
 import sys
 from pathlib import Path
-
-from dotenv import load_dotenv
 
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.deezer import DeezerClient
@@ -31,6 +28,8 @@ from clients.streaming.matching import (
     strip_format_suffix,
 )
 from clients.streaming.spotify import SpotifyClient
+from scripts._lib.runtime import set_up_script_runtime
+from scripts._lib.signals import ShutdownFlag
 from scripts.streaming_availability.dedup import deduplicate_library
 from scripts.streaming_availability.discogs_enricher import (
     check_wxyc_schema,
@@ -42,16 +41,7 @@ from scripts.streaming_availability.results_db import ResultsDB
 
 logger = logging.getLogger("streaming_availability")
 
-_shutdown_requested = False
-
-
-def _handle_signal(signum, frame):
-    global _shutdown_requested
-    if _shutdown_requested:
-        logger.warning("Force quit requested, exiting immediately")
-        sys.exit(1)
-    logger.info("Shutdown requested, finishing current batch...")
-    _shutdown_requested = True
+_shutdown = ShutdownFlag(logger=logger, unit="batch", log_force_quit=True)
 
 
 # ---------------------------------------------------------------------------
@@ -81,13 +71,13 @@ async def _process_spotify(
     not_found = 0
     errors = 0
 
-    while not _shutdown_requested:
+    while not _shutdown.requested:
         rows = await results_db.get_pending("spotify", limit=batch_size)
         if not rows:
             break
 
         for row in rows:
-            if _shutdown_requested:
+            if _shutdown.requested:
                 break
 
             album_id = row["id"]
@@ -183,13 +173,13 @@ async def _process_apple_music(
     not_found = 0
     errors = 0
 
-    while not _shutdown_requested:
+    while not _shutdown.requested:
         rows = await _get_rows(limit=batch_size)
         if not rows:
             break
 
         for row in rows:
-            if _shutdown_requested:
+            if _shutdown.requested:
                 break
 
             album_id = row["id"]
@@ -264,13 +254,13 @@ async def _process_deezer(
     not_found = 0
     errors = 0
 
-    while not _shutdown_requested:
+    while not _shutdown.requested:
         rows = await results_db.get_pending("deezer", limit=batch_size)
         if not rows:
             break
 
         for row in rows:
-            if _shutdown_requested:
+            if _shutdown.requested:
                 break
 
             album_id = row["id"]
@@ -361,13 +351,13 @@ async def _process_discogs_enrichment(
     not_found = 0
     errors = 0
 
-    while not _shutdown_requested:
+    while not _shutdown.requested:
         rows = await results_db.get_pending_discogs(limit=batch_size)
         if not rows:
             break
 
         for row in rows:
-            if _shutdown_requested:
+            if _shutdown.requested:
                 break
 
             album_id = row["id"]
@@ -848,7 +838,7 @@ async def run(args: argparse.Namespace) -> None:
             )
 
         # Apple Music (still sequential, runs after pipeline)
-        if not args.spotify_only and not _shutdown_requested:
+        if not args.spotify_only and not _shutdown.requested:
             am_team = os.environ.get("APPLE_MUSIC_TEAM_ID")
             am_key = os.environ.get("APPLE_MUSIC_KEY_ID")
             am_priv = os.environ.get("APPLE_MUSIC_PRIVATE_KEY")
@@ -898,21 +888,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main():
-    load_dotenv()
+def main() -> None:
+    global _shutdown
     args = parse_args()
-
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
+    _shutdown = set_up_script_runtime(logger=logger, verbose=args.verbose)
     asyncio.run(run(args))
 
 

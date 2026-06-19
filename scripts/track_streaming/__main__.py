@@ -14,13 +14,11 @@ import asyncio
 import json
 import logging
 import os
-import signal
-import sys
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
-from dotenv import load_dotenv
-
+from scripts._lib.runtime import set_up_script_runtime
+from scripts._lib.signals import ShutdownFlag
 from scripts.streaming_availability.results_db import ResultsDB
 from scripts.track_streaming.api_search import search_track_on_services
 from scripts.track_streaming.local_index import LocalStreamingIndex, TrackEntry
@@ -31,16 +29,7 @@ from scripts.track_streaming.track_extractor import (
 
 logger = logging.getLogger("track_streaming")
 
-_shutdown_requested = False
-
-
-def _handle_signal(signum, frame):
-    global _shutdown_requested
-    if _shutdown_requested:
-        logger.warning("Force quit requested, exiting immediately")
-        sys.exit(1)
-    logger.info("Shutdown requested, finishing current batch...")
-    _shutdown_requested = True
+_shutdown = ShutdownFlag(logger=logger, unit="batch", log_force_quit=True)
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +71,7 @@ async def phase_extract(results_db: ResultsDB, args) -> int:
 
     try:
         for i, row in enumerate(singles, 1):
-            if _shutdown_requested:
+            if _shutdown.requested:
                 break
             tracks = await extract_single_tracks(row, discogs_cache=discogs_cache)
             if tracks:
@@ -96,7 +85,7 @@ async def phase_extract(results_db: ResultsDB, args) -> int:
 
     logger.info("Singles extraction complete: %d tracks from %d singles", inserted, len(singles))
 
-    if _shutdown_requested:
+    if _shutdown.requested:
         return inserted
 
     # Compilations
@@ -124,7 +113,7 @@ async def phase_extract(results_db: ResultsDB, args) -> int:
 
     comp_inserted = 0
     for i, row in enumerate(comps, 1):
-        if _shutdown_requested:
+        if _shutdown.requested:
             break
         comp_data = comp_data_by_id.get(row["id"])
         tracks = extract_compilation_tracks(row, comp_data)
@@ -185,7 +174,7 @@ async def phase_build_index(results_db: ResultsDB) -> LocalStreamingIndex:
         batch_size = 1000
 
         for batch_start in range(0, len(release_ids), batch_size):
-            if _shutdown_requested:
+            if _shutdown.requested:
                 break
             batch = release_ids[batch_start : batch_start + batch_size]
             rows = await pool.fetch(
@@ -242,13 +231,13 @@ async def phase_local_resolve(results_db: ResultsDB, index: LocalStreamingIndex)
     resolved = 0
     checked = 0
 
-    while not _shutdown_requested:
+    while not _shutdown.requested:
         pending = await results_db.get_pending_tracks(limit=500)
         if not pending:
             break
 
         for row in pending:
-            if _shutdown_requested:
+            if _shutdown.requested:
                 break
             checked += 1
             match = index.lookup(row["artist"], row["title"])
@@ -301,13 +290,13 @@ async def phase_api_search(results_db: ResultsDB, args) -> tuple[int, int]:
     checked = 0
 
     try:
-        while not _shutdown_requested:
+        while not _shutdown.requested:
             tracks = await results_db.get_local_miss_tracks(limit=args.batch_size)
             if not tracks:
                 break
 
             for row in tracks:
-                if _shutdown_requested:
+                if _shutdown.requested:
                     break
                 checked += 1
                 try:
@@ -378,7 +367,7 @@ async def phase_validate(results_db: ResultsDB, args) -> tuple[int, int]:
 
     async with httpx.AsyncClient() as http:
         for i, row in enumerate(rows, 1):
-            if _shutdown_requested:
+            if _shutdown.requested:
                 break
 
             is_valid = True
@@ -437,7 +426,7 @@ async def phase_album_rollup(results_db: ResultsDB) -> tuple[int, int]:
     off_streaming = 0
 
     for album_id in album_ids:
-        if _shutdown_requested:
+        if _shutdown.requested:
             break
         summary = await results_db.get_album_track_summary(album_id)
         if summary["pending"] > 0:
@@ -496,7 +485,7 @@ async def run(args) -> None:
                 return
 
         # Phase 2: Build index
-        if args.phase in ("resolve", "all") and not _shutdown_requested:
+        if args.phase in ("resolve", "all") and not _shutdown.requested:
             index = await phase_build_index(results_db)
 
             # Phase 3: Local resolution
@@ -504,18 +493,18 @@ async def run(args) -> None:
             logger.info("Phase 3 complete: %d / %d resolved locally", resolved, checked)
 
         # Phase 4: API search
-        if args.phase in ("search", "all") and not _shutdown_requested:
+        if args.phase in ("search", "all") and not _shutdown.requested:
             if not args.skip_api:
                 found, checked = await phase_api_search(results_db, args)
                 logger.info("Phase 4 complete: %d / %d found via API", found, checked)
 
         # Phase 4.5: Validate API matches
-        if args.phase in ("validate", "all") and not _shutdown_requested:
+        if args.phase in ("validate", "all") and not _shutdown.requested:
             valid, invalid = await phase_validate(results_db, args)
             logger.info("Phase 4.5 complete: %d valid, %d false positives", valid, invalid)
 
         # Phase 5: Album rollup
-        if args.phase in ("rollup", "all") and not _shutdown_requested:
+        if args.phase in ("rollup", "all") and not _shutdown.requested:
             on, off = await phase_album_rollup(results_db)
             logger.info("Phase 5 complete: %d on streaming, %d off streaming", on, off)
 
@@ -555,21 +544,10 @@ def parse_args(argv: list[str] | None = None) -> Namespace:
     return parser.parse_args(argv)
 
 
-def main():
-    load_dotenv()
+def main() -> None:
+    global _shutdown
     args = parse_args()
-
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
+    _shutdown = set_up_script_runtime(logger=logger, verbose=args.verbose)
     asyncio.run(run(args))
 
 
