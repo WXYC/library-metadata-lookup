@@ -146,6 +146,54 @@ class TestResolveReleaseForTrack:
 
         assert [r.release_id for r in resolved] == [36907527]
 
+    @pytest.mark.asyncio
+    async def test_album_title_probe_failure_does_not_drop_track_candidates(self):
+        """A transient failure of the album-title probe must NOT discard the
+        validated track-wave candidates. The album-title probe is isolated (like
+        the strategy's ``_album_title_probe_safe``), so only the track waves
+        gate the empty-result path."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(_va_comp()))
+        svc.search_releases_by_album_title = AsyncMock(side_effect=RuntimeError("discogs 503"))
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+            also_probe_album_title=True,
+        )
+
+        assert [r.release_id for r in resolved] == [36907527]
+
+    @pytest.mark.asyncio
+    async def test_album_wave_distinct_release_survives_track_wave_twin_validation_failure(self):
+        """The album-title wave's candidates are deduped by release_id, not title:
+        a track-wave release that FAILS validation must not suppress a DISTINCT
+        same-titled album-wave release that WOULD validate."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        track_twin = _va_comp(release_id=111, album="When There Is No Sun")  # fails validation
+        album_twin = _va_comp(release_id=222, album="When There Is No Sun")  # validates
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(track_twin))
+        svc.search_releases_by_album_title = AsyncMock(return_value=_track_response(album_twin))
+        svc.validate_track_on_release = AsyncMock(side_effect=lambda rid, song, artist: rid == 222)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+            also_probe_album_title=True,
+        )
+
+        assert [r.release_id for r in resolved] == [222]
+
 
 def _single_artist(release_id: int, album: str, *, is_compilation: bool = False) -> ReleaseInfo:
     return ReleaseInfo(
