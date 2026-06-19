@@ -631,6 +631,64 @@ class TestRecordMatchTelemetry:
         assert data["matcher.query_title"] == "DOGA"
         assert data["matcher.matched_title"] == "DOGA"
 
+    def test_marginal_clear_without_label_strings_warns(self):
+        """A marginal clear missing its label strings must not be silent.
+
+        ``service=`` was made a *required* kwarg (commit 6cf01c1) so a forgotten
+        label fails loudly rather than rotting telemetry silently. The label
+        strings stay optional — they are used only on the marginal subset, so
+        requiring them on every call would over-couple non-marginal callers —
+        but the same silent-null failure mode is guarded here: a marginal clear
+        that reaches the span without labels emits an observable warning instead
+        of four ``None`` fields with no signal. The helper must never *raise*
+        (telemetry is best-effort), so a warning is the loudest safe signal.
+        """
+        from clients.streaming.matching import record_match_telemetry
+
+        with (
+            patch("clients.streaming.matching.sentry_sdk") as mock_sentry,
+            patch("clients.streaming.matching.logger") as mock_logger,
+        ):
+            mock_span = MagicMock()
+            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
+            record_match_telemetry(
+                artist_score=88.89,  # marginal artist
+                title_score=100.0,  # high title -> marginal clear
+                service="apple_music",
+                surface="album",
+                # query_/matched_ strings omitted -> the labelability gap
+            )
+
+        mock_logger.warning.assert_called_once()
+        # Pin that it warned about THIS gap (not some unrelated future warning),
+        # and that the message carries the attribution needed to find the caller.
+        fmt, *args = mock_logger.warning.call_args.args
+        assert "without label strings" in fmt
+        assert "apple_music" in args and "album" in args
+
+    def test_non_marginal_clear_without_strings_does_not_warn(self):
+        """The warning fires only on the labelable (marginal) path.
+
+        A non-marginal clear never carries labels by design, so omitting them is
+        correct, not a gap — it must not warn.
+        """
+        from clients.streaming.matching import record_match_telemetry
+
+        with (
+            patch("clients.streaming.matching.sentry_sdk") as mock_sentry,
+            patch("clients.streaming.matching.logger") as mock_logger,
+        ):
+            mock_span = MagicMock()
+            mock_sentry.start_span.return_value.__enter__.return_value = mock_span
+            record_match_telemetry(
+                artist_score=100.0,  # strong artist -> not marginal
+                title_score=100.0,
+                service="apple_music",
+                surface="album",
+            )
+
+        mock_logger.warning.assert_not_called()
+
     def test_non_marginal_clear_omits_strings(self):
         """Strings ride only the marginal sample — not every winning match.
 
