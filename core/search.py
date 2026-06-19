@@ -21,6 +21,7 @@ import sentry_sdk
 
 from generated.api_models import TrackMatchHint
 from library.models import LibraryItem
+from lookup.release_resolution import ResolvedRelease
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -330,8 +331,14 @@ class SearchState:
     strategies_tried: list[SearchStrategyType] = field(default_factory=list)
     """List of strategies that have been executed."""
 
-    discogs_titles: dict[int, str] = field(default_factory=dict)
-    """Map of library item ID to Discogs album title (for artwork lookup)."""
+    discogs_titles: dict[int, ResolvedRelease] = field(default_factory=dict)
+    """Map of library item ID to the resolved Discogs release (for artwork lookup).
+
+    Widened from ``dict[int, str]`` (bare album title) to carry the full
+    :class:`~lookup.release_resolution.ResolvedRelease` — release id/url,
+    compilation flag, and the album title the seam used to carry. Internal to
+    LML; never on the wire.
+    """
 
     albums_for_search: list[str] = field(default_factory=list)
     """Album names resolved from Discogs track lookup (may contain multiple)."""
@@ -427,8 +434,8 @@ class Outcome:
     after the compilation hit replaces them.
     """
 
-    discogs_titles: dict[int, str] | None = None
-    """Per-id Discogs album titles (for artwork lookup). ``None`` = no-op."""
+    discogs_titles: dict[int, ResolvedRelease] | None = None
+    """Per-id resolved Discogs releases (for artwork lookup). ``None`` = no-op."""
 
     matched_via_by_id: dict[int, list[TrackMatchHint]] | None = None
     """Per-id track-match hints (catalog-track-search §5.1). ``None`` = no-op."""
@@ -488,7 +495,9 @@ class Outcome:
         return cls(items=items, song_not_found_after=True)
 
     @classmethod
-    def compilation(cls, items: list[LibraryItem], *, discogs_titles: dict[int, str]) -> "Outcome":
+    def compilation(
+        cls, items: list[LibraryItem], *, discogs_titles: dict[int, ResolvedRelease]
+    ) -> "Outcome":
         """TRACK_ON_COMPILATION's full signal.
 
         Five writes packaged together:

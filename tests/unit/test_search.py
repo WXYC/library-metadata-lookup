@@ -39,9 +39,25 @@ from core.search import (
     song_not_found_with_artist_and_song,
 )
 from generated.api_models import TrackMatchHint, TrackMatchSource
+from lookup.release_resolution import ResolvedRelease
 from lookup.strategies import build_strategies
 from services.parser import ParsedRequest
 from tests.factories import make_library_item as _item
+
+
+def _rr(release_id: int, album_title: str) -> ResolvedRelease:
+    """Build a ResolvedRelease for the widened ``discogs_titles`` seam.
+
+    TRACK_ON_COMPILATION's execute func returns ``dict[int, ResolvedRelease]``;
+    these runner tests assert that map threads through the pipeline unchanged.
+    """
+    return ResolvedRelease(
+        release_id=release_id,
+        release_url=f"https://www.discogs.com/release/{release_id}",
+        is_compilation=True,
+        album_title=album_title,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Test helpers: tiny strategy stand-ins for runner-level tests
@@ -385,7 +401,7 @@ class TestExecuteSearchPipeline:
 
         search_lib = AsyncMock(return_value=([], True))  # song_not_found
         search_alt = AsyncMock(return_value=([], None))
-        search_comp = AsyncMock(return_value=([item], {1: "Rock Comp"}))
+        search_comp = AsyncMock(return_value=([item], {1: _rr(1, "Rock Comp")}))
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
@@ -402,7 +418,7 @@ class TestExecuteSearchPipeline:
         )
 
         assert state.found_on_compilation is True
-        assert state.discogs_titles == {1: "Rock Comp"}
+        assert state.discogs_titles == {1: _rr(1, "Rock Comp")}
 
     @pytest.mark.asyncio
     async def test_compilation_search_when_song_not_found_from_album_resolution(self):
@@ -423,7 +439,10 @@ class TestExecuteSearchPipeline:
         search_lib = AsyncMock(return_value=([], False))
         search_alt = AsyncMock(return_value=([], None))
         search_comp = AsyncMock(
-            return_value=([compilation], {46602: "Trax Records 20th Anniversary Collection"})
+            return_value=(
+                [compilation],
+                {46602: _rr(46602, "Trax Records 20th Anniversary Collection")},
+            )
         )
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -443,7 +462,9 @@ class TestExecuteSearchPipeline:
 
         assert state.found_on_compilation is True
         assert state.results == [compilation]
-        assert state.discogs_titles == {46602: "Trax Records 20th Anniversary Collection"}
+        assert state.discogs_titles == {
+            46602: _rr(46602, "Trax Records 20th Anniversary Collection")
+        }
 
     @pytest.mark.asyncio
     async def test_comma_format_triggers_swapped_interpretation(self):
