@@ -493,6 +493,28 @@ class TestFindAlbumMatch:
         assert match is not None
         assert match.url.endswith("/456")
 
+    @pytest.mark.asyncio
+    async def test_emits_apple_music_service_for_album_winner(self, es256_keypair):
+        """LML#592: the album surface must label its telemetry with
+        service="apple_music", like the track surface does. ``find_album_match``
+        routes through the shared ``find_best_source_match`` chokepoint, whose
+        ``service`` kwarg defaults to "unknown" — Apple must pass its own label
+        so its album matches aren't misattributed to the "unknown" bucket in the
+        per-service marginal-clear breakdown. Patches the matching-module seam
+        because the album emit fires from inside ``find_best_source_match``, not
+        from the apple_music-level import the track path uses.
+        """
+        client = _client(es256_keypair)
+        client.search_album = AsyncMock(return_value=[_make_album_data()])
+
+        with patch("clients.streaming.matching.record_match_telemetry") as rec:
+            match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+
+        assert match is not None
+        rec.assert_called_once()
+        assert rec.call_args.kwargs["service"] == "apple_music"
+        assert rec.call_args.kwargs["surface"] == "album"
+
 
 def _make_song_data_full(
     name: str = "Hebebeb (Zrag)",
@@ -832,18 +854,24 @@ class TestFindTrackMetadataEmits:
     @pytest.mark.asyncio
     async def test_emits_marginal_clear_for_track_winner(self, es256_keypair):
         client = _client(es256_keypair)
-        # Request "Wand" / "DOGA"; Apple returns "Wanda" on a same-titled
-        # track + album. token_set_ratio("wand","wanda") == 88.89 (marginal).
+        # Request artist "Wand" / song "la paradoja" / album "DOGA"; Apple
+        # returns "Wanda" — token_set_ratio("wand","wanda") == 88.89 (marginal).
+        # The song title matches exactly (track axis 100) while album_name
+        # "DOGAS" is a deliberate near-miss to "DOGA" (88.89 — clears the 80
+        # floor but stays below the 95 high-title band). Keeping the track and
+        # album scores distinct pins that the emitted title_score is the *track*
+        # axis: a regression that emitted album_score instead would drop to
+        # 88.89 and fail the >= 95 assertion below.
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(
             return_value=_songs_response(
-                [_make_song_data(name="DOGA", artist_name="Wanda", album_name="DOGA")]
+                [_make_song_data(name="la paradoja", artist_name="Wanda", album_name="DOGAS")]
             )
         )
         client._http = mock_http
 
         with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
-            match = await client.find_track_metadata("Wand", "DOGA", album="DOGA")
+            match = await client.find_track_metadata("Wand", "la paradoja", album="DOGA")
 
         assert match is not None  # still clears — this PR instruments, it does not reject
         rec.assert_called_once()
@@ -851,7 +879,7 @@ class TestFindTrackMetadataEmits:
         assert kwargs["surface"] == "track"
         assert kwargs["service"] == "apple_music"
         assert 80.0 <= kwargs["artist_score"] < 90.0  # marginal artist axis
-        assert kwargs["title_score"] >= 95.0  # high title axis
+        assert kwargs["title_score"] >= 95.0  # high title axis (the track, not the album)
 
     @pytest.mark.asyncio
     async def test_emits_scores_of_chosen_winner_not_top_fuzz(self, es256_keypair):
@@ -861,16 +889,19 @@ class TestFindTrackMetadataEmits:
         client = _client(es256_keypair)
         # A: exact artist, NO artwork -> higher combined -> best_overall.
         a = _make_song_data(
-            name="DOGA",
+            name="la paradoja",
             artist_name="Wand",
             album_name="DOGA",
             url="https://music.apple.com/us/song/a/1",
         )
         # B: marginal artist, WITH artwork -> best_with_artwork -> chosen as best.
+        # B's album_name "DOGAS" is a deliberate near-miss (album axis 88.89)
+        # while its track title matches exactly (track axis 100), so the title
+        # assertion below pins the *track* axis of the chosen winner.
         b = _make_song_data_full(
-            name="DOGA",
+            name="la paradoja",
             artist_name="Wanda",
-            album_name="DOGA",
+            album_name="DOGAS",
             url="https://music.apple.com/us/song/b/2",
         )
         mock_http = AsyncMock(spec=httpx.AsyncClient)
@@ -878,12 +909,15 @@ class TestFindTrackMetadataEmits:
         client._http = mock_http
 
         with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
-            match = await client.find_track_metadata("Wand", "DOGA", album="DOGA")
+            match = await client.find_track_metadata("Wand", "la paradoja", album="DOGA")
 
         assert match is not None
         assert match.url.endswith("/b/2")  # artwork-preferred winner chosen
         # Emitted artist score is B's marginal 88.89, NOT A's exact 100.0.
         assert 80.0 <= rec.call_args.kwargs["artist_score"] < 90.0
+        # Emitted title score is B's track axis (la paradoja == 100), NOT B's
+        # album axis (DOGA vs DOGAS == 88.89) — pins (artist, track) lockstep.
+        assert rec.call_args.kwargs["title_score"] >= 95.0
 
 
 class TestRetryBehavior:

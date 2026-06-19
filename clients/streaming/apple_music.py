@@ -359,6 +359,7 @@ class AppleMusicClient(BaseStreamingClient):
             artist_fn=_extract_artist_name,
             title_fn=_extract_name,
             url_fn=_extract_url,
+            service="apple_music",
         )
 
     async def find_track_metadata(
