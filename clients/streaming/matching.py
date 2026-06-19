@@ -488,7 +488,7 @@ def find_best_source_match(
     artist_fn: Callable[[dict], str],
     title_fn: Callable[[dict], str],
     url_fn: Callable[[dict], str],
-    service: str = "unknown",
+    service: str,
 ) -> SourceMatch | None:
     """Run ``find_best_match`` and wrap the verdict as a ``SourceMatch``.
 
@@ -501,8 +501,13 @@ def find_best_source_match(
     id, so the extra extractor was dead weight in adapter bodies.
 
     ``service`` labels the LML#592 match telemetry emitted for the winning
-    candidate (album surface). It defaults to ``"unknown"`` so a caller that
-    forgets it still records — telemetry is never load-bearing.
+    candidate (album surface) with the originating streaming service
+    ("apple_music", "spotify", ...). It is **required** rather than defaulted:
+    a silent ``"unknown"`` default once let an adapter (Apple) drop its album
+    matches into an unattributable telemetry bucket instead of failing loudly,
+    and because telemetry is best-effort the mistake would have been swallowed
+    at runtime. Requiring the label turns a forgotten ``service=`` into a
+    call-time ``TypeError`` caught by the first test, not silent data rot.
     """
     best = find_best_match(
         results,
