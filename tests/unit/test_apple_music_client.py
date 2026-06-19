@@ -880,6 +880,13 @@ class TestFindTrackMetadataEmits:
         assert kwargs["service"] == "apple_music"
         assert 80.0 <= kwargs["artist_score"] < 90.0  # marginal artist axis
         assert kwargs["title_score"] >= 95.0  # high title axis (the track, not the album)
+        # LML#592 labeling: request value + chosen-winner's value, so this
+        # marginal track clear can be hand-labeled. Matched strings come from
+        # the chosen record's attributes, query strings from the request args.
+        assert kwargs["query_artist"] == "Wand"
+        assert kwargs["matched_artist"] == "Wanda"
+        assert kwargs["query_title"] == "la paradoja"
+        assert kwargs["matched_title"] == "la paradoja"
 
     @pytest.mark.asyncio
     async def test_emits_scores_of_chosen_winner_not_top_fuzz(self, es256_keypair):

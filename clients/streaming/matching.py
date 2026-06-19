@@ -322,7 +322,15 @@ HIGH_TITLE_FLOOR: float = 95.0  # title >= this is "high" — the collision tell
 
 
 def record_match_telemetry(
-    *, artist_score: float, title_score: float, service: str, surface: str
+    *,
+    artist_score: float,
+    title_score: float,
+    service: str,
+    surface: str,
+    query_artist: str | None = None,
+    matched_artist: str | None = None,
+    query_title: str | None = None,
+    matched_title: str | None = None,
 ) -> None:
     """Emit a winning match's per-axis fuzzy scores to Sentry (LML#592).
 
@@ -333,6 +341,17 @@ def record_match_telemetry(
     these spans is the denominator and the flagged subset is the numerator of
     the marginal-clear rate.
 
+    For the marginal subset *only*, the request-vs-matched ``artist``/``title``
+    strings are attached too. The flag and scores answer "how often does a
+    marginal clear happen"; the strings answer "was a given marginal clear
+    actually wrong" — which the scores can't, since an organic false match
+    (``Wand`` -> ``Wanda``) and a legitimate one (``Wand`` -> ``WAND`` with a
+    casing/punctuation diff) can both land at ~88. The strings let a production
+    sample be hand-labeled for the false-positive rate that gates the eventual
+    floor tightening (Part 2). Marginal-only because that set is rare by
+    construction and the only sample worth labeling — the common path stays
+    scores-only, so names don't ride the whole match stream.
+
     Telemetry must never break a lookup: any failure is swallowed with a warning
     (mirrors ``_project_cache_stats_to_transaction`` in ``lookup/router.py``).
 
@@ -341,18 +360,27 @@ def record_match_telemetry(
         title_score: Fuzzy score of the request title vs the matched title.
         service: Streaming service that produced the match ("apple_music", ...).
         surface: Match surface — "album" or "track".
+        query_artist: Request artist string (labeling; marginal clears only).
+        matched_artist: Matched-candidate artist string (labeling).
+        query_title: Request title string (labeling).
+        matched_title: Matched-candidate title string (labeling).
     """
     try:
+        marginal = (
+            SCORE_MATCH_ACCEPTANCE_FLOOR <= artist_score < MARGINAL_ARTIST_CEILING
+            and title_score >= HIGH_TITLE_FLOOR
+        )
         with sentry_sdk.start_span(op="matcher.match", name=f"{service}:{surface}") as span:
             span.set_data("matcher.service", service)
             span.set_data("matcher.surface", surface)
             span.set_data("matcher.artist_score", artist_score)
             span.set_data("matcher.title_score", title_score)
-            span.set_data(
-                "matcher.marginal_artist_clear",
-                SCORE_MATCH_ACCEPTANCE_FLOOR <= artist_score < MARGINAL_ARTIST_CEILING
-                and title_score >= HIGH_TITLE_FLOOR,
-            )
+            span.set_data("matcher.marginal_artist_clear", marginal)
+            if marginal:
+                span.set_data("matcher.query_artist", query_artist)
+                span.set_data("matcher.matched_artist", matched_artist)
+                span.set_data("matcher.query_title", query_title)
+                span.set_data("matcher.matched_title", matched_title)
     except Exception as e:  # defensive; telemetry is best-effort, never fatal
         logger.warning("Failed to emit matcher telemetry: %s", e)
 
@@ -524,5 +552,9 @@ def find_best_source_match(
         title_score=best["title_score"],
         service=service,
         surface="album",
+        query_artist=query_artist,
+        matched_artist=best["matched_artist"],
+        query_title=query_title,
+        matched_title=best["matched_title"],
     )
     return SourceMatch(url=best["url"], confidence=best["confidence"])
