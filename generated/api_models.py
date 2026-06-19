@@ -318,6 +318,10 @@ class EntryType7(StrEnum):
 
 class FlowsheetV2BreakpointEntry(FlowsheetV2Base):
     entry_type: Literal["breakpoint"]
+    radio_hour: AwareDatetime | None = Field(
+        None,
+        description="Exact top-of-hour this breakpoint marks (ISO 8601), sourced from tubafrenzy's RADIO_HOUR. Distinct from `add_time`, which is the row's logging instant (~1 min before the hour). Optional and nullable: absent on servers predating the producer rollout, null for breakpoint rows not yet backfilled. Clients use `radio_hour` for the hour-marker label when present and fall back to `add_time` otherwise.",
+    )
     message: str | None = None
 
 
@@ -1529,6 +1533,12 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
         description="Whether this album is available on streaming platforms. False means WXYC library exclusive. Null if unknown.",
     )
     metadata_status: MetadataStatus | None = None
+    genres: list[str] | None = Field(
+        None, description="Discogs genre tags surfaced on the Playcut Detail card."
+    )
+    styles: list[str] | None = Field(
+        None, description="Discogs style tags (finer-grained than genres)."
+    )
 
 
 class Entries(
