@@ -13,30 +13,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import signal
 import sys
 from argparse import ArgumentParser
 
 import aiosqlite
-from dotenv import load_dotenv
 
 from clients.streaming.matching import (
     normalize_artist_credit,
     score_match,
     strip_format_suffix,
 )
+from scripts._lib.runtime import set_up_script_runtime
+from scripts._lib.signals import ShutdownFlag
 
 logger = logging.getLogger("discogs_rematch")
 
-_shutdown_requested = False
-
-
-def _handle_signal(signum, frame):
-    global _shutdown_requested
-    if _shutdown_requested:
-        sys.exit(1)
-    logger.info("Shutdown requested, finishing current item...")
-    _shutdown_requested = True
+_shutdown = ShutdownFlag(logger=logger, unit="item", log_force_quit=False)
 
 
 ARTIST_THRESHOLD_RELAXED = 70.0
@@ -171,7 +163,7 @@ async def _run_pass(
     """Run a pass function over a list of rows. Returns match count."""
     found = 0
     for i, row in enumerate(rows, 1):
-        if _shutdown_requested:
+        if _shutdown.requested:
             break
         result = await pass_fn(pool, row)
         if result:
@@ -243,7 +235,7 @@ async def run(args) -> None:
             logger.info("Pass 1 complete: %d Discogs matches", found)
 
         # Pass 2: not-enriched (no discogs_artist)
-        if args.run_pass in ("2", "all") and not _shutdown_requested:
+        if args.run_pass in ("2", "all") and not _shutdown.requested:
             cursor = await db.execute(
                 f"""SELECT id, display_artist, display_title
                     FROM albums
@@ -274,8 +266,8 @@ async def run(args) -> None:
         await db.close()
 
 
-def main():
-    load_dotenv()
+def main() -> None:
+    global _shutdown
     parser = ArgumentParser(description="Re-match albums missing Discogs links")
     parser.add_argument("--db-path", default="streaming_availability.db")
     parser.add_argument(
@@ -290,15 +282,14 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
+    _shutdown = set_up_script_runtime(
+        logger=logger,
+        verbose=args.verbose,
+        shutdown_unit="item",
+        log_force_quit=False,
+        quiet_httpx=False,
+        include_logger_name=False,
     )
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
 
     asyncio.run(run(args))
 
