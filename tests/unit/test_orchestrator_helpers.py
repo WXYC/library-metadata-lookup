@@ -829,13 +829,20 @@ class TestSearchWithAlternativeInterpretation:
         )
         assert len(results) == 0
 
+    @staticmethod
+    def _track_releases(*releases: ReleaseInfo) -> TrackReleasesResponse:
+        return TrackReleasesResponse(
+            track="t", artist="a", releases=list(releases), total=len(releases), cached=False
+        )
+
     @pytest.mark.asyncio
     async def test_narrows_to_release_containing_track(self, mock_library_db, mock_discogs_service):
         """LML#622: an ambiguous ``track, artist`` narrows to the release that
         actually contains the track, not the artist's whole discography.
 
         ``Today, Jefferson Airplane`` — "Today" is on *The Worst of Jefferson
-        Airplane* only. Without narrowing this returned all five JA albums.
+        Airplane* only. Routes through the shared SONG_AS_TRACK kernel, so the
+        Discogs tracklist validation is exercised on the successful narrow.
         """
         ja = [
             make_library_item(id=1, artist="Jefferson Airplane", title="Bark"),
@@ -857,52 +864,93 @@ class TestSearchWithAlternativeInterpretation:
         mock_library_db.exact_title.side_effect = lambda title: (
             [worst] if title == "The Worst of Jefferson Airplane" else []
         )
-
-        with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
-            new_callable=AsyncMock,
-            return_value=[("Jefferson Airplane", "The Worst of Jefferson Airplane")],
-        ):
-            results, matched_via = await search_with_alternative_interpretation(
-                mock_library_db,
-                "Today",
-                "Jefferson Airplane",
-                discogs_service=mock_discogs_service,
+        mock_discogs_service.search_releases_by_track = AsyncMock(
+            return_value=self._track_releases(
+                ReleaseInfo(
+                    album="The Worst of Jefferson Airplane",
+                    artist="Jefferson Airplane",
+                    release_id=900,
+                    release_url="https://www.discogs.com/release/900",
+                    is_compilation=True,
+                )
             )
+        )
+        mock_discogs_service.validate_track_on_release = AsyncMock(return_value=True)
+
+        results, matched_via = await search_with_alternative_interpretation(
+            mock_library_db, "Today", "Jefferson Airplane", discogs_service=mock_discogs_service
+        )
 
         assert [r.id for r in results] == [5]
         assert set(matched_via) == {5}
         hint = matched_via[5][0]
         assert hint.title == "Today"
         assert hint.source == TrackMatchSource.discogs_release
+        # The narrow really went through the tracklist-validation seam.
+        mock_discogs_service.validate_track_on_release.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_artist_album_falls_back_to_artist_dump(
         self, mock_library_db, mock_discogs_service
     ):
-        """When the non-artist half is an album (not a track), the Discogs
-        track lookup is empty and the artist-filtered fallback is preserved."""
+        """When the non-artist half is an album (not a track), Discogs returns no
+        release carrying it and the artist-filtered fallback is preserved."""
         rows = [
             make_library_item(id=1, artist="Jessica Pratt", title="On Your Own Love Again"),
             make_library_item(id=2, artist="Jessica Pratt", title="Quiet Signs"),
         ]
         # part1="Jessica Pratt" matches (results1); part2 query returns nothing.
         mock_library_db.search.side_effect = [rows, []]
+        mock_discogs_service.search_releases_by_track = AsyncMock(
+            return_value=self._track_releases()
+        )
 
-        with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
-            new_callable=AsyncMock,
-            return_value=[],
-        ):
-            results, matched_via = await search_with_alternative_interpretation(
-                mock_library_db,
-                "Jessica Pratt",
-                "On Your Own Love Again",
-                discogs_service=mock_discogs_service,
-            )
+        results, matched_via = await search_with_alternative_interpretation(
+            mock_library_db,
+            "Jessica Pratt",
+            "On Your Own Love Again",
+            discogs_service=mock_discogs_service,
+        )
 
         assert {r.id for r in results} == {1, 2}
         assert matched_via == {}
+
+    @pytest.mark.asyncio
+    async def test_track_validation_rejection_falls_back_to_artist_dump(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """A candidate release whose tracklist does NOT validate yields no
+        narrowing, so the artist-filtered fallback is returned with no hints."""
+        ja = [
+            make_library_item(id=1, artist="Jefferson Airplane", title="Bark"),
+            make_library_item(
+                id=5, artist="Jefferson Airplane", title="The Worst of Jefferson Airplane"
+            ),
+        ]
+        mock_library_db.search.side_effect = [ja, ja]
+        mock_library_db.exact_title.side_effect = lambda title: (
+            [ja[1]] if title == "The Worst of Jefferson Airplane" else []
+        )
+        mock_discogs_service.search_releases_by_track = AsyncMock(
+            return_value=self._track_releases(
+                ReleaseInfo(
+                    album="The Worst of Jefferson Airplane",
+                    artist="Jefferson Airplane",
+                    release_id=900,
+                    release_url="https://www.discogs.com/release/900",
+                    is_compilation=True,
+                )
+            )
+        )
+        mock_discogs_service.validate_track_on_release = AsyncMock(return_value=False)
+
+        results, matched_via = await search_with_alternative_interpretation(
+            mock_library_db, "Today", "Jefferson Airplane", discogs_service=mock_discogs_service
+        )
+
+        assert {r.id for r in results} == {1, 5}  # full artist fallback, un-narrowed
+        assert matched_via == {}
+        mock_discogs_service.validate_track_on_release.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_no_discogs_service_preserves_artist_dump(self, mock_library_db):

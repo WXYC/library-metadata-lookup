@@ -848,54 +848,19 @@ async def _narrow_swapped_by_track(
 ) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
     """Narrow a swapped-interpretation artist match to the release holding ``track``.
 
-    LML#622: once SWAPPED_INTERPRETATION identifies the artist side, the other
-    part is cross-referenced as a *track* against Discogs releases by that
-    artist (``lookup_releases_by_track`` already validates the tracklist when an
-    artist is supplied). Each returned release is matched back to the library via
-    ``search_album_fuzzy`` — whose exact-title pre-pass keeps this precise, so a
-    request for one track doesn't drag in same-artist albums that merely share
-    title tokens. Surviving rows carry a ``TrackMatchHint`` mirroring
-    SONG_AS_TRACK.
-
-    Returns ``([], {})`` when there's no Discogs service or nothing
-    cross-references; the caller then keeps its artist-filtered fallback.
+    LML#622: once SWAPPED_INTERPRETATION identifies the artist side, the *other*
+    part is cross-referenced as a track via the shared
+    :func:`_match_track_releases_to_library` kernel — the same release→library
+    matcher SONG_AS_TRACK uses, so compilation handling, the deferred tracklist
+    validation, the ``_chunked_gather`` API-call budget, and the
+    MAX_SEARCH_RESULTS early-exit all apply here too. Scoped to the identified
+    artist's own releases (``artist=artist``) so a request for one track doesn't
+    return that artist's whole discography. Returns ``([], {})`` when nothing
+    cross-references; the caller keeps its artist-filtered fallback.
     """
-    if not discogs_service or not track.strip():
-        return [], {}
-
-    releases = await lookup_releases_by_track(track, artist, limit=10, service=discogs_service)
-    if not releases:
-        return [], {}
-
-    matched: list[LibraryItem] = []
-    matched_via: dict[int, list[TrackMatchHint]] = {}
-    seen: set[int] = set()
-    for _release_artist, album in releases:
-        if not album or len(album.strip()) < 3:
-            continue
-        for row in await search_album_fuzzy(db, album):
-            if row.id is None or not artist_matches_item(row, artist):
-                continue
-            hint = TrackMatchHint(
-                title=track,
-                artist_credit=None,
-                position=None,
-                confidence=SONG_AS_TRACK_CONFIDENCE,
-                source=TrackMatchSource.discogs_release,
-            )
-            if row.id in seen:
-                matched_via[row.id].append(hint)
-                continue
-            seen.add(row.id)
-            matched.append(row)
-            matched_via[row.id] = [hint]
-
-    if matched:
-        logger.info(
-            f"Alternative search narrowed '{artist}' to {len(matched)} release(s) "
-            f"containing track '{track}'"
-        )
-    return matched, matched_via
+    return await _match_track_releases_to_library(
+        db, discogs_service, track, artist=artist, source="swapped_interpretation"
+    )
 
 
 async def search_with_alternative_interpretation(
@@ -919,6 +884,9 @@ async def search_with_alternative_interpretation(
     results1 = filter_results_by_artist(raw1, part1)
     results2 = filter_results_by_artist(raw2, part2)
 
+    # Single-artist branches narrow via track cross-reference (LML#622); the
+    # kernel already caps at MAX_SEARCH_RESULTS, so the narrowed list needs no
+    # further limit_results().
     if results1 and not results2:
         logger.info(f"Alternative search matched with '{part1}' as artist")
         narrowed, matched_via = await _narrow_swapped_by_track(db, part1, part2, discogs_service)
@@ -928,6 +896,9 @@ async def search_with_alternative_interpretation(
         narrowed, matched_via = await _narrow_swapped_by_track(db, part2, part1, discogs_service)
         return (narrowed, matched_via) if narrowed else (results2, {})
     elif results1 and results2:
+        # Both readings resolve to a library artist — too ambiguous to pick a
+        # track side, so return the union un-narrowed (no hints). Narrowing is
+        # deliberately scoped to the unambiguous single-artist branches above.
         logger.info("Alternative search matched both interpretations, combining results")
         seen_ids = set()
         combined = []
@@ -1010,41 +981,46 @@ this floor is replaced with ``library_identity.confidence`` per row.
 """
 
 
-async def search_song_as_track(
+async def _match_track_releases_to_library(
     db: LibraryDB,
-    song: str | None,
-    discogs_service: DiscogsService | None = None,
+    discogs_service: DiscogsService | None,
+    track: str | None,
+    *,
+    artist: str | None,
+    source: str,
 ) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
-    """Cross-reference song against Discogs and match releases back to library.
+    """Find Discogs releases containing ``track`` and match them back to the library.
 
-    Catalog-track-search §4.2 / LML#301: when SONG_AS_ARTIST returns empty for a
-    song-only query, treat the song as a *track* — find Discogs releases that
-    contain it, then fuzzy-match those releases against the WXYC library. Each
-    surviving row carries a TrackMatchHint recording the track→release linkage.
-
-    Args:
-        db: Library database for album fuzzy search.
-        song: The track title from the user query.
-        discogs_service: Required. Without it, this strategy no-ops.
+    The shared kernel behind two strategies: SONG_AS_TRACK (``artist=None`` —
+    song-only) and SWAPPED_INTERPRETATION's narrowing (``artist=<the identified
+    artist>``). It finds Discogs releases carrying the track, fuzzy-matches each
+    to the WXYC library (compilation-aware via the ``Various <album>`` re-query +
+    :func:`_release_matches_library_row`), defers per-release tracklist
+    validation until after a library hit so we only pay the API cost for rows
+    we'd actually surface, and bounds the per-request validate fan-out through
+    :func:`_chunked_gather` with a ``MAX_SEARCH_RESULTS`` early-exit (LML#536).
+    Each surviving row carries a ``TrackMatchHint``; ``source`` labels the
+    validation breadcrumb (LML#344) and the log lines.
 
     Returns:
-        Tuple of (library_items, matched_via_by_id). matched_via_by_id maps
-        each library row's id to one-or-more TrackMatchHint entries — multiple
-        hints accumulate when the same WXYC row is referenced by multiple
-        Discogs releases (different pressings, etc.).
+        Tuple of (library_items, matched_via_by_id). matched_via_by_id maps each
+        library row's id to one-or-more TrackMatchHint entries — multiple hints
+        accumulate when the same WXYC row is referenced by multiple Discogs
+        releases (different pressings, etc.). ``([], {})`` when there's no
+        service, no track, or nothing cross-references.
     """
-    if not song or not discogs_service:
+    if not discogs_service or not track or not track.strip():
         return [], {}
 
-    response = await discogs_service.search_releases_by_track(song, artist=None)
+    label = source.upper()
+    response = await discogs_service.search_releases_by_track(track, artist=artist)
     raw_releases = list(response.releases or [])
     if not raw_releases:
-        logger.info(f"SONG_AS_TRACK: no Discogs releases for '{song}'")
+        logger.info(f"{label}: no Discogs releases for '{track}'")
         return [], {}
 
     logger.info(
-        f"SONG_AS_TRACK: {len(raw_releases)} Discogs releases for '{song}', "
-        "matching against library"
+        f"{label}: {len(raw_releases)} Discogs releases for '{track}', matching against library"
     )
 
     seen_ids: set[int] = set()
@@ -1082,13 +1058,13 @@ async def search_song_as_track(
             is_valid = await validate_release_for_track(
                 discogs_service,
                 release.release_id,
-                song,
+                track,
                 release.artist,
-                source="song_as_track",
+                source=source,
             )
             if not is_valid:
                 logger.debug(
-                    f"SONG_AS_TRACK: skipping '{release.album}' — track not validated on release"
+                    f"{label}: skipping '{release.album}' — track not validated on release"
                 )
                 return None
 
@@ -1109,7 +1085,7 @@ async def search_song_as_track(
 
         for item in eligible:
             hint = TrackMatchHint(
-                title=song,
+                title=track,
                 artist_credit=release.artist if release.is_compilation else None,
                 position=None,
                 confidence=SONG_AS_TRACK_CONFIDENCE,
@@ -1124,8 +1100,7 @@ async def search_song_as_track(
             matched_items.append(item)
             matched_via_by_id[item.id] = [hint]
             logger.debug(
-                f"SONG_AS_TRACK: matched '{item.artist} - {item.title}' "
-                f"via release '{release.album}'"
+                f"{label}: matched '{item.artist} - {item.title}' via release '{release.album}'"
             )
 
             if len(matched_items) >= MAX_SEARCH_RESULTS:
@@ -1135,6 +1110,36 @@ async def search_song_as_track(
             break
 
     return matched_items, matched_via_by_id
+
+
+async def search_song_as_track(
+    db: LibraryDB,
+    song: str | None,
+    discogs_service: DiscogsService | None = None,
+) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
+    """Cross-reference song against Discogs and match releases back to library.
+
+    Catalog-track-search §4.2 / LML#301: when SONG_AS_ARTIST returns empty for a
+    song-only query, treat the song as a *track* — find Discogs releases that
+    contain it, then fuzzy-match those releases against the WXYC library. Each
+    surviving row carries a TrackMatchHint recording the track→release linkage.
+    Thin wrapper over :func:`_match_track_releases_to_library` (song-only, so
+    ``artist=None``); SWAPPED_INTERPRETATION shares the same kernel.
+
+    Args:
+        db: Library database for album fuzzy search.
+        song: The track title from the user query.
+        discogs_service: Required. Without it, this strategy no-ops.
+
+    Returns:
+        Tuple of (library_items, matched_via_by_id). matched_via_by_id maps
+        each library row's id to one-or-more TrackMatchHint entries — multiple
+        hints accumulate when the same WXYC row is referenced by multiple
+        Discogs releases (different pressings, etc.).
+    """
+    return await _match_track_releases_to_library(
+        db, discogs_service, song, artist=None, source="song_as_track"
+    )
 
 
 def _release_matches_library_row(release: ReleaseInfo, item: LibraryItem) -> bool:
