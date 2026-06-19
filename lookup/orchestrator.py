@@ -503,15 +503,18 @@ def _log_release_resolution_bind(
 ) -> None:
     """Emit telemetry each time the lazy release-resolution fallback fires (LML#604).
 
-    Mirrors ``_log_album_title_fallback``: an INFO log line plus a Sentry
-    transaction ``data.release_resolution_bind`` attribute. Logged on every
-    fire (whether or not it bound) so the trace explorer can answer "what
-    fraction of lookups trigger the compilation fallback, and what's its bind
-    rate?" — the adoption + Discogs-cost signal for the staged rollout — without
-    re-pulling Railway logs.
+    An INFO log line plus an accumulating Sentry breadcrumb (``category:
+    release_resolution_bind``). Logged on every fire (whether or not it bound)
+    so the trace explorer can answer "what fraction of lookups trigger the
+    compilation fallback, and what's its bind rate?" — the adoption + Discogs-
+    cost signal for the staged rollout — without re-pulling Railway logs.
 
-    No-op when there's no active Sentry transaction. Any SDK error is swallowed
-    so observability never breaks /lookup.
+    This is a *per-item* event (``fetch_one`` fires it once per library row that
+    reaches the fallback), so it uses ``add_breadcrumb`` like the per-call
+    ``_log_track_validation`` — NOT ``transaction.set_data`` with a fixed key,
+    which would last-write-win across multiple items binding in one request and
+    undercount the fire/bind rate. Any SDK error is swallowed so observability
+    never breaks /lookup.
     """
     payload: dict[str, Any] = {
         "song": song,
@@ -522,11 +525,13 @@ def _log_release_resolution_bind(
     }
     logger.info("release_resolution_bind %s", payload)
     try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("release_resolution_bind", payload)
+        sentry_sdk.add_breadcrumb(
+            category="release_resolution_bind",
+            level="info",
+            data=payload,
+        )
     except Exception as e:
-        logger.warning("Failed to project release_resolution_bind onto Sentry transaction: %s", e)
+        logger.warning("Failed to add release_resolution_bind breadcrumb: %s", e)
 
 
 def _project_mb_rescue_attrs(
