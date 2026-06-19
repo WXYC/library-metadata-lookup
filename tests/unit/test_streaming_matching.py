@@ -643,6 +643,27 @@ class TestFindBestSourceMatchEmits:
         assert match is None
         mock_sentry.start_span.assert_not_called()
 
+    def test_service_is_required(self):
+        """``service`` must be a required keyword arg, never silently defaulted.
+
+        A defaulted ``service="unknown"`` once let an adapter's album matches
+        (Apple's) drop into an unattributable telemetry bucket instead of
+        failing loudly — telemetry is best-effort and would have swallowed the
+        mistake at runtime (LML#592). Pin the required contract so re-adding a
+        default is caught here, not in production data.
+        """
+        from clients.streaming.matching import find_best_source_match
+
+        with pytest.raises(TypeError):
+            find_best_source_match(
+                self._WAND,
+                "Wand",
+                "DOGA",
+                artist_fn=lambda r: r["artist"],
+                title_fn=lambda r: r["album"],
+                url_fn=lambda r: r["url"],
+            )  # no service= → TypeError
+
 
 class TestAcceptanceFloorUnchanged:
     """LML#592 is instrument-only: the 80/80 floor is NOT tightened in this PR.
