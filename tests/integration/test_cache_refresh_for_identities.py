@@ -17,10 +17,8 @@ test so we own a clean substrate without depending on the live discogs-cache.
 from __future__ import annotations
 
 import asyncio
-import os
 from unittest.mock import AsyncMock, patch
 
-import asyncpg
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -29,21 +27,20 @@ from discogs.models import ArtistCredit, ArtistDetails, ReleaseMetadataResponse
 from entity.sources import PgSource
 from entity.store import EntityStore
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL_TEST",
-    "postgresql://discogs:discogs@localhost:5433/discogs",
-)
+# ``DATABASE_URL`` (and the conftest ``pg_pool_large``) come from conftest;
+# imported here for the ``source._dsn`` wiring and ``monkeypatch.setenv`` below.
+from tests.integration.conftest import DATABASE_URL
 
 
 @pytest_asyncio.fixture
-async def pg_pool():
-    try:
-        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
-    except Exception as e:
-        pytest.skip(f"Cannot connect to test PostgreSQL: {e}")
-        return
-    yield pool
-    await pool.close()
+async def pg_pool(pg_pool_large):
+    """Alias to the conftest ``max_size=4`` pool.
+
+    This module's downstream fixtures and tests request ``pg_pool`` by name and
+    historically got a ``max_size=4`` pool; aliasing keeps that cap without
+    re-typing every request.
+    """
+    yield pg_pool_large
 
 
 @pytest_asyncio.fixture

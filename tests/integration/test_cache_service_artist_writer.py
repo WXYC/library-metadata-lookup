@@ -22,31 +22,15 @@ Run with: ``pytest -m pg -v tests/integration/test_cache_service_artist_writer.p
 
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime
 
-import asyncpg
 import pytest
 import pytest_asyncio
 
 from discogs.cache_service import DiscogsCacheService
 from discogs.models import ArtistDetails
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL_TEST",
-    "postgresql://discogs:discogs@localhost:5433/discogs",
-)
-
-
-@pytest_asyncio.fixture
-async def pg_pool():
-    try:
-        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
-    except Exception as e:
-        pytest.skip(f"Cannot connect to test PostgreSQL: {e}")
-        return
-    yield pool
-    await pool.close()
+# ``pg_pool`` (max_size=3) is provided by tests/integration/conftest.py.
 
 
 @pytest_asyncio.fixture(autouse=True)

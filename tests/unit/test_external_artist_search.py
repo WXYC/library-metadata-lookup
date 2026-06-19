@@ -24,11 +24,7 @@ def mock_discogs_cache():
     return cache
 
 
-@pytest.fixture
-def mock_mb_pg():
-    pg = AsyncMock()
-    pg.fetchall = AsyncMock(return_value=[])
-    return pg
+# ``mock_mb_pg`` is provided by tests/unit/conftest.py.
 
 
 class TestSearchExternalArtists:
