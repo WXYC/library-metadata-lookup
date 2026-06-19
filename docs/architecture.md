@@ -29,6 +29,8 @@ The strategy seam (`Outcome` value type, `Strategy` Protocol, `_apply` write sit
 
 Strategies never mutate `SearchState`; they return an `Outcome` and the runner applies it via `_apply`. This makes cancellation safety structural — a cancelled `attempt()` is a no-op against state by construction. Production wiring lives in `lookup.strategies.build_strategies`, called from `perform_lookup`.
 
+`SWAPPED_INTERPRETATION` is **Discogs-touching** (LML#622): once it identifies the artist side, it cross-references the *other* part as a track via `lookup_releases_by_track()` and narrows to the release(s) that actually contain it (matched back to the library through `search_album_fuzzy()`), rather than returning the artist's whole discography. When narrowing fires it emits a `matched_via` map (an `Outcome.track_match`, like `SONG_AS_TRACK`); when nothing cross-references — or no `discogs_service` is wired — it returns the artist-filtered result via `Outcome.found` as before. Of the strategies, only `ARTIST_PLUS_ALBUM` is library-only.
+
 ## Key Files
 
 - `lookup/orchestrator.py` -- Core search logic: `perform_lookup()` and all helper functions

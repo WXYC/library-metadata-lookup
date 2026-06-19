@@ -829,6 +829,95 @@ class TestSearchWithAlternativeInterpretation:
         )
         assert len(results) == 0
 
+    @pytest.mark.asyncio
+    async def test_narrows_to_release_containing_track(self, mock_library_db, mock_discogs_service):
+        """LML#622: an ambiguous ``track, artist`` narrows to the release that
+        actually contains the track, not the artist's whole discography.
+
+        ``Today, Jefferson Airplane`` — "Today" is on *The Worst of Jefferson
+        Airplane* only. Without narrowing this returned all five JA albums.
+        """
+        ja = [
+            make_library_item(id=1, artist="Jefferson Airplane", title="Bark"),
+            make_library_item(
+                id=2, artist="Jefferson Airplane", title="Jefferson Airplane Takes Off"
+            ),
+            make_library_item(id=3, artist="Jefferson Airplane", title="Early Flight"),
+            make_library_item(
+                id=4, artist="Jefferson Airplane", title="Thirty Seconds over Winterland"
+            ),
+            make_library_item(
+                id=5, artist="Jefferson Airplane", title="The Worst of Jefferson Airplane"
+            ),
+        ]
+        # part1="Today" matches no artist; part2="Jefferson Airplane" matches all 5.
+        mock_library_db.search.side_effect = [ja, ja]
+        # search_album_fuzzy's exact-title pre-pass resolves the one release.
+        worst = ja[4]
+        mock_library_db.exact_title.side_effect = lambda title: (
+            [worst] if title == "The Worst of Jefferson Airplane" else []
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[("Jefferson Airplane", "The Worst of Jefferson Airplane")],
+        ):
+            results, matched_via = await search_with_alternative_interpretation(
+                mock_library_db,
+                "Today",
+                "Jefferson Airplane",
+                discogs_service=mock_discogs_service,
+            )
+
+        assert [r.id for r in results] == [5]
+        assert set(matched_via) == {5}
+        hint = matched_via[5][0]
+        assert hint.title == "Today"
+        assert hint.source == TrackMatchSource.discogs_release
+
+    @pytest.mark.asyncio
+    async def test_artist_album_falls_back_to_artist_dump(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """When the non-artist half is an album (not a track), the Discogs
+        track lookup is empty and the artist-filtered fallback is preserved."""
+        rows = [
+            make_library_item(id=1, artist="Jessica Pratt", title="On Your Own Love Again"),
+            make_library_item(id=2, artist="Jessica Pratt", title="Quiet Signs"),
+        ]
+        # part1="Jessica Pratt" matches (results1); part2 query returns nothing.
+        mock_library_db.search.side_effect = [rows, []]
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            results, matched_via = await search_with_alternative_interpretation(
+                mock_library_db,
+                "Jessica Pratt",
+                "On Your Own Love Again",
+                discogs_service=mock_discogs_service,
+            )
+
+        assert {r.id for r in results} == {1, 2}
+        assert matched_via == {}
+
+    @pytest.mark.asyncio
+    async def test_no_discogs_service_preserves_artist_dump(self, mock_library_db):
+        """Without a Discogs service, narrowing is skipped and the legacy
+        artist-filtered result is returned with an empty hint map."""
+        rows = [make_library_item(id=1, artist="Jefferson Airplane", title="Bark")]
+        mock_library_db.search.side_effect = [[], rows]
+
+        results, matched_via = await search_with_alternative_interpretation(
+            mock_library_db, "Today", "Jefferson Airplane"
+        )
+
+        assert {r.id for r in results} == {1}
+        assert matched_via == {}
+
 
 # ---------------------------------------------------------------------------
 # Tests: filter_results_by_track_validation

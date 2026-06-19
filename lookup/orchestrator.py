@@ -840,12 +840,78 @@ def filter_results_by_artist(
     return filtered
 
 
+async def _narrow_swapped_by_track(
+    db: LibraryDB,
+    artist: str,
+    track: str,
+    discogs_service: DiscogsService | None,
+) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
+    """Narrow a swapped-interpretation artist match to the release holding ``track``.
+
+    LML#622: once SWAPPED_INTERPRETATION identifies the artist side, the other
+    part is cross-referenced as a *track* against Discogs releases by that
+    artist (``lookup_releases_by_track`` already validates the tracklist when an
+    artist is supplied). Each returned release is matched back to the library via
+    ``search_album_fuzzy`` — whose exact-title pre-pass keeps this precise, so a
+    request for one track doesn't drag in same-artist albums that merely share
+    title tokens. Surviving rows carry a ``TrackMatchHint`` mirroring
+    SONG_AS_TRACK.
+
+    Returns ``([], {})`` when there's no Discogs service or nothing
+    cross-references; the caller then keeps its artist-filtered fallback.
+    """
+    if not discogs_service or not track.strip():
+        return [], {}
+
+    releases = await lookup_releases_by_track(track, artist, limit=10, service=discogs_service)
+    if not releases:
+        return [], {}
+
+    matched: list[LibraryItem] = []
+    matched_via: dict[int, list[TrackMatchHint]] = {}
+    seen: set[int] = set()
+    for _release_artist, album in releases:
+        if not album or len(album.strip()) < 3:
+            continue
+        for row in await search_album_fuzzy(db, album):
+            if row.id is None or not artist_matches_item(row, artist):
+                continue
+            hint = TrackMatchHint(
+                title=track,
+                artist_credit=None,
+                position=None,
+                confidence=SONG_AS_TRACK_CONFIDENCE,
+                source=TrackMatchSource.discogs_release,
+            )
+            if row.id in seen:
+                matched_via[row.id].append(hint)
+                continue
+            seen.add(row.id)
+            matched.append(row)
+            matched_via[row.id] = [hint]
+
+    if matched:
+        logger.info(
+            f"Alternative search narrowed '{artist}' to {len(matched)} release(s) "
+            f"containing track '{track}'"
+        )
+    return matched, matched_via
+
+
 async def search_with_alternative_interpretation(
     db: LibraryDB,
     part1: str,
     part2: str,
-) -> tuple[list[LibraryItem], None]:
-    """Try searching with both artist/title interpretations for 'X - Y' format."""
+    discogs_service: DiscogsService | None = None,
+) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
+    """Try searching with both artist/title interpretations for 'X - Y' format.
+
+    Once the artist side is identified, the *other* part is cross-referenced as a
+    track against Discogs (LML#622): if it resolves to a release present in the
+    library the result is narrowed to that release (carrying a ``TrackMatchHint``
+    via the second tuple element); otherwise the artist-filtered result is
+    returned unchanged with an empty hint map.
+    """
     raw1, raw2 = await asyncio.gather(
         db.search(query=f"{part1} {part2}", limit=_FETCH_LIMIT),
         db.search(query=f"{part2} {part1}", limit=_FETCH_LIMIT),
@@ -855,10 +921,12 @@ async def search_with_alternative_interpretation(
 
     if results1 and not results2:
         logger.info(f"Alternative search matched with '{part1}' as artist")
-        return results1, None
+        narrowed, matched_via = await _narrow_swapped_by_track(db, part1, part2, discogs_service)
+        return (narrowed, matched_via) if narrowed else (results1, {})
     elif results2 and not results1:
         logger.info(f"Alternative search matched with '{part2}' as artist")
-        return results2, None
+        narrowed, matched_via = await _narrow_swapped_by_track(db, part2, part1, discogs_service)
+        return (narrowed, matched_via) if narrowed else (results2, {})
     elif results1 and results2:
         logger.info("Alternative search matched both interpretations, combining results")
         seen_ids = set()
@@ -867,9 +935,9 @@ async def search_with_alternative_interpretation(
             if item.id not in seen_ids:
                 combined.append(item)
                 seen_ids.add(item.id)
-        return limit_results(combined), None
+        return limit_results(combined), {}
 
-    return [], None
+    return [], {}
 
 
 async def search_song_as_artist(
@@ -3158,12 +3226,15 @@ async def perform_lookup(
     with telemetry.track_step("library_search"):
         # Strategies hold their own ``db`` handle (no per-call db arg on the
         # runner post-#399). The discogs_service is captured via ``partial`` on
-        # the three strategies that need it; ARTIST_PLUS_ALBUM and
-        # SWAPPED_INTERPRETATION are library-only.
+        # the strategies that need it; ARTIST_PLUS_ALBUM is the only
+        # library-only strategy (SWAPPED_INTERPRETATION now cross-references the
+        # non-artist token as a track via Discogs — LML#622).
         strategies = build_strategies(
             db,
             search_library_func=search_library_with_fallback,
-            search_alternative_func=search_with_alternative_interpretation,
+            search_alternative_func=partial(
+                search_with_alternative_interpretation, discogs_service=discogs_service
+            ),
             search_compilations_func=partial(
                 search_compilations_for_track, discogs_service=discogs_service
             ),

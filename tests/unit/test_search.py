@@ -487,6 +487,37 @@ class TestExecuteSearchPipeline:
         search_song.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_swapped_interpretation_carries_matched_via(self):
+        """LML#622: when SWAPPED narrows via a track cross-reference it returns
+        a ``matched_via`` map, which the runner projects onto the state. The
+        telemetry search_type stays ``alternative``.
+        """
+        item = _item(id=1, artist="Jefferson Airplane", title="The Worst of Jefferson Airplane")
+        hint = TrackMatchHint(
+            title="Today", source=TrackMatchSource.discogs_release, confidence=0.85
+        )
+
+        search_lib = AsyncMock(return_value=([], False))
+        search_alt = AsyncMock(return_value=([item], {1: [hint]}))
+        search_comp = AsyncMock(return_value=([], {}))
+        search_song = AsyncMock(return_value=([], None))
+
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp, search_song)
+
+        parsed = ParsedRequest(song="Jefferson Airplane", raw_message="Today, Jefferson Airplane")
+
+        state = await execute_search_pipeline(
+            parsed,
+            "Today, Jefferson Airplane",
+            strategies,
+        )
+
+        assert state.results == [item]
+        assert state.matched_via_by_id == {1: [hint]}
+        assert get_search_type_from_state(state) == "alternative"
+        search_song.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_song_as_track_runs_after_song_as_artist_empty(self):
         """SONG_AS_TRACK fires for song-only queries after SONG_AS_ARTIST returns empty.
 
