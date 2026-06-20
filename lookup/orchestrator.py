@@ -2068,7 +2068,10 @@ async def search_compilations_for_track(
     # ``artist_for_probes``), consistent with the #626 two-channel decision and
     # the #632 cache contract. Gated; off by default.
     if not results and get_settings().lml_resolve_nonlibrary_release and parsed.song:
-        resolved = await _resolve_nonlibrary_release(
+        # Distinct name from the #604 ``resolved`` bound earlier in this function
+        # (a non-optional ``ResolvedRelease``) — the helper returns an Optional,
+        # and reusing the name trips a mypy assignment-type collision.
+        resolved_nonlibrary = await _resolve_nonlibrary_release(
             discogs_service,
             pg,
             song=parsed.song,
@@ -2076,12 +2079,15 @@ async def search_compilations_for_track(
             album=parsed.album,
             is_track=True,
         )
-        if resolved is not None:
-            rowless = _make_rowless_item(artist=parsed.artist or "", title=resolved.album_title)
-            discogs_titles[ROWLESS_LIBRARY_ID] = resolved
+        if resolved_nonlibrary is not None:
+            rowless = _make_rowless_item(
+                artist=parsed.artist or "", title=resolved_nonlibrary.album_title
+            )
+            discogs_titles[ROWLESS_LIBRARY_ID] = resolved_nonlibrary
             logger.info(
                 f"TRACK_ON_COMPILATION: surfacing row-less Discogs release "
-                f"{resolved.release_id} ('{resolved.album_title}') — validated, not in library"
+                f"{resolved_nonlibrary.release_id} ('{resolved_nonlibrary.album_title}') "
+                f"— validated, not in library"
             )
             return [rowless], discogs_titles
 
