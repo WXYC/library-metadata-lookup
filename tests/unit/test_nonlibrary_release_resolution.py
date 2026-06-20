@@ -137,6 +137,32 @@ async def test_cold_resolve_then_cache_hit_skips_second_probe():
 
 
 @pytest.mark.asyncio
+async def test_transient_rehydrate_failure_does_not_demote_positive_to_miss():
+    """A known-good cached id that fails to re-hydrate (transient ``get_release``
+    outage) must NOT be overwritten with a known miss when the live resolve also
+    comes up empty — otherwise a transient outage pins a 7-day miss over good
+    data. It self-heals once the outage clears."""
+    svc = _resolving_service()
+    # Outage: get_release can't fetch (rehydrate fails) AND the live re-probe
+    # finds nothing (the same outage starves validation upstream).
+    svc.get_release = AsyncMock(return_value=None)
+    svc.search_releases_by_track = AsyncMock(return_value=_empty_track_releases())
+
+    pg = _RecordingPg()
+    # Pre-seed a known-good positive entry (a prior successful resolve).
+    pg.store[(ARTIST.lower(), TRACK.lower(), True)] = RELEASE_ID
+
+    result = await _resolve_nonlibrary_release(
+        svc, pg, song=TRACK, artist=ARTIST, album=ALBUM, is_track=True
+    )
+
+    # Nothing surfaces this add, but the cache is NOT demoted to a miss.
+    assert result is None
+    assert pg.execute_calls == 0
+    assert pg.store[(ARTIST.lower(), TRACK.lower(), True)] == RELEASE_ID
+
+
+@pytest.mark.asyncio
 async def test_fresh_known_miss_short_circuits_without_probe(monkeypatch):
     """A cached known-miss (``was_present=True, release_id=None``) skips the
     live probe entirely."""

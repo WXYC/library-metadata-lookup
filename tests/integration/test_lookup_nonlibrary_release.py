@@ -156,6 +156,11 @@ async def test_track_on_compilation_surfaces_rowless_when_flag_on(
     assert item.artwork.release_id == SPINE_RELEASE_ID
     assert item.artwork.release_id > 0
     assert item.artwork.release_url == SPINE_RELEASE_URL
+    # Pin routing: served by the compilation path, not silently re-routed
+    # through SWAPPED (which would report "alternative"). All three strategies
+    # emit byte-identical row-less output, so without this a priority change
+    # could re-route the test and still pass.
+    assert response.search_type != "alternative"
 
 
 @pytest.mark.asyncio
@@ -214,6 +219,8 @@ async def test_song_as_track_surfaces_rowless_when_flag_on(library_db, enable_no
     assert item.artwork is not None
     assert item.artwork.release_id == SPINE_RELEASE_ID
     assert item.artwork.release_url == SPINE_RELEASE_URL
+    # Pin routing: SONG_AS_TRACK (song-only, no typed artist), not SWAPPED.
+    assert response.search_type != "alternative"
 
 
 @pytest.mark.asyncio
@@ -292,7 +299,12 @@ async def test_swapped_interpretation_surfaces_rowless_when_flag_on(
     rowless = [r for r in response.results if r.library_item.id == 0 and r.artwork is not None]
     assert len(rowless) == 1
     assert rowless[0].artwork.release_id == SPINE_RELEASE_ID
+    assert rowless[0].artwork.release_id > 0
     assert rowless[0].artwork.release_url == SPINE_RELEASE_URL
+    # Pin routing: SWAPPED_INTERPRETATION reports search_type "alternative".
+    # This is the discriminator that catches the exact bug already hit once
+    # (a SWAPPED case silently served by TRACK_ON_COMPILATION).
+    assert response.search_type == "alternative"
 
 
 @pytest.mark.asyncio
