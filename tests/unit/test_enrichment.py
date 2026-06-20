@@ -3658,6 +3658,39 @@ class TestBandcampStreamingUrlPostprocessWiring:
         assert captured["bandcamp_url_at_call"] is None
 
     @pytest.mark.asyncio
+    async def test_empty_string_spotify_link_normalized_to_none(self):
+        # Same empty-string asymmetry for spotify_url: it is a post-process
+        # service (spotify_album) whose templated search fallback was deleted in
+        # PR-1, so an un-normalized '' would skip the cache/probe leg AND surface
+        # the empty string straight to the client. Normalizing to None lets the
+        # post-process leg run and prevents the bare '' from leaking.
+        item = make_library_item(id=42, artist="Juana Molina", title="DOGA")
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": "",
+                "apple_music_url": None,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        # Real post-process is a no-op here (no pg / entity_store passed), so the
+        # surfaced spotify_url reflects only the update-dict normalization.
+        results = await enrich_artwork_results(
+            [(item, None)],
+            AsyncMock(),
+            song="la paradoja",
+            album="DOGA",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.spotify_url is None
+
+    @pytest.mark.asyncio
     async def test_search_fallback_applies_when_postprocess_leaves_url_none(self):
         # Post-process is a no-op (flag off / cache miss / client absent); the
         # deferred search-URL fallback still fills bandcamp_url.

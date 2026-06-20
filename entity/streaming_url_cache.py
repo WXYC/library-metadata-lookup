@@ -106,10 +106,14 @@ CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
 # Idempotent widen of the named CHECK. ``CREATE TABLE IF NOT EXISTS`` is a
 # no-op on an already-created prod table, so a new service value added to
 # ``_SERVICES`` would never reach an existing table without this ALTER. The
-# DROP-IF-EXISTS + ADD pair is byte-stable across boots (a no-op once the
-# constraint already matches) and runs atomically within the single statement.
-# The ADD re-validates existing rows; the set only ever grows, so apple/spotify
-# rows always pass. Driven from the same ``_SERVICE_IN_LIST`` as the CREATE.
+# DROP-IF-EXISTS + ADD pair is byte-stable across boots and runs atomically
+# within the single statement. Note ``ADD CONSTRAINT … CHECK`` is NOT a metadata
+# no-op even when the constraint text is unchanged: PostgreSQL re-validates every
+# existing row (a brief seq scan under an ACCESS EXCLUSIVE lock) on each boot.
+# That cost is acceptable here — this cache table is modest and the bootstrap
+# runs once per process start, not per request — and the set only ever grows, so
+# existing apple/spotify/bandcamp rows always pass. Driven from the same
+# ``_SERVICE_IN_LIST`` as the CREATE so the two can't drift.
 _DDL_ALTER_CHECK = f"""\
 ALTER TABLE lml_cache.album_streaming_url_cache
     DROP CONSTRAINT IF EXISTS album_streaming_url_cache_service_valid,
