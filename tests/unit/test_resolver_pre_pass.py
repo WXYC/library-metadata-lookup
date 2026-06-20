@@ -30,7 +30,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from discogs.models import TrackReleasesResponse
+from discogs.models import ReleaseInfo, TrackReleasesResponse
 from lookup.orchestrator import (
     CANONICAL_ARTIST_SIMILARITY_FLOOR,
     ResolverOutcome,
@@ -38,6 +38,7 @@ from lookup.orchestrator import (
     search_compilations_for_track,
 )
 from services.parser import ParsedRequest
+from tests.factories import make_library_item
 
 
 @pytest.fixture
@@ -311,3 +312,153 @@ class TestResolverPrePassCallSite:
             if artist_arg is None and len(call.args) >= 2:
                 artist_arg = call.args[1]
             assert artist_arg == "Alexander Robotnik"
+
+
+class TestLibraryCorrectionTwoChannelSeam:
+    """The B1 two-channel seam (WXYC/library-metadata-lookup#626).
+
+    ``perform_lookup`` no longer overwrites ``parsed.artist`` with the
+    library-fuzzy correction. Instead it threads the corrected name on
+    ``parsed.library_artist`` — used ONLY by the library-side legs — while the
+    typed ``parsed.artist`` flows unchanged to every Discogs-facing path. These
+    tests pin the seam at ``search_compilations_for_track``, where one function
+    drives both a Discogs probe (typed) and a library match-back (corrected).
+
+    The trap this prevents: a *distinct* non-library artist whose name is one
+    edit from a library artist ("Plug" vs library "Plugz") must hit Discogs
+    under the typed name, not the snapped library vocabulary.
+    """
+
+    @pytest.mark.asyncio
+    async def test_probe_sees_typed_artist_library_match_back_sees_corrected(self):
+        """Typed "Plug", corrected library_artist "Plugz".
+
+        The two Discogs probes and ``validate_release_for_track`` must receive
+        the TYPED "Plug"; the library match-back must accept the row whose
+        artist is the corrected "Plugz".
+        """
+        db = AsyncMock()
+        db.exact_title = AsyncMock(
+            return_value=[make_library_item(id=7, artist="Plugz", title="Electric Dreams")]
+        )
+        db.search = AsyncMock(return_value=[])
+
+        service = AsyncMock()
+        service.cache_service = None
+        service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Electric Dreams",
+                artist="Plug",
+                releases=[
+                    ReleaseInfo(
+                        album="Electric Dreams",
+                        artist="Plug",
+                        release_id=555,
+                        release_url="https://discogs.com/release/555",
+                        is_compilation=False,
+                    )
+                ],
+                total=1,
+            )
+        )
+
+        parsed = ParsedRequest(
+            artist="Plug",
+            library_artist="Plugz",
+            song="Electric Dreams",
+            raw_message="Plug - Electric Dreams",
+        )
+
+        with patch(
+            "lookup.orchestrator.validate_release_for_track",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_validate:
+            results, _titles = await search_compilations_for_track(
+                db, parsed, discogs_service=service
+            )
+
+        # Discogs probes: the TYPED artist, never the corrected library name.
+        assert service.search_releases_by_track.await_count == 2
+        for call in service.search_releases_by_track.await_args_list:
+            artist_arg = call.kwargs.get("artist")
+            if artist_arg is None and len(call.args) >= 2:
+                artist_arg = call.args[1]
+            assert artist_arg == "Plug"
+
+        # validate_release_for_track: the TYPED artist.
+        mock_validate.assert_awaited()
+        for call in mock_validate.await_args_list:
+            validate_artist = call.args[3] if len(call.args) >= 4 else call.kwargs.get("artist")
+            assert validate_artist == "Plug"
+
+        # The corrected library row still binds — the library match-back used
+        # "Plugz" (typed "Plug" would also prefix-match here, so the binding
+        # alone isn't decisive; the probe/validate assertions above are).
+        assert [item.id for item in results] == [7]
+
+    @pytest.mark.asyncio
+    async def test_distinct_artist_match_back_uses_corrected_not_typed(self):
+        """Typed "Sun" (distinct), corrected library_artist "Sun Araw".
+
+        A library row by an unrelated "Sunburned Hand of the Man" must NOT bind
+        off the typed "Sun" — the match-back keys on the corrected "Sun Araw",
+        which that row's artist does not start with. Without the seam, the
+        match-back would run against whichever single value won, conflating the
+        two channels.
+        """
+        db = AsyncMock()
+        # Library album-fuzzy returns an unrelated "Sun"-prefixed row.
+        db.exact_title = AsyncMock(
+            return_value=[
+                make_library_item(id=9, artist="Sunburned Hand of the Man", title="Headdress")
+            ]
+        )
+        db.search = AsyncMock(return_value=[])
+
+        service = AsyncMock()
+        service.cache_service = None
+        service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Headdress",
+                artist="Sun",
+                releases=[
+                    ReleaseInfo(
+                        album="Headdress",
+                        artist="Sun",
+                        release_id=556,
+                        release_url="https://discogs.com/release/556",
+                        is_compilation=False,
+                    )
+                ],
+                total=1,
+            )
+        )
+
+        parsed = ParsedRequest(
+            artist="Sun",
+            library_artist="Sun Araw",
+            song="Headdress",
+            raw_message="Sun - Headdress",
+        )
+
+        with patch(
+            "lookup.orchestrator.validate_release_for_track",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            results, _titles = await search_compilations_for_track(
+                db, parsed, discogs_service=service
+            )
+
+        # Probes still see the typed "Sun".
+        for call in service.search_releases_by_track.await_args_list:
+            artist_arg = call.kwargs.get("artist")
+            if artist_arg is None and len(call.args) >= 2:
+                artist_arg = call.args[1]
+            assert artist_arg == "Sun"
+
+        # The unrelated "Sunburned..." row is rejected by the corrected
+        # "Sun Araw" match-back — proving the match-back used library_artist,
+        # not the typed "Sun" (which the row *would* prefix-match).
+        assert results == []

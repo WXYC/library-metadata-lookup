@@ -338,6 +338,105 @@ class TestPerformLookupArtistCorrection:
         assert response.corrected_artist == "Stereolab"
         assert telemetry.steps.get("album_lookup") is not None
 
+    @pytest.mark.asyncio
+    async def test_typed_artist_reaches_discogs_probe_corrected_reaches_library(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Two-channel seam (WXYC/library-metadata-lookup#626) end-to-end.
+
+        Typed "Plug" is a *distinct* non-library artist one edit from library
+        "Plugz". The correction must NOT snap "Plug" into Discogs resolution:
+        ``search_releases_by_track`` (the Discogs probe) sees the typed "Plug",
+        while the primary library leg's ``db.search`` queries carry the corrected
+        "Plugz".
+
+        ``raw_message`` is deliberately non-ambiguous (no "X - Y" two-part shape)
+        so SWAPPED_INTERPRETATION — which re-parses the raw message into typed
+        tokens and is out of this seam's scope — never fires and the only library
+        queries come from ``search_library_with_fallback``.
+        """
+        from discogs.models import TrackReleasesResponse
+
+        mock_library_db.find_similar_artist.return_value = "Plugz"
+        mock_library_db.search.return_value = []
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+        mock_discogs_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(track="Drift", artist="Plug", releases=[], total=0)
+        )
+
+        request = LookupRequest(
+            artist="Plug",
+            song="Drift",
+            raw_message="dj played Drift by Plug",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        # The correction is reported, but parsed.artist was NOT overwritten:
+        # every Discogs probe saw the typed "Plug".
+        assert response.corrected_artist == "Plugz"
+        assert mock_discogs_service.search_releases_by_track.await_count >= 1
+        for call in mock_discogs_service.search_releases_by_track.await_args_list:
+            artist_arg = call.kwargs.get("artist")
+            if artist_arg is None and len(call.args) >= 2:
+                artist_arg = call.args[1]
+            assert artist_arg == "Plug"
+
+        # The library leg used the corrected "Plugz" — every artist-keyed
+        # library query carries it, and none falls back to the typed "Plug".
+        library_queries = [
+            (c.kwargs.get("query") or (c.args[0] if c.args else ""))
+            for c in mock_library_db.search.await_args_list
+        ]
+        assert any("Plugz" in q for q in library_queries)
+        assert not any("Plug" in q and "Plugz" not in q for q in library_queries)
+
+    @pytest.mark.asyncio
+    async def test_misspelled_library_artist_still_binds_to_library_row(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """The accepted-trade-off direction: a misspelled *library* artist still
+        corrects and binds to its library row via the corrected library leg.
+
+        Typed "Stereolb" corrects to library "Stereolab"; the artist+album
+        library search surfaces the Stereolab row, which is returned.
+        """
+        stereolab_row = make_library_item(id=10, artist="Stereolab", title="Aluminum Tunes")
+        mock_library_db.find_similar_artist.return_value = "Stereolab"
+        mock_library_db.search.return_value = [stereolab_row]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Stereolb",
+            album="Aluminum Tunes",
+            raw_message="Stereolb - Aluminum Tunes",
+        )
+
+        with patch(
+            "lookup.orchestrator.fetch_artwork_for_items",
+            new_callable=AsyncMock,
+            return_value=[(stereolab_row, None)],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.corrected_artist == "Stereolab"
+        assert any(item.library_item.id == 10 for item in response.results)
+        # The library search ran under the corrected name.
+        library_queries = [
+            (c.kwargs.get("query") or (c.args[0] if c.args else ""))
+            for c in mock_library_db.search.await_args_list
+        ]
+        assert any("Stereolab" in q for q in library_queries)
+
 
 # ---------------------------------------------------------------------------
 # Tests: perform_lookup - album resolution from Discogs

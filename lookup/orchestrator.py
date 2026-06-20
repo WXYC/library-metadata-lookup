@@ -771,6 +771,18 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     return False
 
 
+def library_artist_for(parsed: ParsedRequest) -> str | None:
+    """The artist name the *library-side* legs should search/match against.
+
+    Library channel of the two-channel seam (WXYC/library-metadata-lookup#626):
+    the fuzzy correction on ``parsed.library_artist`` when present, else the
+    typed ``parsed.artist``. Read by ``db.search`` query construction and the
+    ``artist_matches_item`` match-backs — never by the Discogs-facing probes or
+    ``validate_release_for_track``, which always use the typed ``parsed.artist``.
+    """
+    return parsed.library_artist or parsed.artist
+
+
 async def resolve_albums_for_track(
     parsed: ParsedRequest,
     discogs_service: DiscogsService | None = None,
@@ -1334,13 +1346,20 @@ async def search_library_with_fallback(
 ) -> tuple[list[LibraryItem], bool]:
     """Search library with artist+album(s), falling back to artist+song or artist-only.
 
+    Library channel of the two-channel seam (WXYC/library-metadata-lookup#626):
+    every artist-keyed library operation here uses ``library_artist_for(parsed)``
+    — the fuzzy correction when present, else the typed name — so a misspelled
+    *library* artist still finds its row. The typed ``parsed.artist`` is reserved
+    for the Discogs-facing paths elsewhere.
+
     Returns:
         Tuple of (library_results, song_not_found_flag)
     """
     all_results: list[LibraryItem] = []
     seen_ids: set[int] = set()
+    lib_artist = library_artist_for(parsed)
 
-    if not parsed.artist and albums:
+    if not lib_artist and albums:
         # No artist parsed — search by album title alone
         for album in albums:
             results = await db.search(query=album, limit=_FETCH_LIMIT)
@@ -1348,20 +1367,20 @@ async def search_library_with_fallback(
                 return results[:MAX_SEARCH_RESULTS], False
         return [], bool(parsed.song)
 
-    if parsed.artist and albums:
+    if lib_artist and albums:
 
         async def search_one_album(album: str) -> list[LibraryItem]:
-            query = f"{parsed.artist} {album}"
+            query = f"{lib_artist} {album}"
             results = await db.search(query=query, limit=_FETCH_LIMIT)
-            results = filter_results_by_artist(results, parsed.artist)
+            results = filter_results_by_artist(results, lib_artist)
 
             album_lower = album.lower()
             album_normalized = re.sub(r"[^\w\s]", " ", album_lower)
             album_normalized = " ".join(album_normalized.split())
             album_words = {w for w in album_normalized.split() if len(w) > 2 and w not in STOPWORDS}
-            album_is_artist = parsed.artist and normalize_for_comparison(
+            album_is_artist = lib_artist and normalize_for_comparison(
                 album
-            ) == normalize_for_comparison(parsed.artist)
+            ) == normalize_for_comparison(lib_artist)
 
             filtered_results = []
             for item in results:
@@ -1423,10 +1442,10 @@ async def search_library_with_fallback(
             "falling through to artist search"
         )
 
-    if parsed.artist and parsed.song:
-        query = f"{parsed.artist} {parsed.song}"
+    if lib_artist and parsed.song:
+        query = f"{lib_artist} {parsed.song}"
         results = await db.search(query=query, limit=_FETCH_LIMIT)
-        results = filter_results_by_artist(results, parsed.artist)
+        results = filter_results_by_artist(results, lib_artist)
         results = _filter_results_by_album_match(results, parsed.album)
 
         if results:
@@ -1437,10 +1456,10 @@ async def search_library_with_fallback(
             )
             return results, True
 
-    if not all_results and parsed.artist:
-        logger.info(f"No results for albums {albums}, trying artist only: '{parsed.artist}'")
-        results = await db.search(query=parsed.artist, limit=_FETCH_LIMIT)
-        results = filter_results_by_artist(results, parsed.artist)
+    if not all_results and lib_artist:
+        logger.info(f"No results for albums {albums}, trying artist only: '{lib_artist}'")
+        results = await db.search(query=lib_artist, limit=_FETCH_LIMIT)
+        results = filter_results_by_artist(results, lib_artist)
         results = _filter_results_by_album_match(results, parsed.album)
         if results:
             return results, True
@@ -1458,6 +1477,12 @@ async def search_compilations_for_track(
     The second tuple element maps each surfaced library id to the
     :class:`~lookup.release_resolution.ResolvedRelease` it matched — the widened
     ``discogs_titles`` seam consumed by the artwork-binding step.
+
+    Two-channel seam (WXYC/library-metadata-lookup#626): the Discogs probes and
+    ``validate_release_for_track`` use the typed ``parsed.artist`` (via
+    ``artist_for_probes``); the library-side keyword search and the two
+    ``artist_matches_item`` match-backs use ``lib_artist`` (the correction when
+    present, else the typed name).
     """
     if not parsed.song or not parsed.artist:
         return [], {}
@@ -1467,6 +1492,7 @@ async def search_compilations_for_track(
     results = []
     seen_ids = set()
     discogs_titles: dict[int, ResolvedRelease] = {}
+    lib_artist = library_artist_for(parsed)
 
     # Carried-release ranking (LML#604 deferred finding #2). When the flag is on,
     # a library row matched by multiple releases binds the title-best one — the
@@ -1484,9 +1510,7 @@ async def search_compilations_for_track(
 
     keyword_matches = []
     try:
-        artist_words = (
-            re.sub(r"[^\w\s]", " ", parsed.artist.lower()).split() if parsed.artist else []
-        )
+        artist_words = re.sub(r"[^\w\s]", " ", lib_artist.lower()).split() if lib_artist else []
         song_words = re.sub(r"[^\w\s]", " ", parsed.song.lower()).split() if parsed.song else []
 
         sig_artist = [w for w in artist_words if len(w) > 3 and w not in STOPWORDS]
@@ -1502,7 +1526,7 @@ async def search_compilations_for_track(
             if keyword_results:
                 filtered_results = []
                 for item in keyword_results:
-                    if artist_matches_item(item, parsed.artist):
+                    if lib_artist and artist_matches_item(item, lib_artist):
                         filtered_results.append(item)
                     elif is_compilation_artist(item.artist or ""):
                         filtered_results.append(item)
@@ -1673,7 +1697,7 @@ async def search_compilations_for_track(
             if not matches and release_info.is_compilation:
                 matches = await search_album_fuzzy(db, f"Various {release_album}")
 
-            if matches and parsed.artist and not skip_artist_match_filter:
+            if matches and lib_artist and not skip_artist_match_filter:
                 from rapidfuzz import fuzz as _fuzz
 
                 filtered_matches = []
@@ -1681,7 +1705,7 @@ async def search_compilations_for_track(
                 release_album_lower = release_album.lower()
 
                 for match in matches:
-                    if artist_matches_item(match, parsed.artist):
+                    if artist_matches_item(match, lib_artist):
                         filtered_matches.append(match)
                     elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
                         title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
@@ -3245,7 +3269,16 @@ async def perform_lookup(
             )
         if corrected:
             corrected_artist = corrected
-            parsed.artist = corrected
+            # Two-channel seam (WXYC/library-metadata-lookup#626): do NOT
+            # overwrite ``parsed.artist``. The typed value must keep flowing to
+            # every Discogs-facing path (the three Discogs-aware strategies'
+            # probes, ``validate_release_for_track``, and the library-miss
+            # Discogs probe), or a *distinct* non-library artist one edit from a
+            # library name gets snapped into the library's vocabulary on Discogs.
+            # Thread the correction on ``library_artist``, read only by the
+            # library-side legs (``db.search`` queries + ``artist_matches_item``
+            # match-backs).
+            parsed.library_artist = corrected
     else:
         with telemetry.track_step("album_lookup"):
             albums_for_search, song_not_found = await resolve_albums_for_track(
