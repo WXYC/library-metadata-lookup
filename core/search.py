@@ -361,9 +361,11 @@ class SearchState:
     matched_via_by_id: dict[int, list[TrackMatchHint]] = field(default_factory=dict)
     """Per-library-id provenance for track-driven matches (catalog-track-search §5.1).
 
-    Populated by SONG_AS_TRACK when a track-title cross-reference surfaces a library
-    row. perform_lookup() reads this when building LookupResultItem.matched_via so
-    the API contract carries the track→release linkage back to the caller.
+    Populated by SONG_AS_TRACK, and by SWAPPED_INTERPRETATION when its narrowing
+    cross-references a track (LML#622) — both run through the shared
+    ``_match_track_releases_to_library`` kernel. perform_lookup() reads this when
+    building LookupResultItem.matched_via so the API contract carries the
+    track→release linkage back to the caller.
     """
 
     timed_out: bool = False
@@ -530,9 +532,10 @@ class Outcome:
         *,
         matched_via_by_id: dict[int, list[TrackMatchHint]],
     ) -> "Outcome":
-        """SONG_AS_TRACK's signal: track-driven match with per-id provenance.
+        """Track-driven match with per-id provenance (SONG_AS_TRACK; also
+        SWAPPED_INTERPRETATION's narrowing, LML#622).
 
-        The library row(s) were surfaced by cross-referencing the song against
+        The library row(s) were surfaced by cross-referencing a track against
         Discogs's tracklist index. Each row carries a TrackMatchHint pointing
         back to the release that surfaced it — the API contract uses this for
         the ``matched_via`` field per catalog-track-search §5.1.
