@@ -162,6 +162,33 @@ async def validate_release_for_track(
     return verdict
 
 
+def prerank_candidates_for_validation(
+    candidates: list[ReleaseInfo], album: str | None
+) -> list[ReleaseInfo]:
+    """Order probe candidates so the likeliest match is validated first (LML#633).
+
+    The bounded sequential-early-exit path validates candidates in this order and
+    returns the first that passes, so the ordering decides how few
+    ``validate_track_on_release`` calls the happy path costs.
+
+    With an ``album`` to match, this applies the same TITLE-only signal
+    ``rank_resolved_releases`` applies *after* validation — moved *before* it so
+    the top title match is tried first (stable ``release_id`` tie-break). With no
+    ``album`` there is nothing to title-rank, so it falls back to the #629
+    no-album rule: prefer an own-release (``is_compilation=False``) over a
+    compilation, then stable ``release_id``. The non-bounded path does not call
+    this — it validates every candidate and ranks ``rank_resolved_releases``
+    after, so its ordering is unchanged.
+    """
+    album_query = (album or "").strip()
+    if not album_query:
+        return sorted(candidates, key=lambda r: (r.is_compilation, r.release_id))
+    return sorted(
+        candidates,
+        key=lambda r: (-score_match(album_query, r.album), r.release_id),
+    )
+
+
 def rank_resolved_releases(
     releases: list[ResolvedRelease], album: str | None
 ) -> list[ResolvedRelease]:
@@ -192,6 +219,7 @@ async def resolve_release_for_track(
     discogs_service: DiscogsService | None,
     *,
     also_probe_album_title: bool = False,
+    max_validations: int | None = None,
 ) -> list[ResolvedRelease]:
     """Find and validate the Discogs release(s) a track sits on.
 
@@ -200,6 +228,23 @@ async def resolve_release_for_track(
     via ``validate_track_on_release`` (which matches the per-track credit, not the
     release credit), and returns the validated releases ranked by title match to
     ``album``. Empty when nothing validates.
+
+    ``max_validations`` selects between two validation modes (LML#633):
+
+    - **Default (``None``) — validate-all, rank-after.** Every candidate is
+      validated; the survivors are ranked by ``rank_resolved_releases``. This is
+      the original behavior the #604 lazy-bind callers depend on, kept
+      byte-for-byte; they pass no bound.
+    - **Bounded (an int) — sequential-early-exit.** Candidates are pre-ranked by
+      ``prerank_candidates_for_validation`` (the title signal moved *before*
+      validation), validated in that order, and the **first** that validates is
+      returned — stopping after at most ``max_validations`` attempts. This is the
+      cold-cache cost cap #628 points at every non-library add: a popular track
+      with 20-40 candidates costs 1 validate call on the happy path (top title
+      match validates) instead of 20-40, and the N=5 backstop bounds the worst
+      case. Sequential (not concurrent) to minimize Discogs quota — the binding
+      constraint — and degrade gently under the fallthrough seam's rate-limit
+      cool-down. (See the #625 decision record.)
 
     When ``also_probe_album_title`` is set and ``album`` is non-empty, a third
     album-title probe (``search_releases_by_album_title``) joins the Wave A/B
@@ -266,10 +311,10 @@ async def resolve_release_for_track(
                 candidates.append(r)
                 seen_ids.add(r.release_id)
 
-    validated: list[ResolvedRelease] = []
-    for release in candidates:
-        if not release.release_id:
-            continue
+    async def _validate_one(release: ReleaseInfo) -> ResolvedRelease | None:
+        """Validate one candidate's per-track credit; return the ``ResolvedRelease``
+        on a pass, ``None`` on a fail or a swallowed validation error (a single
+        candidate's failure must never abort the whole call)."""
         try:
             is_valid = await validate_release_for_track(
                 discogs_service, release.release_id, song, artist, source="release_resolution"
@@ -278,17 +323,36 @@ async def resolve_release_for_track(
             logger.warning(
                 "Release-resolution validation failed for release %s: %s", release.release_id, exc
             )
-            continue
+            return None
         if not is_valid:
-            continue
-        validated.append(
-            ResolvedRelease(
-                release_id=release.release_id,
-                release_url=release.release_url,
-                is_compilation=bool(release.is_compilation),
-                album_title=release.album,
-            )
+            return None
+        return ResolvedRelease(
+            release_id=release.release_id,
+            release_url=release.release_url,
+            is_compilation=bool(release.is_compilation),
+            album_title=release.album,
         )
+
+    if max_validations is not None:
+        # Bounded sequential-early-exit (LML#633): pre-rank, validate in order,
+        # return the first that passes, stop after ``max_validations`` attempts.
+        # Falsy-id rows can never be validated, so drop them before counting the
+        # budget — they must not consume an attempt slot.
+        ranked = prerank_candidates_for_validation([r for r in candidates if r.release_id], album)
+        for release in ranked[:max_validations]:
+            resolved = await _validate_one(release)
+            if resolved is not None:
+                return [resolved]
+        return []
+
+    # Default: validate-all, rank-after (the #604 lazy-bind contract).
+    validated: list[ResolvedRelease] = []
+    for release in candidates:
+        if not release.release_id:
+            continue
+        resolved = await _validate_one(release)
+        if resolved is not None:
+            validated.append(resolved)
 
     return rank_resolved_releases(validated, album)
 
