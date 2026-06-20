@@ -966,6 +966,63 @@ class TestSearchWithAlternativeInterpretation:
         assert {r.id for r in results} == {1}
         assert matched_via == {}
 
+    @pytest.mark.asyncio
+    async def test_narrowing_excludes_other_artist_release(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """``require_artist`` keeps the narrow scoped to the identified artist:
+        ``search_releases_by_track``'s under-3-results keyword supplement can
+        return another artist's release, but those rows must not be surfaced."""
+        jefferson = make_library_item(id=1, artist="Jefferson Airplane", title="Bark")
+        # part1="Today" → no artist match; part2="Jefferson Airplane" → results2.
+        mock_library_db.search.side_effect = [[], [jefferson]]
+        # The Discogs track search (artist-filtered + keyword supplement) leaks a
+        # wrong-artist release whose album fuzzy-matches a wrong-artist library row.
+        byrds_row = make_library_item(id=10, artist="The Byrds", title="Younger Than Yesterday")
+        mock_library_db.exact_title.side_effect = lambda title: (
+            [byrds_row] if title == "Younger Than Yesterday" else []
+        )
+        mock_discogs_service.search_releases_by_track = AsyncMock(
+            return_value=self._track_releases(
+                ReleaseInfo(
+                    album="Younger Than Yesterday",
+                    artist="The Byrds",
+                    release_id=901,
+                    release_url="https://www.discogs.com/release/901",
+                    is_compilation=False,
+                )
+            )
+        )
+        mock_discogs_service.validate_track_on_release = AsyncMock(return_value=True)
+
+        results, matched_via = await search_with_alternative_interpretation(
+            mock_library_db, "Today", "Jefferson Airplane", discogs_service=mock_discogs_service
+        )
+
+        # The Byrds row is dropped; we fall back to the identified artist's rows.
+        assert {r.id for r in results} == {1}
+        assert all(r.id != 10 for r in results)
+        assert matched_via == {}
+
+    @pytest.mark.asyncio
+    async def test_both_interpretations_branch_is_not_narrowed(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """When both readings resolve to a library artist, the union is returned
+        un-narrowed with no hints and no Discogs call (documented scoping)."""
+        row_a = make_library_item(id=1, artist="Stereolab", title="Dots and Loops")
+        row_b = make_library_item(id=2, artist="Cat Power", title="Moon Pix")
+        mock_library_db.search.side_effect = [[row_a], [row_b]]
+        mock_discogs_service.search_releases_by_track = AsyncMock()
+
+        results, matched_via = await search_with_alternative_interpretation(
+            mock_library_db, "Stereolab", "Cat Power", discogs_service=mock_discogs_service
+        )
+
+        assert {r.id for r in results} == {1, 2}
+        assert matched_via == {}
+        mock_discogs_service.search_releases_by_track.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Tests: filter_results_by_track_validation
