@@ -148,10 +148,11 @@ def _make_mock_discogs_service():
 
     mock.validate_track_on_release = AsyncMock(side_effect=mock_validate)
 
-    # Track search (for song -> album resolution). Mirrors the real
+    # Track search. Mirrors the real
     # ``search_releases_by_track(track, artist, limit, artist_as_keyword=...)``
-    # signature — ``lookup_releases_by_track`` passes ``limit`` positionally,
-    # and SWAPPED_INTERPRETATION now routes through it too (LML#622).
+    # signature: SONG_AS_TRACK, the ``lookup_releases_by_track`` helper (which
+    # passes ``limit`` positionally), and SWAPPED_INTERPRETATION's narrowing
+    # (via the shared kernel, LML#622) all call this with varying arg shapes.
     async def mock_search_by_track(track, artist=None, limit=20, **kwargs):
         track_lower = track.lower()
         if "paradoja" in track_lower:

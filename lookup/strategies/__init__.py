@@ -60,7 +60,9 @@ def build_strategies(
         search_library_func: Implements ARTIST_PLUS_ALBUM
             (``search_library_with_fallback`` in production).
         search_alternative_func: Implements SWAPPED_INTERPRETATION
-            (``search_with_alternative_interpretation`` in production).
+            (``functools.partial(search_with_alternative_interpretation,
+            discogs_service=...)`` in production — it cross-references the
+            non-artist token as a track to narrow results, LML#622).
         search_compilations_func: Implements TRACK_ON_COMPILATION
             (``functools.partial(search_compilations_for_track,
             discogs_service=...)`` in production).
