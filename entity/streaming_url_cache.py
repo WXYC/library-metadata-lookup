@@ -72,17 +72,22 @@ logger = logging.getLogger(__name__)
 # visible within a week.
 DEFAULT_MISS_TTL = timedelta(days=7)
 
-# The two services PR-1 ships. The named CHECK constraint pins this set at
-# the DB level; PR-3 ALTERs it to add 'bandcamp' and 'deezer_album'. Kept as
-# a module constant so the bootstrap DDL and a parity test can both reference
-# it without re-typing the literal.
-_PR1_SERVICES = ("apple_music_album", "spotify_album")
+# The services the cache ships. The named CHECK constraint pins this set at
+# the DB level; a future PR adding a service (Deezer's 'deezer_album') extends
+# this tuple and the ALTER below picks it up. Kept as a module constant so the
+# bootstrap DDL and a parity test can both reference it without re-typing the
+# literal. PR-3 added 'bandcamp'.
+_SERVICES = ("apple_music_album", "spotify_album", "bandcamp")
+
+# Shared IN-list literal so the CREATE-time CHECK and the idempotent ALTER are
+# generated from the same source — they can never drift.
+_SERVICE_IN_LIST = ", ".join(f"'{s}'" for s in _SERVICES)
 
 _DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
 # Named CHECK constraint (``album_streaming_url_cache_service_valid``) avoids
-# reliance on PG auto-naming so PR-3's ALTER can DROP/ADD it by name. The
-# service-value list is generated from ``_PR1_SERVICES`` so the two stay in
+# reliance on PG auto-naming so the ALTER below can DROP/ADD it by name. The
+# service-value list is generated from ``_SERVICES`` so the two stay in
 # lockstep.
 _DDL_TABLE = f"""\
 CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
@@ -93,9 +98,24 @@ CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
     last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (service, artist_normalized, album_normalized),
     CONSTRAINT album_streaming_url_cache_service_valid CHECK (
-        service IN ({", ".join(f"'{s}'" for s in _PR1_SERVICES)})
+        service IN ({_SERVICE_IN_LIST})
     )
 )\
+"""
+
+# Idempotent widen of the named CHECK. ``CREATE TABLE IF NOT EXISTS`` is a
+# no-op on an already-created prod table, so a new service value added to
+# ``_SERVICES`` would never reach an existing table without this ALTER. The
+# DROP-IF-EXISTS + ADD pair is byte-stable across boots (a no-op once the
+# constraint already matches) and runs atomically within the single statement.
+# The ADD re-validates existing rows; the set only ever grows, so apple/spotify
+# rows always pass. Driven from the same ``_SERVICE_IN_LIST`` as the CREATE.
+_DDL_ALTER_CHECK = f"""\
+ALTER TABLE lml_cache.album_streaming_url_cache
+    DROP CONSTRAINT IF EXISTS album_streaming_url_cache_service_valid,
+    ADD CONSTRAINT album_streaming_url_cache_service_valid CHECK (
+        service IN ({_SERVICE_IN_LIST})
+    )\
 """
 
 # Staleness lives in the WHERE clause (LML#576). ``$1`` is the service key,
@@ -133,9 +153,15 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
     boot LML cleanly. If the discogs-cache PG is unreachable at startup, the
     caller logs and continues; the cache layer degrades to a no-op until the
     next deploy.
+
+    The final ALTER widens the named CHECK constraint to the current
+    ``_SERVICES`` set. ``CREATE TABLE IF NOT EXISTS`` cannot add a value to an
+    already-created table's constraint, so without the ALTER a prod table frozen
+    at an older service set would reject UPSERTs for a newly-added service.
     """
     await pg.execute(_DDL_SCHEMA)
     await pg.execute(_DDL_TABLE)
+    await pg.execute(_DDL_ALTER_CHECK)
 
 
 @dataclass(frozen=True)

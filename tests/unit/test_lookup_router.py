@@ -180,6 +180,44 @@ class TestHandleLookup:
         assert mock_lookup.await_args.kwargs.get("caller_budget_ms") is None
 
     @pytest.mark.asyncio
+    async def test_bandcamp_client_forwarded_to_perform_lookup(
+        self, mock_db, mock_discogs, mock_settings
+    ):
+        """LML#573 PR-3: the Bandcamp client dependency must flow into
+        perform_lookup so the streaming-URL cache post-process can run the
+        Bandcamp leg. Without this the leg is dead even with the flag on.
+        """
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+        from streaming.dependencies import get_bandcamp_client
+
+        sentinel = object()
+        response = LookupResponse(results=[], search_type="direct")
+
+        with (
+            override_deps(
+                app,
+                {
+                    get_library_db: mock_db,
+                    get_discogs_service: mock_discogs,
+                    get_posthog_client: None,
+                    get_settings: mock_settings,
+                    get_bandcamp_client: sentinel,
+                },
+            ),
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_args.kwargs.get("bandcamp") is sentinel
+
+    @pytest.mark.asyncio
     async def test_extended_flag_forwarded_to_perform_lookup(self, app_client):
         """When the request body sets extended=true, the LookupRequest carried
         into perform_lookup must reflect that. The router is a thin layer;
