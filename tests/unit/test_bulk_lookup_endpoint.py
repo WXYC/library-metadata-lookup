@@ -135,6 +135,30 @@ class TestBulkLookupEndpoint:
         assert mock_lookup.await_args.kwargs.get("allow_release_resolution_fallback") is False
 
     @pytest.mark.asyncio
+    async def test_bulk_does_not_forward_bandcamp_client(self, app_client):
+        """The bulk drain must NOT run the Bandcamp leg: its client is rate-
+        limited to 1 req/s, so a per-item live probe would serialize a 35k-album
+        drain into hours of requests against Bandcamp. The handler passes
+        bandcamp=None so the post-process skips the Bandcamp leg on bulk (the
+        search-URL fallback still applies). LML#573 PR-3."""
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_no_match_response(),
+        ) as mock_lookup:
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={"items": [{"artist": "Juana Molina", "album": "DOGA"}]},
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_count == 1
+        assert mock_lookup.await_args.kwargs.get("bandcamp") is None
+
+    @pytest.mark.asyncio
     async def test_results_preserve_input_order(self, app_client):
         """Even with mixed match/no_match/error, response[i] corresponds to request[i]."""
 

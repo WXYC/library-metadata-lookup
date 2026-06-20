@@ -3618,6 +3618,46 @@ class TestBandcampStreamingUrlPostprocessWiring:
         assert enriched.bandcamp_url == album_url
 
     @pytest.mark.asyncio
+    async def test_empty_string_streaming_link_normalized_to_none_for_postprocess(self):
+        # A librarian-curated streaming_links row can carry an empty-string
+        # bandcamp_url (library.db returns the column verbatim, no '' -> None
+        # coercion). It must be normalized to None in the `update` dict so the
+        # post-process active-filter (`is None`) and the deferred search-URL
+        # fallback (`not …`) agree: an empty string must NOT silently disable
+        # the cache/probe leg while still triggering the search fallback.
+        item = make_library_item(id=42, artist="Juana Molina", title="DOGA")
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": None,
+                "apple_music_url": None,
+                "youtube_music_url": None,
+                "bandcamp_url": "",
+                "soundcloud_url": None,
+            }
+        )
+        captured = {}
+
+        async def _capture(update, **kwargs):
+            captured["bandcamp_url_at_call"] = update["bandcamp_url"]
+
+        with patch(
+            "lookup.orchestrator.apply_streaming_url_postprocess",
+            new=AsyncMock(side_effect=_capture),
+        ):
+            await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="la paradoja",
+                album="DOGA",
+                bandcamp=AsyncMock(),
+                library_db=library_db,
+            )
+
+        assert captured["bandcamp_url_at_call"] is None
+
+    @pytest.mark.asyncio
     async def test_search_fallback_applies_when_postprocess_leaves_url_none(self):
         # Post-process is a no-op (flag off / cache miss / client absent); the
         # deferred search-URL fallback still fills bandcamp_url.
