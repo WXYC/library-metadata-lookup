@@ -217,6 +217,15 @@ class Settings(BaseSettings):
             "supplies True. New in PR-1. See WXYC/library-metadata-lookup#573."
         ),
     )
+    lml_persist_streaming_url_bandcamp: bool = Field(
+        default=False,
+        description=(
+            "Per-service flag for Bandcamp in the streaming-URL cache "
+            "post-process. A service persists only when this AND "
+            "LML_PERSIST_STREAMING_URLS are both True. Default False; Railway "
+            "supplies True. New in PR-3. See WXYC/library-metadata-lookup#573."
+        ),
+    )
     # Streaming Webhook Configuration
     streaming_webhook_urls: str | None = Field(
         None,

@@ -25,6 +25,7 @@ from wxyc_fastapi.observability import (
     get_cache_stats_recorder,
 )
 
+from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient, AppleMusicTrackMatch
 from clients.streaming.matching import (
     SCORE_MATCH_ACCEPTANCE_FLOOR,
@@ -2463,6 +2464,7 @@ async def enrich_artwork_results(
     mb_pg: PgSourceProtocol | None = None,
     apple_music: AppleMusicClient | None = None,
     spotify: SpotifyClient | None = None,
+    bandcamp: BandcampClient | None = None,
     entity_store: EntityStore | None = None,
     discogs_cache_pg: PgSource | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
@@ -2904,17 +2906,17 @@ async def enrich_artwork_results(
         # Fall back to search URLs for any service without a direct link.
         # Spotify's templated fallback was deleted in LML#573 — the persistent
         # streaming-URL cache post-process below now backstops spotify_url with
-        # a real album page (and mints the identity) instead of a generic
-        # search URL. YouTube Music / Bandcamp / SoundCloud keep their templated
-        # fallbacks (no album-cache tier for them in PR-1; Bandcamp joins in PR-3).
+        # a real album page (and mints the identity) instead of a generic search
+        # URL. Bandcamp's fallback is DEFERRED past the post-process (LML#573
+        # PR-3): the post-process only fires when its URL field is ``None``, so a
+        # pre-filled search URL would silently disable the Bandcamp leg — the
+        # search URL is applied below, only if the cache/probe leaves it None.
+        # YouTube Music / SoundCloud have no album-cache tier, so they keep
+        # their pre-post-process templated fallbacks.
         if row_artist and search_term:
             if not youtube_music_url:
                 youtube_music_url = _build_streaming_search_url(
                     "https://music.youtube.com/search?q=", row_artist, search_term
-                )
-            if not bandcamp_url:
-                bandcamp_url = _build_streaming_search_url(
-                    "https://bandcamp.com/search?q=", row_artist, search_term
                 )
             if not soundcloud_url:
                 soundcloud_url = _build_streaming_search_url(
@@ -2935,24 +2937,35 @@ async def enrich_artwork_results(
         # LML "streaming URLs for non-library albums" (LML#573) — when the
         # existing per-item probe + override couldn't surface a service URL,
         # the polymorphic post-process runs a cache-backed probe per configured
-        # service (Apple + Spotify) with the REQUEST's (artist, album) — not the
-        # library row's. Fixes the wrong-fallback-row attack (non-library album
-        # like Hyd / "Hold Onto Me Infinity" falls back to a same-titled library
-        # row by a different artist, in-line probe runs with the wrong artist
-        # name → null). Results persist to ``lml_cache.album_streaming_url_cache``
-        # so future lookups short-circuit the upstream API, and live resolutions
-        # mint the parsed ID into ``entity.release_identity``. The ``clients``
-        # dict may carry ``None`` values (e.g. Spotify creds unconfigured) — the
-        # post-process filters them. Gated by the master + per-service flags.
+        # service (Apple + Spotify + Bandcamp) with the REQUEST's (artist, album)
+        # — not the library row's. Fixes the wrong-fallback-row attack
+        # (non-library album like Hyd / "Hold Onto Me Infinity" falls back to a
+        # same-titled library row by a different artist, in-line probe runs with
+        # the wrong artist name → null). Results persist to
+        # ``lml_cache.album_streaming_url_cache`` so future lookups short-circuit
+        # the upstream API, and live resolutions mint the parsed ID into
+        # ``entity.release_identity``. The ``clients`` dict may carry ``None``
+        # values (e.g. Spotify creds unconfigured) — the post-process filters
+        # them. Gated by the master + per-service flags.
         await apply_streaming_url_postprocess(
             update,
-            clients={"apple_music": apple_music, "spotify": spotify},
+            clients={"apple_music": apple_music, "spotify": spotify, "bandcamp": bandcamp},
             pg=discogs_cache_pg,
             entity_store=entity_store,
             request_artist=artist,
             request_album=album,
             settings=get_settings(),
         )
+
+        # Bandcamp's templated search-URL fallback, deferred past the
+        # post-process (LML#573 PR-3): apply it only if the cache/probe (and any
+        # librarian-curated streaming_links override) left bandcamp_url empty, so
+        # a resolved album page / direct link always wins over the generic search
+        # link. Priority: direct link > cache/probe > search URL.
+        if row_artist and search_term and not update["bandcamp_url"]:
+            update["bandcamp_url"] = _build_streaming_search_url(
+                "https://bandcamp.com/search?q=", row_artist, search_term
+            )
 
         # Extended fields land on the top-1 result only and require artwork
         # (same positional + artwork gating as the album-derived scalars).
@@ -3235,6 +3248,7 @@ async def perform_lookup(
     mb_pg: PgSourceProtocol | None = None,
     apple_music: AppleMusicClient | None = None,
     spotify: SpotifyClient | None = None,
+    bandcamp: BandcampClient | None = None,
     discogs_cache_pg: PgSource | None = None,
     caller_budget_ms: int | None = None,
     allow_release_resolution_fallback: bool = True,
@@ -3472,6 +3486,7 @@ async def perform_lookup(
                 mb_pg=mb_pg,
                 apple_music=apple_music,
                 spotify=spotify,
+                bandcamp=bandcamp,
                 entity_store=entity_store,
                 discogs_cache_pg=discogs_cache_pg,
             )

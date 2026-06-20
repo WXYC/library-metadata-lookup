@@ -71,6 +71,7 @@ from entity.streaming_url_cache import (
 from identity.release_validation import validate_and_canonicalize_external_id
 from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, probe_timeout_s_from_env
 from release.apple_music_url_parser import apple_album_id_from_url
+from release.bandcamp_url_parser import bandcamp_album_id_from_url
 from release.spotify_url_parser import spotify_album_id_from_url
 
 if TYPE_CHECKING:
@@ -84,6 +85,14 @@ logger = logging.getLogger(__name__)
 # Bandcamp may run looser). A service whose entry also sets ``timeout_env_var``
 # can be retuned at request time via that env var (see _effective_probe_timeout_s).
 _DEFAULT_PROBE_TIMEOUT_S = 4.0
+
+# Bandcamp runs looser than the 4s default: its 1 req/s rate limit (and 2-way
+# concurrency cap) makes burst queue waits — not the HTTP round-trip — the
+# dominant cost, so a tight ceiling would time out healthy probes under load.
+# Ships at 9.0 without the offline pre-warmer; drops to ``_DEFAULT_PROBE_TIMEOUT_S``
+# once #548's warmer populates the cache ahead of the hot path
+# (WXYC/library-metadata-lookup#573).
+_BANDCAMP_PROBE_TIMEOUT_S = 9.0
 
 
 @dataclass(frozen=True)
@@ -120,11 +129,11 @@ class StreamingUrlCacheConfig:
 # Cache + post-process registry. Deliberately a SUBSET of
 # ``identity.release_validation.RELEASE_SOURCE_CONFIG`` (5 entries): Discogs
 # release/master are identity-only (never resolved from a live streaming
-# probe), and Bandcamp is identity-mintable but only joins the cache config in
-# PR-3. Only Apple + Spotify are both minted-from-live-probe AND URL-cached in
-# PR-1. The parity test asserts these keys ⊆ RELEASE_SOURCE_CONFIG keys; the
-# completeness guard in the test suite pins the exact key set. PR-3 ALTERs the
-# table's named CHECK constraint and adds 'bandcamp' + 'deezer_album' here.
+# probe). Apple + Spotify (PR-1) and Bandcamp (PR-3) are all
+# minted-from-live-probe AND URL-cached. The parity test asserts these keys ⊆
+# RELEASE_SOURCE_CONFIG keys; the completeness guard in the test suite pins the
+# exact key set. A future PR adds Deezer ('deezer_album') here and ALTERs the
+# table's named CHECK constraint to match.
 STREAMING_URL_CACHE_CONFIG: dict[str, StreamingUrlCacheConfig] = {
     "apple_music_album": StreamingUrlCacheConfig(
         miss_ttl=DEFAULT_MISS_TTL,
@@ -144,6 +153,17 @@ STREAMING_URL_CACHE_CONFIG: dict[str, StreamingUrlCacheConfig] = {
         url_field="spotify_url",
         client_attr="spotify",
         flag_setting="lml_persist_streaming_url_spotify",
+    ),
+    "bandcamp": StreamingUrlCacheConfig(
+        miss_ttl=DEFAULT_MISS_TTL,
+        # Looser ceiling than Apple/Spotify — see _BANDCAMP_PROBE_TIMEOUT_S.
+        probe_timeout_s=_BANDCAMP_PROBE_TIMEOUT_S,
+        # Bandcamp's external_id IS the canonical album URL (no opaque ID); the
+        # extractor returns the parser-canonical URL the validator expects.
+        url_to_external_id=bandcamp_album_id_from_url,
+        url_field="bandcamp_url",
+        client_attr="bandcamp",
+        flag_setting="lml_persist_streaming_url_bandcamp",
     ),
 }
 

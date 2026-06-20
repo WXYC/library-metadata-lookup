@@ -60,6 +60,7 @@ _CASES: dict[str, dict] = {
         "url_field": "apple_music_url",
         "client_attr": "apple_music",
         "flag_setting": "lml_persist_streaming_url_apple_music",
+        "probe_timeout_s": 4.0,
         "resolved_url": "https://music.apple.com/us/album/foo/1234567890",
         "external_id": "1234567890",
         # Matches the parser's \d{6,} floor but fails the validator's
@@ -70,10 +71,27 @@ _CASES: dict[str, dict] = {
         "url_field": "spotify_url",
         "client_attr": "spotify",
         "flag_setting": "lml_persist_streaming_url_spotify",
+        "probe_timeout_s": 4.0,
         "resolved_url": "https://open.spotify.com/album/1A2GTWGt0LBTGQAyA3OKAf",
         "external_id": "1A2GTWGt0LBTGQAyA3OKAf",
         # No numeric/22-char ID to parse — surfaces URL, skips mint.
         "unmintable_but_parseable_url": "https://open.spotify.com/album/short",
+    },
+    "bandcamp": {
+        "url_field": "bandcamp_url",
+        "client_attr": "bandcamp",
+        "flag_setting": "lml_persist_streaming_url_bandcamp",
+        # Looser than Apple/Spotify (4.0): Bandcamp's 1 req/s rate limit makes
+        # burst queue waits the dominant cost; tightened to 4.0 once the offline
+        # warmer (#548) lands. See WXYC/library-metadata-lookup#573.
+        "probe_timeout_s": 9.0,
+        # Bandcamp's external_id IS the canonical album URL (no opaque ID), so
+        # resolved_url == external_id after canonicalization.
+        "resolved_url": "https://juanamolina.bandcamp.com/album/doga",
+        "external_id": "https://juanamolina.bandcamp.com/album/doga",
+        # A non-Bandcamp URL: the extractor returns None (parse_url rejects the
+        # host) so the URL surfaces but the mint is skipped.
+        "unmintable_but_parseable_url": "https://example.com/album/doga",
     },
 }
 
@@ -87,6 +105,7 @@ def _settings(*enabled_services: str, master: bool = True) -> SimpleNamespace:
         "lml_persist_streaming_urls": master,
         "lml_persist_streaming_url_apple_music": False,
         "lml_persist_streaming_url_spotify": False,
+        "lml_persist_streaming_url_bandcamp": False,
     }
     for service in enabled_services:
         flags[_FLAG_BY_SERVICE[service]] = True
@@ -583,26 +602,31 @@ class TestSentryProjection:
 
 
 class TestRegistryInvariants:
-    """The cache registry is the 2-entry subset; guards keep it from drifting."""
+    """The cache registry is a subset of the identity registry; guards keep it
+    from drifting."""
 
     def test_parametrize_keys_match_cache_config(self):
         assert set(_CASES) == set(STREAMING_URL_CACHE_CONFIG.keys())
 
     def test_cache_config_is_subset_of_release_source_config(self):
-        # PR-1 parity invariant: every cached service must be identity-mintable.
+        # Parity invariant: every cached service must be identity-mintable.
         assert set(STREAMING_URL_CACHE_CONFIG.keys()) <= set(RELEASE_SOURCE_CONFIG.keys())
 
     def test_cache_config_matches_table_check_constraint_allowlist(self):
         # The cache table's named CHECK constraint pins the allowed ``service``
-        # values from ``_PR1_SERVICES``. A registry service NOT in that
-        # allowlist would fail every UPSERT at runtime; an allowlist value with
-        # no registry entry would be dead. Lock them together.
-        from entity.streaming_url_cache import _PR1_SERVICES
+        # values from ``_SERVICES``. A registry service NOT in that allowlist
+        # would fail every UPSERT at runtime; an allowlist value with no
+        # registry entry would be dead. Lock them together.
+        from entity.streaming_url_cache import _SERVICES
 
-        assert set(STREAMING_URL_CACHE_CONFIG.keys()) == set(_PR1_SERVICES)
+        assert set(STREAMING_URL_CACHE_CONFIG.keys()) == set(_SERVICES)
 
-    def test_cache_config_ships_exactly_apple_and_spotify(self):
-        assert set(STREAMING_URL_CACHE_CONFIG.keys()) == {"apple_music_album", "spotify_album"}
+    def test_cache_config_ships_apple_spotify_and_bandcamp(self):
+        assert set(STREAMING_URL_CACHE_CONFIG.keys()) == {
+            "apple_music_album",
+            "spotify_album",
+            "bandcamp",
+        }
 
     @pytest.mark.parametrize("service", list(_CASES))
     def test_cache_config_fields_match_expectations(self, service):
@@ -611,7 +635,7 @@ class TestRegistryInvariants:
         assert cfg.url_field == case["url_field"]
         assert cfg.client_attr == case["client_attr"]
         assert cfg.flag_setting == case["flag_setting"]
-        assert cfg.probe_timeout_s == 4.0
+        assert cfg.probe_timeout_s == case["probe_timeout_s"]
         # The service key doubles as the mint source; the subset invariant
         # (test_cache_config_is_subset_of_release_source_config) guarantees it
         # keys into RELEASE_SOURCE_CONFIG, so there's no mint_source field.
@@ -648,6 +672,18 @@ class TestPerServiceTimeoutResolution:
     def test_spotify_entry_has_no_env_var(self):
         # New service — no back-compat env knob; static per-service default.
         assert STREAMING_URL_CACHE_CONFIG["spotify_album"].timeout_env_var is None
+
+    def test_bandcamp_entry_has_no_env_var(self):
+        # New service — no back-compat env knob; static per-service default.
+        assert STREAMING_URL_CACHE_CONFIG["bandcamp"].timeout_env_var is None
+
+    def test_bandcamp_effective_timeout_is_static_nine_seconds(self, monkeypatch):
+        from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
+
+        # Apple's env must not bleed into Bandcamp; its ceiling stays the loose
+        # 9.0s static default (tightened once the offline warmer lands).
+        monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
+        assert mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG["bandcamp"]) == 9.0
 
     def test_apple_effective_timeout_honors_env_override(self, monkeypatch):
         from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR

@@ -41,6 +41,7 @@ from streaming.models import SourceMatch
 _SERVICE_CASES = [
     ("apple_music_album", "https://music.apple.com/us/album/aluminum-tunes/1234567890"),
     ("spotify_album", "https://open.spotify.com/album/1A2GTWGt0LBTGQAyA3OKAf"),
+    ("bandcamp", "https://juanamolina.bandcamp.com/album/doga"),
 ]
 
 
@@ -92,7 +93,7 @@ class TestSchemaBootstrap:
 
     @pytest.mark.asyncio
     async def test_named_check_constraint_rejects_unknown_service(self, pg_pool):
-        # The CHECK must actually fire for a service outside the PR-1 set.
+        # The CHECK must actually fire for a service outside the shipped set.
         with pytest.raises(asyncpg.PostgresError):
             async with pg_pool.acquire() as conn:
                 await conn.execute(
@@ -100,6 +101,51 @@ class TestSchemaBootstrap:
                     "(service, artist_normalized, album_normalized, url) "
                     "VALUES ('deezer_album', 'x', 'y', 'https://example.test')"
                 )
+
+    @pytest.mark.asyncio
+    async def test_alter_widens_check_on_preexisting_table(self, pg_pool, pg_source):
+        # The production migration path: a prod table frozen at the pre-bandcamp
+        # service set must pick up 'bandcamp' on the next boot. CREATE TABLE IF
+        # NOT EXISTS is a no-op on the existing table; the idempotent ALTER is
+        # what widens the named CHECK in place.
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS lml_cache CASCADE")
+            await conn.execute("CREATE SCHEMA lml_cache")
+            await conn.execute(
+                "CREATE TABLE lml_cache.album_streaming_url_cache ("
+                "  service TEXT NOT NULL,"
+                "  artist_normalized TEXT NOT NULL,"
+                "  album_normalized TEXT NOT NULL,"
+                "  url TEXT,"
+                "  last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+                "  PRIMARY KEY (service, artist_normalized, album_normalized),"
+                "  CONSTRAINT album_streaming_url_cache_service_valid CHECK ("
+                "    service IN ('apple_music_album', 'spotify_album')"
+                "  )"
+                ")"
+            )
+
+        # Pre-ALTER: bandcamp violates the frozen constraint.
+        with pytest.raises(asyncpg.PostgresError):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO lml_cache.album_streaming_url_cache "
+                    "(service, artist_normalized, album_normalized, url) "
+                    "VALUES ('bandcamp', 'x', 'y', 'https://x.bandcamp.com/album/y')"
+                )
+
+        # Re-boot: the ALTER widens the CHECK so bandcamp now inserts.
+        await set_up_streaming_url_cache_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO lml_cache.album_streaming_url_cache "
+                "(service, artist_normalized, album_normalized, url) "
+                "VALUES ('bandcamp', 'x', 'y', 'https://x.bandcamp.com/album/y')"
+            )
+            row = await conn.fetchrow(
+                "SELECT url FROM lml_cache.album_streaming_url_cache WHERE service = 'bandcamp'"
+            )
+        assert row["url"] == "https://x.bandcamp.com/album/y"
 
 
 @pytest.mark.pg

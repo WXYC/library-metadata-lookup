@@ -3547,3 +3547,93 @@ class TestSiblingOverrideProbeDivergence:
         # Probe gave no contradicting signal — override survives.
         assert enriched.spotify_url == override_spotify
         assert enriched.apple_music_url == override_apple
+
+
+class TestBandcampStreamingUrlPostprocessWiring:
+    """LML#573 PR-3: the orchestrator must thread the Bandcamp client into the
+    streaming-URL cache post-process, AND defer Bandcamp's templated search-URL
+    fallback until *after* the post-process so a resolved album page wins over
+    the generic search link (the post-process only fires when the field is
+    ``None``, so a pre-filled search URL would silently disable the leg)."""
+
+    @pytest.mark.asyncio
+    async def test_bandcamp_client_threaded_into_postprocess_clients(self):
+        item = make_library_item(artist="Juana Molina", title="DOGA")
+        bandcamp = AsyncMock()
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=None)
+        apple_music.find_track_url = AsyncMock(return_value=None)
+        spotify = AsyncMock()
+
+        with patch(
+            "lookup.orchestrator.apply_streaming_url_postprocess",
+            new=AsyncMock(),
+        ) as postprocess:
+            await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="la paradoja",
+                album="DOGA",
+                apple_music=apple_music,
+                spotify=spotify,
+                bandcamp=bandcamp,
+            )
+
+        postprocess.assert_awaited_once()
+        clients = postprocess.await_args.kwargs["clients"]
+        assert clients["bandcamp"] is bandcamp
+        assert clients["apple_music"] is apple_music
+        assert clients["spotify"] is spotify
+
+    @pytest.mark.asyncio
+    async def test_postprocess_sees_bandcamp_url_none_then_resolved_url_wins(self):
+        # The post-process's active-filter only fires for a service whose URL
+        # field is ``None``. If the templated search fallback pre-filled
+        # bandcamp_url, the leg would be silently disabled — so the field MUST
+        # still be None when the post-process runs. Capture it at call time to
+        # pin the ordering, then resolve a real album page and assert it wins.
+        item = make_library_item(artist="Juana Molina", title="DOGA")
+        album_url = "https://juanamolina.bandcamp.com/album/doga"
+        captured = {}
+
+        async def _resolve(update, **kwargs):
+            captured["bandcamp_url_at_call"] = update["bandcamp_url"]
+            update["bandcamp_url"] = album_url
+
+        with patch(
+            "lookup.orchestrator.apply_streaming_url_postprocess",
+            new=AsyncMock(side_effect=_resolve),
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="la paradoja",
+                album="DOGA",
+                bandcamp=AsyncMock(),
+            )
+
+        # Ordering invariant: the search fallback had not yet run.
+        assert captured["bandcamp_url_at_call"] is None
+        _, enriched = results[0]
+        assert enriched.bandcamp_url == album_url
+
+    @pytest.mark.asyncio
+    async def test_search_fallback_applies_when_postprocess_leaves_url_none(self):
+        # Post-process is a no-op (flag off / cache miss / client absent); the
+        # deferred search-URL fallback still fills bandcamp_url.
+        item = make_library_item(artist="Juana Molina", title="DOGA")
+
+        with patch(
+            "lookup.orchestrator.apply_streaming_url_postprocess",
+            new=AsyncMock(),
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="la paradoja",
+                album="DOGA",
+            )
+
+        _, enriched = results[0]
+        assert enriched.bandcamp_url is not None
+        assert enriched.bandcamp_url.startswith("https://bandcamp.com/search?q=")

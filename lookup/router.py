@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import ValidationError
 from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats, init_cache_stats
 
+from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
 from core.bulk_concurrency import (
@@ -44,7 +45,11 @@ from lookup.models import (
     LookupResponse,
 )
 from lookup.orchestrator import perform_lookup
-from streaming.dependencies import get_apple_music_client, get_spotify_client
+from streaming.dependencies import (
+    get_apple_music_client,
+    get_bandcamp_client,
+    get_spotify_client,
+)
 
 if TYPE_CHECKING:
     from posthog import Posthog
@@ -142,6 +147,7 @@ async def handle_lookup(
     posthog_client: Posthog | None = Depends(get_posthog_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     spotify: SpotifyClient | None = Depends(get_spotify_client),
+    bandcamp: BandcampClient | None = Depends(get_bandcamp_client),
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
         default=None,
@@ -179,6 +185,7 @@ async def handle_lookup(
             mb_pg=mb_pg,
             apple_music=apple_music,
             spotify=spotify,
+            bandcamp=bandcamp,
             discogs_cache_pg=discogs_cache_pg,
             caller_budget_ms=x_caller_budget_ms,
         )
@@ -253,6 +260,7 @@ async def handle_bulk_lookup(
     posthog_client: Posthog | None = Depends(get_posthog_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     spotify: SpotifyClient | None = Depends(get_spotify_client),
+    bandcamp: BandcampClient | None = Depends(get_bandcamp_client),
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
         default=None,
@@ -340,6 +348,7 @@ async def handle_bulk_lookup(
                         mb_pg=mb_pg,
                         apple_music=apple_music,
                         spotify=spotify,
+                        bandcamp=bandcamp,
                         discogs_cache_pg=discogs_cache_pg,
                         caller_budget_ms=x_caller_budget_ms,
                         # The 35k-album bulk drain must never trigger the LML#604
