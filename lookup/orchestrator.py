@@ -1087,6 +1087,7 @@ async def _resolve_nonlibrary_release(
     if discogs_service is None or not song or not artist:
         return None
 
+    cached_positive_unhydrated = False
     if pg is not None:
         cached: ReleaseResolution = await get_cached_release_id(
             pg, artist=artist, title=song, is_track=is_track
@@ -1099,14 +1100,22 @@ async def _resolve_nonlibrary_release(
             if rehydrated is not None:
                 return rehydrated
             # The id is cached but its metadata is unfetchable right now; fall
-            # through to a live resolve rather than fabricate a release.
+            # through to a live resolve rather than fabricate a release — but
+            # remember we hold a known-good id so the write-back below doesn't
+            # demote it on a transient outage.
+            cached_positive_unhydrated = True
 
     candidates = await resolve_release_for_track(
         song, artist, album, discogs_service, max_validations=5
     )
     best = candidates[0] if candidates else None
 
-    if pg is not None:
+    # Never overwrite a known-good cached id with a miss: if we already held a
+    # positive entry that merely failed to re-hydrate (transient get_release /
+    # validate outage) and the live resolve also came up empty, leave the
+    # positive entry intact so it self-heals once the outage clears — rather
+    # than pinning a 7-day miss over good data.
+    if pg is not None and not (cached_positive_unhydrated and best is None):
         await set_cached_release_id(
             pg,
             artist=artist,
