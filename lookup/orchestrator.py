@@ -851,15 +851,23 @@ async def _narrow_swapped_by_track(
     LML#622: once SWAPPED_INTERPRETATION identifies the artist side, the *other*
     part is cross-referenced as a track via the shared
     :func:`_match_track_releases_to_library` kernel — the same release→library
-    matcher SONG_AS_TRACK uses, so compilation handling, the deferred tracklist
-    validation, the ``_chunked_gather`` API-call budget, and the
-    MAX_SEARCH_RESULTS early-exit all apply here too. Scoped to the identified
-    artist's own releases (``artist=artist``) so a request for one track doesn't
-    return that artist's whole discography. Returns ``([], {})`` when nothing
-    cross-references; the caller keeps its artist-filtered fallback.
+    matcher SONG_AS_TRACK uses, so the deferred tracklist validation, the
+    ``_chunked_gather`` API-call budget, and the MAX_SEARCH_RESULTS early-exit
+    all apply here too. ``artist=artist`` scopes the Discogs search and
+    ``require_artist=artist`` re-filters the matched library rows, so the result
+    stays the identified artist's own release(s) — a request for one track never
+    returns that artist's whole discography, and the keyword-supplement fallback
+    in ``search_releases_by_track`` can't leak another artist's release in.
+    Returns ``([], {})`` when nothing cross-references; the caller keeps its
+    artist-filtered fallback.
     """
     return await _match_track_releases_to_library(
-        db, discogs_service, track, artist=artist, source="swapped_interpretation"
+        db,
+        discogs_service,
+        track,
+        artist=artist,
+        source="swapped_interpretation",
+        require_artist=artist,
     )
 
 
@@ -988,16 +996,29 @@ async def _match_track_releases_to_library(
     *,
     artist: str | None,
     source: str,
+    require_artist: str | None = None,
 ) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
     """Find Discogs releases containing ``track`` and match them back to the library.
 
-    The shared kernel behind two strategies: SONG_AS_TRACK (``artist=None`` —
-    song-only) and SWAPPED_INTERPRETATION's narrowing (``artist=<the identified
-    artist>``). It finds Discogs releases carrying the track, fuzzy-matches each
-    to the WXYC library (compilation-aware via the ``Various <album>`` re-query +
-    :func:`_release_matches_library_row`), defers per-release tracklist
-    validation until after a library hit so we only pay the API cost for rows
-    we'd actually surface, and bounds the per-request validate fan-out through
+    The shared kernel behind two strategies:
+
+    - **SONG_AS_TRACK** (``artist=None``, ``require_artist=None``) — song-only:
+      any artist's release carrying the track is a valid hit, including VA
+      compilations (the ``Various <album>`` re-query + the compilation arm of
+      :func:`_release_matches_library_row`).
+    - **SWAPPED_INTERPRETATION** (``artist=<identified>``,
+      ``require_artist=<identified>``) — the query already resolved one side to
+      an artist, so the result must stay scoped to *that* artist's own releases.
+      ``require_artist`` re-filters surviving rows to the identified artist,
+      which closes the precision hole where ``search_releases_by_track``'s
+      under-3-results keyword supplement (``discogs/service.py``) returns
+      other-artists' releases. VA-filed rows are out of scope on this path by
+      design — SONG_AS_TRACK is the compilation path.
+
+    Mechanics shared by both: find Discogs releases carrying the track,
+    fuzzy-match each to the WXYC library, defer per-release tracklist validation
+    until after a library hit so we only pay the API cost for rows we'd actually
+    surface, and bound the per-request validate fan-out through
     :func:`_chunked_gather` with a ``MAX_SEARCH_RESULTS`` early-exit (LML#536).
     Each surviving row carries a ``TrackMatchHint``; ``source`` labels the
     validation breadcrumb (LML#344) and the log lines.
@@ -1046,6 +1067,10 @@ async def _match_track_releases_to_library(
             return None
 
         eligible = [m for m in matches if _release_matches_library_row(release, m)]
+        # SWAPPED scopes to the identified artist: drop rows that don't match it,
+        # guarding against the keyword-supplement leaking other-artists' releases.
+        if require_artist is not None:
+            eligible = [m for m in eligible if artist_matches_item(m, require_artist)]
         if not eligible:
             return None
 
