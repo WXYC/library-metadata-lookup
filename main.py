@@ -74,13 +74,22 @@ async def lifespan(app: FastAPI):
     if settings.database_url_discogs:
         try:
             from core.dependencies import get_discogs_pool
+            from entity.release_resolution_cache import (
+                set_up_release_resolution_cache_schema,
+            )
             from entity.sources import PgSource
             from entity.streaming_url_cache import set_up_streaming_url_cache_schema
 
             pool = await get_discogs_pool()
             if pool is not None:
-                await set_up_streaming_url_cache_schema(PgSource(pool=pool))
+                source = PgSource(pool=pool)
+                await set_up_streaming_url_cache_schema(source)
                 logger.info("Streaming-URL cache schema ready")
+                # Positive release-resolution cache (LML#632), another LML-owned
+                # ``lml_cache.*`` application cache. Same pool, same best-effort
+                # posture; #628 wires its read/write into the lookup path.
+                await set_up_release_resolution_cache_schema(source)
+                logger.info("Release-resolution cache schema ready")
             else:
                 logger.info(
                     "Discogs cache pool unavailable at startup — streaming-URL cache "
