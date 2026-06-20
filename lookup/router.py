@@ -260,7 +260,9 @@ async def handle_bulk_lookup(
     posthog_client: Posthog | None = Depends(get_posthog_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     spotify: SpotifyClient | None = Depends(get_spotify_client),
-    bandcamp: BandcampClient | None = Depends(get_bandcamp_client),
+    # No Bandcamp dependency on the bulk path — the Bandcamp leg is disabled
+    # here (bandcamp=None at the perform_lookup call below), so resolving its
+    # client would be dead work. See the call site for the rate-limit rationale.
     skip_cache: bool = False,
     x_caller_budget_ms: int | None = Header(
         default=None,
@@ -348,7 +350,16 @@ async def handle_bulk_lookup(
                         mb_pg=mb_pg,
                         apple_music=apple_music,
                         spotify=spotify,
-                        bandcamp=bandcamp,
+                        # Bandcamp is intentionally NOT forwarded on the bulk
+                        # path (LML#573 PR-3): its client is rate-limited to
+                        # 1 req/s, so a per-item live album probe would serialize
+                        # the 35k-album drain into hours of requests against
+                        # Bandcamp (and starve the shared singleton for the live
+                        # /lookup path). Passing None makes the post-process skip
+                        # the Bandcamp leg here; the search-URL fallback still
+                        # applies, and the offline warmer (#548) is the right tier
+                        # for bulk Bandcamp cache population.
+                        bandcamp=None,
                         discogs_cache_pg=discogs_cache_pg,
                         caller_budget_ms=x_caller_budget_ms,
                         # The 35k-album bulk drain must never trigger the LML#604

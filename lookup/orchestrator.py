@@ -2930,7 +2930,12 @@ async def enrich_artwork_results(
             "spotify_url": spotify_url,
             "apple_music_url": apple_music_override or apple_music_url or None,
             "youtube_music_url": youtube_music_url,
-            "bandcamp_url": bandcamp_url,
+            # Normalize to None (like apple_music_url) so an empty-string
+            # streaming_links override (library.db returns the column verbatim)
+            # is treated as "absent" by BOTH the post-process active-filter
+            # (`is None`) and the deferred search-URL fallback (`not …`). Without
+            # this, "" would skip the cache/probe leg yet still get a search URL.
+            "bandcamp_url": bandcamp_url or None,
             "soundcloud_url": soundcloud_url,
         }
 
