@@ -1162,6 +1162,56 @@ class TestFindLibraryAlbumsWithCachedTrack:
         assert result[0].id == 12682
 
     @pytest.mark.asyncio
+    async def test_match_back_uses_corrected_artist_when_supplied(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """LML#626 two-channel: the library match-back keys on ``match_artist``
+        (the library-corrected name), so a misspelled typed artist still promotes
+        its catalog row — while the Discogs-cache probe stays on the typed name."""
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
+            return_value=self._cache_releases(("Aluminum Tunes", "Stereolab"))
+        )
+        row = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        mock_library_db.search.return_value = [row]
+
+        result = await find_library_albums_with_cached_track(
+            mock_library_db,
+            "Cybele's Reverie",
+            "Stereolb",  # typed (misspelled)
+            mock_discogs_service,
+            match_artist="Stereolab",  # library-corrected
+        )
+
+        assert [item.id for item in result] == [42]
+        # The cache probe used the typed name, not the correction.
+        probe = mock_discogs_service.cache_service.search_releases_by_track
+        assert probe.await_args.kwargs["artist"] == "Stereolb"
+
+    @pytest.mark.asyncio
+    async def test_match_back_defaults_to_typed_artist_without_correction(
+        self, mock_library_db, mock_discogs_service
+    ):
+        """Without ``match_artist`` the match-back falls back to the typed
+        ``artist`` (single-channel default) — a misspelled typed name drops the
+        row, which is why ``perform_lookup`` threads the corrected name in."""
+        mock_discogs_service.cache_service = AsyncMock()
+        mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
+            return_value=self._cache_releases(("Aluminum Tunes", "Stereolab"))
+        )
+        row = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
+        mock_library_db.search.return_value = [row]
+
+        result = await find_library_albums_with_cached_track(
+            mock_library_db,
+            "Cybele's Reverie",
+            "Stereolb",  # typed (misspelled), no correction supplied
+            mock_discogs_service,
+        )
+
+        assert result == []
+
+    @pytest.mark.asyncio
     async def test_returns_empty_without_discogs_service(self, mock_library_db):
         result = await find_library_albums_with_cached_track(
             mock_library_db, "Song", "Artist", None
