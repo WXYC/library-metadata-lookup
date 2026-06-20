@@ -327,6 +327,159 @@ class TestRanking:
         assert [r.release_id for r in resolved] == [20, 50]
 
 
+def _eight_candidates() -> list[ReleaseInfo]:
+    """Eight V/A comps whose titles deliberately do NOT pre-rank in input order.
+
+    Input order is by ``release_id`` (10..80); the exact title match
+    "When There Is No Sun" sits at id 80 (last in input) so a test that asserts
+    "the title-top validates first" genuinely proves the pre-rank moved it to the
+    front, not that input order happened to coincide.
+    """
+    return [
+        _va_comp(release_id=10, album="Acid House Classics"),
+        _va_comp(release_id=20, album="Some Other Comp"),
+        _va_comp(release_id=30, album="Totally Different"),
+        _va_comp(release_id=40, album="Comp A"),
+        _va_comp(release_id=50, album="Comp B"),
+        _va_comp(release_id=60, album="An Unrelated Solo Album"),
+        _va_comp(release_id=70, album="Yet Another Comp"),
+        _va_comp(release_id=80, album="When There Is No Sun"),  # exact title match
+    ]
+
+
+class TestBoundedEarlyExit:
+    """Opt-in bounded sequential-early-exit (LML#633).
+
+    ``max_validations`` defaults to ``None`` (today's validate-all, rank-after —
+    pins the #604 lazy-bind callers byte-for-byte). When set to an int the
+    resolver pre-ranks candidates by title score, validates in rank order,
+    returns the first that validates, and stops after that many attempts (the
+    consumer #628 passes 5).
+    """
+
+    @pytest.mark.asyncio
+    async def test_title_top_validates_first_single_call(self):
+        """8 candidates, the title-top-ranked one validates → exactly 1 validate
+        call, and that release is returned."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(*_eight_candidates()))
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+            max_validations=5,
+        )
+
+        assert [r.release_id for r in resolved] == [80]
+        assert svc.validate_track_on_release.await_count == 1
+        # The single validate probe was the title-top (id 80), not input-order #1.
+        assert svc.validate_track_on_release.await_args.args[0] == 80
+
+    @pytest.mark.asyncio
+    async def test_title_top_fails_second_validates_two_calls(self):
+        """Title-top fails validation, the #2-ranked validates → exactly 2 calls,
+        returns the #2-ranked release."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        # Pre-rank: id 80 (exact, 100) > id 20 ("Some Other Comp", 45.7) > rest.
+        # 80 fails the per-track credit; 20 passes.
+        candidates = _eight_candidates()
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(*candidates))
+        svc.validate_track_on_release = AsyncMock(side_effect=lambda rid, song, artist: rid == 20)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+            max_validations=5,
+        )
+
+        assert [r.release_id for r in resolved] == [20]
+        assert svc.validate_track_on_release.await_count == 2
+        # Probed in rank order: title-top (80) first, then the runner-up (20).
+        assert [c.args[0] for c in svc.validate_track_on_release.await_args_list] == [80, 20]
+
+    @pytest.mark.asyncio
+    async def test_none_validate_stops_at_backstop_cap(self):
+        """No candidate validates → stops after exactly 5 attempts (the N=5
+        backstop), returns empty — even though 8 candidates were available."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(*_eight_candidates()))
+        svc.validate_track_on_release = AsyncMock(return_value=False)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+            max_validations=5,
+        )
+
+        assert resolved == []
+        assert svc.validate_track_on_release.await_count == 5
+
+    @pytest.mark.asyncio
+    async def test_default_mode_validates_all_candidates(self):
+        """Default mode (no ``max_validations`` arg) validates ALL 8 candidates —
+        pins the #604 lazy-bind callers unchanged (validate-all, rank-after)."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(*_eight_candidates()))
+        svc.validate_track_on_release = AsyncMock(return_value=False)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+        )
+
+        assert resolved == []
+        assert svc.validate_track_on_release.await_count == 8
+
+    @pytest.mark.asyncio
+    async def test_no_album_orders_by_own_release_then_id_early_exits(self):
+        """No-album case: nothing to title-rank, so order by prefer
+        ``is_compilation=False`` (own release) then stable ``release_id``,
+        early-exit on first validation, capped at 5. The own-release with the
+        lowest id is probed first and, validating, ends the sweep at 1 call."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(
+            return_value=_track_response(
+                _va_comp(release_id=20, album="A V/A Comp"),  # is_compilation=True
+                _single_artist(50, "Own Album B"),  # is_compilation=False
+                _single_artist(40, "Own Album A"),  # is_compilation=False, lower id
+            )
+        )
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album=None,
+            discogs_service=svc,
+            max_validations=5,
+        )
+
+        # Own releases first (40 before 50 by id), comp last → 40 probed first,
+        # validates, early-exit.
+        assert [r.release_id for r in resolved] == [40]
+        assert svc.validate_track_on_release.await_count == 1
+        assert svc.validate_track_on_release.await_args.args[0] == 40
+
+
 class TestValidateReleaseForTrack:
     """The shared validate+telemetry primitive both strategies delegate to."""
 
