@@ -848,7 +848,10 @@ class LookupRequest(BaseModel):
 
 
 class LibraryCatalogItem(BaseModel):
-    id: int = Field(..., description="Unique identifier in the library database")
+    id: int = Field(
+        ...,
+        description='Unique identifier in the library database. `0` means there is no WXYC catalog row for this result (a row-less / "(external)" item, e.g. a Discogs-only library miss); any positive value is a real shelved release.\n',
+    )
     title: str | None = Field(None, description="Album/release title")
     artist: str | None = Field(None, description="Artist name")
     call_letters: str | None = Field(None, description="Library call letter code")
@@ -1652,8 +1655,14 @@ class EnhancedRequest(SongRequest):
 class DiscogsMatchResult(BaseModel):
     album: str | None = Field(None, description="Release title")
     artist: str | None = Field(None, description="Release artist")
-    release_id: int = Field(..., description="Discogs release ID")
-    release_url: str = Field(..., description="URL to the release on Discogs")
+    release_id: int = Field(
+        ...,
+        description='Discogs release ID. `> 0` is a real release identity; `0` is the streaming-only sentinel (paired with `release_url == ""`, BS#1185) and is not a linkable Discogs release.\n',
+    )
+    release_url: str = Field(
+        ...,
+        description="URL to the release on Discogs. Non-empty for a real release identity; the empty string accompanies the `release_id == 0` streaming-only sentinel.\n",
+    )
     artwork_url: str | None = Field(None, description="Artwork image URL")
     confidence: confloat(ge=0.0, le=1.0) | None = Field(0, description="Match confidence score")
     release_year: int | None = Field(None, description="Release year from Discogs")
