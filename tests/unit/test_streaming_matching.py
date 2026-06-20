@@ -524,6 +524,190 @@ class TestFindBestMatch:
         assert best["confidence"] > 0
 
 
+# The exact extractor shapes the adapters pass — replicated here so the guard is
+# tested against the real subscript chains, not a paraphrase.
+#   Spotify: clients/streaming/spotify.py:66-68
+#   Deezer:  clients/streaming/deezer.py:39-41
+_SPOTIFY_EXTRACTORS = {
+    "artist_fn": lambda x: x["artists"][0]["name"],
+    "title_fn": lambda x: x["name"],
+    "url_fn": lambda x: x["external_urls"]["spotify"],
+}
+_DEEZER_EXTRACTORS = {
+    "artist_fn": lambda x: x["artist"]["name"],
+    "title_fn": lambda x: x["title"],
+    "url_fn": lambda x: x["link"],
+}
+
+_SPOTIFY_GOOD = {
+    "name": "DOGA",
+    "artists": [{"name": "Juana Molina"}],
+    "external_urls": {"spotify": "https://open.spotify.com/album/good"},
+}
+_DEEZER_GOOD = {
+    "artist": {"name": "Juana Molina"},
+    "title": "DOGA",
+    "link": "https://www.deezer.com/album/good",
+}
+
+
+class TestFindBestMatchSparseRowGuard:
+    """LML#640: a single sparse/malformed row must not erase every match.
+
+    The Spotify/Deezer extractors subscript raw API dicts directly, so a row
+    missing ``artists`` / ``external_urls`` / ``link`` (or carrying an empty
+    ``artists`` list) raises ``KeyError``/``IndexError``/``TypeError`` mid-loop.
+    Before the per-item guard, that exception propagated out of
+    ``find_best_match`` and aborted the whole match — the well-formed rows in
+    the same response were lost with it. The guard skips (and logs) just the
+    bad row.
+    """
+
+    @pytest.mark.parametrize(
+        "sparse_row",
+        [
+            pytest.param({"name": "X", "external_urls": {"spotify": "http://x"}}, id="no-artists"),
+            pytest.param(
+                {"name": "X", "artists": [], "external_urls": {"spotify": "http://x"}},
+                id="empty-artists-list",
+            ),
+            pytest.param(
+                {"name": "X", "artists": [{}], "external_urls": {"spotify": "http://x"}},
+                id="artist-without-name",
+            ),
+            pytest.param(
+                {"artists": [{"name": "X"}], "external_urls": {"spotify": "http://x"}},
+                id="no-title",
+            ),
+        ],
+    )
+    def test_spotify_sparse_row_skipped_good_row_survives(self, sparse_row):
+        from clients.streaming.matching import find_best_match
+
+        best = find_best_match(
+            [sparse_row, _SPOTIFY_GOOD],
+            "Juana Molina",
+            "DOGA",
+            **_SPOTIFY_EXTRACTORS,
+        )
+        assert best is not None
+        assert best["url"] == "https://open.spotify.com/album/good"
+        assert best["matched_title"] == "DOGA"
+
+    @pytest.mark.parametrize(
+        "sparse_row",
+        [
+            pytest.param({"title": "X", "link": "http://x"}, id="no-artist"),
+            pytest.param({"artist": None, "title": "X", "link": "http://x"}, id="null-artist"),
+            pytest.param(
+                {"artist": {}, "title": "X", "link": "http://x"}, id="artist-without-name"
+            ),
+            pytest.param({"artist": {"name": "X"}, "link": "http://x"}, id="no-title"),
+        ],
+    )
+    def test_deezer_sparse_row_skipped_good_row_survives(self, sparse_row):
+        from clients.streaming.matching import find_best_match
+
+        best = find_best_match(
+            [sparse_row, _DEEZER_GOOD],
+            "Juana Molina",
+            "DOGA",
+            **_DEEZER_EXTRACTORS,
+        )
+        assert best is not None
+        assert best["url"] == "https://www.deezer.com/album/good"
+        assert best["matched_title"] == "DOGA"
+
+    def test_sparse_row_after_good_row_does_not_erase_winner(self):
+        """Order independence: the bad row trailing a good row must not undo it."""
+        from clients.streaming.matching import find_best_match
+
+        best = find_best_match(
+            [_DEEZER_GOOD, {"title": "X", "link": "http://x"}],
+            "Juana Molina",
+            "DOGA",
+            **_DEEZER_EXTRACTORS,
+        )
+        assert best is not None
+        assert best["url"] == "https://www.deezer.com/album/good"
+
+    def test_floor_clearing_row_with_unextractable_url_is_skipped(self):
+        """A row that clears the artist/title floor but whose ``url_fn`` raises
+        is skipped, not fatal — and a lower-priority well-formed row still wins.
+
+        ``url_fn`` is the one extractor evaluated only for a candidate that
+        clears the floor, so this pins that the guard covers it too (not just
+        the always-run artist/title extractors)."""
+        from clients.streaming.matching import find_best_match
+
+        # First row matches on artist/title but has no ``external_urls`` → url_fn
+        # raises KeyError. Second row is fully well-formed.
+        no_url = {"name": "DOGA", "artists": [{"name": "Juana Molina"}]}
+        best = find_best_match(
+            [no_url, _SPOTIFY_GOOD],
+            "Juana Molina",
+            "DOGA",
+            **_SPOTIFY_EXTRACTORS,
+        )
+        assert best is not None
+        assert best["url"] == "https://open.spotify.com/album/good"
+
+    def test_only_sparse_rows_returns_none_without_raising(self):
+        from clients.streaming.matching import find_best_match
+
+        best = find_best_match(
+            [
+                {"title": "X", "link": "http://x"},
+                {"artist": None, "title": "Y", "link": "http://y"},
+            ],
+            "Juana Molina",
+            "DOGA",
+            **_DEEZER_EXTRACTORS,
+        )
+        assert best is None
+
+    def test_skipped_row_is_logged(self):
+        from clients.streaming.matching import find_best_match
+
+        with patch("clients.streaming.matching.logger") as mock_logger:
+            find_best_match(
+                [{"title": "X", "link": "http://x"}, _DEEZER_GOOD],
+                "Juana Molina",
+                "DOGA",
+                **_DEEZER_EXTRACTORS,
+            )
+        mock_logger.warning.assert_called_once()
+
+    def test_well_formed_response_does_not_log(self):
+        """No spurious warnings when every row is well-formed (no behavior change)."""
+        from clients.streaming.matching import find_best_match
+
+        with patch("clients.streaming.matching.logger") as mock_logger:
+            find_best_match(
+                [_SPOTIFY_GOOD],
+                "Juana Molina",
+                "DOGA",
+                **_SPOTIFY_EXTRACTORS,
+            )
+        mock_logger.warning.assert_not_called()
+
+    def test_typed_match_sparse_row_skipped(self):
+        """The sibling matcher on the orchestrator lookup path has the same
+        unguarded shape — a malformed candidate must be skipped, not fatal."""
+        from clients.streaming.matching import find_best_typed_match
+
+        good = {"artist": {"name": "Juana Molina"}, "title": "DOGA"}
+        bad = {"title": "DOGA"}  # no ``artist`` key → KeyError in artist_fn
+        best = find_best_typed_match(
+            [bad, good],
+            query_artist="Juana Molina",
+            query_title="DOGA",
+            artist_fn=lambda x: x["artist"]["name"],
+            title_fn=lambda x: x["title"],
+        )
+        assert best is good
+
+
 class TestRecordMatchTelemetry:
     """LML#592: emit the winning match's per-axis scores to Sentry.
 

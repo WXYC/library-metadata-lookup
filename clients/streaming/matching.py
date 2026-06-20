@@ -409,6 +409,20 @@ def record_match_telemetry(
         logger.warning("Failed to emit matcher telemetry: %s", e)
 
 
+# Adapter extractors subscript raw API dicts directly (e.g. Spotify's
+# ``x["artists"][0]["name"]``, Deezer's ``x["artist"]["name"]``). A sparse or
+# malformed upstream row — a missing key, an empty ``artists`` list, a null
+# where a dict is expected — makes one of them raise mid-loop. Without a
+# per-item guard that exception propagates out of the matcher and aborts the
+# whole match, erasing every well-formed row in the same response (LML#640).
+# The guard catches exactly these extraction-shaped errors and skips the one
+# bad row; a genuine programming error in an extractor (e.g. calling a
+# non-callable) is not in this set and still surfaces loudly rather than being
+# silently swallowed for every row. Kept narrow on purpose — it wraps only the
+# extractor calls, never the scoring.
+_EXTRACTION_ERRORS = (KeyError, IndexError, TypeError)
+
+
 def find_best_match(
     results: list[dict],
     query_artist: str,
@@ -441,8 +455,19 @@ def find_best_match(
     best: dict | None = None
     best_score = 0.0
     for item in results:
-        result_artist = artist_fn(item)
-        result_title = title_fn(item)
+        # Extract every field up front, inside the guard, so a sparse row is
+        # skipped whichever extractor trips — including ``url_fn``/``id_fn``,
+        # which only feed a floor-clearing winner. Evaluating them per-row (vs.
+        # lazily on the winner) costs a dict subscript and changes no output for
+        # well-formed rows. See ``_EXTRACTION_ERRORS`` (LML#640).
+        try:
+            result_artist = artist_fn(item)
+            result_title = title_fn(item)
+            result_url = url_fn(item)
+            result_id = id_fn(item) if id_fn is not None else None
+        except _EXTRACTION_ERRORS as exc:
+            logger.warning("Skipping malformed result row in find_best_match: %s", exc)
+            continue
         artist_score = score_match(query_artist, result_artist)
         title_score = score_match(query_title, result_title)
         if not is_acceptable_match(artist_score, title_score):
@@ -451,7 +476,7 @@ def find_best_match(
         if combined > best_score:
             best_score = combined
             match: dict = {
-                "url": url_fn(item),
+                "url": result_url,
                 "confidence": combined,
                 "matched_artist": result_artist,
                 "matched_title": result_title,
@@ -461,7 +486,7 @@ def find_best_match(
                 "title_score": title_score,
             }
             if id_fn is not None:
-                match["id"] = id_fn(item)
+                match["id"] = result_id
             best = match
     return best
 
@@ -512,8 +537,15 @@ def find_best_typed_match[T](
     best: T | None = None
     best_score = 0.0
     for item in results:
-        r_artist = artist_fn(item) or ""
-        r_title = title_fn(item) or ""
+        # Same per-item guard as ``find_best_match`` — the orchestrator lookup
+        # path runs through here, so a malformed candidate must be skipped, not
+        # fatal (LML#640).
+        try:
+            r_artist = artist_fn(item) or ""
+            r_title = title_fn(item) or ""
+        except _EXTRACTION_ERRORS as exc:
+            logger.warning("Skipping malformed result row in find_best_typed_match: %s", exc)
+            continue
         artist_score = max(score_match(q, r_artist) for q in artist_variants)
         title_score = max(score_match(q, r_title) for q in title_variants)
         if not is_acceptable_match(artist_score, title_score):
