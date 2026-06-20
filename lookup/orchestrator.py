@@ -2155,6 +2155,8 @@ async def find_library_albums_with_cached_track(
     artist: str | None,
     discogs_service: DiscogsService | None,
     limit: int = MAX_SEARCH_RESULTS,
+    *,
+    match_artist: str | None = None,
 ) -> list[LibraryItem]:
     """Find WXYC library albums whose Discogs cache entry lists ``song`` by ``artist``.
 
@@ -2164,11 +2166,19 @@ async def find_library_albums_with_cached_track(
     answer "which releases by this artist contain this track?" in milliseconds —
     even when the upstream ``resolve_albums_for_track`` / API path missed it.
 
+    Two-channel artist (LML#626): the Discogs-cache probe keys on the typed
+    ``artist`` (the cache holds Discogs-credited names), while the library
+    match-back keys on ``match_artist`` when supplied — the library-corrected
+    name — so a misspelled library artist still promotes its catalog row.
+    ``match_artist`` defaults to ``artist`` to preserve single-channel behavior
+    for callers that don't distinguish the two.
+
     Cache-only by design: skips any API fallback path. Returns ``[]`` cleanly
     when the cache is unavailable, fails, or has nothing for the query.
     """
     if not discogs_service or not song or not artist:
         return []
+    match_against = match_artist or artist
     cache_service = getattr(discogs_service, "cache_service", None)
     if cache_service is None:
         return []
@@ -2192,7 +2202,7 @@ async def find_library_albums_with_cached_track(
         for item in candidate_items:
             if item.id in seen_ids:
                 continue
-            if not artist_matches_item(item, artist):
+            if not artist_matches_item(item, match_against):
                 continue
             matches.append(item)
             seen_ids.add(item.id)
@@ -3376,7 +3386,11 @@ async def perform_lookup(
                     # library album. Catches the case where the upstream
                     # track→releases lookup missed a release the cache holds.
                     promoted = await find_library_albums_with_cached_track(
-                        db, parsed.song, parsed.artist, discogs_service
+                        db,
+                        parsed.song,
+                        parsed.artist,
+                        discogs_service,
+                        match_artist=library_artist_for(parsed),
                     )
                     if promoted:
                         library_results = promoted
