@@ -163,6 +163,37 @@ async def test_transient_rehydrate_failure_does_not_demote_positive_to_miss():
 
 
 @pytest.mark.asyncio
+async def test_empty_title_rehydrate_falls_through_to_live_resolve():
+    """A #632 cache hit whose release rehydrates to an empty title (a malformed,
+    title-less but non-404 Discogs release) must NOT surface a degenerate
+    title-less row-less item — it falls through to the live resolve instead,
+    reusing the ``cached_positive_unhydrated`` machinery (no demotion)."""
+    svc = _resolving_service()
+    # The cache-hit rehydrate returns a present (release_id>0, not 404) but
+    # title-less release. The live re-probe still finds the real release.
+    svc.get_release = AsyncMock(
+        return_value=ReleaseMetadataResponse(
+            release_id=RELEASE_ID,
+            title="",
+            artist="Various",
+            release_url=RELEASE_URL,
+            artwork_url="https://i.discogs.com/sun.jpg",
+        )
+    )
+    pg = _RecordingPg()
+    pg.store[(ARTIST.lower(), TRACK.lower(), True)] = RELEASE_ID  # known-good positive
+
+    result = await _resolve_nonlibrary_release(
+        svc, pg, song=TRACK, artist=ARTIST, album=ALBUM, is_track=True
+    )
+
+    # Fell through to the live resolve (search_releases_by_track -> real title),
+    # not the empty-title rehydrate.
+    assert result is not None
+    assert result.album_title == ALBUM
+
+
+@pytest.mark.asyncio
 async def test_fresh_known_miss_short_circuits_without_probe(monkeypatch):
     """A cached known-miss (``was_present=True, release_id=None``) skips the
     live probe entirely."""

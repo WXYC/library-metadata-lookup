@@ -207,8 +207,9 @@ async def test_track_on_compilation_flag_off_no_rowless(library_db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("extended", [False, True])
 async def test_track_on_compilation_survives_mismatched_request_album(
-    library_db, enable_nonlibrary_release
+    library_db, enable_nonlibrary_release, extended
 ):
     """A request album that doesn't match the resolved compilation title must NOT
     clobber the validated carry-through binding down to the BS#1185 sentinel.
@@ -220,6 +221,11 @@ async def test_track_on_compilation_survives_mismatched_request_album(
     leak from, and its ``release_id`` was validated to carry the track. Gating it
     emitted ``release_id=0`` (the sentinel) for the common album-bearing request,
     silently defeating the feature.
+
+    Parametrized over ``extended`` because Backend-Service forces ``extended=true``
+    on every write-path call (LML#504) — the extended branch takes the
+    album-derived-eligible enrichment path that the lean branch doesn't, so the
+    binding must survive both.
     """
     svc = _base_discogs_mock()
     svc.search_releases_by_track = AsyncMock(return_value=_track_releases(_spine_release()))
@@ -228,6 +234,7 @@ async def test_track_on_compilation_survives_mismatched_request_album(
         artist=SPINE_ARTIST,
         song=SPINE_TRACK,
         album="Black Secret Technology",  # the artist's own LP, not the V/A comp
+        extended=extended,
         raw_message=f"{SPINE_ARTIST} - {SPINE_TRACK}",
     )
     response = await perform_lookup(

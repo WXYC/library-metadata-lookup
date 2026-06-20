@@ -1135,15 +1135,17 @@ async def _rehydrate_resolved_release(
     The cache stores only the id; ``get_release`` (its own by-id cache) fills in
     the title + URL. ``is_compilation`` is not needed downstream of
     ``_bind_resolved_release`` (which keys on id/url/title), so it is left
-    ``False``. Returns ``None`` when the release can't be fetched, letting the
-    caller fall through to a live resolve.
+    ``False``. Returns ``None`` when the release can't be fetched **or rehydrates
+    to an empty title** (a malformed/title-less but non-404 Discogs release),
+    letting the caller fall through to a live resolve rather than surface a
+    degenerate row-less item with ``title=""``.
     """
     try:
         metadata = await discogs_service.get_release(release_id)
     except Exception as exc:
         logger.warning("Row-less cache re-hydrate failed for release %s: %s", release_id, exc)
         return None
-    if metadata is None or not metadata.release_id:
+    if metadata is None or not metadata.release_id or not metadata.title:
         return None
     return ResolvedRelease(
         release_id=metadata.release_id,
