@@ -2927,14 +2927,18 @@ async def enrich_artwork_results(
             "release_year": year_result,
             "artist_bio": artist_bio,
             "wikipedia_url": wikipedia_url,
-            "spotify_url": spotify_url,
+            # spotify_url / bandcamp_url are normalized to None (like
+            # apple_music_url) so an empty-string streaming_links override
+            # (library.db returns the column verbatim, no '' -> None coercion) is
+            # treated as "absent" by the post-process active-filter (`is None`).
+            # Without this, "" skips the cache/probe leg AND either surfaces
+            # straight to the client (spotify has no fallback) or gets a search
+            # URL while the leg was skipped (bandcamp's deferred `not …`
+            # fallback). youtube / soundcloud aren't post-process services and
+            # overwrite "" with a search URL above, so they need no normalization.
+            "spotify_url": spotify_url or None,
             "apple_music_url": apple_music_override or apple_music_url or None,
             "youtube_music_url": youtube_music_url,
-            # Normalize to None (like apple_music_url) so an empty-string
-            # streaming_links override (library.db returns the column verbatim)
-            # is treated as "absent" by BOTH the post-process active-filter
-            # (`is None`) and the deferred search-URL fallback (`not …`). Without
-            # this, "" would skip the cache/probe leg yet still get a search URL.
             "bandcamp_url": bandcamp_url or None,
             "soundcloud_url": soundcloud_url,
         }
