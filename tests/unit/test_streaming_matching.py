@@ -1,5 +1,6 @@
 """Unit tests for clients/streaming/matching.py."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -561,6 +562,11 @@ class TestFindBestMatchSparseRowGuard:
     ``find_best_match`` and aborted the whole match — the well-formed rows in
     the same response were lost with it. The guard skips (and logs) just the
     bad row.
+
+    A *sparse minority* is skipped, but *total* extraction failure (every row
+    raises) re-raises: that is a systemic upstream break, not a sparse row, and
+    the streaming orchestrator must see it as an errored source to retry
+    (LML#376) rather than a persisted no-match.
     """
 
     @pytest.mark.parametrize(
@@ -652,19 +658,147 @@ class TestFindBestMatchSparseRowGuard:
         assert best is not None
         assert best["url"] == "https://open.spotify.com/album/good"
 
-    def test_only_sparse_rows_returns_none_without_raising(self):
+    def test_all_rows_failing_extraction_reraises(self):
+        """Total extraction failure re-raises (it is a systemic break, not a
+        sparse row). Skipping every row and returning None would silently
+        convert a broken upstream into a persisted no-match and suppress the
+        LML#376 errored-source retry. Deliberately reverses the earlier
+        all-sparse -> None behavior.
+        """
+        from clients.streaming.matching import find_best_match
+
+        # Row 1 raises KeyError (no "artist"); row 2 raises TypeError (None
+        # subscript). Asserting BOTH rows logged a warning — and that the LAST
+        # row's error (TypeError) is what escapes — proves the loop caught each
+        # row then re-raised at the aggregate, not that it aborted on row 1
+        # (which would log zero warnings and raise KeyError).
+        with patch("clients.streaming.matching.logger") as mock_logger:
+            with pytest.raises(TypeError) as excinfo:
+                find_best_match(
+                    [
+                        {"title": "X", "link": "http://x"},
+                        {"artist": None, "title": "Y", "link": "http://y"},
+                    ],
+                    "Juana Molina",
+                    "DOGA",
+                    **_DEEZER_EXTRACTORS,
+                )
+        assert mock_logger.warning.call_count == 2
+        # The genuine upstream error object is surfaced (the row-2 null subscript),
+        # not a freshly synthesized exception — so the orchestrator's errored-source
+        # diagnostics carry the real cause.
+        assert "subscriptable" in str(excinfo.value)
+
+    def test_partial_failure_does_not_reraise(self):
+        """A sparse minority (at least one row extracts cleanly) is tolerated —
+        only total failure re-raises."""
         from clients.streaming.matching import find_best_match
 
         best = find_best_match(
-            [
-                {"title": "X", "link": "http://x"},
-                {"artist": None, "title": "Y", "link": "http://y"},
-            ],
+            [{"title": "X", "link": "http://x"}, _DEEZER_GOOD],
             "Juana Molina",
             "DOGA",
             **_DEEZER_EXTRACTORS,
         )
-        assert best is None
+        assert best is not None
+        assert best["url"] == "https://www.deezer.com/album/good"
+
+    def test_clean_floor_rejected_row_is_not_an_extraction_failure(self):
+        """The re-raise boundary is ``extraction_failures == total``, NOT
+        ``best is None``. A row that extracts cleanly but loses the 80/80 floor
+        is a *successful* extraction, so pairing it with a malformed row must
+        return None WITHOUT re-raising — a legitimate no-match, not a systemic
+        break. Guards against a future `if best is None: raise` mis-refactor.
+        """
+        from clients.streaming.matching import find_best_match
+
+        # Extracts fine, but the title is for a different album → fails the floor.
+        clean_but_wrong = {
+            "artist": {"name": "Juana Molina"},
+            "title": "Halo",
+            "link": "http://other",
+        }
+        malformed = {"title": "X", "link": "http://x"}  # KeyError in artist_fn
+        best = find_best_match(
+            [clean_but_wrong, malformed],
+            "Juana Molina",
+            "DOGA",
+            **_DEEZER_EXTRACTORS,
+        )
+        assert best is None  # floor-rejected + one skipped row → no match, no raise
+
+    def test_id_fn_raise_is_skipped_not_fatal(self):
+        """``id_fn`` is evaluated inside the guard and feeds the output dict, so
+        a row whose only fault is a raising ``id_fn`` must be skipped, not abort
+        the match — pins that id_fn extraction stays inside the try.
+
+        ``bad_id`` is an EXACT match (would win the floor on a tie as the first
+        row), so if ``id_fn`` were evaluated lazily on the winner instead of
+        eagerly inside the guard, it would be selected and then crash. The
+        tracking ``id_fn`` also asserts it actually ran on the bad row — i.e.
+        the skip is caused by id_fn raising, not by the row losing on score.
+        """
+        from clients.streaming.matching import find_best_match
+
+        # Clears artist/title/url but has no "id" key -> id_fn raises KeyError.
+        # Placed first and exact so it is the would-be winner.
+        bad_id = {
+            "name": "DOGA",
+            "artists": [{"name": "Juana Molina"}],
+            "external_urls": {"spotify": "http://bad"},
+        }
+        seen_ids = []
+
+        def tracking_id_fn(x):
+            seen_ids.append(x.get("external_urls", {}).get("spotify"))
+            return x["id"]  # raises KeyError on bad_id
+
+        best = find_best_match(
+            [bad_id, {**_SPOTIFY_GOOD, "id": "good-id"}],
+            "Juana Molina",
+            "DOGA",
+            **_SPOTIFY_EXTRACTORS,
+            id_fn=tracking_id_fn,
+        )
+        assert best is not None
+        assert best["id"] == "good-id"
+        # id_fn ran on the bad row (proving it is inside the per-row guard, not
+        # deferred to the winner) and on the good row.
+        assert "http://bad" in seen_ids
+
+    def test_skip_does_not_perturb_winner(self):
+        """Skipping a bad row leaves the winner and its combined score identical
+        to the no-skip case — the 80/80 floor math is untouched."""
+        from clients.streaming.matching import find_best_match
+
+        with_skip = find_best_match(
+            [{"title": "X", "link": "http://x"}, _DEEZER_GOOD],
+            "Juana Molina",
+            "DOGA",
+            **_DEEZER_EXTRACTORS,
+        )
+        without_skip = find_best_match([_DEEZER_GOOD], "Juana Molina", "DOGA", **_DEEZER_EXTRACTORS)
+        assert with_skip is not None and without_skip is not None
+        assert with_skip["confidence"] == without_skip["confidence"]
+        assert with_skip["url"] == without_skip["url"]
+
+    def test_skipped_rows_logged_once_per_bad_row(self):
+        """Cardinality: one warning per skipped row, not one per call. Two bad
+        rows alongside a good one -> exactly two warnings."""
+        from clients.streaming.matching import find_best_match
+
+        with patch("clients.streaming.matching.logger") as mock_logger:
+            find_best_match(
+                [
+                    {"title": "X", "link": "http://x"},
+                    {"artist": None, "title": "Y", "link": "http://y"},
+                    _DEEZER_GOOD,
+                ],
+                "Juana Molina",
+                "DOGA",
+                **_DEEZER_EXTRACTORS,
+            )
+        assert mock_logger.warning.call_count == 2
 
     def test_skipped_row_is_logged(self):
         from clients.streaming.matching import find_best_match
@@ -706,6 +840,86 @@ class TestFindBestMatchSparseRowGuard:
             title_fn=lambda x: x["title"],
         )
         assert best is good
+
+    def test_typed_match_attribute_error_is_skipped(self):
+        """The real orchestrator callers use attribute extractors
+        (``lambda r: r.artist``) on objects; a ``None``/wrong-type item raises
+        ``AttributeError`` — which must be caught, else the guard is inert for
+        its only production call shape."""
+        from clients.streaming.matching import find_best_typed_match
+
+        good = SimpleNamespace(artist="Juana Molina", album="DOGA")
+        best = find_best_typed_match(
+            [None, good],  # None.artist -> AttributeError
+            query_artist="Juana Molina",
+            query_title="DOGA",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is good
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param({"artist": [], "title": "DOGA"}, id="index-error"),
+            pytest.param({"artist": None, "title": "DOGA"}, id="type-error-null-subscript"),
+        ],
+    )
+    def test_typed_match_index_and_type_errors_skipped(self, bad):
+        """The typed guard must cover the same IndexError/TypeError shapes as
+        ``find_best_match`` — its error set must not drift from the sibling's."""
+        from clients.streaming.matching import find_best_typed_match
+
+        good = {"artist": {"name": "Juana Molina"}, "title": "DOGA"}
+        best = find_best_typed_match(
+            [bad, good],
+            query_artist="Juana Molina",
+            query_title="DOGA",
+            artist_fn=lambda x: (
+                x["artist"][0] if isinstance(x["artist"], list) else x["artist"]["name"]
+            ),
+            title_fn=lambda x: x["title"],
+        )
+        assert best is good
+
+    def test_typed_match_skip_on_variant_list_query_path(self):
+        """The production caller (orchestrator) passes variant LISTS for the
+        query, not scalars — exercise the guard on that branch too."""
+        from clients.streaming.matching import find_best_typed_match
+
+        good = {"artist": {"name": "Various Artists"}, "title": "Disco Not Disco"}
+        bad = {"title": "Disco Not Disco"}  # KeyError in artist_fn
+        best = find_best_typed_match(
+            [bad, good],
+            query_artist=["Various", "Various Artists"],
+            query_title=["Disco Not Disco"],
+            artist_fn=lambda x: x["artist"]["name"],
+            title_fn=lambda x: x["title"],
+        )
+        assert best is good
+
+    def test_typed_match_total_failure_returns_none_not_raises(self):
+        """The typed matcher must NOT re-raise on total extraction failure —
+        unlike ``find_best_match``. Its callers are the lookup pipeline
+        (``lookup/orchestrator.py``): ``fetch_one`` would swallow a raise back
+        to None and ``_library_miss_discogs_search`` would let it 500 the
+        request, and neither maps it to an errored-source retry (LML#376 lives
+        on the streaming path that find_best_match feeds). So a wholesale-
+        malformed response must degrade to a graceful None, with every item
+        still skipped+logged.
+        """
+        from clients.streaming.matching import find_best_typed_match
+
+        with patch("clients.streaming.matching.logger") as mock_logger:
+            best = find_best_typed_match(
+                [None, None],  # each item: None.artist -> AttributeError, caught
+                query_artist="Juana Molina",
+                query_title="DOGA",
+                artist_fn=lambda r: r.artist,
+                title_fn=lambda r: r.album,
+            )
+        assert best is None
+        assert mock_logger.warning.call_count == 2  # both caught, neither fatal
 
 
 class TestRecordMatchTelemetry:
@@ -951,6 +1165,28 @@ class TestFindBestSourceMatchEmits:
                 service="deezer",
             )
         assert match is None
+        mock_sentry.start_span.assert_not_called()
+
+    def test_total_extraction_failure_propagates_and_skips_telemetry(self):
+        """The wrapper is the real streaming seam (every adapter funnels through
+        it), so pin that a total extraction failure propagates the re-raise out
+        of ``find_best_source_match`` — that is what reaches the orchestrator's
+        errored-source mapping (LML#376) — and does NOT emit match telemetry
+        (there is no winner to record).
+        """
+        from clients.streaming.matching import find_best_source_match
+
+        with patch("clients.streaming.matching.sentry_sdk") as mock_sentry:
+            with pytest.raises((KeyError, IndexError, TypeError, AttributeError)):
+                find_best_source_match(
+                    [{"title": "X", "link": "http://x"}],  # all malformed (Deezer shape)
+                    "Juana Molina",
+                    "DOGA",
+                    artist_fn=lambda x: x["artist"]["name"],
+                    title_fn=lambda x: x["title"],
+                    url_fn=lambda x: x["link"],
+                    service="deezer",
+                )
         mock_sentry.start_span.assert_not_called()
 
     def test_service_is_required(self):
