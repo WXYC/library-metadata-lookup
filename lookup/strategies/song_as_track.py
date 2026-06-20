@@ -26,11 +26,14 @@ from core.search import (
 from generated.api_models import TrackMatchHint
 from library.db import LibraryDB
 from library.models import LibraryItem
+from lookup.release_resolution import ResolvedRelease
 from services.parser import ParsedRequest
 
 SongAsTrackExecute = Callable[
     [LibraryDB, str | None],
-    Awaitable[tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]],
+    Awaitable[
+        tuple[list[LibraryItem], dict[int, list[TrackMatchHint]], dict[int, ResolvedRelease]]
+    ],
 ]
 
 
@@ -49,7 +52,9 @@ class SongAsTrack:
         return no_results_and_song_but_no_artist_track_fallback(parsed, state, raw_message)
 
     async def attempt(self, parsed: ParsedRequest, state: SearchState, raw_message: str) -> Outcome:
-        items, matched_via_by_id = await self.execute(self.db, parsed.song)
+        items, matched_via_by_id, discogs_titles = await self.execute(self.db, parsed.song)
         if not items:
             return Outcome.empty()
-        return Outcome.track_match(items, matched_via_by_id=matched_via_by_id)
+        return Outcome.track_match(
+            items, matched_via_by_id=matched_via_by_id, discogs_titles=discogs_titles or None
+        )

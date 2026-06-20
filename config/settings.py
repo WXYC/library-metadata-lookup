@@ -182,6 +182,24 @@ class Settings(BaseSettings):
             "See WXYC/library-metadata-lookup#604."
         ),
     )
+    lml_resolve_nonlibrary_release: bool = Field(
+        default=False,
+        description=(
+            "When True, the track-validating Discogs-aware strategies "
+            "(TRACK_ON_COMPILATION, SONG_AS_TRACK, SWAPPED_INTERPRETATION) surface a "
+            "resolvable Discogs release that is NOT in library.db as a row-less "
+            "result (LibraryItem(id=0) + a real DiscogsSearchResult) instead of "
+            "dropping it on the library-row gate (#536 defers track-validation "
+            "until after that gate, so a non-library release is dropped before the "
+            "validation that would confirm it). The release is resolved via the "
+            "uncached bounded resolve_release_for_track(max_validations=5) (#633) "
+            "and amortized by the #632 PG positive cache keyed on the typed artist. "
+            "When False, a non-library release stays dropped (today's empty/sentinel "
+            "behavior). Mirrors lml_resolve_compilation_release; default off, roll "
+            "staging -> prod and watch the Discogs call rate. "
+            "See WXYC/library-metadata-lookup#628."
+        ),
+    )
     # Persistent streaming-URL cache flags (LML#573). A service is persisted
     # only when BOTH the master kill switch AND its per-service flag are true
     # (AND-gate). The master defaults True and the per-service flags default

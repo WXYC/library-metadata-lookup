@@ -27,11 +27,14 @@ from core.search import (
 from generated.api_models import TrackMatchHint
 from library.db import LibraryDB
 from library.models import LibraryItem
+from lookup.release_resolution import ResolvedRelease
 from services.parser import ParsedRequest
 
 SwappedInterpretationExecute = Callable[
     [LibraryDB, str, str],
-    Awaitable[tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]],
+    Awaitable[
+        tuple[list[LibraryItem], dict[int, list[TrackMatchHint]], dict[int, ResolvedRelease]]
+    ],
 ]
 
 
@@ -56,11 +59,18 @@ class SwappedInterpretation:
             # can't silently crash here.
             return Outcome.empty()
         part1, part2 = parts
-        items, matched_via = await self.execute(self.db, part1, part2)
+        items, matched_via, discogs_titles = await self.execute(self.db, part1, part2)
         if not items:
             return Outcome.empty()
         # ``matched_via`` is populated only when the track cross-reference
-        # narrowed the result (LML#622); legacy execute funcs return ``None``.
-        if matched_via:
-            return Outcome.track_match(items, matched_via_by_id=matched_via)
+        # narrowed the result (LML#622); ``discogs_titles`` only when that
+        # narrow surfaced a row-less non-library release (LML#628). Either
+        # signal means the track-match path fired; a bare library fallback
+        # (both empty) reports a plain found().
+        if matched_via or discogs_titles:
+            return Outcome.track_match(
+                items,
+                matched_via_by_id=matched_via,
+                discogs_titles=discogs_titles or None,
+            )
         return Outcome.found(items)

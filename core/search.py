@@ -531,6 +531,7 @@ class Outcome:
         items: list[LibraryItem],
         *,
         matched_via_by_id: dict[int, list[TrackMatchHint]],
+        discogs_titles: "dict[int, ResolvedRelease] | None" = None,
     ) -> "Outcome":
         """Track-driven match with per-id provenance (SONG_AS_TRACK; also
         SWAPPED_INTERPRETATION's narrowing, LML#622).
@@ -539,11 +540,19 @@ class Outcome:
         Discogs's tracklist index. Each row carries a TrackMatchHint pointing
         back to the release that surfaced it — the API contract uses this for
         the ``matched_via`` field per catalog-track-search §5.1.
+
+        ``discogs_titles`` is the row-less carry-through seam (LML#628): when the
+        track resolves to a release with **no** WXYC catalog row, the kernel
+        surfaces a single ``LibraryItem(id=0)`` here and carries the validated
+        :class:`ResolvedRelease` on ``discogs_titles`` (``{0: ...}``) so
+        ``fetch_artwork_for_items`` binds it. Empty / ``None`` on the in-library
+        path, which keeps ``matched_via_by_id`` as its only side-channel.
         """
         return cls(
             items=items,
             song_not_found_after=False,
             matched_via_by_id=matched_via_by_id,
+            discogs_titles=discogs_titles,
         )
 
 

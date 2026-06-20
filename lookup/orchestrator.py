@@ -64,6 +64,11 @@ from discogs.models import (
     TrackReleasesResponse,
 )
 from discogs.service import DiscogsService
+from entity.release_resolution_cache import (
+    ReleaseResolution,
+    get_cached_release_id,
+    set_cached_release_id,
+)
 from entity.sources import PgSource, PgSourceProtocol
 from entity.store import EntityStore, Identity
 from generated.api_models import (
@@ -84,6 +89,7 @@ from lookup.release_resolution import (
     ResolvedRelease,
     merge_wave_b_compilations,
     rank_resolved_releases,
+    resolve_release_for_track,
     resolve_release_for_track_cached,
     validate_release_for_track,
 )
@@ -858,7 +864,9 @@ async def _narrow_swapped_by_track(
     artist: str,
     track: str,
     discogs_service: DiscogsService | None,
-) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
+    *,
+    pg: PgSource | None = None,
+) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]], dict[int, ResolvedRelease]]:
     """Narrow a swapped-interpretation artist match to the release holding ``track``.
 
     LML#622: once SWAPPED_INTERPRETATION identifies the artist side, the *other*
@@ -871,8 +879,13 @@ async def _narrow_swapped_by_track(
     stays the identified artist's own release(s) — a request for one track never
     returns that artist's whole discography, and the keyword-supplement fallback
     in ``search_releases_by_track`` can't leak another artist's release in.
-    Returns ``([], {})`` when nothing cross-references; the caller keeps its
-    artist-filtered fallback.
+
+    Returns ``([], {}, {})`` when nothing cross-references; the caller keeps its
+    artist-filtered fallback. When the #628 carry-through fires (the identified
+    artist's release containing the track is *not* shelved), the third element
+    carries ``{0: ResolvedRelease}`` and the first a single ``LibraryItem(id=0)``
+    — the row-less surface, which the kernel produces by bypassing
+    ``require_artist`` (no library row exists to filter on that path).
     """
     return await _match_track_releases_to_library(
         db,
@@ -881,6 +894,7 @@ async def _narrow_swapped_by_track(
         artist=artist,
         source="swapped_interpretation",
         require_artist=artist,
+        pg=pg,
     )
 
 
@@ -889,7 +903,9 @@ async def search_with_alternative_interpretation(
     part1: str,
     part2: str,
     discogs_service: DiscogsService | None = None,
-) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
+    *,
+    pg: PgSource | None = None,
+) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]], dict[int, ResolvedRelease]]:
     """Try searching with both artist/title interpretations for 'X - Y' format.
 
     Once the artist side is identified, the *other* part is cross-referenced as a
@@ -897,6 +913,11 @@ async def search_with_alternative_interpretation(
     library the result is narrowed to that release (carrying a ``TrackMatchHint``
     via the second tuple element); otherwise the artist-filtered result is
     returned unchanged with an empty hint map.
+
+    The third tuple element is the ``discogs_titles`` seam: empty on every
+    in-library path, and ``{0: ResolvedRelease}`` only when the #628 row-less
+    carry-through surfaces a validated non-library release for the identified
+    artist (``pg`` threads the #632 resolution cache into the kernel).
     """
     raw1, raw2 = await asyncio.gather(
         db.search(query=f"{part1} {part2}", limit=_FETCH_LIMIT),
@@ -910,12 +931,16 @@ async def search_with_alternative_interpretation(
     # further limit_results().
     if results1 and not results2:
         logger.info(f"Alternative search matched with '{part1}' as artist")
-        narrowed, matched_via = await _narrow_swapped_by_track(db, part1, part2, discogs_service)
-        return (narrowed, matched_via) if narrowed else (results1, {})
+        narrowed, matched_via, titles = await _narrow_swapped_by_track(
+            db, part1, part2, discogs_service, pg=pg
+        )
+        return (narrowed, matched_via, titles) if narrowed else (results1, {}, {})
     elif results2 and not results1:
         logger.info(f"Alternative search matched with '{part2}' as artist")
-        narrowed, matched_via = await _narrow_swapped_by_track(db, part2, part1, discogs_service)
-        return (narrowed, matched_via) if narrowed else (results2, {})
+        narrowed, matched_via, titles = await _narrow_swapped_by_track(
+            db, part2, part1, discogs_service, pg=pg
+        )
+        return (narrowed, matched_via, titles) if narrowed else (results2, {}, {})
     elif results1 and results2:
         # Both readings resolve to a library artist — too ambiguous to pick a
         # track side, so return the union un-narrowed (no hints). Narrowing is
@@ -927,9 +952,9 @@ async def search_with_alternative_interpretation(
             if item.id not in seen_ids:
                 combined.append(item)
                 seen_ids.add(item.id)
-        return limit_results(combined), {}
+        return limit_results(combined), {}, {}
 
-    return [], {}
+    return [], {}, {}
 
 
 async def search_song_as_artist(
@@ -1001,6 +1026,123 @@ When LML graduates onto ``library_identity`` per cross-cache-identity (#25),
 this floor is replaced with ``library_identity.confidence`` per row.
 """
 
+# Synthetic library-id for a row-less result — a Discogs release with no WXYC
+# catalog row. Shared by the Step-3a library-miss search and the #628 A1
+# carry-through: Step-3b excludes it from re-validation, fetch_artwork_for_items
+# binds its carried release, and Step-6 serializes it with the "(external)"
+# call-number sentinel BS already understands.
+ROWLESS_LIBRARY_ID = 0
+
+
+def _make_rowless_item(*, artist: str, title: str) -> LibraryItem:
+    """Build the synthetic ``LibraryItem(id=0)`` for a row-less carry-through.
+
+    Carries the resolved release's artist + album title so Step-6's "(external)"
+    catalog item and the Step-4b identity resolution have real names to use. The
+    real Discogs identity rides alongside on the ``discogs_titles`` seam, not on
+    this row.
+    """
+    return LibraryItem(id=ROWLESS_LIBRARY_ID, artist=artist, title=title)
+
+
+async def _resolve_nonlibrary_release(
+    discogs_service: DiscogsService | None,
+    pg: PgSource | None,
+    *,
+    song: str,
+    artist: str,
+    album: str | None,
+    is_track: bool = True,
+) -> ResolvedRelease | None:
+    """Resolve + validate the Discogs release a non-library track sits on (#628).
+
+    The shared kernel behind the A1 carry-through: the three Discogs-aware
+    strategies call this at their library-gate drop point, when a candidate
+    release validated from the inputs but matched no WXYC catalog row. Returns
+    the validated :class:`ResolvedRelease` to surface row-less, or ``None`` when
+    nothing resolves.
+
+    Three layers, in order:
+
+    1. **#632 positive cache read** (``get_cached_release_id``), keyed on the
+       **typed** ``artist`` (never ``library_artist_for`` — the library channel —
+       and never a canonical-swapped probe name). Three-valued
+       :class:`ReleaseResolution`: a fresh hit re-hydrates via ``get_release``; a
+       fresh known miss (``was_present=True, release_id=None``) short-circuits to
+       ``None`` *without* a live probe; an absent/stale entry falls through.
+    2. **Bounded resolve on a cold miss** — the **uncached**
+       ``resolve_release_for_track(..., max_validations=5)`` (#633). Deliberately
+       NOT ``resolve_release_for_track_cached``: the L1 wrapper's key omits
+       ``max_validations``, so a bounded ``[]`` would coalesce with a default
+       ``[]`` (the #633 landmine). Cold-cache durability comes from the #632 PG
+       cache here instead.
+    3. **#632 cache write-back** — the resolved id, or ``None`` to record a known
+       miss so the next identical add short-circuits.
+
+    ``pg`` is best-effort: ``None`` (or a PG failure, swallowed inside the cache
+    helpers) degrades to an uncached bounded resolve. ``album`` (often absent on
+    the kernel paths) only ranks the validated candidates by title; the bounded
+    resolver returns at most one.
+    """
+    if discogs_service is None or not song or not artist:
+        return None
+
+    if pg is not None:
+        cached: ReleaseResolution = await get_cached_release_id(
+            pg, artist=artist, title=song, is_track=is_track
+        )
+        if cached.was_present:
+            if cached.release_id is None:
+                # Fresh known miss — the live probe came up empty recently.
+                return None
+            rehydrated = await _rehydrate_resolved_release(discogs_service, cached.release_id)
+            if rehydrated is not None:
+                return rehydrated
+            # The id is cached but its metadata is unfetchable right now; fall
+            # through to a live resolve rather than fabricate a release.
+
+    candidates = await resolve_release_for_track(
+        song, artist, album, discogs_service, max_validations=5
+    )
+    best = candidates[0] if candidates else None
+
+    if pg is not None:
+        await set_cached_release_id(
+            pg,
+            artist=artist,
+            title=song,
+            is_track=is_track,
+            release_id=best.release_id if best is not None else None,
+        )
+
+    return best
+
+
+async def _rehydrate_resolved_release(
+    discogs_service: DiscogsService, release_id: int
+) -> ResolvedRelease | None:
+    """Rebuild a :class:`ResolvedRelease` from a #632 cache-hit release_id.
+
+    The cache stores only the id; ``get_release`` (its own by-id cache) fills in
+    the title + URL. ``is_compilation`` is not needed downstream of
+    ``_bind_resolved_release`` (which keys on id/url/title), so it is left
+    ``False``. Returns ``None`` when the release can't be fetched, letting the
+    caller fall through to a live resolve.
+    """
+    try:
+        metadata = await discogs_service.get_release(release_id)
+    except Exception as exc:
+        logger.warning("Row-less cache re-hydrate failed for release %s: %s", release_id, exc)
+        return None
+    if metadata is None or not metadata.release_id:
+        return None
+    return ResolvedRelease(
+        release_id=metadata.release_id,
+        release_url=metadata.release_url or "",
+        is_compilation=False,
+        album_title=metadata.title or "",
+    )
+
 
 async def _match_track_releases_to_library(
     db: LibraryDB,
@@ -1010,7 +1152,9 @@ async def _match_track_releases_to_library(
     artist: str | None,
     source: str,
     require_artist: str | None = None,
-) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
+    album: str | None = None,
+    pg: PgSource | None = None,
+) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]], dict[int, ResolvedRelease]]:
     """Find Discogs releases containing ``track`` and match them back to the library.
 
     The shared kernel behind two strategies:
@@ -1036,22 +1180,37 @@ async def _match_track_releases_to_library(
     Each surviving row carries a ``TrackMatchHint``; ``source`` labels the
     validation breadcrumb (LML#344) and the log lines.
 
+    **A1 carry-through (LML#628):** when the library walk surfaces *no* row and
+    ``lml_resolve_nonlibrary_release`` is on, the kernel resolves + validates the
+    release the track sits on (via :func:`_resolve_nonlibrary_release`, bounded +
+    #632-cached) and emits a single **row-less** ``LibraryItem(id=0)`` carrying
+    that :class:`ResolvedRelease` on the third tuple element (the
+    ``discogs_titles`` seam ``fetch_artwork_for_items`` binds). This **bypasses
+    the ``require_artist`` library re-filter** — there is no library row to
+    filter, and the artist is already settled by the typed-artist
+    ``search_releases_by_track`` probe + the per-track ``validate_track_on_release``
+    credit check. The #632 cache is keyed on the typed anchor artist (the kernel's
+    ``artist`` for SWAPPED; the surfaced release's own credit for SONG_AS_TRACK,
+    which has no typed artist).
+
     Returns:
-        Tuple of (library_items, matched_via_by_id). matched_via_by_id maps each
-        library row's id to one-or-more TrackMatchHint entries — multiple hints
-        accumulate when the same WXYC row is referenced by multiple Discogs
-        releases (different pressings, etc.). ``([], {})`` when there's no
-        service, no track, or nothing cross-references.
+        Tuple of (library_items, matched_via_by_id, discogs_titles).
+        matched_via_by_id maps each library row's id to one-or-more
+        TrackMatchHint entries — multiple hints accumulate when the same WXYC row
+        is referenced by multiple Discogs releases (different pressings, etc.).
+        discogs_titles is empty on the in-library path; on the row-less
+        carry-through it carries ``{0: ResolvedRelease}``. ``([], {}, {})`` when
+        there's no service, no track, or nothing cross-references.
     """
     if not discogs_service or not track or not track.strip():
-        return [], {}
+        return [], {}, {}
 
     label = source.upper()
     response = await discogs_service.search_releases_by_track(track, artist=artist)
     raw_releases = list(response.releases or [])
     if not raw_releases:
         logger.info(f"{label}: no Discogs releases for '{track}'")
-        return [], {}
+        return [], {}, {}
 
     logger.info(
         f"{label}: {len(raw_releases)} Discogs releases for '{track}', matching against library"
@@ -1147,14 +1306,47 @@ async def _match_track_releases_to_library(
         if done:
             break
 
-    return matched_items, matched_via_by_id
+    if matched_items:
+        return matched_items, matched_via_by_id, {}
+
+    # A1 carry-through (LML#628): the library walk dropped every candidate (no
+    # WXYC row), but a release may still resolve + validate from the inputs.
+    # Surface it row-less rather than returning empty. Gated; off by default.
+    if get_settings().lml_resolve_nonlibrary_release:
+        # Anchor artist: the kernel's typed ``artist`` (SWAPPED's identified
+        # side). SONG_AS_TRACK has none, so fall back to the surfaced release's
+        # own credit — the only artist signal a song-only query carries. Either
+        # way this bypasses ``require_artist`` (no library row to re-filter; the
+        # per-track credit check settles the artist).
+        anchor_artist = artist or next(
+            (r.artist for r in raw_releases if r.artist and r.artist.strip()), ""
+        )
+        resolved = await _resolve_nonlibrary_release(
+            discogs_service,
+            pg,
+            song=track,
+            artist=anchor_artist,
+            album=album,
+            is_track=True,
+        )
+        if resolved is not None:
+            rowless = _make_rowless_item(artist=anchor_artist, title=resolved.album_title)
+            logger.info(
+                f"{label}: surfacing row-less Discogs release {resolved.release_id} "
+                f"('{resolved.album_title}') — validated, not in library"
+            )
+            return [rowless], {}, {ROWLESS_LIBRARY_ID: resolved}
+
+    return matched_items, matched_via_by_id, {}
 
 
 async def search_song_as_track(
     db: LibraryDB,
     song: str | None,
     discogs_service: DiscogsService | None = None,
-) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]]]:
+    *,
+    pg: PgSource | None = None,
+) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]], dict[int, ResolvedRelease]]:
     """Cross-reference song against Discogs and match releases back to library.
 
     Catalog-track-search §4.2 / LML#301: when SONG_AS_ARTIST returns empty for a
@@ -1168,15 +1360,17 @@ async def search_song_as_track(
         db: Library database for album fuzzy search.
         song: The track title from the user query.
         discogs_service: Required. Without it, this strategy no-ops.
+        pg: Discogs-cache PG handle for the #632 row-less resolution cache. When
+            ``None`` the A1 carry-through (LML#628) still resolves, just uncached.
 
     Returns:
-        Tuple of (library_items, matched_via_by_id). matched_via_by_id maps
-        each library row's id to one-or-more TrackMatchHint entries — multiple
-        hints accumulate when the same WXYC row is referenced by multiple
-        Discogs releases (different pressings, etc.).
+        Tuple of (library_items, matched_via_by_id, discogs_titles). See the
+        kernel :func:`_match_track_releases_to_library` for the per-element
+        contract; ``discogs_titles`` carries the row-less ``{0: ResolvedRelease}``
+        only when the #628 carry-through fires.
     """
     return await _match_track_releases_to_library(
-        db, discogs_service, song, artist=None, source="song_as_track"
+        db, discogs_service, song, artist=None, source="song_as_track", pg=pg
     )
 
 
@@ -1472,6 +1666,8 @@ async def search_compilations_for_track(
     db: LibraryDB,
     parsed: ParsedRequest,
     discogs_service: DiscogsService | None = None,
+    *,
+    pg: PgSource | None = None,
 ) -> tuple[list[LibraryItem], dict[int, ResolvedRelease]]:
     """Search for track on compilation albums using Discogs and library keyword search.
 
@@ -1484,6 +1680,13 @@ async def search_compilations_for_track(
     ``artist_for_probes``); the library-side keyword search and the two
     ``artist_matches_item`` match-backs use ``lib_artist`` (the correction when
     present, else the typed name).
+
+    A1 carry-through (LML#628): when the whole search surfaces no library row and
+    ``lml_resolve_nonlibrary_release`` is on, the track's release is resolved +
+    validated (via :func:`_resolve_nonlibrary_release`, keyed on the typed
+    ``parsed.artist``) and surfaced row-less as ``LibraryItem(id=0)`` +
+    ``discogs_titles[0]``. ``pg`` threads the #632 cache; ``None`` resolves
+    uncached.
     """
     if not parsed.song or not parsed.artist:
         return [], {}
@@ -1848,6 +2051,30 @@ async def search_compilations_for_track(
             key=lambda r: song_lower in (r.title or "").lower(),
             reverse=True,
         )
+
+    # A1 carry-through (LML#628): the artist+keyword+album waves dropped every
+    # candidate on the library gate, but the track may still resolve + validate
+    # off a non-library release. Surface it row-less rather than empty. Keyed on
+    # the typed ``parsed.artist`` (NOT ``lib_artist`` / the canonical-swapped
+    # ``artist_for_probes``), consistent with the #626 two-channel decision and
+    # the #632 cache contract. Gated; off by default.
+    if not results and get_settings().lml_resolve_nonlibrary_release and parsed.song:
+        resolved = await _resolve_nonlibrary_release(
+            discogs_service,
+            pg,
+            song=parsed.song,
+            artist=parsed.artist or "",
+            album=parsed.album,
+            is_track=True,
+        )
+        if resolved is not None:
+            rowless = _make_rowless_item(artist=parsed.artist or "", title=resolved.album_title)
+            discogs_titles[ROWLESS_LIBRARY_ID] = resolved
+            logger.info(
+                f"TRACK_ON_COMPILATION: surfacing row-less Discogs release "
+                f"{resolved.release_id} ('{resolved.album_title}') — validated, not in library"
+            )
+            return [rowless], discogs_titles
 
     return limit_results(results), discogs_titles
 
@@ -2305,6 +2532,7 @@ async def fetch_artwork_for_items(
     discogs_titles = discogs_titles or {}
     settings = get_settings()
     resolve_compilation_release = settings.lml_resolve_compilation_release
+    resolve_nonlibrary_release = settings.lml_resolve_nonlibrary_release
     resolve_artist_canonical = settings.lml_resolve_artist_canonical
 
     async def fetch_one(item: LibraryItem) -> DiscogsSearchResult | None:
@@ -2314,12 +2542,21 @@ async def fetch_artwork_for_items(
             # library row's own title when no release was resolved for this id.
             resolved = discogs_titles.get(item.id)
 
-            # Carried-release trust-and-bind (LML#604): the search strategy
-            # already resolved and validated this release this same request, so
-            # bind it by id and skip the artist-floor re-search. Flag-gated so
-            # flag-off re-searches exactly as before (the release's album_title
-            # still seeds that search below).
-            if resolve_compilation_release and resolved is not None:
+            # Carried-release trust-and-bind: the search strategy already
+            # resolved and validated this release this same request, so bind it
+            # by id and skip the artist-floor re-search. Two flag-gated callers:
+            #   - LML#604: an in-library compilation row whose floor search the
+            #     ``lml_resolve_compilation_release`` flag rescues.
+            #   - LML#628: a *row-less* (id==0) non-library release the A1
+            #     carry-through synthesized; ``lml_resolve_nonlibrary_release``
+            #     gates it. There is no library row to floor-search against, so
+            #     binding the carried release is the only way to surface it.
+            # Flag-off on both re-searches exactly as before (the release's
+            # album_title still seeds that search below for non-row-less items).
+            bind_carried = resolve_compilation_release or (
+                resolve_nonlibrary_release and item.id == ROWLESS_LIBRARY_ID
+            )
+            if bind_carried and resolved is not None:
                 return await _bind_resolved_release(discogs_service, resolved, item)
 
             album = resolved.album_title if resolved is not None else item.title
@@ -3325,20 +3562,27 @@ async def perform_lookup(
         # the strategies that need it; ARTIST_PLUS_ALBUM is the only
         # library-only strategy (SWAPPED_INTERPRETATION now cross-references the
         # non-artist token as a track via Discogs — LML#622).
+        # ``discogs_cache_pg`` threads the #632 row-less resolution cache into the
+        # three Discogs-aware strategies' A1 carry-through (LML#628). The library
+        # channel and ARTIST_PLUS_ALBUM / SONG_AS_ARTIST never touch it.
         strategies = build_strategies(
             db,
             search_library_func=search_library_with_fallback,
             search_alternative_func=partial(
-                search_with_alternative_interpretation, discogs_service=discogs_service
+                search_with_alternative_interpretation,
+                discogs_service=discogs_service,
+                pg=discogs_cache_pg,
             ),
             search_compilations_func=partial(
-                search_compilations_for_track, discogs_service=discogs_service
+                search_compilations_for_track,
+                discogs_service=discogs_service,
+                pg=discogs_cache_pg,
             ),
             search_song_as_artist_func=partial(
                 search_song_as_artist, discogs_service=discogs_service
             ),
             search_song_as_track_func=partial(
-                search_song_as_track, discogs_service=discogs_service
+                search_song_as_track, discogs_service=discogs_service, pg=discogs_cache_pg
             ),
         )
 
