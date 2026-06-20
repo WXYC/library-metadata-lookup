@@ -2919,6 +2919,16 @@ async def enrich_artwork_results(
             not album
             or not item.title
             or score_match(album, item.title) >= SCORE_MATCH_ACCEPTANCE_FLOOR
+            # LML#628: a row-less carry-through item (id == ROWLESS_LIBRARY_ID,
+            # carrying an already-validated Discogs release) has no library row,
+            # so the LML#487 sibling-leak concern — a *row's* artwork/streaming
+            # links bleeding onto a mismatched album — cannot apply. The
+            # carry-through resolves by *track*, so its release title (``item.title``)
+            # routinely differs from a typed album; gating it here clobbered the
+            # validated ``release_id`` down to the BS#1185 ``release_id=0`` sentinel
+            # the feature exists to avoid. The release_id was validated to carry the
+            # track, and item.title IS that release's title, so trust the binding.
+            or (item.id == ROWLESS_LIBRARY_ID and artwork is not None and artwork.release_id > 0)
         )
 
         # LML#487: the library row is "acceptable" (a real match for the

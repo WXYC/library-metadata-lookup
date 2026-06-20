@@ -12,9 +12,12 @@ rather than the BS#1185 ``release_id=0`` sentinel.
 
 Spine case (the #604 repro shape): A Guy Called Gerald — "When There Is No Sun"
 (a track on a Various-Artists compilation filed under the track artist, so the
-library never carries the release). One case per strategy plus the cache
-amortization check (#632) live here; the wire-contract guard for the row-less
-shape lives in ``tests/unit/test_rowless_result_contract.py``.
+library never carries the release). One case per strategy here, plus a
+#632 cache-threading check (the deeper read-amortization is unit-tested in
+``tests/unit/test_nonlibrary_release_resolution.py``) and a regression for the
+LML#487 enrichment gate clobbering the row-less binding on a mismatched request
+album. The wire-contract guard for the row-less shape lives in
+``tests/unit/test_rowless_result_contract.py``.
 
 Driven end-to-end through ``perform_lookup`` against the real seeded
 ``library_db`` with a mock ``DiscogsService`` so the strategy gating, the
@@ -110,6 +113,31 @@ def _base_discogs_mock() -> AsyncMock:
     return svc
 
 
+class _RecordingPg:
+    """Dict-backed ``PgSource`` stand-in for the #632 cache, recording writes.
+
+    Keyed on ``(artist_normalized, title_normalized, is_track)`` — close enough
+    to the ``release_resolution_cache`` SELECT/UPSERT shape that the real
+    ``get_cached_release_id`` / ``set_cached_release_id`` exercise their
+    normalization + three-valued logic against it.
+    """
+
+    def __init__(self):
+        self.store: dict[tuple[str, str, bool], int | None] = {}
+        self.execute_calls = 0
+
+    async def fetchone(self, query: str, *args):
+        key = (args[0], args[1], args[2])
+        if key not in self.store:
+            return None
+        return {"release_id": self.store[key]}
+
+    async def execute(self, query: str, *args):
+        self.execute_calls += 1
+        self.store[(args[0], args[1], args[2])] = args[3]
+        return "INSERT 0 1"
+
+
 # ---------------------------------------------------------------------------
 # TRACK_ON_COMPILATION
 # ---------------------------------------------------------------------------
@@ -160,7 +188,7 @@ async def test_track_on_compilation_surfaces_rowless_when_flag_on(
     # through SWAPPED (which would report "alternative"). All three strategies
     # emit byte-identical row-less output, so without this a priority change
     # could re-route the test and still pass.
-    assert response.search_type != "alternative"
+    assert response.search_type == "compilation"
 
 
 @pytest.mark.asyncio
@@ -176,6 +204,70 @@ async def test_track_on_compilation_flag_off_no_rowless(library_db):
         r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
         for r in response.results
     )
+
+
+@pytest.mark.asyncio
+async def test_track_on_compilation_survives_mismatched_request_album(
+    library_db, enable_nonlibrary_release
+):
+    """A request album that doesn't match the resolved compilation title must NOT
+    clobber the validated carry-through binding down to the BS#1185 sentinel.
+
+    The carry-through resolves by *track*, so the resolved release title ("When
+    There Is No Sun") routinely differs from a typed album. The LML#487 title
+    gate in ``enrich_artwork_results`` guards a *library row*'s artwork from
+    leaking onto a mismatched album — but a row-less item has no library row to
+    leak from, and its ``release_id`` was validated to carry the track. Gating it
+    emitted ``release_id=0`` (the sentinel) for the common album-bearing request,
+    silently defeating the feature.
+    """
+    svc = _base_discogs_mock()
+    svc.search_releases_by_track = AsyncMock(return_value=_track_releases(_spine_release()))
+
+    request = LookupRequest(
+        artist=SPINE_ARTIST,
+        song=SPINE_TRACK,
+        album="Black Secret Technology",  # the artist's own LP, not the V/A comp
+        raw_message=f"{SPINE_ARTIST} - {SPINE_TRACK}",
+    )
+    response = await perform_lookup(
+        request,
+        library_db,
+        svc,
+        telemetry=make_lml_telemetry(),
+        discogs_cache_pg=None,
+    )
+
+    rowless = [r for r in response.results if r.library_item.id == 0 and r.artwork is not None]
+    assert len(rowless) == 1
+    # The validated Discogs identity survives enrichment — NOT the release_id=0 sentinel.
+    assert rowless[0].artwork.release_id == SPINE_RELEASE_ID
+    assert rowless[0].artwork.release_id > 0
+    assert rowless[0].artwork.release_url == SPINE_RELEASE_URL
+
+
+@pytest.mark.asyncio
+async def test_track_on_compilation_threads_pg_and_writes_cache(
+    library_db, enable_nonlibrary_release
+):
+    """The #632 cache handle reaches ``_resolve_nonlibrary_release`` through the
+    full ``perform_lookup`` -> ``build_strategies`` partial plumbing: a lookup
+    with a pg writes the resolved release to the cache. A partial that dropped
+    ``pg=discogs_cache_pg`` would leave the store empty and fail this."""
+    svc = _base_discogs_mock()
+    svc.search_releases_by_track = AsyncMock(return_value=_track_releases(_spine_release()))
+    pg = _RecordingPg()
+
+    response = await _run_track_on_compilation(library_db, svc, pg=pg)
+
+    assert any(
+        r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
+        for r in response.results
+    )
+    # The pg handle was threaded all the way down: the positive resolution landed
+    # in the #632 cache (keyed on the typed artist + track).
+    assert pg.execute_calls >= 1
+    assert pg.store.get((SPINE_ARTIST.lower(), SPINE_TRACK.lower(), True)) == SPINE_RELEASE_ID
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +312,7 @@ async def test_song_as_track_surfaces_rowless_when_flag_on(library_db, enable_no
     assert item.artwork.release_id == SPINE_RELEASE_ID
     assert item.artwork.release_url == SPINE_RELEASE_URL
     # Pin routing: SONG_AS_TRACK (song-only, no typed artist), not SWAPPED.
-    assert response.search_type != "alternative"
+    assert response.search_type == "compilation"
 
 
 @pytest.mark.asyncio
