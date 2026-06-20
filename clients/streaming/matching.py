@@ -409,18 +409,33 @@ def record_match_telemetry(
         logger.warning("Failed to emit matcher telemetry: %s", e)
 
 
-# Adapter extractors subscript raw API dicts directly (e.g. Spotify's
-# ``x["artists"][0]["name"]``, Deezer's ``x["artist"]["name"]``). A sparse or
-# malformed upstream row — a missing key, an empty ``artists`` list, a null
-# where a dict is expected — makes one of them raise mid-loop. Without a
-# per-item guard that exception propagates out of the matcher and aborts the
-# whole match, erasing every well-formed row in the same response (LML#640).
-# The guard catches exactly these extraction-shaped errors and skips the one
-# bad row; a genuine programming error in an extractor (e.g. calling a
-# non-callable) is not in this set and still surfaces loudly rather than being
-# silently swallowed for every row. Kept narrow on purpose — it wraps only the
-# extractor calls, never the scoring.
-_EXTRACTION_ERRORS = (KeyError, IndexError, TypeError)
+# Adapter extractors pull fields out of raw upstream rows either by subscripting
+# (Spotify's ``x["artists"][0]["name"]``, Deezer's ``x["artist"]["name"]``) or by
+# attribute access (the orchestrator's ``lambda r: r.artist`` over a
+# ``DiscogsSearchResult``). A sparse or malformed row makes one of them raise
+# mid-loop, and these four exception types ARE those extraction shapes: KeyError
+# (missing key), IndexError (empty ``artists`` list), TypeError (subscripting a
+# null), AttributeError (attribute on None / wrong type — the failure mode of the
+# attribute-style extractors that the typed matcher's real callers pass). Without
+# a guard the exception aborts the whole match and erases every well-formed row in
+# the same response (LML#640).
+#
+# The guard skips one offending row. It deliberately does NOT try to tell a
+# "sparse upstream row" apart from a "buggy extractor" by exception type — both
+# raise the same types, so that split is undecidable per row.
+#
+# The two matchers then diverge on what a *total* failure means, because they
+# feed different pipelines:
+#   - ``find_best_match`` feeds the streaming-check path, which HAS an
+#     errored-source retry channel (``streaming/orchestrator.py``, LML#376). So
+#     if EVERY row fails extraction — a systemic break, not a sparse row — it
+#     re-raises; the orchestrator marks the source errored and retries instead
+#     of persisting a definitive no-match.
+#   - ``find_best_typed_match`` feeds the lookup pipeline, which has no such
+#     channel (a raise there 500s the request or is swallowed back to None). So
+#     it never re-raises: a wholesale-malformed response degrades to a graceful
+#     ``None`` and the pipeline falls through.
+_EXTRACTION_ERRORS = (KeyError, IndexError, TypeError, AttributeError)
 
 
 def find_best_match(
@@ -440,6 +455,11 @@ def find_best_match(
     highest-scoring result as a dict with url, confidence, matched_artist,
     matched_title, and optionally id.
 
+    A row whose extractor raises an extraction-shaped error (see
+    ``_EXTRACTION_ERRORS``) is skipped and logged rather than aborting the whole
+    match (LML#640) — except when *every* row fails, which re-raises (see
+    Raises).
+
     Args:
         results: Raw result dicts from a streaming service API.
         query_artist: Artist name to match against.
@@ -451,10 +471,21 @@ def find_best_match(
 
     Returns:
         Best match dict, or None if no acceptable match found.
+
+    Raises:
+        KeyError | IndexError | TypeError | AttributeError: when a non-empty
+        ``results`` is passed and *every* row fails extraction — a systemic
+        break (upstream shape change or broken extractor), surfaced so the
+        caller can treat the source as errored and retry (LML#376) rather than
+        record a definitive no-match. A sparse minority never raises.
     """
     best: dict | None = None
     best_score = 0.0
+    total = 0
+    extraction_failures = 0
+    last_error: Exception | None = None
     for item in results:
+        total += 1
         # Extract every field up front, inside the guard, so a sparse row is
         # skipped whichever extractor trips — including ``url_fn``/``id_fn``,
         # which only feed a floor-clearing winner. Evaluating them per-row (vs.
@@ -466,6 +497,8 @@ def find_best_match(
             result_url = url_fn(item)
             result_id = id_fn(item) if id_fn is not None else None
         except _EXTRACTION_ERRORS as exc:
+            extraction_failures += 1
+            last_error = exc
             logger.warning("Skipping malformed result row in find_best_match: %s", exc)
             continue
         artist_score = score_match(query_artist, result_artist)
@@ -488,6 +521,12 @@ def find_best_match(
             if id_fn is not None:
                 match["id"] = result_id
             best = match
+    # Every row failed extraction → systemic break, not a sparse minority. Surface
+    # it (LML#376 errored-source retry) instead of silently returning None. This
+    # still raises strictly less than the pre-LML#640 code, which aborted on the
+    # first bad row regardless of the others.
+    if last_error is not None and extraction_failures == total:
+        raise last_error
     return best
 
 
@@ -524,10 +563,24 @@ def find_best_typed_match[T](
 
     None-valued extractors score as 0 against any non-empty query. Ties
     resolve to the first candidate reaching the score, preserving input
-    order.
+    order. An extractor that *raises* (vs. returns None) is treated as a
+    malformed candidate: the row is skipped and logged rather than scored
+    (LML#640). The real callers pass attribute extractors (``lambda r:
+    r.artist``), whose failure mode is ``AttributeError``, so
+    ``_EXTRACTION_ERRORS`` includes it — a ``None``/wrong-type candidate is
+    skipped, not fatal.
 
-    Iterables are materialized to a list internally — a single-pass
-    generator is safe.
+    Unlike ``find_best_match``, this does NOT re-raise on total extraction
+    failure. Its callers are the lookup pipeline (``lookup/orchestrator.py``),
+    which has no errored-source retry channel: ``fetch_one`` would swallow a
+    raise back to ``None`` and ``_library_miss_discogs_search`` would let it
+    500 the request. So a wholesale-malformed ``results`` degrades to ``None``
+    (a clean no-match the pipeline can fall through), not an exception. The
+    errored-source signal (LML#376) belongs only to the streaming path that
+    ``find_best_match`` feeds.
+
+    Results are consumed in a single pass, so a generator argument is safe (it
+    is not materialized).
     """
     artist_variants = [v for v in _as_variants(query_artist) if v and v.strip()]
     title_variants = [v for v in _as_variants(query_title) if v and v.strip()]
@@ -537,9 +590,9 @@ def find_best_typed_match[T](
     best: T | None = None
     best_score = 0.0
     for item in results:
-        # Same per-item guard as ``find_best_match`` — the orchestrator lookup
-        # path runs through here, so a malformed candidate must be skipped, not
-        # fatal (LML#640).
+        # Per-item guard, as in ``find_best_match``: a malformed candidate is
+        # skipped, not fatal (LML#640). No total-failure re-raise here — the
+        # lookup pipeline wants a graceful ``None`` (see docstring).
         try:
             r_artist = artist_fn(item) or ""
             r_title = title_fn(item) or ""

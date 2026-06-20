@@ -113,15 +113,31 @@ async def run(args) -> None:
 
             for artist, title in queries:
                 results = await spotify.search_album(artist, title)
-                match = find_best_match(
-                    results,
-                    artist,
-                    title,
-                    artist_fn=_SPOTIFY_ARTIST,
-                    title_fn=_SPOTIFY_TITLE,
-                    url_fn=_SPOTIFY_URL,
-                    id_fn=_SPOTIFY_ID,
-                )
+                try:
+                    match = find_best_match(
+                        results,
+                        artist,
+                        title,
+                        artist_fn=_SPOTIFY_ARTIST,
+                        title_fn=_SPOTIFY_TITLE,
+                        url_fn=_SPOTIFY_URL,
+                        id_fn=_SPOTIFY_ID,
+                    )
+                except Exception as exc:
+                    # find_best_match re-raises only when EVERY row of a response
+                    # fails extraction — rare here, since these extractors use
+                    # .get() defaults (it takes e.g. "artists": [] on every row to
+                    # trip an IndexError). Still, a long batch must not abort on one
+                    # bad page: log and treat this query as a miss so the loop
+                    # continues, as the sibling streaming scripts likewise guard
+                    # their own find_best_match calls. (LML#640)
+                    logger.warning(
+                        "Extraction failed for every row of '%s - %s'; skipping query: %s",
+                        artist,
+                        title,
+                        exc,
+                    )
+                    continue
                 if match and (best_match is None or match["confidence"] > best_match["confidence"]):
                     best_match = match
 
