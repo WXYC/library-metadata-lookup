@@ -78,7 +78,7 @@ class TestSongAsTrackAgainstDiscogsCache:
         and the response should carry a TrackMatchHint with
         ``source=discogs_release`` and the track title preserved.
         """
-        results, matched_via = await search_song_as_track(
+        results, matched_via, _ = await search_song_as_track(
             library_db, "vi scose poise", discogs_service=discogs_service
         )
 

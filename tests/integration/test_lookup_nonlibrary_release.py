@@ -1,0 +1,308 @@
+"""A1 carry-through: non-library resolvable releases surface row-less (LML#628).
+
+The track-validating Discogs-aware strategies (TRACK_ON_COMPILATION,
+SONG_AS_TRACK, SWAPPED_INTERPRETATION) gate a candidate Discogs release on a
+fuzzy *library-row* match first and drop it if none exists — even when the
+release validates from the inputs (#536 defers track-validation until after the
+library gate). LML#628 wires the row-less carry-through: when the flag is on and
+no library row matches, the strategy resolves + validates the release and emits
+the ``LibraryItem(id=0)`` + real ``DiscogsSearchResult`` shape the library-miss
+search already produces (orchestrator.py ``_library_miss_discogs_search``),
+rather than the BS#1185 ``release_id=0`` sentinel.
+
+Spine case (the #604 repro shape): A Guy Called Gerald — "When There Is No Sun"
+(a track on a Various-Artists compilation filed under the track artist, so the
+library never carries the release). One case per strategy plus the cache
+amortization check (#632) live here; the wire-contract guard for the row-less
+shape lives in ``tests/unit/test_rowless_result_contract.py``.
+
+Driven end-to-end through ``perform_lookup`` against the real seeded
+``library_db`` with a mock ``DiscogsService`` so the strategy gating, the
+two-channel artist seam (#626), and Step-6 id==0 serialization are all
+exercised. Flag default-off asserts today's empty/sentinel behavior.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock
+
+import pytest
+
+from discogs.models import (
+    DiscogsSearchResponse,
+    ReleaseInfo,
+    ReleaseMetadataResponse,
+    TrackReleasesResponse,
+)
+from lookup.models import LookupRequest
+from lookup.orchestrator import perform_lookup
+from tests.conftest import make_lml_telemetry
+
+# A real-looking Discogs release id + canonical URL for the non-library
+# compilation the spine track sits on. Distinct from every seeded library row.
+SPINE_RELEASE_ID = 36907527
+SPINE_RELEASE_URL = f"https://www.discogs.com/release/{SPINE_RELEASE_ID}"
+SPINE_ALBUM = "When There Is No Sun"
+SPINE_ARTIST = "A Guy Called Gerald"
+SPINE_TRACK = "Message to Black Youth"
+
+
+@pytest.fixture
+def enable_nonlibrary_release(monkeypatch):
+    """Turn on LML_RESOLVE_NONLIBRARY_RELEASE for the carry-through."""
+    monkeypatch.setenv("LML_RESOLVE_NONLIBRARY_RELEASE", "true")
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def _spine_release(
+    release_id: int = SPINE_RELEASE_ID, artist: str = "Various", album: str = SPINE_ALBUM
+) -> ReleaseInfo:
+    """The V/A compilation release carrying the spine track — not in library."""
+    return ReleaseInfo(
+        album=album,
+        artist=artist,
+        release_id=release_id,
+        release_url=f"https://www.discogs.com/release/{release_id}",
+        is_compilation=True,
+    )
+
+
+def _track_releases(*releases: ReleaseInfo) -> TrackReleasesResponse:
+    return TrackReleasesResponse(
+        track=SPINE_TRACK,
+        artist=SPINE_ARTIST,
+        releases=list(releases),
+        total=len(releases),
+        cached=False,
+    )
+
+
+def _empty_track_releases() -> TrackReleasesResponse:
+    return TrackReleasesResponse(track="", artist="", releases=[], total=0, cached=False)
+
+
+def _spine_release_metadata() -> ReleaseMetadataResponse:
+    return ReleaseMetadataResponse(
+        release_id=SPINE_RELEASE_ID,
+        title=SPINE_ALBUM,
+        artist="Various",
+        release_url=SPINE_RELEASE_URL,
+        artwork_url="https://i.discogs.com/sun.jpg",
+    )
+
+
+def _base_discogs_mock() -> AsyncMock:
+    """A mock DiscogsService that surfaces the spine release only via the
+    track-probe, never via the library-miss ``search()`` (which the row-less
+    path does NOT use) and never via a library-matching album title."""
+    svc = AsyncMock()
+    svc.cache_service = None
+    # The library-miss Step-3a probe + the strategies' floor re-search both go
+    # through search(); return nothing so neither short-circuits the strategy.
+    svc.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
+    svc.validate_track_on_release = AsyncMock(return_value=True)
+    svc.search_releases_by_album_title = AsyncMock(return_value=_empty_track_releases())
+    svc.get_release = AsyncMock(return_value=_spine_release_metadata())
+    return svc
+
+
+# ---------------------------------------------------------------------------
+# TRACK_ON_COMPILATION
+# ---------------------------------------------------------------------------
+
+
+async def _run_track_on_compilation(library_db, svc, *, pg=None):
+    """Drive perform_lookup down the TRACK_ON_COMPILATION cut-site.
+
+    The artist is not in the seeded library, ``resolve_albums_for_track`` sees
+    only a V/A release for the track (sets ``song_not_found``), and the
+    compilation album title is not shelved — so ``search_compilations_for_track``
+    finds the Discogs release but no library row.
+    """
+    request = LookupRequest(
+        artist=SPINE_ARTIST,
+        song=SPINE_TRACK,
+        raw_message=f"{SPINE_ARTIST} - {SPINE_TRACK}",
+    )
+    return await perform_lookup(
+        request,
+        library_db,
+        svc,
+        telemetry=make_lml_telemetry(),
+        discogs_cache_pg=pg,
+    )
+
+
+@pytest.mark.asyncio
+async def test_track_on_compilation_surfaces_rowless_when_flag_on(
+    library_db, enable_nonlibrary_release
+):
+    svc = _base_discogs_mock()
+    # resolve_albums_for_track probes by track (no album) and validate; surface
+    # the V/A comp so song_not_found is set, then the compilation strategy
+    # re-finds it by track.
+    svc.search_releases_by_track = AsyncMock(return_value=_track_releases(_spine_release()))
+
+    response = await _run_track_on_compilation(library_db, svc)
+
+    assert len(response.results) == 1
+    item = response.results[0]
+    assert item.library_item.id == 0
+    assert item.artwork is not None
+    assert item.artwork.release_id == SPINE_RELEASE_ID
+    assert item.artwork.release_id > 0
+    assert item.artwork.release_url == SPINE_RELEASE_URL
+
+
+@pytest.mark.asyncio
+async def test_track_on_compilation_flag_off_no_rowless(library_db):
+    svc = _base_discogs_mock()
+    svc.search_releases_by_track = AsyncMock(return_value=_track_releases(_spine_release()))
+
+    response = await _run_track_on_compilation(library_db, svc)
+
+    # Flag off: no row-less identity surfaces. Either no results, or no result
+    # carries a real Discogs identity (release_id > 0).
+    assert not any(
+        r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
+        for r in response.results
+    )
+
+
+# ---------------------------------------------------------------------------
+# SONG_AS_TRACK
+# ---------------------------------------------------------------------------
+
+
+async def _run_song_as_track(library_db, svc, *, pg=None):
+    """Drive perform_lookup down the SONG_AS_TRACK cut-site.
+
+    Song-only (no artist) so SONG_AS_ARTIST runs first and finds nothing, then
+    SONG_AS_TRACK cross-references the song as a track. The surfaced release is
+    not in the library, so the kernel's library gate drops it.
+    """
+    request = LookupRequest(song=SPINE_TRACK, raw_message=SPINE_TRACK)
+    return await perform_lookup(
+        request,
+        library_db,
+        svc,
+        telemetry=make_lml_telemetry(),
+        discogs_cache_pg=pg,
+    )
+
+
+@pytest.mark.asyncio
+async def test_song_as_track_surfaces_rowless_when_flag_on(library_db, enable_nonlibrary_release):
+    svc = _base_discogs_mock()
+    # SONG_AS_ARTIST: no releases by the song-as-artist name.
+    svc.lookup_releases_by_artist = AsyncMock(return_value=[])
+    # Song-only probe surfaces the spine release (its own artist credit anchors
+    # the row-less resolve, since there is no typed artist here).
+    svc.search_releases_by_track = AsyncMock(
+        return_value=_track_releases(_spine_release(artist=SPINE_ARTIST))
+    )
+
+    response = await _run_song_as_track(library_db, svc)
+
+    assert len(response.results) == 1
+    item = response.results[0]
+    assert item.library_item.id == 0
+    assert item.artwork is not None
+    assert item.artwork.release_id == SPINE_RELEASE_ID
+    assert item.artwork.release_url == SPINE_RELEASE_URL
+
+
+@pytest.mark.asyncio
+async def test_song_as_track_flag_off_no_rowless(library_db):
+    svc = _base_discogs_mock()
+    svc.lookup_releases_by_artist = AsyncMock(return_value=[])
+    svc.search_releases_by_track = AsyncMock(
+        return_value=_track_releases(_spine_release(artist=SPINE_ARTIST))
+    )
+
+    response = await _run_song_as_track(library_db, svc)
+
+    assert not any(
+        r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
+        for r in response.results
+    )
+
+
+# ---------------------------------------------------------------------------
+# SWAPPED_INTERPRETATION
+# ---------------------------------------------------------------------------
+
+
+# The SWAPPED track side: a word ("Tunes") that co-occurs in Stereolab's seeded
+# catalog ("Aluminum Tunes"), so the combined "Stereolab Tunes" FTS query
+# surfaces the Stereolab row (results1) while "Tunes" as an *artist* matches
+# nothing (results2 empty) — the unambiguous single-artist branch that narrows
+# via the track cross-reference. Typed song/artist are left unset so neither
+# ARTIST_PLUS_ALBUM (which would surface Stereolab rows and pre-empt SWAPPED's
+# ``not state.results`` gate) nor TRACK_ON_COMPILATION / SONG_AS_TRACK (both
+# need ``parsed.song``) can fire — SWAPPED is the only strategy in play.
+SWAPPED_ARTIST = "Stereolab"
+SWAPPED_TRACK = "Tunes"
+
+
+async def _run_swapped(library_db, svc, *, pg=None):
+    """Drive perform_lookup down the SWAPPED_INTERPRETATION cut-site.
+
+    ``"Stereolab - Tunes"`` is an ambiguous X - Y. "Stereolab" matches the seeded
+    library artist (results1), "Tunes" as an artist matches nothing (results2
+    empty), so the kernel narrows by cross-referencing "Tunes" as a track against
+    Discogs — but the release holding it is a comp not shelved in the library.
+    """
+    request = LookupRequest(raw_message=f"{SWAPPED_ARTIST} - {SWAPPED_TRACK}")
+    return await perform_lookup(
+        request,
+        library_db,
+        svc,
+        telemetry=make_lml_telemetry(),
+        discogs_cache_pg=pg,
+    )
+
+
+def _swapped_track_probe(track: str, artist: str | None = None, **_kw) -> TrackReleasesResponse:
+    """Return the spine release only for the identified-artist track probe.
+
+    Scopes the surfaced release to the ``("Tunes", "Stereolab")`` probe so the
+    mock doesn't bleed the V/A comp into any other (artist, track) pair.
+    """
+    if track == SWAPPED_TRACK and artist == SWAPPED_ARTIST:
+        return _track_releases(_spine_release(artist=SWAPPED_ARTIST, album="Some Comp"))
+    return _empty_track_releases()
+
+
+@pytest.mark.asyncio
+async def test_swapped_interpretation_surfaces_rowless_when_flag_on(
+    library_db, enable_nonlibrary_release
+):
+    svc = _base_discogs_mock()
+    # The identified artist (Stereolab) probes the track; the release is a comp
+    # not shelved in the library. Artist-scoped so it can't reach another path.
+    svc.search_releases_by_track = AsyncMock(side_effect=_swapped_track_probe)
+
+    response = await _run_swapped(library_db, svc)
+
+    rowless = [r for r in response.results if r.library_item.id == 0 and r.artwork is not None]
+    assert len(rowless) == 1
+    assert rowless[0].artwork.release_id == SPINE_RELEASE_ID
+    assert rowless[0].artwork.release_url == SPINE_RELEASE_URL
+
+
+@pytest.mark.asyncio
+async def test_swapped_interpretation_flag_off_no_rowless(library_db):
+    svc = _base_discogs_mock()
+    svc.search_releases_by_track = AsyncMock(side_effect=_swapped_track_probe)
+
+    response = await _run_swapped(library_db, svc)
+
+    assert not any(
+        r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
+        for r in response.results
+    )

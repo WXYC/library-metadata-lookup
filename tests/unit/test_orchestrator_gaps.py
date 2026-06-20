@@ -64,7 +64,7 @@ class TestAlternativeInterpretationBothResults:
         # Second interpretation: "Bar Foo" -> items 2, 3
         db.search = AsyncMock(side_effect=[[item1, shared], [item2, shared]])
 
-        results, _ = await search_with_alternative_interpretation(db, "Foo", "Bar")
+        results, _, _ = await search_with_alternative_interpretation(db, "Foo", "Bar")
 
         ids = [r.id for r in results]
         assert 1 in ids

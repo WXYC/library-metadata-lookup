@@ -801,7 +801,7 @@ class TestSearchWithAlternativeInterpretation:
             [make_library_item(id=2, artist="Someone Else", title="Other Album")],
         ]
 
-        results, _ = await search_with_alternative_interpretation(
+        results, _, _ = await search_with_alternative_interpretation(
             mock_library_db, "Amps for Christ", "Edward"
         )
         assert len(results) == 1
@@ -812,7 +812,7 @@ class TestSearchWithAlternativeInterpretation:
         item = make_library_item(id=1, artist="Artist A", title="Album 1")
         mock_library_db.search.side_effect = [[item], [item]]
 
-        results, _ = await search_with_alternative_interpretation(
+        results, _, _ = await search_with_alternative_interpretation(
             mock_library_db, "Artist A", "Something"
         )
         assert len(results) == 1
@@ -824,7 +824,7 @@ class TestSearchWithAlternativeInterpretation:
             [make_library_item(id=2, artist="Also Wrong", title="Another")],
         ]
 
-        results, _ = await search_with_alternative_interpretation(
+        results, _, _ = await search_with_alternative_interpretation(
             mock_library_db, "Nonexistent", "Unknown"
         )
         assert len(results) == 0
@@ -877,7 +877,7 @@ class TestSearchWithAlternativeInterpretation:
         )
         mock_discogs_service.validate_track_on_release = AsyncMock(return_value=True)
 
-        results, matched_via = await search_with_alternative_interpretation(
+        results, matched_via, _ = await search_with_alternative_interpretation(
             mock_library_db, "Today", "Jefferson Airplane", discogs_service=mock_discogs_service
         )
 
@@ -905,7 +905,7 @@ class TestSearchWithAlternativeInterpretation:
             return_value=self._track_releases()
         )
 
-        results, matched_via = await search_with_alternative_interpretation(
+        results, matched_via, _ = await search_with_alternative_interpretation(
             mock_library_db,
             "Jessica Pratt",
             "On Your Own Love Again",
@@ -944,7 +944,7 @@ class TestSearchWithAlternativeInterpretation:
         )
         mock_discogs_service.validate_track_on_release = AsyncMock(return_value=False)
 
-        results, matched_via = await search_with_alternative_interpretation(
+        results, matched_via, _ = await search_with_alternative_interpretation(
             mock_library_db, "Today", "Jefferson Airplane", discogs_service=mock_discogs_service
         )
 
@@ -959,7 +959,7 @@ class TestSearchWithAlternativeInterpretation:
         rows = [make_library_item(id=1, artist="Jefferson Airplane", title="Bark")]
         mock_library_db.search.side_effect = [[], rows]
 
-        results, matched_via = await search_with_alternative_interpretation(
+        results, matched_via, _ = await search_with_alternative_interpretation(
             mock_library_db, "Today", "Jefferson Airplane"
         )
 
@@ -995,7 +995,7 @@ class TestSearchWithAlternativeInterpretation:
         )
         mock_discogs_service.validate_track_on_release = AsyncMock(return_value=True)
 
-        results, matched_via = await search_with_alternative_interpretation(
+        results, matched_via, _ = await search_with_alternative_interpretation(
             mock_library_db, "Today", "Jefferson Airplane", discogs_service=mock_discogs_service
         )
 
@@ -1015,7 +1015,7 @@ class TestSearchWithAlternativeInterpretation:
         mock_library_db.search.side_effect = [[row_a], [row_b]]
         mock_discogs_service.search_releases_by_track = AsyncMock()
 
-        results, matched_via = await search_with_alternative_interpretation(
+        results, matched_via, _ = await search_with_alternative_interpretation(
             mock_library_db, "Stereolab", "Cat Power", discogs_service=mock_discogs_service
         )
 
@@ -2181,7 +2181,7 @@ class TestSearchSongAsTrack:
     async def test_no_song_returns_empty(self):
         db = AsyncMock()
         db.exact_title = AsyncMock(return_value=[])
-        results, matched_via = await search_song_as_track(db, None)
+        results, matched_via, _ = await search_song_as_track(db, None)
         assert results == []
         assert matched_via == {}
         db.search.assert_not_awaited()
@@ -2190,7 +2190,7 @@ class TestSearchSongAsTrack:
     async def test_blank_song_returns_empty(self):
         db = AsyncMock()
         db.exact_title = AsyncMock(return_value=[])
-        results, matched_via = await search_song_as_track(db, "")
+        results, matched_via, _ = await search_song_as_track(db, "")
         assert results == []
         assert matched_via == {}
 
@@ -2199,7 +2199,7 @@ class TestSearchSongAsTrack:
         """Without a Discogs service, the strategy can't run and must no-op."""
         db = AsyncMock()
         db.exact_title = AsyncMock(return_value=[])
-        results, matched_via = await search_song_as_track(
+        results, matched_via, _ = await search_song_as_track(
             db, "vi scose poise", discogs_service=None
         )
         assert results == []
@@ -2215,7 +2215,9 @@ class TestSearchSongAsTrack:
             track="vi scose poise", artist=None, releases=[], total=0
         )
 
-        results, matched_via = await search_song_as_track(db, "vi scose poise", discogs_service=svc)
+        results, matched_via, _ = await search_song_as_track(
+            db, "vi scose poise", discogs_service=svc
+        )
 
         assert results == []
         assert matched_via == {}
@@ -2242,7 +2244,9 @@ class TestSearchSongAsTrack:
             total=1,
         )
 
-        results, matched_via = await search_song_as_track(db, "unknown song", discogs_service=svc)
+        results, matched_via, _ = await search_song_as_track(
+            db, "unknown song", discogs_service=svc
+        )
 
         assert results == []
         assert matched_via == {}
@@ -2274,7 +2278,9 @@ class TestSearchSongAsTrack:
             total=1,
         )
 
-        results, matched_via = await search_song_as_track(db, "vi scose poise", discogs_service=svc)
+        results, matched_via, _ = await search_song_as_track(
+            db, "vi scose poise", discogs_service=svc
+        )
 
         assert results == [confield]
         assert 60359 in matched_via
@@ -2316,7 +2322,7 @@ class TestSearchSongAsTrack:
             total=1,
         )
 
-        results, matched_via = await search_song_as_track(db, "No Way Back", discogs_service=svc)
+        results, matched_via, _ = await search_song_as_track(db, "No Way Back", discogs_service=svc)
 
         assert results == [va_album]
         assert matched_via[12345][0].artist_credit == "Adonis"
@@ -2349,7 +2355,9 @@ class TestSearchSongAsTrack:
         )
         svc.validate_track_on_release.return_value = False
 
-        results, matched_via = await search_song_as_track(db, "vi scose poise", discogs_service=svc)
+        results, matched_via, _ = await search_song_as_track(
+            db, "vi scose poise", discogs_service=svc
+        )
 
         assert results == []
         assert matched_via == {}
@@ -2389,7 +2397,9 @@ class TestSearchSongAsTrack:
             total=2,
         )
 
-        results, matched_via = await search_song_as_track(db, "vi scose poise", discogs_service=svc)
+        results, matched_via, _ = await search_song_as_track(
+            db, "vi scose poise", discogs_service=svc
+        )
 
         assert results == [confield]
         assert len(matched_via[60359]) == 2
@@ -2429,7 +2439,7 @@ class TestSearchSongAsTrack:
             total=1,
         )
 
-        results, matched_via = await search_song_as_track(db, "No Way Back", discogs_service=svc)
+        results, matched_via, _ = await search_song_as_track(db, "No Way Back", discogs_service=svc)
 
         assert results == [va_album]
         assert matched_via[11111][0].artist_credit == "Adonis"
@@ -2491,7 +2501,7 @@ class TestSearchSongAsTrack:
         svc.validate_track_on_release.side_effect = slow_validate
 
         start = _time.perf_counter()
-        results, _matched_via = await search_song_as_track(db, "t", discogs_service=svc)
+        results, _matched_via, _ = await search_song_as_track(db, "t", discogs_service=svc)
         elapsed = _time.perf_counter() - start
 
         # Serial would be ~1.0s; concurrent should be ~0.2s. The 0.5s ceiling
@@ -2578,7 +2588,7 @@ class TestSearchSongAsTrack:
 
         svc.validate_track_on_release.side_effect = validate_side_effect
 
-        results, _matched_via = await search_song_as_track(db, "t", discogs_service=svc)
+        results, _matched_via, _ = await search_song_as_track(db, "t", discogs_service=svc)
 
         # Input order is [A, B, C]; B drops on validation; output must be [A, C].
         assert results == [item_a, item_c], (
@@ -2643,7 +2653,9 @@ class TestSearchSongAsTrack:
 
         svc.validate_track_on_release.side_effect = validate_side_effect
 
-        results, matched_via = await search_song_as_track(db, "vi scose poise", discogs_service=svc)
+        results, matched_via, _ = await search_song_as_track(
+            db, "vi scose poise", discogs_service=svc
+        )
 
         assert results == [va_album]
         hints = matched_via[60359]
@@ -2787,7 +2799,7 @@ class TestSearchSongAsTrack:
         )
         svc.validate_track_on_release.return_value = True
 
-        results, _matched_via = await search_song_as_track(db, "t", discogs_service=svc)
+        results, _matched_via, _ = await search_song_as_track(db, "t", discogs_service=svc)
 
         assert len(results) == MAX_SEARCH_RESULTS
         n_validate_calls = svc.validate_track_on_release.await_count

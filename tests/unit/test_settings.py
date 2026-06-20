@@ -51,6 +51,20 @@ class TestResolveCompilationReleaseFlag:
         assert Settings().lml_resolve_compilation_release is False
 
 
+class TestResolveNonlibraryReleaseFlag:
+    """LML#628: gate the A1 row-less carry-through (TRACK_ON_COMPILATION,
+    SONG_AS_TRACK, SWAPPED_INTERPRETATION surface a resolvable non-library
+    release as LibraryItem(id=0)) behind a default-off flag so flag-off behavior
+    stays today's empty/sentinel."""
+
+    def test_defaults_false(self):
+        assert Settings().lml_resolve_nonlibrary_release is False
+
+    def test_reads_env(self, monkeypatch):
+        monkeypatch.setenv("LML_RESOLVE_NONLIBRARY_RELEASE", "true")
+        assert Settings().lml_resolve_nonlibrary_release is True
+
+
 class TestGetSettings:
     def test_returns_settings_instance(self):
         get_settings.cache_clear()

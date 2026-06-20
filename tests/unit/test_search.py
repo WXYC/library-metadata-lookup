@@ -319,7 +319,7 @@ class TestExecuteSearchPipeline:
     async def test_swapped_interpretation_no_ambiguous_format(self):
         """SWAPPED_INTERPRETATION with non-ambiguous message results in empty."""
         search_lib = AsyncMock(return_value=([], False))
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -340,7 +340,7 @@ class TestExecuteSearchPipeline:
         item = _item(id=1, artist="Stereolab", title="Dots and Loops")
 
         search_lib = AsyncMock(return_value=([], False))
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
         search_song = AsyncMock(return_value=([item], None))
 
@@ -363,7 +363,7 @@ class TestExecuteSearchPipeline:
         item = _item(id=1, artist="Foo", title="Bar")
 
         search_lib = AsyncMock(return_value=([], True))  # no results, song_not_found
-        search_alt = AsyncMock(return_value=([item], None))
+        search_alt = AsyncMock(return_value=([item], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -385,7 +385,7 @@ class TestExecuteSearchPipeline:
         item = _item(id=1, artist="Various", title="Rock Comp")
 
         search_lib = AsyncMock(return_value=([], True))  # song_not_found
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([item], {1: _rr(1, "Rock Comp")}))
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -422,7 +422,7 @@ class TestExecuteSearchPipeline:
 
         # ARTIST_PLUS_ALBUM: artist not in library at all -> ([], False)
         search_lib = AsyncMock(return_value=([], False))
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(
             return_value=(
                 [compilation],
@@ -464,7 +464,7 @@ class TestExecuteSearchPipeline:
         adult_item = _item(id=13766, artist="Adult.", title="Resuscitation")
 
         search_lib = AsyncMock(return_value=([], False))
-        search_alt = AsyncMock(return_value=([adult_item], None))
+        search_alt = AsyncMock(return_value=([adult_item], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
         search_song = AsyncMock(return_value=([], None))
 
@@ -498,7 +498,7 @@ class TestExecuteSearchPipeline:
         )
 
         search_lib = AsyncMock(return_value=([], False))
-        search_alt = AsyncMock(return_value=([item], {1: [hint]}))
+        search_alt = AsyncMock(return_value=([item], {1: [hint]}, {}))
         search_comp = AsyncMock(return_value=([], {}))
         search_song = AsyncMock(return_value=([], None))
 
@@ -535,10 +535,10 @@ class TestExecuteSearchPipeline:
         )
 
         search_lib = AsyncMock(return_value=([], False))
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
         search_song = AsyncMock(return_value=([], None))
-        search_track = AsyncMock(return_value=([confield], {60359: [hint]}))
+        search_track = AsyncMock(return_value=([confield], {60359: [hint]}, {}))
 
         strategies = _build_test_strategies(
             search_lib, search_alt, search_comp, search_song, search_track
@@ -564,10 +564,10 @@ class TestExecuteSearchPipeline:
         item = _item(id=1, artist="Stereolab", title="Dots and Loops")
 
         search_lib = AsyncMock(return_value=([], False))
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
         search_song = AsyncMock(return_value=([item], None))
-        search_track = AsyncMock(return_value=([], {}))
+        search_track = AsyncMock(return_value=([], {}, {}))
 
         strategies = _build_test_strategies(
             search_lib, search_alt, search_comp, search_song, search_track
@@ -588,10 +588,10 @@ class TestExecuteSearchPipeline:
     async def test_song_as_track_empty_results_keeps_state_empty(self):
         """When SONG_AS_TRACK also returns empty, state.results stays empty."""
         search_lib = AsyncMock(return_value=([], False))
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
         search_song = AsyncMock(return_value=([], None))
-        search_track = AsyncMock(return_value=([], {}))
+        search_track = AsyncMock(return_value=([], {}, {}))
 
         strategies = _build_test_strategies(
             search_lib, search_alt, search_comp, search_song, search_track
@@ -734,7 +734,7 @@ class TestSearchBudget:
             raise AssertionError("compilation strategy should be skipped by budget")
 
         search_lib = AsyncMock(side_effect=slow_first)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(side_effect=must_not_run_compilation)
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -796,10 +796,10 @@ class TestSearchBudget:
         )
 
         search_lib = AsyncMock(side_effect=slow_empty)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
         search_song = AsyncMock(return_value=([], None))
-        search_track = AsyncMock(return_value=([track_hit], {60359: [hint]}))
+        search_track = AsyncMock(return_value=([track_hit], {60359: [hint]}, {}))
 
         strategies = _build_test_strategies(
             search_lib, search_alt, search_comp, search_song, search_track
@@ -829,7 +829,7 @@ class TestSearchBudget:
 
         hit = _item(id=1, artist="Juana Molina", title="DOGA")
         search_lib = AsyncMock(return_value=([hit], False))
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -869,7 +869,7 @@ class TestSearchBudget:
             return ([first_hit], False)
 
         search_lib = AsyncMock(side_effect=slow_first)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -911,7 +911,7 @@ class TestSearchBudget:
             return ([first_hit], False)
 
         search_lib = AsyncMock(side_effect=slow_first)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -1064,7 +1064,7 @@ class TestSearchHardTimeoutLoopGate:
             return ([], False)
 
         search_lib = AsyncMock(side_effect=slow_empty)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -1174,7 +1174,7 @@ class TestPerStrategyWaitFor:
             return ([], False)  # unreachable
 
         search_lib = AsyncMock(side_effect=fan_out_strategy)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
@@ -1302,7 +1302,7 @@ class TestHardCapSoftBudgetIndependence:
             raise AssertionError("compilation strategy should be skipped by soft budget")
 
         search_lib = AsyncMock(side_effect=slow_first)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(side_effect=must_not_run)
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
 
@@ -1416,7 +1416,7 @@ class TestCallerBudget:
         )
 
         search_lib = AsyncMock(side_effect=slow_first)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = must_not_run_compilation
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -1464,7 +1464,7 @@ class TestCallerBudget:
             return ([first_hit], False)
 
         search_lib = AsyncMock(side_effect=fast_first)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(return_value=([], {}))
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -1518,7 +1518,7 @@ class TestCallerBudget:
             return ([], {})
 
         search_lib = AsyncMock(side_effect=slow_empty)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(side_effect=slow_empty_compilation)
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
@@ -1568,7 +1568,7 @@ class TestCallerBudget:
             return ([late_hit], {})
 
         search_lib = AsyncMock(side_effect=slow_empty)
-        search_alt = AsyncMock(return_value=([], None))
+        search_alt = AsyncMock(return_value=([], None, {}))
         search_comp = AsyncMock(side_effect=slow_then_hit)
 
         strategies = _build_test_strategies(search_lib, search_alt, search_comp)
