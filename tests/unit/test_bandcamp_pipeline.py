@@ -581,6 +581,69 @@ class TestConcurrentPipeline:
 
         assert len(results) >= 1
 
+    @pytest.mark.asyncio
+    async def test_queue_event_only_fetches_new_slug(self, db):
+        """A queue event must fetch only the newly discovered slug's catalog.
+
+        Regression for #125: the consumer used to call phase_lookup() with no
+        filter on every queue event, re-scanning the entire pending set. Any
+        album that never matched stayed pending forever, so each newly
+        discovered slug re-fetched every still-pending catalog -- O(slugs x
+        catalogs) instead of one fetch per slug.
+        """
+        from scripts.bandcamp_pipeline import run_concurrent
+
+        # Stereolab already has a slug but its catalog will NOT match its
+        # album, so it stays pending (bandcamp_url NULL) for the whole run.
+        # Autechre is discovered by search and arrives via the queue.
+        await db.insert_albums(
+            [
+                _make_album(),
+                _make_album(
+                    normalized_artist="autechre",
+                    normalized_title="confield",
+                    display_artist="Autechre",
+                    display_title="Confield",
+                ),
+            ]
+        )
+        all_rows = await db.get_pending("spotify", limit=10)
+        stereolab_id = next(r["id"] for r in all_rows if r["display_artist"] == "Stereolab")
+        autechre_id = next(r["id"] for r in all_rows if r["display_artist"] == "Autechre")
+
+        await db.update_bandcamp_slug(stereolab_id, "stereolab")
+        await db.update_result(autechre_id, "spotify", "not_found")
+
+        mock_client = AsyncMock()
+        mock_client.search_artist = AsyncMock(
+            return_value=[
+                {"name": "Autechre", "url": "https://autechre.bandcamp.com", "slug": "autechre"}
+            ]
+        )
+
+        async def fake_catalog(slug):
+            if slug == "autechre":
+                return [
+                    {"url": "https://autechre.bandcamp.com/album/confield", "title": "Confield"}
+                ]
+            # Stereolab's catalog never matches "Aluminum Tunes"
+            return [
+                {
+                    "url": "https://stereolab.bandcamp.com/album/something-else",
+                    "title": "Something Else",
+                }
+            ]
+
+        mock_client.fetch_artist_catalog = AsyncMock(side_effect=fake_catalog)
+
+        await run_concurrent(mock_client, db)
+
+        fetched = [call.args[0] for call in mock_client.fetch_artist_catalog.call_args_list]
+        # Stereolab is fetched exactly once (the initial pre-existing pass);
+        # the autechre queue event must NOT re-scrape it.
+        assert fetched.count("stereolab") == 1, fetched
+        assert fetched.count("autechre") == 1, fetched
+
 
 class TestProcessBatched:
     @pytest.mark.asyncio

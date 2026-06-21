@@ -194,6 +194,7 @@ async def phase_lookup(
     *,
     artist_fallback: bool = False,
     limit: int | None = None,
+    slug: str | None = None,
 ) -> list[dict]:
     """Phase 2: Album-level matching using known slugs.
 
@@ -202,11 +203,15 @@ async def phase_lookup(
         db: ResultsDB instance.
         artist_fallback: If True, write artist-level URL when no album match.
         limit: Maximum number of distinct slugs to process.
+        slug: If provided, only process albums with this exact slug. The
+            concurrent consumer passes the freshly discovered slug so a queue
+            event fetches one catalog instead of re-scanning every pending
+            catalog (#125).
 
     Returns:
         List of match result dicts for bandcamp_matches.json.
     """
-    rows = await db.get_pending_bandcamp_lookup()
+    rows = await db.get_pending_bandcamp_lookup(slug=slug)
 
     if not rows:
         log.info("No albums pending Bandcamp lookup")
@@ -310,8 +315,10 @@ async def run_concurrent(
             if slug is None:
                 break
 
-            # Process the newly discovered slug's albums
-            new_results = await phase_lookup(client, db, artist_fallback=artist_fallback)
+            # Process only the newly discovered slug's albums (#125): without
+            # the slug filter, phase_lookup re-scanned the entire pending set
+            # on every queue event, re-scraping every still-pending catalog.
+            new_results = await phase_lookup(client, db, artist_fallback=artist_fallback, slug=slug)
             all_results.extend(new_results)
 
     await asyncio.gather(search_producer(), lookup_consumer())
