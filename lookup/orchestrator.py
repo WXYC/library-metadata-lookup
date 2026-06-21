@@ -88,6 +88,7 @@ from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.release_resolution import (
     ResolvedRelease,
     merge_wave_b_compilations,
+    prerank_candidates_for_validation,
     rank_resolved_releases,
     resolve_release_for_track,
     resolve_release_for_track_cached,
@@ -1028,14 +1029,16 @@ this floor is replaced with ``library_identity.confidence`` per row.
 
 
 ROWLESS_NO_ALBUM_CONFIDENCE: float = 0.8
-"""Soft confidence for a row-less non-library release surfaced by a *no-album*
-query (A2, LML#629).
+"""Soft confidence for a row-less non-library release that was not album-matched
+(A2, LML#629).
 
-A song-only / artist+song query validates the (artist, track) pair, but with no
-typed album the bound release is the best-ranked candidate (prefer-own-release,
-then stable release_id) — not a user-confirmed album. Carrying a confidence
-below the album-typed 1.0 lets a consumer (request-o-matic) treat it as soft.
-Album-typed binds keep the full 1.0: the user named the album.
+Applied when a row-less bind is *not* a user-confirmed album — either because the
+request typed no album (song-only / artist+song), or because the binding route
+never matched the release against the typed album. The latter is the cached-track
+safety net (A4), which picks by track only; it stamps this on the seam so the
+bind stays soft even when an album was typed. An album-ranked carry-through
+(A1/#628 with a typed album) keeps the full 1.0 — the typed album shaped the
+pick. Lets a consumer (request-o-matic) treat the soft results as tentative.
 """
 
 # Synthetic library-id for a row-less result — a Discogs release with no WXYC
@@ -2484,26 +2487,28 @@ async def find_library_albums_with_cached_track(
     # surface the best one row-less so its release_id (hence discogs_url) still
     # binds via #628's {0: ResolvedRelease} seam. Gated on the same flag as the
     # other carry-through sites: when off, fetch_artwork_for_items won't bind a
-    # row-less item, so we preserve the pre-#629 drop. No-album ordering (the
-    # #629 rule prerank_candidates_for_validation applies on the bounded resolve
-    # path): prefer the artist's own release (is_compilation=False) over a
-    # compilation, then stable release_id. Cache rows are already track-confirmed
-    # by the trigram query, so no re-validation is needed.
+    # row-less item, so we preserve the pre-#629 drop. Cache rows are already
+    # track-confirmed by the trigram query, so no re-validation is needed.
+    #
+    # Ordering reuses the shared #629 no-album rule (prefer is_compilation=False,
+    # then stable release_id) instead of restating it — keeping this path and the
+    # bounded-resolve path on one definition. There is no typed album to rank
+    # against here (the cache keyed on track only), so confidence is soft: the
+    # pick was never album-matched, and the soft value rides the seam so the bind
+    # surfaces it even when the request did type an album.
     if not get_settings().lml_resolve_nonlibrary_release:
         return [], {}
-    best = min(
-        (r for r in cached_releases if r.release_id),
-        key=lambda r: (r.is_compilation, r.release_id),
-        default=None,
-    )
-    if best is None:
+    ranked = prerank_candidates_for_validation([r for r in cached_releases if r.release_id], None)
+    if not ranked:
         return [], {}
+    best = ranked[0]
     rowless = _make_rowless_item(artist=artist or "", title=best.album)
     resolved = ResolvedRelease(
         release_id=best.release_id,
         release_url=best.release_url or "",
         is_compilation=bool(best.is_compilation),
         album_title=best.album or "",
+        confidence=ROWLESS_NO_ALBUM_CONFIDENCE,
     )
     return [rowless], {ROWLESS_LIBRARY_ID: resolved}
 
@@ -2563,25 +2568,35 @@ async def _bind_resolved_release(
     year/label/genres via ``get_release`` exactly as for a floor-matched result.
 
     The floor was never a validation backstop — it is a search disambiguator,
-    and validation already settled the artist — so ``confidence`` is the
+    and validation already settled the artist — so ``confidence`` defaults to the
     maximum 1.0.
 
-    **A2 soft confidence (LML#629):** a *row-less* (id==0) bind from a *no-album*
-    query carries ``ROWLESS_NO_ALBUM_CONFIDENCE`` instead. The (artist, track)
-    pair validated, but with no typed album the release is the best-ranked guess,
-    not a user-confirmed album — so a consumer can treat it as soft. An in-library
-    bind, or a row-less bind for an album-typed query, keeps the full 1.0.
+    **A2 soft confidence (LML#629):** a *row-less* (id==0) bind is softened in two
+    cases, and the result takes the lower (softer) of the two signals:
+
+    - **No typed album in the request** — the release is the best-ranked guess,
+      not a user-confirmed album, so any row-less bind drops to
+      ``ROWLESS_NO_ALBUM_CONFIDENCE``.
+    - **The seam already carries a soft confidence** (``release.confidence``) —
+      the cached-track safety net (A4) picks by track only and never
+      album-matches, so it stamps the seam soft *regardless* of a typed album;
+      the bind can't tell A4 from an album-ranked carry-through otherwise. An
+      album-ranked carry-through (A1/#628 with a typed album) leaves the seam at
+      1.0, so a typed-album request keeps the full confidence there.
+
+    An in-library bind (id != 0) is never softened.
     """
     artwork_url = await _resolve_fallback_artwork(discogs_service, release.release_id)
-    no_album = not (album or "").strip()
-    soft = item.id == ROWLESS_LIBRARY_ID and no_album
+    confidence = release.confidence
+    if item.id == ROWLESS_LIBRARY_ID and not (album or "").strip():
+        confidence = min(confidence, ROWLESS_NO_ALBUM_CONFIDENCE)
     return DiscogsSearchResult(
         release_id=release.release_id,
         release_url=release.release_url,
         album=release.album_title,
         artist=item.artist,
         artwork_url=artwork_url,
-        confidence=ROWLESS_NO_ALBUM_CONFIDENCE if soft else 1.0,
+        confidence=confidence,
     )
 
 
@@ -2754,7 +2769,9 @@ async def fetch_artwork_for_items(
                         release_id=best.release_id if best is not None else None,
                     )
                     if best is not None:
-                        return await _bind_resolved_release(discogs_service, best, item)
+                        return await _bind_resolved_release(
+                            discogs_service, best, item, album=request_album
+                        )
                 return None
             if not result.artwork_url:
                 fallback = await _resolve_fallback_artwork(discogs_service, result.release_id)

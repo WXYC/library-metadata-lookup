@@ -29,6 +29,8 @@ from generated.api_models import (
     TrackMatchSource,
 )
 from lookup.orchestrator import (
+    ROWLESS_LIBRARY_ID,
+    ROWLESS_NO_ALBUM_CONFIDENCE,
     _resolve_fallback_artwork,
     artist_matches_item,
     build_context_message,
@@ -1366,9 +1368,7 @@ class TestRowlessNoAlbumConfidence:
         )
         return svc
 
-    def _rowless(self):
-        from lookup.orchestrator import ROWLESS_LIBRARY_ID
-
+    def _rowless(self, *, confidence: float = 1.0):
         item = make_library_item(
             id=ROWLESS_LIBRARY_ID,
             artist="Lee 'Scratch' Perry",
@@ -1379,6 +1379,7 @@ class TestRowlessNoAlbumConfidence:
             release_url="https://www.discogs.com/release/1000",
             is_compilation=False,
             album_title="Roast Fish Collie Weed & Corn Bread",
+            confidence=confidence,
         )
         return item, {ROWLESS_LIBRARY_ID: resolved}
 
@@ -1412,6 +1413,24 @@ class TestRowlessNoAlbumConfidence:
         bound = results[0][1]
         assert bound is not None
         assert bound.confidence == 1.0
+
+    @pytest.mark.asyncio
+    async def test_soft_seam_stays_soft_even_with_typed_album(self, enable_nonlibrary_release):
+        """A row-less release whose seam confidence is already soft (the A4
+        cached-track pick, never album-matched) must NOT be promoted to 1.0 just
+        because the request typed an album — the bind takes the softer signal.
+        Without this, A4 would stamp 'user-confirmed album' on a release it never
+        matched to the typed album."""
+        item, discogs_titles = self._rowless(confidence=ROWLESS_NO_ALBUM_CONFIDENCE)
+        svc = self._svc()
+
+        results = await fetch_artwork_for_items(
+            [item], svc, discogs_titles, song="Bucky Skank", album="A Typed Album"
+        )
+
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.confidence == ROWLESS_NO_ALBUM_CONFIDENCE
 
 
 # ---------------------------------------------------------------------------

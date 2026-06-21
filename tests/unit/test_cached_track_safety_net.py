@@ -21,7 +21,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from discogs.models import ReleaseInfo
-from lookup.orchestrator import ROWLESS_LIBRARY_ID, find_library_albums_with_cached_track
+from lookup.orchestrator import (
+    ROWLESS_LIBRARY_ID,
+    ROWLESS_NO_ALBUM_CONFIDENCE,
+    find_library_albums_with_cached_track,
+)
 from lookup.release_resolution import ResolvedRelease
 
 
@@ -96,6 +100,27 @@ async def test_prefers_own_release_over_compilation_when_no_library_row_matches(
     resolved = discogs_titles[ROWLESS_LIBRARY_ID]
     assert resolved.release_id == 2000
     assert resolved.is_compilation is False
+
+
+@pytest.mark.asyncio
+async def test_rowless_release_carries_soft_seam_confidence(
+    mock_library_db, mock_discogs_service, enable_nonlibrary_release
+):
+    """The A4 pick is by track only — never album-matched — so it stamps the seam
+    with a soft confidence. That soft value must ride the seam so the bind stays
+    soft even when the request typed an album (the bind can't otherwise tell A4
+    from an album-ranked carry-through)."""
+    mock_discogs_service.cache_service = AsyncMock()
+    mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
+        return_value=[_cache_release("Some Bootleg Compilation", "Lee Perry", 1000)]
+    )
+    mock_library_db.search.return_value = []
+
+    _, discogs_titles = await find_library_albums_with_cached_track(
+        mock_library_db, "Bucky Skank", "Lee 'Scratch' Perry", mock_discogs_service
+    )
+
+    assert discogs_titles[ROWLESS_LIBRARY_ID].confidence == ROWLESS_NO_ALBUM_CONFIDENCE
 
 
 @pytest.mark.asyncio
