@@ -1101,6 +1101,18 @@ When LML graduates onto ``library_identity`` per cross-cache-identity (#25),
 this floor is replaced with ``library_identity.confidence`` per row.
 """
 
+
+ROWLESS_NO_ALBUM_CONFIDENCE: float = 0.8
+"""Soft confidence for a row-less non-library release surfaced by a *no-album*
+query (A2, LML#629).
+
+A song-only / artist+song query validates the (artist, track) pair, but with no
+typed album the bound release is the best-ranked candidate (prefer-own-release,
+then stable release_id) — not a user-confirmed album. Carrying a confidence
+below the album-typed 1.0 lets a consumer (request-o-matic) treat it as soft.
+Album-typed binds keep the full 1.0: the user named the album.
+"""
+
 # Synthetic library-id for a row-less result — a Discogs release with no WXYC
 # catalog row. Shared by the Step-3a library-miss search and the #628 A1
 # carry-through: Step-3b excludes it from re-validation, fetch_artwork_for_items
@@ -2510,7 +2522,7 @@ async def find_library_albums_with_cached_track(
     limit: int = MAX_SEARCH_RESULTS,
     *,
     match_artist: str | None = None,
-) -> list[LibraryItem]:
+) -> tuple[list[LibraryItem], dict[int, ResolvedRelease]]:
     """Find WXYC library albums whose Discogs cache entry lists ``song`` by ``artist``.
 
     Used as a safety net after ``filter_results_by_track_validation`` fails to
@@ -2526,15 +2538,25 @@ async def find_library_albums_with_cached_track(
     ``match_artist`` defaults to ``artist`` to preserve single-channel behavior
     for callers that don't distinguish the two.
 
-    Cache-only by design: skips any API fallback path. Returns ``[]`` cleanly
-    when the cache is unavailable, fails, or has nothing for the query.
+    Returns ``(items, discogs_titles)``. On the in-library path ``items`` are the
+    promoted WXYC rows and ``discogs_titles`` is empty. **A4 carry-through
+    (LML#629):** when the cache confirms the track on a release but *no* library
+    row artist-matches — and ``lml_resolve_nonlibrary_release`` is on — a single
+    **row-less** ``LibraryItem(id=0)`` is returned with the resolved release on
+    the ``{0: ResolvedRelease}`` seam, reusing #628's carry-through so the
+    ``release_id`` (hence ``discogs_url``) still surfaces instead of being
+    dropped for want of a matching catalog row.
+
+    Cache-only by design: skips any API fallback path. Returns ``([], {})``
+    cleanly when the cache is unavailable, fails, or has nothing for the query —
+    and, with the flag off, when nothing artist-matches (pre-#629 behavior).
     """
     if not discogs_service or not song or not artist:
-        return []
+        return [], {}
     match_against = match_artist or artist
     cache_service = getattr(discogs_service, "cache_service", None)
     if cache_service is None:
-        return []
+        return [], {}
 
     try:
         cached_releases = await cache_service.search_releases_by_track(
@@ -2542,10 +2564,10 @@ async def find_library_albums_with_cached_track(
         )
     except Exception as e:
         logger.warning(f"Cache lookup for track-album promotion failed: {e}")
-        return []
+        return [], {}
 
     if not cached_releases:
-        return []
+        return [], {}
 
     matches: list[LibraryItem] = []
     seen_ids: set[int] = set()
@@ -2560,9 +2582,38 @@ async def find_library_albums_with_cached_track(
             matches.append(item)
             seen_ids.add(item.id)
             if len(matches) >= limit:
-                return matches
+                return matches, {}
 
-    return matches
+    if matches:
+        return matches, {}
+
+    # A4 carry-through (LML#629): the cache confirmed the track on a release, but
+    # no WXYC library row artist-matches. Rather than drop a resolvable release,
+    # surface the best one row-less so its release_id (hence discogs_url) still
+    # binds via #628's {0: ResolvedRelease} seam. Gated on the same flag as the
+    # other carry-through sites: when off, fetch_artwork_for_items won't bind a
+    # row-less item, so we preserve the pre-#629 drop. No-album ordering (the
+    # #629 rule prerank_candidates_for_validation applies on the bounded resolve
+    # path): prefer the artist's own release (is_compilation=False) over a
+    # compilation, then stable release_id. Cache rows are already track-confirmed
+    # by the trigram query, so no re-validation is needed.
+    if not get_settings().lml_resolve_nonlibrary_release:
+        return [], {}
+    best = min(
+        (r for r in cached_releases if r.release_id),
+        key=lambda r: (r.is_compilation, r.release_id),
+        default=None,
+    )
+    if best is None:
+        return [], {}
+    rowless = _make_rowless_item(artist=artist or "", title=best.album)
+    resolved = ResolvedRelease(
+        release_id=best.release_id,
+        release_url=best.release_url or "",
+        is_compilation=bool(best.is_compilation),
+        album_title=best.album or "",
+    )
+    return [rowless], {ROWLESS_LIBRARY_ID: resolved}
 
 
 async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id: int) -> str | None:
@@ -2607,6 +2658,8 @@ async def _bind_resolved_release(
     discogs_service: DiscogsService,
     release: ResolvedRelease,
     item: LibraryItem,
+    *,
+    album: str | None = None,
 ) -> DiscogsSearchResult:
     """Trust-and-bind an already-validated ``ResolvedRelease`` (LML#604).
 
@@ -2620,15 +2673,23 @@ async def _bind_resolved_release(
     The floor was never a validation backstop — it is a search disambiguator,
     and validation already settled the artist — so ``confidence`` is the
     maximum 1.0.
+
+    **A2 soft confidence (LML#629):** a *row-less* (id==0) bind from a *no-album*
+    query carries ``ROWLESS_NO_ALBUM_CONFIDENCE`` instead. The (artist, track)
+    pair validated, but with no typed album the release is the best-ranked guess,
+    not a user-confirmed album — so a consumer can treat it as soft. An in-library
+    bind, or a row-less bind for an album-typed query, keeps the full 1.0.
     """
     artwork_url = await _resolve_fallback_artwork(discogs_service, release.release_id)
+    no_album = not (album or "").strip()
+    soft = item.id == ROWLESS_LIBRARY_ID and no_album
     return DiscogsSearchResult(
         release_id=release.release_id,
         release_url=release.release_url,
         album=release.album_title,
         artist=item.artist,
         artwork_url=artwork_url,
-        confidence=1.0,
+        confidence=ROWLESS_NO_ALBUM_CONFIDENCE if soft else 1.0,
     )
 
 
@@ -2638,6 +2699,7 @@ async def fetch_artwork_for_items(
     discogs_titles: dict[int, ResolvedRelease] | None = None,
     *,
     song: str | None = None,
+    album: str | None = None,
     allow_release_resolution_fallback: bool = True,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Fetch artwork for multiple library items in parallel.
@@ -2650,11 +2712,18 @@ async def fetch_artwork_for_items(
     ``allow_release_resolution_fallback`` is the bulk kill switch — the
     /lookup/bulk drain passes ``False`` so the 35k-album backfill never triggers
     the per-row Discogs fan-out.
+
+    ``album`` (the request-level typed album, when present) only gates the A2
+    soft-confidence on a row-less carried bind (LML#629): a no-album query's
+    row-less release binds at ``ROWLESS_NO_ALBUM_CONFIDENCE`` rather than 1.0.
     """
     if not discogs_service:
         return [(item, None) for item in items]
 
     discogs_titles = discogs_titles or {}
+    # Bound to a distinct name: ``fetch_one`` rebinds a local ``album`` (the
+    # per-item search title), which would shadow this request-level value.
+    request_album = album
     settings = get_settings()
     resolve_compilation_release = settings.lml_resolve_compilation_release
     resolve_nonlibrary_release = settings.lml_resolve_nonlibrary_release
@@ -2682,7 +2751,9 @@ async def fetch_artwork_for_items(
                 resolve_nonlibrary_release and item.id == ROWLESS_LIBRARY_ID
             )
             if bind_carried and resolved is not None:
-                return await _bind_resolved_release(discogs_service, resolved, item)
+                return await _bind_resolved_release(
+                    discogs_service, resolved, item, album=request_album
+                )
 
             album = resolved.album_title if resolved is not None else item.title
 
@@ -3787,7 +3858,7 @@ async def perform_lookup(
                     # tracklist contains this song?" — and promote the matching
                     # library album. Catches the case where the upstream
                     # track→releases lookup missed a release the cache holds.
-                    promoted = await find_library_albums_with_cached_track(
+                    promoted, promoted_titles = await find_library_albums_with_cached_track(
                         db,
                         parsed.song,
                         parsed.artist,
@@ -3796,6 +3867,9 @@ async def perform_lookup(
                     )
                     if promoted:
                         library_results = promoted
+                        # A4 (LML#629): a row-less promotion carries its resolved
+                        # release on the seam so Step 4 binds discogs_url by id.
+                        discogs_titles = {**discogs_titles, **promoted_titles}
                         song_not_found = False
                     else:
                         # Last resort before declaring song-not-found: the
@@ -3849,6 +3923,7 @@ async def perform_lookup(
                 discogs_service,
                 discogs_titles,
                 song=parsed.song,
+                album=parsed.album,
                 allow_release_resolution_fallback=allow_release_resolution_fallback,
             )
 

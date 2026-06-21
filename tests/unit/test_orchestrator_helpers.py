@@ -1151,7 +1151,7 @@ class TestFindLibraryAlbumsWithCachedTrack:
         )
         mock_library_db.search.return_value = [maritime]
 
-        result = await find_library_albums_with_cached_track(
+        result, _ = await find_library_albums_with_cached_track(
             mock_library_db,
             "Bucky Skank",
             "Lee 'Scratch' Perry",
@@ -1175,7 +1175,7 @@ class TestFindLibraryAlbumsWithCachedTrack:
         row = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
         mock_library_db.search.return_value = [row]
 
-        result = await find_library_albums_with_cached_track(
+        result, _ = await find_library_albums_with_cached_track(
             mock_library_db,
             "Cybele's Reverie",
             "Stereolb",  # typed (misspelled)
@@ -1202,7 +1202,7 @@ class TestFindLibraryAlbumsWithCachedTrack:
         row = make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes")
         mock_library_db.search.return_value = [row]
 
-        result = await find_library_albums_with_cached_track(
+        result, _ = await find_library_albums_with_cached_track(
             mock_library_db,
             "Cybele's Reverie",
             "Stereolb",  # typed (misspelled), no correction supplied
@@ -1213,7 +1213,7 @@ class TestFindLibraryAlbumsWithCachedTrack:
 
     @pytest.mark.asyncio
     async def test_returns_empty_without_discogs_service(self, mock_library_db):
-        result = await find_library_albums_with_cached_track(
+        result, _ = await find_library_albums_with_cached_track(
             mock_library_db, "Song", "Artist", None
         )
         assert result == []
@@ -1222,7 +1222,7 @@ class TestFindLibraryAlbumsWithCachedTrack:
     async def test_returns_empty_without_cache_service(self, mock_library_db, mock_discogs_service):
         """No PG cache attached → helper is a no-op (we don't fall back to the API)."""
         mock_discogs_service.cache_service = None
-        result = await find_library_albums_with_cached_track(
+        result, _ = await find_library_albums_with_cached_track(
             mock_library_db, "Song", "Artist", mock_discogs_service
         )
         assert result == []
@@ -1232,18 +1232,12 @@ class TestFindLibraryAlbumsWithCachedTrack:
         self, mock_library_db, mock_discogs_service
     ):
         mock_discogs_service.cache_service = AsyncMock()
-        assert (
-            await find_library_albums_with_cached_track(
-                mock_library_db, None, "Artist", mock_discogs_service
-            )
-            == []
-        )
-        assert (
-            await find_library_albums_with_cached_track(
-                mock_library_db, "Song", None, mock_discogs_service
-            )
-            == []
-        )
+        assert await find_library_albums_with_cached_track(
+            mock_library_db, None, "Artist", mock_discogs_service
+        ) == ([], {})
+        assert await find_library_albums_with_cached_track(
+            mock_library_db, "Song", None, mock_discogs_service
+        ) == ([], {})
         # Cache should never be consulted when inputs are insufficient
         mock_discogs_service.cache_service.search_releases_by_track.assert_not_called()
 
@@ -1253,7 +1247,7 @@ class TestFindLibraryAlbumsWithCachedTrack:
     ):
         mock_discogs_service.cache_service = AsyncMock()
         mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(return_value=[])
-        result = await find_library_albums_with_cached_track(
+        result, _ = await find_library_albums_with_cached_track(
             mock_library_db, "Song", "Artist", mock_discogs_service
         )
         assert result == []
@@ -1269,7 +1263,7 @@ class TestFindLibraryAlbumsWithCachedTrack:
         )
         mock_library_db.search.return_value = []
 
-        result = await find_library_albums_with_cached_track(
+        result, _ = await find_library_albums_with_cached_track(
             mock_library_db, "Song", "Lee Perry", mock_discogs_service
         )
         assert result == []
@@ -1288,7 +1282,7 @@ class TestFindLibraryAlbumsWithCachedTrack:
         )
         mock_library_db.search.return_value = [wrong_artist]
 
-        result = await find_library_albums_with_cached_track(
+        result, _ = await find_library_albums_with_cached_track(
             mock_library_db, "Bucky Skank", "Lee 'Scratch' Perry", mock_discogs_service
         )
         assert result == []
@@ -1310,7 +1304,7 @@ class TestFindLibraryAlbumsWithCachedTrack:
         )
         mock_library_db.search.return_value = [maritime]
 
-        result = await find_library_albums_with_cached_track(
+        result, _ = await find_library_albums_with_cached_track(
             mock_library_db,
             "Bucky Skank",
             "Lee 'Scratch' Perry",
@@ -1328,13 +1322,96 @@ class TestFindLibraryAlbumsWithCachedTrack:
         mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
             side_effect=RuntimeError("cache offline")
         )
-        result = await find_library_albums_with_cached_track(
+        result, _ = await find_library_albums_with_cached_track(
             mock_library_db,
             "Song",
             "Artist",
             mock_discogs_service,
         )
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: row-less no-album soft confidence (A2, LML#629)
+# ---------------------------------------------------------------------------
+
+
+class TestRowlessNoAlbumConfidence:
+    """A no-album (song-only / artist+song) query that surfaces a row-less
+    non-library release should carry a *soft* confidence so a consumer can treat
+    it as tentative — the artist + track were validated, but with no typed album
+    the chosen release is the best-ranked guess, not a user-confirmed one. When
+    an album *was* typed, the bound release keeps full confidence (1.0)."""
+
+    @pytest.fixture
+    def enable_nonlibrary_release(self, monkeypatch):
+        monkeypatch.setenv("LML_RESOLVE_NONLIBRARY_RELEASE", "true")
+        from config.settings import get_settings
+
+        get_settings.cache_clear()
+        yield
+        get_settings.cache_clear()
+
+    def _svc(self) -> AsyncMock:
+        svc = AsyncMock()
+        svc.cache_service = None
+        svc.get_release = AsyncMock(
+            return_value=ReleaseMetadataResponse(
+                release_id=1000,
+                title="Roast Fish Collie Weed & Corn Bread",
+                artist="Lee 'Scratch' Perry",
+                release_url="https://www.discogs.com/release/1000",
+                artwork_url="https://i.discogs.com/roast.jpg",
+            )
+        )
+        return svc
+
+    def _rowless(self):
+        from lookup.orchestrator import ROWLESS_LIBRARY_ID
+
+        item = make_library_item(
+            id=ROWLESS_LIBRARY_ID,
+            artist="Lee 'Scratch' Perry",
+            title="Roast Fish Collie Weed & Corn Bread",
+        )
+        resolved = ResolvedRelease(
+            release_id=1000,
+            release_url="https://www.discogs.com/release/1000",
+            is_compilation=False,
+            album_title="Roast Fish Collie Weed & Corn Bread",
+        )
+        return item, {ROWLESS_LIBRARY_ID: resolved}
+
+    @pytest.mark.asyncio
+    async def test_no_album_rowless_bind_carries_soft_confidence(self, enable_nonlibrary_release):
+        item, discogs_titles = self._rowless()
+        svc = self._svc()
+
+        results = await fetch_artwork_for_items(
+            [item], svc, discogs_titles, song="Bucky Skank", album=None
+        )
+
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.release_id == 1000
+        assert bound.confidence < 1.0
+
+    @pytest.mark.asyncio
+    async def test_album_typed_rowless_bind_keeps_full_confidence(self, enable_nonlibrary_release):
+        item, discogs_titles = self._rowless()
+        svc = self._svc()
+
+        results = await fetch_artwork_for_items(
+            [item],
+            svc,
+            discogs_titles,
+            song="Bucky Skank",
+            album="Roast Fish Collie Weed & Corn Bread",
+        )
+
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.confidence == 1.0
 
 
 # ---------------------------------------------------------------------------
