@@ -290,13 +290,20 @@ class ResultsDB:
     async def get_stats(self) -> dict:
         """Return counts by status for each service."""
         assert self._db is not None
-        stats: dict = {"spotify": {}, "apple": {}, "discogs": {}, "deezer": {}, "total": 0}
+        stats: dict = {
+            "spotify": {},
+            "apple": {},
+            "discogs": {},
+            "deezer": {},
+            "bandcamp": {},
+            "total": 0,
+        }
 
         cursor = await self._db.execute("SELECT COUNT(*) FROM albums")
         row = await cursor.fetchone()
         stats["total"] = row[0] if row else 0
 
-        for service in ("spotify", "apple", "discogs", "deezer"):
+        for service in ("spotify", "apple", "discogs", "deezer", "bandcamp"):
             col = f"{service}_status"
             cursor = await self._db.execute(
                 f"SELECT {col}, COUNT(*) FROM albums GROUP BY {col}"  # noqa: S608

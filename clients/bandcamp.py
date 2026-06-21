@@ -115,7 +115,9 @@ class BandcampClient(BaseStreamingClient):
                 best_artist_score = s
         if best_artist is None:
             return None
-        catalog = await self.fetch_artist_catalog(best_artist["slug"])
+        # A fetch failure (None) is treated as "no catalog" for the live
+        # match path -- there is no retry loop here, so it degrades to no match.
+        catalog = await self.fetch_artist_catalog(best_artist["slug"]) or []
         matched_artist_name = best_artist["name"]
         return find_best_source_match(
             catalog,
@@ -159,16 +161,21 @@ class BandcampClient(BaseStreamingClient):
                 )
         return results
 
-    async def fetch_artist_catalog(self, slug: str) -> list[dict]:
+    async def fetch_artist_catalog(self, slug: str) -> list[dict] | None:
         """Fetch album list from {slug}.bandcamp.com/music.
 
-        Returns list of dicts with keys: url, title.
-        Deduplicates by URL.
+        Returns a list of dicts with keys ``url``, ``title`` (deduplicated by
+        URL) on a successful fetch -- possibly empty if the page has no album
+        links. Returns ``None`` on a fetch failure (network error, timeout,
+        non-200, or 429 after retries), which callers must NOT treat as a
+        definitively-empty catalog: an empty list means "the artist has no
+        releases" while ``None`` means "we couldn't tell" and should be retried
+        rather than recorded as a final result (#661).
         """
         url = f"https://{slug}.bandcamp.com/music"
         resp = await self._request_with_retry("GET", url, timeout=15.0, follow_redirects=True)
         if resp is None or resp.status_code != 200:
-            return []
+            return None
 
         # Bandcamp serves UTF-8 but its Content-Type often omits `charset=`;
         # force UTF-8 so diacritic-bearing album titles don't mojibake. See

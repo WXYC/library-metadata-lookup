@@ -237,12 +237,20 @@ async def phase_lookup(
     results: list[dict] = []
     processed = 0
     not_found = 0
+    fetch_failed = 0
 
     for slug in slugs_to_process:
         catalog = await client.fetch_artist_catalog(slug)
         albums = slug_albums[slug]
+        processed += 1
 
-        if catalog:
+        if catalog is None:
+            # Transient fetch failure (network error / timeout / non-200 / 429
+            # after retries): leave the slug's albums 'pending' so a re-run
+            # retries them. Marking not_found here would permanently drop the
+            # slug on a network blip during the multi-hour drain (#661).
+            fetch_failed += 1
+        elif catalog:
             for album_row in albums:
                 title = album_row["display_title"]
                 best_score = 0.0
@@ -269,8 +277,8 @@ async def phase_lookup(
                     fallback_url = f"https://{slug}.bandcamp.com"
                     await db.update_bandcamp_url(album_row["id"], fallback_url)
                 else:
-                    # No album match: durably record the attempt so a re-run
-                    # skips this slug instead of re-scraping forever (#661).
+                    # In a fetched catalog but no title match: durably record
+                    # the attempt so a re-run skips this slug (#661).
                     await db.mark_bandcamp_not_found(album_row["id"])
                     not_found += 1
         elif artist_fallback:
@@ -278,21 +286,21 @@ async def phase_lookup(
                 fallback_url = f"https://{slug}.bandcamp.com"
                 await db.update_bandcamp_url(album_row["id"], fallback_url)
         else:
-            # Empty catalog and no fallback: mark every album attempted (#661).
+            # Successful fetch of a genuinely empty catalog (the artist page has
+            # no releases): definitively absent, mark every album attempted.
             for album_row in albums:
                 await db.mark_bandcamp_not_found(album_row["id"])
                 not_found += 1
 
-        processed += 1
         if processed % 100 == 0:
             log.info(
                 f"  {processed}/{len(slugs_to_process)} catalogs, "
-                f"{len(results)} matches, {not_found} no-match"
+                f"{len(results)} matches, {not_found} no-match, {fetch_failed} fetch-failed"
             )
 
     log.info(
         f"Lookup complete: {len(results)} album matches, {not_found} marked "
-        f"not-found, from {processed} catalogs"
+        f"not-found, {fetch_failed} fetch-failed (left pending), from {processed} catalogs"
     )
     return results
 
