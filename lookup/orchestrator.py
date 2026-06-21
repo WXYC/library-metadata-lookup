@@ -1052,9 +1052,19 @@ def _select_rowless_artist_release(
     to "Various" fail the gate by construction, so the survivors are the artist's
     own releases. Among them, pick the most-relevant (Discogs ``confidence``
     descending) with a stable ``release_id`` tiebreak for determinism.
+
+    A non-positive ``release_id`` is dropped before selection: such an id would
+    fail ``_resolve_fallback_artwork``'s ``release_id > 0`` guard downstream and
+    collapse to the BS#1185 ``release_id=0`` sentinel — the silent not-found this
+    path exists to kill. Discogs ids are positive, so this only closes a
+    malformed-upstream path.
     """
     token_form = normalize_for_comparison(token)
-    own = [r for r in discogs_releases if normalize_for_comparison(r.artist or "") == token_form]
+    own = [
+        r
+        for r in discogs_releases
+        if r.release_id > 0 and normalize_for_comparison(r.artist or "") == token_form
+    ]
     if not own:
         return None
     best = min(own, key=lambda r: (-r.confidence, r.release_id))
