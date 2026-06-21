@@ -1078,12 +1078,15 @@ def _select_rowless_artist_release(
     if not own:
         return None
     best = min(own, key=lambda r: (-r.confidence, r.release_id))
-    item = _make_rowless_item(artist=best.artist or token, title=best.album or "")
+    # One album-title fallback feeds both the synthetic row's title and the
+    # carried release's album_title, so they can't drift.
+    album_title = best.album or ""
+    item = _make_rowless_item(artist=best.artist or token, title=album_title)
     resolved = ResolvedRelease(
         release_id=best.release_id,
         release_url=best.release_url,
         is_compilation=False,
-        album_title=best.album or "",
+        album_title=album_title,
     )
     return item, resolved
 
