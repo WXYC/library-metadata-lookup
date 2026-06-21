@@ -19,7 +19,11 @@ from streaming.dependencies import (
     get_deezer_client,
     get_spotify_client,
 )
-from streaming.models import StreamingCheckRequest, StreamingCheckResponse
+from streaming.models import (
+    StreamingCheckRequest,
+    StreamingCheckResponse,
+    StreamingCheckSources,
+)
 from streaming.orchestrator import check_streaming_availability
 
 if TYPE_CHECKING:
@@ -29,13 +33,16 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["streaming"])
 
-# The four streaming services dispatched by ``check_streaming_availability``,
-# in a fixed order. Doubles as the ``RequestTelemetry`` ``api_call_keys`` so the
-# summary event's ``api_calls`` map has a stable shape (all zero until LML#641
-# instruments the clients) and as the iteration order for per-service verdicts.
-# Mirrors ``StreamingCheckSources`` field names; the orchestrator's import-time
-# guard fails loudly if that response shape ever drifts from these names.
-_STREAMING_SERVICES: tuple[str, ...] = ("spotify", "deezer", "apple_music", "bandcamp")
+# The streaming services dispatched by ``check_streaming_availability``, in a
+# fixed order. Derived from ``StreamingCheckSources`` (pydantic preserves
+# field-declaration order) so the telemetry service list can't drift from the
+# response shape. Adding a provider still requires editing the orchestrator
+# (its ``clients`` dict + kwargs + the ``_EXPECTED_SERVICE_FIELDS`` guard, which
+# halts import on drift) — but this list then updates automatically rather than
+# being a separate literal to forget. Doubles as the ``RequestTelemetry``
+# ``api_call_keys`` (stable ``api_calls`` shape, all zero until LML#641
+# instruments the clients) and as the verdict-iteration order.
+_STREAMING_SERVICES: tuple[str, ...] = tuple(StreamingCheckSources.model_fields)
 
 
 def _summary_properties(
@@ -59,19 +66,30 @@ def _summary_properties(
       availability`` itself raised, so no result exists — every verdict is
       ``unknown`` and ``on_streaming`` is None. This is the 500 path.
     """
-    errored = set(response.errored_sources) if response else set()
+    # Total-failure path: no result exists, so every verdict is ``unknown``.
+    # Early-return keeps the success branch below free of ``if response`` noise.
+    if response is None:
+        return {
+            "outcome": "error",
+            "error_type": error_type,
+            "on_streaming": None,
+            "errored_sources": [],
+            "errored_count": 0,
+            "match_count": 0,
+            **{f"verdict_{service}": "unknown" for service in _STREAMING_SERVICES},
+        }
+
+    errored = set(response.errored_sources)
     props: dict[str, object] = {
-        "outcome": "error" if error_type is not None else "success",
-        "error_type": error_type,
-        "on_streaming": response.on_streaming if response else None,
-        "errored_sources": response.errored_sources if response else [],
-        "errored_count": len(response.errored_sources) if response else 0,
+        "outcome": "success",
+        "error_type": None,
+        "on_streaming": response.on_streaming,
+        "errored_sources": response.errored_sources,
+        "errored_count": len(response.errored_sources),
     }
     match_count = 0
     for service in _STREAMING_SERVICES:
-        if response is None:
-            verdict = "unknown"
-        elif getattr(response.sources, service) is not None:
+        if getattr(response.sources, service) is not None:
             verdict = "matched"
             match_count += 1
         elif service in errored:
@@ -86,18 +104,23 @@ def _summary_properties(
 def _emit_summary(
     posthog_client: Posthog | None,
     telemetry: RequestTelemetry,
-    extra_properties: dict[str, object],
+    response: StreamingCheckResponse | None,
+    *,
+    error_type: str | None = None,
 ) -> None:
     """Best-effort summary emit, used on BOTH the success and failure paths.
 
-    Wrapped in its own swallow so a telemetry failure can never change the
-    handler's outcome — on success the response still returns, on failure the
-    500 still raises (LML#639). No-op when telemetry is disabled (client None).
+    Building the properties (``_summary_properties``) is done *inside* the swallow
+    too, not just the send — so the whole telemetry step (incl. deriving verdicts)
+    can never change the handler's outcome: on success the response still returns,
+    on failure the 500 still raises (LML#639). No-op when telemetry is disabled.
     """
     if not posthog_client:
         return
     try:
-        telemetry.send_to_posthog(posthog_client, extra_properties)
+        telemetry.send_to_posthog(
+            posthog_client, _summary_properties(response, error_type=error_type)
+        )
     except Exception:
         logger.warning("streaming-check telemetry emit failed", exc_info=True)
 
@@ -150,10 +173,8 @@ async def handle_streaming_check(
         logger.exception("Streaming check failed for %s - %s", request.artist, request.title)
         # Report the total failure before raising. The emit is itself swallowed,
         # so it can neither suppress nor alter the 500 (LML#639).
-        _emit_summary(
-            posthog_client, telemetry, _summary_properties(None, error_type=type(e).__name__)
-        )
+        _emit_summary(posthog_client, telemetry, None, error_type=type(e).__name__)
         raise HTTPException(status_code=500, detail="Streaming check failed") from e
 
-    _emit_summary(posthog_client, telemetry, _summary_properties(response))
+    _emit_summary(posthog_client, telemetry, response)
     return response
