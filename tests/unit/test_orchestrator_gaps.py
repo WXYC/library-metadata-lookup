@@ -334,6 +334,28 @@ class TestSearchSongAsArtistRowless:
         assert resolved.release_id == 220
         assert items[0].title == "Estrela Acesa"
 
+    @pytest.mark.asyncio
+    async def test_no_rowless_when_resolved_release_id_nonpositive(self, enable_nonlibrary_release):
+        """Defense in depth: a malformed non-positive ``release_id`` must not
+        surface. It would fail the ``release_id > 0`` artwork bypass downstream
+        and silently collapse to the BS#1185 sentinel — the not-found outcome
+        this path exists to kill — so drop it at selection instead."""
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[])
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[
+                make_discogs_result(release_id=0, artist="Sessa", album="Grandeza"),
+            ],
+        ):
+            items, discogs_titles = await search_song_as_artist(db, "Sessa", AsyncMock())
+
+        assert items == []
+        assert discogs_titles is None
+
 
 # ---------------------------------------------------------------------------
 # search_library_with_fallback -- artist+song path (lines 260-265)
