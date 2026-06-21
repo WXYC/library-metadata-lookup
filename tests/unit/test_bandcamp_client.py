@@ -383,6 +383,22 @@ class TestFindAlbumMatch:
         assert match is None
 
     @pytest.mark.asyncio
+    async def test_returns_none_when_catalog_fetch_fails(self):
+        # fetch_artist_catalog now returns None on a fetch failure; the live
+        # match path must coalesce that to no-match, never pass None into the
+        # matcher (which iterates the catalog and would TypeError on None).
+        client = BandcampClient()
+        client.search_artist = AsyncMock(
+            return_value=[
+                {"name": "Stereolab", "url": "https://stereolab.bandcamp.com", "slug": "stereolab"}
+            ]
+        )
+        client.fetch_artist_catalog = AsyncMock(return_value=None)
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+        assert match is None
+
+    @pytest.mark.asyncio
     async def test_returns_none_when_album_title_doesnt_match(self):
         client = BandcampClient()
         client.search_artist = AsyncMock(
