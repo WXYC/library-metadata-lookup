@@ -277,6 +277,59 @@ async def test_track_on_compilation_threads_pg_and_writes_cache(
     assert pg.store.get((SPINE_ARTIST.lower(), SPINE_TRACK.lower(), True)) == SPINE_RELEASE_ID
 
 
+@pytest.mark.asyncio
+async def test_track_on_compilation_surfaces_rowless_via_album_title_wave(
+    library_db, enable_nonlibrary_release
+):
+    """The row-less carry-through must fire the album-title probe (#646).
+
+    The #319/#237 shape: a non-library release whose per-track credit Discogs
+    files oddly (trio collaboration / odd credit), so the artist-scoped track
+    probes (``search_releases_by_track`` Wave A/B) surface *nothing* — the
+    release is discoverable only by its album title. The in-library #604
+    lazy-bind already fires the album-title wave (``also_probe_album_title``);
+    the #628 carry-through did not, so this non-library release was dropped by
+    ``process_release`` (no library row) *and* missed by the carry-through's
+    track-only resolve.
+
+    Threading ``also_probe_album_title=bool(album)`` into
+    ``_resolve_nonlibrary_release``'s ``resolve_release_for_track`` call closes
+    the gap. The fix lives in the shared helper, so SONG_AS_TRACK and SWAPPED
+    inherit it; TRACK_ON_COMPILATION is the natural home for the trio shape
+    (artist + album typed) and the call site #646 names.
+    """
+    svc = _base_discogs_mock()
+    # Track-artist probe finds nothing — the odd-credit case.
+    svc.search_releases_by_track = AsyncMock(return_value=_empty_track_releases())
+    # The release is reachable only by album title.
+    svc.search_releases_by_album_title = AsyncMock(return_value=_track_releases(_spine_release()))
+
+    request = LookupRequest(
+        artist=SPINE_ARTIST,
+        song=SPINE_TRACK,
+        album=SPINE_ALBUM,
+        raw_message=f"{SPINE_ARTIST} - {SPINE_TRACK}",
+    )
+    response = await perform_lookup(
+        request,
+        library_db,
+        svc,
+        telemetry=make_lml_telemetry(),
+        discogs_cache_pg=None,
+    )
+
+    # Discriminator: the track-artist probe is empty and the library gate drops
+    # the strategy's own album candidate, so the only path to a row-less result
+    # is the carry-through firing its *own* album-title wave inside
+    # resolve_release_for_track. Pre-#646 this list is empty (the carry-through
+    # resolved track-only). The unit test pins the resolver kwarg directly.
+    rowless = [r for r in response.results if r.library_item.id == 0 and r.artwork is not None]
+    assert len(rowless) == 1
+    assert rowless[0].artwork.release_id == SPINE_RELEASE_ID
+    assert rowless[0].artwork.release_id > 0
+    assert rowless[0].artwork.release_url == SPINE_RELEASE_URL
+
+
 # ---------------------------------------------------------------------------
 # SONG_AS_TRACK
 # ---------------------------------------------------------------------------

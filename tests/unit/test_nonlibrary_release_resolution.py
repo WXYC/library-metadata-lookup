@@ -272,3 +272,32 @@ async def test_bounded_resolver_is_used_not_l1_wrapper(monkeypatch):
     bounded.assert_awaited_once()
     _args, kwargs = bounded.await_args
     assert kwargs.get("max_validations") == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("album", "expected_probe"),
+    [(ALBUM, True), (None, False), ("", False)],
+)
+async def test_album_title_wave_gated_on_album_presence(monkeypatch, album, expected_probe):
+    """The bounded resolve fires the album-title wave only when an album is
+    present (#646) — parity with the in-library #604 lazy-bind, which gates the
+    same probe on ``bool(album)``. Without it, a non-library release reachable
+    only by album title (the #319/#237 trio / odd-credit shape) is missed."""
+    svc = _resolving_service()
+
+    bounded = AsyncMock(return_value=[])
+    monkeypatch.setattr("lookup.orchestrator.resolve_release_for_track", bounded)
+    monkeypatch.setattr(
+        "lookup.orchestrator.get_cached_release_id",
+        AsyncMock(return_value=ReleaseResolution(release_id=None, was_present=False)),
+    )
+    monkeypatch.setattr("lookup.orchestrator.set_cached_release_id", AsyncMock())
+
+    await _resolve_nonlibrary_release(
+        svc, None, song=TRACK, artist=ARTIST, album=album, is_track=True
+    )
+
+    bounded.assert_awaited_once()
+    _args, kwargs = bounded.await_args
+    assert kwargs.get("also_probe_album_title") == expected_probe
