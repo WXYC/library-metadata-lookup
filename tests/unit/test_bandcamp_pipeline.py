@@ -79,6 +79,25 @@ class TestMigrateExistingBandcampUrls:
         assert rows[0]["bandcamp_url"] is None
 
     @pytest.mark.asyncio
+    async def test_artist_level_url_resets_status_to_pending(self, db):
+        from scripts.bandcamp_pipeline import migrate_existing_bandcamp_urls
+
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        # An artist-level URL was previously written (which marks status 'found').
+        await db.update_bandcamp_url(album_id, "https://stereolab.bandcamp.com")
+
+        await migrate_existing_bandcamp_urls(db)
+
+        # Clearing the URL for re-matching must re-enable Phase 2: the album
+        # is pending again, not stuck at 'found' (#661).
+        pending = await db.get_pending_bandcamp_lookup()
+        assert len(pending) == 1
+        assert pending[0]["id"] == album_id
+        assert pending[0]["bandcamp_status"] == "pending"
+
+    @pytest.mark.asyncio
     async def test_idempotent_on_rerun(self, db):
         from scripts.bandcamp_pipeline import migrate_existing_bandcamp_urls
 
@@ -298,7 +317,7 @@ class TestPhaseLookup:
         assert len(pending) == 0
 
     @pytest.mark.asyncio
-    async def test_no_match_leaves_url_null(self, db):
+    async def test_no_match_marks_not_found_and_excludes_from_pending(self, db):
         from scripts.bandcamp_pipeline import phase_lookup
 
         await db.insert_albums([_make_album()])
@@ -318,9 +337,53 @@ class TestPhaseLookup:
         results = await phase_lookup(mock_client, db)
 
         assert len(results) == 0
-        pending = await db.get_pending_bandcamp_lookup()
-        # Still pending since no match was found and no fallback
-        assert len(pending) == 1
+        # URL stays null, but the album is durably marked attempted so a re-run
+        # skips it instead of re-scraping forever (resumability, #661).
+        all_rows = await db.get_all_results()
+        assert all_rows[0]["bandcamp_url"] is None
+        assert all_rows[0]["bandcamp_status"] == "not_found"
+        assert len(await db.get_pending_bandcamp_lookup()) == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_catalog_marks_not_found(self, db):
+        from scripts.bandcamp_pipeline import phase_lookup
+
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
+
+        mock_client = AsyncMock()
+        mock_client.fetch_artist_catalog = AsyncMock(return_value=[])
+
+        await phase_lookup(mock_client, db)
+
+        all_rows = await db.get_all_results()
+        assert all_rows[0]["bandcamp_status"] == "not_found"
+        assert len(await db.get_pending_bandcamp_lookup()) == 0
+
+    @pytest.mark.asyncio
+    async def test_rerun_skips_attempted_no_match(self, db):
+        from scripts.bandcamp_pipeline import phase_lookup
+
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
+
+        mock_client = AsyncMock()
+        mock_client.fetch_artist_catalog = AsyncMock(
+            return_value=[
+                {
+                    "url": "https://stereolab.bandcamp.com/album/something-else",
+                    "title": "Something Else",
+                },
+            ]
+        )
+
+        await phase_lookup(mock_client, db)  # first attempt: no match -> not_found
+        mock_client.fetch_artist_catalog.reset_mock()
+
+        await phase_lookup(mock_client, db)  # re-run must skip the attempted slug
+        mock_client.fetch_artist_catalog.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_artist_fallback_writes_artist_url(self, db):

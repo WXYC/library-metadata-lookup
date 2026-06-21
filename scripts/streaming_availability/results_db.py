@@ -117,10 +117,26 @@ class ResultsDB:
             ("deezer_checked_at", "TEXT"),
             ("bandcamp_slug", "TEXT"),
             ("bandcamp_url", "TEXT"),
+            ("bandcamp_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("bandcamp_checked_at", "TEXT"),
         ]
+        bandcamp_status_added = "bandcamp_status" not in columns
         for col_name, col_type in migrations:
             if col_name not in columns:
                 await self._db.execute(f"ALTER TABLE albums ADD COLUMN {col_name} {col_type}")
+        # Keep Phase-2 pending scans cheap, mirroring spotify/apple. Created
+        # after the ALTER loop so the column exists on fresh databases too.
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_albums_bandcamp_status ON albums(bandcamp_status)"
+        )
+        if bandcamp_status_added:
+            # The ALTER stamps 'pending' on every existing row; rows that already
+            # carry a resolved URL are really 'found'. Backfill so the marker is
+            # trustworthy for attempted-vs-resolved reporting (#661).
+            await self._db.execute(
+                "UPDATE albums SET bandcamp_status = 'found' "
+                "WHERE bandcamp_url IS NOT NULL AND bandcamp_status = 'pending'"
+            )
 
     async def close(self) -> None:
         if self._db:
@@ -309,12 +325,35 @@ class ResultsDB:
             await self._db.commit()
 
     async def update_bandcamp_url(self, album_id: int, url: str) -> None:
-        """Set the Bandcamp album URL for an album."""
+        """Set the Bandcamp album URL and mark the album resolved.
+
+        Writes the ``found`` Phase-2 marker alongside the URL so the album is
+        excluded from future pending scans (#661).
+        """
         assert self._db is not None
         async with self._write_lock:
+            now = datetime.now(UTC).isoformat()
             await self._db.execute(
-                "UPDATE albums SET bandcamp_url = ? WHERE id = ?",
-                (url, album_id),
+                "UPDATE albums SET bandcamp_url = ?, bandcamp_status = 'found', "
+                "bandcamp_checked_at = ? WHERE id = ?",
+                (url, now, album_id),
+            )
+            await self._db.commit()
+
+    async def mark_bandcamp_not_found(self, album_id: int) -> None:
+        """Durably record a Phase-2 attempt that found no album match.
+
+        Distinguishes "tried, no match" (status ``not_found``) from "not yet
+        tried" (status ``pending``) so a bulk drain is resumable and re-runs
+        skip already-attempted slugs (#661). Leaves ``bandcamp_url`` NULL.
+        """
+        assert self._db is not None
+        async with self._write_lock:
+            now = datetime.now(UTC).isoformat()
+            await self._db.execute(
+                "UPDATE albums SET bandcamp_status = 'not_found', "
+                "bandcamp_checked_at = ? WHERE id = ?",
+                (now, album_id),
             )
             await self._db.commit()
 
@@ -354,12 +393,17 @@ class ResultsDB:
                 ``bandcamp_slug``. The concurrent consumer uses this to process
                 only a newly discovered slug instead of re-scanning the whole
                 pending set on every queue event (#125).
+
+        Only albums still in ``bandcamp_status = 'pending'`` are returned;
+        albums marked ``not_found`` by a prior attempt are skipped so a bulk
+        drain is resumable (#661).
         """
         assert self._db is not None
         query = (
             "SELECT * FROM albums "
             "WHERE bandcamp_slug IS NOT NULL AND bandcamp_slug != '' "
-            "AND bandcamp_url IS NULL AND is_compilation = 0"
+            "AND bandcamp_url IS NULL AND bandcamp_status = 'pending' "
+            "AND is_compilation = 0"
         )
         params: list = []
         if slug is not None:

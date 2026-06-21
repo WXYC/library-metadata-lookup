@@ -85,7 +85,9 @@ async def migrate_existing_bandcamp_urls(db: ResultsDB) -> None:
                 (slug, row["id"]),
             )
 
-    # Step 2: Artist-level URLs -- extract slug, clear URL
+    # Step 2: Artist-level URLs -- extract slug, clear URL. Reset the Phase-2
+    # marker to 'pending' so the cleared album re-enters the lookup backlog
+    # rather than being skipped as already-resolved (#661).
     cursor = await db._db.execute(
         "SELECT id, bandcamp_url FROM albums "
         "WHERE bandcamp_url IS NOT NULL AND bandcamp_url NOT LIKE '%/album/%' "
@@ -96,7 +98,8 @@ async def migrate_existing_bandcamp_urls(db: ResultsDB) -> None:
         slug = extract_slug(row["bandcamp_url"])
         if slug:
             await db._db.execute(
-                "UPDATE albums SET bandcamp_slug = ?, bandcamp_url = NULL WHERE id = ?",
+                "UPDATE albums SET bandcamp_slug = ?, bandcamp_url = NULL, "
+                "bandcamp_status = 'pending', bandcamp_checked_at = NULL WHERE id = ?",
                 (slug, row["id"]),
             )
 
@@ -233,6 +236,7 @@ async def phase_lookup(
 
     results: list[dict] = []
     processed = 0
+    not_found = 0
 
     for slug in slugs_to_process:
         catalog = await client.fetch_artist_catalog(slug)
@@ -264,16 +268,32 @@ async def phase_lookup(
                 elif artist_fallback:
                     fallback_url = f"https://{slug}.bandcamp.com"
                     await db.update_bandcamp_url(album_row["id"], fallback_url)
+                else:
+                    # No album match: durably record the attempt so a re-run
+                    # skips this slug instead of re-scraping forever (#661).
+                    await db.mark_bandcamp_not_found(album_row["id"])
+                    not_found += 1
         elif artist_fallback:
             for album_row in albums:
                 fallback_url = f"https://{slug}.bandcamp.com"
                 await db.update_bandcamp_url(album_row["id"], fallback_url)
+        else:
+            # Empty catalog and no fallback: mark every album attempted (#661).
+            for album_row in albums:
+                await db.mark_bandcamp_not_found(album_row["id"])
+                not_found += 1
 
         processed += 1
         if processed % 100 == 0:
-            log.info(f"  {processed}/{len(slugs_to_process)} catalogs, {len(results)} matches")
+            log.info(
+                f"  {processed}/{len(slugs_to_process)} catalogs, "
+                f"{len(results)} matches, {not_found} no-match"
+            )
 
-    log.info(f"Lookup complete: {len(results)} album matches from {processed} catalogs")
+    log.info(
+        f"Lookup complete: {len(results)} album matches, {not_found} marked "
+        f"not-found, from {processed} catalogs"
+    )
     return results
 
 
