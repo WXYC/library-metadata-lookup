@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import Iterator
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -1434,6 +1435,23 @@ class DiscogsService:
         return _scan_tracklist_for_credit(release, track_lower)
 
 
+def _iter_title_matched_items(
+    release: ReleaseMetadataResponse, track_lower: str
+) -> Iterator[TrackItem]:
+    """Yield tracklist items whose normalized title matches ``track_lower``.
+
+    The shared title-match step behind both tracklist scans —
+    :func:`_scan_tracklist_for_match` (validation) and
+    :func:`_scan_tracklist_for_credit` (credit recovery, LML#660): a bidirectional
+    substring on the normalized title. Centralized so the two scans' title rule
+    can't drift apart. ``track_lower`` is pre-normalized by the caller.
+    """
+    for item in release.tracklist or []:
+        item_title = normalize_for_track_comparison(item.title)
+        if track_lower in item_title or item_title in track_lower:
+            yield item
+
+
 def _scan_tracklist_for_match(
     release: ReleaseMetadataResponse,
     release_id: int,
@@ -1450,12 +1468,7 @@ def _scan_tracklist_for_match(
     ``normalize_for_track_comparison`` / ``normalize_artist_for_validation``)
     so the inner loop is hot-path arithmetic.
     """
-    for item in release.tracklist or []:
-        item_title = normalize_for_track_comparison(item.title)
-        # Check if track title matches
-        if track_lower not in item_title and item_title not in track_lower:
-            continue
-
+    for item in _iter_title_matched_items(release, track_lower):
         # Per-track credits first (compilations, or tracks crediting the
         # writers/performers). A positive hit short-circuits.
         if item.artists:
@@ -1514,10 +1527,7 @@ def _scan_tracklist_for_credit(release: ReleaseMetadataResponse, track_lower: st
     ``track_lower`` is pre-normalized by the caller (single
     ``normalize_for_track_comparison`` call), mirroring ``_scan_tracklist_for_match``.
     """
-    for item in release.tracklist or []:
-        item_title = normalize_for_track_comparison(item.title)
-        if track_lower not in item_title and item_title not in track_lower:
-            continue
+    for item in _iter_title_matched_items(release, track_lower):
         if item.artists:
             joined = " ".join(a.strip() for a in item.artists if a and a.strip())
             if joined:
