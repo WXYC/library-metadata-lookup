@@ -123,7 +123,12 @@ class TestRowlessEnrichmentSplit:
         assert enriched.release_id == RELEASE_ID
         assert enriched.release_url != ""
 
-        # Album-derived extended payload, read from the resolved release.
+        # Album-derived payload (rides ``is_album_derived_eligible``, which the
+        # #628 bypass opens by flipping ``library_row_acceptable``). These — plus
+        # ``release_id`` above — are the assertions that actually guard the #628
+        # bypass: remove the bypass clause and they collapse to the sentinel /
+        # None. ``artist_image_url`` is album-derived too (see test 3's scope
+        # note), not artist-derived, despite being artist-scoped data.
         assert enriched.genres == ["Rock"]
         assert enriched.styles == ["Folk", "Acoustic"]
         assert enriched.label == "Drag City"
@@ -132,9 +137,14 @@ class TestRowlessEnrichmentSplit:
         assert len(enriched.tracklist) == 1
         assert enriched.tracklist[0].title == SONG
         assert enriched.release_year == 2015
-
-        # Artist-derived enrichment, on the same row-less result.
         assert enriched.artist_image_url == "https://img.discogs.com/jp.jpg"
+
+        # Artist-derived enrichment. NB: these ride the LML#504 split-gate on a
+        # *verified artist identity*, independent of the #628 bypass — they
+        # survive even with the bypass removed (the result still carries bio/wiki
+        # on the sentinel). Asserting them here pins the full row-less shape
+        # (#630 criterion 1: artwork + bio/wiki + extended payload together), not
+        # the bypass specifically. Their guard is the #504 gate, not #628.
         assert enriched.discogs_artist_id == 42
         assert enriched.artist_bio is not None
         assert "singer-songwriter" in enriched.artist_bio
