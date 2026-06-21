@@ -357,17 +357,22 @@ class TestSearchSongAsArtistRowless:
         assert discogs_titles is None
 
     @pytest.mark.asyncio
-    async def test_tiebreak_picks_lowest_release_id_on_equal_confidence(
+    async def test_tiebreak_preserves_discogs_order_on_equal_confidence(
         self, enable_nonlibrary_release
     ):
         """The *effective* production selector. The artist-only Discogs query
         carries no album term, so ``calculate_confidence`` scores every
         exact-credit match identically (~0.4) — the confidence key ties and the
-        deterministic ``release_id`` tiebreak decides. Among equal-confidence own
-        releases the lowest ``release_id`` wins. The earlier selection test feeds
-        distinct confidences (0.8 vs 0.2), a spread this path never produces, so
-        this pins the tiebreak that actually governs selection in production.
-        (True relevance ranking is deferred to #633.)"""
+        tie is broken by input order. ``lookup_releases_by_artist`` returns the
+        list ``service.search`` already sorted by confidence descending (a stable
+        sort preserving Discogs' own relevance order within a tie), so the first
+        survivor — the release Discogs ranked highest — wins. The earlier
+        selection test feeds distinct confidences (0.8 vs 0.2), a spread this
+        path never produces, so this pins the tiebreak that actually governs
+        selection in production. Note the winner (release_id 900) is NOT the
+        lowest release_id (210): the tiebreak follows Discogs' ranking, not the
+        oldest-cataloged pressing. (True community-count ranking is deferred to
+        #633.)"""
         db = AsyncMock()
         db.exact_title = AsyncMock(return_value=[])
         db.search = AsyncMock(return_value=[])
@@ -389,8 +394,8 @@ class TestSearchSongAsArtistRowless:
 
         assert len(items) == 1
         resolved = discogs_titles[0]
-        assert resolved.release_id == 210
-        assert items[0].title == "Estrela Acesa"
+        assert resolved.release_id == 900
+        assert items[0].title == "Grandeza"
 
 
 # ---------------------------------------------------------------------------

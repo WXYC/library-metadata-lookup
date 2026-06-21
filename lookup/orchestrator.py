@@ -1054,15 +1054,20 @@ def _select_rowless_artist_release(
     collaborations credited "<artist> & <other>" among them — so the survivors
     are releases credited to the artist alone.
 
-    Among the survivors, sort by Discogs ``confidence`` descending with a stable
-    ``release_id`` tiebreak. Note the upstream query is artist-only
+    Among the survivors, take the highest Discogs ``confidence``, breaking a tie
+    by **input order**. The upstream query is artist-only
     (``DiscogsSearchRequest(artist=token)`` in ``lookup_releases_by_artist``), so
     ``calculate_confidence`` scores every exact-credit match identically (~0.4,
     no album term) — confidence only separates an exact credit from a fuzzier
-    diacritic variant, and in the common all-identical-credit case the
-    deterministic ``release_id`` tiebreak is the effective selector. True
-    relevance ranking (community have/want counts) needs a per-release
-    ``get_release`` fetch and is deferred to #633.
+    diacritic variant, so the input-order tiebreak is the effective selector in
+    the common all-identical-credit case. ``lookup_releases_by_artist`` returns
+    the list ``service.search`` already sorted by confidence descending — a
+    *stable* sort that preserves Discogs' own result order within a confidence
+    tie — so first-survivor-wins surfaces the release Discogs ranked highest,
+    not the oldest-cataloged pressing a ``release_id`` tiebreak would pick.
+    Deterministic for a given Discogs response. True community-count ranking
+    (have/want) needs a per-release ``get_release`` fetch and is deferred to
+    #633.
 
     A non-positive ``release_id`` is dropped before selection: such an id would
     fail ``_resolve_fallback_artwork``'s ``release_id > 0`` guard downstream and
@@ -1078,7 +1083,12 @@ def _select_rowless_artist_release(
     ]
     if not own:
         return None
-    best = min(own, key=lambda r: (-r.confidence, r.release_id))
+    # Highest confidence wins; ties break by input index (ascending), so the
+    # first survivor — Discogs' highest-ranked release within a confidence tie —
+    # is chosen rather than the lowest release_id (the oldest pressing). ``own``
+    # preserves ``discogs_releases`` order, which ``service.search`` sorted by
+    # confidence descending with a stable sort.
+    best = min(enumerate(own), key=lambda iv: (-iv[1].confidence, iv[0]))[1]
     # One album-title fallback feeds both the synthetic row's title and the
     # carried release's album_title, so they can't drift.
     album_title = best.album or ""
