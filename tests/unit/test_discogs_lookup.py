@@ -132,7 +132,11 @@ class TestLookupReleasesByArtist:
 
         result = await lookup_releases_by_artist("Radiohead", service=service)
         assert len(result) == 1
-        assert result[0] == ("Radiohead", "OK Computer")
+        # Widened (LML#631) to surface the full DiscogsSearchResult so the
+        # row-less path can carry release_id / release_url, not just the title.
+        assert result[0].artist == "Radiohead"
+        assert result[0].album == "OK Computer"
+        assert result[0].release_id == 1
 
     @pytest.mark.asyncio
     async def test_no_service_returns_empty(self):
@@ -157,4 +161,7 @@ class TestLookupReleasesByArtist:
         )
 
         result = await lookup_releases_by_artist("Artist", service=service)
-        assert result == [("", "")]
+        # Raw passthrough now — no ``or ""`` coercion; None stays None.
+        assert len(result) == 1
+        assert result[0].artist is None
+        assert result[0].album is None

@@ -454,7 +454,12 @@ class Outcome:
         return cls(items=[])
 
     @classmethod
-    def found(cls, items: list[LibraryItem]) -> "Outcome":
+    def found(
+        cls,
+        items: list[LibraryItem],
+        *,
+        discogs_titles: "dict[int, ResolvedRelease] | None" = None,
+    ) -> "Outcome":
         """Direct match where the strategy can vouch for the song.
 
         Clears ``state.song_not_found`` because the strategy explicitly
@@ -463,13 +468,19 @@ class Outcome:
         etc.). Use this for the 90% case where success means "the song
         was matched."
 
+        ``discogs_titles`` carries resolved Discogs releases for artwork lookup
+        (defaults to ``None`` — a no-op). SONG_AS_ARTIST's LML#631 row-less path
+        passes ``{0: ResolvedRelease}`` here so ``fetch_artwork_for_items`` binds
+        the non-library release onto the ``id=0`` item instead of falling
+        through to the BS#1185 sentinel.
+
         For ARTIST_PLUS_ALBUM's direct path — where the artist's album was
         found by name but the song's presence on the album wasn't verified —
         use :meth:`album_match` instead, which leaves ``song_not_found``
         alone so a prior album-resolution signal can still drive
         TRACK_ON_COMPILATION downstream.
         """
-        return cls(items=items, song_not_found_after=False)
+        return cls(items=items, song_not_found_after=False, discogs_titles=discogs_titles)
 
     @classmethod
     def album_match(cls, items: list[LibraryItem]) -> "Outcome":

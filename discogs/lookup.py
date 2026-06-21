@@ -7,7 +7,7 @@ When omitted, a cacheless service is created as a fallback.
 
 import logging
 
-from discogs.models import DiscogsSearchRequest
+from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
 from discogs.service import DiscogsService
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ async def lookup_releases_by_artist(
     artist: str,
     limit: int = 10,
     service: DiscogsService | None = None,
-) -> list[tuple[str, str]]:
+) -> list[DiscogsSearchResult]:
     """Look up releases by an artist using Discogs.
 
     Args:
@@ -90,7 +90,10 @@ async def lookup_releases_by_artist(
             creates a cacheless fallback service.
 
     Returns:
-        List of (artist, album) tuples for releases by or featuring the artist.
+        The ranked ``DiscogsSearchResult`` list for releases by or featuring the
+        artist. Callers that only need album titles read ``r.album``; the LML#631
+        row-less path also reads ``r.release_id`` / ``r.release_url`` to carry the
+        resolved identity for a non-library artist.
     """
     if service is None:
         service = _get_service()
@@ -100,4 +103,4 @@ async def lookup_releases_by_artist(
     request = DiscogsSearchRequest(artist=artist)
     response = await service.search(request, limit=limit)
 
-    return [(r.artist or "", r.album or "") for r in response.results]
+    return list(response.results)

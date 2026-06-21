@@ -961,8 +961,19 @@ async def search_song_as_artist(
     db: LibraryDB,
     song_as_artist: str,
     discogs_service: DiscogsService | None = None,
-) -> tuple[list[LibraryItem], None]:
-    """Try searching using the parsed song title as an artist name."""
+) -> tuple[list[LibraryItem], dict[int, ResolvedRelease] | None]:
+    """Try searching using the parsed song title as an artist name.
+
+    Primarily serves request-o-matic listener requests. When the typed token is
+    an artist WXYC owns, the library cross-reference returns those rows. When it
+    resolves on Discogs but has no ``library.db`` row, LML#631 surfaces a
+    *row-less* result — ``LibraryItem(id=0)`` paired with the resolved release on
+    the ``discogs_titles`` seam — so rom can post the Discogs context to Slack.
+    The row-less path is gated on ``LML_RESOLVE_NONLIBRARY_RELEASE`` (shared with
+    the #628 carry-through) and on the typed token normalizing-equal to the
+    resolved Discogs artist name; the second tuple element carries that release
+    (``None`` on the library-backed paths, which are unchanged).
+    """
     logger.info(f"Trying song '{song_as_artist}' as artist name")
 
     results = await db.search(query=song_as_artist, limit=_FETCH_LIMIT)
@@ -993,7 +1004,7 @@ async def search_song_as_artist(
         ]
 
     all_matches = await asyncio.gather(
-        *[search_album(album_title) for _, album_title in discogs_releases]
+        *[search_album(release.album or "") for release in discogs_releases]
     )
 
     seen_ids: set[int] = set()
@@ -1012,8 +1023,49 @@ async def search_song_as_artist(
         logger.info(
             f"Found {len(results)} results via Discogs cross-reference for '{song_as_artist}'"
         )
+        return limit_results(results), None
 
-    return limit_results(results), None
+    # LML#631 — no WXYC catalog row for this artist. If the token resolves
+    # cleanly on Discogs, surface the best-representative release row-less so rom
+    # can post Discogs context to Slack. Gated behind the shared non-library flag.
+    if get_settings().lml_resolve_nonlibrary_release:
+        rowless = _select_rowless_artist_release(song_as_artist, discogs_releases)
+        if rowless is not None:
+            item, resolved = rowless
+            logger.info(
+                f"Surfacing row-less Discogs release {resolved.release_id} for "
+                f"non-library artist '{song_as_artist}'"
+            )
+            return [item], {ROWLESS_LIBRARY_ID: resolved}
+
+    return [], None
+
+
+def _select_rowless_artist_release(
+    token: str, discogs_releases: list[DiscogsSearchResult]
+) -> tuple[LibraryItem, ResolvedRelease] | None:
+    """Pick the release that represents a non-library artist request (LML#631).
+
+    Confidence gate: keep only releases whose credited artist normalizes-equal
+    to the typed token (the artist-only analog of ``find_best_typed_match``'s
+    floor). A coincidental token→name hit is dropped. V/A compilations credited
+    to "Various" fail the gate by construction, so the survivors are the artist's
+    own releases. Among them, pick the most-relevant (Discogs ``confidence``
+    descending) with a stable ``release_id`` tiebreak for determinism.
+    """
+    token_form = normalize_for_comparison(token)
+    own = [r for r in discogs_releases if normalize_for_comparison(r.artist or "") == token_form]
+    if not own:
+        return None
+    best = min(own, key=lambda r: (-r.confidence, r.release_id))
+    item = _make_rowless_item(artist=best.artist or token, title=best.album or "")
+    resolved = ResolvedRelease(
+        release_id=best.release_id,
+        release_url=best.release_url,
+        is_compilation=False,
+        album_title=best.album or "",
+    )
+    return item, resolved
 
 
 SONG_AS_TRACK_CONFIDENCE: float = 0.85
