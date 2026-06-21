@@ -40,6 +40,18 @@ def enable_nonlibrary_release(monkeypatch):
     get_settings.cache_clear()
 
 
+@pytest.fixture
+def disable_nonlibrary_release(monkeypatch):
+    """Force the flag off + reset the settings lru-cache so the flag-off assertion
+    is self-contained, not dependent on a prior test's fixture teardown."""
+    monkeypatch.delenv("LML_RESOLVE_NONLIBRARY_RELEASE", raising=False)
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 def _cache_release(album, artist, release_id, *, is_compilation=False):
     return ReleaseInfo(
         album=album,
@@ -124,8 +136,28 @@ async def test_rowless_release_carries_soft_seam_confidence(
 
 
 @pytest.mark.asyncio
+async def test_drops_title_less_cache_release(
+    mock_library_db, mock_discogs_service, enable_nonlibrary_release
+):
+    """A cache release with a valid release_id but no album title must not surface
+    a degenerate row-less item (parity with the rehydrate-path empty-title guard)."""
+    mock_discogs_service.cache_service = AsyncMock()
+    mock_discogs_service.cache_service.search_releases_by_track = AsyncMock(
+        return_value=[_cache_release("", "Lee Perry", 1000)]
+    )
+    mock_library_db.search.return_value = []
+
+    items, discogs_titles = await find_library_albums_with_cached_track(
+        mock_library_db, "Bucky Skank", "Lee 'Scratch' Perry", mock_discogs_service
+    )
+
+    assert items == []
+    assert discogs_titles == {}
+
+
+@pytest.mark.asyncio
 async def test_flag_off_preserves_drop_when_no_library_row_matches(
-    mock_library_db, mock_discogs_service
+    mock_library_db, mock_discogs_service, disable_nonlibrary_release
 ):
     """Without ``lml_resolve_nonlibrary_release`` the A4 carry-through stays off:
     a cache-confirmed release with no artist-matching row drops to empty exactly
