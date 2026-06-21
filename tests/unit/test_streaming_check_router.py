@@ -6,7 +6,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from config.settings import get_settings
-from core.dependencies import get_posthog_client
+from core.dependencies import get_streaming_posthog_client
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
@@ -160,7 +160,7 @@ def telemetry_app_client(mock_settings):
             get_deezer_client: AsyncMock(),
             get_apple_music_client: None,
             get_bandcamp_client: None,
-            get_posthog_client: mock_posthog,
+            get_streaming_posthog_client: mock_posthog,
         },
     ):
         yield app, mock_posthog

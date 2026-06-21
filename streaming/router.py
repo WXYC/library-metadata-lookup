@@ -12,7 +12,7 @@ from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.deezer import DeezerClient
 from clients.streaming.spotify import SpotifyClient
-from core.dependencies import get_posthog_client
+from core.dependencies import get_streaming_posthog_client
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
@@ -144,7 +144,7 @@ async def handle_streaming_check(
     deezer: DeezerClient = Depends(get_deezer_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     bandcamp: BandcampClient = Depends(get_bandcamp_client),
-    posthog_client: Posthog | None = Depends(get_posthog_client),
+    posthog_client: Posthog | None = Depends(get_streaming_posthog_client),
 ) -> StreamingCheckResponse:
     """Check streaming availability across all configured services."""
     # Per-request telemetry (LML#639). The cache-stats bracket and api_calls map

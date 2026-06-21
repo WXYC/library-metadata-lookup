@@ -14,6 +14,7 @@ from core.dependencies import (
     get_discogs_service,
     get_library_db,
     get_posthog_client,
+    get_streaming_posthog_client,
 )
 
 
@@ -408,3 +409,56 @@ class TestGetPosthogClient:
             client = get_posthog_client(mock_settings)
         assert client is mock_shared.return_value
         mock_shared.assert_called_once_with(event_prefix="lookup")
+
+
+class TestGetStreamingPosthogClient:
+    """The streaming-check endpoint gets its own per-caller prefix (LML#659).
+
+    Reusing the hardcoded ``"lookup"`` prefix mis-attributed the missing-key
+    warning to ``caller=lookup`` and, because the upstream singleton warns once
+    per prefix, suppressed the streaming-check warning entirely.
+    """
+
+    def test_short_circuits_when_telemetry_disabled(self, mock_settings):
+        mock_settings.enable_telemetry = False
+        with patch("core.dependencies._shared_posthog_client") as mock_shared:
+            assert get_streaming_posthog_client(mock_settings) is None
+        mock_shared.assert_not_called()
+
+    def test_delegates_with_streaming_check_event_prefix(self, mock_settings):
+        mock_settings.enable_telemetry = True
+        with patch("core.dependencies._shared_posthog_client") as mock_shared:
+            mock_shared.return_value = Mock()
+            client = get_streaming_posthog_client(mock_settings)
+        assert client is mock_shared.return_value
+        mock_shared.assert_called_once_with(event_prefix="streaming_check")
+
+    def test_has_distinct_identity_from_lookup_dep(self):
+        """FastAPI ``dependency_overrides`` are keyed by callable identity, so the
+        two per-caller deps must be distinct objects to be overridable apart."""
+        assert get_streaming_posthog_client is not get_posthog_client
+
+
+class TestPerCallerMissingKeyWarning:
+    """End-to-end attribution against the real wxyc-fastapi singleton (LML#659).
+
+    With telemetry enabled but ``POSTHOG_API_KEY`` unset, each distinct caller
+    must log its own one-time missing-key warning under its own ``caller=``
+    label — the lookup warning must not suppress the streaming-check one.
+    """
+
+    def test_each_caller_warns_under_its_own_label(self, mock_settings, caplog):
+        import wxyc_fastapi.observability.posthog as upstream
+
+        mock_settings.enable_telemetry = True  # POSTHOG_API_KEY already "" via fixture
+        upstream._warned_prefixes.clear()
+        try:
+            with caplog.at_level("WARNING", logger=upstream.logger.name):
+                assert get_posthog_client(mock_settings) is None
+                assert get_streaming_posthog_client(mock_settings) is None
+        finally:
+            upstream._warned_prefixes.clear()
+
+        warnings = [r.getMessage() for r in caplog.records if "POSTHOG_API_KEY" in r.getMessage()]
+        assert any("caller=lookup" in m for m in warnings)
+        assert any("caller=streaming_check" in m for m in warnings)
