@@ -61,8 +61,10 @@ def enable_nonlibrary_release(monkeypatch):
 @pytest.fixture
 def disable_nonlibrary_release(monkeypatch):
     """Force the flag off + reset the settings lru-cache so the flag-off assertion
-    is self-contained, not dependent on a prior test's fixture teardown."""
-    monkeypatch.delenv("LML_RESOLVE_NONLIBRARY_RELEASE", raising=False)
+    is self-contained, not dependent on a prior test's fixture teardown. Sets the
+    env var to "false" rather than unsetting it so it also overrides a developer's
+    local .env (Settings reads env_file=".env"; setenv takes precedence)."""
+    monkeypatch.setenv("LML_RESOLVE_NONLIBRARY_RELEASE", "false")
     from config.settings import get_settings
 
     get_settings.cache_clear()
