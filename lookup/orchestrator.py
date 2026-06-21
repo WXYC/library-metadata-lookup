@@ -1071,18 +1071,23 @@ async def _resolve_nonlibrary_release(
        fresh known miss (``was_present=True, release_id=None``) short-circuits to
        ``None`` *without* a live probe; an absent/stale entry falls through.
     2. **Bounded resolve on a cold miss** — the **uncached**
-       ``resolve_release_for_track(..., max_validations=5)`` (#633). Deliberately
-       NOT ``resolve_release_for_track_cached``: the L1 wrapper's key omits
-       ``max_validations``, so a bounded ``[]`` would coalesce with a default
-       ``[]`` (the #633 landmine). Cold-cache durability comes from the #632 PG
-       cache here instead.
+       ``resolve_release_for_track(..., also_probe_album_title=bool(album),
+       max_validations=5)`` (#633). The album-title wave (#646, gated on a
+       present ``album``) fires the third ``search_releases_by_album_title``
+       probe so a non-library release discoverable *only* by its album title
+       — the #319/#237 trio-collaboration / odd-credit shape the track-artist
+       probes miss — still resolves, at parity with the in-library #604
+       lazy-bind. Deliberately NOT ``resolve_release_for_track_cached``: the L1
+       wrapper's key omits ``max_validations``, so a bounded ``[]`` would
+       coalesce with a default ``[]`` (the #633 landmine). Cold-cache
+       durability comes from the #632 PG cache here instead.
     3. **#632 cache write-back** — the resolved id, or ``None`` to record a known
        miss so the next identical add short-circuits.
 
     ``pg`` is best-effort: ``None`` (or a PG failure, swallowed inside the cache
     helpers) degrades to an uncached bounded resolve. ``album`` (often absent on
-    the kernel paths) only ranks the validated candidates by title; the bounded
-    resolver returns at most one.
+    the kernel paths) both fires the album-title probe (layer 2) and ranks the
+    validated candidates by title; the bounded resolver returns at most one.
     """
     if discogs_service is None or not song or not artist:
         return None
@@ -1106,7 +1111,12 @@ async def _resolve_nonlibrary_release(
             cached_positive_unhydrated = True
 
     candidates = await resolve_release_for_track(
-        song, artist, album, discogs_service, max_validations=5
+        song,
+        artist,
+        album,
+        discogs_service,
+        also_probe_album_title=bool(album),
+        max_validations=5,
     )
     best = candidates[0] if candidates else None
 
