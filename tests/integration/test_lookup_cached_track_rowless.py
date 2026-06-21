@@ -58,6 +58,18 @@ def enable_nonlibrary_release(monkeypatch):
     get_settings.cache_clear()
 
 
+@pytest.fixture
+def disable_nonlibrary_release(monkeypatch):
+    """Force the flag off + reset the settings lru-cache so the flag-off assertion
+    is self-contained, not dependent on a prior test's fixture teardown."""
+    monkeypatch.delenv("LML_RESOLVE_NONLIBRARY_RELEASE", raising=False)
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 def _cache_release() -> ReleaseInfo:
     return ReleaseInfo(
         album=NONLIB_ALBUM,
@@ -132,7 +144,7 @@ async def test_cached_track_surfaces_rowless_release_end_to_end(
 
 
 @pytest.mark.asyncio
-async def test_cached_track_flag_off_no_rowless_release(library_db):
+async def test_cached_track_flag_off_no_rowless_release(library_db, disable_nonlibrary_release):
     """Flag off: the safety net stays inert — no row-less Discogs identity
     surfaces (pre-#629 drop preserved)."""
     svc = _service(with_cache_hit=True)

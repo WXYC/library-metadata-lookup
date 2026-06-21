@@ -2498,7 +2498,12 @@ async def find_library_albums_with_cached_track(
     # surfaces it even when the request did type an album.
     if not get_settings().lml_resolve_nonlibrary_release:
         return [], {}
-    ranked = prerank_candidates_for_validation([r for r in cached_releases if r.release_id], None)
+    # Require a title as well as an id: a title-less release would surface a
+    # degenerate row-less item (title=""), exactly what the sibling rehydrate
+    # path (_rehydrate_resolved_release) guards against.
+    ranked = prerank_candidates_for_validation(
+        [r for r in cached_releases if r.release_id and r.album], None
+    )
     if not ranked:
         return [], {}
     best = ranked[0]
@@ -2509,6 +2514,10 @@ async def find_library_albums_with_cached_track(
         is_compilation=bool(best.is_compilation),
         album_title=best.album or "",
         confidence=ROWLESS_NO_ALBUM_CONFIDENCE,
+    )
+    logger.info(
+        f"cached-track safety net: surfacing row-less Discogs release "
+        f"{best.release_id} ('{best.album}') — track-confirmed in cache, not in library"
     )
     return [rowless], {ROWLESS_LIBRARY_ID: resolved}
 
