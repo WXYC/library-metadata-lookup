@@ -356,6 +356,42 @@ class TestSearchSongAsArtistRowless:
         assert items == []
         assert discogs_titles is None
 
+    @pytest.mark.asyncio
+    async def test_tiebreak_picks_lowest_release_id_on_equal_confidence(
+        self, enable_nonlibrary_release
+    ):
+        """The *effective* production selector. The artist-only Discogs query
+        carries no album term, so ``calculate_confidence`` scores every
+        exact-credit match identically (~0.4) — the confidence key ties and the
+        deterministic ``release_id`` tiebreak decides. Among equal-confidence own
+        releases the lowest ``release_id`` wins. The earlier selection test feeds
+        distinct confidences (0.8 vs 0.2), a spread this path never produces, so
+        this pins the tiebreak that actually governs selection in production.
+        (True relevance ranking is deferred to #633.)"""
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[])
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[
+                make_discogs_result(
+                    release_id=900, artist="Sessa", album="Grandeza", confidence=0.4
+                ),
+                make_discogs_result(
+                    release_id=210, artist="Sessa", album="Estrela Acesa", confidence=0.4
+                ),
+                make_discogs_result(release_id=540, artist="Sessa", album="Sessa", confidence=0.4),
+            ],
+        ):
+            items, discogs_titles = await search_song_as_artist(db, "Sessa", AsyncMock())
+
+        assert len(items) == 1
+        resolved = discogs_titles[0]
+        assert resolved.release_id == 210
+        assert items[0].title == "Estrela Acesa"
+
 
 # ---------------------------------------------------------------------------
 # search_library_with_fallback -- artist+song path (lines 260-265)
