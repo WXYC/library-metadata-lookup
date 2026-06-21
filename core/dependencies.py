@@ -18,6 +18,8 @@ from entity.sources import PgSource
 from library.db import LibraryDB
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from posthog import Posthog
 
 logger = logging.getLogger(__name__)
@@ -283,13 +285,35 @@ async def close_musicbrainz_pg() -> None:
     await _close_musicbrainz_pg_singleton()
 
 
-def get_posthog_client(settings: Settings = Depends(get_settings)) -> Posthog | None:
-    """Get PostHog client instance, gated on the ``ENABLE_TELEMETRY`` flag.
+def _make_posthog_client_dep(event_prefix: str) -> Callable[..., Posthog | None]:
+    """Build a PostHog-client FastAPI dependency bound to one caller's prefix.
 
-    The shared ``wxyc_fastapi`` singleton handles the missing-API-key warn-once
-    behavior; this wrapper short-circuits when telemetry is disabled entirely.
+    This dependency is injected by multiple endpoints, but the shared
+    ``wxyc_fastapi`` singleton keys its missing-API-key warn-once diagnostic by
+    ``event_prefix``. A single hardcoded prefix attributes every warning to one
+    caller and, because the warn-once set is keyed by prefix, suppresses the
+    warning for all other callers (LML#659). Binding the prefix per caller —
+    each as its own module-level callable with a stable identity, so FastAPI
+    ``dependency_overrides`` (keyed by callable identity) keep working — gives
+    every endpoint its own one-time missing-key warning under its own
+    ``caller=`` label.
+
+    Like the original wrapper, the returned dependency short-circuits to ``None``
+    when telemetry is disabled entirely, before touching the shared singleton.
     """
-    if not settings.enable_telemetry:
-        logger.debug("Telemetry disabled")
-        return None
-    return _shared_posthog_client(event_prefix="lookup")
+
+    def _dep(settings: Settings = Depends(get_settings)) -> Posthog | None:
+        if not settings.enable_telemetry:
+            logger.debug("Telemetry disabled")
+            return None
+        return _shared_posthog_client(event_prefix=event_prefix)
+
+    _dep.__name__ = f"get_posthog_client[{event_prefix}]"
+    return _dep
+
+
+# Per-caller PostHog dependencies. ``get_posthog_client`` keeps its name and
+# identity so the lookup routers and the many dependency-override tests that key
+# on it are undisturbed; streaming-check gets its own prefix (LML#659).
+get_posthog_client = _make_posthog_client_dep("lookup")
+get_streaming_posthog_client = _make_posthog_client_dep("streaming_check")
