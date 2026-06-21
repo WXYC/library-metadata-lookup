@@ -1,11 +1,12 @@
 """Tests for the streaming-check router endpoint."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from config.settings import get_settings
+from core.dependencies import get_posthog_client
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
@@ -14,6 +15,21 @@ from streaming.dependencies import (
 )
 from streaming.models import SourceMatch, StreamingCheckResponse, StreamingCheckSources
 from tests.unit.conftest import override_deps
+
+
+def _captured_events(mock_posthog):
+    """Event names PostHog.capture was called with (kwargs-style call sites)."""
+    return [call.kwargs.get("event") for call in mock_posthog.capture.call_args_list]
+
+
+def _completed_props(mock_posthog):
+    """Properties dict from the single ``streaming_check_completed`` summary event."""
+    for call in mock_posthog.capture.call_args_list:
+        if call.kwargs.get("event") == "streaming_check_completed":
+            return call.kwargs["properties"]
+    raise AssertionError(
+        f"no streaming_check_completed event emitted; saw {_captured_events(mock_posthog)}"
+    )
 
 
 @pytest.fixture
@@ -118,3 +134,227 @@ async def test_streaming_check_internal_error(app_client):
             )
 
     assert resp.status_code == 500
+
+
+# --- Telemetry (LML#639) -------------------------------------------------------
+#
+# /api/v1/streaming-check is on the synchronous flowsheet-add path (Backend-Service
+# and tubafrenzy call it on every add), so it must emit a per-request PostHog
+# summary event for observability — but a telemetry failure must never fail the
+# check (see test_telemetry_failure_does_not_fail_check).
+
+
+@pytest.fixture
+def telemetry_app_client(mock_settings):
+    """App with a mock PostHog client injected so emitted events are inspectable."""
+    from main import app
+
+    mock_posthog = Mock()
+    mock_posthog.capture = Mock()
+
+    with override_deps(
+        app,
+        {
+            get_settings: mock_settings,
+            get_spotify_client: None,
+            get_deezer_client: AsyncMock(),
+            get_apple_music_client: None,
+            get_bandcamp_client: None,
+            get_posthog_client: mock_posthog,
+        },
+    ):
+        yield app, mock_posthog
+
+
+async def _post_streaming_check(app, response):
+    with patch(
+        "streaming.router.check_streaming_availability",
+        new_callable=AsyncMock,
+        return_value=response,
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            return await client.post(
+                "/api/v1/streaming-check",
+                json={"artist": "Stereolab", "title": "Aluminum Tunes"},
+            )
+
+
+@pytest.mark.asyncio
+async def test_summary_event_emitted_on_success(telemetry_app_client):
+    """A successful check emits a streaming_check_completed summary event."""
+    app, mock_posthog = telemetry_app_client
+    response = StreamingCheckResponse(
+        on_streaming=True,
+        sources=StreamingCheckSources(
+            spotify=SourceMatch(url="https://open.spotify.com/album/abc", confidence=95.0),
+        ),
+    )
+
+    resp = await _post_streaming_check(app, response)
+
+    assert resp.status_code == 200
+    assert "streaming_check_completed" in _captured_events(mock_posthog)
+
+
+@pytest.mark.asyncio
+async def test_summary_event_carries_per_service_verdict(telemetry_app_client):
+    """The summary event derives on_streaming + per-service verdicts from the response.
+
+    Each service is classified matched / errored / absent from the response alone
+    (sources, errored_sources). A service can match while another errors (LML#376).
+    """
+    app, mock_posthog = telemetry_app_client
+    response = StreamingCheckResponse(
+        on_streaming=True,
+        sources=StreamingCheckSources(
+            spotify=SourceMatch(url="https://open.spotify.com/album/abc", confidence=95.0),
+        ),
+        errored_sources=["deezer"],
+    )
+
+    resp = await _post_streaming_check(app, response)
+
+    assert resp.status_code == 200
+    props = _completed_props(mock_posthog)
+    assert props["on_streaming"] is True
+    assert props["match_count"] == 1
+    assert props["errored_count"] == 1
+    assert props["errored_sources"] == ["deezer"]
+    assert props["verdict_spotify"] == "matched"
+    assert props["verdict_deezer"] == "errored"
+    assert props["verdict_apple_music"] == "absent"
+    assert props["verdict_bandcamp"] == "absent"
+
+
+@pytest.mark.asyncio
+async def test_summary_event_has_stable_zeroed_cache_and_api_calls(telemetry_app_client):
+    """cache + api_calls are emitted with a stable shape, zeroed until LML#641.
+
+    The streaming-check path is application-cache-free and the clients record no
+    API calls yet, so these fields carry the *shape* (base cache keys; one key
+    per service) at value 0 — asserted here so #641 has a contract to fill.
+    """
+    app, mock_posthog = telemetry_app_client
+    response = StreamingCheckResponse(on_streaming=False, sources=StreamingCheckSources())
+
+    resp = await _post_streaming_check(app, response)
+
+    assert resp.status_code == 200
+    props = _completed_props(mock_posthog)
+
+    assert props["api_calls"] == {
+        "spotify": 0,
+        "deezer": 0,
+        "apple_music": 0,
+        "bandcamp": 0,
+    }
+    # Base cache-stats keys present and zeroed (shape stability, not values).
+    cache = props["cache"]
+    assert set(cache) == {
+        "memory_hits",
+        "pg_hits",
+        "pg_misses",
+        "api_calls",
+        "pg_time_ms",
+        "api_time_ms",
+    }
+    assert all(value == 0 for value in cache.values())
+    # Real per-request timing is present.
+    assert "availability_ms" in props["steps"]
+    assert props["total_duration_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_telemetry_failure_does_not_fail_check(telemetry_app_client):
+    """A PostHog emit failure is swallowed — the check still returns its result.
+
+    /streaming-check is on the synchronous flowsheet-add path; a telemetry hiccup
+    becoming a 500 would fail a DJ's flowsheet write. The emit must be wrapped in
+    its own swallow, NOT the handler's 500 try (LML#639).
+    """
+    app, mock_posthog = telemetry_app_client
+    mock_posthog.capture.side_effect = RuntimeError("posthog down")
+    response = StreamingCheckResponse(
+        on_streaming=True,
+        sources=StreamingCheckSources(
+            spotify=SourceMatch(url="https://open.spotify.com/album/abc", confidence=95.0),
+        ),
+    )
+
+    resp = await _post_streaming_check(app, response)
+
+    assert resp.status_code == 200
+    assert resp.json()["on_streaming"] is True
+
+
+@pytest.mark.asyncio
+async def test_failure_path_emits_error_summary(telemetry_app_client):
+    """A total failure (500 path) still emits a streaming_check_completed event.
+
+    The orchestrator absorbs per-service failures into errored_sources (a 200);
+    a raise out of check_streaming_availability is a total failure that 500s. We
+    must report it too (LML#639) — outcome=error, error_type set, per-service
+    verdicts 'unknown' since no result was produced.
+    """
+    app, mock_posthog = telemetry_app_client
+
+    with patch(
+        "streaming.router.check_streaming_availability",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("upstream exploded"),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/streaming-check",
+                json={"artist": "Stereolab", "title": "Aluminum Tunes"},
+            )
+
+    assert resp.status_code == 500
+    props = _completed_props(mock_posthog)
+    assert props["outcome"] == "error"
+    assert props["error_type"] == "RuntimeError"
+    assert props["on_streaming"] is None
+    assert props["verdict_spotify"] == "unknown"
+    assert props["verdict_bandcamp"] == "unknown"
+    # Timing is still captured even though the step raised.
+    assert "availability_ms" in props["steps"]
+
+
+@pytest.mark.asyncio
+async def test_telemetry_failure_on_error_path_preserves_500(telemetry_app_client):
+    """A telemetry failure on the 500 path must not mask the real error.
+
+    The failure-path emit is swallowed, so the handler still raises its own
+    HTTPException(500, "Streaming check failed") rather than leaking the PostHog
+    exception as a generic 500 (LML#639).
+    """
+    app, mock_posthog = telemetry_app_client
+    mock_posthog.capture.side_effect = RuntimeError("posthog down")
+
+    with patch(
+        "streaming.router.check_streaming_availability",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("upstream exploded"),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/streaming-check",
+                json={"artist": "Stereolab", "title": "Aluminum Tunes"},
+            )
+
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == "Streaming check failed"
+
+
+@pytest.mark.asyncio
+async def test_success_summary_marks_outcome(telemetry_app_client):
+    """The success event shares the failure event's shape: outcome + error_type."""
+    app, mock_posthog = telemetry_app_client
+    response = StreamingCheckResponse(on_streaming=False, sources=StreamingCheckSources())
+
+    resp = await _post_streaming_check(app, response)
+
+    assert resp.status_code == 200
+    props = _completed_props(mock_posthog)
+    assert props["outcome"] == "success"
+    assert props["error_type"] is None

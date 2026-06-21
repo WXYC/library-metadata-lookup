@@ -46,7 +46,7 @@ Strategies never mutate `SearchState`; they return an `Outcome` and the runner a
 - `discogs/markup_parser.py` -- Discogs markup parser: tokenize/resolve `[a=Name]`, `[a12345]`, `[b]...[/b]`, etc. into structured `ResolvedToken` models. Includes `EntityResolver` protocol and `DiscogsServiceResolver` adapter for async ID resolution. Translated from iOS `DiscogsMarkupParser.swift`.
 - `discogs/matching.py` -- Discogs-specific normalization (strip_discogs_suffix, normalize_for_track_comparison, normalize_artist_for_validation)
 - `core/dependencies.py` -- FastAPI DI for LibraryDB + DiscogsService
-- `streaming/router.py` -- `POST /streaming-check` endpoint for single-release streaming availability
+- `streaming/router.py` -- `POST /streaming-check` endpoint for single-release streaming availability; emits a best-effort `streaming_check_completed` PostHog summary event on both success and the 500 failure path (timing + `outcome`/`error_type` + per-service verdict; `cache`/`api_calls` stable-but-zeroed pending LML#641). The emit is in its own swallow so telemetry can never fail the check nor mask a 500 (synchronous flowsheet-add path)
 - `streaming/orchestrator.py` -- Concurrent streaming checks across Spotify, Deezer, Apple Music, Bandcamp
 - `streaming/models.py` -- Request/response Pydantic models (`StreamingCheckRequest`, `StreamingCheckResponse`)
 - `streaming/dependencies.py` -- FastAPI DI for streaming service clients (SpotifyClient, DeezerClient, etc.)
