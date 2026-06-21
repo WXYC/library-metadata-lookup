@@ -343,17 +343,31 @@ class ResultsDB:
         cursor = await self._db.execute(query)
         return list(await cursor.fetchall())
 
-    async def get_pending_bandcamp_lookup(self, limit: int | None = None) -> list[aiosqlite.Row]:
-        """Get albums with a slug but no album-level bandcamp_url."""
+    async def get_pending_bandcamp_lookup(
+        self, limit: int | None = None, slug: str | None = None
+    ) -> list[aiosqlite.Row]:
+        """Get albums with a slug but no album-level bandcamp_url.
+
+        Args:
+            limit: Maximum number of rows to return.
+            slug: If provided, restrict to albums with this exact
+                ``bandcamp_slug``. The concurrent consumer uses this to process
+                only a newly discovered slug instead of re-scanning the whole
+                pending set on every queue event (#125).
+        """
         assert self._db is not None
         query = (
             "SELECT * FROM albums "
             "WHERE bandcamp_slug IS NOT NULL AND bandcamp_slug != '' "
             "AND bandcamp_url IS NULL AND is_compilation = 0"
         )
+        params: list = []
+        if slug is not None:
+            query += " AND bandcamp_slug = ?"
+            params.append(slug)
         if limit is not None:
             query += f" LIMIT {limit}"
-        cursor = await self._db.execute(query)
+        cursor = await self._db.execute(query, params)
         return list(await cursor.fetchall())
 
     async def get_all_results(self) -> list[aiosqlite.Row]:

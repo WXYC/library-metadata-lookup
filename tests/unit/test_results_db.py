@@ -386,3 +386,26 @@ class TestGetPendingBandcampLookup:
             await db.update_bandcamp_slug(r["id"], "someslug")
         pending = await db.get_pending_bandcamp_lookup(limit=1)
         assert len(pending) == 1
+
+    @pytest.mark.asyncio
+    async def test_slug_filter_restricts_to_one_slug(self, db):
+        await db.insert_albums(
+            [
+                _make_album(),
+                _make_album(
+                    normalized_artist="autechre",
+                    normalized_title="confield",
+                    display_artist="Autechre",
+                    display_title="Confield",
+                    library_ids=[3],
+                    formats=["cd"],
+                ),
+            ]
+        )
+        all_rows = await db.get_pending("spotify", limit=10)
+        for r in all_rows:
+            await db.update_bandcamp_slug(r["id"], r["display_artist"].lower())
+
+        pending = await db.get_pending_bandcamp_lookup(slug="autechre")
+        assert len(pending) == 1
+        assert pending[0]["bandcamp_slug"] == "autechre"
