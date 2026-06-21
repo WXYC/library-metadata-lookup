@@ -4,7 +4,9 @@ Fires when the parser produced a song but no artist — typically because the
 parser misread an artist as a song title (e.g. "Laid Back" parsed as song
 instead of artist). The execute func may also cross-reference Discogs for
 releases by the candidate name and intersect with the library. Its tuple
-second element is unused.
+second element carries the row-less ``discogs_titles`` seam (LML#631) when a
+non-library artist resolved on Discogs (``{0: ResolvedRelease}``), and is
+``None`` on the library-backed paths.
 
 Strictly upstream of :class:`lookup.strategies.song_as_track.SongAsTrack` —
 the parser-misread-artist case gets first crack at song-only queries; the
@@ -46,5 +48,7 @@ class SongAsArtist:
         return no_results_and_song_but_no_artist(parsed, state, raw_message)
 
     async def attempt(self, parsed: ParsedRequest, state: SearchState, raw_message: str) -> Outcome:
-        items, _meta = await self.execute(self.db, parsed.song)
-        return Outcome.found(items) if items else Outcome.empty()
+        items, discogs_titles = await self.execute(self.db, parsed.song)
+        if not items:
+            return Outcome.empty()
+        return Outcome.found(items, discogs_titles=discogs_titles or None)

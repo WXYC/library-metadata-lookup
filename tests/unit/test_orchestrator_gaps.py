@@ -107,7 +107,11 @@ class TestSearchSongAsArtist:
         with patch(
             "lookup.orchestrator.lookup_releases_by_artist",
             new_callable=AsyncMock,
-            return_value=[("Stereolab", "Emperor Tomato Ketchup")],
+            return_value=[
+                make_discogs_result(
+                    release_id=2, artist="Stereolab", album="Emperor Tomato Ketchup"
+                )
+            ],
         ):
             results, _ = await search_song_as_artist(db, "Stereolab", discogs)
 
@@ -142,7 +146,9 @@ class TestSearchSongAsArtist:
         with patch(
             "lookup.orchestrator.lookup_releases_by_artist",
             new_callable=AsyncMock,
-            return_value=[("SomeArtist", "Indie Comp 2020")],
+            return_value=[
+                make_discogs_result(release_id=3, artist="SomeArtist", album="Indie Comp 2020")
+            ],
         ):
             results, _ = await search_song_as_artist(db, "SomeArtist")
 
@@ -159,11 +165,174 @@ class TestSearchSongAsArtist:
         with patch(
             "lookup.orchestrator.lookup_releases_by_artist",
             new_callable=AsyncMock,
-            return_value=[("Artist", ""), ("Artist", None)],
+            return_value=[
+                make_discogs_result(release_id=10, artist="Artist", album=""),
+                make_discogs_result(release_id=11, artist="Artist", album=None),
+            ],
         ):
             results, _ = await search_song_as_artist(db, "Artist")
 
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# search_song_as_artist -- row-less carry-through (LML#631)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def enable_nonlibrary_release(monkeypatch):
+    """Turn on LML_RESOLVE_NONLIBRARY_RELEASE.
+
+    SONG_AS_ARTIST reuses the #628 carry-through flag: the binding side
+    (``fetch_artwork_for_items``) already binds any ``id=0`` item under this
+    flag, so the rom-path row-less result rides the same switch.
+    """
+    monkeypatch.setenv("LML_RESOLVE_NONLIBRARY_RELEASE", "true")
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+class TestSearchSongAsArtistRowless:
+    """LML#631 — a listener-requested artist that resolves on Discogs but has no
+    ``library.db`` row surfaces row-less (``LibraryItem(id=0)`` + a real
+    ``ResolvedRelease`` on the ``discogs_titles`` seam), so request-o-matic can
+    post the Discogs context to Slack. Gated on the typed token normalizing-equal
+    to the resolved Discogs artist name, behind ``LML_RESOLVE_NONLIBRARY_RELEASE``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_emits_rowless_when_token_matches_discogs_artist(self, enable_nonlibrary_release):
+        """Flag on + no library row + Discogs returns a release credited to the
+        typed artist → emit ``LibraryItem(id=0)`` + ``{0: ResolvedRelease}``."""
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        # Direct artist search and every album cross-reference miss the library.
+        db.search = AsyncMock(return_value=[])
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[
+                make_discogs_result(
+                    release_id=555,
+                    artist="Sessa",
+                    album="Pequena Vertigem de Amor",
+                )
+            ],
+        ):
+            items, discogs_titles = await search_song_as_artist(db, "Sessa", AsyncMock())
+
+        assert len(items) == 1
+        assert items[0].id == 0
+        assert items[0].artist == "Sessa"
+        assert items[0].title == "Pequena Vertigem de Amor"
+        assert discogs_titles is not None
+        resolved = discogs_titles[0]
+        assert resolved.release_id == 555
+        assert resolved.release_url == "https://discogs.com/release/555"
+
+    @pytest.mark.asyncio
+    async def test_no_rowless_when_token_not_normalize_equal(self, enable_nonlibrary_release):
+        """A coincidental token→artist-name hit that is NOT normalize-equal does
+        not surface a release — the confidence gate floor."""
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[])
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[
+                make_discogs_result(release_id=42, artist="Stereolab", album="Dots and Loops")
+            ],
+        ):
+            items, discogs_titles = await search_song_as_artist(db, "Sterolab Typo", AsyncMock())
+
+        assert items == []
+        assert discogs_titles is None
+
+    @pytest.mark.asyncio
+    async def test_no_rowless_when_flag_off(self, monkeypatch):
+        """Flag off → no row-less identity, even when Discogs cleanly resolves
+        the artist (gated rollout)."""
+        monkeypatch.delenv("LML_RESOLVE_NONLIBRARY_RELEASE", raising=False)
+        from config.settings import get_settings
+
+        get_settings.cache_clear()
+
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[])
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[make_discogs_result(release_id=555, artist="Sessa", album="Grandeza")],
+        ):
+            items, discogs_titles = await search_song_as_artist(db, "Sessa", AsyncMock())
+
+        get_settings.cache_clear()
+        assert items == []
+        assert discogs_titles is None
+
+    @pytest.mark.asyncio
+    async def test_library_backed_unchanged_with_flag_on(self, enable_nonlibrary_release):
+        """When the Discogs cross-reference hits a real library row, that row is
+        returned (no row-less), even with the flag on — library-backed
+        SONG_AS_ARTIST behavior is unchanged."""
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        lib_item = _item(id=7, artist="Stereolab", title="Dots and Loops")
+        # Direct artist search misses; album cross-reference hits the library row.
+        db.search = AsyncMock(side_effect=[[], [lib_item]])
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[
+                make_discogs_result(release_id=99, artist="Stereolab", album="Dots and Loops")
+            ],
+        ):
+            items, discogs_titles = await search_song_as_artist(db, "Stereolab", AsyncMock())
+
+        assert [i.id for i in items] == [7]
+        assert discogs_titles is None
+
+    @pytest.mark.asyncio
+    async def test_selects_own_release_excluding_va_comp(self, enable_nonlibrary_release):
+        """Selection rule: the V/A comp (credited 'Various') is gated out even
+        with the highest confidence; among the artist's own releases the
+        higher-confidence one wins."""
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[])
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[
+                make_discogs_result(
+                    release_id=300, artist="Various", album="Some Comp", confidence=0.99
+                ),
+                make_discogs_result(
+                    release_id=210, artist="Sessa", album="Grandeza", confidence=0.2
+                ),
+                make_discogs_result(
+                    release_id=220, artist="Sessa", album="Estrela Acesa", confidence=0.8
+                ),
+            ],
+        ):
+            items, discogs_titles = await search_song_as_artist(db, "Sessa", AsyncMock())
+
+        assert len(items) == 1
+        assert items[0].id == 0
+        resolved = discogs_titles[0]
+        assert resolved.release_id == 220
+        assert items[0].title == "Estrela Acesa"
 
 
 # ---------------------------------------------------------------------------
