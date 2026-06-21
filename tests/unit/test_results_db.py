@@ -200,6 +200,18 @@ class TestGetStats:
         stats = await db.get_stats()
         assert stats["total"] == 0
 
+    @pytest.mark.asyncio
+    async def test_stats_includes_bandcamp(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.update_bandcamp_slug(album_id, "stereolab")
+        await db.update_bandcamp_url(
+            album_id, "https://stereolab.bandcamp.com/album/aluminum-tunes"
+        )
+        stats = await db.get_stats()
+        assert stats["bandcamp"]["found"] == 1
+
 
 class TestBandcampSlugMigration:
     @pytest.mark.asyncio
@@ -552,3 +564,36 @@ class TestBandcampStatusMigrationOnExistingDb:
             assert rows[0]["bandcamp_status"] == "found"
         finally:
             await db.close()
+
+    @pytest.mark.asyncio
+    async def test_backfill_runs_once_and_preserves_manual_reset(self, tmp_path):
+        # The pending->found backfill must run only when the column is first
+        # added, so a later connect never re-stamps a row a user deliberately
+        # reset to 'pending' (URL kept) to force Phase-2 re-matching. Removing
+        # the bandcamp_status_added guard would clobber that reset -- this test
+        # is the regression fence.
+        path = str(tmp_path / "reset.db")
+
+        db = ResultsDB(path)
+        await db.connect()
+        try:
+            await db.insert_albums([_make_album()])
+            rows = await db.get_pending("spotify", limit=10)
+            album_id = rows[0]["id"]
+            await db.update_bandcamp_url(
+                album_id, "https://stereolab.bandcamp.com/album/aluminum-tunes"
+            )
+            await db._db.execute(
+                "UPDATE albums SET bandcamp_status = 'pending' WHERE id = ?", (album_id,)
+            )
+            await db._db.commit()
+        finally:
+            await db.close()
+
+        db2 = ResultsDB(path)
+        await db2.connect()
+        try:
+            rows = await db2.get_all_results()
+            assert rows[0]["bandcamp_status"] == "pending"
+        finally:
+            await db2.close()

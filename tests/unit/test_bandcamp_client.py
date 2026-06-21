@@ -229,7 +229,9 @@ class TestFetchArtistCatalog:
         assert albums[0]["title"] == "confield"
 
     @pytest.mark.asyncio
-    async def test_returns_empty_on_404(self):
+    async def test_returns_none_on_http_error(self):
+        # A non-200 is a fetch failure, distinct from a 200 page with no albums:
+        # callers must not treat it as "definitively no catalog" (#661).
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.request = AsyncMock(
@@ -238,16 +240,30 @@ class TestFetchArtistCatalog:
         client._http = mock_http
 
         albums = await client.fetch_artist_catalog("nonexistent99")
-        assert albums == []
+        assert albums is None
 
     @pytest.mark.asyncio
-    async def test_returns_empty_on_network_error(self):
+    async def test_returns_none_on_network_error(self):
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.request = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
         client._http = mock_http
 
         albums = await client.fetch_artist_catalog("broken")
+        assert albums is None
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_on_successful_empty_catalog(self):
+        # A successful 200 whose page has no album links is a genuine empty
+        # catalog ([]), not a failure (None) -- the two must stay distinct.
+        client = BandcampClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(
+            return_value=_html_response("<html><body>no releases here</body></html>")
+        )
+        client._http = mock_http
+
+        albums = await client.fetch_artist_catalog("emptyband")
         assert albums == []
 
     @pytest.mark.asyncio

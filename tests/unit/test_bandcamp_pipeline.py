@@ -353,6 +353,7 @@ class TestPhaseLookup:
         await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
 
         mock_client = AsyncMock()
+        # [] is a successful fetch of a genuinely empty catalog.
         mock_client.fetch_artist_catalog = AsyncMock(return_value=[])
 
         await phase_lookup(mock_client, db)
@@ -360,6 +361,28 @@ class TestPhaseLookup:
         all_rows = await db.get_all_results()
         assert all_rows[0]["bandcamp_status"] == "not_found"
         assert len(await db.get_pending_bandcamp_lookup()) == 0
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_leaves_pending(self, db):
+        from scripts.bandcamp_pipeline import phase_lookup
+
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
+
+        mock_client = AsyncMock()
+        # None signals a transient fetch failure (timeout / 5xx / rate-limit
+        # exhausted), NOT a definitively-empty catalog. Marking it not_found
+        # would permanently drop the slug on a network blip during the drain.
+        mock_client.fetch_artist_catalog = AsyncMock(return_value=None)
+
+        await phase_lookup(mock_client, db)
+
+        all_rows = await db.get_all_results()
+        assert all_rows[0]["bandcamp_status"] == "pending"
+        assert all_rows[0]["bandcamp_url"] is None
+        # Still pending -> a re-run will retry it.
+        assert len(await db.get_pending_bandcamp_lookup()) == 1
 
     @pytest.mark.asyncio
     async def test_rerun_skips_attempted_no_match(self, db):
