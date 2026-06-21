@@ -1202,7 +1202,12 @@ async def _match_track_releases_to_library(
     ``search_releases_by_track`` probe + the per-track ``validate_track_on_release``
     credit check. The #632 cache is keyed on the typed anchor artist (the kernel's
     ``artist`` for SWAPPED; the surfaced release's own credit for SONG_AS_TRACK,
-    which has no typed artist).
+    which has no typed artist). **LML#649:** when that SONG_AS_TRACK fallback
+    credit is a compilation marker ("Various" for a V/A comp), it is not a usable
+    per-track artist — the carry-through is suppressed entirely rather than
+    resolved/validated/cached under it (which would validate only against the
+    release-level "Various" credit and collide same-titled tracks across comps on
+    the ``("various", <title>, True)`` cache key).
 
     Returns:
         Tuple of (library_items, matched_via_by_id, discogs_titles).
@@ -1332,6 +1337,24 @@ async def _match_track_releases_to_library(
         anchor_artist = artist or next(
             (r.artist for r in raw_releases if r.artist and r.artist.strip()), ""
         )
+        # LML#649: a compilation-marker anchor ("Various") is not a usable
+        # per-track artist. SONG_AS_TRACK on a V/A comp falls back here to the
+        # release-level credit, which is "Various" for the exact case the
+        # carry-through targets. Resolving under it would (a) validate only
+        # against the release-level "Various" credit — blind to the track's
+        # actual performer (validate_track_on_release's release-artist fallback)
+        # — and (b) key the #632 cache on ``("various", <title>, True)``,
+        # collapsing same-titled tracks across different comps onto one row (the
+        # second add could surface the first comp's release). Suppress the
+        # carry-through rather than surface an imprecise, collision-prone item;
+        # the precise fix plumbs the per-track credit as the anchor. SWAPPED and
+        # TRACK_ON_COMPILATION carry a typed artist and never reach this.
+        if is_compilation_artist(anchor_artist.strip()):
+            logger.info(
+                f"{label}: suppressing row-less carry-through — anchor artist "
+                f"'{anchor_artist}' is a compilation marker, not a per-track credit"
+            )
+            return matched_items, matched_via_by_id, {}
         resolved = await _resolve_nonlibrary_release(
             discogs_service,
             pg,
