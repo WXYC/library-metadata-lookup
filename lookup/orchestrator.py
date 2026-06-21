@@ -1255,6 +1255,44 @@ async def _rehydrate_resolved_release(
     )
 
 
+# How many candidate releases the SONG_AS_TRACK carry-through fetches while
+# recovering a per-track credit before giving up and suppressing (LML#660). The
+# credit is a track-level property, so the first release that carries it answers
+# the question; the cap only bounds the worst case (a popular track whose comps
+# all credit at release level). Mirrors the resolve path's ``max_validations=5``.
+_MAX_CREDIT_RECOVERY_FETCHES = 5
+
+
+async def _recover_track_credit(
+    discogs_service: DiscogsService,
+    raw_releases: list[ReleaseInfo],
+    track: str,
+) -> str | None:
+    """Recover ``track``'s actual per-track credit from the surfaced releases (LML#660).
+
+    The SONG_AS_TRACK carry-through carries no typed artist, so it can't anchor
+    the row-less resolve on a query artist; falling back to the release-level
+    credit yields "Various" for a V/A comp — the LML#649 hazard this replaces.
+    This walks the releases the track probe already surfaced (compilations first,
+    since that is where Discogs files per-track credits), fetching each — bounded
+    by :data:`_MAX_CREDIT_RECOVERY_FETCHES` — until one exposes the track's own
+    per-track ``artists``. Returns that credit to anchor the resolve and the #632
+    cache key, or ``None`` when none is recoverable (the caller then suppresses,
+    preserving the LML#649 fallback).
+    """
+    # Compilations first: a V/A comp is where the per-track credit lives; an
+    # own-artist release usually carries only the release-level credit. Stable
+    # within each group, so the ordering is deterministic.
+    ordered = sorted(raw_releases, key=lambda r: not r.is_compilation)
+    for release in ordered[:_MAX_CREDIT_RECOVERY_FETCHES]:
+        if not release.release_id:
+            continue
+        credit = await discogs_service.get_track_credit_on_release(release.release_id, track)
+        if credit:
+            return credit
+    return None
+
+
 async def _match_track_releases_to_library(
     db: LibraryDB,
     discogs_service: DiscogsService | None,
@@ -1437,24 +1475,31 @@ async def _match_track_releases_to_library(
         anchor_artist = artist or next(
             (r.artist for r in raw_releases if r.artist and r.artist.strip()), ""
         )
-        # LML#649: a compilation-marker anchor ("Various") is not a usable
-        # per-track artist. SONG_AS_TRACK on a V/A comp falls back here to the
-        # release-level credit, which is "Various" for the exact case the
-        # carry-through targets. Resolving under it would (a) validate only
-        # against the release-level "Various" credit — blind to the track's
-        # actual performer (validate_track_on_release's release-artist fallback)
-        # — and (b) key the #632 cache on ``("various", <title>, True)``,
-        # collapsing same-titled tracks across different comps onto one row (the
-        # second add could surface the first comp's release). Suppress the
-        # carry-through rather than surface an imprecise, collision-prone item;
-        # the precise fix plumbs the per-track credit as the anchor. SWAPPED and
-        # TRACK_ON_COMPILATION carry a typed artist and never reach this.
-        if is_compilation_artist(anchor_artist.strip()):
+        # LML#660: a compilation-marker anchor ("Various") — or no anchor at all —
+        # is not a usable per-track artist. SONG_AS_TRACK on a V/A comp lands here
+        # with the release-level "Various" credit, the exact case the carry-through
+        # targets. Anchoring on it would (a) validate only against that release-
+        # level credit, blind to the track's actual performer, and (b) key the
+        # #632 cache on ``("various", <title>, True)``, collapsing same-titled
+        # tracks across different comps onto one row. So recover the track's
+        # *actual per-track credit* from the release tracklist (LML#660) and anchor
+        # on that instead. When none is recoverable, suppress the carry-through
+        # rather than surface an imprecise, collision-prone item — the LML#649
+        # fallback, preserved. SWAPPED and TRACK_ON_COMPILATION carry a typed
+        # artist and never reach this recovery.
+        if not anchor_artist.strip() or is_compilation_artist(anchor_artist.strip()):
+            recovered = await _recover_track_credit(discogs_service, raw_releases, track)
+            if not recovered:
+                logger.info(
+                    f"{label}: suppressing row-less carry-through — no per-track "
+                    f"credit recoverable for '{track}' (anchor would be '{anchor_artist}')"
+                )
+                return matched_items, matched_via_by_id, {}
             logger.info(
-                f"{label}: suppressing row-less carry-through — anchor artist "
-                f"'{anchor_artist}' is a compilation marker, not a per-track credit"
+                f"{label}: anchoring row-less carry-through on recovered per-track "
+                f"credit '{recovered}' (release-level anchor was '{anchor_artist}')"
             )
-            return matched_items, matched_via_by_id, {}
+            anchor_artist = recovered
         resolved = await _resolve_nonlibrary_release(
             discogs_service,
             pg,

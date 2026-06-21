@@ -1404,6 +1404,35 @@ class DiscogsService:
         # ``T | None`` here is always bool in practice.
         return bool(validated)
 
+    async def get_track_credit_on_release(self, release_id: int, track: str) -> str | None:
+        """Recover the per-track credit for ``track`` on a release (LML#660).
+
+        Where :meth:`validate_track_on_release` answers "is *this* artist on the
+        track?", this answers "*which* artist is credited for this track?" — the
+        SONG_AS_TRACK carry-through has no typed artist to validate against, so it
+        recovers the track's actual credited performer from the release tracklist
+        to anchor the row-less resolve (and the #632 cache key) on a real artist
+        instead of the release-level "Various" marker. This supersedes the LML#649
+        stopgap that suppressed the carry-through under that "Various" anchor.
+
+        Read-only: rides ``get_release`` (its own read-through cache) and never
+        writes. Returns the joined per-track credit, or ``None`` when the release
+        can't be fetched, no track title matches, or the matched track carries
+        only a release-level credit (empty ``artists``).
+
+        Args:
+            release_id: Discogs release ID to fetch.
+            track: Track title to locate in the tracklist.
+
+        Returns:
+            The matched track's per-track credit (``artists`` joined), or ``None``.
+        """
+        release = await self.get_release(release_id)
+        if release is None:
+            return None
+        track_lower = normalize_for_track_comparison(track)
+        return _scan_tracklist_for_credit(release, track_lower)
+
 
 def _scan_tracklist_for_match(
     release: ReleaseMetadataResponse,
@@ -1466,3 +1495,31 @@ def _scan_tracklist_for_match(
 
     logger.info(f"Track '{track}' by '{artist}' NOT found on release {release_id}")
     return False
+
+
+def _scan_tracklist_for_credit(release: ReleaseMetadataResponse, track_lower: str) -> str | None:
+    """Return the per-track credit for the title-matched track, or ``None`` (LML#660).
+
+    The credit-recovery counterpart to :func:`_scan_tracklist_for_match`: same
+    bidirectional-substring title rule, but artist-blind — it surfaces *which*
+    artist the track credits rather than checking a supplied one. The first
+    title-matched track that carries a per-track ``artists`` list wins; its
+    credit is joined with a space, matching the joined form
+    ``_scan_tracklist_for_match``'s LML#210 fuzzy fallback validates against, so
+    the recovered anchor re-validates consistently on the resolve path. A
+    title-matched track with no per-track ``artists`` (release-level-only credit)
+    is skipped; when none carries one, ``None`` is returned and the caller falls
+    back to LML#649 suppression rather than anchor on the release-level "Various".
+
+    ``track_lower`` is pre-normalized by the caller (single
+    ``normalize_for_track_comparison`` call), mirroring ``_scan_tracklist_for_match``.
+    """
+    for item in release.tracklist or []:
+        item_title = normalize_for_track_comparison(item.title)
+        if track_lower not in item_title and item_title not in track_lower:
+            continue
+        if item.artists:
+            joined = " ".join(a.strip() for a in item.artists if a and a.strip())
+            if joined:
+                return joined
+    return None
