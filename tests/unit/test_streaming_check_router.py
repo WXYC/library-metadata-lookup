@@ -259,9 +259,10 @@ async def test_summary_event_has_stable_zeroed_cache_and_api_calls(telemetry_app
         "api_time_ms",
     }
     assert all(value == 0 for value in cache.values())
-    # Real per-request timing is present.
+    # Real per-request timing is present (assert the key exists and is numeric —
+    # `>= 0` alone is tautological for a perf_counter delta).
     assert "availability_ms" in props["steps"]
-    assert props["total_duration_ms"] >= 0
+    assert isinstance(props["total_duration_ms"], (int, float))
 
 
 @pytest.mark.asyncio
@@ -285,6 +286,10 @@ async def test_telemetry_failure_does_not_fail_check(telemetry_app_client):
 
     assert resp.status_code == 200
     assert resp.json()["on_streaming"] is True
+    # Guard against a vacuous pass: the swallow is only exercised if the emit was
+    # actually attempted. If a regression short-circuited telemetry, capture would
+    # never fire and this test would pass without testing the swallow at all.
+    mock_posthog.capture.assert_called()
 
 
 @pytest.mark.asyncio
@@ -358,3 +363,53 @@ async def test_success_summary_marks_outcome(telemetry_app_client):
     props = _completed_props(mock_posthog)
     assert props["outcome"] == "success"
     assert props["error_type"] is None
+
+
+@pytest.mark.asyncio
+async def test_cache_stats_bracket_is_live(telemetry_app_client):
+    """init_cache_stats() actually wires the per-request cache-stats dict.
+
+    The zeroed-shape test above passes even if the bracket is removed (the
+    telemetry helper falls back to a zeroed default), so it can't prove the
+    bracket is live. This records into cache_stats *during* the request — the way
+    LML#641's instrumented clients will — and asserts the value surfaces in the
+    emitted event. Removing init_cache_stats() makes the recorder a silent no-op,
+    so this fails: cache.memory_hits would be 0, not 1.
+    """
+    from wxyc_fastapi.observability.cache_stats import get_cache_stats_recorder
+
+    app, mock_posthog = telemetry_app_client
+    response = StreamingCheckResponse(on_streaming=False, sources=StreamingCheckSources())
+
+    async def _record_then_return(*args, **kwargs):
+        get_cache_stats_recorder().record_memory_cache_hit()
+        return response
+
+    with patch(
+        "streaming.router.check_streaming_availability",
+        side_effect=_record_then_return,
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/streaming-check",
+                json={"artist": "Stereolab", "title": "Aluminum Tunes"},
+            )
+
+    assert resp.status_code == 200
+    assert _completed_props(mock_posthog)["cache"]["memory_hits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_per_step_event_emitted_alongside_summary(telemetry_app_client):
+    """The shared helper emits a per-step streaming_check_availability event too.
+
+    Documented alongside the summary; pinned here so a helper change that drops or
+    renames the per-step event is caught against the docs.
+    """
+    app, mock_posthog = telemetry_app_client
+    response = StreamingCheckResponse(on_streaming=False, sources=StreamingCheckSources())
+
+    resp = await _post_streaming_check(app, response)
+
+    assert resp.status_code == 200
+    assert "streaming_check_availability" in _captured_events(mock_posthog)
