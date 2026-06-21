@@ -110,15 +110,27 @@ async def test_song_as_artist_surfaces_rowless_when_flag_on(library_db, enable_n
 
 
 @pytest.mark.asyncio
-async def test_song_as_artist_flag_off_no_rowless(library_db):
+async def test_song_as_artist_flag_off_no_rowless(library_db, monkeypatch):
+    # Clear the lru-cached Settings at entry (not just rely on the flag-on
+    # sibling's teardown) so a leaked flag=True cache can't make this exercise
+    # flag-on behavior under reordering / parallel runs.
+    monkeypatch.delenv("LML_RESOLVE_NONLIBRARY_RELEASE", raising=False)
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+
     svc = _base_mock()
     request = LookupRequest(song=SESSA_ARTIST, raw_message=SESSA_ARTIST)
 
     with _patch_artist_releases():
         response = await perform_lookup(request, library_db, svc, telemetry=make_lml_telemetry())
 
-    # Flag off: no row-less Discogs identity surfaces.
-    assert not any(
-        r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
-        for r in response.results
-    )
+    get_settings.cache_clear()
+
+    # Flag off: no row-less Discogs identity surfaces. The flag-on sibling
+    # produces exactly one id=0 result (bound artwork) from these same inputs;
+    # with the flag off the lookup falls through to the unresolved outcome, so
+    # assert the concrete empty result set — a bare ``not any(...)`` would pass
+    # vacuously on an empty list even if the gate were deleted or inverted.
+    assert response.results == []
+    assert response.search_type != "song_as_artist"
