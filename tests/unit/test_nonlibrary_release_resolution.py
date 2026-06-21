@@ -373,3 +373,32 @@ class TestRecoverTrackCredit:
 
         assert credit is None
         assert svc.get_track_credit_on_release.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_idless_releases_do_not_consume_fetch_budget(self, monkeypatch):
+        """A release with no usable ``release_id`` is unfetchable, so it must not
+        burn a slot of the fetch budget — the cap bounds *real* fetches. A creditful
+        release sitting behind id-less ones is still reached within the cap."""
+        from lookup import orchestrator
+        from lookup.orchestrator import _recover_track_credit
+
+        monkeypatch.setattr(orchestrator, "_MAX_CREDIT_RECOVERY_FETCHES", 2)
+        svc = AsyncMock()
+        svc.get_track_credit_on_release = AsyncMock(return_value=ARTIST)
+
+        idless = ReleaseInfo(
+            album="No Id Comp",
+            artist="Various",
+            release_id=0,
+            release_url="https://www.discogs.com/release/0",
+            is_compilation=True,
+        )
+        # Two id-less comps ahead of the one creditful release. With the cap at 2,
+        # counting the id-less releases against the budget would stop before the
+        # creditful release and miss the credit.
+        releases = [idless, idless, _release()]
+
+        credit = await _recover_track_credit(svc, releases, TRACK)
+
+        assert credit == ARTIST
+        svc.get_track_credit_on_release.assert_awaited_once_with(RELEASE_ID, TRACK)
