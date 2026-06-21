@@ -38,7 +38,7 @@ from discogs.models import (
     TrackReleasesResponse,
 )
 from lookup.models import LookupRequest
-from lookup.orchestrator import perform_lookup
+from lookup.orchestrator import ROWLESS_NO_ALBUM_CONFIDENCE, perform_lookup
 from tests.conftest import make_lml_telemetry
 
 # A real-looking Discogs release id + canonical URL for the non-library
@@ -375,6 +375,10 @@ async def test_song_as_track_surfaces_rowless_when_flag_on(library_db, enable_no
     assert item.artwork is not None
     assert item.artwork.release_id == SPINE_RELEASE_ID
     assert item.artwork.release_url == SPINE_RELEASE_URL
+    # A2 (LML#629): a song-only (no typed album) row-less result is soft. Pin it
+    # here so a future reversion of the no-album confidence is caught on the
+    # #628 SONG_AS_TRACK path, not only on the new #629 tests.
+    assert item.artwork.confidence == ROWLESS_NO_ALBUM_CONFIDENCE
     # Pin routing: SONG_AS_TRACK (song-only, no typed artist), not SWAPPED.
     assert response.search_type == "compilation"
 

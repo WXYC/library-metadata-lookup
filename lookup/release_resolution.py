@@ -46,6 +46,12 @@ class ResolvedRelease:
     release_url: str
     is_compilation: bool
     album_title: str
+    # Confidence the binding step stamps on the surfaced result. Defaults to the
+    # full 1.0 (a track-validated, album-ranked carry-through). The cached-track
+    # safety net (LML#629 A4) sets it soft because it picks by track only and
+    # never album-matches — so the soft value must ride the seam to the bind,
+    # which otherwise can't distinguish A4 from an album-ranked carry-through.
+    confidence: float = 1.0
 
 
 def merge_wave_b_compilations(
@@ -182,7 +188,9 @@ def prerank_candidates_for_validation(
     """
     album_query = (album or "").strip()
     if not album_query:
-        return sorted(candidates, key=lambda r: (r.is_compilation, r.release_id))
+        # ``ReleaseInfo.is_compilation`` is ``bool | None``; coerce so a ``None``
+        # never lands in the sort tuple (``None < False`` raises TypeError).
+        return sorted(candidates, key=lambda r: (bool(r.is_compilation), r.release_id))
     return sorted(
         candidates,
         key=lambda r: (-score_match(album_query, r.album), r.release_id),
