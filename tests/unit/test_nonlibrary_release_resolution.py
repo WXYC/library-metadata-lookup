@@ -301,3 +301,75 @@ async def test_album_title_wave_gated_on_album_presence(monkeypatch, album, expe
     bounded.assert_awaited_once()
     _args, kwargs = bounded.await_args
     assert kwargs.get("also_probe_album_title") == expected_probe
+
+
+# ---------------------------------------------------------------------------
+# _recover_track_credit (LML#660): the SONG_AS_TRACK per-track-credit anchor
+# ---------------------------------------------------------------------------
+
+
+def _non_comp_release(release_id: int) -> ReleaseInfo:
+    return ReleaseInfo(
+        album="Some Single",
+        artist="Various",
+        release_id=release_id,
+        release_url=f"https://www.discogs.com/release/{release_id}",
+        is_compilation=False,
+    )
+
+
+class TestRecoverTrackCredit:
+    @pytest.mark.asyncio
+    async def test_returns_first_recoverable_per_track_credit(self):
+        from lookup.orchestrator import _recover_track_credit
+
+        svc = AsyncMock()
+        svc.get_track_credit_on_release = AsyncMock(return_value=ARTIST)
+
+        credit = await _recover_track_credit(svc, [_release()], TRACK)
+
+        assert credit == ARTIST
+        svc.get_track_credit_on_release.assert_awaited_once_with(RELEASE_ID, TRACK)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_release_exposes_credit(self):
+        from lookup.orchestrator import _recover_track_credit
+
+        svc = AsyncMock()
+        svc.get_track_credit_on_release = AsyncMock(return_value=None)
+
+        credit = await _recover_track_credit(svc, [_release(), _non_comp_release(99)], TRACK)
+
+        assert credit is None
+
+    @pytest.mark.asyncio
+    async def test_scans_compilations_before_own_releases(self):
+        """The per-track credit lives on the V/A comp, so comps are fetched first
+        even when an own-artist release precedes them in the probe results."""
+        from lookup.orchestrator import _recover_track_credit
+
+        svc = AsyncMock()
+        svc.get_track_credit_on_release = AsyncMock(return_value=ARTIST)
+
+        # Own-release first in input order; the comp must still be scanned first.
+        credit = await _recover_track_credit(svc, [_non_comp_release(99), _release()], TRACK)
+
+        assert credit == ARTIST
+        svc.get_track_credit_on_release.assert_awaited_once_with(RELEASE_ID, TRACK)
+
+    @pytest.mark.asyncio
+    async def test_bounds_fetches_to_the_cap(self, monkeypatch):
+        """A popular track with many credit-less candidates must not fan out an
+        unbounded number of release fetches."""
+        from lookup import orchestrator
+        from lookup.orchestrator import _recover_track_credit
+
+        monkeypatch.setattr(orchestrator, "_MAX_CREDIT_RECOVERY_FETCHES", 3)
+        svc = AsyncMock()
+        svc.get_track_credit_on_release = AsyncMock(return_value=None)
+        releases = [_non_comp_release(i) for i in range(1, 11)]
+
+        credit = await _recover_track_credit(svc, releases, TRACK)
+
+        assert credit is None
+        assert svc.get_track_credit_on_release.await_count == 3

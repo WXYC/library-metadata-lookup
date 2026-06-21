@@ -30,6 +30,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from wxyc_etl.text import to_match_form
 
 from discogs.models import (
     DiscogsSearchResponse,
@@ -110,6 +111,10 @@ def _base_discogs_mock() -> AsyncMock:
     svc.validate_track_on_release = AsyncMock(return_value=True)
     svc.search_releases_by_album_title = AsyncMock(return_value=_empty_track_releases())
     svc.get_release = AsyncMock(return_value=_spine_release_metadata())
+    # LML#660: no per-track credit recoverable by default, so a SONG_AS_TRACK V/A
+    # carry-through suppresses (the preserved LML#649 fallback) unless a test
+    # opts into a recovered credit. Keeps unrelated tests on the safe default.
+    svc.get_track_credit_on_release = AsyncMock(return_value=None)
     return svc
 
 
@@ -400,29 +405,29 @@ async def test_song_as_track_flag_off_no_rowless(library_db):
 
 
 @pytest.mark.asyncio
-async def test_song_as_track_various_anchor_suppresses_rowless(
+async def test_song_as_track_no_recoverable_credit_suppresses_rowless(
     library_db, enable_nonlibrary_release
 ):
-    """LML#649: a song-only V/A-comp miss whose only artist signal is the
-    release-level "Various" credit must NOT surface row-less, even flag-on.
+    """LML#660 fallback (preserving LML#649): a song-only V/A-comp miss whose
+    track exposes NO per-track credit must NOT surface row-less, even flag-on.
 
-    The anchor falls back to the surfaced release's own credit, which is the
-    compilation marker "Various" for a real V/A comp (the case the carry-through
-    targets). That is not a usable per-track artist: resolving under it validates
-    only against the release-level "Various" credit (blind to the track's actual
-    performer) and would key the #632 cache on ``("various", <title>, True)``,
-    colliding same-titled tracks across different comps. Until the per-track
-    credit is plumbed through, suppress the carry-through rather than surface an
-    imprecise, collision-prone item.
+    The anchor falls back to the surfaced release's own credit — the compilation
+    marker "Various" for a real V/A comp — so the carry-through tries to recover
+    the track's actual per-track credit (LML#660). When the tracklist carries
+    only a release-level credit (``get_track_credit_on_release`` returns ``None``),
+    there is no usable per-track artist: anchoring on "Various" would validate
+    blind to the performer and key the #632 cache on ``("various", <title>, True)``,
+    colliding same-titled tracks across different comps. So suppress rather than
+    surface an imprecise, collision-prone item.
 
-    The sibling ``..._surfaces_rowless_when_flag_on`` overrides
-    ``artist=SPINE_ARTIST`` — a real release credit — and still surfaces; this
-    pins the realistic default-``Various`` case that override hid.
+    The sibling ``..._surfaces_via_per_track_credit`` recovers a real credit and
+    surfaces; this pins the no-credit case that must still suppress.
     """
     svc = _base_discogs_mock()
     svc.lookup_releases_by_artist = AsyncMock(return_value=[])
     # Default _spine_release() credits the comp to "Various" — the realistic V/A
-    # shape, not the artist=SPINE_ARTIST the masking test substitutes.
+    # shape — and the base mock's ``get_track_credit_on_release`` returns None
+    # (no per-track credit recoverable), so the carry-through must suppress.
     svc.search_releases_by_track = AsyncMock(return_value=_track_releases(_spine_release()))
 
     response = await _run_song_as_track(library_db, svc)
@@ -434,16 +439,17 @@ async def test_song_as_track_various_anchor_suppresses_rowless(
 
 
 @pytest.mark.asyncio
-async def test_song_as_track_various_anchor_never_writes_632_cache(
+async def test_song_as_track_no_credit_never_writes_632_cache(
     library_db, enable_nonlibrary_release
 ):
-    """LML#649 AC3: the song-only V/A path must never write the #632 cache under
-    a "Various" anchor — that ``("various", <title>, True)`` key is what collides
-    distinct same-titled tracks across different comps. Suppressing the
-    carry-through means no resolve, hence no cache write at all.
+    """LML#660 / LML#649 AC3: when no per-track credit is recoverable the song-only
+    V/A path must never write the #632 cache under a "Various" anchor — that
+    ``("various", <title>, True)`` key is what collides distinct same-titled tracks
+    across different comps. Suppressing the carry-through means no resolve, hence no
+    cache write at all.
 
-    Contrast ``test_track_on_compilation_threads_pg_and_writes_cache``, where a
-    *typed* artist anchor legitimately writes ``(SPINE_ARTIST, SPINE_TRACK)``.
+    Contrast ``..._writes_632_cache_under_per_track_credit``, where a recovered
+    per-track credit legitimately writes ``(<credit>, SPINE_TRACK)``.
     """
     svc = _base_discogs_mock()
     svc.lookup_releases_by_artist = AsyncMock(return_value=[])
@@ -455,6 +461,108 @@ async def test_song_as_track_various_anchor_never_writes_632_cache(
     # No row was written under any key — in particular nothing under "various".
     assert pg.execute_calls == 0
     assert pg.store == {}
+
+
+@pytest.mark.asyncio
+async def test_song_as_track_writes_632_cache_under_per_track_credit(
+    library_db, enable_nonlibrary_release
+):
+    """LML#660 AC2: the song-only V/A path keys the #632 cache on the recovered
+    per-track credit — never ``("various", <title>, True)``. That distinct-per-
+    performer key is what prevents same-titled tracks across comps from colliding.
+    """
+    svc = _base_discogs_mock()
+    svc.lookup_releases_by_artist = AsyncMock(return_value=[])
+    svc.search_releases_by_track = AsyncMock(return_value=_track_releases(_spine_release()))
+    svc.get_track_credit_on_release = AsyncMock(return_value=SPINE_ARTIST)
+    pg = _RecordingPg()
+
+    await _run_song_as_track(library_db, svc, pg=pg)
+
+    # Exactly one row, keyed on the normalized per-track credit — not "various".
+    assert pg.execute_calls == 1
+    keys = list(pg.store.keys())
+    assert len(keys) == 1
+    artist_key, _title_key, is_track = keys[0]
+    assert is_track is True
+    assert "various" not in artist_key
+    assert artist_key == to_match_form(SPINE_ARTIST)
+    assert pg.store[keys[0]] == SPINE_RELEASE_ID
+
+
+@pytest.mark.asyncio
+async def test_song_as_track_various_anchor_surfaces_via_per_track_credit(
+    library_db, enable_nonlibrary_release
+):
+    """LML#660: a song-only V/A-comp miss now surfaces row-less, anchored on the
+    track's *actual per-track credit* recovered from the release tracklist — not
+    the release-level "Various" marker that LML#649 suppressed.
+
+    The default ``_spine_release()`` credits the comp to "Various" (the realistic
+    V/A shape). The anchor would fall back to that marker, so the carry-through
+    recovers the per-track credit instead: ``get_track_credit_on_release`` returns
+    the real performer, which anchors the resolve, and the row-less item surfaces
+    with the correct Discogs identity and the per-track artist."""
+    svc = _base_discogs_mock()
+    svc.lookup_releases_by_artist = AsyncMock(return_value=[])
+    svc.search_releases_by_track = AsyncMock(return_value=_track_releases(_spine_release()))
+    # The tracklist scan surfaces the track's real credit (the LML#660 anchor).
+    svc.get_track_credit_on_release = AsyncMock(return_value=SPINE_ARTIST)
+
+    response = await _run_song_as_track(library_db, svc)
+
+    assert len(response.results) == 1
+    item = response.results[0]
+    assert item.library_item.id == 0
+    assert item.artwork is not None
+    assert item.artwork.release_id == SPINE_RELEASE_ID
+    # Anchored on the per-track credit, not the release-level "Various".
+    assert item.library_item.artist == SPINE_ARTIST
+    assert response.search_type == "compilation"
+    svc.get_track_credit_on_release.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_same_titled_tracks_on_different_comps_do_not_collide(
+    library_db, enable_nonlibrary_release
+):
+    """LML#660 AC3 (regression): two performers' same-titled tracks on different
+    V/A comps must resolve to DIFFERENT releases under DIFFERENT #632 cache keys.
+
+    Under the LML#649-era "Various" anchor both would have keyed
+    ``("various", <title>, True)`` and collided onto one row — the second add could
+    surface the first comp's release. Anchoring on the per-track credit keys them
+    apart: distinct performers → distinct keys → distinct releases.
+    """
+    pg = _RecordingPg()
+    release_one, release_two = 11111111, 22222222
+    credit_one, credit_two = "Juana Molina", "Jessica Pratt"
+
+    # Comp 1: the spine-titled track credited to Juana Molina -> resolves to R1.
+    svc1 = _base_discogs_mock()
+    svc1.lookup_releases_by_artist = AsyncMock(return_value=[])
+    svc1.search_releases_by_track = AsyncMock(
+        return_value=_track_releases(_spine_release(release_id=release_one))
+    )
+    svc1.get_track_credit_on_release = AsyncMock(return_value=credit_one)
+    await _run_song_as_track(library_db, svc1, pg=pg)
+
+    # Comp 2: the same-titled track credited to Jessica Pratt -> resolves to R2.
+    svc2 = _base_discogs_mock()
+    svc2.lookup_releases_by_artist = AsyncMock(return_value=[])
+    svc2.search_releases_by_track = AsyncMock(
+        return_value=_track_releases(_spine_release(release_id=release_two))
+    )
+    svc2.get_track_credit_on_release = AsyncMock(return_value=credit_two)
+    await _run_song_as_track(library_db, svc2, pg=pg)
+
+    # Two distinct keys (distinct credits) -> two distinct releases. No collision.
+    key_one = (to_match_form(credit_one), to_match_form(SPINE_TRACK), True)
+    key_two = (to_match_form(credit_two), to_match_form(SPINE_TRACK), True)
+    assert len(pg.store) == 2
+    assert pg.store[key_one] == release_one
+    assert pg.store[key_two] == release_two
+    assert all("various" not in artist_key for artist_key, _, _ in pg.store)
 
 
 # ---------------------------------------------------------------------------

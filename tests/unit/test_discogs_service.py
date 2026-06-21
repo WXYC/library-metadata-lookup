@@ -1936,6 +1936,105 @@ class TestValidateTrackOnRelease:
 
 
 # ---------------------------------------------------------------------------
+# get_track_credit_on_release (LML#660)
+# ---------------------------------------------------------------------------
+
+
+class TestGetTrackCreditOnRelease:
+    """The per-track credit recovery behind the SONG_AS_TRACK carry-through.
+
+    Unlike ``validate_track_on_release`` (which answers "is *this* artist on the
+    track?"), this answers "*which* artist is credited for this track?" — the
+    song-only path has no typed artist to validate against, so it recovers the
+    track's actual performer from the release tracklist to anchor the row-less
+    resolve (LML#660, replacing the LML#649 "Various"-suppression stopgap).
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_per_track_credit_on_compilation(self, service):
+        """A V/A comp whose matched track carries its own ``artists`` credit
+        returns that credit — not the release-level "Various"."""
+        release = ReleaseMetadataResponse(
+            release_id=36907527,
+            title="When There Is No Sun",
+            artist="Various",
+            release_url="https://discogs.com/release/36907527",
+            tracklist=[
+                TrackItem(position="1", title="Intro", artists=["Some Other Act"]),
+                TrackItem(
+                    position="2",
+                    title="Message to Black Youth",
+                    artists=["A Guy Called Gerald"],
+                ),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            credit = await service.get_track_credit_on_release(36907527, "Message to Black Youth")
+        assert credit == "A Guy Called Gerald"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_track_credit_is_release_level_only(self, service):
+        """A title-matched track carrying no per-track ``artists`` (the credit
+        lives only at release level) yields ``None`` — the caller must NOT anchor
+        on the release-level "Various"; it falls back to LML#649 suppression."""
+        release = ReleaseMetadataResponse(
+            release_id=36907527,
+            title="When There Is No Sun",
+            artist="Various",
+            release_url="https://discogs.com/release/36907527",
+            tracklist=[
+                TrackItem(position="1", title="Message to Black Youth", artists=[]),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            credit = await service.get_track_credit_on_release(36907527, "Message to Black Youth")
+        assert credit is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_track_title_matches(self, service):
+        release = ReleaseMetadataResponse(
+            release_id=36907527,
+            title="When There Is No Sun",
+            artist="Various",
+            release_url="https://discogs.com/release/36907527",
+            tracklist=[
+                TrackItem(position="1", title="A Completely Different Track", artists=["Someone"]),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            credit = await service.get_track_credit_on_release(36907527, "Message to Black Youth")
+        assert credit is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_release_unfetchable(self, service):
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=None):
+            credit = await service.get_track_credit_on_release(36907527, "Message to Black Youth")
+        assert credit is None
+
+    @pytest.mark.asyncio
+    async def test_joins_collaboration_per_track_credit(self, service):
+        """A multi-artist track returns the space-joined credit — the same form
+        ``_scan_tracklist_for_match``'s LML#210 fuzzy fallback validates against,
+        so the recovered anchor re-validates on the resolve path."""
+        release = ReleaseMetadataResponse(
+            release_id=34993109,
+            title="A V/A Comp",
+            artist="Various",
+            release_url="https://discogs.com/release/34993109",
+            tracklist=[
+                TrackItem(
+                    position="1",
+                    title="A Star Is Born",
+                    artists=["Bill Orcutt", "Tashi Shelley", "Robbie Miller"],
+                ),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            credit = await service.get_track_credit_on_release(34993109, "A Star Is Born")
+        assert credit == "Bill Orcutt Tashi Shelley Robbie Miller"
+
+
+# ---------------------------------------------------------------------------
 # get_artist_image
 # ---------------------------------------------------------------------------
 
