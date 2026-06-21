@@ -58,6 +58,8 @@ Unified pipeline for discovering Bandcamp artist slugs and matching them to WXYC
 
 **Phase 2 (Lookup):** For artists with known slugs, scrapes the Bandcamp catalog page and fuzzy-matches album titles using `score_match()`. Writes album-specific URLs to `bandcamp_url`.
 
+**Phase 2 resumability (#661):** every album carries a `bandcamp_status` marker (`pending` → `found` / `not_found`) plus `bandcamp_checked_at`, mirroring `spotify_status`/`spotify_checked_at`. A match (or an `--artist-fallback` URL) marks `found`; a scraped-but-no-match album — including an empty catalog — is marked `not_found` rather than left at `bandcamp_url = NULL`. `get_pending_bandcamp_lookup` only returns `pending` rows, so a re-run skips already-attempted slugs and a multi-hour bulk drain is restartable. The lookup log reports the attempted-vs-resolved split (`N album matches, M marked not-found`). The columns are added by the idempotent `_migrate()` ALTER path in `results_db.py`, which also backfills `found` for rows that already had a resolved `bandcamp_url`.
+
 **Usage:**
 ```bash
 python -m scripts.bandcamp_pipeline [--phase {search,lookup,both}] [--include-streaming] [--artist-fallback] [--dry-run] [--limit N] [--db-path PATH]

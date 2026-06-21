@@ -2,6 +2,7 @@
 
 import json
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 
@@ -409,3 +410,145 @@ class TestGetPendingBandcampLookup:
         pending = await db.get_pending_bandcamp_lookup(slug="autechre")
         assert len(pending) == 1
         assert pending[0]["bandcamp_slug"] == "autechre"
+
+
+class TestBandcampStatusMarker:
+    """Phase-2 resumability marker (#661): bandcamp_status / bandcamp_checked_at."""
+
+    @pytest.mark.asyncio
+    async def test_status_defaults_to_pending(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["bandcamp_status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_checked_at_defaults_to_none(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["bandcamp_checked_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_update_bandcamp_url_marks_found(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.update_bandcamp_slug(album_id, "stereolab")
+        await db.update_bandcamp_url(
+            album_id, "https://stereolab.bandcamp.com/album/aluminum-tunes"
+        )
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["bandcamp_status"] == "found"
+        assert rows[0]["bandcamp_checked_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_mark_not_found_sets_status_and_timestamp(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.mark_bandcamp_not_found(album_id)
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["bandcamp_status"] == "not_found"
+        assert rows[0]["bandcamp_checked_at"] is not None
+        assert rows[0]["bandcamp_url"] is None
+
+    @pytest.mark.asyncio
+    async def test_pending_excludes_attempted_not_found(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        album_id = rows[0]["id"]
+        await db.update_bandcamp_slug(album_id, "stereolab")
+        assert len(await db.get_pending_bandcamp_lookup()) == 1
+        await db.mark_bandcamp_not_found(album_id)
+        assert len(await db.get_pending_bandcamp_lookup()) == 0
+
+    @pytest.mark.asyncio
+    async def test_pending_includes_untried_slug(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
+        pending = await db.get_pending_bandcamp_lookup()
+        assert len(pending) == 1
+        assert pending[0]["bandcamp_status"] == "pending"
+
+
+class TestBandcampStatusMigrationOnExistingDb:
+    """Exercise the ALTER-table path against a DB created before the column.
+
+    A CREATE-TABLE-only definition would pass on a fresh DB but silently miss
+    the column on a pre-existing file -- this test catches that regression.
+    """
+
+    OLD_SCHEMA = """
+        CREATE TABLE albums (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            normalized_artist TEXT NOT NULL,
+            normalized_title TEXT NOT NULL,
+            display_artist TEXT NOT NULL,
+            display_title TEXT NOT NULL,
+            library_ids TEXT NOT NULL,
+            formats TEXT NOT NULL,
+            is_compilation INTEGER NOT NULL DEFAULT 0,
+            spotify_status TEXT NOT NULL DEFAULT 'pending',
+            apple_status TEXT NOT NULL DEFAULT 'pending',
+            bandcamp_slug TEXT,
+            bandcamp_url TEXT,
+            UNIQUE(normalized_artist, normalized_title)
+        )
+    """
+
+    async def _make_old_db(self, path: str, *, slug: str, url: str | None) -> None:
+        conn = await aiosqlite.connect(path)
+        try:
+            await conn.executescript(self.OLD_SCHEMA)
+            await conn.execute(
+                "INSERT INTO albums "
+                "(normalized_artist, normalized_title, display_artist, display_title, "
+                " library_ids, formats, bandcamp_slug, bandcamp_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "stereolab",
+                    "aluminum tunes",
+                    "Stereolab",
+                    "Aluminum Tunes",
+                    "[1]",
+                    '["cd"]',
+                    slug,
+                    url,
+                ),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_migration_adds_status_and_gates_pending(self, tmp_path):
+        path = str(tmp_path / "old.db")
+        await self._make_old_db(path, slug="stereolab", url=None)
+
+        db = ResultsDB(path)
+        await db.connect()
+        try:
+            pending = await db.get_pending_bandcamp_lookup()
+            assert len(pending) == 1
+            assert pending[0]["bandcamp_status"] == "pending"
+            await db.mark_bandcamp_not_found(pending[0]["id"])
+            assert len(await db.get_pending_bandcamp_lookup()) == 0
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_migration_backfills_found_for_resolved_url(self, tmp_path):
+        path = str(tmp_path / "old.db")
+        await self._make_old_db(
+            path,
+            slug="stereolab",
+            url="https://stereolab.bandcamp.com/album/aluminum-tunes",
+        )
+
+        db = ResultsDB(path)
+        await db.connect()
+        try:
+            rows = await db.get_all_results()
+            assert rows[0]["bandcamp_status"] == "found"
+        finally:
+            await db.close()
