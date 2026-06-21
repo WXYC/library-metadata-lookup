@@ -1046,12 +1046,22 @@ def _select_rowless_artist_release(
 ) -> tuple[LibraryItem, ResolvedRelease] | None:
     """Pick the release that represents a non-library artist request (LML#631).
 
-    Confidence gate: keep only releases whose credited artist normalizes-equal
-    to the typed token (the artist-only analog of ``find_best_typed_match``'s
-    floor). A coincidental token→name hit is dropped. V/A compilations credited
-    to "Various" fail the gate by construction, so the survivors are the artist's
-    own releases. Among them, pick the most-relevant (Discogs ``confidence``
-    descending) with a stable ``release_id`` tiebreak for determinism.
+    Credit gate: keep only releases whose credited artist normalizes-equal to
+    the typed token (the artist-only analog of ``find_best_typed_match``'s
+    floor). A coincidental token→name hit is dropped, as is any release whose
+    credit differs from the token — V/A compilations credited to "Various" and
+    collaborations credited "<artist> & <other>" among them — so the survivors
+    are releases credited to the artist alone.
+
+    Among the survivors, sort by Discogs ``confidence`` descending with a stable
+    ``release_id`` tiebreak. Note the upstream query is artist-only
+    (``DiscogsSearchRequest(artist=token)`` in ``lookup_releases_by_artist``), so
+    ``calculate_confidence`` scores every exact-credit match identically (~0.4,
+    no album term) — confidence only separates an exact credit from a fuzzier
+    diacritic variant, and in the common all-identical-credit case the
+    deterministic ``release_id`` tiebreak is the effective selector. True
+    relevance ranking (community have/want counts) needs a per-release
+    ``get_release`` fetch and is deferred to #633.
 
     A non-positive ``release_id`` is dropped before selection: such an id would
     fail ``_resolve_fallback_artwork``'s ``release_id > 0`` guard downstream and
