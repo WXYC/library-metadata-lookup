@@ -3987,8 +3987,22 @@ async def perform_lookup(
     # 3b track validation (the synthesized item is already 80-floored on
     # (artist, album) jointly; routing it through an unfloored top-1 re-search
     # has non-zero probability of flipping to a different release).
+    #
+    # Gated on ``allow_release_resolution_fallback`` (the bulk kill switch, LML#671):
+    # /lookup/bulk passes ``False`` so the 35k-album backfill never pays a per-row
+    # Discogs ``search()`` here, nor surfaces a row-less ``LibraryItem(id=0)``.
+    # An album-only backfill item (artist+album, no song) hits *this* producer —
+    # not the five song-bearing LML#652 producers — so gating it is what makes the
+    # "no per-row Discogs surfacing/cost on bulk" guarantee true for the real drain.
+    # /lookup keeps the default (``True``), so #583 fires there exactly as before.
     library_miss_outcome: str | None = None
-    if not library_results and parsed.artist and parsed.album and parsed.album.strip():
+    if (
+        not library_results
+        and allow_release_resolution_fallback
+        and parsed.artist
+        and parsed.album
+        and parsed.album.strip()
+    ):
         with telemetry.track_step("library_miss_discogs_search"):
             miss_match = await _library_miss_discogs_search(parsed, discogs_service)
         if miss_match is not None:

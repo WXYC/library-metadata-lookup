@@ -432,6 +432,95 @@ class TestPerformLookupLibraryMissPath:
             mock_miss_search.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_step_3a_fires_on_non_bulk_with_typed_artist_album(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#671 regression guard: /lookup (allow_release_resolution_fallback=True,
+        the default) still runs the #583 library-miss search on a typed artist+album
+        miss. Symmetric to the bulk-suppression test below — pins that gating the
+        bulk path leaves the non-bulk path unchanged.
+        """
+        mock_library_db.search.return_value = []
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=37008771,
+                    artist="My New Band Believe",
+                    album="My New Band Believe",
+                    artwork_url="https://img.discogs.com/cover.jpg",
+                )
+            ]
+        )
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="My New Band Believe",
+            album="My New Band Believe",
+            raw_message="My New Band Believe - My New Band Believe",
+        )
+        response = await perform_lookup(
+            request,
+            mock_library_db,
+            mock_discogs_service,
+            telemetry,
+            allow_release_resolution_fallback=True,
+        )
+
+        assert len(response.results) == 1
+        assert response.results[0].library_item.id == 0
+        assert response.results[0].artwork is not None
+
+    @pytest.mark.asyncio
+    async def test_step_3a_suppressed_on_bulk_kill_switch(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#671: /lookup/bulk passes ``allow_release_resolution_fallback=False`` so
+        the 35k-album backfill can't trigger per-row Discogs work. The #583 library-miss
+        search is the one row-less producer an album-only (artist+album, no song)
+        backfill item actually hits — the five LML#652 producers are all song-bearing.
+
+        With the kill switch closed, Step 3a must not fire: no per-row Discogs
+        ``search()`` (asserted via the helper not being called) and no row-less
+        ``LibraryItem(id=0)`` result surfaced.
+        """
+        mock_library_db.search.return_value = []
+        mock_library_db.find_similar_artist.return_value = None
+        # Were the gate to leak, this confident match would surface a row-less item.
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=37008771,
+                    artist="My New Band Believe",
+                    album="My New Band Believe",
+                    artwork_url="https://img.discogs.com/cover.jpg",
+                )
+            ]
+        )
+        mock_discogs_service.get_release = AsyncMock(return_value=None)
+
+        request = LookupRequest(
+            artist="My New Band Believe",
+            album="My New Band Believe",
+            raw_message="My New Band Believe - My New Band Believe",
+        )
+
+        with patch(
+            "lookup.orchestrator._library_miss_discogs_search",
+            new_callable=AsyncMock,
+        ) as mock_miss_search:
+            response = await perform_lookup(
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                allow_release_resolution_fallback=False,
+            )
+            mock_miss_search.assert_not_called()
+
+        assert len(response.results) == 0
+
+    @pytest.mark.asyncio
     async def test_synthesized_item_excluded_from_track_validation(
         self, mock_library_db, mock_discogs_service, telemetry
     ):
