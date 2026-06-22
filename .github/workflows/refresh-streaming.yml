@@ -1,10 +1,23 @@
 name: Refresh Streaming Availability
 
 # Incremental refresh only — retries errors and processes newly added albums.
-# Full catalog runs (65k+ albums) exceed CI time limits and should be done
-# locally, then uploaded:
-#   python -m scripts.streaming_availability --library-db library.db --results-db streaming_availability.db
-#   gh release upload streaming-data-v1 streaming_availability.db --clobber
+# The Railway volume copy of streaming_availability.db is the single canonical
+# lineage (LML#672): this workflow round-trips it (download -> Spotify/Deezer
+# incremental -> upload) so Apple + track_streaming results, which only an
+# occasional creds-bearing run produces, are carried forward on every write.
+#
+# Full catalog / Apple / track_streaming runs (65k+ albums) exceed CI time
+# limits and are still done locally — and MUST also round-trip the volume so the
+# weekly incremental never clobbers them:
+#   curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
+#     "$PRODUCTION_URL/admin/download-streaming-db" -o streaming_availability.db
+#   python -m scripts.streaming_availability --library-db library.db \
+#     --results-db streaming_availability.db   # + Apple creds, + track_streaming
+#   curl -fsS -X POST "$PRODUCTION_URL/admin/upload-streaming-db" \
+#     -H "Authorization: Bearer $ADMIN_TOKEN" -F "file=@streaming_availability.db"
+#
+# The upload passes through the coverage-regression guard, so a stale/thin write
+# is rejected (use ?force=true only for an intentional shrink).
 
 on:
   schedule:
@@ -12,9 +25,10 @@ on:
     - cron: "0 0 * * 0"
   workflow_dispatch:
 
-# Workflow-level GITHUB_TOKEN scope. Jobs in this file write back to the
-# repository (create tags / upload release assets / push commits) via
-# GITHUB_TOKEN, so contents:write is required.
+# Workflow-level GITHUB_TOKEN scope. The library.db download and (transitional)
+# release dual-write use GITHUB_TOKEN; the streaming_availability.db round-trip
+# uses ADMIN_TOKEN against the Railway volume. contents:write is required for the
+# release asset write.
 permissions:
   contents: write
 
@@ -22,6 +36,9 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+      PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
     steps:
       - uses: actions/checkout@v6
 
@@ -41,11 +58,34 @@ jobs:
 
       - run: pip install -e "."
 
-      - name: Download library.db and streaming_availability.db from release
+      # library.db is the input catalog and still lives on the release (written
+      # by discogs-etl sync-library.yml). Hard-fail if it is missing.
+      - name: Download library.db from release
         run: |
-          gh release download streaming-data-v1 --dir . || echo "No existing release, starting fresh"
+          gh release download streaming-data-v1 --dir . --pattern "library.db" --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+
+      # streaming_availability.db comes from the Railway volume (the canonical
+      # copy), NOT the release. Hard-fail: enriching from an empty db is never
+      # correct when the volume is canonical, so there is no `|| echo` fallback.
+      - name: Download streaming_availability.db from the Railway volume
+        run: |
+          set -euo pipefail
+          dest=streaming_availability.db
+          http_code=$(curl -sS -w '%{http_code}' -o "$dest" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" \
+            "$PRODUCTION_URL/admin/download-streaming-db")
+          if [ "$http_code" != "200" ]; then
+            echo "::error::download-streaming-db returned HTTP $http_code"
+            head -c 2000 "$dest" || true
+            exit 1
+          fi
+          if [ ! -s "$dest" ]; then
+            echo "::error::downloaded streaming_availability.db is empty"
+            exit 1
+          fi
+          python -c "import sqlite3,sys; n=sqlite3.connect(sys.argv[1]).execute('SELECT count(*) FROM albums').fetchone()[0]; print('volume streaming_availability.db OK: %d albums' % n); sys.exit(0 if n>0 else 'downloaded streaming_availability.db has 0 albums')" "$dest"
 
       - name: Run streaming availability pipeline
         run: |
@@ -65,7 +105,27 @@ jobs:
             --streaming-db streaming_availability.db \
             --dry-run
 
-      - name: Upload to GitHub Release
+      # Write the enriched copy back to the canonical volume. The coverage guard
+      # rejects a regression (e.g. a stale writer that lost Apple) — that is the
+      # intended serialization: a rejected write re-applies next cycle.
+      - name: Upload streaming_availability.db to the Railway volume
+        run: |
+          set -euo pipefail
+          http_code=$(curl -sS -w '%{http_code}' -o upload_response.json \
+            -X POST "$PRODUCTION_URL/admin/upload-streaming-db" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" \
+            -F "file=@streaming_availability.db")
+          cat upload_response.json || true
+          echo
+          if [ "$http_code" != "200" ]; then
+            echo "::error::upload-streaming-db returned HTTP $http_code"
+            exit 1
+          fi
+
+      # TRANSITIONAL dual-write (LML#672 rollout step 1): keep the release asset
+      # warm until discogs-etl reads the volume and one sync cycle is verified.
+      # Removed in the cutover PR (rollout step 3), retiring this asset.
+      - name: Upload to GitHub Release (transitional dual-write)
         run: |
           gh release upload streaming-data-v1 streaming_availability.db --clobber 2>/dev/null || \
           gh release create streaming-data-v1 streaming_availability.db --title "Streaming availability data" --notes "Pre-computed streaming service URLs for WXYC library releases. Updated weekly by the refresh-streaming workflow."

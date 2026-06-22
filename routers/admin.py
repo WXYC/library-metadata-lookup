@@ -28,6 +28,17 @@ router = APIRouter(tags=["admin"])
 
 STREAMING_DB_FILENAME = "streaming_availability.db"
 
+# Coverage-regression guard tolerance for /admin/upload-streaming-db (LML#672).
+# An upload is rejected if any guarded metric drops below prior * (1 - tolerance)
+# or goes non-zero -> zero. 5% absorbs legitimate churn (a release falling off a
+# service, a removed library row) while still catching a stripped column.
+STREAMING_COVERAGE_TOLERANCE = 0.05
+
+# The streaming_availability.db metrics guarded on upload. The three URL counts
+# live on the `albums` table; `track_results` is a separate table that
+# export_streaming_links.py also consumes, so its loss must be caught too.
+_STREAMING_COVERAGE_METRICS = ("apple_url", "spotify_url", "deezer_url", "albums", "track_results")
+
 # Strong references to background tasks to prevent GC before completion.
 # See https://docs.python.org/3/library/asyncio-task.html#creating-tasks
 _background_tasks: set[asyncio.Task] = set()
@@ -36,6 +47,80 @@ _background_tasks: set[asyncio.Task] = set()
 def _streaming_db_path(settings: Settings) -> Path:
     """Sibling of library.db on the Railway volume."""
     return settings.resolved_library_db_path.parent / STREAMING_DB_FILENAME
+
+
+def _streaming_coverage(db_path: Path) -> dict[str, int]:
+    """Coverage metrics for a streaming_availability.db file (LML#672 guard).
+
+    Always returns the same five fixed keys (see ``_STREAMING_COVERAGE_METRICS``).
+    A missing file, missing ``albums``/``track_results`` table, or missing URL
+    column all read as ``0`` rather than raising, so the regression check can
+    iterate without ``KeyError`` and a disappearing table/column is caught as an
+    N -> 0 regression. Mirrors the defensive style of ``_get_streaming_ids``.
+    """
+    zero = dict.fromkeys(_STREAMING_COVERAGE_METRICS, 0)
+    if not db_path.exists():
+        return zero
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cov = dict(zero)
+            if _has_table(conn, "albums"):
+                cov["albums"] = conn.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
+                album_cols = _table_columns(conn, "albums")
+                for col in ("apple_url", "spotify_url", "deezer_url"):
+                    if col in album_cols:
+                        cov[col] = conn.execute(
+                            f"SELECT COUNT({col}) FROM albums"  # noqa: S608 (col from fixed allowlist)
+                        ).fetchone()[0]
+            if _has_table(conn, "track_results"):
+                cov["track_results"] = conn.execute(
+                    "SELECT COUNT(*) FROM track_results"
+                ).fetchone()[0]
+            return cov
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("Failed to read streaming coverage from %s", db_path, exc_info=True)
+        return zero
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _table_columns(conn: sqlite3.Connection, name: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({name})").fetchall()}
+
+
+def _check_streaming_regression(
+    old: dict[str, int],
+    new: dict[str, int],
+    tolerance: float = STREAMING_COVERAGE_TOLERANCE,
+) -> list[dict]:
+    """Return regression records for metrics that shrank too far.
+
+    For each of the five fixed metrics, a record ``{metric, old, new, floor}`` is
+    returned when ``new`` drops below ``floor = old * (1 - tolerance)`` **or** goes
+    non-zero -> zero. Empty list means the upload is safe. Pure function; both
+    inputs are expected to carry all five keys (``_streaming_coverage`` guarantees
+    this).
+    """
+    regressions: list[dict] = []
+    for metric in _STREAMING_COVERAGE_METRICS:
+        old_v = old.get(metric, 0)
+        new_v = new.get(metric, 0)
+        if old_v <= 0:
+            continue  # nothing to regress against (first upload / absent metric)
+        floor = old_v * (1 - tolerance)
+        if new_v == 0 or new_v < floor:
+            regressions.append({"metric": metric, "old": old_v, "new": new_v, "floor": floor})
+    return regressions
 
 
 def _get_streaming_ids(db_path: Path) -> set[int]:
@@ -227,18 +312,24 @@ async def upload_library_db(
         400: {"description": "Invalid SQLite database"},
         401: {"description": "Missing authorization"},
         403: {"description": "Invalid or missing token"},
+        409: {"description": "Coverage regression vs the file on disk (use force=true)"},
     },
 )
 async def upload_streaming_db(
     file: UploadFile,
+    force: bool = False,
     settings: Settings = Depends(get_settings),
     authorization: str | None = Header(None),
 ):
     """Store a streaming_availability.db backup on the Railway volume.
 
-    This file is not used at runtime — it's a backup of the analysis database
-    that contains all streaming search results, track-level data, and Discogs
-    match state. Validated as SQLite with an 'albums' table before writing.
+    This is the canonical copy the daily library-sync reads (LML#672), so the
+    upload is a full-file replace guarded against coverage regression: if any of
+    {apple_url, spotify_url, deezer_url, albums, track_results} drops below
+    prior * (1 - tolerance) or goes non-zero -> zero versus the file currently on
+    disk, the upload is rejected with 409. Pass ``?force=true`` to override an
+    intentional shrink (logged loudly). Validated as SQLite with an 'albums'
+    table before the guard runs.
     """
     _validate_auth(settings, authorization)
 
@@ -262,6 +353,35 @@ async def upload_streaming_db(
             status_code=400,
             detail=f"Invalid SQLite database: {e}",
         ) from e
+
+    # Coverage-regression guard (LML#672): compare against the live on-disk file
+    # at replace time (not an uploader-supplied baseline), so a stale writer in a
+    # read-modify-write race is rejected and re-applies next cycle.
+    old_cov = _streaming_coverage(db_path)
+    new_cov = _streaming_coverage(tmp_path)
+    regressions = _check_streaming_regression(old_cov, new_cov)
+    if regressions:
+        if force:
+            logger.warning(
+                "Streaming upload regresses coverage but force=true; replacing anyway. "
+                "Regressions: %s",
+                regressions,
+            )
+        else:
+            tmp_path.unlink(missing_ok=True)
+            logger.warning(
+                "Rejected streaming upload: coverage regression vs on-disk file. %s",
+                regressions,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "streaming coverage regression",
+                    "regressions": regressions,
+                    "hint": "re-run as a round-trip (download -> modify -> upload), "
+                    "or pass force=true to override",
+                },
+            )
 
     os.replace(str(tmp_path), str(db_path))
     logger.info(f"Streaming database backed up: {db_path} ({row_count} albums)")
