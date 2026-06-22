@@ -26,6 +26,7 @@ def _make_streaming_db(
     spotify: int = 0,
     deezer: int = 0,
     track_results: int | None = None,
+    track_results_usable: int | None = None,
     with_url_columns: bool = True,
 ) -> None:
     """Build a streaming_availability.db with controllable coverage metrics.
@@ -34,10 +35,18 @@ def _make_streaming_db(
         albums: number of rows in the `albums` table.
         apple/spotify/deezer: how many of those rows carry a non-null URL.
         track_results: row count for the `track_results` table; None omits the table.
+        track_results_usable: how many of those rows are "usable" -- i.e. resolved
+            (`resolution_status='local_match'`) AND carry a non-null URL, matching the
+            predicate export_streaming_links.py uses. The remaining
+            ``track_results - track_results_usable`` rows are unresolved
+            (`resolution_status='pending'`, NULL URLs), like the rows the pipeline
+            inserts up front before resolution. Defaults to ``track_results`` (all
+            usable) so callers that only care about row count stay simple.
         with_url_columns: when False, the `albums` table has no URL columns at all
             (mirrors the minimal fixture in test_admin_streaming_db.py).
 
-    Requires albums >= max(apple, spotify, deezer).
+    Requires albums >= max(apple, spotify, deezer) and
+    0 <= track_results_usable <= track_results.
     """
     assert albums >= max(apple, spotify, deezer), "albums must be >= each URL count"
     conn = sqlite3.connect(str(path))
@@ -66,16 +75,25 @@ def _make_streaming_db(
                 "INSERT INTO albums (id, library_ids) VALUES (?, ?)", (i + 1, f"[{i + 1}]")
             )
     if track_results is not None:
+        usable = track_results if track_results_usable is None else track_results_usable
+        assert 0 <= usable <= track_results, "track_results_usable must be in [0, track_results]"
         conn.execute(
             "CREATE TABLE track_results ("
             "id INTEGER PRIMARY KEY, album_id INTEGER, "
             "spotify_url TEXT, deezer_url TEXT, resolution_status TEXT)"
         )
         for i in range(track_results):
-            conn.execute(
-                "INSERT INTO track_results (id, album_id, resolution_status) VALUES (?, ?, ?)",
-                (i + 1, 1, "local_match"),
-            )
+            if i < usable:
+                conn.execute(
+                    "INSERT INTO track_results "
+                    "(id, album_id, spotify_url, resolution_status) VALUES (?, ?, ?, ?)",
+                    (i + 1, 1, f"https://open.spotify.com/track/{i}", "local_match"),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO track_results (id, album_id, resolution_status) VALUES (?, ?, ?)",
+                    (i + 1, 1, "pending"),
+                )
     conn.commit()
     conn.close()
 
@@ -149,6 +167,39 @@ class TestStreamingCoverage:
             "albums": 5,
             "track_results": 0,
         }
+
+    def test_track_results_counts_only_usable_rows(self, tmp_path):
+        """track_results coverage counts resolved+URL-bearing rows, not raw COUNT(*).
+
+        The pipeline inserts a track_results row per track up front
+        (resolution_status='pending', NULL URLs) and fills URLs in later; the
+        downstream export only consumes resolved rows with a non-null URL. A raw
+        COUNT(*) would let an upload that nulls every track URL pass the guard, so
+        the metric must mirror the export predicate.
+        """
+        from routers.admin import _streaming_coverage
+
+        db = tmp_path / "s.db"
+        _make_streaming_db(db, albums=10, track_results=100, track_results_usable=30)
+        assert _streaming_coverage(db)["track_results"] == 30
+
+    def test_track_results_with_legacy_schema_falls_back_to_rowcount(self, tmp_path):
+        """A track_results table lacking the URL/status columns reads as COUNT(*).
+
+        Keeps the column-defensive contract: an unexpected schema still produces a
+        non-zero count so a disappearing table is caught as an N -> 0 regression.
+        """
+        from routers.admin import _streaming_coverage
+
+        db = tmp_path / "s.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE albums (id INTEGER PRIMARY KEY, library_ids TEXT)")
+        conn.execute("CREATE TABLE track_results (id INTEGER PRIMARY KEY, album_id INTEGER)")
+        for i in range(7):
+            conn.execute("INSERT INTO track_results (id, album_id) VALUES (?, ?)", (i + 1, 1))
+        conn.commit()
+        conn.close()
+        assert _streaming_coverage(db)["track_results"] == 7
 
 
 class TestCheckStreamingRegression:
@@ -348,6 +399,45 @@ class TestUploadStreamingGuard:
         # The on-disk file is now the (thinner) uploaded copy.
         assert _read_apple_count(vol) == 0
         assert any("regress" in r.message.lower() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_unreadable_existing_db_rejected_not_fail_open(self, tmp_path, admin_settings):
+        """A present-but-corrupt on-disk DB must fail closed, not wave the upload through.
+
+        If the existing file can't be read, the guard has no baseline to compare
+        against. Returning all-zero coverage would treat it as a first upload and
+        accept any thin replacement -- exactly the 288 -> 0 incident the guard
+        exists to prevent, fired precisely when the disk is flaky. Expect 409.
+        """
+        from main import app
+
+        vol = self._volume_path(admin_settings)
+        # exists() is True but it is not a valid SQLite file -> the coverage read raises.
+        vol.write_bytes(b"this is not a sqlite database")
+
+        upload = tmp_path / "u.db"
+        _make_streaming_db(upload, albums=300, apple=0, spotify=200, deezer=150)
+        before = vol.read_bytes()
+
+        resp = await self._upload(app, admin_settings, upload)
+        assert resp.status_code == 409
+        # The corrupt on-disk file is left untouched.
+        assert vol.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_force_overrides_unreadable_existing_db(self, tmp_path, admin_settings):
+        """force=true still lets an upload replace an unreadable on-disk DB."""
+        from main import app
+
+        vol = self._volume_path(admin_settings)
+        vol.write_bytes(b"this is not a sqlite database")
+
+        upload = tmp_path / "u.db"
+        _make_streaming_db(upload, albums=300, apple=288, spotify=200, deezer=150)
+
+        resp = await self._upload(app, admin_settings, upload, force=True)
+        assert resp.status_code == 200
+        assert _read_apple_count(vol) == 288
 
 
 def _read_apple_count(path) -> int:
