@@ -38,7 +38,7 @@ Three classes of pin in `.github/workflows/*.yml` exist for supply-chain reasons
 - **Workflow-level `permissions:`** scoped to the minimum each workflow needs:
   - `ci.yml`, `cross-cache-identity-flags.yml`, `set-railway-var.yml`: `contents: read` (no GITHUB_TOKEN writes).
   - `charset-corpus-drift.yml`: `contents: read` plus `packages: read` (the reusable workflow pulls `@wxyc/shared` from `npm.pkg.github.com`).
-  - `refresh-streaming.yml`: `contents: write` (creates / uploads to `streaming-data-v1` GitHub Release via `GH_TOKEN`).
+  - `refresh-streaming.yml`: `contents: write` (downloads `library.db` from, and transitionally dual-writes `streaming_availability.db` to, the `streaming-data-v1` GitHub Release via `GH_TOKEN`). The canonical `streaming_availability.db` round-trip itself goes to the Railway **volume** via `ADMIN_TOKEN` + `PRODUCTION_URL` (see [Streaming Database Backup](#streaming-database-backup-upload--download)), not GITHUB_TOKEN.
   Failure mode is silent — a job that needs a missing scope (e.g. `pull-requests: write`) fails its API call but the workflow stays green. When adding a step that needs to comment on PRs, push tags, mint releases, etc., explicitly grant the scope at the job level (or widen the workflow-level floor only if every job in the file needs it).
 - **Reusable-workflow refs pinned to `@gha/v1`**, not `@main` — `WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@gha/v1` (in `ci.yml`) and `WXYC/wxyc-shared/.github/workflows/check-charset-corpus-drift.yml@gha/v1` (in `charset-corpus-drift.yml`). The publishing repos treat `gha/v1` as a moving major tag — re-pointed forward on non-breaking changes, frozen on breaking changes (which get a fresh `gha/v2`). Don't downgrade either to `@main`; if a `gha/v2` migration arrives, follow the procedure at the top of the publishing repo's CLAUDE.md.
 
@@ -61,14 +61,34 @@ The ETL script in [discogs-cache](https://github.com/WXYC/discogs-etl) (`scripts
 
 ## Streaming Database Backup (Upload + Download)
 
-`streaming_availability.db` is the analysis database for streaming-availability search results. It's a sibling of `library.db` on the Railway volume. Two symmetric admin endpoints, both gated by `ADMIN_TOKEN`:
+`streaming_availability.db` is the analysis database for streaming-availability search results — it holds Apple/Spotify/Deezer URLs, track-level results, and Discogs match state. It's a sibling of `library.db` on the Railway volume. Two symmetric admin endpoints, both gated by `ADMIN_TOKEN`:
 
 ```
-POST /admin/upload-streaming-db    # multipart upload, validates `albums` table
+POST /admin/upload-streaming-db    # multipart upload, validates `albums` table + coverage guard
 GET  /admin/download-streaming-db  # FileResponse stream of the volume copy (404 if missing)
 ```
 
-The download endpoint lets the daily library-sync pipeline (WXYC/discogs-etl) read the file directly from the Railway volume instead of round-tripping it through a GitHub Release, making the volume the canonical source.
+### The volume is the single canonical lineage (LML#672)
+
+Before LML#672 this file was maintained as **two copies that drifted**: a `streaming-data-v1` GitHub Release asset (written weekly by `refresh-streaming.yml`, CI-only creds so Spotify/Deezer-only) and this volume copy (the rich local working DB with Apple + `track_streaming`, uploaded manually). The daily library-sync read the *release*, so production `library.db` silently carried **zero Apple Music links** while hundreds sat unused on the volume.
+
+The volume is now the enforced single source. Every writer round-trips it (download → modify → upload):
+
+- `refresh-streaming.yml` (LML, weekly): downloads the volume copy, runs the Spotify/Deezer incremental, uploads it back. (`library.db`, the input catalog, still comes from the release.)
+- The occasional manual Apple + `track_streaming` run: same download → enrich → upload round-trip, so it never clobbers the weekly incremental and vice versa.
+- `sync-library.yml` (WXYC/discogs-etl, daily): reads the volume via `GET /admin/download-streaming-db` to enrich `library.db`.
+
+During the cutover the release asset is still **dual-written** by `refresh-streaming.yml` as a safety net; it is retired once discogs-etl is confirmed reading the volume (the release keeps hosting `library.db`).
+
+### Coverage-regression guard on upload
+
+`POST /admin/upload-streaming-db` is a full-file replace, so a thin copy could overwrite a rich one (this is how the 288 Apple URLs → 0 incident happened). The upload is guarded: it computes coverage for the five metrics `COUNT(apple_url)`, `COUNT(spotify_url)`, `COUNT(deezer_url)` over `albums`, `COUNT(*)` of `albums`, and `COUNT(*)` of `track_results`, comparing the uploaded file against **the copy currently on disk at replace time** (not an uploader baseline). The upload is rejected with **HTTP 409** if any metric drops below `prior × (1 − 0.05)` **or** goes non-zero → zero. Pass `?force=true` to override an intentional shrink (logged loudly). Comparing against live on-disk state also serializes concurrent writers: a stale writer that lost Apple is rejected on the Apple regression and re-applies next cycle.
+
+### Railway-uptime failure mode
+
+Making the volume canonical couples the daily prod sync to LML/Railway being reachable at sync time (vs. the durable GitHub-hosted release). This is deliberate and the failure mode is safe: discogs-etl's `GET /admin/download-streaming-db` step **hard-fails** on a non-200 or empty/invalid file, so a Railway outage at sync time **aborts** the sync and production keeps **yesterday's** `library.db` (which still has its streaming links) rather than publishing a zero-link db. A flaked download never strips links.
+
+Operational prerequisite: `refresh-streaming.yml` needs the `ADMIN_TOKEN` and `PRODUCTION_URL` repo secrets set on **WXYC/library-metadata-lookup** (they previously lived only on the discogs-etl side).
 
 ## Health Check Behavior
 
