@@ -36,9 +36,6 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
-      PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
     steps:
       - uses: actions/checkout@v6
 
@@ -86,6 +83,9 @@ jobs:
             exit 1
           fi
           python -c "import sqlite3,sys; n=sqlite3.connect(sys.argv[1]).execute('SELECT count(*) FROM albums').fetchone()[0]; print('volume streaming_availability.db OK: %d albums' % n); sys.exit(0 if n>0 else 'downloaded streaming_availability.db has 0 albums')" "$dest"
+        env:
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
 
       - name: Run streaming availability pipeline
         run: |
@@ -121,6 +121,9 @@ jobs:
             echo "::error::upload-streaming-db returned HTTP $http_code"
             exit 1
           fi
+        env:
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
 
       # TRANSITIONAL dual-write (LML#672 rollout step 1): keep the release asset
       # warm until discogs-etl reads the volume and one sync cycle is verified.
