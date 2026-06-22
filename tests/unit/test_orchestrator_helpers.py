@@ -2069,6 +2069,85 @@ class TestFetchArtworkLazyReleaseResolution:
         svc.search_releases_by_track.assert_not_called()
 
 
+class TestFetchArtworkRowlessBindKillSwitch:
+    """LML#652: the row-less (id==0) ``bind_carried`` trust-bind respects the bulk
+    kill switch. Once the four producers are gated no row-less item reaches
+    ``fetch_artwork_for_items`` on bulk, so this is belt-and-suspenders — but it's
+    the only level at which the ``and allow_release_resolution_fallback`` guard on
+    the ``id == ROWLESS_LIBRARY_ID`` branch can be exercised directly.
+
+    Distinct from the #604 compilation trust-bind (an in-library row whose
+    ``lml_resolve_compilation_release`` carried release binds): that branch is NOT
+    gated by the switch (its own lazy fallback already is) and stays bound.
+    """
+
+    @pytest.fixture
+    def enable_nonlibrary_release(self, monkeypatch):
+        monkeypatch.setenv("LML_RESOLVE_NONLIBRARY_RELEASE", "true")
+        from config.settings import get_settings
+
+        get_settings.cache_clear()
+        yield
+        get_settings.cache_clear()
+
+    def _rowless_inputs(self):
+        """An id==0 row-less item + its carried release, and a service whose
+        floor re-search finds nothing (so a suppressed bind leaves it unbound)."""
+        item = make_library_item(id=0, artist="A Guy Called Gerald", title="When There Is No Sun")
+        discogs_titles = {
+            0: ResolvedRelease(
+                release_id=36907527,
+                release_url="https://www.discogs.com/release/36907527",
+                is_compilation=True,
+                album_title="When There Is No Sun",
+            )
+        }
+        svc = AsyncMock()
+        svc.cache_service = None
+        svc.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
+        svc.get_release = AsyncMock(
+            return_value=ReleaseMetadataResponse(
+                release_id=36907527,
+                title="When There Is No Sun",
+                artist="Various",
+                release_url="https://www.discogs.com/release/36907527",
+                artwork_url="https://i.discogs.com/sun.jpg",
+            )
+        )
+        return item, discogs_titles, svc
+
+    @pytest.mark.asyncio
+    async def test_rowless_bind_suppressed_when_allow_false(self, enable_nonlibrary_release):
+        item, discogs_titles, svc = self._rowless_inputs()
+
+        results = await fetch_artwork_for_items(
+            [item],
+            svc,
+            discogs_titles=discogs_titles,
+            allow_release_resolution_fallback=False,
+        )
+
+        # No trust-bind: the carried release is not bound by id, so the row-less
+        # artwork fetch (_resolve_fallback_artwork -> get_release) never fires and
+        # the floor re-search (empty) leaves the item unbound.
+        svc.get_release.assert_not_awaited()
+        assert results[0][1] is None
+
+    @pytest.mark.asyncio
+    async def test_rowless_bind_fires_when_allow_true(self, enable_nonlibrary_release):
+        """Default path (the /lookup default): the same inputs DO trust-bind the
+        carried release — the regression guard the kill-switch test is measured
+        against."""
+        item, discogs_titles, svc = self._rowless_inputs()
+
+        results = await fetch_artwork_for_items([item], svc, discogs_titles=discogs_titles)
+
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.release_id == 36907527
+        svc.get_release.assert_awaited()
+
+
 class TestFetchArtworkFallback:
     """Tests for artwork fallback to artist/label images."""
 

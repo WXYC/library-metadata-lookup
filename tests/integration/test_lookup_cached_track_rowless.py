@@ -116,10 +116,33 @@ def _service(*, with_cache_hit: bool) -> AsyncMock:
     return svc
 
 
-async def _run(library_db, svc):
+@pytest.fixture
+def enable_nonlibrary_and_compilation(monkeypatch):
+    """Both rollout flags on — the worst case for the A4 bulk kill switch (LML#652).
+
+    ``LML_RESOLVE_COMPILATION_RELEASE`` makes ``fetch_artwork_for_items``'
+    ``bind_carried`` *first* operand True for every item, so a row-less A4 item that
+    leaked past the producer gate would still trust-bind (the second operand's new
+    ``allow_release_resolution_fallback`` guard wouldn't help). Gating A4's producer
+    itself is what closes the surface; this fixture proves it under both flags."""
+    monkeypatch.setenv("LML_RESOLVE_NONLIBRARY_RELEASE", "true")
+    monkeypatch.setenv("LML_RESOLVE_COMPILATION_RELEASE", "true")
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+async def _run(library_db, svc, *, allow=True):
     request = LookupRequest(artist=ARTIST, song=SONG, raw_message=f"{ARTIST} - {SONG}")
     return await perform_lookup(
-        request, library_db, svc, telemetry=make_lml_telemetry(), discogs_cache_pg=None
+        request,
+        library_db,
+        svc,
+        telemetry=make_lml_telemetry(),
+        discogs_cache_pg=None,
+        allow_release_resolution_fallback=allow,
     )
 
 
@@ -143,6 +166,31 @@ async def test_cached_track_surfaces_rowless_release_end_to_end(
     assert item.artwork.release_url == NONLIB_RELEASE_URL
     # No typed album -> A2 soft confidence on the A4 path too.
     assert item.artwork.confidence == ROWLESS_NO_ALBUM_CONFIDENCE
+
+
+@pytest.mark.asyncio
+async def test_cached_track_bulk_kill_switch_suppresses_rowless(
+    library_db, enable_nonlibrary_and_compilation
+):
+    """LML#652: A4 is the fifth row-less producer — the issue enumerated only four
+    and missed it (#629's A4 carry-through landed after the issue was pinned to the
+    lagging prod tree). On /lookup/bulk (``allow_release_resolution_fallback=False``)
+    it must surface no row-less item, even with ``LML_RESOLVE_COMPILATION_RELEASE``
+    also on — which would otherwise let ``fetch_artwork_for_items``' ``bind_carried``
+    first operand trust-bind a leaked id=0 item and fire a per-row ``get_release``
+    artwork fetch. Contrast ``test_cached_track_surfaces_rowless_release_end_to_end``,
+    which surfaces it from the same inputs with the switch open."""
+    svc = _service(with_cache_hit=True)
+
+    response = await _run(library_db, svc, allow=False)
+
+    assert not any(
+        r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
+        for r in response.results
+    )
+    # No row-less item reached fetch_artwork_for_items, so no per-row artwork fetch
+    # (the bind_carried get_release) fired for an id=0 item.
+    svc.get_release.assert_not_awaited()
 
 
 @pytest.mark.asyncio

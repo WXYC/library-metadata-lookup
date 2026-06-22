@@ -867,6 +867,7 @@ async def _narrow_swapped_by_track(
     discogs_service: DiscogsService | None,
     *,
     pg: PgSource | None = None,
+    allow_release_resolution_fallback: bool = True,
 ) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]], dict[int, ResolvedRelease]]:
     """Narrow a swapped-interpretation artist match to the release holding ``track``.
 
@@ -896,6 +897,7 @@ async def _narrow_swapped_by_track(
         source="swapped_interpretation",
         require_artist=artist,
         pg=pg,
+        allow_release_resolution_fallback=allow_release_resolution_fallback,
     )
 
 
@@ -906,6 +908,7 @@ async def search_with_alternative_interpretation(
     discogs_service: DiscogsService | None = None,
     *,
     pg: PgSource | None = None,
+    allow_release_resolution_fallback: bool = True,
 ) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]], dict[int, ResolvedRelease]]:
     """Try searching with both artist/title interpretations for 'X - Y' format.
 
@@ -933,13 +936,23 @@ async def search_with_alternative_interpretation(
     if results1 and not results2:
         logger.info(f"Alternative search matched with '{part1}' as artist")
         narrowed, matched_via, titles = await _narrow_swapped_by_track(
-            db, part1, part2, discogs_service, pg=pg
+            db,
+            part1,
+            part2,
+            discogs_service,
+            pg=pg,
+            allow_release_resolution_fallback=allow_release_resolution_fallback,
         )
         return (narrowed, matched_via, titles) if narrowed else (results1, {}, {})
     elif results2 and not results1:
         logger.info(f"Alternative search matched with '{part2}' as artist")
         narrowed, matched_via, titles = await _narrow_swapped_by_track(
-            db, part2, part1, discogs_service, pg=pg
+            db,
+            part2,
+            part1,
+            discogs_service,
+            pg=pg,
+            allow_release_resolution_fallback=allow_release_resolution_fallback,
         )
         return (narrowed, matched_via, titles) if narrowed else (results2, {}, {})
     elif results1 and results2:
@@ -962,6 +975,8 @@ async def search_song_as_artist(
     db: LibraryDB,
     song_as_artist: str,
     discogs_service: DiscogsService | None = None,
+    *,
+    allow_release_resolution_fallback: bool = True,
 ) -> tuple[list[LibraryItem], dict[int, ResolvedRelease] | None]:
     """Try searching using the parsed song title as an artist name.
 
@@ -974,6 +989,13 @@ async def search_song_as_artist(
     the #628 carry-through) and on the typed token normalizing-equal to the
     resolved Discogs artist name; the second tuple element carries that release
     (``None`` on the library-backed paths, which are unchanged).
+
+    ``allow_release_resolution_fallback`` is the bulk kill switch (LML#652):
+    ``False`` on /lookup/bulk suppresses the row-less surface (no row-less item,
+    hence no per-row ``bind_carried`` artwork fetch downstream), parity with the
+    #628 carry-through and #604's lazy fallback. Unlike those, this path does no
+    resolve fan-out or cache write — the gate only suppresses the row-less pick
+    over releases the artist probe already fetched.
     """
     logger.info(f"Trying song '{song_as_artist}' as artist name")
 
@@ -1028,8 +1050,12 @@ async def search_song_as_artist(
 
     # LML#631 — no WXYC catalog row for this artist. If the token resolves
     # cleanly on Discogs, surface the best-representative release row-less so rom
-    # can post Discogs context to Slack. Gated behind the shared non-library flag.
-    if get_settings().lml_resolve_nonlibrary_release:
+    # can post Discogs context to Slack. Gated behind the shared non-library flag
+    # and, per LML#652, the per-request bulk kill switch — /lookup/bulk passes
+    # ``allow_release_resolution_fallback=False`` so a song-only backfill item
+    # never surfaces a row-less result (and never pays the downstream per-row
+    # ``bind_carried`` artwork fetch).
+    if get_settings().lml_resolve_nonlibrary_release and allow_release_resolution_fallback:
         rowless = _select_rowless_artist_release(song_as_artist, discogs_releases)
         if rowless is not None:
             item, resolved = rowless
@@ -1315,6 +1341,7 @@ async def _match_track_releases_to_library(
     require_artist: str | None = None,
     album: str | None = None,
     pg: PgSource | None = None,
+    allow_release_resolution_fallback: bool = True,
 ) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]], dict[int, ResolvedRelease]]:
     """Find Discogs releases containing ``track`` and match them back to the library.
 
@@ -1478,7 +1505,11 @@ async def _match_track_releases_to_library(
     # A1 carry-through (LML#628): the library walk dropped every candidate (no
     # WXYC row), but a release may still resolve + validate from the inputs.
     # Surface it row-less rather than returning empty. Gated; off by default.
-    if get_settings().lml_resolve_nonlibrary_release:
+    # LML#652: the bulk kill switch also gates the carry-through — /lookup/bulk
+    # passes ``allow_release_resolution_fallback=False`` so the backfill never
+    # pays the per-row resolve + #632 cache write (parity with #604's lazy
+    # fallback). Covers SONG_AS_TRACK and SWAPPED, both of which reach here.
+    if get_settings().lml_resolve_nonlibrary_release and allow_release_resolution_fallback:
         # Anchor artist: the kernel's typed ``artist`` (SWAPPED's identified
         # side). SONG_AS_TRACK has none, so fall back to the surfaced release's
         # own credit — the only artist signal a song-only query carries. Either
@@ -1537,6 +1568,7 @@ async def search_song_as_track(
     discogs_service: DiscogsService | None = None,
     *,
     pg: PgSource | None = None,
+    allow_release_resolution_fallback: bool = True,
 ) -> tuple[list[LibraryItem], dict[int, list[TrackMatchHint]], dict[int, ResolvedRelease]]:
     """Cross-reference song against Discogs and match releases back to library.
 
@@ -1553,6 +1585,8 @@ async def search_song_as_track(
         discogs_service: Required. Without it, this strategy no-ops.
         pg: Discogs-cache PG handle for the #632 row-less resolution cache. When
             ``None`` the A1 carry-through (LML#628) still resolves, just uncached.
+        allow_release_resolution_fallback: Bulk kill switch (LML#652). ``False``
+            on /lookup/bulk suppresses the row-less carry-through entirely.
 
     Returns:
         Tuple of (library_items, matched_via_by_id, discogs_titles). See the
@@ -1561,7 +1595,13 @@ async def search_song_as_track(
         only when the #628 carry-through fires.
     """
     return await _match_track_releases_to_library(
-        db, discogs_service, song, artist=None, source="song_as_track", pg=pg
+        db,
+        discogs_service,
+        song,
+        artist=None,
+        source="song_as_track",
+        pg=pg,
+        allow_release_resolution_fallback=allow_release_resolution_fallback,
     )
 
 
@@ -1859,6 +1899,7 @@ async def search_compilations_for_track(
     discogs_service: DiscogsService | None = None,
     *,
     pg: PgSource | None = None,
+    allow_release_resolution_fallback: bool = True,
 ) -> tuple[list[LibraryItem], dict[int, ResolvedRelease]]:
     """Search for track on compilation albums using Discogs and library keyword search.
 
@@ -1877,7 +1918,9 @@ async def search_compilations_for_track(
     validated (via :func:`_resolve_nonlibrary_release`, keyed on the typed
     ``parsed.artist``) and surfaced row-less as ``LibraryItem(id=0)`` +
     ``discogs_titles[0]``. ``pg`` threads the #632 cache; ``None`` resolves
-    uncached.
+    uncached. ``allow_release_resolution_fallback`` is the bulk kill switch
+    (LML#652): ``False`` on /lookup/bulk suppresses that carry-through entirely
+    (no resolve, no cache write, no row-less item).
     """
     if not parsed.song or not parsed.artist:
         return [], {}
@@ -2248,8 +2291,16 @@ async def search_compilations_for_track(
     # off a non-library release. Surface it row-less rather than empty. Keyed on
     # the typed ``parsed.artist`` (NOT ``lib_artist`` / the canonical-swapped
     # ``artist_for_probes``), consistent with the #626 two-channel decision and
-    # the #632 cache contract. Gated; off by default.
-    if not results and get_settings().lml_resolve_nonlibrary_release and parsed.song:
+    # the #632 cache contract. Gated; off by default. LML#652: also gated on the
+    # bulk kill switch — /lookup/bulk passes ``allow_release_resolution_fallback
+    # =False`` so the backfill never pays the per-row resolve + #632 cache write
+    # (parity with #604's lazy fallback).
+    if (
+        not results
+        and get_settings().lml_resolve_nonlibrary_release
+        and allow_release_resolution_fallback
+        and parsed.song
+    ):
         # Distinct name from the #604 ``resolved`` bound earlier in this function
         # (a non-optional ``ResolvedRelease``) — the helper returns an Optional,
         # and reusing the name trips a mypy assignment-type collision.
@@ -2582,6 +2633,7 @@ async def find_library_albums_with_cached_track(
     limit: int = MAX_SEARCH_RESULTS,
     *,
     match_artist: str | None = None,
+    allow_release_resolution_fallback: bool = True,
 ) -> tuple[list[LibraryItem], dict[int, ResolvedRelease]]:
     """Find WXYC library albums whose Discogs cache entry lists ``song`` by ``artist``.
 
@@ -2605,7 +2657,11 @@ async def find_library_albums_with_cached_track(
     **row-less** ``LibraryItem(id=0)`` is returned with the resolved release on
     the ``{0: ResolvedRelease}`` seam, reusing #628's carry-through so the
     ``release_id`` (hence ``discogs_url``) still surfaces instead of being
-    dropped for want of a matching catalog row.
+    dropped for want of a matching catalog row. This A4 row-less surface is the
+    *fifth* row-less producer (LML#652): it honors the per-request bulk kill
+    switch ``allow_release_resolution_fallback`` exactly as the four strategy
+    producers do — ``False`` on /lookup/bulk suppresses it (the in-library
+    promotion above is unaffected, returning before the gate).
 
     Cache-only by design: skips any API fallback path. Returns ``([], {})``
     cleanly when the cache is unavailable, fails, or has nothing for the query —
@@ -2661,7 +2717,13 @@ async def find_library_albums_with_cached_track(
     # against here (the cache keyed on track only), so confidence is soft: the
     # pick was never album-matched, and the soft value rides the seam so the bind
     # surfaces it even when the request did type an album.
-    if not get_settings().lml_resolve_nonlibrary_release:
+    #
+    # LML#652: gated on the bulk kill switch too — /lookup/bulk passes
+    # ``allow_release_resolution_fallback=False`` so this A4 row-less surface (the
+    # fifth row-less producer) never reaches the per-row ``bind_carried`` artwork
+    # fetch on the backfill path. The in-library promotion above returns before
+    # this gate, so it stays available on bulk.
+    if not (get_settings().lml_resolve_nonlibrary_release and allow_release_resolution_fallback):
         return [], {}
     # Require a title as well as an id: a title-less release would surface a
     # degenerate row-less item (title=""), exactly what the sibling rehydrate
@@ -2828,8 +2890,16 @@ async def fetch_artwork_for_items(
             #     binding the carried release is the only way to surface it.
             # Flag-off on both re-searches exactly as before (the release's
             # album_title still seeds that search below for non-row-less items).
+            # LML#652: the row-less (id==0) bind also honors the bulk kill switch —
+            # belt-and-suspenders, since once the five row-less producers (the four
+            # Discogs-aware strategies + the A4 cached-track safety net) are gated
+            # no id==0 item reaches here on /lookup/bulk. The #604 compilation
+            # trust-bind (the first operand) is NOT gated here; its own lazy
+            # fallback already respects the switch below.
             bind_carried = resolve_compilation_release or (
-                resolve_nonlibrary_release and item.id == ROWLESS_LIBRARY_ID
+                resolve_nonlibrary_release
+                and item.id == ROWLESS_LIBRARY_ID
+                and allow_release_resolution_fallback
             )
             if bind_carried and resolved is not None:
                 return await _bind_resolved_release(
@@ -3854,6 +3924,13 @@ async def perform_lookup(
         # ``discogs_cache_pg`` threads the #632 row-less resolution cache into the
         # three Discogs-aware strategies' A1 carry-through (LML#628). The library
         # channel and ARTIST_PLUS_ALBUM / SONG_AS_ARTIST never touch it.
+        # LML#652: the per-request bulk kill switch (``False`` on /lookup/bulk)
+        # threads into the four Discogs-aware row-less producers here via the
+        # partials, and into the fifth (the A4 cached-track safety net) at its
+        # own Step-3b call site below — exactly as it already reaches
+        # ``fetch_artwork_for_items`` (Step 4) for #604's lazy fallback. So no
+        # row-less item surfaces, nor any carry-through resolve or #632 cache
+        # write, on the backfill path.
         strategies = build_strategies(
             db,
             search_library_func=search_library_with_fallback,
@@ -3861,17 +3938,24 @@ async def perform_lookup(
                 search_with_alternative_interpretation,
                 discogs_service=discogs_service,
                 pg=discogs_cache_pg,
+                allow_release_resolution_fallback=allow_release_resolution_fallback,
             ),
             search_compilations_func=partial(
                 search_compilations_for_track,
                 discogs_service=discogs_service,
                 pg=discogs_cache_pg,
+                allow_release_resolution_fallback=allow_release_resolution_fallback,
             ),
             search_song_as_artist_func=partial(
-                search_song_as_artist, discogs_service=discogs_service
+                search_song_as_artist,
+                discogs_service=discogs_service,
+                allow_release_resolution_fallback=allow_release_resolution_fallback,
             ),
             search_song_as_track_func=partial(
-                search_song_as_track, discogs_service=discogs_service, pg=discogs_cache_pg
+                search_song_as_track,
+                discogs_service=discogs_service,
+                pg=discogs_cache_pg,
+                allow_release_resolution_fallback=allow_release_resolution_fallback,
             ),
         )
 
@@ -3947,6 +4031,7 @@ async def perform_lookup(
                         parsed.artist,
                         discogs_service,
                         match_artist=library_artist_for(parsed),
+                        allow_release_resolution_fallback=allow_release_resolution_fallback,
                     )
                     if promoted:
                         library_results = promoted

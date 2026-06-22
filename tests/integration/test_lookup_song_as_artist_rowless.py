@@ -134,3 +134,32 @@ async def test_song_as_artist_flag_off_no_rowless(library_db, monkeypatch):
     # vacuously on an empty list even if the gate were deleted or inverted.
     assert response.results == []
     assert response.search_type != "song_as_artist"
+
+
+@pytest.mark.asyncio
+async def test_song_as_artist_bulk_kill_switch_suppresses_rowless(
+    library_db, enable_nonlibrary_release
+):
+    """LML#652: the #631 SONG_AS_ARTIST row-less surface respects the bulk kill
+    switch. Flag on + ``allow_release_resolution_fallback=False`` (the /lookup/bulk
+    drain) surfaces no row-less item — and, because no id==0 item reaches
+    ``fetch_artwork_for_items``, fires no ``bind_carried`` artwork fetch (the
+    row-less artwork fallback runs through ``get_release``, which must stay
+    un-awaited). Contrast ``test_song_as_artist_surfaces_rowless_when_flag_on``,
+    which surfaces the row-less item from these same inputs with the switch open.
+    """
+    svc = _base_mock()
+    request = LookupRequest(song=SESSA_ARTIST, raw_message=SESSA_ARTIST)
+
+    with _patch_artist_releases():
+        response = await perform_lookup(
+            request,
+            library_db,
+            svc,
+            telemetry=make_lml_telemetry(),
+            allow_release_resolution_fallback=False,
+        )
+
+    assert response.results == []
+    assert response.search_type != "song_as_artist"
+    svc.get_release.assert_not_awaited()

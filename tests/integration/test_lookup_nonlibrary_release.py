@@ -27,7 +27,7 @@ exercised. Flag default-off asserts today's empty/sentinel behavior.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from wxyc_etl.text import to_match_form
@@ -38,6 +38,7 @@ from discogs.models import (
     ReleaseMetadataResponse,
     TrackReleasesResponse,
 )
+from lookup import orchestrator
 from lookup.models import LookupRequest
 from lookup.orchestrator import ROWLESS_NO_ALBUM_CONFIDENCE, perform_lookup
 from tests.conftest import make_lml_telemetry
@@ -143,18 +144,44 @@ class _RecordingPg:
         return "INSERT 0 1"
 
 
+def _surfaced_rowless(response) -> bool:
+    """True iff a row-less Discogs identity (id==0 with a real release) surfaced."""
+    return any(
+        r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
+        for r in response.results
+    )
+
+
+def _spy_resolve_nonlibrary():
+    """Patch ``_resolve_nonlibrary_release`` with a pass-through spy.
+
+    ``wraps`` keeps the real resolve behavior, so a *broken* gate still fires the
+    carry-through (and the row-less assertions fail too); the fixed gate never
+    awaits it. Lets ``assert_not_awaited()`` pin LML#652's core invariant
+    directly, not just by proxy through the cache-write count.
+    """
+    return patch.object(
+        orchestrator,
+        "_resolve_nonlibrary_release",
+        new=AsyncMock(wraps=orchestrator._resolve_nonlibrary_release),
+    )
+
+
 # ---------------------------------------------------------------------------
 # TRACK_ON_COMPILATION
 # ---------------------------------------------------------------------------
 
 
-async def _run_track_on_compilation(library_db, svc, *, pg=None):
+async def _run_track_on_compilation(library_db, svc, *, pg=None, allow=True):
     """Drive perform_lookup down the TRACK_ON_COMPILATION cut-site.
 
     The artist is not in the seeded library, ``resolve_albums_for_track`` sees
     only a V/A release for the track (sets ``song_not_found``), and the
     compilation album title is not shelved — so ``search_compilations_for_track``
     finds the Discogs release but no library row.
+
+    ``allow`` threads ``allow_release_resolution_fallback`` (the bulk kill switch,
+    LML#652); the /lookup default is ``True`` and /lookup/bulk passes ``False``.
     """
     request = LookupRequest(
         artist=SPINE_ARTIST,
@@ -167,6 +194,7 @@ async def _run_track_on_compilation(library_db, svc, *, pg=None):
         svc,
         telemetry=make_lml_telemetry(),
         discogs_cache_pg=pg,
+        allow_release_resolution_fallback=allow,
     )
 
 
@@ -335,17 +363,43 @@ async def test_track_on_compilation_surfaces_rowless_via_album_title_wave(
     assert rowless[0].artwork.release_url == SPINE_RELEASE_URL
 
 
+@pytest.mark.asyncio
+async def test_track_on_compilation_bulk_kill_switch_suppresses_carry_through(
+    library_db, enable_nonlibrary_release
+):
+    """LML#652: ``allow_release_resolution_fallback=False`` (the /lookup/bulk
+    drain) must suppress the #628 carry-through even with the flag on — no
+    ``_resolve_nonlibrary_release``, no #632 cache write, no row-less item.
+
+    Same inputs as ``test_track_on_compilation_threads_pg_and_writes_cache``
+    (which asserts ``pg.execute_calls >= 1`` with the kill switch open), so the
+    contrast isolates the gate."""
+    svc = _base_discogs_mock()
+    svc.search_releases_by_track = AsyncMock(return_value=_track_releases(_spine_release()))
+    pg = _RecordingPg()
+
+    with _spy_resolve_nonlibrary() as resolve_spy:
+        response = await _run_track_on_compilation(library_db, svc, pg=pg, allow=False)
+
+    resolve_spy.assert_not_awaited()
+    assert pg.execute_calls == 0
+    assert not _surfaced_rowless(response)
+
+
 # ---------------------------------------------------------------------------
 # SONG_AS_TRACK
 # ---------------------------------------------------------------------------
 
 
-async def _run_song_as_track(library_db, svc, *, pg=None):
+async def _run_song_as_track(library_db, svc, *, pg=None, allow=True):
     """Drive perform_lookup down the SONG_AS_TRACK cut-site.
 
     Song-only (no artist) so SONG_AS_ARTIST runs first and finds nothing, then
     SONG_AS_TRACK cross-references the song as a track. The surfaced release is
     not in the library, so the kernel's library gate drops it.
+
+    ``allow`` threads ``allow_release_resolution_fallback`` (the bulk kill switch,
+    LML#652).
     """
     request = LookupRequest(song=SPINE_TRACK, raw_message=SPINE_TRACK)
     return await perform_lookup(
@@ -354,6 +408,7 @@ async def _run_song_as_track(library_db, svc, *, pg=None):
         svc,
         telemetry=make_lml_telemetry(),
         discogs_cache_pg=pg,
+        allow_release_resolution_fallback=allow,
     )
 
 
@@ -402,6 +457,29 @@ async def test_song_as_track_flag_off_no_rowless(library_db):
         r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
         for r in response.results
     )
+
+
+@pytest.mark.asyncio
+async def test_song_as_track_bulk_kill_switch_suppresses_carry_through(
+    library_db, enable_nonlibrary_release
+):
+    """LML#652: the song-only SONG_AS_TRACK carry-through respects the bulk kill
+    switch. With ``allow_release_resolution_fallback=False`` + the flag on and a
+    real-credit release that would otherwise surface (the flag-on sibling above),
+    no resolve fires, no #632 cache write happens, and no row-less item surfaces."""
+    svc = _base_discogs_mock()
+    svc.lookup_releases_by_artist = AsyncMock(return_value=[])
+    svc.search_releases_by_track = AsyncMock(
+        return_value=_track_releases(_spine_release(artist=SPINE_ARTIST))
+    )
+    pg = _RecordingPg()
+
+    with _spy_resolve_nonlibrary() as resolve_spy:
+        response = await _run_song_as_track(library_db, svc, pg=pg, allow=False)
+
+    resolve_spy.assert_not_awaited()
+    assert pg.execute_calls == 0
+    assert not _surfaced_rowless(response)
 
 
 @pytest.mark.asyncio
@@ -582,13 +660,16 @@ SWAPPED_ARTIST = "Stereolab"
 SWAPPED_TRACK = "Tunes"
 
 
-async def _run_swapped(library_db, svc, *, pg=None):
+async def _run_swapped(library_db, svc, *, pg=None, allow=True):
     """Drive perform_lookup down the SWAPPED_INTERPRETATION cut-site.
 
     ``"Stereolab - Tunes"`` is an ambiguous X - Y. "Stereolab" matches the seeded
     library artist (results1), "Tunes" as an artist matches nothing (results2
     empty), so the kernel narrows by cross-referencing "Tunes" as a track against
     Discogs — but the release holding it is a comp not shelved in the library.
+
+    ``allow`` threads ``allow_release_resolution_fallback`` (the bulk kill switch,
+    LML#652).
     """
     request = LookupRequest(raw_message=f"{SWAPPED_ARTIST} - {SWAPPED_TRACK}")
     return await perform_lookup(
@@ -597,6 +678,7 @@ async def _run_swapped(library_db, svc, *, pg=None):
         svc,
         telemetry=make_lml_telemetry(),
         discogs_cache_pg=pg,
+        allow_release_resolution_fallback=allow,
     )
 
 
@@ -644,3 +726,23 @@ async def test_swapped_interpretation_flag_off_no_rowless(library_db):
         r.library_item.id == 0 and r.artwork is not None and r.artwork.release_id > 0
         for r in response.results
     )
+
+
+@pytest.mark.asyncio
+async def test_swapped_interpretation_bulk_kill_switch_suppresses_carry_through(
+    library_db, enable_nonlibrary_release
+):
+    """LML#652: the SWAPPED_INTERPRETATION carry-through (the second kernel path,
+    sharing the gate with SONG_AS_TRACK) respects the bulk kill switch. Flag on +
+    ``allow_release_resolution_fallback=False`` fires no resolve, writes no #632
+    cache, and surfaces no row-less item."""
+    svc = _base_discogs_mock()
+    svc.search_releases_by_track = AsyncMock(side_effect=_swapped_track_probe)
+    pg = _RecordingPg()
+
+    with _spy_resolve_nonlibrary() as resolve_spy:
+        response = await _run_swapped(library_db, svc, pg=pg, allow=False)
+
+    resolve_spy.assert_not_awaited()
+    assert pg.execute_calls == 0
+    assert not _surfaced_rowless(response)
