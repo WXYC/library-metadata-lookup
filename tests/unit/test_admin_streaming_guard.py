@@ -439,6 +439,65 @@ class TestUploadStreamingGuard:
         assert resp.status_code == 200
         assert _read_apple_count(vol) == 288
 
+    @pytest.mark.asyncio
+    async def test_unreadable_existing_db_409_detail_has_no_regressions(
+        self, tmp_path, admin_settings
+    ):
+        """The unreadable-baseline 409 carries the `error` discriminator but no `regressions`.
+
+        Guards the contract a consumer branches on: a 409 always has `detail['error']`,
+        and `detail['regressions']` is present only for the coverage-regression variant.
+        """
+        from main import app
+
+        vol = self._volume_path(admin_settings)
+        vol.write_bytes(b"this is not a sqlite database")
+        upload = tmp_path / "u.db"
+        _make_streaming_db(upload, albums=300, apple=288, spotify=200, deezer=150)
+
+        resp = await self._upload(app, admin_settings, upload)
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert "error" in detail
+        assert "regressions" not in detail
+
+    @pytest.mark.asyncio
+    async def test_unreadable_uploaded_tmp_after_validation_is_500(
+        self, tmp_path, admin_settings, monkeypatch
+    ):
+        """A read fault on the just-validated upload is a server fault (500), not a 400.
+
+        The upload passes the albums-count probe, then the coverage read of the tmp
+        file faults -- a server-side problem with a file we just wrote, so a
+        retry-on-5xx caller should retry. The tmp file must still be cleaned up.
+        """
+        import routers.admin as admin_mod
+        from main import app
+
+        # A healthy prior file on the volume, so old_cov reads fine and we reach
+        # the tmp-file coverage read.
+        vol = self._volume_path(admin_settings)
+        _make_streaming_db(vol, albums=100, apple=50, spotify=80, deezer=60)
+
+        upload = tmp_path / "u.db"
+        _make_streaming_db(upload, albums=100, apple=50, spotify=80, deezer=60)
+
+        real_coverage = admin_mod._streaming_coverage
+
+        def fake_coverage(db_path):
+            # Fault only on the freshly-written tmp file; delegate for the on-disk one.
+            if str(db_path).endswith(".tmp"):
+                raise admin_mod.StreamingCoverageUnreadableError(str(db_path))
+            return real_coverage(db_path)
+
+        monkeypatch.setattr(admin_mod, "_streaming_coverage", fake_coverage)
+
+        resp = await self._upload(app, admin_settings, upload)
+        assert resp.status_code == 500
+        # The on-disk file is untouched and the tmp scratch file is cleaned up.
+        assert _read_apple_count(vol) == 50
+        assert not (vol.parent / (vol.name + ".tmp")).exists()
+
 
 def _read_apple_count(path) -> int:
     conn = sqlite3.connect(str(path))

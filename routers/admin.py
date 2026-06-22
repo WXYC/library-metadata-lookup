@@ -96,8 +96,9 @@ def _streaming_coverage(db_path: Path) -> dict[str, int]:
                 # pipeline inserts a row per track up front (resolution_status
                 # 'pending', NULL URLs) and fills URLs in later, so a raw COUNT(*)
                 # would let an upload that nulls every track URL slip past the
-                # guard. Fall back to COUNT(*) on a legacy/unexpected schema so a
-                # disappearing table is still caught as an N -> 0 regression.
+                # guard. Fall back to COUNT(*) on a legacy/partial schema missing
+                # any of these columns (over-counting only makes the guard harder
+                # to trip falsely) so a disappearing table is still caught as N->0.
                 track_cols = _table_columns(conn, "track_results")
                 if {"resolution_status", "spotify_url", "deezer_url"} <= track_cols:
                     cov["track_results"] = conn.execute(
@@ -341,10 +342,16 @@ async def upload_library_db(
     summary="Upload a streaming_availability.db backup",
     responses={
         200: {"description": "Upload successful"},
-        400: {"description": "Invalid SQLite database"},
+        400: {"description": "Invalid SQLite database (failed the 'albums' probe)"},
         401: {"description": "Missing authorization"},
         403: {"description": "Invalid or missing token"},
-        409: {"description": "Coverage regression vs the file on disk (use force=true)"},
+        409: {
+            "description": "Refused (use force=true): either a coverage regression vs the "
+            "file on disk, or the on-disk file is present but unreadable. The JSON `detail` "
+            "carries an `error` discriminator; the regression variant also includes a "
+            "`regressions` list."
+        },
+        500: {"description": "Server-side fault writing or reading the file"},
     },
 )
 async def upload_streaming_db(
@@ -356,12 +363,18 @@ async def upload_streaming_db(
     """Store a streaming_availability.db backup on the Railway volume.
 
     This is the canonical copy the daily library-sync reads (LML#672), so the
-    upload is a full-file replace guarded against coverage regression: if any of
-    {apple_url, spotify_url, deezer_url, albums, track_results} drops below
-    prior * (1 - tolerance) or goes non-zero -> zero versus the file currently on
-    disk, the upload is rejected with 409. Pass ``?force=true`` to override an
-    intentional shrink (logged loudly). Validated as SQLite with an 'albums'
-    table before the guard runs.
+    upload is a full-file replace guarded against coverage regression. It is first
+    validated as SQLite with an 'albums' table (400 on failure), then the guard
+    runs and rejects the upload with **409** when either:
+
+    * any of {apple_url, spotify_url, deezer_url, albums, track_results} drops
+      below prior * (1 - tolerance) or goes non-zero -> zero versus the file
+      currently on disk -- ``detail`` is ``{error, regressions, hint}``; or
+    * the on-disk file exists but cannot be read, so there is no baseline to
+      compare against -- ``detail`` is ``{error, hint}`` (no ``regressions``).
+
+    Branch on ``detail['error']``; ``regressions`` is only present for the first
+    case. Pass ``?force=true`` to override either rejection (logged loudly).
     """
     _validate_auth(settings, authorization)
 
@@ -417,13 +430,13 @@ async def upload_streaming_db(
     try:
         new_cov = _streaming_coverage(tmp_path)
     except StreamingCoverageUnreadableError as e:
-        # The upload passed the albums-count validation above, so this is a
-        # transient read fault on a file we just wrote -- treat it like an invalid
-        # upload (400) rather than blaming the on-disk baseline.
+        # The upload already passed the albums-count validation above, so this is a
+        # server-side read fault on a file we just wrote and validated, not a bad
+        # client upload -- surface it as 500 so a retry-on-5xx caller retries.
         tmp_path.unlink(missing_ok=True)
         raise HTTPException(
-            status_code=400,
-            detail=f"Uploaded streaming DB became unreadable: {e}",
+            status_code=500,
+            detail=f"Uploaded streaming DB became unreadable after validation: {e}",
         ) from e
     regressions = _check_streaming_regression(old_cov, new_cov)
     if regressions:
