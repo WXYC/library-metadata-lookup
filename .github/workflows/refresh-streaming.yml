@@ -106,8 +106,8 @@ jobs:
             --dry-run
 
       # Write the enriched copy back to the canonical volume. The coverage guard
-      # rejects a regression (e.g. a stale writer that lost Apple) — that is the
-      # intended serialization: a rejected write re-applies next cycle.
+      # rejects a regression (e.g. a stale-content writer that lost Apple) — a
+      # rejected write simply re-applies on the next cycle.
       - name: Upload streaming_availability.db to the Railway volume
         run: |
           set -euo pipefail

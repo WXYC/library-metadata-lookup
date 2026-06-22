@@ -49,14 +49,31 @@ def _streaming_db_path(settings: Settings) -> Path:
     return settings.resolved_library_db_path.parent / STREAMING_DB_FILENAME
 
 
+class StreamingCoverageUnreadableError(Exception):
+    """A streaming_availability.db file exists on disk but could not be read.
+
+    Distinguishes "no prior file" (a legitimate first upload) from "prior file
+    present but unreadable" so the upload guard can fail *closed* on the latter:
+    waving an upload through because the baseline read failed would re-open the
+    288-Apple-URLs -> 0 hole the guard exists to plug, precisely when the disk is
+    flaky.
+    """
+
+
 def _streaming_coverage(db_path: Path) -> dict[str, int]:
     """Coverage metrics for a streaming_availability.db file (LML#672 guard).
 
     Always returns the same five fixed keys (see ``_STREAMING_COVERAGE_METRICS``).
-    A missing file, missing ``albums``/``track_results`` table, or missing URL
-    column all read as ``0`` rather than raising, so the regression check can
-    iterate without ``KeyError`` and a disappearing table/column is caught as an
-    N -> 0 regression. Mirrors the defensive style of ``_get_streaming_ids``.
+    A missing file returns all-zero (the first-upload baseline). A missing
+    ``albums``/``track_results`` table, or a missing URL column, reads as ``0``
+    rather than raising, so the regression check can iterate without ``KeyError``
+    and a disappearing table/column is caught as an N -> 0 regression.
+
+    Raises:
+        StreamingCoverageUnreadableError: the file exists but the read failed (corrupt
+            file, locking error, I/O fault). Callers decide how to react -- the
+            upload guard fails closed (409) rather than treating an unreadable
+            baseline as "nothing to regress against".
     """
     zero = dict.fromkeys(_STREAMING_COVERAGE_METRICS, 0)
     if not db_path.exists():
@@ -74,15 +91,30 @@ def _streaming_coverage(db_path: Path) -> dict[str, int]:
                             f"SELECT COUNT({col}) FROM albums"  # noqa: S608 (col from fixed allowlist)
                         ).fetchone()[0]
             if _has_table(conn, "track_results"):
-                cov["track_results"] = conn.execute(
-                    "SELECT COUNT(*) FROM track_results"
-                ).fetchone()[0]
+                # Count only *usable* track rows -- resolved and URL-bearing -- to
+                # mirror the predicate export_streaming_links.py applies. The
+                # pipeline inserts a row per track up front (resolution_status
+                # 'pending', NULL URLs) and fills URLs in later, so a raw COUNT(*)
+                # would let an upload that nulls every track URL slip past the
+                # guard. Fall back to COUNT(*) on a legacy/unexpected schema so a
+                # disappearing table is still caught as an N -> 0 regression.
+                track_cols = _table_columns(conn, "track_results")
+                if {"resolution_status", "spotify_url", "deezer_url"} <= track_cols:
+                    cov["track_results"] = conn.execute(
+                        "SELECT COUNT(*) FROM track_results "
+                        "WHERE resolution_status IN ('local_match', 'api_match') "
+                        "AND (spotify_url IS NOT NULL OR deezer_url IS NOT NULL)"
+                    ).fetchone()[0]
+                else:
+                    cov["track_results"] = conn.execute(
+                        "SELECT COUNT(*) FROM track_results"
+                    ).fetchone()[0]
             return cov
         finally:
             conn.close()
-    except Exception:
+    except Exception as e:
         logger.warning("Failed to read streaming coverage from %s", db_path, exc_info=True)
-        return zero
+        raise StreamingCoverageUnreadableError(str(db_path)) from e
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
@@ -355,10 +387,44 @@ async def upload_streaming_db(
         ) from e
 
     # Coverage-regression guard (LML#672): compare against the live on-disk file
-    # at replace time (not an uploader-supplied baseline), so a stale writer in a
-    # read-modify-write race is rejected and re-applies next cycle.
-    old_cov = _streaming_coverage(db_path)
-    new_cov = _streaming_coverage(tmp_path)
+    # at replace time (not an uploader-supplied baseline). A stale-content writer
+    # that genuinely lost coverage is rejected on the regression and re-applies on
+    # its next cycle. (This is eventual rejection across cycles, not a lock across
+    # concurrent uploads -- the two writers here, a weekly cron and a rare manual
+    # run, are effectively non-concurrent.)
+    try:
+        old_cov = _streaming_coverage(db_path)
+    except StreamingCoverageUnreadableError:
+        # The existing file is present but unreadable, so there is no baseline to
+        # compare against. Fail closed rather than fail open: treating it as a
+        # first upload would accept any thin replacement. force=true overrides.
+        if force:
+            logger.warning(
+                "On-disk streaming DB unreadable but force=true; "
+                "replacing without a coverage baseline."
+            )
+            old_cov = dict.fromkeys(_STREAMING_COVERAGE_METRICS, 0)
+        else:
+            tmp_path.unlink(missing_ok=True)
+            logger.warning("Rejected streaming upload: on-disk streaming DB unreadable.")
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "existing streaming DB unreadable; refusing to replace blind",
+                    "hint": "retry once the volume is readable, or pass force=true to override",
+                },
+            ) from None
+    try:
+        new_cov = _streaming_coverage(tmp_path)
+    except StreamingCoverageUnreadableError as e:
+        # The upload passed the albums-count validation above, so this is a
+        # transient read fault on a file we just wrote -- treat it like an invalid
+        # upload (400) rather than blaming the on-disk baseline.
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Uploaded streaming DB became unreadable: {e}",
+        ) from e
     regressions = _check_streaming_regression(old_cov, new_cov)
     if regressions:
         if force:
