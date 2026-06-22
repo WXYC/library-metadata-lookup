@@ -79,12 +79,9 @@ ignore_errors = true
 # new pipeline scripts should remain fully typed.
 [[tool.mypy.overrides]]
 module = [
-    "scripts.bandcamp_lookup",
-    "scripts.bandcamp_search",
     "scripts.canonicalize_albums",
     "scripts.canonicalize_compilations",
     "scripts.enrich_discogs_matches",
-    "scripts.kagi_streaming_search",
     "scripts.match_compilations",
     "scripts.merge_cta",
     "scripts.musicbrainz_matching",
