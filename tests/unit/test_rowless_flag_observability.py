@@ -23,6 +23,14 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
 
+from config.settings import get_settings
+from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+from lookup.models import LookupResponse
+from lookup.router import LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY
+from main import app
+from tests.factories import LOOKUP_BODY
+from tests.unit.conftest import override_deps
+
 
 class TestNonlibraryReleaseSurfacedCounter:
     """The ``nonlibrary_release_surfaced`` counter fires once per flag-gated
@@ -210,12 +218,48 @@ def _completed_cache_props(mock_posthog: Mock) -> dict:
     raise AssertionError("no *_completed PostHog event captured")
 
 
+async def _post_for_cache_props(endpoint: str, json_body: dict, *, mock_settings) -> dict:
+    """POST to a lookup endpoint with ``perform_lookup`` and PostHog mocked, then
+    return the ``*_completed`` event's ``cache`` props.
+
+    Shared by the flag-tag cases so the override + patch + client scaffolding
+    lives once. The flag value under test is set by the ``set_flags`` fixture
+    (env + ``get_settings.cache_clear``) — the router reads ``get_settings()``
+    directly, so env is the control point; the ``get_settings`` override here
+    only neutralizes the DI-injected settings for the other dependency providers,
+    matching the sibling router suites."""
+    mock_posthog = Mock()
+    mock_posthog.capture = Mock()
+    mock_posthog.flush = Mock()
+
+    with (
+        override_deps(
+            app,
+            {
+                get_library_db: AsyncMock(),
+                get_discogs_service: AsyncMock(),
+                get_posthog_client: mock_posthog,
+                get_settings: mock_settings,
+            },
+        ),
+        patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=LookupResponse(results=[], search_type="none"),
+        ),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(endpoint, json=json_body)
+
+    assert resp.status_code == 200
+    return _completed_cache_props(mock_posthog)
+
+
 @pytest.fixture
 def set_flags(monkeypatch):
     """Set the row-less-family flags via env and reset the lru_cache around the
     test, mirroring the orchestrator suite's flag toggling. The router reads the
     process-constant ``get_settings()`` directly, so env is the control point."""
-    from config.settings import get_settings
 
     def _apply(*, nonlibrary: bool, compilation: bool = False):
         monkeypatch.setenv("LML_RESOLVE_NONLIBRARY_RELEASE", "true" if nonlibrary else "false")
@@ -232,81 +276,16 @@ class TestFlagTag:
     endpoints — recorded once per context at the router so the shared-context
     bulk batch never sums it to the batch size."""
 
+    @pytest.mark.parametrize("nonlibrary, expected", [(True, 1), (False, 0)])
     @pytest.mark.asyncio
-    async def test_lookup_records_flag_on_as_one(self, mock_settings, set_flags):
-        from config.settings import get_settings
-        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
-        from lookup.models import LookupResponse
-        from lookup.router import LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY
-        from main import app
-        from tests.factories import LOOKUP_BODY
-        from tests.unit.conftest import override_deps
-
-        set_flags(nonlibrary=True)
-        mock_posthog = Mock()
-        mock_posthog.capture = Mock()
-        mock_posthog.flush = Mock()
-
-        with (
-            override_deps(
-                app,
-                {
-                    get_library_db: AsyncMock(),
-                    get_discogs_service: AsyncMock(),
-                    get_posthog_client: mock_posthog,
-                    get_settings: mock_settings,
-                },
-            ),
-            patch(
-                "lookup.router.perform_lookup",
-                new_callable=AsyncMock,
-                return_value=LookupResponse(results=[], search_type="direct"),
-            ),
-        ):
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-                resp = await ac.post("/api/v1/lookup", json=LOOKUP_BODY)
-
-        assert resp.status_code == 200
-        cache = _completed_cache_props(mock_posthog)
-        assert cache[LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY] == 1
-
-    @pytest.mark.asyncio
-    async def test_lookup_records_flag_off_as_zero(self, mock_settings, set_flags):
-        from config.settings import get_settings
-        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
-        from lookup.models import LookupResponse
-        from lookup.router import LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY
-        from main import app
-        from tests.factories import LOOKUP_BODY
-        from tests.unit.conftest import override_deps
-
-        set_flags(nonlibrary=False)
-        mock_posthog = Mock()
-        mock_posthog.capture = Mock()
-        mock_posthog.flush = Mock()
-
-        with (
-            override_deps(
-                app,
-                {
-                    get_library_db: AsyncMock(),
-                    get_discogs_service: AsyncMock(),
-                    get_posthog_client: mock_posthog,
-                    get_settings: mock_settings,
-                },
-            ),
-            patch(
-                "lookup.router.perform_lookup",
-                new_callable=AsyncMock,
-                return_value=LookupResponse(results=[], search_type="direct"),
-            ),
-        ):
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-                resp = await ac.post("/api/v1/lookup", json=LOOKUP_BODY)
-
-        assert resp.status_code == 200
-        cache = _completed_cache_props(mock_posthog)
-        assert cache[LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY] == 0
+    async def test_lookup_records_flag_state(self, nonlibrary, expected, mock_settings, set_flags):
+        """``/lookup`` carries the flag as ``1`` when on, ``0`` when off (the
+        flag-off baseline the A/B comparison needs)."""
+        set_flags(nonlibrary=nonlibrary)
+        cache = await _post_for_cache_props(
+            "/api/v1/lookup", LOOKUP_BODY, mock_settings=mock_settings
+        )
+        assert cache[LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY] == expected
 
     @pytest.mark.asyncio
     async def test_bulk_flag_tag_is_one_not_summed_across_batch(self, mock_settings, set_flags):
@@ -314,48 +293,18 @@ class TestFlagTag:
         batch sharing ONE cache_stats context, the tag must be ``1`` (recorded
         once at the router), never ``3``. Recording it per-item in the
         orchestrator would sum to the batch size."""
-        from config.settings import get_settings
-        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
-        from lookup.models import LookupResponse
-        from lookup.router import LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY
-        from main import app
-        from tests.unit.conftest import override_deps
-
         set_flags(nonlibrary=True)
-        mock_posthog = Mock()
-        mock_posthog.capture = Mock()
-        mock_posthog.flush = Mock()
-
-        with (
-            override_deps(
-                app,
-                {
-                    get_library_db: AsyncMock(),
-                    get_discogs_service: AsyncMock(),
-                    get_posthog_client: mock_posthog,
-                    get_settings: mock_settings,
-                },
-            ),
-            patch(
-                "lookup.router.perform_lookup",
-                new_callable=AsyncMock,
-                return_value=LookupResponse(results=[], search_type="none"),
-            ),
-        ):
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-                resp = await ac.post(
-                    "/api/v1/lookup/bulk",
-                    json={
-                        "items": [
-                            {"artist": "Stereolab", "album": "Aluminum Tunes"},
-                            {"artist": "Juana Molina", "album": "DOGA"},
-                            {"artist": "Cat Power", "album": "Moon Pix"},
-                        ]
-                    },
-                )
-
-        assert resp.status_code == 200
-        cache = _completed_cache_props(mock_posthog)
+        cache = await _post_for_cache_props(
+            "/api/v1/lookup/bulk",
+            {
+                "items": [
+                    {"artist": "Stereolab", "album": "Aluminum Tunes"},
+                    {"artist": "Juana Molina", "album": "DOGA"},
+                    {"artist": "Cat Power", "album": "Moon Pix"},
+                ]
+            },
+            mock_settings=mock_settings,
+        )
         assert cache[LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY] == 1
 
 
