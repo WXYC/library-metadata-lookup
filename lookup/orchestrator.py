@@ -1068,6 +1068,45 @@ async def search_song_as_artist(
     return [], None
 
 
+# LML#663: ``r.artist`` is a reliable credit only on the PG-cache path (the clean
+# ``artist_name`` column). On the live Discogs path it is title-derived —
+# ``DiscogsService._parse_title`` splits the search title on ``" - "`` and yields
+# ``artist=""`` when the title has no such separator, packing the whole title into
+# ``r.album``. A self-titled release (title is just the artist name) or one whose
+# title uses a non-ASCII dash then drops a genuine own-release, so a cold-cache
+# request falls through to not-found while a warm-cache one surfaces it. This
+# separator set recovers the leading credit from such a packed title.
+_PACKED_TITLE_SEPARATOR = re.compile(r"\s[-–—]\s")
+
+
+def _own_release_credit(r: DiscogsSearchResult, token_form: str) -> tuple[str, str] | None:
+    """``(artist, album_title)`` to surface when ``r`` credits the typed token, else None.
+
+    Recovers a title-derived-empty credit the live Discogs path left in ``r.album``
+    (LML#663). Still requires exact normalized-equality to ``token_form``, so V/A
+    "Various" and collaborations stay excluded — the gate is re-sourced, not loosened.
+    """
+    clean = (r.artist or "").strip()
+    if normalize_for_comparison(clean) == token_form:
+        return clean, r.album or ""
+    if clean:
+        # A non-empty credit that simply differs — a real mismatch (coincidental
+        # token hit, V/A "Various", or a collaboration). Drop without recovery.
+        return None
+    # Empty title-derived credit: the live path packed the whole Discogs title into
+    # ``r.album``. Recover the artist from it.
+    packed = (r.album or "").strip()
+    if not packed:
+        return None
+    if normalize_for_comparison(packed) == token_form:
+        # Self-titled: the title is just the artist name.
+        return packed, packed
+    parts = _PACKED_TITLE_SEPARATOR.split(packed, maxsplit=1)
+    if len(parts) == 2 and normalize_for_comparison(parts[0]) == token_form:
+        return parts[0].strip(), parts[1].strip()
+    return None
+
+
 def _select_rowless_artist_release(
     token: str, discogs_releases: list[DiscogsSearchResult]
 ) -> tuple[LibraryItem, ResolvedRelease] | None:
@@ -1102,10 +1141,14 @@ def _select_rowless_artist_release(
     malformed-upstream path.
     """
     token_form = normalize_for_comparison(token)
+    # (release, (recovered_artist, album_title)) for every release crediting the
+    # typed token. ``_own_release_credit`` recovers a credit the live Discogs path
+    # left title-derived-empty (LML#663), so a cold-cache request matches the
+    # warm-cache (clean ``r.artist``) outcome instead of dropping to not-found.
     own = [
-        r
+        (r, credit)
         for r in discogs_releases
-        if r.release_id > 0 and normalize_for_comparison(r.artist or "") == token_form
+        if r.release_id > 0 and (credit := _own_release_credit(r, token_form)) is not None
     ]
     if not own:
         return None
@@ -1114,16 +1157,17 @@ def _select_rowless_artist_release(
     # is chosen rather than the lowest release_id (the oldest pressing). ``own``
     # preserves ``discogs_releases`` order, which ``service.search`` sorted by
     # confidence descending with a stable sort.
-    best = min(enumerate(own), key=lambda iv: (-iv[1].confidence, iv[0]))[1]
-    # One album-title fallback feeds both the synthetic row's title and the
+    best, (best_artist, best_album) = min(
+        enumerate(own), key=lambda iv: (-iv[1][0].confidence, iv[0])
+    )[1]
+    # One recovered album title feeds both the synthetic row's title and the
     # carried release's album_title, so they can't drift.
-    album_title = best.album or ""
-    item = _make_rowless_item(artist=best.artist or token, title=album_title)
+    item = _make_rowless_item(artist=best_artist or token, title=best_album)
     resolved = ResolvedRelease(
         release_id=best.release_id,
         release_url=best.release_url,
         is_compilation=False,
-        album_title=album_title,
+        album_title=best_album,
     )
     return item, resolved
 

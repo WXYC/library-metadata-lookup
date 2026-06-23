@@ -397,6 +397,87 @@ class TestSearchSongAsArtistRowless:
         assert resolved.release_id == 900
         assert items[0].title == "Grandeza"
 
+    @pytest.mark.asyncio
+    async def test_emits_rowless_for_self_titled_live_path_credit(self, enable_nonlibrary_release):
+        """LML#663: on the live Discogs path the credit is title-derived —
+        ``_parse_title`` splits the search title on ``" - "`` and yields
+        ``artist=""`` when there is no separator (a self-titled release whose
+        title is just the artist name), packing the name into ``album``. The
+        warm-cache (PG) path has the clean credit and surfaces row-less; the gate
+        must recover the credit from the packed title so the cold/live path
+        produces the *same* outcome instead of dropping to not-found — the
+        warm/cold asymmetry #663 fixes.
+        """
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[])
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[make_discogs_result(release_id=556, artist="", album="Sessa")],
+        ):
+            items, discogs_titles = await search_song_as_artist(db, "Sessa", AsyncMock())
+
+        assert len(items) == 1
+        assert items[0].id == 0
+        assert items[0].artist == "Sessa"
+        assert discogs_titles is not None
+        assert discogs_titles[0].release_id == 556
+
+    @pytest.mark.asyncio
+    async def test_emits_rowless_for_packed_title_credit(self, enable_nonlibrary_release):
+        """LML#663: an ``"Artist <sep> Album"`` title whose separator the ASCII
+        ``" - "`` split missed (e.g. a non-ASCII en/em dash) lands whole in
+        ``album`` with ``artist=""``. Recover the leading credit and surface the
+        remainder as the row-less album title — not the packed string.
+        """
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[])
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[
+                make_discogs_result(release_id=557, artist="", album="Sessa – Estrela Acesa")
+            ],
+        ):
+            items, discogs_titles = await search_song_as_artist(db, "Sessa", AsyncMock())
+
+        assert len(items) == 1
+        assert items[0].id == 0
+        assert items[0].artist == "Sessa"
+        assert items[0].title == "Estrela Acesa"
+        assert discogs_titles[0].release_id == 557
+
+    @pytest.mark.asyncio
+    async def test_empty_credit_recovery_excludes_va_and_other_artists(
+        self, enable_nonlibrary_release
+    ):
+        """LML#663 constraint: recovering the credit from the packed title must
+        not loosen the gate. An empty title-derived credit whose packed title is
+        a V/A ``"Various"`` comp or a *different* artist stays excluded — the gate
+        still requires exact normalized-equality to the typed token, so only the
+        artist's own releases survive.
+        """
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[])
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_artist",
+            new_callable=AsyncMock,
+            return_value=[
+                make_discogs_result(release_id=560, artist="", album="Various"),
+                make_discogs_result(release_id=561, artist="", album="Tom Zé – Estudando O Samba"),
+            ],
+        ):
+            items, discogs_titles = await search_song_as_artist(db, "Sessa", AsyncMock())
+
+        assert items == []
+        assert discogs_titles is None
+
 
 # ---------------------------------------------------------------------------
 # search_library_with_fallback -- artist+song path (lines 260-265)
