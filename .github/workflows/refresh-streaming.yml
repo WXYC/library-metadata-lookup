@@ -25,12 +25,11 @@ on:
     - cron: "0 0 * * 0"
   workflow_dispatch:
 
-# Workflow-level GITHUB_TOKEN scope. The library.db download and (transitional)
-# release dual-write use GITHUB_TOKEN; the streaming_availability.db round-trip
-# uses ADMIN_TOKEN against the Railway volume. contents:write is required for the
-# release asset write.
+# Workflow-level GITHUB_TOKEN scope. The only release interaction is downloading
+# library.db (a read); the streaming_availability.db round-trip uses ADMIN_TOKEN
+# against the Railway volume, not GITHUB_TOKEN. contents:read is the safe floor.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   refresh:
@@ -124,13 +123,3 @@ jobs:
         env:
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
-
-      # TRANSITIONAL dual-write (LML#672 rollout step 1): keep the release asset
-      # warm until discogs-etl reads the volume and one sync cycle is verified.
-      # Removed in the cutover PR (rollout step 3), retiring this asset.
-      - name: Upload to GitHub Release (transitional dual-write)
-        run: |
-          gh release upload streaming-data-v1 streaming_availability.db --clobber 2>/dev/null || \
-          gh release create streaming-data-v1 streaming_availability.db --title "Streaming availability data" --notes "Pre-computed streaming service URLs for WXYC library releases. Updated weekly by the refresh-streaming workflow."
-        env:
-          GH_TOKEN: ${{ github.token }}

@@ -38,7 +38,7 @@ Three classes of pin in `.github/workflows/*.yml` exist for supply-chain reasons
 - **Workflow-level `permissions:`** scoped to the minimum each workflow needs:
   - `ci.yml`, `cross-cache-identity-flags.yml`, `set-railway-var.yml`: `contents: read` (no GITHUB_TOKEN writes).
   - `charset-corpus-drift.yml`: `contents: read` plus `packages: read` (the reusable workflow pulls `@wxyc/shared` from `npm.pkg.github.com`).
-  - `refresh-streaming.yml`: `contents: write` (downloads `library.db` from, and transitionally dual-writes `streaming_availability.db` to, the `streaming-data-v1` GitHub Release via `GH_TOKEN`). The canonical `streaming_availability.db` round-trip itself goes to the Railway **volume** via `ADMIN_TOKEN` + `PRODUCTION_URL` (see [Streaming Database Backup](#streaming-database-backup-upload--download)), not GITHUB_TOKEN.
+  - `refresh-streaming.yml`: `contents: read` (its only release interaction is downloading `library.db` via `GH_TOKEN` — a read). The canonical `streaming_availability.db` round-trip goes to the Railway **volume** via `ADMIN_TOKEN` + `PRODUCTION_URL` (see [Streaming Database Backup](#streaming-database-backup-upload--download)), not GITHUB_TOKEN.
   Failure mode is silent — a job that needs a missing scope (e.g. `pull-requests: write`) fails its API call but the workflow stays green. When adding a step that needs to comment on PRs, push tags, mint releases, etc., explicitly grant the scope at the job level (or widen the workflow-level floor only if every job in the file needs it).
 - **Reusable-workflow refs pinned to `@gha/v1`**, not `@main` — `WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@gha/v1` (in `ci.yml`) and `WXYC/wxyc-shared/.github/workflows/check-charset-corpus-drift.yml@gha/v1` (in `charset-corpus-drift.yml`). The publishing repos treat `gha/v1` as a moving major tag — re-pointed forward on non-breaking changes, frozen on breaking changes (which get a fresh `gha/v2`). Don't downgrade either to `@main`; if a `gha/v2` migration arrives, follow the procedure at the top of the publishing repo's CLAUDE.md.
 
@@ -78,7 +78,7 @@ The volume is now the enforced single source. Every writer round-trips it (downl
 - The occasional manual Apple + `track_streaming` run: same download → enrich → upload round-trip, so it never clobbers the weekly incremental and vice versa.
 - `sync-library.yml` (WXYC/discogs-etl, daily): reads the volume via `GET /admin/download-streaming-db` to enrich `library.db`.
 
-During the cutover the release asset is still **dual-written** by `refresh-streaming.yml` as a safety net; it is retired once discogs-etl is confirmed reading the volume (the release keeps hosting `library.db`).
+The `streaming_availability.db` release asset has been **retired** (LML#672 cutover): nothing writes or reads it anymore. The `streaming-data-v1` release still hosts **`library.db`** (written by discogs-etl `sync-library.yml`, read by `refresh-streaming.yml` as the input catalog).
 
 ### Coverage-regression guard on upload
 
