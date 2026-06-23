@@ -394,6 +394,39 @@ class Album(BaseModel):
     )
 
 
+class CatalogExportRow(BaseModel):
+    id: int
+    artist_name: str = Field(
+        ...,
+        description="Authoritative artist name. The server COALESCEs the denormalized library.artist_name to artists.artist_name (NOT NULL), so this never ships as null even before the denormalization backfill completes.\n",
+    )
+    album_title: str
+    code_letters: str = Field(..., description='Shelf call-number letters (e.g. "AU").')
+    code_number: int = Field(..., description="Shelf call-number release number.")
+    code_artist_number: int = Field(
+        ..., description="Shelf call-number artist number (genre-scoped)."
+    )
+    label: str | None = None
+    genre_name: str
+    format_name: str
+    on_streaming: bool | None = Field(
+        None,
+        description="True if on >=1 streaming service; false if physical-only; null if unknown.",
+    )
+    plays: int | None = None
+    artwork_url: str | None = Field(
+        None, description="Album cover URL from Discogs; null if not yet fetched."
+    )
+    rotation_bin: str | None = Field(
+        None,
+        description="RAW current-rotation bin — the most-recently-ADDED rotation record for this album — NOT the CURRENT_DATE-filtered value AlbumSearchResult returns. Nominal values are H/M/L/S (see RotationBin) but it is typed as a free string, NOT the RotationBin enum, so a value outside those cohorts (e.g. 'N', a current server-enum member — NOT legacy) cannot break a strict-enum decoder. Evaluate live rotation client-side together with rotation_kill_date:\n  in rotation  ==  rotation_bin != null\n                  AND (rotation_kill_date == null\n                       OR rotation_kill_date > today-in-client-tz)\nThe daily kill-date expiry is a clock event no DB trigger can observe, which is why this endpoint ships raw and defers expiry to the client.\n",
+    )
+    rotation_kill_date: date_aliased | None = Field(
+        None,
+        description="Date (YYYY-MM-DD; server ::text cast) the current rotation record expires, or null if it has none. Used with rotation_bin to evaluate live rotation client-side. Absent from AlbumSearchResult — a client that reuses AlbumSearchResult for this endpoint silently loses it.\n",
+    )
+
+
 class AddAlbumRequest(BaseModel):
     album_title: str
     artist_name: str | None = None
