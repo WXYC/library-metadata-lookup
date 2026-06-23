@@ -10,11 +10,17 @@ from typing import TYPE_CHECKING, Any
 import sentry_sdk
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import ValidationError
-from wxyc_fastapi.observability import RequestTelemetry, get_cache_stats, init_cache_stats
+from wxyc_fastapi.observability import (
+    RequestTelemetry,
+    get_cache_stats,
+    get_cache_stats_recorder,
+    init_cache_stats,
+)
 
 from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
+from config.settings import get_settings
 from core.bulk_concurrency import (
     cancel_and_drain,
     max_concurrency_from_env,
@@ -32,6 +38,11 @@ from core.search import SEARCH_API_CALL_CAP_FIRED_STAT_KEY
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
 from discogs.service import DiscogsService
+from entity.release_resolution_cache import (
+    RELEASE_RESOLUTION_CACHE_HIT_STAT_KEY,
+    RELEASE_RESOLUTION_CACHE_MISS_STAT_KEY,
+    RELEASE_RESOLUTION_CACHE_UNAVAILABLE_STAT_KEY,
+)
 from entity.sources import PgSource
 from entity.store import EntityStore
 from generated.api_models import CacheStats
@@ -44,7 +55,7 @@ from lookup.models import (
     LookupRequest,
     LookupResponse,
 )
-from lookup.orchestrator import perform_lookup
+from lookup.orchestrator import NONLIBRARY_RELEASE_SURFACED_STAT_KEY, perform_lookup
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
@@ -64,18 +75,63 @@ _BULK_LOOKUP_INPUT_CAP = 100
 
 _BULK_LOOKUP_DEFAULT_CONCURRENCY = 10
 
+# LML#681 flag-tag keys. Recorded once per cache_stats context at the router
+# (see ``_record_lml_flag_tags``) as a clean 0/1, so flag-on vs flag-off is
+# sliceable in both PostHog and the Sentry transaction. The key names mirror the
+# Settings field names so the dimension is self-describing.
+LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY = "lml_resolve_nonlibrary_release"
+LML_RESOLVE_COMPILATION_RELEASE_STAT_KEY = "lml_resolve_compilation_release"
+
 _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     "memory_cache_inflight_join",
     "memory_cache_inflight_retry_after_cancel",
     "memory_cache_write_failed",
     SEARCH_API_CALL_CAP_FIRED_STAT_KEY,
+    # LML#681 pre-flip observability for LML_RESOLVE_NONLIBRARY_RELEASE.
+    LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY,
+    LML_RESOLVE_COMPILATION_RELEASE_STAT_KEY,
+    NONLIBRARY_RELEASE_SURFACED_STAT_KEY,
+    RELEASE_RESOLUTION_CACHE_HIT_STAT_KEY,
+    RELEASE_RESOLUTION_CACHE_MISS_STAT_KEY,
+    RELEASE_RESOLUTION_CACHE_UNAVAILABLE_STAT_KEY,
 )
 """LML-specific keys seeded into every request's cache_stats dict so PostHog
 and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and
 ``handle_bulk_lookup`` so the two endpoints emit identical shapes. See
 ``init_cache_stats`` and LML#544 round 2 for the shape-stability rationale.
-Adding a new key here is the single point of update; LML#543's
-``search_api_call_cap_fired`` was the most recent addition."""
+Adding a new key here is the single point of update; LML#681's row-less flag
+observability (flag tags, ``nonlibrary_release_surfaced``, the #632
+hit/miss/unavailable counters) was the most recent addition."""
+
+
+def _record_lml_flag_tags() -> None:
+    """Record the row-less-family feature-flag state as 0/1 cache_stats keys.
+
+    Called once per ``cache_stats`` context, right after ``init_cache_stats`` at
+    BOTH ``handle_lookup`` and ``handle_bulk_lookup`` (LML#681). Recording once
+    at the router — reading the process-constant flag — keeps the tag a clean
+    ``0``/``1`` even on ``/lookup/bulk``, where one ``cache_stats`` context is
+    shared across the whole batch and ``record`` is additive-only: recording the
+    flag per-request from inside the orchestrator would sum to the batch size.
+
+    Observability must not break the request path, so any recorder/SDK exception
+    is swallowed (matches ``_project_cache_stats_to_transaction``). ``record`` is
+    a no-op when ``init_cache_stats`` wasn't called for the context.
+    """
+    try:
+        settings = get_settings()
+        recorder = get_cache_stats_recorder()
+        recorder.record(
+            LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY,
+            1 if settings.lml_resolve_nonlibrary_release else 0,
+        )
+        recorder.record(
+            LML_RESOLVE_COMPILATION_RELEASE_STAT_KEY,
+            1 if settings.lml_resolve_compilation_release else 0,
+        )
+    except Exception as e:
+        logger.warning("Failed to record LML flag tags into cache_stats: %s", e)
+
 
 # Canonical full path for the bulk endpoint. Referenced by the explicit
 # `http.server` span (name + `http.target` data field) so the two stay in
@@ -166,6 +222,9 @@ async def handle_lookup(
     # failures (LML#544 round 2). Without extra_keys, the keys would only
     # appear in payloads from the first request that records them.
     init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
+    # LML#681: tag the per-request payload with the row-less-family flag state
+    # (0/1) once per context so the flip is sliceable in PostHog/Sentry.
+    _record_lml_flag_tags()
     if skip_cache:
         set_skip_cache(True)
     telemetry = RequestTelemetry(
@@ -319,6 +378,9 @@ async def handle_bulk_lookup(
     # failures (LML#544 round 2). Without extra_keys, the keys would only
     # appear in payloads from the first request that records them.
     init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
+    # LML#681: record the flag tag once for the whole batch (shared context),
+    # so the bulk value stays 0/1 instead of summing across items.
+    _record_lml_flag_tags()
 
     max_concurrent = max_concurrency_from_env(_BULK_LOOKUP_DEFAULT_CONCURRENCY)
     semaphore = asyncio.Semaphore(max_concurrent)

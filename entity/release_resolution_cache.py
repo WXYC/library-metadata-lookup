@@ -64,10 +64,26 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from wxyc_etl.text import to_match_form
+from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
+
+# LML#681 observability for the #632 positive cache. ``get_cached_release_id``
+# returns four outcomes; these map them deliberately so the dashboard reads
+# cleanly during a PG outage:
+#   hit  — ``was_present=True`` (a fresh positive id OR a fresh known-miss
+#          short-circuit; both avoid the live probe, which is the amortization
+#          win this counter proves). Recorded on ``was_present``, NOT on
+#          ``release_id is not None``.
+#   miss — the ``row is None`` branch (absent / stale-positive / stale-miss).
+#   unavailable — the PG-exception branch: a degradation, NOT a cache miss, so
+#          a PG outage doesn't inflate the miss rate precisely when the
+#          dashboard is being read.
+RELEASE_RESOLUTION_CACHE_HIT_STAT_KEY = "release_resolution_cache_hit"
+RELEASE_RESOLUTION_CACHE_MISS_STAT_KEY = "release_resolution_cache_miss"
+RELEASE_RESOLUTION_CACHE_UNAVAILABLE_STAT_KEY = "release_resolution_cache_unavailable"
 
 # How long a fresh positive resolution stays authoritative before it is
 # re-derived. Diverges from the streaming cache's eternal-hit policy: a
@@ -202,16 +218,24 @@ async def get_cached_release_id(
             title_key,
             is_track,
         )
+        # Degradation, not a cache miss (LML#681): count it apart so a PG outage
+        # doesn't inflate the miss rate. The caller still falls through to a live
+        # probe as if the cache were empty.
+        get_cache_stats_recorder().record(RELEASE_RESOLUTION_CACHE_UNAVAILABLE_STAT_KEY)
         return ReleaseResolution(release_id=None, was_present=False)
 
     if row is None:
         # No row, a stale positive hit, or a stale miss — all filtered by the
         # SQL WHERE into the same "absent" shape. Caller re-resolves.
+        get_cache_stats_recorder().record(RELEASE_RESOLUTION_CACHE_MISS_STAT_KEY)
         return ReleaseResolution(release_id=None, was_present=False)
 
     # Present + fresh: a non-null release_id is a hit; a null is a known miss
     # the caller should honor (skip the probe). ``was_present`` distinguishes
-    # this from the absent case above.
+    # this from the absent case above. Both short-circuit the live probe, so
+    # both count as a hit (LML#681) — recorded on ``was_present``, not on a
+    # non-null release_id.
+    get_cache_stats_recorder().record(RELEASE_RESOLUTION_CACHE_HIT_STAT_KEY)
     return ReleaseResolution(release_id=row["release_id"], was_present=True)
 
 

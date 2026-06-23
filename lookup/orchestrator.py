@@ -1203,6 +1203,17 @@ pick. Lets a consumer (request-o-matic) treat the soft results as tentative.
 # call-number sentinel BS already understands.
 ROWLESS_LIBRARY_ID = 0
 
+# LML#681 observability. Recorded once per flag-gated row-less emission at the
+# single ``_make_rowless_item`` chokepoint that all four
+# ``lml_resolve_nonlibrary_release``-gated producers route through (SONG_AS_ARTIST,
+# the SONG_AS_TRACK + SWAPPED kernel, TRACK_ON_COMPILATION, the A4 cached-track
+# safety net). Deliberately scoped to the flag, NOT to all ``id=0`` items: the
+# LML#583 library-miss search (``_library_miss_discogs_search``) also surfaces
+# ``LibraryItem(id=0)`` but builds it directly — counting it would break the
+# "0 when the flag is off" property and conflate two independent features. Hence
+# the ``nonlibrary_release_surfaced`` name over a generic ``rowless_surfaced``.
+NONLIBRARY_RELEASE_SURFACED_STAT_KEY = "nonlibrary_release_surfaced"
+
 
 def _make_rowless_item(*, artist: str, title: str) -> LibraryItem:
     """Build the synthetic ``LibraryItem(id=0)`` for a row-less carry-through.
@@ -1211,7 +1222,14 @@ def _make_rowless_item(*, artist: str, title: str) -> LibraryItem:
     catalog item and the Step-4b identity resolution have real names to use. The
     real Discogs identity rides alongside on the ``discogs_titles`` seam, not on
     this row.
+
+    LML#681: this is the single chokepoint every flag-gated row-less producer
+    routes through, so recording ``nonlibrary_release_surfaced`` here counts each
+    flag-gated emission exactly once. ``record`` is a silent no-op when
+    ``init_cache_stats`` wasn't called for the current context, so this can't
+    raise on the uninitialized-stats path.
     """
+    get_cache_stats_recorder().record(NONLIBRARY_RELEASE_SURFACED_STAT_KEY)
     return LibraryItem(id=ROWLESS_LIBRARY_ID, artist=artist, title=title)
 
 
