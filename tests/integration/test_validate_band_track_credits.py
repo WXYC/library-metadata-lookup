@@ -49,3 +49,21 @@ async def test_validate_track_on_release_still_rejects_unrelated_artist():
     finally:
         await service.close()
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_validate_track_on_release_tolerates_track_title_typo():
+    """The canonical LML#334 repro: the singular typo ``tower of dub`` (the
+    original user query) validates against release 674529 (Live 93) by The Orb.
+
+    The bidirectional substring gate rejects ``tower`` vs ``towers``; the
+    ``token_set_ratio`` fuzzy fallback (~96, over the 85 floor) recovers it, and
+    the release-level credit (``The Orb``) validates the artist. Exercises the
+    real Discogs tracklist end-to-end.
+    """
+    service = DiscogsService(token=DISCOGS_TOKEN)
+    try:
+        result = await service.validate_track_on_release(674529, "tower of dub", "The Orb")
+    finally:
+        await service.close()
+    assert result is True

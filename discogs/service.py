@@ -83,6 +83,19 @@ _MAX_RETRY_DELAY_SECONDS = 60.0
 # clears the bar (~70.6) while unrelated artists score well below 50. See LML#210.
 _ARTIST_FUZZY_MATCH_THRESHOLD = 70
 
+# Fuzzy fallback for `validate_track_on_release` track-title matching (LML#334).
+# The bidirectional substring gate loses on typographic noise that leaves token
+# content intact: a singular/plural typo ("tower of dub" vs "Towers Of Dub"), a
+# dropped interior word ("smells teen spirit" vs "Smells Like Teen Spirit"), or a
+# dash-vs-paren suffix ("de la soul - radio edit" vs "de la soul (radio edit)").
+# token_set_ratio is order- and stopword-tolerant. The threshold is stricter than
+# the artist-side 70 because track titles are short, so a single shared token can
+# score 50+; 85 lets the substitutions above through (each scores >= 96) while
+# rejecting one-shared-token adversarial near-misses ("towers of dub" vs "towers
+# of london" scores ~82). Mirrored in `discogs/cache_service.py` so cache hits and
+# misses agree on the verdict.
+_TRACK_TITLE_FUZZY_MATCH_THRESHOLD = 85
+
 
 def _approx_semaphore_queue_depth(semaphore: asyncio.Semaphore) -> int:
     """Return an approximate count of waiters queued behind ``semaphore``.
@@ -1478,12 +1491,20 @@ def _iter_title_matched_items(
     The shared title-match step behind both tracklist scans —
     :func:`_scan_tracklist_for_match` (validation) and
     :func:`_scan_tracklist_for_credit` (credit recovery, LML#660): a bidirectional
-    substring on the normalized title. Centralized so the two scans' title rule
-    can't drift apart. ``track_lower`` is pre-normalized by the caller.
+    substring on the normalized title, then a ``token_set_ratio`` fuzzy fallback
+    (LML#334) so typographic noise that leaves token content intact — singular/
+    plural, a dropped interior word, dash-vs-paren suffixes — still matches.
+    Centralized so the two scans' title rule can't drift apart. ``track_lower`` is
+    pre-normalized by the caller.
     """
     for item in release.tracklist or []:
         item_title = normalize_for_track_comparison(item.title)
         if track_lower in item_title or item_title in track_lower:
+            yield item
+        elif (
+            item_title
+            and fuzz.token_set_ratio(track_lower, item_title) >= _TRACK_TITLE_FUZZY_MATCH_THRESHOLD
+        ):
             yield item
 
 
