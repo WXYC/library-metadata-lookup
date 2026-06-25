@@ -462,3 +462,120 @@ class TestNormalizationSymmetryGuard:
             "See WXYC/library-metadata-lookup#280."
         )
         assert reconciler_module.normalize_artist_name is not to_match_form
+
+
+class TestTrigramFallbackStage:
+    """Stage 6 trigram fuzzy fallback (WXYC/library-metadata-lookup#215).
+
+    When a canonical survives every equality stage (1 exact, 2 member, 3 alias,
+    4 name_variation) and the Stage 5 preprocessing cascade, a pg_trgm
+    ``similarity()`` query against ``release_artist`` rescues near-misses
+    (typos, "th"/"the", "&"/"and", bracket annotations) whose similarity clears
+    the 0.85 threshold. Matches below the floor are rejected so incidental
+    token overlap (the issue's ``"Hot 8"`` vs ``"Hot 8 Brass Band"`` case) does
+    not leak a false positive.
+
+    These tests mock ``fetchall`` with the trigram row(s) the SQL would return,
+    so they pin the stage's ordering, threshold comparison, method label, and
+    canonical-name passthrough without a live Postgres. The real SQL is
+    exercised against pg_trgm in
+    ``tests/integration/test_entity_resolution.py::TestTrigramFallbackSQLIntegration``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_match_above_threshold_resolves(self, reconciler, mock_pg):
+        """A 0.88-similarity rescue clears the 0.85 floor and resolves as trigram_fallback."""
+        mock_pg.fetchall = AsyncMock(
+            side_effect=[
+                [],  # Stage 1 exact — miss
+                [],  # Stage 2 member — miss
+                [],  # Stage 3 alias — miss
+                [],  # Stage 4 name_variation — miss
+                # Stage 5 yields no variants for this name, so no inner SQL runs;
+                # Stage 6 trigram returns the best candidate at 0.88.
+                [{"artist_id": 321, "artist_name": "stereolab", "score": 0.88}],
+            ]
+        )
+        results = await reconciler.reconcile_batch(["Sterolab"])  # typo: missing 'e'
+        assert "Sterolab" in results
+        assert results["Sterolab"].discogs_artist_id == 321
+        assert results["Sterolab"].method == "trigram_fallback"
+        # The similarity score is recorded as the match confidence so the
+        # borderline-audit (issue §Validation) can query it from reconciliation_log.
+        assert results["Sterolab"].confidence == pytest.approx(0.88)
+
+    @pytest.mark.asyncio
+    async def test_near_miss_below_threshold_rejected(self, reconciler, mock_pg):
+        """A 0.80 best candidate is below the 0.85 floor and must NOT resolve.
+
+        ``"Hot 8"`` vs ``"Hot 8 Brass Band"`` is the issue's motivating
+        false-positive: a short substring with incidental trigram overlap.
+        """
+        mock_pg.fetchall = AsyncMock(
+            side_effect=[
+                [],  # Stage 1
+                [],  # Stage 2
+                [],  # Stage 3
+                [],  # Stage 4
+                [{"artist_id": 999, "artist_name": "hot 8 brass band", "score": 0.80}],
+            ]
+        )
+        results = await reconciler.reconcile_batch(["Hot 8"])
+        assert results == {}
+
+    @pytest.mark.asyncio
+    async def test_exact_threshold_boundary_matches(self, reconciler, mock_pg):
+        """Similarity exactly at 0.85 matches — the comparison is ``>=``, not ``>``."""
+        mock_pg.fetchall = AsyncMock(
+            side_effect=[[], [], [], [], [{"artist_id": 77, "artist_name": "yy", "score": 0.85}]]
+        )
+        results = await reconciler.reconcile_batch(["Xx"])
+        assert "Xx" in results
+        assert results["Xx"].discogs_artist_id == 77
+        assert results["Xx"].method == "trigram_fallback"
+
+    @pytest.mark.asyncio
+    async def test_empty_trigram_result_keeps_no_match(self, reconciler, mock_pg):
+        """No ``%`` candidate at all (empty rowset) leaves the canonical unresolved."""
+        mock_pg.fetchall = AsyncMock(return_value=[])
+        results = await reconciler.reconcile_batch(["Sterolab"])
+        assert results == {}
+
+    @pytest.mark.asyncio
+    async def test_trigram_not_run_when_earlier_stage_matches(self, reconciler, mock_pg):
+        """An exact-match hit short-circuits the cascade — no trigram SQL issued."""
+        mock_pg.fetchall = AsyncMock(return_value=[{"artist_name": "stereolab", "artist_id": 99}])
+        await reconciler.reconcile_batch(["Stereolab"])
+        # Exactly one SQL call: Stage 1. The trigram stage never runs.
+        assert mock_pg.fetchall.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_threshold_is_configurable(self, mock_pg):
+        """A reconciler built with a higher threshold rejects a sub-threshold rescue."""
+        reconciler = DiscogsReconciler(mock_pg, trigram_threshold=0.90)
+        mock_pg.fetchall = AsyncMock(
+            side_effect=[[], [], [], [], [{"artist_id": 5, "artist_name": "yy", "score": 0.88}]]
+        )
+        results = await reconciler.reconcile_batch(["Yy"])
+        assert results == {}  # 0.88 < 0.90
+
+    @pytest.mark.asyncio
+    async def test_default_threshold_is_085(self, mock_pg):
+        """Ship default is 0.85 per the issue rationale."""
+        assert DiscogsReconciler(mock_pg)._trigram_threshold == pytest.approx(0.85)
+
+    @pytest.mark.asyncio
+    async def test_trigram_sql_receives_canonical_and_uses_similarity(self, reconciler, mock_pg):
+        """The trigram query is issued with the original canonical (SQL applies
+        ``lower(f_unaccent(...))``) and uses the ``similarity()`` function plus
+        the ``%`` trigram operator so the existing GIN index applies."""
+        mock_pg.fetchall = AsyncMock(side_effect=[[], [], [], [], []])
+        await reconciler.reconcile_batch(["Sterolab"])
+        last_call = mock_pg.fetchall.await_args_list[-1].args
+        sql_arg, name_arg = last_call
+        assert "similarity(" in sql_arg, "Trigram stage must compute pg_trgm similarity()."
+        assert " % " in sql_arg, "Trigram stage must use the % operator to hit the GIN index."
+        assert name_arg == "Sterolab", (
+            "Trigram stage must pass the original canonical name; the SQL applies "
+            "lower(f_unaccent(...)) on the input side, mirroring search_artists_by_name."
+        )

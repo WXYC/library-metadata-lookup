@@ -318,7 +318,17 @@ async def run_discogs_stage(
                     source="discogs",
                     external_id=str(match.discogs_artist_id),
                     method=match.method,
-                    confidence=confidence_for_method(match.method),
+                    # Equality/bridge stages keep #233's per-method §3.4.1 band
+                    # (member_group stays 0.85, not 1.0). The new trigram_fallback
+                    # row instead logs its RAW pg_trgm similarity — the borderline
+                    # audit value #215 exists to capture, safe to log because
+                    # trigram_fallback is reconciliation-internal and dropped
+                    # before Backend's wire contract.
+                    confidence=(
+                        match.confidence
+                        if match.method == "trigram_fallback"
+                        else confidence_for_method(match.method)
+                    ),
                 )
                 matched_count += 1
             else:
