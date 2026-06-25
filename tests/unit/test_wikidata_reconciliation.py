@@ -283,11 +283,16 @@ class TestStreamingIdCacheBacking:
         assert result["Q123"].spotify_artist_id == "abc123"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("empty_slug", [None, ""])
     async def test_blank_cache_slug_falls_through_to_sparql(
-        self, reconciler, mock_wikidata_pg, mock_sparql
+        self, reconciler, mock_wikidata_pg, mock_sparql, empty_slug
     ):
-        """A row with a null/blank slug is treated as a miss, not a hit."""
-        mock_wikidata_pg.fetchall = AsyncMock(return_value=[{"qid": "Q378288", "discogs_id": None}])
+        """A row with a null or empty-string slug is treated as a miss, not a
+        hit — the ``if slug:`` guard rejects both falsy forms so the QID still
+        reaches SPARQL (and can come back with a real Bandcamp ID there)."""
+        mock_wikidata_pg.fetchall = AsyncMock(
+            return_value=[{"qid": "Q378288", "discogs_id": empty_slug}]
+        )
         mock_sparql.query_batched = AsyncMock(
             return_value=[
                 {
