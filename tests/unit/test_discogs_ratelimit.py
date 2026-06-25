@@ -24,6 +24,7 @@ re-acquired on the next attempt. These tests pin that behavior:
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -44,7 +45,7 @@ class CountingSemaphore(asyncio.Semaphore):
         self.acquire_count = 0
         self.release_count = 0
 
-    async def acquire(self) -> bool:
+    async def acquire(self) -> Literal[True]:
         self.acquire_count += 1
         return await super().acquire()
 
