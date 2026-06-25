@@ -501,6 +501,58 @@ class TestBulkResolveObservability:
         )
 
     @pytest.mark.asyncio
+    async def test_503_pinned_on_span_when_per_input_lookup_fails(
+        self, app_client, mock_entity_store
+    ):
+        """A per-input PG failure pins ``http.status_code=503`` on the span.
+
+        The #278 gather refactor moved the span-status pin: the old serial loop
+        set 503 on the span inside each per-input ``except`` block, whereas the
+        gather path raises ``HTTPException`` out of the child coroutine (which
+        runs *before* the span is opened, so it can't touch the span) and pins
+        the status in the handler's outer ``except HTTPException`` instead. This
+        characterizes that relocation so a future edit that drops the outer
+        catch can't silently close the span with no status on the 503 path —
+        the audit-style ``op:http.server http.status_code:503`` query depends
+        on it.
+        """
+        from unittest.mock import MagicMock
+
+        async def maybe_fail(name: str):
+            if name == "Boom":
+                raise PostgresError("simulated mid-batch PG failure")
+            return None
+
+        mock_entity_store.resolve_library_name.side_effect = maybe_fail
+
+        span_mock = MagicMock()
+        span_cm = MagicMock()
+        span_cm.__enter__ = MagicMock(return_value=span_mock)
+        span_cm.__exit__ = MagicMock(return_value=False)
+
+        with patch("identity.router.sentry_sdk.start_span", return_value=span_cm):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/identity/bulk-resolve-libraries",
+                    json={
+                        "inputs": [
+                            {"library_id": 1, "artist_name": "Fine One", "album_title": "x"},
+                            {"library_id": 2, "artist_name": "Boom", "album_title": "x"},
+                        ]
+                    },
+                )
+
+        assert resp.status_code == 503
+        status_calls = [
+            c for c in span_mock.set_data.call_args_list if c.args[0] == "http.status_code"
+        ]
+        assert any(c.args[1] == 503 for c in status_calls), (
+            f"Expected http.status_code=503 pinned on the span; saw: {status_calls}"
+        )
+
+    @pytest.mark.asyncio
     async def test_http_server_span_emitted(self, app_client, mock_entity_store):
         """An explicit Sentry `http.server` span wraps the handler.
 
