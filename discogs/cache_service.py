@@ -497,7 +497,7 @@ class DiscogsCacheService:
         try:
             release_row = await self.pool.fetchrow(
                 "SELECT id, title, release_year, artwork_url, released, "
-                "artwork_checked_at, not_found "
+                "artwork_checked_at, not_found, master_id "
                 "FROM release WHERE id = $1",
                 release_id,
             )
@@ -683,6 +683,11 @@ class DiscogsCacheService:
                 extra_artists=extra_artist_credits,
                 labels=label_credits,
                 released=release_row["released"],
+                # LML#688: nullable, recently-added column. ``.get`` tolerates
+                # cache rows written before master_id was plumbed (and partial
+                # test doubles); a real ``SELECT … master_id`` row always carries
+                # the key, None when Discogs has no master for the release.
+                master_id=release_row.get("master_id"),
                 videos=videos,
             )
 
@@ -754,22 +759,24 @@ class DiscogsCacheService:
                     """
                     INSERT INTO release (
                         id, title, release_year, artwork_url, released,
-                        artwork_checked_at, not_found
+                        artwork_checked_at, not_found, master_id
                     )
-                    VALUES ($1, $2, $3, $4, $5, now(), FALSE)
+                    VALUES ($1, $2, $3, $4, $5, now(), FALSE, $6)
                     ON CONFLICT (id) DO UPDATE SET
                         title = EXCLUDED.title,
                         release_year = EXCLUDED.release_year,
                         artwork_url = EXCLUDED.artwork_url,
                         released = EXCLUDED.released,
                         artwork_checked_at = EXCLUDED.artwork_checked_at,
-                        not_found = FALSE
+                        not_found = FALSE,
+                        master_id = EXCLUDED.master_id
                     """,
                     release.release_id,
                     release.title,
                     release.year,
                     release.artwork_url,
                     release.released,
+                    release.master_id,
                 )
 
                 # Delete + re-insert all artists (clean replacement)

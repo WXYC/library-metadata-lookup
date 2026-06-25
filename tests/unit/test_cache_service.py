@@ -526,6 +526,35 @@ class TestWriteRelease:
         )
 
     @pytest.mark.asyncio
+    async def test_release_upsert_persists_master_id(self, cache_service, mock_asyncpg_pool):
+        """LML#688: the release upsert must persist master_id so a cold API
+        fetch warms the field into PG (matching the value discogs-etl seeds),
+        and the ON CONFLICT path refreshes it from EXCLUDED on re-upsert."""
+        release = ReleaseMetadataResponse(
+            release_id=28138,
+            title="Confield",
+            artist="Autechre",
+            year=2001,
+            master_id=12345,
+            release_url="https://discogs.com/release/28138",
+        )
+
+        await cache_service.write_release(release)
+
+        conn = mock_asyncpg_pool._mock_conn
+        release_sql = conn.execute.call_args_list[0][0][0]
+        assert "master_id" in release_sql, (
+            "release upsert must persist master_id (LML#688 cache-warm path)"
+        )
+        assert "master_id = EXCLUDED.master_id" in release_sql, (
+            "ON CONFLICT must refresh master_id from EXCLUDED on re-upsert"
+        )
+        release_params = conn.execute.call_args_list[0][0][1:]
+        assert 12345 in release_params, (
+            f"master_id value must be bound into the upsert params; got: {release_params!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_error_raises(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.acquire.return_value.__aenter__ = AsyncMock(side_effect=Exception("fail"))
         release = ReleaseMetadataResponse(
@@ -812,6 +841,92 @@ class TestGetReleaseEnriched:
         # Backward compat scalars
         assert result.artist == "Autechre"
         assert result.label == "Warp Records"
+
+    @pytest.mark.asyncio
+    async def test_reads_master_id(self, cache_service, mock_asyncpg_pool):
+        """LML#688: a master-bearing cached release surfaces its master_id.
+
+        ``get_release`` is read-through (in-memory → PG → API). WXYC library
+        releases are pre-warmed into discogs-cache PG by discogs-etl, so the PG
+        tier — not the API path — serves essentially every library lookup.
+        ``master_id`` must be plumbed through this path or the catalog-popularity
+        caller (BS#1486) sees ``None`` for exactly the releases it cares about.
+        """
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 28138,
+                "title": "Confield",
+                "release_year": 2001,
+                "artwork_url": None,
+                "released": None,
+                "artwork_checked_at": None,
+                "not_found": False,
+                "master_id": 9999,
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_artist=[
+                    {"artist_id": 77, "artist_name": "Autechre", "extra": 0, "role": None}
+                ],
+            )
+        )
+
+        result = await cache_service.get_release(28138)
+        assert result is not None
+        assert result.master_id == 9999
+
+    @pytest.mark.asyncio
+    async def test_master_less_release_surfaces_none(self, cache_service, mock_asyncpg_pool):
+        """A release with no Discogs master surfaces master_id=None, not an error."""
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "Self-Released EP",
+                "release_year": 2019,
+                "artwork_url": None,
+                "released": None,
+                "artwork_checked_at": None,
+                "not_found": False,
+                "master_id": None,
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_artist=[
+                    {"artist_id": 5, "artist_name": "Some Artist", "extra": 0, "role": None}
+                ],
+            )
+        )
+
+        result = await cache_service.get_release(1)
+        assert result is not None
+        assert result.master_id is None
+
+    @pytest.mark.asyncio
+    async def test_get_release_select_includes_master_id(self, cache_service, mock_asyncpg_pool):
+        """Pin master_id in the parent release SELECT so a future refactor that
+        drops the column can't silently regress the cache-warm path (LML#688)."""
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "X",
+                "release_year": 2000,
+                "artwork_url": None,
+                "released": None,
+                "artwork_checked_at": None,
+                "not_found": False,
+                "master_id": 42,
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=make_fetch_router())
+
+        await cache_service.get_release(1)
+
+        select_sql = mock_asyncpg_pool.fetchrow.call_args.args[0]
+        assert "master_id" in select_sql, (
+            f"the parent release SELECT must fetch master_id (LML#688); got: {select_sql!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
