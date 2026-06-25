@@ -19,6 +19,9 @@ re-acquired on the next attempt. These tests pin that behavior:
    permits (balanced acquire/release, no leak).
 3. Task cancellation during the inter-attempt sleep leaves the semaphore at
    its pre-call permit count (no leak).
+
+The fixture-injected client never issues a real HTTP request, so these tests
+run under the default (no-marker) suite.
 """
 
 from __future__ import annotations
