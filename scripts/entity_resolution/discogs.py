@@ -11,8 +11,15 @@ Resolves WXYC library artist names to Discogs artist IDs via a cascade:
    ``Y``). Each transform is a pure-Python derivation; the SQL path is the
    same equality cascade reused on the variant strings, so no new index or
    query plan is added.
+6. Trigram fuzzy fallback — for names that survive every equality stage, run a
+   pg_trgm ``similarity()`` query against ``release_artist`` and accept the best
+   candidate whose similarity clears a threshold (default 0.85). This is the
+   only stage that is not an equality lookup: it rescues typos, "th"/"the",
+   "&"/"and", and bracket-annotation residue that the symmetric normalization
+   pair did not already collapse, without picking up incidental token overlap.
+   See WXYC/library-metadata-lookup#215 (parent #211).
 
-Matching uses ``wxyc_identity_match_artist(col)`` on the column and
+Stages 1–5 use ``wxyc_identity_match_artist(col)`` on the column and
 ``to_identity_match_form(name)`` (aliased here as ``normalize_artist_name``)
 on the input — the symmetric pair specified by wiki
 ``plans/library-hook-canonicalization.md`` §3.3.5. The discogs-cache
@@ -22,6 +29,11 @@ collapse the same case + diacritic + leading-article + paren-suffix axes
 identically. The cache-side functional GIN trigram index rebuild over the
 new function expression is tracked separately; ``= ANY(...)`` exact lookups
 fall back to per-row evaluation in the meantime.
+
+Stage 6 (trigram) deliberately uses ``lower(f_unaccent(col))`` rather than
+``wxyc_identity_match_artist(col)`` so it hits the existing GIN trigram index
+from ``discogs-etl/schema/create_indexes.sql`` — the same expression used by
+``discogs/cache_service.py:search_artists_by_name``.
 
 Ported from semantic-index ``reconciliation.py``.
 """
@@ -69,6 +81,33 @@ SELECT DISTINCT wxyc_identity_match_artist(nv.name) AS name, nv.artist_id
 FROM artist_name_variation nv
 WHERE wxyc_identity_match_artist(nv.name) = ANY($1)\
 """
+
+# Stage 6: pg_trgm fuzzy fallback against ``release_artist``. Per-name (single
+# ``$1``) query — by the time the cascade reaches here the unmatched set is
+# small, and the ``%`` operator rides the existing functional GIN trigram index
+# on ``lower(f_unaccent(artist_name))``. Mirrors
+# ``discogs/cache_service.py:search_artists_by_name``; the ``extra = 0`` /
+# ``artist_id IS NOT NULL`` filters keep the candidate universe identical to the
+# Stage 1 exact match. Returns the single best candidate by descending
+# similarity; the caller applies the acceptance threshold in Python so it stays
+# trivially tunable (and so the score is available to record as confidence).
+_TRIGRAM_FALLBACK_SQL = """\
+SELECT ra.artist_id, ra.artist_name,
+       similarity(lower(f_unaccent(ra.artist_name)), lower(f_unaccent($1))) AS score
+FROM release_artist ra
+WHERE ra.extra = 0
+  AND ra.artist_id IS NOT NULL
+  AND lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($1))
+ORDER BY score DESC
+LIMIT 1\
+"""
+
+# Starting trigram acceptance threshold (WXYC/library-metadata-lookup#215).
+# pg_trgm ``similarity()`` is in [0, 1]; 0.85 catches typo / "th"-vs-"the" /
+# "&"-vs-"and" / bracket-annotation rescues without admitting incidental
+# substring overlap (e.g. "Hot 8" vs "Hot 8 Brass Band" scores well under it).
+# Tunable per the issue's validation plan via the ``trigram_threshold`` ctor arg.
+_DEFAULT_TRIGRAM_THRESHOLD = 0.85
 
 
 _BRACKET_ANNOTATION_RE = re.compile(r"\s*\[[^\]]*\]")
@@ -128,26 +167,46 @@ def _preprocessing_variants(canonical: str) -> list[str]:
 
 @dataclass
 class ReconciliationMatch:
-    """Result of a successful Discogs reconciliation."""
+    """Result of a successful Discogs reconciliation.
+
+    ``confidence`` is 1.0 for the equality stages (exact / member / alias /
+    name_variation / name_preprocessing) and the pg_trgm ``similarity()`` score
+    for ``trigram_fallback`` matches, so the borderline-match audit called for
+    in WXYC/library-metadata-lookup#215 can read the fuzzy score straight from
+    ``entity.reconciliation_log.confidence``.
+    """
 
     discogs_artist_id: int
-    method: str  # exact_match, member_group, alias_match, name_variation, name_preprocessing
+    # exact_match, member_group, alias_match, name_variation, name_preprocessing,
+    # trigram_fallback
+    method: str
+    confidence: float = 1.0
 
 
 class DiscogsReconciler:
     """Batch reconciler for WXYC library artist names against Discogs data.
 
     Uses a cascade of matching strategies: exact name match, member/group
-    lookup, then alias/name-variation fallback.
+    lookup, alias/name-variation fallback, name preprocessing, and finally a
+    pg_trgm trigram fuzzy fallback (WXYC/library-metadata-lookup#215).
 
     Args:
         pg: PgSource connected to the discogs-cache database.
         batch_size: Maximum names per SQL query (default 1000).
+        trigram_threshold: Minimum pg_trgm similarity [0, 1] for the Stage 6
+            fuzzy fallback to accept a candidate (default 0.85).
     """
 
-    def __init__(self, pg: PgSource, batch_size: int = 1000) -> None:
+    def __init__(
+        self,
+        pg: PgSource,
+        batch_size: int = 1000,
+        *,
+        trigram_threshold: float = _DEFAULT_TRIGRAM_THRESHOLD,
+    ) -> None:
         self._pg = pg
         self._batch_size = batch_size
+        self._trigram_threshold = trigram_threshold
 
     async def reconcile_batch(
         self,
@@ -157,8 +216,9 @@ class DiscogsReconciler:
     ) -> dict[str, ReconciliationMatch]:
         """Reconcile a list of artist names against Discogs data.
 
-        Runs through the cascade: exact match -> member/group -> alias -> name variation.
-        Only unmatched names cascade to the next strategy.
+        Runs through the cascade: exact match -> member/group -> alias -> name
+        variation -> name preprocessing -> trigram fuzzy fallback. Only
+        unmatched names cascade to the next strategy.
 
         Args:
             names: Canonical artist names from the WXYC library.
@@ -278,6 +338,26 @@ class DiscogsReconciler:
                     v: c for v, c in variant_to_canonical.items() if c not in results
                 }
 
+        # Stage 6: Trigram fuzzy fallback. Names that survived every equality
+        # stage get one pg_trgm ``similarity()`` query each against the original
+        # canonical (the SQL applies ``lower(f_unaccent(...))`` on the input
+        # side). The best candidate is accepted only if its score clears
+        # ``self._trigram_threshold``; the score rides along as the match
+        # confidence. Sorted iteration keeps diff-driven prod audits
+        # reproducible, matching the Stage 5 rationale above.
+        if unmatched:
+            for normalized_name in sorted(unmatched):
+                canonical = normalized_to_canonical[normalized_name]
+                if canonical in results:
+                    continue
+                hit = await self._trigram_match(canonical)
+                if hit is None:
+                    continue
+                artist_id, score = hit
+                results[canonical] = ReconciliationMatch(
+                    artist_id, "trigram_fallback", confidence=score
+                )
+
         return results
 
     async def _exact_match(self, normalized_names: list[str]) -> dict[str, int]:
@@ -311,6 +391,32 @@ class DiscogsReconciler:
         if not rows:
             return {}
         return {row["name"]: row["artist_id"] for row in rows if row["artist_id"] is not None}
+
+    async def _trigram_match(self, name: str) -> tuple[int, float] | None:
+        """Stage 6: pg_trgm fuzzy fallback against release_artist.
+
+        Runs ``_TRIGRAM_FALLBACK_SQL`` for a single canonical name and returns
+        ``(artist_id, score)`` for the highest-similarity candidate whose score
+        clears ``self._trigram_threshold``, else ``None``. The threshold is
+        applied here (not in SQL) so it stays trivially tunable and the score is
+        available to record as the match confidence.
+
+        Args:
+            name: Original canonical artist name. The SQL applies
+                ``lower(f_unaccent(...))`` on this input side, mirroring
+                ``discogs/cache_service.py:search_artists_by_name``.
+        """
+        rows = await self._pg.fetchall(_TRIGRAM_FALLBACK_SQL, name)
+        if not rows:
+            return None
+        top = rows[0]
+        artist_id = top["artist_id"]
+        if artist_id is None:
+            return None
+        score = float(top["score"])
+        if score < self._trigram_threshold:
+            return None
+        return artist_id, score
 
     def _batches(self, items: list[str]) -> list[list[str]]:
         """Split items into batches of self._batch_size."""

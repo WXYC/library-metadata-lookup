@@ -175,7 +175,14 @@ class TestDiscogsReconciliationIntegration:
         assert len(results) >= 1, f"Expected at least 1 match, got {len(results)}"
         for _name, match in results.items():
             assert match.discogs_artist_id > 0
-            assert match.method in ("exact_match", "member_group", "alias_match", "name_variation")
+            assert match.method in (
+                "exact_match",
+                "member_group",
+                "alias_match",
+                "name_variation",
+                "name_preprocessing",
+                "trigram_fallback",
+            )
 
 
 @pytest.mark.pg
@@ -335,6 +342,127 @@ class TestDiscogsReconciliationSQLSmoke:
             f"Missing wxyc_identity_match_* functions: {sorted(missing)}. "
             "Re-run alembic 0004 from WXYC/discogs-etl against this cache."
         )
+
+
+@pytest.mark.pg
+class TestTrigramFallbackSQLIntegration:
+    """Exercise the Stage 6 ``_TRIGRAM_FALLBACK_SQL`` against real pg_trgm.
+
+    The full ``reconcile_batch`` cascade needs ``wxyc_identity_match_artist``
+    (alembic 0004, absent on CI's plain ``postgres:16-alpine``), so this class
+    drives the Stage 6 method ``_trigram_match`` directly — it only depends on
+    ``pg_trgm`` + ``f_unaccent``, both provisionable from contrib on the CI
+    service container. See WXYC/library-metadata-lookup#215 (parent #211).
+
+    Data safety: ``release_artist`` is a real, multi-million-row table on a live
+    discogs-cache. This fixture **skips** if that table already exists rather
+    than stubbing over it; it only creates (and on teardown drops) the table
+    when absent, so it can never clobber real cache data. Same posture as
+    ``TestDiscogsReconciliationSQLSmoke``'s ``created_tables`` guard.
+    """
+
+    @pytest_asyncio.fixture(autouse=True)
+    async def set_up_trigram_fixture(self, pg_pool):
+        async with pg_pool.acquire() as conn:
+            try:
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
+            except Exception as e:  # locked-down Postgres without contrib
+                pytest.skip(f"pg_trgm/unaccent extensions unavailable: {e}")
+
+            release_artist_exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = current_schema() AND table_name = 'release_artist')"
+            )
+            if release_artist_exists:
+                pytest.skip(
+                    "release_artist already present -- refusing to stub over real "
+                    "discogs-cache data (run the cascade test against a live cache instead)"
+                )
+
+            # IMMUTABLE f_unaccent wrapper mirroring discogs-cache, so the
+            # trigram operator can ride a functional GIN index. Idempotent.
+            await conn.execute(
+                "CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text "
+                "AS $$ SELECT unaccent('unaccent', $1) $$ "
+                "LANGUAGE sql IMMUTABLE PARALLEL SAFE"
+            )
+            await conn.execute(
+                "CREATE TABLE release_artist ("
+                "release_id INTEGER, artist_id INTEGER, artist_name TEXT, extra INTEGER DEFAULT 0)"
+            )
+            await conn.executemany(
+                "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "
+                "VALUES ($1, $2, $3, $4)",
+                [
+                    (1, 4242, "Stereolab", 0),
+                    (2, 5499521, "Nilufer Yanya", 0),  # diacritic-free cache form
+                    (3, 7777, "Hot 8 Brass Band", 0),
+                    # ``extra = 1`` credit that must be invisible to the fallback,
+                    # mirroring the Stage 1 ``extra = 0`` filter.
+                    (4, 9999, "Stereolab", 1),
+                ],
+            )
+        try:
+            yield
+        finally:
+            async with pg_pool.acquire() as conn:
+                await conn.execute("DROP TABLE IF EXISTS release_artist")
+
+    @pytest.mark.asyncio
+    async def test_diacritic_variant_clears_default_threshold(self, pg_source):
+        """``Nilüfer Yanya`` (umlaut) matches the diacritic-free cache row at 1.0.
+
+        ``f_unaccent`` collapses both sides to ``nilufer yanya`` → similarity 1.0,
+        well over the 0.85 floor; proves the operator + f_unaccent path end to end.
+        """
+        reconciler = DiscogsReconciler(pg_source)
+        hit = await reconciler._trigram_match("Nilüfer Yanya")
+        assert hit is not None
+        artist_id, score = hit
+        assert artist_id == 5499521
+        assert score >= 0.85
+
+    @pytest.mark.asyncio
+    async def test_sub_unit_fuzzy_match_resolves_when_threshold_lowered(self, pg_source):
+        """A genuine sub-1.0 fuzzy hit (typo ``Stereolabs``) resolves once the
+        threshold is set below its pg_trgm score — proving the gate is the
+        threshold, not an exact-string coincidence."""
+        reconciler = DiscogsReconciler(pg_source, trigram_threshold=0.4)
+        hit = await reconciler._trigram_match("Stereolabs")  # trailing 's'
+        assert hit is not None
+        artist_id, score = hit
+        assert artist_id == 4242
+        assert 0.4 <= score < 1.0
+
+    @pytest.mark.asyncio
+    async def test_substring_near_miss_rejected_at_default_threshold(self, pg_source):
+        """``Hot 8`` must NOT match ``Hot 8 Brass Band`` — incidental substring
+        overlap scores well under the 0.85 floor (the issue's motivating case)."""
+        reconciler = DiscogsReconciler(pg_source)
+        hit = await reconciler._trigram_match("Hot 8")
+        assert hit is None
+
+    @pytest.mark.asyncio
+    async def test_extra_credit_excluded_from_fallback(self, pg_source):
+        """The ``extra = 1`` Stereolab row (artist_id 9999) is filtered out, so the
+        only Stereolab candidate is the primary ``extra = 0`` row (4242)."""
+        reconciler = DiscogsReconciler(pg_source)
+        hit = await reconciler._trigram_match("Stereolab")
+        assert hit is not None
+        artist_id, _score = hit
+        assert artist_id == 4242
+
+    @pytest.mark.asyncio
+    async def test_raw_sql_score_in_unit_interval(self, pg_source):
+        """``_TRIGRAM_FALLBACK_SQL`` parses, executes, and returns a float
+        similarity in [0, 1] for a fuzzy query."""
+        from scripts.entity_resolution.discogs import _TRIGRAM_FALLBACK_SQL
+
+        rows = await pg_source.fetchall(_TRIGRAM_FALLBACK_SQL, "Stereolab")
+        assert rows, "expected at least the Stereolab primary-credit candidate"
+        score = float(rows[0]["score"])
+        assert 0.0 <= score <= 1.0
 
 
 @pytest.mark.pg
