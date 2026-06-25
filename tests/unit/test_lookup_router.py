@@ -453,6 +453,82 @@ class TestHandleLookup:
 
         assert resp.status_code == 200
 
+    def test_extra_keys_seeded_and_projected_onto_transaction(self):
+        """Regression (LML#567): the LML-specific cache_stats extra keys must land
+        as `lml.cache.*` data on the Sentry transaction even when never recorded
+        (value 0).
+
+        Exercises the REAL seeding path — `init_cache_stats(extra_keys=...)`
+        followed by `get_cache_stats()` — rather than a hand-built dict, so the
+        assertion fails if either LML drops one of these keys from
+        `_LML_CACHE_STATS_EXTRA_KEYS` or the upstream `wxyc_fastapi` seeding
+        contract regresses. The original bug was the upstream half: the extras
+        were not seeded with 0, so they appeared only in payloads from the first
+        request that recorded them, and a representative (non-follower) request
+        showed no `lml.cache.memory_cache_inflight_join` at all.
+        """
+        from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
+
+        from lookup.router import (
+            _LML_CACHE_STATS_EXTRA_KEYS,
+            _project_cache_stats_to_transaction,
+        )
+
+        init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
+        stats = get_cache_stats()
+
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+        with patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope):
+            _project_cache_stats_to_transaction(stats)
+
+        projected = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        for key in (
+            "memory_cache_inflight_join",
+            "memory_cache_inflight_retry_after_cancel",
+            "memory_cache_write_failed",
+        ):
+            assert f"lml.cache.{key}" in projected, (
+                f"{key!r} must be seeded by init_cache_stats(extra_keys=...) and "
+                "projected onto the transaction even at zero (LML#567)."
+            )
+            assert projected[f"lml.cache.{key}"] == 0
+
+    def test_recorded_extra_key_value_flows_to_transaction(self):
+        """A recorded extra-key count must flow through the real recorder →
+        get_cache_stats → projection path (LML#567).
+
+        Pins the "even when the dedup fires" half of the report: once a
+        follower-join is actually recorded, its count has to surface as
+        `lml.cache.memory_cache_inflight_join`, not just the seeded zero.
+        """
+        from wxyc_fastapi.observability import (
+            get_cache_stats,
+            get_cache_stats_recorder,
+            init_cache_stats,
+        )
+
+        from lookup.router import (
+            _LML_CACHE_STATS_EXTRA_KEYS,
+            _project_cache_stats_to_transaction,
+        )
+
+        init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
+        recorder = get_cache_stats_recorder()
+        recorder.record("memory_cache_inflight_join")
+        recorder.record("memory_cache_inflight_join")
+        stats = get_cache_stats()
+
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+        with patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope):
+            _project_cache_stats_to_transaction(stats)
+
+        projected = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        assert projected["lml.cache.memory_cache_inflight_join"] == 2
+
     @pytest.mark.asyncio
     async def test_response_includes_call_number(self, app_client):
         """Regression: call_number must appear in the JSON response."""
