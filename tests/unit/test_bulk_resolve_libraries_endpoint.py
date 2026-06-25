@@ -6,10 +6,13 @@ internals are covered separately in `test_bulk_resolve_composer.py`.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import sentry_sdk
+from asyncpg.exceptions import PostgresError
 from httpx import ASGITransport, AsyncClient
 
 from entity.store import Identity
@@ -538,3 +541,184 @@ class TestBulkResolveObservability:
         assert "bulk-resolve-libraries" in span_name, (
             f"Expected http.server span name to include 'bulk-resolve-libraries'; got {span_name!r}"
         )
+
+
+class TestBulkResolveConcurrency:
+    """Per-input lookups fan out concurrently under a pool-bound semaphore (#278).
+
+    Before #278 the handler iterated inputs serially — worst-case latency for a
+    1,000-row miss-heavy batch was ~3,000 sequential PG round-trips. #278
+    dispatches the per-input work via ``asyncio.gather`` capped by a semaphore
+    sized to the discogs-cache pool's ``max_size`` so we parallelize without
+    exhausting the asyncpg pool. These tests pin:
+
+    1. Concurrency actually happens (total elapsed ≈ one slow lookup, not N).
+    2. The semaphore caps in-flight lookups at the configured bound.
+    3. ``asyncio.gather`` preserves input order even when completion order
+       differs (slowest input first).
+    4. A ``PostgresError`` raised by any one input still fails the whole batch
+       closed with 503 — never a 200 carrying partial results.
+    """
+
+    @pytest.mark.asyncio
+    async def test_per_input_lookups_run_concurrently(self, app_client, mock_entity_store):
+        """N lookups each sleeping DELAY finish in ~DELAY, not N×DELAY.
+
+        With the default cap (the pool ``max_size`` of 5) and N=5 inputs, all
+        five ``resolve_library_name`` calls overlap, so wall-clock is dominated
+        by a single sleep. The serial implementation would take ~5×DELAY; this
+        asserts a 3× margin below that to stay robust on slow CI.
+        """
+        delay = 0.05
+        n = 5
+
+        async def slow_lookup(name: str):
+            await asyncio.sleep(delay)
+            return None
+
+        mock_entity_store.resolve_library_name.side_effect = slow_lookup
+
+        inputs = [
+            {"library_id": i, "artist_name": f"Artist {i}", "album_title": "x"} for i in range(n)
+        ]
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            start = time.perf_counter()
+            resp = await ac.post("/api/v1/identity/bulk-resolve-libraries", json={"inputs": inputs})
+            elapsed = time.perf_counter() - start
+
+        assert resp.status_code == 200
+        assert len(resp.json()["results"]) == n
+        # Serial would be n * delay = 0.25s. Concurrent is ~delay. A 3×-delay
+        # ceiling cleanly separates the two without being CI-flaky.
+        assert elapsed < (n * delay) / 2, (
+            f"Expected concurrent dispatch (~{delay:.2f}s) but took {elapsed:.3f}s; "
+            "per-input lookups appear to still be running serially."
+        )
+
+    @pytest.mark.asyncio
+    async def test_semaphore_bounds_in_flight_lookups(
+        self, app_client, mock_entity_store, monkeypatch
+    ):
+        """The semaphore caps concurrent in-flight lookups at the configured bound.
+
+        Sets ``LML_BULK_MAX_CONCURRENT=2`` and posts 6 inputs. A counter tracks
+        how many ``resolve_library_name`` calls overlap; the observed peak must
+        equal the bound (2) — proving the work both parallelizes *and* is capped
+        so the asyncpg pool can't be exhausted.
+        """
+        monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "2")
+
+        in_flight = 0
+        max_in_flight = 0
+        lock = asyncio.Lock()
+
+        async def tracked_lookup(name: str):
+            nonlocal in_flight, max_in_flight
+            async with lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.02)
+            async with lock:
+                in_flight -= 1
+            return None
+
+        mock_entity_store.resolve_library_name.side_effect = tracked_lookup
+
+        inputs = [
+            {"library_id": i, "artist_name": f"Artist {i}", "album_title": "x"} for i in range(6)
+        ]
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/api/v1/identity/bulk-resolve-libraries", json={"inputs": inputs})
+
+        assert resp.status_code == 200
+        assert len(resp.json()["results"]) == 6
+        assert max_in_flight == 2, (
+            f"Expected the semaphore to cap in-flight lookups at 2; observed peak "
+            f"{max_in_flight}. <2 means no parallelism; >2 means the bound leaked."
+        )
+
+    @pytest.mark.asyncio
+    async def test_input_order_preserved_under_staggered_completion(
+        self, app_client, mock_entity_store
+    ):
+        """gather preserves input order even when the first input finishes last.
+
+        The earliest input sleeps the longest so completion order is the reverse
+        of input order. ``results[i]`` must still correspond to ``inputs[i]``.
+        """
+        identities = {
+            "First": _identity("First", id=1, discogs_artist_id=11),
+            "Second": _identity("Second", id=2, discogs_artist_id=22),
+            "Third": _identity("Third", id=3, discogs_artist_id=33),
+        }
+        # Slowest first, fastest last → completion order is reversed.
+        delays = {"First": 0.06, "Second": 0.03, "Third": 0.0}
+
+        async def staggered_lookup(name: str):
+            await asyncio.sleep(delays[name])
+            return identities[name]
+
+        mock_entity_store.resolve_library_name.side_effect = staggered_lookup
+        mock_entity_store.get_latest_provenance_by_source.return_value = {}
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/identity/bulk-resolve-libraries",
+                json={
+                    "inputs": [
+                        {"library_id": 1, "artist_name": "First", "album_title": "x"},
+                        {"library_id": 2, "artist_name": "Second", "album_title": "x"},
+                        {"library_id": 3, "artist_name": "Third", "album_title": "x"},
+                    ]
+                },
+            )
+
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert [r["library_id"] for r in results] == [1, 2, 3]
+        assert [r["main"]["discogs_artist_id"] for r in results] == [11, 22, 33]
+
+    @pytest.mark.asyncio
+    async def test_postgres_error_mid_batch_returns_503_not_partial(
+        self, app_client, mock_entity_store
+    ):
+        """A PostgresError on any input fails the whole batch closed with 503.
+
+        Fail-closed posture must survive the gather refactor: the caller cannot
+        distinguish "row had no identity" from "PG died before this row was
+        tried", so a partial 200 would silently cache wrong no-match verdicts.
+        """
+
+        async def maybe_fail(name: str):
+            if name == "Boom":
+                raise PostgresError("simulated mid-batch PG failure")
+            return None
+
+        mock_entity_store.resolve_library_name.side_effect = maybe_fail
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/identity/bulk-resolve-libraries",
+                json={
+                    "inputs": [
+                        {"library_id": 1, "artist_name": "Fine One", "album_title": "x"},
+                        {"library_id": 2, "artist_name": "Boom", "album_title": "x"},
+                        {"library_id": 3, "artist_name": "Fine Two", "album_title": "x"},
+                    ]
+                },
+            )
+
+        assert resp.status_code == 503
+        # No partial results leak: the body is the 503 error envelope, not a
+        # 200 `results` payload.
+        assert "results" not in resp.json()
