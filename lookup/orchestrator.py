@@ -3480,6 +3480,20 @@ async def enrich_artwork_results(
         is_album_derived_eligible = is_top1 and library_row_acceptable
         year_result = top1_year if is_album_derived_eligible else probe_release_year
 
+        # LML#688: the resolved release's Discogs master_id, gated like the
+        # other release-sourced fields (top-1 + acceptable library row). Lets a
+        # catalog-popularity caller (Backend) collapse pressings/formats of one
+        # logical album by the master. ``None`` when the release has no master
+        # (one-offs, self-released) or the top-1 release never resolved. Unlike
+        # the extended-only fields below, it rides the album-derived gate alone
+        # (not ``extended``): it is a lightweight release-identity integer that
+        # the non-extended bulk-drain path also needs to group by.
+        master_id_result = (
+            top1_release.master_id
+            if is_album_derived_eligible and top1_release is not None
+            else None
+        )
+
         # LML#504: library-row hop. ``artist_matches_item``
         # (orchestrator.py:527) and ``library/db.py``'s ``_fuzzy_search``
         # both consult ``item.artist`` AND ``item.alternate_artist_name``
@@ -3583,6 +3597,7 @@ async def enrich_artwork_results(
 
         update: dict[str, Any] = {
             "release_year": year_result,
+            "master_id": master_id_result,
             "artist_bio": artist_bio,
             "wikipedia_url": wikipedia_url,
             # spotify_url / bandcamp_url are normalized to None (like

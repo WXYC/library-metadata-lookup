@@ -1232,6 +1232,10 @@ class DiscogsReleaseVideo(BaseModel):
 
 class DiscogsReleaseMetadata(BaseModel):
     release_id: int
+    master_id: int | None = Field(
+        None,
+        description="Discogs master ID for this release, when the release belongs to a master. `null` when Discogs has no master (one-offs, self-released). Lets a caller collapse multiple pressings/formats of one logical album into a single record keyed on the master.\n",
+    )
     title: str
     artist: str
     year: int | None = None
@@ -1691,6 +1695,10 @@ class DiscogsMatchResult(BaseModel):
     release_id: int = Field(
         ...,
         description='Discogs release ID. `> 0` is a real release identity; `0` is the streaming-only sentinel (paired with `release_url == ""`, BS#1185) and is not a linkable Discogs release.\n',
+    )
+    master_id: int | None = Field(
+        None,
+        description="Discogs master ID for the release, when the release belongs to a master. `null` when Discogs has no master for this release (one-offs, self-released) or for the streaming-only sentinel (`release_id == 0`). Lets a caller collapse multiple pressings/formats of one logical album into a single record keyed on the master. Populated from the resolved release's `master_id` field on `/lookup` (single and bulk).\n",
     )
     release_url: str = Field(
         ...,

@@ -209,6 +209,12 @@ class DiscogsSearchResult(BaseModel):
     artwork_url: str | None = None
     confidence: float = 0.0
     # Enriched fields (populated after initial search by orchestrator)
+    # LML#688: the release's Discogs master_id, populated by the orchestrator
+    # from the resolved release so a catalog-popularity caller can collapse
+    # pressings/formats of one logical album by the master. `None` when the
+    # release has no master (one-offs, self-released) or for the streaming-only
+    # sentinel (release_id == 0).
+    master_id: int | None = None
     release_year: int | None = None
     artist_bio: str | None = None
     wikipedia_url: str | None = None
@@ -237,6 +243,7 @@ class DiscogsSearchResult(BaseModel):
             artist=self.artist,
             release_id=self.release_id,
             release_url=self.release_url,
+            master_id=self.master_id,
             artwork_url=self.artwork_url,
             confidence=self.confidence,
             release_year=self.release_year,
