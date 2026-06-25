@@ -412,6 +412,79 @@ class TestEnrichArtworkResultsExtended:
         assert "French-British band" in enriched.artist_bio
 
     @pytest.mark.asyncio
+    async def test_populates_master_id_on_top1_from_resolved_release(self):
+        """LML#688: the resolved release's master_id lands on the enriched top-1
+        result so a catalog-popularity caller can collapse pressings by master.
+
+        master_id is a release-identity fact (like release_id), so it surfaces
+        whenever the release resolves — independent of ``extended`` mode. This
+        is the same enrichment path the bulk /lookup route runs per item, so a
+        passing assertion here covers the bulk path's master_id carriage too.
+        """
+        item = make_library_item(artist="Juana Molina", title="DOGA")
+        artwork = make_discogs_result(release_id=10154369, artist="Juana Molina", album="DOGA")
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=10154369,
+            master_id=777001,
+            title="DOGA",
+            artist="Juana Molina",
+            year=2022,
+            artist_id=42,
+            release_url="https://discogs.com/release/10154369",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=42,
+            name="Juana Molina",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="la paradoja",
+            artist="Juana Molina",
+            extended=True,
+        )
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.master_id == 777001
+
+    @pytest.mark.asyncio
+    async def test_master_less_release_surfaces_null_master_id(self):
+        """A master-less release (one-off / self-released) surfaces master_id=None."""
+        item = make_library_item(artist="Chuquimamani-Condori", title="Edits")
+        artwork = make_discogs_result(
+            release_id=20154369, artist="Chuquimamani-Condori", album="Edits"
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=20154369,
+            master_id=None,
+            title="Edits",
+            artist="Chuquimamani-Condori",
+            year=2023,
+            artist_id=43,
+            release_url="https://discogs.com/release/20154369",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=43,
+            name="Chuquimamani-Condori",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Call Your Name",
+            artist="Chuquimamani-Condori",
+            extended=True,
+        )
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.master_id is None
+
+    @pytest.mark.asyncio
     async def test_extended_false_leaves_new_fields_unset(self):
         """With extended=False the response shape is unchanged.
 

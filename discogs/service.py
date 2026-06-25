@@ -874,6 +874,11 @@ class DiscogsService:
 
                 return ReleaseMetadataResponse(
                     release_id=release_id,
+                    # LML#688: surface the release's Discogs master_id so a
+                    # caller (Backend catalog-popularity) can collapse multiple
+                    # pressings/formats of one logical album by the master.
+                    # `None` when Discogs has no master for this release.
+                    master_id=data.get("master_id"),
                     title=data.get("title", ""),
                     artist=artist_name,
                     year=data.get("year"),

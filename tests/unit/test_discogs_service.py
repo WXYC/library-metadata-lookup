@@ -2363,6 +2363,63 @@ class TestGetReleaseEnrichedParsing:
 
 
 # ---------------------------------------------------------------------------
+# get_release extracts master_id (LML#688 / Phase-2 catalog popularity)
+# ---------------------------------------------------------------------------
+
+
+class TestGetReleaseExtractsMasterId:
+    @pytest.mark.asyncio
+    async def test_extracts_master_id_when_present(self, service):
+        """A release that belongs to a Discogs master surfaces its master_id."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "DOGA",
+            "artists": [{"id": 1, "name": "Juana Molina"}],
+            "labels": [{"id": 2, "name": "Sonamos"}],
+            "tracklist": [],
+            "images": [],
+            "genres": ["Rock"],
+            "styles": [],
+            "master_id": 123456,
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(28138)
+
+        assert result is not None
+        assert result.master_id == 123456
+
+    @pytest.mark.asyncio
+    async def test_master_id_is_none_when_absent(self, service):
+        """A master-less release (one-off / self-released) surfaces master_id=None."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Edits",
+            "artists": [{"id": 3, "name": "Chuquimamani-Condori"}],
+            "labels": [],
+            "tracklist": [],
+            "images": [],
+            "genres": ["Electronic"],
+            "styles": [],
+            # no master_id key
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(99999)
+
+        assert result is not None
+        assert result.master_id is None
+
+
+# ---------------------------------------------------------------------------
 # get_artist_details
 # ---------------------------------------------------------------------------
 

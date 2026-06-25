@@ -44,6 +44,28 @@ class TestToMatchResult:
         assert match.artwork_url is None
         assert match.confidence == 0.0
 
+    def test_threads_master_id_when_present(self):
+        """LML#688: a search result carrying a master_id surfaces it on the match."""
+        result = DiscogsSearchResult(
+            album="DOGA",
+            artist="Juana Molina",
+            release_id=12345,
+            release_url="https://discogs.com/release/12345",
+            master_id=67890,
+        )
+        match = result.to_match_result()
+        assert match.master_id == 67890
+
+    def test_master_id_defaults_to_none(self):
+        """A master-less search result surfaces master_id=None on the match."""
+        result = DiscogsSearchResult(
+            release_id=1,
+            release_url="https://discogs.com/release/1",
+        )
+        assert result.master_id is None
+        match = result.to_match_result()
+        assert match.master_id is None
+
 
 # ---------------------------------------------------------------------------
 # ArtistCredit / LabelCredit models
