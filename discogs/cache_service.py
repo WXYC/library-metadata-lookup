@@ -45,6 +45,12 @@ class CacheUnavailableError(Exception):
 # on a release. Tied to that constant by intent, not duplicated by accident.
 _ARTIST_FUZZY_MATCH_THRESHOLD = 70
 
+# Mirrors ``_TRACK_TITLE_FUZZY_MATCH_THRESHOLD`` in ``discogs/service.py`` (LML#334)
+# — the track-title fuzzy fallback applied here after the bidirectional substring
+# gate misses. Must score the same as the API path so cache hits and misses agree
+# on whether a (possibly misspelled) track title is on a release.
+_TRACK_TITLE_FUZZY_MATCH_THRESHOLD = 85
+
 # Default TTL for a negative-cache entry (7 days, matching the
 # migration's column default). 7 days is conservative: tracks that
 # eventually land on Discogs (new releases) shouldn't be pinned negative
@@ -1450,7 +1456,17 @@ class DiscogsCacheService:
                 item_title = normalize_for_track_comparison(row["title"])
 
                 if track_lower not in item_title and item_title not in track_lower:
-                    continue
+                    # Fuzzy title fallback (LML#334): typographic noise that leaves
+                    # token content intact (singular/plural, a dropped interior word,
+                    # dash-vs-paren suffix) misses the substring gate but clears the
+                    # token_set_ratio floor. Mirrors the API path's
+                    # ``_iter_title_matched_items``.
+                    if (
+                        not item_title
+                        or fuzz.token_set_ratio(track_lower, item_title)
+                        < _TRACK_TITLE_FUZZY_MATCH_THRESHOLD
+                    ):
+                        continue
 
                 seq = row["sequence"]
                 artists_for_track = track_artists.get(seq, [])

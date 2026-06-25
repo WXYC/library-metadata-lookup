@@ -1888,6 +1888,115 @@ class TestValidateTrackOnRelease:
         assert result is False
 
     @pytest.mark.asyncio
+    async def test_track_title_singular_plural_typo_validates_via_fuzzy(self, service):
+        """Singular/plural track-title typo survives the fuzzy title fallback (LML#334).
+
+        The canonical motivating query: ``tower of dub`` (the user's singular typo)
+        against ``Towers Of Dub`` on Live 93. The trailing ``s`` breaks the
+        bidirectional substring gate, but ``token_set_ratio`` scores ~96, well over
+        the 85 floor. The release-level credit (``The Orb``) then validates the artist.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=674529,
+            title="Live 93",
+            artist="The Orb",
+            release_url="https://discogs.com/release/674529",
+            tracklist=[
+                TrackItem(
+                    position="5",
+                    title="Towers Of Dub",
+                    artists=["Alex Paterson", "Kris Weston", "Thomas Fehlmann"],
+                ),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(674529, "tower of dub", "The Orb")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_track_title_missing_word_validates_via_fuzzy(self, service):
+        """A missing interior word in the requested title survives the fuzzy fallback.
+
+        ``smells teen spirit`` (the request dropped ``like``) is neither a substring
+        of nor a superstring of ``Smells Like Teen Spirit``, but ``token_set_ratio``
+        scores 100 (the request tokens are a subset). LML#334.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Some Album",
+            artist="The Artist",
+            release_url="https://discogs.com/release/1",
+            tracklist=[
+                TrackItem(position="1", title="Smells Like Teen Spirit"),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(1, "smells teen spirit", "The Artist")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_track_title_fuzzy_rejects_no_token_overlap(self, service):
+        """The title fuzzy fallback must reject titles with no token overlap (LML#334).
+
+        Artist trivially matches, so a ``False`` result isolates the title gate:
+        ``towers of dub`` vs ``a perfect day`` scores ~31, far below the 85 floor.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Some Album",
+            artist="The Artist",
+            release_url="https://discogs.com/release/1",
+            tracklist=[
+                TrackItem(position="1", title="A Perfect Day"),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(1, "towers of dub", "The Artist")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_track_title_fuzzy_rejects_one_shared_token(self, service):
+        """One shared significant token must stay below the 85 floor (LML#334).
+
+        ``towers of dub`` vs ``towers of london`` scores ~82 — the adversarial
+        near-miss the threshold is tuned to reject. Artist trivially matches so
+        only the title gate can fail the validation.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Some Album",
+            artist="The Artist",
+            release_url="https://discogs.com/release/1",
+            tracklist=[
+                TrackItem(position="1", title="Towers Of London"),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(1, "towers of dub", "The Artist")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_track_title_fuzzy_rejects_partial_phrase_overlap(self, service):
+        """A shared leading phrase but divergent tail stays rejected (LML#334).
+
+        ``smells like teen spirit`` vs ``smells like the bicep`` scores ~73.
+        """
+        release = ReleaseMetadataResponse(
+            release_id=1,
+            title="Some Album",
+            artist="The Artist",
+            release_url="https://discogs.com/release/1",
+            tracklist=[
+                TrackItem(position="1", title="Smells Like The Bicep"),
+            ],
+        )
+        with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
+            result = await service.validate_track_on_release(
+                1, "smells like teen spirit", "The Artist"
+            )
+        assert result is False
+
+    @pytest.mark.asyncio
     async def test_cache_validated(self, service_with_cache):
         service_with_cache.cache_service.validate_track_on_release = AsyncMock(return_value=True)
 

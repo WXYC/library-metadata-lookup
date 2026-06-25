@@ -1075,6 +1075,115 @@ class TestValidateTrackOnRelease:
         assert paterson_result is False
 
     @pytest.mark.asyncio
+    async def test_track_title_singular_plural_typo_validates_via_fuzzy(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """Singular/plural typo survives the cache-path fuzzy title fallback (LML#334).
+
+        Mirrors the API path: ``tower of dub`` against the cached ``Towers Of Dub``
+        row on Live 93. The substring gate fails on the trailing ``s``; the
+        ``token_set_ratio`` fallback (~96) clears the 85 floor and the release-level
+        credit (``The Orb``) validates the artist.
+        """
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=True)
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[
+                    {"track_sequence": 5, "artist_name": "Alex Paterson"},
+                    {"track_sequence": 5, "artist_name": "Kris Weston"},
+                    {"track_sequence": 5, "artist_name": "Thomas Fehlmann"},
+                ],
+                release_track=[{"sequence": 5, "title": "Towers Of Dub"}],
+            )
+        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "The Orb"})
+        result = await cache_service.validate_track_on_release(13938, "tower of dub", "The Orb")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_track_title_missing_word_validates_via_fuzzy(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """A missing interior word survives the cache-path fuzzy title fallback.
+
+        ``smells teen spirit`` (request dropped ``like``) vs cached
+        ``Smells Like Teen Spirit`` scores 100. LML#334.
+        """
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=True)
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[{"sequence": 1, "title": "Smells Like Teen Spirit"}],
+            )
+        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "The Artist"})
+        result = await cache_service.validate_track_on_release(
+            1, "smells teen spirit", "The Artist"
+        )
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_track_title_fuzzy_rejects_no_token_overlap(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """Cache-path title fuzzy fallback rejects titles with no token overlap.
+
+        Artist trivially matches, so ``False`` isolates the title gate:
+        ``towers of dub`` vs ``a perfect day`` scores ~31. LML#334.
+        """
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=True)
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[{"sequence": 1, "title": "A Perfect Day"}],
+            )
+        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "The Artist"})
+        result = await cache_service.validate_track_on_release(1, "towers of dub", "The Artist")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_track_title_fuzzy_rejects_one_shared_token(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """One shared significant token stays below the 85 floor on the cache path.
+
+        ``towers of dub`` vs ``towers of london`` scores ~82 — the adversarial
+        near-miss the threshold rejects. Artist trivially matches. LML#334.
+        """
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=True)
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[{"sequence": 1, "title": "Towers Of London"}],
+            )
+        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "The Artist"})
+        result = await cache_service.validate_track_on_release(1, "towers of dub", "The Artist")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_track_title_fuzzy_rejects_partial_phrase_overlap(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """A shared leading phrase with divergent tail stays rejected on the cache path.
+
+        ``smells like teen spirit`` vs ``smells like the bicep`` scores ~73. LML#334.
+        """
+        mock_asyncpg_pool.fetchval = AsyncMock(return_value=True)
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[{"sequence": 1, "title": "Smells Like The Bicep"}],
+            )
+        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value={"artist_name": "The Artist"})
+        result = await cache_service.validate_track_on_release(
+            1, "smells like teen spirit", "The Artist"
+        )
+        assert result is False
+
+    @pytest.mark.asyncio
     async def test_query_filters_release_track_artist_to_extra_zero(
         self, cache_service, mock_asyncpg_pool
     ):
