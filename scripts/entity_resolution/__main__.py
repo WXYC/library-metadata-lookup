@@ -50,6 +50,71 @@ _LIBRARY_ARTISTS_SQL = (
     "SELECT DISTINCT artist FROM library WHERE artist IS NOT NULL ORDER BY artist"
 )
 
+# Per-method confidence written to ``entity.reconciliation_log`` (LML#233).
+#
+# The plan §3.4.1 matrix locks a confidence band per resolution method;
+# Backend's §3.2.2 write-contract sanity-check rejects any row whose
+# ``(method, confidence)`` pair falls outside its band. Before this map the
+# Discogs stage wrote a flat ``confidence=1.0`` for every method, so a
+# ``member_group`` row (band 0.80–0.89) was silently dropped at Backend's
+# writer.
+#
+# §3.4.1 bands (inclusive):
+#   exact_match     1.00 (exact)
+#   name_variation  0.90–0.99
+#   member_group    0.80–0.89
+#   alias_match     0.75–0.84
+#   trigram         0.70–0.95   (not emitted by these stages)
+#   llm             0.60–0.79   (not emitted by these stages)
+#   inherited       parent × 0.95 (not emitted by these stages)
+#
+# Values sit mid-band so a future calibration pass can nudge them without
+# crossing a band edge. Methods that are not §3.4.1 matrix entries
+# (``name_preprocessing`` and the Wikidata / MusicBrainz bridge + search
+# methods) are scored inside the ``name_variation`` band — a deterministic
+# cross-source ID bridge sits at the high end, a name lookup at the floor.
+# The bulk-resolve composer (``identity/bulk_resolve.py``) only surfaces the
+# enum-named matrix methods on the wire, so these extra entries never reach
+# Backend's §3.2.2 check, but they keep the raw log rows honest and bounded.
+METHOD_CONFIDENCE: dict[str, float] = {
+    # Discogs cascade (scripts/entity_resolution/discogs.py) — §3.4.1 matrix.
+    "exact_match": 1.00,  # §3.4.1: 1.00
+    "name_variation": 0.92,  # §3.4.1: 0.90–0.99
+    "member_group": 0.85,  # §3.4.1: 0.80–0.89
+    "alias_match": 0.80,  # §3.4.1: 0.75–0.84
+    # Stage 5 re-runs the equality cascade on cheap name derivations (article
+    # strip, "&"→"and", bracket strip, multi-credit split). Floor of the
+    # name_variation band to reflect the extra derivation step.
+    "name_preprocessing": 0.90,
+    # Wikidata stage (run_wikidata_stage): a QID bridged deterministically
+    # from an already-reconciled Discogs ID is a graph join, not a fuzzy
+    # match — high end of the name_variation band. A SPARQL name search is a
+    # name lookup — band floor.
+    "discogs_bridge": 0.95,
+    "name_search": 0.90,
+    # MusicBrainz stage (run_musicbrainz_stage): deterministic QID→MBID
+    # bridge vs. direct name match, same reasoning as the Wikidata leg.
+    "qid_bridge": 0.95,
+    "name_match": 0.90,
+}
+
+# Fallback for any method absent from ``METHOD_CONFIDENCE`` — a value inside
+# member_group's §3.4.1 band (0.80–0.89). Conservative but always inside a
+# valid band, so an unforeseen method can never write an out-of-band row.
+_DEFAULT_METHOD_CONFIDENCE = 0.85
+
+
+def confidence_for_method(method: str) -> float:
+    """Return the §3.4.1 confidence for ``method`` (LML#233).
+
+    Looks ``method`` up in ``METHOD_CONFIDENCE``, falling back to
+    ``_DEFAULT_METHOD_CONFIDENCE`` (inside member_group's band) for any method
+    not in the table. The returned value is always inside a §3.4.1 band, so
+    every ``entity.reconciliation_log`` write passes Backend's §3.2.2
+    write-contract sanity-check.
+    """
+    return METHOD_CONFIDENCE.get(method, _DEFAULT_METHOD_CONFIDENCE)
+
 
 class OrphanDrainAbortError(RuntimeError):
     """Raised when orphan count exceeds the drain-safety threshold.
@@ -253,7 +318,7 @@ async def run_discogs_stage(
                     source="discogs",
                     external_id=str(match.discogs_artist_id),
                     method=match.method,
-                    confidence=1.0,
+                    confidence=confidence_for_method(match.method),
                 )
                 matched_count += 1
             else:
@@ -291,6 +356,7 @@ async def run_wikidata_stage(
                     source="wikidata",
                     external_id=qid,
                     method="discogs_bridge",
+                    confidence=confidence_for_method("discogs_bridge"),
                 )
                 qid_bridged += 1
 
@@ -310,6 +376,7 @@ async def run_wikidata_stage(
                 source="wikidata",
                 external_id=found_qid,
                 method="name_search",
+                confidence=confidence_for_method("name_search"),
             )
             name_searched += 1
 
@@ -375,6 +442,7 @@ async def run_musicbrainz_stage(
                     source="musicbrainz",
                     external_id=mbid,
                     method="qid_bridge",
+                    confidence=confidence_for_method("qid_bridge"),
                 )
                 mb_resolved += 1
 
@@ -401,6 +469,7 @@ async def run_musicbrainz_stage(
                     source="musicbrainz",
                     external_id=mbid,
                     method="name_match",
+                    confidence=confidence_for_method("name_match"),
                 )
                 mb_resolved += 1
 

@@ -256,12 +256,20 @@ ORDER BY bind.name, i.id ASC\
 # pick the latest attempt — matching the "most recent matcher decision" notion
 # §3.4.1.1 needs to compose from. Sub-0.70 rows are NOT excluded here; the
 # composer applies Rule 6 (sidecar-floor exclusion) separately.
+#
+# `id DESC` is the stable tie-break (LML#233): at identical `created_at`
+# (microsecond collisions are possible on burst writes) `DISTINCT ON` would
+# otherwise pick an arbitrary row, so two back-to-back `bulk-resolve` calls
+# could return different `provenance[].method` / confidence for the same
+# identity and spuriously invalidate the caller's cache. The serial `id`
+# is monotonic with insertion order, so `id DESC` deterministically keeps the
+# latest-written row.
 _LATEST_LOG_BY_SOURCE_SQL = """\
 SELECT DISTINCT ON (source)
        source, external_id, confidence, method
 FROM entity.reconciliation_log
 WHERE identity_id = $1
-ORDER BY source, created_at DESC\
+ORDER BY source, created_at DESC, id DESC\
 """
 
 
