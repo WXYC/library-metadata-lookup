@@ -182,6 +182,11 @@ SEED_ITEMS = [
     (58611, "Disco Not Disco, vol. 2", "Various Artists - Rock - D", "V", 3, 2, "Rock", "CD"),
     # Non-V/A with the same shape — regression guard so the gate stays narrow.
     (60001, "Live Sessions, vol. 2", "Some Band", "S", 4, 2, "Rock", "CD"),
+    # Trio / collaboration filed under one member (LML#684). The Discogs release
+    # crediting the full trio fails the artist floor in the Step-4 artwork
+    # re-search, so the found_on_compilation result must trust-bind the carried
+    # (already-validated) release instead of dropping its artwork.
+    (70001, "Orcutt-Shelley-Miller", "Bill Orcutt", "OR", 1, 1, "Jazz", "Vinyl"),
 ]
 
 

@@ -2906,6 +2906,7 @@ async def fetch_artwork_for_items(
     song: str | None = None,
     album: str | None = None,
     allow_release_resolution_fallback: bool = True,
+    found_on_compilation: bool = False,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Fetch artwork for multiple library items in parallel.
 
@@ -2921,6 +2922,17 @@ async def fetch_artwork_for_items(
     ``album`` (the request-level typed album, when present) only gates the A2
     soft-confidence on a row-less carried bind (LML#629): a no-album query's
     row-less release binds at ``ROWLESS_NO_ALBUM_CONFIDENCE`` rather than 1.0.
+
+    ``found_on_compilation`` (LML#684): when the result came from
+    ``search_compilations_for_track`` (TRACK_ON_COMPILATION), an in-library row
+    carries an already-validated ``ResolvedRelease`` on the seam. The artist-floor
+    re-search systematically rejects *non*-Various-Artists trio / collaboration
+    credits (the row is filed under one member, e.g. "Bill Orcutt", while Discogs
+    credits the full trio), leaving the result with no artwork. When the floor
+    rejects every candidate and a release is carried, that validated release is
+    trust-bound for artwork — independent of ``lml_resolve_compilation_release``,
+    since binding an already-carried release costs no extra Discogs fan-out
+    (unlike the flag-gated lazy ``resolve_release_for_track`` fallback below).
     """
     if not discogs_service:
         return [(item, None) for item in items]
@@ -3028,6 +3040,24 @@ async def fetch_artwork_for_items(
                 title_fn=lambda r: r.album,
             )
             if result is None:
+                # LML#684: a found-on-compilation in-library row carries a
+                # release the search strategy already resolved AND validated this
+                # same request (via validate_release_for_track in
+                # search_compilations_for_track). The artist-floor re-search above
+                # just rejected every candidate — the systematic failure for a
+                # *non*-Various-Artists trio / collaboration credit (the row is
+                # filed under one member, e.g. "Bill Orcutt", but Discogs credits
+                # the full trio on "Orcutt Shelley Miller", release 34993109).
+                # Trust-bind the carried, validated release for artwork rather than
+                # dropping it. Independent of lml_resolve_compilation_release:
+                # binding an already-carried release costs no extra Discogs fan-out
+                # (only a cached get_release), unlike the lazy fallback below. The
+                # row-less (id==0) carry-through is handled by the flag-gated
+                # bind_carried branch at the top, so it is excluded here.
+                if found_on_compilation and resolved is not None and item.id != ROWLESS_LIBRARY_ID:
+                    return await _bind_resolved_release(
+                        discogs_service, resolved, item, album=request_album
+                    )
                 # Lazy release-resolution fallback (LML#604): the artist floor
                 # rejected every candidate — the systematic failure for a V/A
                 # compilation row filed under the track artist. When the flag is
@@ -3115,6 +3145,7 @@ async def enrich_artwork_results(
     bandcamp: BandcampClient | None = None,
     entity_store: EntityStore | None = None,
     discogs_cache_pg: PgSource | None = None,
+    found_on_compilation: bool = False,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
@@ -3325,6 +3356,16 @@ async def enrich_artwork_results(
             # the feature exists to avoid. The release_id was validated to carry the
             # track, and item.title IS that release's title, so trust the binding.
             or (item.id == ROWLESS_LIBRARY_ID and artwork is not None and artwork.release_id > 0)
+            # LML#684: an in-library found_on_compilation row is the analog of the
+            # row-less carry-through above — TRACK_ON_COMPILATION located the track
+            # on a release that IS shelved, and validate_release_for_track confirmed
+            # the track sits on it. Its release title ("Orcutt-Shelley-Miller")
+            # legitimately differs from the typed album (the trio/collab name
+            # "Orcutt Shelley Miller", which scores 61.9 here), so the sibling-leak
+            # gate would clobber the validated release_id to the release_id=0
+            # sentinel — the silent-no-artwork bug this fix exists to kill. The row
+            # was track-validated, so the leak concern doesn't apply.
+            or (found_on_compilation and artwork is not None and artwork.release_id > 0)
         )
 
         # LML#487: the library row is "acceptable" (a real match for the
@@ -4184,6 +4225,7 @@ async def perform_lookup(
                 song=parsed.song,
                 album=parsed.album,
                 allow_release_resolution_fallback=allow_release_resolution_fallback,
+                found_on_compilation=found_on_compilation,
             )
 
     # The generated LookupRequest models these as bool | None (api.yaml
@@ -4211,6 +4253,7 @@ async def perform_lookup(
                 bandcamp=bandcamp,
                 entity_store=entity_store,
                 discogs_cache_pg=discogs_cache_pg,
+                found_on_compilation=found_on_compilation,
             )
 
     # Project the request-side flags and result-quality signals onto the

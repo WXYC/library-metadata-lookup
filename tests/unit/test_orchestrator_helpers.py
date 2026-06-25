@@ -2148,6 +2148,128 @@ class TestFetchArtworkRowlessBindKillSwitch:
         svc.get_release.assert_awaited()
 
 
+class TestFetchArtworkFoundOnCompilation:
+    """LML#684: a ``found_on_compilation`` in-library result carries a validated
+    ``ResolvedRelease`` on the seam. When the artist-floor re-search rejects the
+    candidate — the systematic failure for a *non*-Various-Artists trio /
+    collaboration credit (e.g. library row filed under "Bill Orcutt" vs the
+    Discogs trio credit on "Orcutt Shelley Miller", release 34993109) — the
+    carried release must still surface its artwork.
+
+    The carried release was already validated by ``validate_release_for_track``
+    during ``search_compilations_for_track``, so trust-binding it costs no extra
+    Discogs fan-out (unlike the ``lml_resolve_compilation_release`` lazy
+    ``resolve_release_for_track`` fallback). The bind is therefore independent of
+    that flag — these tests run with it at its default (off).
+    """
+
+    def _trio_inputs(self):
+        """An in-library row filed under one trio member, its carried (validated)
+        release, and a service whose floor re-search finds nothing (so an
+        unbound result leaves artwork ``None``)."""
+        item = make_library_item(id=42, artist="Bill Orcutt", title="Orcutt-Shelley-Miller")
+        discogs_titles = {
+            42: ResolvedRelease(
+                release_id=34993109,
+                release_url="https://www.discogs.com/release/34993109",
+                is_compilation=False,
+                album_title="Orcutt Shelley Miller",
+            )
+        }
+        svc = AsyncMock()
+        svc.cache_service = None
+        # Floor re-search can't clear the trio credit -> find_best_typed_match -> None.
+        svc.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
+        svc.get_release = AsyncMock(
+            return_value=ReleaseMetadataResponse(
+                release_id=34993109,
+                title="Orcutt Shelley Miller",
+                artist="Bill Orcutt, Chris Corsano, Sarah Louise",
+                release_url="https://www.discogs.com/release/34993109",
+                artwork_url="https://i.discogs.com/osm.jpg",
+            )
+        )
+        return item, discogs_titles, svc
+
+    @pytest.mark.asyncio
+    async def test_binds_carried_release_when_floor_rejects(self):
+        """found_on_compilation=True + carried release + floor rejection ->
+        trust-bind the carried release's artwork (the #684 acceptance criterion)."""
+        item, discogs_titles, svc = self._trio_inputs()
+
+        results = await fetch_artwork_for_items(
+            [item],
+            svc,
+            discogs_titles=discogs_titles,
+            song="A Star Is Born",
+            album="Orcutt Shelley Miller",
+            found_on_compilation=True,
+        )
+
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.release_id == 34993109
+        assert bound.release_url == "https://www.discogs.com/release/34993109"
+        assert bound.artwork_url == "https://i.discogs.com/osm.jpg"
+        # Art comes from the carried release's own cover via _resolve_fallback_artwork.
+        svc.get_release.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_not_found_on_compilation_leaves_floor_rejection_unbound(self):
+        """Scope guard: the same inputs WITHOUT found_on_compilation keep the
+        pre-#684 behavior — a floor-rejected row with a carried release stays
+        unbound (the flag-off floor path is unchanged for non-compilation hits)."""
+        item, discogs_titles, svc = self._trio_inputs()
+
+        results = await fetch_artwork_for_items(
+            [item],
+            svc,
+            discogs_titles=discogs_titles,
+            song="A Star Is Born",
+            album="Orcutt Shelley Miller",
+            found_on_compilation=False,
+        )
+
+        assert results[0][1] is None
+        svc.get_release.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_floor_match_preferred_over_carried_bind(self):
+        """When the floor re-search DOES clear (the Various-Artists case that
+        already works), the floor result is used as before — the #684 bind is a
+        fallback for the rejection case only, not a replacement for the floor."""
+        item, discogs_titles, svc = self._trio_inputs()
+        # This time the floor search returns a clean, matching candidate.
+        svc.search = AsyncMock(
+            return_value=DiscogsSearchResponse(
+                results=[
+                    make_discogs_result(
+                        release_id=111,
+                        album="Orcutt Shelley Miller",
+                        artist="Bill Orcutt",
+                        artwork_url="https://i.discogs.com/floor.jpg",
+                    )
+                ]
+            )
+        )
+
+        results = await fetch_artwork_for_items(
+            [item],
+            svc,
+            discogs_titles=discogs_titles,
+            song="A Star Is Born",
+            album="Orcutt Shelley Miller",
+            found_on_compilation=True,
+        )
+
+        bound = results[0][1]
+        assert bound is not None
+        assert bound.release_id == 111
+        assert bound.artwork_url == "https://i.discogs.com/floor.jpg"
+        # Floor cleared, so the carried-release trust-bind never fired.
+        svc.get_release.assert_not_awaited()
+
+
 class TestFetchArtworkFallback:
     """Tests for artwork fallback to artist/label images."""
 

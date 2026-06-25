@@ -233,3 +233,50 @@ class TestRowlessEnrichmentSplit:
         assert enriched.full_release_date is None
         assert enriched.tracklist is None
         assert enriched.artist_image_url is None
+
+    @pytest.mark.asyncio
+    async def test_found_on_compilation_rowbacked_mismatch_keeps_release(self):
+        """LML#684: a row-*backed* found_on_compilation result whose release title
+        differs from the typed album must KEEP its validated release identity (and
+        album-derived payload) — NOT collapse to the BS#1185 release_id=0 sentinel.
+
+        TRACK_ON_COMPILATION located the track on a shelved release and
+        validate_release_for_track confirmed it; the typed album (a trio / collab
+        or compilation-series name) legitimately differs from the release title, so
+        the LML#487 sibling-leak gate must be bypassed for these — the same logic
+        as the row-less carry-through bypass above, just for an in-library row.
+
+        Identical inputs to ``test_rowbacked_album_mismatch_still_suppresses_album_payload``
+        (a real ``id`` + an album that mismatches the release title); only
+        ``found_on_compilation=True`` is added — so this is its mirror image, and
+        together they pin that the exemption keys exactly on that flag.
+        """
+        item = make_library_item(id=999, artist=ARTIST, title=RELEASE_TITLE)
+        artwork = make_discogs_result(release_id=RELEASE_ID, artist=ARTIST, album=RELEASE_TITLE)
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = _resolved_release()
+        discogs_service.get_artist_details.return_value = _artist_details()
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song=SONG,
+            album=MISMATCHED_ALBUM,
+            artist=ARTIST,
+            extended=True,
+            found_on_compilation=True,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # The validated release identity survives — not the sentinel.
+        assert enriched.release_id == RELEASE_ID
+        assert enriched.release_url != ""
+        # Album-derived payload populates from the validated release.
+        assert enriched.genres == ["Rock"]
+        assert enriched.styles == ["Folk", "Acoustic"]
+        assert enriched.label == "Drag City"
+        assert enriched.full_release_date == "2015-01-27"
+        assert enriched.tracklist is not None
+        assert enriched.release_year == 2015
