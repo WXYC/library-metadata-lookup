@@ -2418,6 +2418,36 @@ class TestGetReleaseExtractsMasterId:
         assert result is not None
         assert result.master_id is None
 
+    @pytest.mark.asyncio
+    async def test_master_id_zero_sentinel_surfaces_none(self, service):
+        """Discogs returns the integer ``master_id: 0`` for a release with no
+        master (the same no-master sentinel the canonical discogs_client treats
+        as falsy, and that this repo already guards as ``master_id <= 0`` in
+        ``markup_parser``). It must normalize to ``None`` so the wire contract
+        (``null`` for no master) holds and a cold-API write-back doesn't poison
+        the PG cache with ``master_id = 0``."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "title": "Edits",
+            "artists": [{"id": 3, "name": "Chuquimamani-Condori"}],
+            "labels": [],
+            "tracklist": [],
+            "images": [],
+            "genres": ["Electronic"],
+            "styles": [],
+            "master_id": 0,
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_release(99999)
+
+        assert result is not None
+        assert result.master_id is None
+
 
 # ---------------------------------------------------------------------------
 # get_artist_details

@@ -872,13 +872,25 @@ class DiscogsService:
                     if v.get("uri")
                 ]
 
+                # LML#688: surface the release's Discogs master_id so a caller
+                # (Backend catalog-popularity) can collapse multiple pressings/
+                # formats of one logical album by the master. Discogs returns the
+                # integer ``master_id: 0`` (a sentinel, not an absent key) for a
+                # release with no master — the same no-master value the canonical
+                # discogs_client treats as falsy and that this repo already guards
+                # as ``master_id <= 0`` in ``markup_parser``. Normalize any
+                # non-positive / non-int to ``None`` so the wire contract
+                # (``null`` for no master) holds AND a cold-API write-back never
+                # persists ``master_id = 0`` into the PG cache (cache_service
+                # write_release warms straight from this value).
+                raw_master_id = data.get("master_id")
+                master_id = (
+                    raw_master_id if isinstance(raw_master_id, int) and raw_master_id > 0 else None
+                )
+
                 return ReleaseMetadataResponse(
                     release_id=release_id,
-                    # LML#688: surface the release's Discogs master_id so a
-                    # caller (Backend catalog-popularity) can collapse multiple
-                    # pressings/formats of one logical album by the master.
-                    # `None` when Discogs has no master for this release.
-                    master_id=data.get("master_id"),
+                    master_id=master_id,
                     title=data.get("title", ""),
                     artist=artist_name,
                     year=data.get("year"),
