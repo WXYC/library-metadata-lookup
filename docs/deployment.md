@@ -32,7 +32,7 @@ See [`testing.md`](testing.md#pytest-markers-architecture-a) for what each test 
 
 ## CI pin maintenance
 
-Three classes of pin in `.github/workflows/*.yml` exist for supply-chain reasons (mirrors WXYC/request-o-matic#124's free-tier hardening; see WXYC/wiki#67 for the org-wide rollout). They will bit-rot and need occasional bumps:
+Four classes of pin in `.github/workflows/*.yml` exist for supply-chain reasons (mirrors WXYC/request-o-matic#124's free-tier hardening; see WXYC/wiki#67 for the org-wide rollout). They will bit-rot and need occasional bumps:
 
 - **`@railway/cli@<version>`** in the `Install Railway CLI` step of `ci.yml` (`deploy-staging`, `deploy-production`) and `set-railway-var.yml`. Three lines total. Failure mode is loud (deploy step fails with a CLI error). Bump by checking `npm view @railway/cli version` and updating all three lines together; mismatched pins across these workflows would mean staging, production, and ops use different CLIs against the same Railway project. Railway ships fast (~40 versions in 60 days as of 2026-05); pin "current" rather than chasing every release. Last bump: 66d2eb4 (2026-05-13, pinned to 4.58.0).
 - **Workflow-level `permissions:`** scoped to the minimum each workflow needs:
@@ -41,8 +41,9 @@ Three classes of pin in `.github/workflows/*.yml` exist for supply-chain reasons
   - `refresh-streaming.yml`: `contents: read` (its only release interaction is downloading `library.db` via `GH_TOKEN` — a read). The canonical `streaming_availability.db` round-trip goes to the Railway **volume** via `ADMIN_TOKEN` + `PRODUCTION_URL` (see [Streaming Database Backup](#streaming-database-backup-upload--download)), not GITHUB_TOKEN.
   Failure mode is silent — a job that needs a missing scope (e.g. `pull-requests: write`) fails its API call but the workflow stays green. When adding a step that needs to comment on PRs, push tags, mint releases, etc., explicitly grant the scope at the job level (or widen the workflow-level floor only if every job in the file needs it).
 - **Reusable-workflow refs pinned to `@gha/v1`**, not `@main` — `WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@gha/v1` (in `ci.yml`) and `WXYC/wxyc-shared/.github/workflows/check-charset-corpus-drift.yml@gha/v1` (in `charset-corpus-drift.yml`). The publishing repos treat `gha/v1` as a moving major tag — re-pointed forward on non-breaking changes, frozen on breaking changes (which get a fresh `gha/v2`). Don't downgrade either to `@main`; if a `gha/v2` migration arrives, follow the procedure at the top of the publishing repo's CLAUDE.md.
+- **`ACTIONLINT_VERSION`** in `actionlint.yml` (the `Workflow Lint` workflow). rhysd/actionlint publishes no root `action.yml`, so the job downloads a pinned binary via the official `download-actionlint.bash` script — the env var feeds both the script's release-tag ref and the binary version it fetches, keeping them in lockstep. Failure mode is loud (the lint step fails). Bump by checking the latest release at https://github.com/rhysd/actionlint/releases and updating the single `ACTIONLINT_VERSION` value. Last pin: 1.7.12.
 
-Run `actionlint .github/workflows/*.yml` locally before pushing workflow changes; it validates `permissions:` syntax, action-version pins, and shell-script blocks (via shellcheck), and catches the silent-mistake class of errors above before CI does.
+The `Workflow Lint` CI job (`actionlint.yml`) runs `actionlint` on every PR (and `main`/`prod` push) that touches `.github/workflows/**`, failing on lint errors. It validates `permissions:` syntax, action-version pins, expression references, and shell-script blocks (via shellcheck), catching the silent-mistake class of errors above before they merge. Run `actionlint .github/workflows/*.yml` locally before pushing to get the same signal without burning a CI cycle.
 
 ## Library Database Upload
 
