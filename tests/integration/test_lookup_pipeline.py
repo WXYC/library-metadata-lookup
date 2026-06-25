@@ -620,6 +620,108 @@ class TestVACompilationTrackSearch:
         assert "Now That's What I Call Music 47" in titles
 
 
+class TestFoundOnCompilationArtwork:
+    """LML#684: a found_on_compilation result must carry the matched Discogs
+    release's artwork even when the Step-4 artist-floor re-search rejects the
+    candidate — the systematic failure for a non-Various-Artists trio /
+    collaboration credit.
+
+    Repro (prod, 2026-06-23): ``Orcutt Shelley Miller`` / ``Orcutt Shelley
+    Miller`` / ``A Star Is Born``. The library row is filed under "Bill Orcutt"
+    (release 34993109 credits the full trio), so the floor re-search can't clear
+    it. The release was already validated during the compilation search, so its
+    artwork must be trust-bound rather than dropped (release_id=0 / empty url).
+    """
+
+    @pytest.mark.asyncio
+    async def test_trio_compilation_result_carries_release_artwork(self, library_db):
+        """Seed row (70001, "Orcutt-Shelley-Miller", "Bill Orcutt"). The
+        album-title fallback in search_compilations_for_track locates it via
+        release 34993109; the floor re-search rejects the trio credit; the
+        carried, validated release's artwork is bound."""
+        from wxyc_fastapi.observability import init_cache_stats
+
+        from discogs.service import DiscogsService
+        from lookup.models import LookupRequest
+        from lookup.orchestrator import perform_lookup
+        from tests.conftest import make_lml_telemetry
+
+        init_cache_stats()
+
+        mock_service = AsyncMock(spec=DiscogsService)
+        mock_service.cache_service = None
+
+        # The two artist-scoped probes find nothing — no single canonical entity
+        # exists for the trio (the motivating shape for the album-title fallback).
+        mock_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="A Star Is Born", artist="Orcutt Shelley Miller", releases=[], total=0
+            )
+        )
+        # The album-title fallback surfaces the trio release. Discogs does NOT
+        # classify it as a compilation; its credit is the full trio.
+        mock_service.search_releases_by_album_title = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="",
+                artist="",
+                releases=[
+                    ReleaseInfo(
+                        album="Orcutt-Shelley-Miller",
+                        artist="Bill Orcutt, Chris Corsano, Sarah Louise",
+                        release_id=34993109,
+                        release_url="https://www.discogs.com/release/34993109",
+                        is_compilation=False,
+                    ),
+                ],
+                total=1,
+                cached=False,
+            )
+        )
+        # The track validates on the trio release.
+        mock_service.validate_track_on_release = AsyncMock(return_value=True)
+        # Step-4 artist-floor re-search returns nothing usable -> None.
+        mock_service.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
+        # The carried release's own cover (trust-bind path).
+        mock_service.get_release = AsyncMock(
+            return_value=ReleaseMetadataResponse(
+                release_id=34993109,
+                title="Orcutt-Shelley-Miller",
+                artist="Bill Orcutt, Chris Corsano, Sarah Louise",
+                release_url="https://www.discogs.com/release/34993109",
+                artwork_url="https://i.discogs.com/osm.jpg",
+            )
+        )
+
+        request = LookupRequest(
+            artist="Orcutt Shelley Miller",
+            album="Orcutt Shelley Miller",
+            song="A Star Is Born",
+            raw_message="Orcutt Shelley Miller - Orcutt Shelley Miller - A Star Is Born",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            response = await perform_lookup(
+                request,
+                library_db,
+                mock_service,
+                make_lml_telemetry(),
+            )
+
+        assert response.found_on_compilation is True, (
+            "Trio compilation hit should set found_on_compilation=True"
+        )
+        assert len(response.results) >= 1
+        top = response.results[0]
+        assert top.library_item.title == "Orcutt-Shelley-Miller"
+        assert top.artwork is not None, "found_on_compilation result must carry artwork (#684)"
+        assert top.artwork.release_id == 34993109
+        assert top.artwork.artwork_url == "https://i.discogs.com/osm.jpg"
+
+
 class TestTrackOnArtistAlbumAndCompilation:
     """Test that tracks on both an artist album and a compilation return both results.
 
