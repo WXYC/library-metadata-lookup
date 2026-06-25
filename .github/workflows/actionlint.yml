@@ -30,20 +30,28 @@ jobs:
     name: actionlint
     runs-on: ubuntu-latest
     env:
-      # Pinned for reproducibility, mirroring the repo's CI-pin philosophy (see
-      # docs/deployment.md "CI pin maintenance"). Bump by checking the latest
-      # release at https://github.com/rhysd/actionlint/releases and updating
-      # this version — the download-script ref below interpolates it, so the
-      # script tag and the downloaded binary stay in lockstep.
+      # Version-pinned to a release tag (not a SHA), mirroring the repo's CI-pin
+      # philosophy (see docs/deployment.md "CI pin maintenance"). Bump by checking
+      # the latest release at https://github.com/rhysd/actionlint/releases and
+      # updating this version — the download-script ref below interpolates it, so
+      # the script tag and the downloaded binary stay in lockstep.
       ACTIONLINT_VERSION: 1.7.12
     steps:
       - uses: actions/checkout@v6
       # rhysd/actionlint publishes no root action.yml, so install the pinned
       # binary via the official download script (also pinned to the release
-      # tag). The script writes the binary path to the `executable` step output.
+      # tag). Fetch the script to a file first rather than `bash <(curl ...)`:
+      # process substitution discards curl's exit code, so a transient fetch
+      # failure would pass this step green and only surface as a confusing
+      # "command not found" at the run step. The script writes the binary path
+      # to the `executable` step output.
       - name: Download pinned actionlint
         id: get_actionlint
-        run: bash <(curl -sSfL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
+        run: |
+          curl -sSfL \
+            "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash" \
+            -o "${RUNNER_TEMP}/download-actionlint.bash"
+          bash "${RUNNER_TEMP}/download-actionlint.bash" "$ACTIONLINT_VERSION"
         shell: bash
       - name: Run actionlint
         run: ${{ steps.get_actionlint.outputs.executable }} -color
