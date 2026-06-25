@@ -381,60 +381,78 @@ class DiscogsService:
         # the ``request_context()`` helper (the three API-only methods that
         # bypass the seam and the four ``cache is None`` fallback branches).
 
-        # Explicit acquire/release (not `async with semaphore:`) so the wait
-        # is wrapped in a Sentry span. The 5-permit semaphore is the dominant
-        # source of pre-request dark time on backfill cascades — sampling the
-        # queue depth right before the await gives the trace explorer a
-        # relative-load signal per call. See WXYC/library-metadata-lookup#358.
-        with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
-            span.set_data("lml.semaphore.queue_depth", _approx_semaphore_queue_depth(semaphore))
-            apply_request_ctx_tags(span)
-            await semaphore.acquire()
-        try:
-            for attempt in range(max_retries + 1):
+        # The semaphore wraps a single attempt, not the whole retry loop
+        # (LML#569). A 429's inter-attempt ``asyncio.sleep(Retry-After)`` runs
+        # *outside* the held permit, so a caller riding out a 30-60s rate-limit
+        # window no longer parks one of the 5 permits for that whole window and
+        # amplifies ``lml.discogs.semaphore`` acquire-wait for unrelated callers
+        # (the last unhandled tail of #537, cause #3). The egress cap is still
+        # the per-attempt ``rate_limiter.acquire()`` below — releasing the
+        # semaphore during the sleep does not bypass the AsyncLimiter.
+        #
+        # The per-attempt try/finally guarantees exactly one release per
+        # acquire: cancellation mid-sleep (sleep is outside the block) or a
+        # raise inside the request leaves no leaked permit and never
+        # double-releases. As a result the ``lml.discogs.semaphore`` /
+        # ``lml.discogs.rate_limiter`` spans now fire once per attempt rather
+        # than once per request — a span-count schema change documented in the
+        # #569 PR (no current dashboard/alert aggregates on that count).
+        for attempt in range(max_retries + 1):
+            # Explicit acquire/release (not `async with semaphore:`) so the wait
+            # is wrapped in a Sentry span. The 5-permit semaphore is the dominant
+            # source of pre-request dark time on backfill cascades — sampling the
+            # queue depth right before the await gives the trace explorer a
+            # relative-load signal per call. See WXYC/library-metadata-lookup#358.
+            with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
+                span.set_data("lml.semaphore.queue_depth", _approx_semaphore_queue_depth(semaphore))
+                apply_request_ctx_tags(span)
+                await semaphore.acquire()
+
+            try:
                 with sentry_sdk.start_span(
                     op="lock.acquire", name="lml.discogs.rate_limiter"
                 ) as span:
                     apply_request_ctx_tags(span)
                     await rate_limiter.acquire()
 
-                try:
-                    response = await client.request(method, path, params=params)
+                response = await client.request(method, path, params=params)
 
-                    # Log rate limit remaining for observability
-                    remaining = response.headers.get("X-Discogs-Ratelimit-Remaining")
-                    if remaining:
-                        logger.debug(f"Discogs rate limit remaining: {remaining}")
+                # Log rate limit remaining for observability
+                remaining = response.headers.get("X-Discogs-Ratelimit-Remaining")
+                if remaining:
+                    logger.debug(f"Discogs rate limit remaining: {remaining}")
+            except httpx.RequestError as e:
+                logger.error(
+                    "Discogs request failed: %s %s -> %s: %r",
+                    method,
+                    path,
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
+                return None
+            finally:
+                # Released before the retry sleep below, on success, and on any
+                # error/cancellation in this attempt — one release per acquire.
+                semaphore.release()
 
-                    if response.status_code == 429:
-                        if attempt < max_retries:
-                            retry_after = response.headers.get("Retry-After")
-                            delay = _compute_retry_delay(attempt, retry_after)
-                            logger.warning(
-                                f"Discogs rate limit hit, retrying in {delay:.2f}s "
-                                f"(attempt {attempt + 1}/{max_retries + 1}, "
-                                f"Retry-After={retry_after})"
-                            )
-                            await asyncio.sleep(delay)
-                            continue
-                        else:
-                            logger.error("Discogs rate limit hit, max retries exhausted")
-                            return None
+            if response.status_code != 429:
+                return response
 
-                    return response
+            if attempt < max_retries:
+                retry_after = response.headers.get("Retry-After")
+                delay = _compute_retry_delay(attempt, retry_after)
+                logger.warning(
+                    f"Discogs rate limit hit, retrying in {delay:.2f}s "
+                    f"(attempt {attempt + 1}/{max_retries + 1}, "
+                    f"Retry-After={retry_after})"
+                )
+                # Sleep WITHOUT holding the permit; re-acquire on the next pass.
+                await asyncio.sleep(delay)
+                continue
 
-                except httpx.RequestError as e:
-                    logger.error(
-                        "Discogs request failed: %s %s -> %s: %r",
-                        method,
-                        path,
-                        type(e).__name__,
-                        e,
-                        exc_info=True,
-                    )
-                    return None
-        finally:
-            semaphore.release()
+            logger.error("Discogs rate limit hit, max retries exhausted")
+            return None
 
         return None
 
