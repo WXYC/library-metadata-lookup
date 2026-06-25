@@ -91,6 +91,12 @@ WHERE wxyc_identity_match_artist(nv.name) = ANY($1)\
 # Stage 1 exact match. Returns the single best candidate by descending
 # similarity; the caller applies the acceptance threshold in Python so it stays
 # trivially tunable (and so the score is available to record as confidence).
+# Note: the ``%`` operator pre-filters to rows above pg_trgm's session
+# ``similarity_threshold`` (``show_limit()``, default 0.3) before the Python
+# ``trigram_threshold`` is applied, so configuring a ``trigram_threshold`` below
+# that floor would silently drop candidates in the gap. The shipped default
+# (0.85) and the issue's tuning band sit well above 0.3, so this never bites in
+# practice.
 _TRIGRAM_FALLBACK_SQL = """\
 SELECT ra.artist_id, ra.artist_name,
        similarity(lower(f_unaccent(ra.artist_name)), lower(f_unaccent($1))) AS score
