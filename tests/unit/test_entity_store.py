@@ -6,6 +6,7 @@ import pytest
 
 from entity.store import (
     _GET_IDENTITY_LOWER_SQL,
+    _LATEST_LOG_BY_SOURCE_SQL,
     EntityStore,
 )
 
@@ -370,6 +371,19 @@ class TestLogReconciliation:
         call_args = mock_pg.execute.call_args
         assert "entity.reconciliation_log" in call_args[0][0]
         assert "INSERT" in call_args[0][0]
+
+
+class TestLatestLogBySourceSQL:
+    def test_includes_id_tiebreak_for_stable_distinct_on(self):
+        """Locks the LML#233 stable tie-break.
+
+        `DISTINCT ON (source)` picks an arbitrary row when two log rows for
+        the same source share a `created_at` (microsecond collisions are
+        possible on burst writes). Adding `id DESC` after `created_at DESC`
+        makes the pick deterministic: the latest-inserted row wins, so
+        back-to-back `bulk-resolve` calls return identical provenance.
+        """
+        assert "ORDER BY source, created_at DESC, id DESC" in _LATEST_LOG_BY_SOURCE_SQL
 
 
 class TestGetIdentitiesByStatus:

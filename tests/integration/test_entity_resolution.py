@@ -10,6 +10,7 @@ Requires: DATABASE_URL_TEST env var or Docker postgres on port 5433.
 from __future__ import annotations
 
 from typing import ClassVar
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -19,10 +20,11 @@ from entity.store import EntityStore
 from scripts.entity_resolution.__main__ import (
     OrphanDrainAbortError,
     prune_orphan_identities,
+    run_discogs_stage,
     seed_identities,
 )
 from scripts.entity_resolution.dedup import EntityDeduplicator
-from scripts.entity_resolution.discogs import DiscogsReconciler
+from scripts.entity_resolution.discogs import DiscogsReconciler, ReconciliationMatch
 
 # ``pg_pool`` (max_size=3) lives in conftest; ``DATABASE_URL`` is imported from
 # there for the ``source._dsn`` wiring and ``monkeypatch.setenv`` calls below.
@@ -731,3 +733,82 @@ class TestDeduplicationIntegration:
         # The merged record should have both discogs and musicbrainz IDs
         assert remaining[0]["discogs_artist_id"] == 12
         assert remaining[0]["musicbrainz_artist_id"] == "mbid-1"
+
+
+# §3.4.1 locked bands (inclusive) keyed by method, mirroring Backend's §3.2.2
+# write-contract sanity-check ranges. A row whose (method, confidence) lands
+# outside its band would be rejected by Backend's writer.
+_METHOD_BANDS_341: dict[str, tuple[float, float]] = {
+    "exact_match": (1.00, 1.00),
+    "name_variation": (0.90, 0.99),
+    "member_group": (0.80, 0.89),
+    "alias_match": (0.75, 0.84),
+}
+
+
+@pytest.mark.pg
+class TestDiscogsStageConfidencePersisted:
+    """LML#233: `run_discogs_stage` persists per-method confidence to PG.
+
+    Runs the real `EntityStore` write path against PostgreSQL with a stubbed
+    reconciler so the assertion covers the REAL-column round-trip (confidence
+    is stored as a 4-byte `REAL`, so we assert bands, not float equality).
+    """
+
+    @pytest.mark.parametrize("method", list(_METHOD_BANDS_341))
+    @pytest.mark.asyncio
+    async def test_logged_confidence_within_341_band(self, pg_source, method):
+        store = EntityStore(pg_source)
+        await store.upsert_identity(library_name="Stereolab")
+
+        reconciler = AsyncMock()
+        reconciler.reconcile_batch = AsyncMock(
+            return_value={"Stereolab": ReconciliationMatch(discogs_artist_id=2154, method=method)}
+        )
+
+        await run_discogs_stage(store, reconciler, batch_size=1000)
+
+        rows = await pg_source.fetchall(
+            "SELECT method, confidence FROM entity.reconciliation_log WHERE source = 'discogs'"
+        )
+        assert len(rows) == 1
+        assert rows[0]["method"] == method
+        lo, hi = _METHOD_BANDS_341[method]
+        # Pad the band by the float32 storage epsilon so e.g. 0.85 → 0.8500000238
+        # doesn't fall foul of an exact band edge.
+        assert lo - 1e-6 <= rows[0]["confidence"] <= hi + 1e-6
+
+
+@pytest.mark.pg
+class TestLatestProvenanceTiebreak:
+    """LML#233: identical `created_at` rows resolve deterministically by id."""
+
+    @pytest.mark.asyncio
+    async def test_identical_created_at_breaks_by_id_desc(self, pg_source):
+        store = EntityStore(pg_source)
+        identity = await store.upsert_identity(library_name="Stereolab")
+
+        # Two discogs rows for the same identity at the SAME created_at (a SQL
+        # literal so both rows land on the identical microsecond); the
+        # second-inserted (higher id) row must win the DISTINCT ON pick.
+        await pg_source.execute(
+            "INSERT INTO entity.reconciliation_log "
+            "(identity_id, source, external_id, confidence, method, created_at) "
+            "VALUES ($1, 'discogs', '111', 0.85, 'member_group', "
+            "TIMESTAMPTZ '2026-01-01 00:00:00+00')",
+            identity.id,
+        )
+        await pg_source.execute(
+            "INSERT INTO entity.reconciliation_log "
+            "(identity_id, source, external_id, confidence, method, created_at) "
+            "VALUES ($1, 'discogs', '222', 1.0, 'exact_match', "
+            "TIMESTAMPTZ '2026-01-01 00:00:00+00')",
+            identity.id,
+        )
+
+        # Repeat the read to prove stability — without the id tiebreak PG could
+        # return either row on each call.
+        for _ in range(5):
+            prov = await store.get_latest_provenance_by_source(identity.id)
+            assert prov["discogs"].external_id == "222"
+            assert prov["discogs"].method == "exact_match"
