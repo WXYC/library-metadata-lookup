@@ -22,10 +22,13 @@ from asyncpg.exceptions import PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
+from core.bulk_concurrency import max_concurrency_from_env
 from entity.store import EntityStore, Identity
 from generated.api_models import (
+    BulkResolveInput,
     BulkResolveLibrariesRequest,
     BulkResolveLibrariesResponse,
+    BulkResolveResult,
     ReleaseIdentityResolveRequest,
     ReleaseIdentityResolveResponse,
 )
@@ -46,6 +49,19 @@ from identity.release_validation import (
 
 # Per api.yaml: max 1,000 inputs per request; over-cap returns 413.
 _BULK_RESOLVE_INPUT_CAP = 1000
+
+# Default ceiling on concurrent per-input lookups (LML#278). The discogs-cache
+# asyncpg pool is built with ``max_size=5`` (``core.dependencies._build_discogs_pool``),
+# and each per-input coroutine holds at most one pooled connection at a time —
+# ``resolve_library_name``'s three legs and ``compose_for_identity``'s provenance
+# read are sequential awaits within a single coroutine, never concurrent — so a
+# semaphore sized to the pool's ``max_size`` saturates the pool without
+# coroutines queueing on ``pool.acquire()`` (which would otherwise block up to the
+# pool's 10 s acquire timeout). Overridable at runtime via the shared
+# ``LML_BULK_MAX_CONCURRENT`` env knob (see ``core.bulk_concurrency``); the
+# default IS the pool max, per the issue's "default to the asyncpg pool's
+# max_size" acceptance criterion.
+_BULK_RESOLVE_DEFAULT_CONCURRENCY = 5
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +239,67 @@ async def bulk_resolve_libraries(
     inputs_count = len(request.inputs)
     logger.info("bulk resolve start: inputs=%d", inputs_count)
 
+    # Per-input lookups dispatch concurrently under a semaphore (LML#278).
+    # Worst case drops from ~3,000 sequential PG round-trips for a 1,000-row
+    # miss-heavy batch to ~``ceil(N / max_concurrent)`` waves. The semaphore is
+    # sized to the discogs-cache pool's ``max_size`` (see
+    # ``_BULK_RESOLVE_DEFAULT_CONCURRENCY``) so we parallelize without exhausting
+    # the asyncpg pool. ``min(..., inputs_count)`` avoids over-allocating permits
+    # for small batches; ``max(1, ...)`` keeps ``Semaphore(0)`` (which would
+    # deadlock any acquire) off the table for an empty-input request.
+    max_concurrent = max_concurrency_from_env(_BULK_RESOLVE_DEFAULT_CONCURRENCY)
+    semaphore = asyncio.Semaphore(max(1, min(max_concurrent, inputs_count)))
+
+    async def _resolve_one(input_row: BulkResolveInput) -> BulkResolveResult:
+        """Compose one verdict, gated by the shared pool semaphore.
+
+        Holds a single permit across the whole per-input path so the in-flight
+        connection count never exceeds the pool. A ``PostgresError`` / ``OSError``
+        raised here surfaces as ``HTTPException(503)``; ``asyncio.gather`` (default
+        ``return_exceptions=False``) propagates the first such failure to the
+        awaiting handler, which fails the whole batch closed — never a 200 with
+        partial results. The caller cannot distinguish "row had no identity"
+        from "PG died before this row was tried", so the fail-closed posture is
+        load-bearing (same contract as ``/identity/bulk``).
+        """
+        async with semaphore:
+            if is_compilation_artist(input_row.artist_name):
+                return compilation_result(input_row.library_id)
+
+            try:
+                # Three-leg fall-through lookup (issues #274 / #276): exact
+                # match first (handles the 99.8% dominant case where Backend's
+                # `library.artist_name` shape equals storage), then
+                # case-insensitive `LOWER()` (catches pure case drift), then
+                # canonical form (catches diacritic / `&`-vs-`and` / smart-quote
+                # / etc. divergence when storage happens to be canonical).
+                # Strictly ≥ legacy `get_identity()` hit rate.
+                identity: Identity | None = await store.resolve_library_name(input_row.artist_name)
+            except (PostgresError, OSError):
+                logger.exception(
+                    "Entity store query failed mid-bulk-resolve for library_id=%d artist_name=%r",
+                    input_row.library_id,
+                    input_row.artist_name,
+                )
+                raise HTTPException(
+                    status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
+                ) from None
+
+            try:
+                # `compose_for_identity` issues its own
+                # `get_latest_provenance_by_source` query — that second round-trip
+                # is covered by the same permit, so a resolved input never holds
+                # two pool connections at once.
+                return await compose_for_identity(input_row.library_id, identity, store)
+            except (PostgresError, OSError):
+                logger.exception(
+                    "Provenance fetch failed mid-bulk-resolve for library_id=%d",
+                    input_row.library_id,
+                )
+                raise HTTPException(
+                    status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
+                ) from None
+
     # Explicit `http.server` span (LML#430). Defense-in-depth against the
     # FastApiIntegration's automatic transaction not landing for this endpoint
     # — `op:http.server span.description:*bulk-resolve-libraries*` queries in
@@ -236,70 +313,30 @@ async def bulk_resolve_libraries(
         http_span.set_data("http.method", "POST")
         http_span.set_data("http.target", "/api/v1/identity/bulk-resolve-libraries")
         http_span.set_data("lml.bulk_resolve.inputs", inputs_count)
+        http_span.set_data("lml.bulk_resolve.max_concurrent", max_concurrent)
 
-        results = []
         try:
-            for input_row in request.inputs:
-                if is_compilation_artist(input_row.artist_name):
-                    results.append(compilation_result(input_row.library_id))
-                    continue
-
-                try:
-                    # Three-leg fall-through lookup (issues #274 / #276): exact
-                    # match first (handles the 99.8% dominant case where
-                    # Backend's `library.artist_name` shape equals storage),
-                    # then case-insensitive `LOWER()` (catches pure case
-                    # drift), then canonical form (catches diacritic /
-                    # `&`-vs-`and` / smart-quote / etc. divergence when
-                    # storage happens to be canonical). Strictly ≥ legacy
-                    # `get_identity()` hit rate.
-                    identity: Identity | None = await store.resolve_library_name(
-                        input_row.artist_name
-                    )
-                except (PostgresError, OSError):
-                    # Fail closed on partial PG failure — the caller cannot
-                    # distinguish "row had no identity" from "PG died before
-                    # this row was tried". Same posture as ``/identity/bulk``.
-                    logger.exception(
-                        "Entity store query failed mid-bulk-resolve for "
-                        "library_id=%d artist_name=%r",
-                        input_row.library_id,
-                        input_row.artist_name,
-                    )
-                    http_span.set_data("http.status_code", 503)
-                    raise HTTPException(
-                        status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
-                    ) from None
-
-                try:
-                    result = await compose_for_identity(input_row.library_id, identity, store)
-                except (PostgresError, OSError):
-                    logger.exception(
-                        "Provenance fetch failed mid-bulk-resolve for library_id=%d",
-                        input_row.library_id,
-                    )
-                    http_span.set_data("http.status_code", 503)
-                    raise HTTPException(
-                        status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL
-                    ) from None
-                results.append(result)
+            # `gather` preserves input order (results[i] <-> inputs[i]) regardless
+            # of completion order, satisfying the api.yaml ordering contract.
+            results = await asyncio.gather(*(_resolve_one(r) for r in request.inputs))
         except asyncio.CancelledError:
-            # Client aborted mid-loop. The sequential per-input loop has no
-            # gather/sentinel structure (unlike PR #417's `/lookup/bulk`
-            # shape), so CancelledError raised at the next `await` point is
-            # the only abort signal we get. Pin 499 on the span before
+            # Client aborted mid-batch. Cancelling the handler task propagates
+            # into the in-flight `gather` (and thus its children), so permits are
+            # released as the children unwind. Pin 499 on the span before
             # re-raising so the audit-style query
-            # `op:http.server http.status_code:499` surfaces these in Sentry,
-            # and emit a warn log so Railway also carries the record.
-            # CancelledError is re-raised (not converted to HTTPException) —
-            # the asyncio cancellation contract requires this, and the client
-            # is gone anyway so there is nobody to read a 499 response.
+            # `op:http.server http.status_code:499` surfaces these in Sentry, and
+            # emit a warn log so Railway also carries the record. CancelledError
+            # is re-raised (not converted to HTTPException) — the asyncio
+            # cancellation contract requires this, and the client is gone anyway
+            # so there is nobody to read a 499 response.
             http_span.set_data("http.status_code", 499)
-            logger.warning(
-                "bulk resolve aborted by client: inputs=%d processed=%d",
-                inputs_count,
-                len(results),
-            )
+            logger.warning("bulk resolve aborted by client: inputs=%d", inputs_count)
+            raise
+        except HTTPException as exc:
+            # Fail-closed 503 (or any explicit status) from a per-input failure.
+            # Pin the status on the span before re-raising so the trace carries
+            # the real outcome rather than an unset code.
+            http_span.set_data("http.status_code", exc.status_code)
             raise
 
         # Exit signal pairs with the entry log so operators can confirm
