@@ -6,6 +6,7 @@ import pytest
 
 from entity.sources import SparqlSource
 from scripts.entity_resolution.wikidata import (
+    _CACHE_QID_TO_BANDCAMP_SQL,
     _SPARQL_DISCOGS_TO_QID,
     _SPARQL_QID_TO_DISCOGS_ARTIST,
     _SPARQL_QID_TO_DISCOGS_MASTER,
@@ -199,6 +200,122 @@ class TestStreamingIdFetch:
         assert ids.spotify_artist_id == "abc123"
         assert ids.apple_music_artist_id is None
         assert ids.bandcamp_id is None
+
+
+class TestStreamingIdCacheBacking:
+    """``fetch_streaming_ids`` consults the wikidata-cache (P3283 Bandcamp)
+    before SPARQL, mirroring ``resolve_qids_from_discogs_ids``.
+
+    WXYC/library-metadata-lookup#599: the wikidata-cache already carries the
+    Bandcamp profile ID (P3283) in the generic ``discogs_mapping`` table, so a
+    cache hit resolves the slug with no rate-limited SPARQL round-trip.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bandcamp_id_from_cache_skips_sparql(
+        self, reconciler, mock_wikidata_pg, mock_sparql
+    ):
+        """A P3283 cache hit returns the Bandcamp slug and fires no SPARQL."""
+        mock_wikidata_pg.fetchall = AsyncMock(
+            return_value=[{"qid": "Q378288", "discogs_id": "autechre"}]
+        )
+        result = await reconciler.fetch_streaming_ids(["Q378288"])
+        assert result["Q378288"].bandcamp_id == "autechre"
+        # The whole point: no rate-limited SPARQL round-trip on a cache hit.
+        mock_sparql.query_batched.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_returns_bandcamp_only_no_spotify_apple(
+        self, reconciler, mock_wikidata_pg, mock_sparql
+    ):
+        """Intended trade-off (#599 criteria #1 + #3): skipping SPARQL for a
+        cache hit means that QID yields *only* ``bandcamp_id`` — Spotify and
+        Apple Music are ``None`` because the cache exposes only P3283. The
+        caller persists ``bandcamp_id`` and leaves Spotify/Apple unset for that
+        QID until P1902/P2850 are also cached (tracked as a follow-up). This
+        test pins the deliberate consequence so it can't regress silently.
+        """
+        mock_wikidata_pg.fetchall = AsyncMock(
+            return_value=[{"qid": "Q378288", "discogs_id": "autechre"}]
+        )
+        result = await reconciler.fetch_streaming_ids(["Q378288"])
+        ids = result["Q378288"]
+        assert ids.bandcamp_id == "autechre"
+        assert ids.spotify_artist_id is None
+        assert ids.apple_music_artist_id is None
+        mock_sparql.query_batched.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cache_query_targets_p3283_keyed_by_qid(self, reconciler, mock_wikidata_pg):
+        """The cache stage runs the P3283 query, passing the input QIDs as args."""
+        mock_wikidata_pg.fetchall = AsyncMock(return_value=[])
+        await reconciler.fetch_streaming_ids(["Q378288", "Q123"])
+        mock_wikidata_pg.fetchall.assert_called_once()
+        sql_arg, qids_arg = mock_wikidata_pg.fetchall.call_args.args
+        assert sql_arg is _CACHE_QID_TO_BANDCAMP_SQL
+        assert "P3283" in sql_arg
+        assert set(qids_arg) == {"Q378288", "Q123"}
+
+    @pytest.mark.asyncio
+    async def test_sparql_fires_only_for_cache_misses(
+        self, reconciler, mock_wikidata_pg, mock_sparql
+    ):
+        """Cache hit for one QID; the other falls through to SPARQL alone."""
+        mock_wikidata_pg.fetchall = AsyncMock(
+            return_value=[{"qid": "Q378288", "discogs_id": "autechre"}]
+        )
+        mock_sparql.query_batched = AsyncMock(
+            return_value=[
+                {
+                    "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q123"},
+                    "spotifyId": {"type": "literal", "value": "abc123"},
+                }
+            ]
+        )
+        result = await reconciler.fetch_streaming_ids(["Q378288", "Q123"])
+
+        # Cache-resolved QID carries the Bandcamp slug from the local join.
+        assert result["Q378288"].bandcamp_id == "autechre"
+        # SPARQL ran exactly once and only for the cache miss.
+        mock_sparql.query_batched.assert_called_once()
+        _template_arg, items_arg = mock_sparql.query_batched.call_args.args
+        assert items_arg == ["wd:Q123"]
+        assert result["Q123"].spotify_artist_id == "abc123"
+
+    @pytest.mark.asyncio
+    async def test_blank_cache_slug_falls_through_to_sparql(
+        self, reconciler, mock_wikidata_pg, mock_sparql
+    ):
+        """A row with a null/blank slug is treated as a miss, not a hit."""
+        mock_wikidata_pg.fetchall = AsyncMock(return_value=[{"qid": "Q378288", "discogs_id": None}])
+        mock_sparql.query_batched = AsyncMock(
+            return_value=[
+                {
+                    "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q378288"},
+                    "bandcampId": {"type": "literal", "value": "autechre"},
+                }
+            ]
+        )
+        result = await reconciler.fetch_streaming_ids(["Q378288"])
+        mock_sparql.query_batched.assert_called_once()
+        _template_arg, items_arg = mock_sparql.query_batched.call_args.args
+        assert items_arg == ["wd:Q378288"]
+        assert result["Q378288"].bandcamp_id == "autechre"
+
+    @pytest.mark.asyncio
+    async def test_no_cache_goes_straight_to_sparql(self, reconciler_no_cache, mock_sparql):
+        """With wikidata_pg=None, the SPARQL-only path is unchanged (#599 safe default)."""
+        mock_sparql.query_batched = AsyncMock(
+            return_value=[
+                {
+                    "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q378288"},
+                    "bandcampId": {"type": "literal", "value": "autechre"},
+                }
+            ]
+        )
+        result = await reconciler_no_cache.fetch_streaming_ids(["Q378288"])
+        assert result["Q378288"].bandcamp_id == "autechre"
+        mock_sparql.query_batched.assert_called_once()
 
 
 class TestGracefulDegradation:

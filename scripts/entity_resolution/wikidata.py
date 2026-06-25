@@ -4,7 +4,8 @@ Resolves:
 - Discogs artist ID -> Wikidata QID (via wikidata-cache P1953 mapping or SPARQL)
 - QID -> Discogs artist/master/release ID (via SPARQL P1953 / P1954 / P2206)
 - Artist name -> QID (via SPARQL name search for musicians/musical groups)
-- QID -> streaming platform IDs (Spotify P1902, Apple Music P2850, Bandcamp P3283)
+- QID -> streaming platform IDs (Bandcamp P3283 via wikidata-cache or SPARQL;
+  Spotify P1902 / Apple Music P2850 via SPARQL)
 
 Ported from semantic-index ``wikidata_client.py`` and ``reconciliation.py``.
 """
@@ -25,6 +26,19 @@ _CACHE_DISCOGS_TO_QID_SQL = """\
 SELECT discogs_artist_id, qid
 FROM discogs_mapping
 WHERE discogs_artist_id = ANY($1)\
+"""
+
+# Cache-first read for the Bandcamp profile ID (Wikidata P3283), mirroring the
+# Discogs->QID bridge above. The WXYC wikidata-cache captures P3283 into the
+# generic ``discogs_mapping(qid, property, discogs_id)`` table (the slug lands
+# in ``discogs_id``), so a local join resolves the slug with no rate-limited
+# SPARQL round-trip. Proven query: ``scripts/bandcamp_pipeline.py`` Wikidata
+# slug loader. Keyed by QID here because that is the handle the caller holds.
+# See WXYC/library-metadata-lookup#599.
+_CACHE_QID_TO_BANDCAMP_SQL = """\
+SELECT qid, discogs_id
+FROM discogs_mapping
+WHERE property = 'P3283' AND qid = ANY($1)\
 """
 
 # Templates use ``{values}`` / ``{name}`` placeholders substituted via
@@ -257,8 +271,29 @@ class WikidataReconciler:
     async def fetch_streaming_ids(self, qids: list[str]) -> dict[str, StreamingIds]:
         """Fetch streaming platform IDs for Wikidata entities.
 
-        Queries P1902 (Spotify), P2850 (Apple Music), P3283 (Bandcamp)
-        using OPTIONAL clauses for partial results.
+        Cache-first for the Bandcamp profile ID (P3283): the wikidata-cache
+        already holds P3283 in ``discogs_mapping``, so a QID whose Bandcamp ID
+        is in the cache is resolved from a local join and is *not* sent through
+        the rate-limited (~1 req/s) SPARQL endpoint — this removes the SPARQL
+        bottleneck from the offline ``bandcamp_id`` backfill (#599). Cache
+        misses fall back to the existing SPARQL path, which queries P1902
+        (Spotify), P2850 (Apple Music) and P3283 (Bandcamp) with OPTIONAL
+        clauses for partial results.
+
+        Trade-off (intended, #599 acceptance criteria #1 + #3): on a P3283
+        cache hit the returned ``StreamingIds`` carries **only** ``bandcamp_id``
+        — ``spotify_artist_id`` and ``apple_music_artist_id`` come back ``None``
+        because the QID is never sent to SPARQL. Skipping the rate-limited
+        endpoint is the whole point, and the wikidata-cache currently exposes
+        only P3283 (P1902 is mislabeled in the cache filter; P2850 is not yet
+        wired — both deferred), so a cache hit cannot also supply Spotify/Apple.
+        The sole caller (``scripts/entity_resolution/__main__.py`` streaming
+        stage) persists all three columns, so for a cache-hit QID it writes the
+        ``bandcamp_id`` and leaves Spotify/Apple unset until those properties
+        are added to the cache (and the caller's "has any streaming id" gate is
+        relaxed to re-admit Bandcamp-only rows — tracked with the P1902/P2850
+        caching follow-up). The ``bandcamp_id`` values written are identical to
+        the SPARQL path. Cache misses still fetch all three properties.
 
         Args:
             qids: List of Wikidata QIDs to fetch streaming IDs for.
@@ -270,6 +305,31 @@ class WikidataReconciler:
         if not qids:
             return {}
 
+        result: dict[str, StreamingIds] = {}
+        remaining = list(qids)
+
+        # Stage 1: wikidata-cache P3283 (Bandcamp). Mirrors the Discogs->QID
+        # bridge in ``resolve_qids_from_discogs_ids``. A non-empty slug counts
+        # as a hit and shrinks the SPARQL workload.
+        if self._wikidata_pg is not None:
+            rows = await self._wikidata_pg.fetchall(_CACHE_QID_TO_BANDCAMP_SQL, list(qids))
+            hits: set[str] = set()
+            for row in rows:
+                slug = row["discogs_id"]
+                if slug:
+                    result[row["qid"]] = StreamingIds(bandcamp_id=slug)
+                    hits.add(row["qid"])
+            if hits:
+                remaining = [qid for qid in remaining if qid not in hits]
+
+        # Stage 2: SPARQL fallback for cache misses (all three properties).
+        if remaining:
+            result.update(await self._fetch_streaming_ids_via_sparql(remaining))
+
+        return result
+
+    async def _fetch_streaming_ids_via_sparql(self, qids: list[str]) -> dict[str, StreamingIds]:
+        """Fetch P1902 / P2850 / P3283 for ``qids`` via SPARQL OPTIONAL clauses."""
         # Prefix with ``wd:`` so the rendered ``VALUES ?item { ... }`` clause is
         # syntactically valid SPARQL — bare ``Q378288`` is a parse error.
         items = [f"wd:{qid}" for qid in qids]
