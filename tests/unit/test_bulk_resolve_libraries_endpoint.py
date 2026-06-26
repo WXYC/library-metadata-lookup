@@ -739,8 +739,10 @@ class TestBulkResolveConcurrency:
         assert [r["main"]["discogs_artist_id"] for r in results] == [11, 22, 33]
 
     @pytest.mark.asyncio
-    async def test_client_disconnect_cancels_in_flight_lookups(self, app_client, mock_entity_store):
-        """Mid-batch client disconnect aborts the gather with 499; queued items never run.
+    async def test_client_disconnect_cancels_in_flight_lookups(
+        self, app_client, mock_entity_store, monkeypatch
+    ):
+        """Mid-batch client disconnect cancels in-flight lookups; queued ones never start.
 
         Adopts the ``/lookup/bulk`` disconnect-cancellation pattern (LML#700):
         without it, a caller that hangs up mid-request leaves the in-flight
@@ -752,11 +754,33 @@ class TestBulkResolveConcurrency:
         "detects" the disconnect after a short delay; the real receive-channel
         mechanism is exercised in production by uvicorn. The slow lookup outlasts
         the sentinel so the abort fires while work is still in flight.
+
+        The load-bearing assertion is ``cancelled == started``: every lookup that
+        actually entered (the in-flight items, bounded by the pinned concurrency)
+        must receive ``CancelledError``. A regression that returns 499 but leaves
+        the gather draining in the background (the LML#700 bug) leaves the
+        in-flight items sleeping — ``cancelled == 0 != started`` — so this fails.
+        ``await_count``-style counts alone can't catch that: the semaphore already
+        bounds in-flight lookups below the batch size whether or not the cancel
+        lands. Concurrency is pinned (not read from the production default) so a
+        future pool-size change can't silently make the batch fit under one wave.
         """
+        monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "3")
+        concurrency = 3
+        batch_size = 9
+
+        started = 0
+        cancelled = 0
 
         async def slow_lookup(name: str):
-            await asyncio.sleep(5)
-            return None
+            nonlocal started, cancelled
+            started += 1
+            try:
+                await asyncio.sleep(5)
+                return None
+            except asyncio.CancelledError:
+                cancelled += 1
+                raise
 
         mock_entity_store.resolve_library_name.side_effect = slow_lookup
 
@@ -764,7 +788,8 @@ class TestBulkResolveConcurrency:
             await asyncio.sleep(0.05)
 
         inputs = [
-            {"library_id": i, "artist_name": f"Artist {i}", "album_title": "x"} for i in range(20)
+            {"library_id": i, "artist_name": f"Artist {i}", "album_title": "x"}
+            for i in range(batch_size)
         ]
 
         with patch("identity.router.watch_disconnect", fake_sentinel):
@@ -777,12 +802,18 @@ class TestBulkResolveConcurrency:
                 )
 
         assert resp.status_code == 499, f"Expected 499 on client disconnect, got {resp.status_code}"
-        # Default concurrency is 5, so at most 5 lookups can be in flight when the
-        # sentinel fires; the other 15 are queued behind the semaphore and never
-        # start. If the gather ran to completion all 20 would have been awaited.
-        assert mock_entity_store.resolve_library_name.await_count < 20, (
-            f"All {mock_entity_store.resolve_library_name.await_count}/20 lookups ran — "
-            "abort did not cancel in-flight items"
+        # Queued lookups never start: the semaphore caps in-flight at `concurrency`
+        # and each in-flight lookup is still sleeping when the sentinel fires.
+        assert 0 < started <= concurrency, (
+            f"Expected 1..{concurrency} in-flight lookups, got {started}; "
+            f"{batch_size - started} should have stayed queued behind the semaphore"
+        )
+        # Every in-flight lookup received the cancel and unwound — the actual proof
+        # that the disconnect cancelled the outstanding gather rather than letting
+        # it drain in the background against a departed client.
+        assert cancelled == started, (
+            f"{started - cancelled} of {started} in-flight lookup(s) were never "
+            "cancelled — the disconnect did not cancel the outstanding gather"
         )
 
     @pytest.mark.asyncio
