@@ -24,12 +24,14 @@ The mock-store layer keeps the assertions on the value handed to
 
 from __future__ import annotations
 
+import struct
 from unittest.mock import AsyncMock
 
 import pytest
 
 from entity.store import Identity
 from scripts.entity_resolution.__main__ import (
+    _DEFAULT_METHOD_CONFIDENCE,
     METHOD_CONFIDENCE,
     run_discogs_stage,
     run_musicbrainz_stage,
@@ -45,6 +47,29 @@ DISCOGS_METHOD_BANDS: dict[str, tuple[float, float]] = {
     "member_group": (0.80, 0.89),
     "alias_match": (0.75, 0.84),
 }
+
+# The §3.4.1 band *floor* every mapped method's confidence must still read back
+# at-or-above once persisted to ``entity.reconciliation_log.confidence`` — a
+# PostgreSQL ``REAL`` (IEEE-754 binary32) column. Methods that are not §3.4.1
+# matrix entries are scored inside the ``name_variation`` band (floor 0.90).
+# Pins LML#701: ``0.90`` round-trips through float32 to ``0.8999999762``, a hair
+# under the 0.90 floor, so band-floor values must be chosen float32-safe.
+METHOD_BAND_FLOORS: dict[str, float] = {
+    "exact_match": 1.00,
+    "name_variation": 0.90,
+    "member_group": 0.80,
+    "alias_match": 0.75,
+    "name_preprocessing": 0.90,
+    "discogs_bridge": 0.90,
+    "name_search": 0.90,
+    "qid_bridge": 0.90,
+    "name_match": 0.90,
+}
+
+
+def _as_real(value: float) -> float:
+    """Round-trip ``value`` through a PostgreSQL ``REAL`` (IEEE-754 binary32)."""
+    return struct.unpack("f", struct.pack("f", value))[0]
 
 
 def _confidence_for_logged_method(store: AsyncMock, method: str) -> float:
@@ -135,6 +160,33 @@ class TestMethodConfidenceMap:
         for method, (lo, hi) in DISCOGS_METHOD_BANDS.items():
             assert method in METHOD_CONFIDENCE, f"{method} missing from METHOD_CONFIDENCE"
             assert lo <= METHOD_CONFIDENCE[method] <= hi
+
+    def test_band_floors_cover_every_mapped_method(self):
+        """METHOD_BAND_FLOORS must stay in lockstep with METHOD_CONFIDENCE so the
+        REAL round-trip guard can never silently skip a newly added method."""
+        assert set(METHOD_BAND_FLOORS) == set(METHOD_CONFIDENCE)
+
+    def test_real_roundtrip_stays_at_or_above_band_floor(self):
+        """Every mapped confidence must read back ``>=`` its §3.4.1 band floor
+        after a PostgreSQL ``REAL`` (float32) round-trip, with NO epsilon pad.
+
+        Regression for LML#701: ``name_preprocessing`` / ``name_search`` /
+        ``name_match`` were ``0.90``, which round-trips to ``0.8999999762`` — a
+        hair under the 0.90 ``name_variation`` floor. This test fails on any
+        band-floor value chosen without float32 headroom.
+        """
+        for method, floor in METHOD_BAND_FLOORS.items():
+            stored = _as_real(METHOD_CONFIDENCE[method])
+            assert stored >= floor, (
+                f"{method}={METHOD_CONFIDENCE[method]} stored as REAL is {stored!r}, "
+                f"below §3.4.1 floor {floor}"
+            )
+
+    def test_default_confidence_real_roundtrip_inside_band(self):
+        """The sidecar default stays inside member_group's band (0.80–0.89) after
+        a ``REAL`` round-trip — the fallback must never write an out-of-band row."""
+        stored = _as_real(_DEFAULT_METHOD_CONFIDENCE)
+        assert 0.80 <= stored <= 0.89
 
 
 class TestWikidataStageConfidence:
