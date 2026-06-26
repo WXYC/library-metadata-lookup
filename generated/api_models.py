@@ -9,6 +9,7 @@ from enum import IntEnum, StrEnum
 from typing import Any, Literal
 
 from pydantic import (
+    AnyUrl,
     AwareDatetime,
     BaseModel,
     ConfigDict,
@@ -718,6 +719,134 @@ class DeviceRegistration(BaseModel):
 class DeviceToken(BaseModel):
     token: str
     expires_at: AwareDatetime
+
+
+class DeviceAuthCodeRequest(BaseModel):
+    client_id: str = Field(
+        ..., description="The client ID of the application requesting authorization."
+    )
+    scope: str | None = Field(None, description="Optional space-separated list of OAuth scopes.")
+    user_id: str | None = Field(
+        None,
+        description="Optional. The user ID to which the device code should be pre-bound (a better-auth 1.6.20+ plugin field). WXYC's shared-computer QR flow does not send this — the DJ is identified later at /auth/device/approve — but it is mirrored here for runtime fidelity.\n",
+    )
+
+
+class DeviceAuthCodeResponse(BaseModel):
+    device_code: str = Field(
+        ..., description="The device verification code, polled at /auth/device/token."
+    )
+    user_code: str = Field(..., description="The short code shown to the user / encoded in the QR.")
+    verification_uri: AnyUrl = Field(..., description="URL where the user verifies the code.")
+    verification_uri_complete: AnyUrl = Field(
+        ...,
+        description="verification_uri with user_code pre-filled as a query parameter.",
+    )
+    expires_in: int = Field(
+        ...,
+        description="Lifetime of the device/user code in seconds (WXYC config: 300 = 5min).",
+    )
+    interval: int = Field(..., description="Minimum polling interval in seconds (WXYC config: 5).")
+
+
+class GrantType(StrEnum):
+    urn_ietf_params_oauth_grant_type_device_code = "urn:ietf:params:oauth:grant-type:device_code"
+
+
+class DeviceAuthTokenRequest(BaseModel):
+    grant_type: GrantType = Field(..., description="RFC 8628 device-flow grant type (fixed value).")
+    device_code: str = Field(..., description="The device_code returned by /auth/device/code.")
+    client_id: str = Field(..., description="The client ID of the application.")
+
+
+class TokenType(StrEnum):
+    Bearer = "Bearer"
+
+
+class DeviceAuthTokenResponse(BaseModel):
+    access_token: str = Field(..., description="The session bearer token for the browser.")
+    token_type: TokenType
+    expires_in: int = Field(
+        ...,
+        description="Token lifetime in seconds. WXYC's auth-service (Backend-Service#1495, hooks.after on /device/token) rewrites the plugin's session-derived value to a fixed 43200 (12h). The vanilla-plugin value would otherwise be the global ~7-day session TTL.\n",
+    )
+    scope: str = Field(..., description="Granted scopes (empty string when none were requested).")
+
+
+class DeviceAuthStatus(StrEnum):
+    pending = "pending"
+    approved = "approved"
+    denied = "denied"
+
+
+class DeviceAuthVerifyResponse(BaseModel):
+    user_code: str
+    status: DeviceAuthStatus
+
+
+class DeviceAuthApproveRequest(BaseModel):
+    userCode: str = Field(
+        ...,
+        description="The user code to approve. NOTE: camelCase on the wire — the plugin's approve/deny bodies differ from the snake_case code/token bodies.\n",
+    )
+
+
+class DeviceAuthDenyRequest(BaseModel):
+    userCode: str = Field(
+        ...,
+        description="The user code to deny. NOTE: camelCase on the wire (see DeviceAuthApproveRequest).\n",
+    )
+
+
+class DeviceAuthActionResponse(BaseModel):
+    success: bool = Field(..., description="Always true on success. Shared by /approve and /deny.")
+
+
+class DeviceAuthCodeErrorCode(StrEnum):
+    invalid_request = "invalid_request"
+    invalid_client = "invalid_client"
+
+
+class DeviceAuthCodeError(BaseModel):
+    error: DeviceAuthCodeErrorCode
+    error_description: str
+
+
+class DeviceAuthTokenErrorCode(StrEnum):
+    authorization_pending = "authorization_pending"
+    slow_down = "slow_down"
+    expired_token = "expired_token"
+    access_denied = "access_denied"
+    invalid_request = "invalid_request"
+    invalid_grant = "invalid_grant"
+    server_error = "server_error"
+
+
+class DeviceAuthTokenError(BaseModel):
+    error: DeviceAuthTokenErrorCode
+    error_description: str
+
+
+class DeviceAuthVerifyErrorCode(StrEnum):
+    invalid_request = "invalid_request"
+    expired_token = "expired_token"
+
+
+class DeviceAuthVerifyError(BaseModel):
+    error: DeviceAuthVerifyErrorCode
+    error_description: str
+
+
+class DeviceAuthActionErrorCode(StrEnum):
+    invalid_request = "invalid_request"
+    expired_token = "expired_token"
+    unauthorized = "unauthorized"
+    access_denied = "access_denied"
+
+
+class DeviceAuthActionError(BaseModel):
+    error: DeviceAuthActionErrorCode
+    error_description: str
 
 
 class RateLimitInfo(BaseModel):
