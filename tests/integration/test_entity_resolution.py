@@ -902,9 +902,12 @@ class TestDiscogsStageConfidencePersisted:
         assert len(rows) == 1
         assert rows[0]["method"] == method
         lo, hi = _METHOD_BANDS_341[method]
-        # Pad the band by the float32 storage epsilon so e.g. 0.85 → 0.8500000238
-        # doesn't fall foul of an exact band edge.
-        assert lo - 1e-6 <= rows[0]["confidence"] <= hi + 1e-6
+        # No epsilon pad (LML#701): the persisted value must read back inside the
+        # band on its own, because `confidence` is a PostgreSQL `REAL` (float32)
+        # and any value placed *on* a band edge (e.g. 0.90 → 0.8999999762) would
+        # round-trip just outside it. The mapped matrix values sit mid-band, so
+        # their float32 forms (e.g. 0.85 → 0.8500000238) stay comfortably within.
+        assert lo <= rows[0]["confidence"] <= hi
 
 
 @pytest.mark.pg

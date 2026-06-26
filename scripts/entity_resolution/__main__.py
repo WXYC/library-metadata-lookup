@@ -72,10 +72,15 @@ _LIBRARY_ARTISTS_SQL = (
 # crossing a band edge. Methods that are not §3.4.1 matrix entries
 # (``name_preprocessing`` and the Wikidata / MusicBrainz bridge + search
 # methods) are scored inside the ``name_variation`` band — a deterministic
-# cross-source ID bridge sits at the high end, a name lookup at the floor.
+# cross-source ID bridge sits at the high end, a name lookup at the low end.
 # The bulk-resolve composer (``identity/bulk_resolve.py``) only surfaces the
 # enum-named matrix methods on the wire, so these extra entries never reach
 # Backend's §3.2.2 check, but they keep the raw log rows honest and bounded.
+#
+# Never put a value *on* a band edge: ``entity.reconciliation_log.confidence``
+# is a PostgreSQL ``REAL`` (float32), and ``0.90`` round-trips to
+# ``0.8999999762`` — a hair under the 0.90 floor (LML#701). The low-end name
+# lookups therefore sit at ``0.91``, one float32-safe step above the floor.
 METHOD_CONFIDENCE: dict[str, float] = {
     # Discogs cascade (scripts/entity_resolution/discogs.py) — §3.4.1 matrix.
     "exact_match": 1.00,  # §3.4.1: 1.00
@@ -83,19 +88,20 @@ METHOD_CONFIDENCE: dict[str, float] = {
     "member_group": 0.85,  # §3.4.1: 0.80–0.89
     "alias_match": 0.80,  # §3.4.1: 0.75–0.84
     # Stage 5 re-runs the equality cascade on cheap name derivations (article
-    # strip, "&"→"and", bracket strip, multi-credit split). Floor of the
-    # name_variation band to reflect the extra derivation step.
-    "name_preprocessing": 0.90,
+    # strip, "&"→"and", bracket strip, multi-credit split). Low end of the
+    # name_variation band to reflect the extra derivation step (0.91, not the
+    # 0.90 floor — float32-safe, see LML#701).
+    "name_preprocessing": 0.91,
     # Wikidata stage (run_wikidata_stage): a QID bridged deterministically
     # from an already-reconciled Discogs ID is a graph join, not a fuzzy
     # match — high end of the name_variation band. A SPARQL name search is a
-    # name lookup — band floor.
+    # name lookup — low end of the band (0.91, float32-safe; LML#701).
     "discogs_bridge": 0.95,
-    "name_search": 0.90,
+    "name_search": 0.91,
     # MusicBrainz stage (run_musicbrainz_stage): deterministic QID→MBID
     # bridge vs. direct name match, same reasoning as the Wikidata leg.
     "qid_bridge": 0.95,
-    "name_match": 0.90,
+    "name_match": 0.91,
 }
 
 # Fallback for any method absent from ``METHOD_CONFIDENCE`` — a value inside
