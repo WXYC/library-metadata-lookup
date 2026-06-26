@@ -16,13 +16,14 @@ Provides:
 import asyncio
 import logging
 from collections import Counter
+from typing import Any
 
 import sentry_sdk
 from asyncpg.exceptions import PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
-from core.bulk_concurrency import max_concurrency_from_env
+from core.bulk_concurrency import cancel_and_drain, max_concurrency_from_env, watch_disconnect
 from entity.store import EntityStore, Identity
 from generated.api_models import (
     BulkResolveInput,
@@ -315,22 +316,67 @@ async def bulk_resolve_libraries(
         http_span.set_data("lml.bulk_resolve.inputs", inputs_count)
         http_span.set_data("lml.bulk_resolve.max_concurrent", max_concurrent)
 
+        # Race the gather against a client-disconnect sentinel (LML#700). uvicorn
+        # does not propagate a client socket close into the handler, so a plain
+        # `await asyncio.gather(...)` runs the in-flight per-input tasks — and the
+        # discogs-cache pool permits they hold (bounded by `max_concurrent`) — to
+        # completion against a client that is already gone. The sentinel lets a
+        # disconnect cancel the outstanding gather promptly instead. Mirrors the
+        # `/lookup/bulk` shape (lookup/router.py) and reuses the shared
+        # `watch_disconnect` / `cancel_and_drain` helpers rather than forking the
+        # logic.
+        #
+        # `gather` preserves input order (results[i] <-> inputs[i]) regardless of
+        # completion order, satisfying the api.yaml ordering contract.
+        #
+        # Spawning the sentinel must happen *after* `await http_request.json()`
+        # above has fully consumed the request body — `watch_disconnect` awaits
+        # `request.receive()`, which would otherwise swallow the `http.request`
+        # body messages the JSON parser needs.
+        gather_future = asyncio.gather(*(_resolve_one(r) for r in request.inputs))
+        sentinel_task = asyncio.create_task(
+            watch_disconnect(http_request),
+            name="lml.bulk_resolve.disconnect_sentinel",
+        )
+        waitables: set[asyncio.Future[Any]] = {gather_future, sentinel_task}
+
         try:
-            # `gather` preserves input order (results[i] <-> inputs[i]) regardless
-            # of completion order, satisfying the api.yaml ordering contract.
-            results = await asyncio.gather(*(_resolve_one(r) for r in request.inputs))
-        except asyncio.CancelledError:
-            # Client aborted mid-batch. Cancelling the handler task propagates
-            # into the in-flight `gather` (and thus its children), so permits are
-            # released as the children unwind. Pin 499 on the span before
-            # re-raising so the audit-style query
-            # `op:http.server http.status_code:499` surfaces these in Sentry, and
-            # emit a warn log so Railway also carries the record. CancelledError
-            # is re-raised (not converted to HTTPException) — the asyncio
-            # cancellation contract requires this, and the client is gone anyway
-            # so there is nobody to read a 499 response.
+            done, _pending = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            # Outer cancellation (server shutdown / timeout middleware) must
+            # propagate to both children AND drain them, not just signal them — a
+            # bare `.cancel()` is asynchronous, so the pool permits stay held
+            # until the tasks observe the cancel and unwind.
+            await cancel_and_drain(gather_future)
+            await cancel_and_drain(sentinel_task)
+            raise
+
+        if sentinel_task in done and not gather_future.done():
+            # Client departed first. Cancel + drain the gather so the per-input
+            # tasks unwind and their permits free promptly instead of after the
+            # whole batch finishes. The tag is global-scope (filterable across
+            # routes as `lml.client_aborted:true`); the 499 + warn log mirror the
+            # `/lookup/bulk` abort branch. 499 = Nginx "client closed request" —
+            # nobody reads the body, but it pins the span/log for triage.
+            sentry_sdk.set_tag("lml.client_aborted", "true")
+            await cancel_and_drain(gather_future)
             http_span.set_data("http.status_code", 499)
             logger.warning("bulk resolve aborted by client: inputs=%d", inputs_count)
+            raise HTTPException(status_code=499, detail="client disconnected")
+
+        # Work finished first (or failed). Drain the still-pending sentinel so it
+        # doesn't leak, then surface the gather's outcome.
+        await cancel_and_drain(sentinel_task)
+        try:
+            results = gather_future.result()
+        except asyncio.CancelledError:
+            # Server-driven cancellation surfaced through the gather (shutdown /
+            # outer timeout), or a child observed a cancel — distinct from the
+            # client-disconnect branch above, which the sentinel handles. Pin 499
+            # and re-raise per the asyncio cancellation contract; the client is
+            # gone so there is nobody to read a 499 response.
+            http_span.set_data("http.status_code", 499)
+            logger.warning("bulk resolve aborted (cancelled): inputs=%d", inputs_count)
             raise
         except HTTPException as exc:
             # Fail-closed 503 (or any explicit status) from a per-input failure.

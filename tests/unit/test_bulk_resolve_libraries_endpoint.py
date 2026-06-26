@@ -739,6 +739,151 @@ class TestBulkResolveConcurrency:
         assert [r["main"]["discogs_artist_id"] for r in results] == [11, 22, 33]
 
     @pytest.mark.asyncio
+    async def test_client_disconnect_cancels_in_flight_lookups(self, app_client, mock_entity_store):
+        """Mid-batch client disconnect aborts the gather with 499; queued items never run.
+
+        Adopts the ``/lookup/bulk`` disconnect-cancellation pattern (LML#700):
+        without it, a caller that hangs up mid-request leaves the in-flight
+        per-input tasks — and the discogs-cache pool permits they hold — running
+        to completion against a client that is already gone. The sentinel race
+        cancels the outstanding gather promptly instead.
+
+        Patches ``identity.router.watch_disconnect`` with a sentinel that
+        "detects" the disconnect after a short delay; the real receive-channel
+        mechanism is exercised in production by uvicorn. The slow lookup outlasts
+        the sentinel so the abort fires while work is still in flight.
+        """
+
+        async def slow_lookup(name: str):
+            await asyncio.sleep(5)
+            return None
+
+        mock_entity_store.resolve_library_name.side_effect = slow_lookup
+
+        async def fake_sentinel(_request):
+            await asyncio.sleep(0.05)
+
+        inputs = [
+            {"library_id": i, "artist_name": f"Artist {i}", "album_title": "x"} for i in range(20)
+        ]
+
+        with patch("identity.router.watch_disconnect", fake_sentinel):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await asyncio.wait_for(
+                    ac.post("/api/v1/identity/bulk-resolve-libraries", json={"inputs": inputs}),
+                    timeout=3.0,
+                )
+
+        assert resp.status_code == 499, f"Expected 499 on client disconnect, got {resp.status_code}"
+        # Default concurrency is 5, so at most 5 lookups can be in flight when the
+        # sentinel fires; the other 15 are queued behind the semaphore and never
+        # start. If the gather ran to completion all 20 would have been awaited.
+        assert mock_entity_store.resolve_library_name.await_count < 20, (
+            f"All {mock_entity_store.resolve_library_name.await_count}/20 lookups ran — "
+            "abort did not cancel in-flight items"
+        )
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_unwinds_per_item_tasks_cleanly(
+        self, app_client, mock_entity_store, monkeypatch
+    ):
+        """Cancellation reaches each per-input coroutine, which unwinds via `finally`.
+
+        Permit release is the downstream consequence: the per-input semaphore in
+        ``bulk_resolve_libraries`` releases via ``async with semaphore`` __aexit__
+        only if the cancel actually reaches the per-input coroutine. Proxy
+        assertion: count ``started`` (each lookup entered) and ``cleaned_up``
+        (each that exited via ``finally``). On clean propagation
+        ``started == cleaned_up``; if the cancel never reaches the per-item tasks
+        they keep running and ``started > cleaned_up`` — the LML#700 bug.
+        """
+        monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "2")
+
+        started = 0
+        cleaned_up = 0
+
+        async def slow_lookup(name: str):
+            nonlocal started, cleaned_up
+            started += 1
+            try:
+                await asyncio.sleep(5)
+                return None
+            finally:
+                cleaned_up += 1
+
+        mock_entity_store.resolve_library_name.side_effect = slow_lookup
+
+        async def fake_sentinel(_request):
+            await asyncio.sleep(0.05)
+
+        inputs = [
+            {"library_id": i, "artist_name": f"Artist {i}", "album_title": "x"} for i in range(6)
+        ]
+
+        with patch("identity.router.watch_disconnect", fake_sentinel):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await asyncio.wait_for(
+                    ac.post("/api/v1/identity/bulk-resolve-libraries", json={"inputs": inputs}),
+                    timeout=3.0,
+                )
+
+        assert resp.status_code == 499
+        assert started > 0, "no lookups started — test mis-configured"
+        assert started == cleaned_up, (
+            f"{started - cleaned_up} lookup(s) started but never cleaned up — "
+            "cancellation did not propagate into the per-input tasks"
+        )
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_sets_sentry_tag(self, app_client, mock_entity_store):
+        """`lml.client_aborted=true` lands on the active Sentry scope on abort.
+
+        Filterable in the trace explorer (`lml.client_aborted:true`) to surface
+        aborted batches for triage — same global-scope tag the `/lookup/bulk`
+        abort branch sets, so a single filter spans both bulk routes.
+        """
+        captured_tags: dict[str, str] = {}
+        original_set_tag = sentry_sdk.set_tag
+
+        def capture_tag(key, value):
+            captured_tags[key] = value
+            return original_set_tag(key, value)
+
+        async def slow_lookup(name: str):
+            await asyncio.sleep(5)
+            return None
+
+        mock_entity_store.resolve_library_name.side_effect = slow_lookup
+
+        async def fake_sentinel(_request):
+            await asyncio.sleep(0.05)
+
+        inputs = [
+            {"library_id": i, "artist_name": f"Artist {i}", "album_title": "x"} for i in range(4)
+        ]
+
+        with (
+            patch("identity.router.watch_disconnect", fake_sentinel),
+            patch("identity.router.sentry_sdk.set_tag", side_effect=capture_tag),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await asyncio.wait_for(
+                    ac.post("/api/v1/identity/bulk-resolve-libraries", json={"inputs": inputs}),
+                    timeout=3.0,
+                )
+
+        assert resp.status_code == 499
+        assert captured_tags.get("lml.client_aborted") == "true", (
+            f"Expected lml.client_aborted=true tag; got {captured_tags!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_postgres_error_mid_batch_returns_503_not_partial(
         self, app_client, mock_entity_store
     ):
