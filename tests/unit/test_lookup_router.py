@@ -395,6 +395,30 @@ class TestHandleLookup:
         actual_calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
         assert actual_calls == {"lml.cache.api_calls": 2}
 
+    def test_projection_emits_measurements_for_alerting(self):
+        """Each numeric cache_stats field is also recorded as a Sentry transaction
+        *measurement* (`lml.cache.<key>`), not only span `data` (LML#683).
+
+        `set_data` attaches the value as opaque span data — visible inside a single
+        trace, but not aggregatable in the spans/metrics datasets ("Unknown
+        attribute"), so it cannot back a metric alert. `set_measurement` promotes
+        the same value to a transaction measurement that the alert engine can
+        average/threshold (the row-less-flag degradation alerts in #683). Non-numeric
+        values are skipped here too, mirroring the `set_data` projection.
+        """
+        from lookup.router import _project_cache_stats_to_transaction
+
+        stats = {"api_calls": 2, "pg_time_ms": 12.5, "weird_string": "nope", "weird_none": None}
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with patch("lookup.router.sentry_sdk.get_current_scope", return_value=mock_scope):
+            _project_cache_stats_to_transaction(stats)
+
+        measured = {c.args[0]: c.args[1] for c in mock_transaction.set_measurement.call_args_list}
+        assert measured == {"lml.cache.api_calls": 2, "lml.cache.pg_time_ms": 12.5}
+
     @pytest.mark.asyncio
     async def test_cache_stats_projection_called_with_raw_get_cache_stats_return(self, app_client):
         """The projection helper must be invoked with the exact dict returned by

@@ -143,9 +143,21 @@ _BULK_LOOKUP_ROUTE = "/api/v1/lookup/bulk"
 def _project_cache_stats_to_transaction(stats: dict | None) -> None:
     """Attach numeric cache_stats fields to the current Sentry transaction.
 
-    Each field becomes a `lml.cache.<key>` data attribute on the transaction
-    so the data joins against the trace in Sentry's trace explorer. No-op
-    when there is no active transaction (Sentry not initialized, or call
+    Each field is attached two ways, because the two serve different consumers:
+
+    - ``set_data`` — a ``lml.cache.<key>`` span-data attribute, visible when you
+      open a single trace in Sentry's trace explorer (per-request drill-down,
+      alongside latency/status).
+    - ``set_measurement`` — a ``lml.cache.<key>`` transaction *measurement*. Span
+      ``data`` set via ``set_data`` is opaque to the spans/metrics datasets (it
+      reads back as "Unknown attribute"), so it cannot back a metric alert.
+      Measurements are aggregatable (avg/percentile/threshold) and are what the
+      LML#683 row-less-flag degradation alerts query (e.g. the Discogs call-rate
+      guard on ``lml.cache.api_calls``). traces_sample_rate is 1.0 (see
+      ``init_sentry`` in ``main.py``), so the measurement series covers every
+      request, not a sampled fraction.
+
+    No-op when there is no active transaction (Sentry not initialized, or call
     happening outside a request span).
 
     Non-numeric values (strings, None) are skipped — the cache_stats schema
@@ -165,6 +177,7 @@ def _project_cache_stats_to_transaction(stats: dict | None) -> None:
         for key, value in stats.items():
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 transaction.set_data(f"lml.cache.{key}", value)
+                transaction.set_measurement(f"lml.cache.{key}", value)
     except Exception as e:
         logger.warning("Failed to project cache_stats onto Sentry transaction: %s", e)
 
