@@ -414,7 +414,14 @@ class CatalogExportRow(BaseModel):
         None,
         description="True if on >=1 streaming service; false if physical-only; null if unknown.",
     )
-    plays: int | None = None
+    plays: int | None = Field(
+        None,
+        description="Per-pressing LINKED play count for THIS catalog row (from album_plays). The honest per-release number; to rank by real popularity across all pressings of a logical album, use `popularity` instead.\n",
+    )
+    popularity: int | None = Field(
+        None,
+        description="Attribution-corrected popularity (BS#1486 Phase-2 Track 3): a play count for this row's LOGICAL album rather than this single pressing. Pressings that resolve to the same Discogs master (~90% of RESOLVED library rows) collapse into one count; release-only and unresolved rows keep a per-release or per-library key, with no cross-pressing collapse. It also adds the free-text/unlinked plays Track 1 has resolved to the same release/master (the ~43% free-text tail is the ceiling, not all of it — only the resolved subset counts), which the linked-only `plays` cannot see. Rank releases by `popularity`. null when the album_popularity signal has no row for this row's logical key. Distinct from `plays`, which stays the per-pressing linked count.\n",
+    )
     artwork_url: str | None = Field(
         None, description="Album cover URL from Discogs; null if not yet fetched."
     )
