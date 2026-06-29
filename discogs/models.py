@@ -17,6 +17,7 @@ from generated.api_models import (
     DiscogsReleaseVideo,
     DiscogsTrackItem,
     DiscogsTrackReleasesResponse,
+    DiscogsWriterCredits,
     Member,
 )
 from generated.api_models import DiscogsMatchResult as _GeneratedDiscogsMatchResult
@@ -36,6 +37,7 @@ ReleaseVideo = DiscogsReleaseVideo
 ReleaseInfo = DiscogsReleaseInfo
 TrackReleasesResponse = DiscogsTrackReleasesResponse
 ReleaseMetadataResponse = DiscogsReleaseMetadata
+WriterCredits = DiscogsWriterCredits
 ArtistRef = Alias
 MemberRef = Member
 
@@ -235,6 +237,10 @@ class DiscogsSearchResult(BaseModel):
     full_release_date: str | None = None
     artist_image_url: str | None = None
     profile_tokens: list[ResolvedToken] | None = None
+    # Songwriter/composer credits for BMI reporting (LML#699), populated by the
+    # orchestrator enrichment seam from the resolved release's writer-role
+    # credits. Rides the same extended gate as the other enriched fields.
+    writer_credits: WriterCredits | None = None
 
     def to_match_result(self) -> EnrichedDiscogsMatchResult:
         """Convert to the enriched API contract model."""
@@ -262,6 +268,7 @@ class DiscogsSearchResult(BaseModel):
             full_release_date=self.full_release_date,
             artist_image_url=self.artist_image_url,
             profile_tokens=self.profile_tokens,
+            writer_credits=self.writer_credits,
         )
 
 

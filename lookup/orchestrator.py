@@ -64,6 +64,7 @@ from discogs.models import (
     TrackReleasesResponse,
 )
 from discogs.service import DiscogsService
+from discogs.writer_roles import writer_credits_from_release
 from entity.release_resolution_cache import (
     ReleaseResolution,
     get_cached_release_id,
@@ -3704,6 +3705,11 @@ async def enrich_artwork_results(
                 update["styles"] = list(top1_release.styles) if top1_release.styles else None
                 update["label"] = top1_release.label
                 update["full_release_date"] = top1_release.released
+                # BMI songwriter/composer credits (LML#699 Phase 1): the
+                # release-level writer-role subset of the already-fetched
+                # ``extra_artists`` (no new Discogs call). ``None`` for comps or
+                # when no writer resolves. Per-track precision is Phase 2.
+                update["writer_credits"] = writer_credits_from_release(top1_release)
             # ``artist_image_url`` stays gated on ``is_album_derived_eligible``
             # despite being artist-scoped: neither wxyc-ios-64 nor
             # wxyc-dj-tool-ios mounts a UI affordance for it

@@ -7,6 +7,7 @@ import pytest
 
 from clients.streaming.apple_music import AppleMusicClient, AppleMusicTrackMatch
 from discogs.models import (
+    ArtistCredit,
     ArtistDetails,
     DiscogsSearchResult,
     ReleaseMetadataResponse,
@@ -523,6 +524,106 @@ class TestEnrichArtworkResultsExtended:
         assert enriched.artist_image_url is None
         assert enriched.tracklist is None
         assert enriched.profile_tokens is None
+
+    @pytest.mark.asyncio
+    async def test_extended_populates_writer_credits_release_level(self):
+        """LML#699: the release-level writer-role subset of the resolved
+        release's extra_artists surfaces as writer_credits (provenance=release),
+        derived from the already-fetched release with no new Discogs call.
+        """
+        item = make_library_item(artist="Juana Molina", title="DOGA")
+        artwork = make_discogs_result(release_id=555, artist="Juana Molina", album="DOGA")
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=555,
+            title="DOGA",
+            artist="Juana Molina",
+            artist_id=42,
+            release_url="https://discogs.com/release/555",
+            tracklist=[TrackItem(position="1", title="la paradoja", artists=[])],
+            extra_artists=[
+                ArtistCredit(name="Juana Molina", role="Written-By"),
+                ArtistCredit(name="A Producer", role="Producer"),
+            ],
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=42, name="Juana Molina"
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="la paradoja",
+            artist="Juana Molina",
+            extended=True,
+        )
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.writer_credits is not None
+        assert enriched.writer_credits.names == ["Juana Molina"]
+        assert enriched.writer_credits.provenance == "release"
+        assert enriched.writer_credits.track_position is None
+        # Cache-only: the writer credits came from the single already-fetched
+        # release, not a second Discogs call.
+        discogs_service.get_release.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_extended_writer_credits_none_when_no_writer(self):
+        """A resolved release whose extra_artists carry no writer role omits
+        writer_credits (never fabricated).
+        """
+        item = make_library_item(artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=556, artist="Stereolab", album="Aluminum Tunes")
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=556,
+            title="Aluminum Tunes",
+            artist="Stereolab",
+            artist_id=42,
+            release_url="https://discogs.com/release/556",
+            tracklist=[TrackItem(position="1", title="Olv 26", artists=[])],
+            extra_artists=[ArtistCredit(name="An Engineer", role="Mixed By")],
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=42, name="Stereolab"
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Olv 26",
+            artist="Stereolab",
+            extended=True,
+        )
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.writer_credits is None
+
+    @pytest.mark.asyncio
+    async def test_extended_false_leaves_writer_credits_unset(self):
+        """With extended=False, writer_credits stays unset — unchanged shape for
+        request-line / dj-site-proxy consumers, even when the release carries a
+        writer credit.
+        """
+        item = make_library_item()
+        artwork = make_discogs_result()
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=557,
+            title="x",
+            artist="x",
+            artist_id=42,
+            release_url="https://discogs.com/release/557",
+            extra_artists=[ArtistCredit(name="x", role="Written-By")],
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(artist_id=42, name="x")
+
+        results = await enrich_artwork_results([(item, artwork)], discogs_service, extended=False)
+        _, enriched = results[0]
+        assert enriched.writer_credits is None
 
     @pytest.mark.asyncio
     async def test_extended_parses_profile_tokens_cache_only(self):
