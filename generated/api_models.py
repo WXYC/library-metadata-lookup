@@ -414,7 +414,14 @@ class CatalogExportRow(BaseModel):
         None,
         description="True if on >=1 streaming service; false if physical-only; null if unknown.",
     )
-    plays: int | None = None
+    plays: int | None = Field(
+        None,
+        description="Per-pressing LINKED play count for THIS catalog row (from album_plays). The honest per-release number; to rank by real popularity across all pressings of a logical album, use `popularity` instead.\n",
+    )
+    popularity: int | None = Field(
+        None,
+        description="Attribution-corrected popularity (BS#1486 Phase-2 Track 3): a play count for this row's LOGICAL album rather than this single pressing. Pressings that resolve to the same Discogs master (~90% of RESOLVED library rows) collapse into one count; release-only and unresolved rows keep a per-release or per-library key, with no cross-pressing collapse. It also adds the free-text/unlinked plays Track 1 has resolved to the same release/master (the ~43% free-text tail is the ceiling, not all of it — only the resolved subset counts), which the linked-only `plays` cannot see. Rank releases by `popularity`. null when the album_popularity signal has no row for this row's logical key. Distinct from `plays`, which stays the per-pressing linked count.\n",
+    )
     artwork_url: str | None = Field(
         None, description="Album cover URL from Discogs; null if not yet fetched."
     )
@@ -1346,6 +1353,29 @@ class DiscogsArtistCredit(BaseModel):
     )
 
 
+class Provenance(StrEnum):
+    track = "track"
+    release = "release"
+
+
+class DiscogsWriterCredits(BaseModel):
+    names: list[str] = Field(
+        ..., description="Distinct songwriter/composer names for the resolved track."
+    )
+    roles: list[str] | None = Field(
+        None,
+        description='The verbatim Discogs role strings the names were drawn from (e.g. "Written-By", "Words By, Music By"), for auditability of the writer-role mapping.\n',
+    )
+    provenance: Provenance = Field(
+        ...,
+        description="`track` = scoped to the resolved track's per-track credits (precise); `release` = a release-level credit applied to the whole release (approximate for an individual track, mirroring tubafrenzy's auto-fill-from-artist fallback). Populated as `release` in the initial rollout; `track` is added when per-track resolution lands.\n",
+    )
+    track_position: str | None = Field(
+        None,
+        description='The resolved track\'s position (e.g. "A1", "5") when `provenance` is `track`; null for release-level credits.\n',
+    )
+
+
 class DiscogsLabelCredit(BaseModel):
     label_id: int | None = None
     name: str
@@ -1875,6 +1905,7 @@ class DiscogsMatchResult(BaseModel):
         None,
         description="Pre-parsed structured tokens from the artist's `profile` markup, using a cache-only resolver — references to entities not in the local PG cache fall through as plain-text tokens (no inline Discogs API calls on the read path). Populated only when `extended` is true. Field name matches `DiscogsArtistDetails.profile_tokens` so callers can share rendering code across the two payloads. Pair with `LookupRequest.warm_cache=true` on write-path calls to progressively populate the cache so subsequent reads render richer.\n",
     )
+    writer_credits: DiscogsWriterCredits | None = None
 
 
 class LookupResultItem(BaseModel):
