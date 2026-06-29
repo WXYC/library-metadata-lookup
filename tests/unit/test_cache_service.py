@@ -394,6 +394,74 @@ class TestGetRelease:
         assert result.tracklist[0].artists == ["Performer One"]
 
     @pytest.mark.asyncio
+    async def test_ambiguous_duplicate_position_dropped_not_merged(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """LML#699: a display position claimed by more than one track (Discogs
+        ``position`` is non-unique text — multi-disc / mispressed releases repeat
+        it) is AMBIGUOUS and dropped from the writer map, NOT merged. Merging
+        would attribute one track's composers to a co-positioned sibling on a BMI
+        royalty field; dropping makes the track-level path fall back to
+        release-level instead.
+        """
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "An Album",
+                "release_year": 2020,
+                "artwork_url": None,
+                "released": None,
+                "artwork_checked_at": None,
+                "not_found": False,
+                "master_id": None,
+            }
+        )
+        extra1 = [
+            {"track_sequence": 1, "artist_name": "Disc One Writer", "role": "Written-By"},
+            {"track_sequence": 2, "artist_name": "Disc Two Writer", "role": "Composed By"},
+        ]
+        # Two distinct tracks carry the SAME display position "A1" (e.g. disc 1
+        # A1 and disc 2 A1 on a release that didn't disc-qualify its positions).
+        tracks = [
+            {"position": "A1", "title": "Disc One Opener", "duration": None, "sequence": 1},
+            {"position": "A1", "title": "Disc Two Opener", "duration": None, "sequence": 2},
+        ]
+
+        async def route(query, *args):
+            if "release_track_artist" in query and "extra = 1" in query:
+                return extra1
+            if "release_track_artist" in query:
+                return []
+            if "release_track" in query:
+                return tracks
+            if "release_artist" in query:
+                return [{"artist_id": 1, "artist_name": "Sessa", "extra": 0, "role": None}]
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=route)
+        result = await cache_service.get_release(1)
+
+        # "A1" is ambiguous → dropped entirely (no merge, no bleed). It is the
+        # only writer position, so the map collapses to None.
+        assert result.track_writers is None
+
+    def test_track_writers_excluded_from_json_schema_and_wire(self):
+        """track_writers is internal (Field exclude=True + SkipJsonSchema): off
+        the wire AND out of the OpenAPI schema, so the GET /release/{id} contract
+        never advertises a property absent from every response body.
+        """
+        schema = ReleaseMetadataResponse.model_json_schema()
+        assert "track_writers" not in schema["properties"]
+        dumped = ReleaseMetadataResponse(
+            release_id=1,
+            title="An Album",
+            artist="Sessa",
+            release_url="https://discogs.com/release/1",
+            track_writers={"A1": [ArtistCredit(name="A Writer", role="Written-By")]},
+        ).model_dump()
+        assert "track_writers" not in dumped
+
+    @pytest.mark.asyncio
     async def test_query_reads_release_track_artist_extra_one(
         self, cache_service, mock_asyncpg_pool
     ):

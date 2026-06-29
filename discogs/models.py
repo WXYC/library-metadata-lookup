@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Discriminator, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from generated.api_models import (
     Alias,
@@ -51,16 +52,20 @@ class ReleaseMetadataResponse(DiscogsReleaseMetadata):
     enrichment (``discogs/writer_roles.py``) scope composer credits to the
     resolved playcut (``provenance="track"``) instead of the whole-release
     approximation. Internal-only: ``exclude=True`` keeps it off the wire, so the
-    response contract — and ``DiscogsTrackItem.artists`` — is unchanged. ``None``
-    when the release has no per-track writer credits (or was built from the
-    Discogs API path, which does not source them).
+    response contract — and ``DiscogsTrackItem.artists`` — is unchanged.
+    ``SkipJsonSchema`` keeps it out of the generated OpenAPI schema too, so the
+    documented ``GET /release/{id}`` contract doesn't advertise a property that
+    never appears on the wire. ``None`` when the release has no per-track writer
+    credits (or was built from the Discogs API path, which does not source them).
 
     Subclasses the generated model (mirroring ``EnrichedDiscogsMatchResult``) so
     it passes Pydantic validation everywhere ``DiscogsReleaseMetadata`` is
     expected; the regen overwrites only ``generated/api_models.py``.
     """
 
-    track_writers: dict[str, list[DiscogsArtistCredit]] | None = Field(default=None, exclude=True)
+    track_writers: SkipJsonSchema[dict[str, list[DiscogsArtistCredit]] | None] = Field(
+        default=None, exclude=True
+    )
 
 
 class TracksAutocompleteResponse(BaseModel):

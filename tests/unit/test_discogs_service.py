@@ -2193,6 +2193,27 @@ class TestFindTrackPosition:
         release = self._release([TrackItem(position="", title="Pequena Vertigem", artists=[])])
         assert find_track_position(release, "Pequena Vertigem") is None
 
+    def test_skips_empty_position_match_and_continues(self) -> None:
+        # When the first title-matched track has an empty position but a later
+        # same-titled track carries one, return the later position rather than
+        # None — don't forfeit an available track-level credit. Mirrors how
+        # _scan_tracklist_for_credit skips items lacking the wanted field.
+        release = self._release(
+            [
+                TrackItem(position="", title="Repeat", artists=[]),
+                TrackItem(position="B5", title="Repeat", artists=[]),
+            ]
+        )
+        assert find_track_position(release, "Repeat") == "B5"
+
+    def test_returns_none_for_empty_or_whitespace_song(self) -> None:
+        # An empty/whitespace song normalizes to "" which would substring-match
+        # every track; the guard returns None so it can't attribute an arbitrary
+        # first-track credit.
+        release = self._release([TrackItem(position="A1", title="Pequena Vertigem", artists=[])])
+        assert find_track_position(release, "") is None
+        assert find_track_position(release, "   ") is None
+
     def test_returns_none_for_empty_tracklist(self) -> None:
         release = self._release([])
         assert find_track_position(release, "Pequena Vertigem") is None
