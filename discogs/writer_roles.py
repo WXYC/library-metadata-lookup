@@ -2,8 +2,15 @@
 
 Classifies Discogs ``role`` strings (from the ``release_track_artist`` /
 ``release_artist`` extra credits already fetched at resolution time) as
-songwriter/composer credits, and assembles the release-level
-``DiscogsWriterCredits`` surfaced on the lookup response.
+songwriter/composer credits, and assembles the ``DiscogsWriterCredits`` surfaced
+on the lookup response. ``writer_credits_from_release`` resolves at two
+precisions: when a played-track position is supplied and that track carries its
+own writer credits (the per-track ``release_track_artist`` ``extra=1`` rows,
+carried on ``ReleaseMetadataResponse.track_writers``), it emits
+``provenance="track"`` scoped to the playcut — bypassing the VA guard, since a
+per-track writer is correct even on a compilation; otherwise it falls back to
+the release-level ``extra_artists`` subset tagged ``provenance="release"``,
+which is suppressed for compilations / Various-Artists releases.
 
 Role strings are stored verbatim as Discogs emits them, so the classifier
 normalizes aggressively: any ``[qualifier]`` is stripped from the whole cell
@@ -99,18 +106,59 @@ def _matched_roles(credits: list[ArtistCredit]) -> list[str]:
     return roles
 
 
+def _track_level_credits(
+    release: ReleaseMetadataResponse, track_position: str | None
+) -> WriterCredits | None:
+    """Per-track writer credits for ``track_position`` on ``release``, or ``None``.
+
+    The precise path (LML#699 Phase 2): when the resolved track carries its own
+    writer credits, those are scoped exactly to the playcut, so this deliberately
+    **bypasses the VA/compilation guard** — a per-track writer is correct on a
+    compilation precisely *because* it is track-scoped. Returns ``None`` (so the
+    caller falls back to the release-level path) when no position is supplied,
+    the release carries no per-track writer map, the position has no map entry,
+    or that entry yields no writer name. Null-safe throughout: a missing/empty
+    position is normal, not exceptional, so the map is never indexed without a
+    presence check and nothing is logged.
+    """
+    if not track_position:
+        return None
+    track_writers = getattr(release, "track_writers", None)
+    if not track_writers:
+        return None
+    credits = track_writers.get(track_position)
+    if not credits:
+        return None
+    names = extract_writer_names(credits)
+    if not names:
+        return None
+    return WriterCredits(
+        names=names,
+        roles=_matched_roles(credits),
+        provenance=Provenance.track,
+        track_position=track_position,
+    )
+
+
 def writer_credits_from_release(
     release: ReleaseMetadataResponse,
+    track_position: str | None = None,
 ) -> WriterCredits | None:
-    """Release-level writer credits for ``release``, or ``None`` (LML#699 Phase 1).
+    """Writer credits for the resolved playcut on ``release``, or ``None`` (LML#699).
 
-    Returns ``None`` for a compilation / Various-Artists release: release-level
-    writers are meaningless for an individual track on a comp, so the guard
-    fires before any extraction. Otherwise extracts the writer-role subset of
-    ``extra_artists`` and tags it ``provenance="release"`` (the whole-release
-    approximation; per-track precision is Phase 2). Returns ``None`` when no
-    writer credit resolves -- never fabricated.
+    Prefers track-level precision: when ``track_position`` resolves to a track
+    that carries its own writer credits, returns those tagged
+    ``provenance="track"`` (the playcut-scoped credit; bypasses the VA guard).
+    Otherwise falls back to the release-level path (Phase 1): ``None`` for a
+    compilation / Various-Artists release (release-level writers are meaningless
+    for an individual comp track, so the guard fires before extraction), else the
+    writer-role subset of ``extra_artists`` tagged ``provenance="release"`` (the
+    whole-release approximation). Returns ``None`` when no writer credit resolves
+    -- never fabricated.
     """
+    track_level = _track_level_credits(release, track_position)
+    if track_level is not None:
+        return track_level
     if is_compilation_artist(release.artist):
         return None
     extra = release.extra_artists or []

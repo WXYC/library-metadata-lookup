@@ -342,6 +342,125 @@ class TestGetRelease:
         )
 
     @pytest.mark.asyncio
+    async def test_builds_position_keyed_track_writers(self, cache_service, mock_asyncpg_pool):
+        """LML#699 Phase 2: get_release reads extra=1 per-track credits and keys
+        the writer subset by the track's display position (not track_sequence).
+        Non-writer extras (producer) and the extra=0 performer credits are
+        excluded from the writer map; TrackItem.artists is untouched.
+        """
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "An Album",
+                "release_year": 2020,
+                "artwork_url": None,
+                "released": None,
+                "artwork_checked_at": None,
+                "not_found": False,
+                "master_id": None,
+            }
+        )
+        extra0 = [{"track_sequence": 1, "artist_name": "Performer One"}]
+        extra1 = [
+            {"track_sequence": 1, "artist_name": "Track One Writer", "role": "Written-By"},
+            {"track_sequence": 2, "artist_name": "Track Two Writer", "role": "Composed By"},
+            {"track_sequence": 2, "artist_name": "A Producer", "role": "Producer"},
+        ]
+        tracks = [
+            {"position": "A1", "title": "First", "duration": None, "sequence": 1},
+            {"position": "A2", "title": "Second", "duration": None, "sequence": 2},
+        ]
+
+        async def route(query, *args):
+            if "release_track_artist" in query and "extra = 1" in query:
+                return extra1
+            if "release_track_artist" in query:
+                return extra0
+            if "release_track" in query:
+                return tracks
+            if "release_artist" in query:
+                return [{"artist_id": 1, "artist_name": "Sessa", "extra": 0, "role": None}]
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=route)
+        result = await cache_service.get_release(1)
+
+        assert result.track_writers is not None
+        assert [c.name for c in result.track_writers["A1"]] == ["Track One Writer"]
+        # A2: producer excluded — only the writer-role credit lands in the map.
+        assert [c.name for c in result.track_writers["A2"]] == ["Track Two Writer"]
+        assert result.track_writers["A2"][0].role == "Composed By"
+        # extra=0 performer credits stay on TrackItem.artists, untouched.
+        assert result.tracklist[0].artists == ["Performer One"]
+
+    @pytest.mark.asyncio
+    async def test_query_reads_release_track_artist_extra_one(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """get_release issues an extra=1 read against release_track_artist
+        (alongside the extra=0 performer read) to source per-track writers.
+        """
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "An Album",
+                "release_year": 2020,
+                "artwork_url": None,
+                "released": None,
+                "artwork_checked_at": None,
+                "not_found": False,
+                "master_id": None,
+            }
+        )
+        captured_queries: list[str] = []
+
+        async def capture_fetch(query, *args):
+            captured_queries.append(query)
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=capture_fetch)
+
+        await cache_service.get_release(1)
+
+        rta_queries = [" ".join(q.split()) for q in captured_queries if "release_track_artist" in q]
+        assert any(
+            "release_track_artist WHERE release_id = $1 AND extra = 1" in q for q in rta_queries
+        ), f"Expected an extra=1 release_track_artist read (LML#699); got: {rta_queries!r}"
+
+    @pytest.mark.asyncio
+    async def test_track_writers_none_when_no_extra_credits(self, cache_service, mock_asyncpg_pool):
+        """A release with no extra=1 credits carries track_writers=None, not an
+        empty dict — the writer-credit path treats both the same, but None keeps
+        the field tidy for releases that have no per-track writers.
+        """
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "An Album",
+                "release_year": 2020,
+                "artwork_url": None,
+                "released": None,
+                "artwork_checked_at": None,
+                "not_found": False,
+                "master_id": None,
+            }
+        )
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[
+                    {"position": "A1", "title": "First", "duration": None, "sequence": 1}
+                ],
+                release_artist=[{"artist_id": 1, "artist_name": "Sessa", "extra": 0, "role": None}],
+                release_label=[],
+                release_genre=[],
+                release_style=[],
+            )
+        )
+        result = await cache_service.get_release(1)
+        assert result.track_writers is None
+
+    @pytest.mark.asyncio
     async def test_reads_videos(self, cache_service, mock_asyncpg_pool):
         """get_release returns videos fetched from release_video table."""
         mock_asyncpg_pool.fetchrow = AsyncMock(

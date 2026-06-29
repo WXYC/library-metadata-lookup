@@ -29,6 +29,7 @@ from discogs.models import (
     ReleaseVideo,
     TrackItem,
 )
+from discogs.writer_roles import is_writer_role
 
 logger = logging.getLogger(__name__)
 
@@ -532,7 +533,13 @@ class DiscogsCacheService:
                 )
 
             # Fetch all child tables in parallel (independent queries)
-            artist_rows, label_rows, track_rows, track_artist_rows = await asyncio.gather(
+            (
+                artist_rows,
+                label_rows,
+                track_rows,
+                track_artist_rows,
+                track_writer_rows,
+            ) = await asyncio.gather(
                 self.pool.fetch(
                     """
                     SELECT artist_id, artist_name, extra, role
@@ -569,6 +576,24 @@ class DiscogsCacheService:
                     FROM release_track_artist
                     WHERE release_id = $1
                       AND extra = 0
+                    ORDER BY track_sequence
+                    """,
+                    release_id,
+                ),
+                self.pool.fetch(
+                    # LML#699 Phase 2: the `extra = 1` companion read — per-track
+                    # writer/producer/remixer credits carrying `role`. Kept as a
+                    # SEPARATE query (not a widening of the `extra = 0` read
+                    # above) so `TrackItem.artists` stays performers-only for the
+                    # validation scan; the writer-role subset is keyed by track
+                    # position into `track_writers` below for BMI composer
+                    # credits. `release_track_artist` has no `artist_id` column,
+                    # so only `artist_name` + `role` are selected.
+                    """
+                    SELECT track_sequence, artist_name, role
+                    FROM release_track_artist
+                    WHERE release_id = $1
+                      AND extra = 1
                     ORDER BY track_sequence
                     """,
                     release_id,
@@ -648,17 +673,46 @@ class DiscogsCacheService:
                     track_artists[seq] = []
                 track_artists[seq].append(row["artist_name"])
 
+            # LML#699 Phase 2: per-track writer credits, keyed by `track_sequence`
+            # first, then translated to the display `position` via the tracklist
+            # build below. Pre-filtered to writer roles (`is_writer_role`, pure)
+            # so the carried map is a true writer map; `role` is read defensively
+            # (`.get`) because partial test doubles route extra=0-shaped rows here
+            # without a `role` column.
+            track_writers_by_seq: dict[int, list[ArtistCredit]] = {}
+            for row in track_writer_rows:
+                role = row.get("role")
+                if not is_writer_role(role):
+                    continue
+                seq = row["track_sequence"]
+                track_writers_by_seq.setdefault(seq, []).append(
+                    ArtistCredit(name=row["artist_name"], role=role)
+                )
+
             tracklist = []
+            seq_to_position: dict[int, str] = {}
             for row in track_rows:
                 seq = row["sequence"]
+                position = row["position"] or ""
+                seq_to_position[seq] = position
                 tracklist.append(
                     TrackItem(
-                        position=row["position"] or "",
+                        position=position,
                         title=row["title"],
                         duration=row["duration"],
                         artists=track_artists.get(seq, []),
                     )
                 )
+
+            # Re-key the per-track writer credits by display position (the only
+            # track identifier `TrackItem` carries downstream). A writer row
+            # whose `track_sequence` has no tracklist row, or whose position is
+            # empty, is dropped — it can't be looked up by position anyway.
+            track_writers: dict[str, list[ArtistCredit]] = {}
+            for seq, credits in track_writers_by_seq.items():
+                position = seq_to_position.get(seq)
+                if position:
+                    track_writers.setdefault(position, []).extend(credits)
 
             videos = [
                 ReleaseVideo(
@@ -695,6 +749,9 @@ class DiscogsCacheService:
                 # the key, None when Discogs has no master for the release.
                 master_id=release_row.get("master_id"),
                 videos=videos,
+                # LML#699 Phase 2: per-track writer credits keyed by display
+                # position; None (not {}) when the release has none.
+                track_writers=track_writers or None,
             )
 
         except Exception as e:

@@ -569,6 +569,54 @@ class TestEnrichArtworkResultsExtended:
         discogs_service.get_release.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_extended_writer_credits_track_level_when_song_resolves(self):
+        """LML#699 Phase 2: when the played song resolves to a tracklist
+        position carrying per-track writers, the response emits
+        provenance="track" with that track's position — scoped to the playcut,
+        not the release-level approximation, and no cross-track bleed.
+        """
+        item = make_library_item(artist="Sessa", title="Pequena Vertigem de Amor")
+        artwork = make_discogs_result(
+            release_id=558, artist="Sessa", album="Pequena Vertigem de Amor"
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=558,
+            title="Pequena Vertigem de Amor",
+            artist="Sessa",
+            artist_id=42,
+            release_url="https://discogs.com/release/558",
+            tracklist=[
+                TrackItem(position="A1", title="Sol Te Pegou", artists=[]),
+                TrackItem(position="A2", title="Dor Fodida", artists=[]),
+            ],
+            track_writers={
+                "A1": [ArtistCredit(name="A1 Writer", role="Written-By")],
+                "A2": [ArtistCredit(name="A2 Writer", role="Composed By")],
+            },
+            extra_artists=[ArtistCredit(name="Sessa", role="Written-By")],
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(artist_id=42, name="Sessa")
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Sol Te Pegou",
+            artist="Sessa",
+            extended=True,
+        )
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.writer_credits is not None
+        assert enriched.writer_credits.provenance == "track"
+        assert enriched.writer_credits.track_position == "A1"
+        assert enriched.writer_credits.names == ["A1 Writer"]
+        assert "A2 Writer" not in enriched.writer_credits.names  # no cross-track bleed
+        # Cache-only: derived from the single already-fetched release.
+        discogs_service.get_release.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_extended_writer_credits_none_when_no_writer(self):
         """A resolved release whose extra_artists carry no writer role omits
         writer_credits (never fabricated).
@@ -2442,6 +2490,53 @@ class TestArtistIdentitySplitGate:
         assert enriched.writer_credits is None
         # ...while the album-title match still surfaces album-derived fields,
         # proving writer_credits follows the artist gate, not the album gate.
+        assert enriched.tracklist is not None
+
+    @pytest.mark.asyncio
+    async def test_release_side_drift_suppresses_track_level_writer_credits(self):
+        """The artist-identity gate covers BOTH writer-credit precisions: even
+        when the drifted release carries a per-track writer for the played
+        track (which, absent the gate, would emit ``provenance="track"``), an
+        artist-identity mismatch suppresses it. Locks the F1 fix against the
+        track-level path added in Phase 2 (LML#699)."""
+        item = make_library_item(id=42, artist="Noura Mint Seymali", title="Tzenni")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Noura Mint Seymali",
+            album="Tzenni",
+            artwork_url="https://example.com/tzenni.jpg",
+        )
+
+        discogs_service = AsyncMock()
+        # Wrong artist, but a per-track writer keyed to the played track's
+        # position — the track-level path would fire if the gate let it.
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Tzenni",
+            artist="Completely Different Artist",
+            artist_id=99,
+            release_url="https://discogs.com/release/1",
+            tracklist=[TrackItem(position="A1", title="Hebebeb (Zrag)", artists=[])],
+            track_writers={"A1": [ArtistCredit(name="Wrong Track Writer", role="Written-By")]},
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99, name="Completely Different Artist"
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Hebebeb (Zrag)",
+            album="Tzenni",
+            artist="Noura Mint Seymali",
+            extended=True,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # Track-level writers for the played track exist, but the artist gate
+        # suppresses the whole field — no wrong-artist composer leaks.
+        assert enriched.writer_credits is None
         assert enriched.tracklist is not None
 
     @pytest.mark.asyncio

@@ -1589,3 +1589,22 @@ def _scan_tracklist_for_credit(release: ReleaseMetadataResponse, track_lower: st
             if joined:
                 return joined
     return None
+
+
+def find_track_position(release: ReleaseMetadataResponse, track: str) -> str | None:
+    """Return the display ``position`` of the first title-matched track (LML#699).
+
+    The position-recovery sibling of :func:`_scan_tracklist_for_credit`: artist-
+    blind, it surfaces *where* the played track sits in the tracklist (its
+    ``position`` — e.g. ``"A1"`` / ``"5"``) so the BMI writer-credit enrichment
+    can scope per-track composer credits to the resolved playcut. Reuses the
+    shared :func:`_iter_title_matched_items` title rule, so the position resolves
+    identically to the validation / credit scans. The first title-matched track
+    wins (the playcut). Returns ``None`` when no title matches or the matched
+    track has an empty position — the caller then falls back to release-level
+    credits. ``track`` is raw; it is normalized here.
+    """
+    track_lower = normalize_for_track_comparison(track)
+    for item in _iter_title_matched_items(release, track_lower):
+        return item.position or None
+    return None

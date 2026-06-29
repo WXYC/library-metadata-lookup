@@ -161,3 +161,108 @@ def test_writer_credits_names_dedup_by_name_roles_dedup_by_role() -> None:
     assert wc is not None
     assert wc.names == ["Tim Gane", "Laetitia Sadier"]
     assert wc.roles == ["Composed By", "Written-By"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (LML#699 PR-C): track-level precision. A resolved track position
+# prefers that track's per-track writers (provenance="track"); otherwise the
+# release-level Phase-1 path applies (provenance="release"). The track-level
+# path bypasses the VA/compilation guard — a per-track writer is correct on a
+# comp precisely because it is track-scoped.
+# ---------------------------------------------------------------------------
+
+
+def _release_with_track_writers(
+    artist: str,
+    track_writers: dict[str, list[ArtistCredit]],
+    extra_artists: list[ArtistCredit] | None = None,
+) -> ReleaseMetadataResponse:
+    return ReleaseMetadataResponse(
+        release_id=1,
+        title="Test Album",
+        artist=artist,
+        release_url="https://www.discogs.com/release/1",
+        extra_artists=extra_artists or [],
+        track_writers=track_writers,
+    )
+
+
+def test_writer_credits_track_level_scoped() -> None:
+    # Multi-track release: the played track's position returns ONLY that
+    # track's writers (provenance="track"), with no bleed from the sibling.
+    release = _release_with_track_writers(
+        "Sessa",
+        track_writers={
+            "A1": [ArtistCredit(name="Track One Writer", role="Written-By")],
+            "A2": [ArtistCredit(name="Track Two Writer", role="Composed By")],
+        },
+    )
+    wc = writer_credits_from_release(release, track_position="A1")
+    assert isinstance(wc, WriterCredits)
+    assert wc.names == ["Track One Writer"]
+    assert wc.provenance == "track"
+    assert wc.track_position == "A1"
+    assert "Track Two Writer" not in wc.names  # no cross-track bleed
+    assert "Written-By" in (wc.roles or [])
+
+
+def test_writer_credits_track_missing_falls_back_to_release() -> None:
+    # The played track has no per-track writer entry; fall back to the
+    # release-level credit (provenance="release", track_position=None).
+    release = _release_with_track_writers(
+        "Jessica Pratt",
+        track_writers={"A1": [ArtistCredit(name="Track One Writer", role="Written-By")]},
+        extra_artists=[ArtistCredit(name="Jessica Pratt", role="Written-By")],
+    )
+    wc = writer_credits_from_release(release, track_position="B2")  # no map entry
+    assert isinstance(wc, WriterCredits)
+    assert wc.names == ["Jessica Pratt"]
+    assert wc.provenance == "release"
+    assert wc.track_position is None
+
+
+@pytest.mark.parametrize("position", [None, ""])
+def test_writer_credits_null_position_falls_back_without_raising(position: str | None) -> None:
+    # A null/empty resolved position falls back to release-level credits and
+    # never raises — a missing position is normal, not exceptional.
+    release = _release_with_track_writers(
+        "Cat Power",
+        track_writers={"A1": [ArtistCredit(name="Track One Writer", role="Written-By")]},
+        extra_artists=[ArtistCredit(name="Cat Power", role="Written-By")],
+    )
+    wc = writer_credits_from_release(release, track_position=position)
+    assert isinstance(wc, WriterCredits)
+    assert wc.provenance == "release"
+    assert wc.names == ["Cat Power"]
+
+
+def test_writer_credits_track_position_without_map_falls_back() -> None:
+    # A release that carries no per-track writer map at all (Phase-1 shape):
+    # a supplied position can't index anything, so fall back to release-level
+    # without raising.
+    release = _release(
+        "Juana Molina",
+        [ArtistCredit(name="Juana Molina", role="Written-By")],
+    )
+    wc = writer_credits_from_release(release, track_position="A1")
+    assert isinstance(wc, WriterCredits)
+    assert wc.provenance == "release"
+    assert wc.names == ["Juana Molina"]
+
+
+def test_writer_credits_compilation_track_level_resolves() -> None:
+    # On a VA/compilation release the release-level guard still returns None,
+    # but a per-track writer on the played track resolves (provenance="track").
+    release = _release_with_track_writers(
+        "Various",
+        track_writers={"3": [ArtistCredit(name="Comp Track Writer", role="Written-By")]},
+        extra_artists=[ArtistCredit(name="Some Writer", role="Written-By")],
+    )
+    # Release-level path (no position) is still suppressed on the comp.
+    assert writer_credits_from_release(release) is None
+    # Track-level path bypasses the VA guard.
+    wc = writer_credits_from_release(release, track_position="3")
+    assert isinstance(wc, WriterCredits)
+    assert wc.names == ["Comp Track Writer"]
+    assert wc.provenance == "track"
+    assert wc.track_position == "3"
