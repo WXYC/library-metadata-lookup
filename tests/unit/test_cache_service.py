@@ -445,6 +445,60 @@ class TestGetRelease:
         # only writer position, so the map collapses to None.
         assert result.track_writers is None
 
+    @pytest.mark.asyncio
+    async def test_ambiguous_position_dropped_unique_position_survives(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """The drop is per-position, not all-or-nothing: a unique writer position
+        survives alongside a dropped ambiguous one. And ambiguity is counted over
+        ALL tracks — the colliding "A1" is shared by a writer-bearing track and a
+        writer-LESS sibling, so a writer sharing a bare position with a
+        credit-less track is still correctly dropped (not just collisions between
+        two writer-bearing tracks).
+        """
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "An Album",
+                "release_year": 2020,
+                "artwork_url": None,
+                "released": None,
+                "artwork_checked_at": None,
+                "not_found": False,
+                "master_id": None,
+            }
+        )
+        extra1 = [
+            {"track_sequence": 1, "artist_name": "Ambiguous A1 Writer", "role": "Written-By"},
+            {"track_sequence": 2, "artist_name": "Unique A2 Writer", "role": "Composed By"},
+        ]
+        # seq1 + seq3 both carry "A1" (seq3 has NO extra=1 writer); seq2 carries
+        # the unique "A2".
+        tracks = [
+            {"position": "A1", "title": "First", "duration": None, "sequence": 1},
+            {"position": "A2", "title": "Second", "duration": None, "sequence": 2},
+            {"position": "A1", "title": "Third", "duration": None, "sequence": 3},
+        ]
+
+        async def route(query, *args):
+            if "release_track_artist" in query and "extra = 1" in query:
+                return extra1
+            if "release_track_artist" in query:
+                return []
+            if "release_track" in query:
+                return tracks
+            if "release_artist" in query:
+                return [{"artist_id": 1, "artist_name": "Sessa", "extra": 0, "role": None}]
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=route)
+        result = await cache_service.get_release(1)
+
+        # "A1" ambiguous (two tracks) → dropped; "A2" unique → survives.
+        assert result.track_writers is not None
+        assert set(result.track_writers) == {"A2"}
+        assert [c.name for c in result.track_writers["A2"]] == ["Unique A2 Writer"]
+
     def test_track_writers_excluded_from_json_schema_and_wire(self):
         """track_writers is internal (Field exclude=True + SkipJsonSchema): off
         the wire AND out of the OpenAPI schema, so the GET /release/{id} contract
