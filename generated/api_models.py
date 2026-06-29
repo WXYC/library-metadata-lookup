@@ -1353,6 +1353,29 @@ class DiscogsArtistCredit(BaseModel):
     )
 
 
+class Provenance(StrEnum):
+    track = "track"
+    release = "release"
+
+
+class DiscogsWriterCredits(BaseModel):
+    names: list[str] = Field(
+        ..., description="Distinct songwriter/composer names for the resolved track."
+    )
+    roles: list[str] | None = Field(
+        None,
+        description='The verbatim Discogs role strings the names were drawn from (e.g. "Written-By", "Words By, Music By"), for auditability of the writer-role mapping.\n',
+    )
+    provenance: Provenance = Field(
+        ...,
+        description="`track` = scoped to the resolved track's per-track credits (precise); `release` = a release-level credit applied to the whole release (approximate for an individual track, mirroring tubafrenzy's auto-fill-from-artist fallback). Populated as `release` in the initial rollout; `track` is added when per-track resolution lands.\n",
+    )
+    track_position: str | None = Field(
+        None,
+        description='The resolved track\'s position (e.g. "A1", "5") when `provenance` is `track`; null for release-level credits.\n',
+    )
+
+
 class DiscogsLabelCredit(BaseModel):
     label_id: int | None = None
     name: str
@@ -1882,6 +1905,7 @@ class DiscogsMatchResult(BaseModel):
         None,
         description="Pre-parsed structured tokens from the artist's `profile` markup, using a cache-only resolver — references to entities not in the local PG cache fall through as plain-text tokens (no inline Discogs API calls on the read path). Populated only when `extended` is true. Field name matches `DiscogsArtistDetails.profile_tokens` so callers can share rendering code across the two payloads. Pair with `LookupRequest.warm_cache=true` on write-path calls to progressively populate the cache so subsequent reads render richer.\n",
     )
+    writer_credits: DiscogsWriterCredits | None = None
 
 
 class LookupResultItem(BaseModel):
