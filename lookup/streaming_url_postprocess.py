@@ -12,31 +12,37 @@ does NO synchronous external HTTP. For each configured service whose
 per-service flag is on, whose URL field came out ``None`` in ``update``, and
 whose client is present in ``clients``, this:
 
-1. Reads ``entity.streaming_url_cache.get_cached_streaming_url`` (a pure SELECT)
+1. Reads ``entity.streaming_url_cache.peek_cached_streaming_url`` (a pure SELECT)
    with the REQUEST's ``(artist, album)`` — not the library row's. This is the
    fix for the wrong-fallback-row attack (a non-library album matched to a
    same-titled library row by a different artist, probed with the wrong artist
    name). The cache key is the album, so URLs are reused across song lookups on
-   the same album.
-2. On a cache **hit**, mutates ``update[cfg.url_field]`` in place synchronously.
-   No mint — cache hits already minted on their original resolution.
-3. On a cache **miss**, leaves the field ``None`` and enqueues **one** bounded,
-   deduplicated background task (``_warm_streaming_url_cache``) that runs the
-   live probe (``resolve_streaming_url_with_cache``) → cache UPSERT →
-   mint-on-``live_resolved``. The response has already returned by the time the
-   probe runs, so streaming URLs are *eventually consistent*: the first lookup
-   of an uncached album omits that service's URL; the warm fills the cache so
-   the next lookup is a hit. Artwork is unaffected (it never flowed through
-   here — the synthesis-path Apple probe in ``orchestrator.py`` stays
-   synchronous).
+   the same album. The peek returns ``(url, has_fresh_decision)`` so the hot
+   path can make the same three-way choice the resolver makes — without probing.
+2. On a cache **hit** (url present), mutates ``update[cfg.url_field]`` in place
+   synchronously. No mint — cache hits already minted on their original
+   resolution.
+3. On a **known recent miss** (no url, but the cache holds a fresh "not found"
+   within the TTL), does nothing: a warm would only re-derive the same verdict.
+4. On a **genuine miss** (absent/stale row), leaves the field ``None`` and
+   enqueues **one** bounded, deduplicated background task
+   (``_warm_streaming_url_cache``) that runs the live probe
+   (``resolve_streaming_url_with_cache``) → cache UPSERT → mint-on-``live_resolved``.
+   The response has already returned by the time the probe runs, so streaming
+   URLs are *eventually consistent*: the first lookup of an uncached album omits
+   that service's URL; the warm fills the cache so the next lookup is a hit.
+   Artwork is unaffected (it never flowed through here — the synthesis-path
+   Apple probe in ``orchestrator.py`` stays synchronous). The warm is suppressed
+   for the whole context when ``should_suppress_streaming_warm()`` is set (the
+   ``/lookup/bulk`` path), which then does cache read-fill only.
 
 **Background warm.** Each warm handles one ``(service, artist, album)``:
 
 * **Dedup** — a process-global ``_streaming_warm_in_flight`` set keyed on
   ``(service, to_match_form(artist), to_match_form(album))`` (the same
-  normalization the cache uses). The key is added before ``create_task`` and
-  discarded in the done-callback, so two identical misses arriving close
-  together enqueue a single probe.
+  normalization the cache uses). The key is registered right after
+  ``create_task`` (with no intervening await, so two identical misses still
+  dedup to one task) and discarded in the done-callback.
 * **Bound** — a process-global semaphore sized by ``LML_STREAMING_WARM_CONCURRENCY``
   (default 4), deliberately separate from the bio warm's bound: this path was
   introduced to fix an incident and a no-redeploy throttle from Railway is the
@@ -51,8 +57,10 @@ whose client is present in ``clients``, this:
 Sentry on the hot path projects, per active service:
 
 * ``streaming_url.persistent_lookup.fired.<service>`` — "post-process ran".
-* ``streaming_url.persistent_lookup.<cache_hit|cache_miss_enqueued>.<service>``
-  — whether the URL was filled synchronously or a warm was scheduled.
+* ``streaming_url.persistent_lookup.<outcome>.<service>`` where ``<outcome>`` is
+  one of ``cache_hit`` / ``cache_miss_recent`` / ``cache_miss_enqueued`` /
+  ``cache_miss_unwarmed`` — the hot-path disposition (filled, known-miss,
+  warm-scheduled, or warm-suppressed-on-bulk).
 
 Side effects degrade gracefully: PG errors swallow inside the cache layer; mint
 failures log and continue; Sentry projection errors log and continue; the
@@ -66,6 +74,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal
@@ -79,7 +88,7 @@ from entity.sources import PgSource
 from entity.store import EntityStore
 from entity.streaming_url_cache import (
     DEFAULT_MISS_TTL,
-    get_cached_streaming_url,
+    peek_cached_streaming_url,
     resolve_streaming_url_with_cache,
 )
 from identity.release_validation import validate_and_canonicalize_external_id
@@ -118,6 +127,34 @@ _background_tasks: set[asyncio.Task] = set()
 """Strong refs to fire-and-forget warm tasks. ``asyncio.create_task`` returns a
 weak reference; without anchoring it the GC can reap the warm mid-flight. Each
 task removes itself in a done-callback (mirrors ``orchestrator._background_tasks``)."""
+
+_suppress_streaming_warm_var: ContextVar[bool] = ContextVar(
+    "lml_suppress_streaming_warm", default=False
+)
+"""Per-context switch: when ``True``, a cache miss fills nothing and schedules
+NO background warm (cache-read-only). Set once at the top of a ``/lookup/bulk``
+batch so the bulk drain never spawns a decoupled warm tail that competes with
+the live ``/lookup`` path. Mirrors the bulk ``skip_cache`` ContextVar and the
+``bandcamp=None`` / ``allow_release_resolution_fallback=False`` bulk kill
+switches — the offline warmer (#548) is the right tier for bulk cache fill.
+Backed by a ContextVar so setting it at the batch top propagates into each
+per-item task via the inherited context."""
+
+
+def set_suppress_streaming_warm(suppress: bool) -> None:
+    """Suppress (or re-enable) the background streaming-URL warm for this context.
+
+    Call once at the top of a ``/lookup/bulk`` handler with ``True``; the value
+    propagates into every per-item ``perform_lookup`` task via the inherited
+    context, so each item's post-process does cache read-fill only.
+    """
+    _suppress_streaming_warm_var.set(suppress)
+
+
+def should_suppress_streaming_warm() -> bool:
+    """Whether the current context suppresses the background streaming-URL warm."""
+    return _suppress_streaming_warm_var.get()
+
 
 # Default per-service wall-clock ceiling for a single live probe in the
 # background warm (LML#706 moved the probe off the response path; this now
@@ -270,12 +307,14 @@ async def apply_streaming_url_postprocess(
     if not active:
         return
 
-    # Fast PG SELECTs, concurrently. ``get_cached_streaming_url`` swallows its
-    # own PG errors (returns ``None``), so a failed read degrades to a miss —
-    # the same fall-through-to-probe posture as an absent row.
-    cached_urls = await asyncio.gather(
+    # Fast PG SELECTs, concurrently. ``peek_cached_streaming_url`` swallows its
+    # own PG errors (returns ``(None, False)``); ``return_exceptions`` contains
+    # any surprise (e.g. a normalization failure) so a single service can never
+    # make the post-process raise — it must degrade, never 500 the lookup. The
+    # old synchronous-probe gather used ``return_exceptions`` for the same reason.
+    peeks = await asyncio.gather(
         *(
-            get_cached_streaming_url(
+            peek_cached_streaming_url(
                 pg,
                 service=service_key,
                 artist=request_artist,
@@ -283,19 +322,41 @@ async def apply_streaming_url_postprocess(
                 miss_ttl=cfg.miss_ttl,
             )
             for service_key, cfg, _client in active
-        )
+        ),
+        return_exceptions=True,
     )
 
-    for (service_key, cfg, client), cached_url in zip(active, cached_urls, strict=True):
+    suppress_warm = should_suppress_streaming_warm()
+    for (service_key, cfg, client), peek in zip(active, peeks, strict=True):
+        if isinstance(peek, BaseException):
+            logger.warning(
+                "streaming-URL cache peek failed for %s / %s / %s: %r",
+                service_key,
+                request_artist,
+                request_album,
+                peek,
+            )
+            continue
+        cached_url, has_fresh_decision = peek
         if cached_url is not None:
             # Synchronous hit: fill the URL now. No mint — the URL was minted on
             # the resolution that first wrote this cache row.
             update[cfg.url_field] = cached_url
             _project_sentry(service_key, "cache_hit")
+        elif has_fresh_decision:
+            # Known recent miss: the cache already records "checked, not found"
+            # within the TTL. No probe is warranted, so don't schedule a no-op
+            # warm (it would just re-derive the same recent-miss verdict).
+            _project_sentry(service_key, "cache_miss_recent")
+        elif suppress_warm:
+            # Bulk path: cache read-fill only. The offline warmer owns bulk fill;
+            # spawning a warm here would decouple the drain's probes from the
+            # request and starve the live /lookup path's own warms.
+            _project_sentry(service_key, "cache_miss_unwarmed")
         else:
-            # Miss: defer the live probe + UPSERT + mint to a bounded,
-            # deduplicated background task. The response returns without this
-            # service's URL; the warm fills the cache for next time.
+            # Genuine miss (absent/stale): defer the live probe + UPSERT + mint
+            # to a bounded, deduplicated background task. The response returns
+            # without this service's URL; the warm fills the cache for next time.
             _enqueue_streaming_warm(
                 service_key, cfg, client, pg, entity_store, request_artist, request_album
             )
@@ -348,12 +409,17 @@ def _enqueue_streaming_warm(
     key = (service_key, to_match_form(request_artist), to_match_form(request_album))
     if key in _streaming_warm_in_flight:
         return
-    _streaming_warm_in_flight.add(key)
+    # Create the task BEFORE registering the dedup key, so a create_task failure
+    # (e.g. no running loop) can't leak a key that would suppress the warm for
+    # this (service, artist, album) for the rest of the process's life. There is
+    # no await between the membership check and the registration below, so two
+    # identical misses still dedup to one task.
     task = asyncio.create_task(
         _warm_streaming_url_cache(
             service_key, cfg, client, pg, entity_store, request_artist, request_album
         )
     )
+    _streaming_warm_in_flight.add(key)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     task.add_done_callback(lambda _t: _streaming_warm_in_flight.discard(key))
@@ -452,15 +518,22 @@ async def _mint_identity(
         )
 
 
-def _project_sentry(service_key: str, outcome: Literal["cache_hit", "cache_miss_enqueued"]) -> None:
+def _project_sentry(
+    service_key: str,
+    outcome: Literal[
+        "cache_hit", "cache_miss_recent", "cache_miss_enqueued", "cache_miss_unwarmed"
+    ],
+) -> None:
     """Project per-service Sentry data-attributes for the post-process hot path.
 
     Two booleans land on the active transaction per service:
 
     * ``streaming_url.persistent_lookup.fired.<service>`` — ran-for-service.
-    * ``streaming_url.persistent_lookup.<outcome>.<service>`` — whether the URL
-      was a synchronous ``cache_hit`` or the miss scheduled a warm
-      (``cache_miss_enqueued``).
+    * ``streaming_url.persistent_lookup.<outcome>.<service>`` — the hot-path
+      disposition: ``cache_hit`` (filled synchronously), ``cache_miss_recent``
+      (known miss within TTL, no warm), ``cache_miss_enqueued`` (genuine miss,
+      warm scheduled), or ``cache_miss_unwarmed`` (genuine miss, warm suppressed
+      on the bulk path).
 
     Hot-path only (and therefore always in-request — correct attribution): the
     background warm's ``live_*`` outcome is logged, never tagged here, because

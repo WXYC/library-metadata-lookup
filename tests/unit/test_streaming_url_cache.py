@@ -33,6 +33,7 @@ from entity.sources import PgSource
 from entity.streaming_url_cache import (
     DEFAULT_MISS_TTL,
     get_cached_streaming_url,
+    peek_cached_streaming_url,
     set_cached_streaming_url,
 )
 
@@ -138,6 +139,64 @@ class TestGetCachedStreamingURL:
         )
 
         assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("service", "sample_url"), _SERVICE_CASES)
+class TestPeekCachedStreamingURL:
+    """``peek_cached_streaming_url`` exposes the ``was_present`` bit so the
+    /lookup post-process can tell a fresh known-miss (skip the warm) from an
+    absent/stale row (warm) — without paying the live probe (LML#706)."""
+
+    async def test_hit_returns_url_and_fresh_decision(self, service, sample_url):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value={"url": sample_url})
+
+        url, has_fresh_decision = await peek_cached_streaming_url(
+            pg, service=service, artist="Stereolab", album="Aluminum Tunes"
+        )
+
+        assert url == sample_url
+        assert has_fresh_decision is True
+
+    async def test_fresh_known_miss_returns_none_with_fresh_decision(self, service, sample_url):
+        # Row present, url NULL, inside the TTL (the SQL filter returned it):
+        # the cache already knows "not found" — the caller must NOT warm.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value={"url": None})
+
+        url, has_fresh_decision = await peek_cached_streaming_url(
+            pg, service=service, artist="Sessa", album="Estrela Acesa"
+        )
+
+        assert url is None
+        assert has_fresh_decision is True
+
+    async def test_absent_or_stale_returns_none_without_fresh_decision(self, service, sample_url):
+        # No row (absent, or a stale miss the SQL WHERE filtered out): the
+        # caller should probe/warm.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+
+        url, has_fresh_decision = await peek_cached_streaming_url(
+            pg, service=service, artist="Hyd", album="Hold Onto Me Infinity"
+        )
+
+        assert url is None
+        assert has_fresh_decision is False
+
+    async def test_pg_error_degrades_to_probe(self, service, sample_url):
+        # A failed read must look like "absent" so the caller falls through to
+        # a probe/warm — same posture as ``get_cached_streaming_url``.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(side_effect=RuntimeError("PG unreachable"))
+
+        url, has_fresh_decision = await peek_cached_streaming_url(
+            pg, service=service, artist="Hyd", album="Hold Onto Me Infinity"
+        )
+
+        assert url is None
+        assert has_fresh_decision is False
 
 
 @pytest.mark.asyncio

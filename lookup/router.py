@@ -56,6 +56,7 @@ from lookup.models import (
     LookupResponse,
 )
 from lookup.orchestrator import NONLIBRARY_RELEASE_SURFACED_STAT_KEY, perform_lookup
+from lookup.streaming_url_postprocess import set_suppress_streaming_warm
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
@@ -382,6 +383,14 @@ async def handle_bulk_lookup(
     # `_run_one` task via the inherited task context.
     if skip_cache:
         set_skip_cache(True)
+
+    # Bulk does streaming-URL cache read-fill ONLY — never spawns the background
+    # warm (LML#706). A 35k-album drain returns fast per item, so an enqueued
+    # warm tail would decouple from the request and starve the live /lookup
+    # path's own warms. Same ContextVar-propagation mechanism as `skip_cache`,
+    # and the same posture as `bandcamp=None` / `allow_release_resolution_fallback
+    # =False` below: the offline warmer (#548) is the right tier for bulk fill.
+    set_suppress_streaming_warm(True)
 
     # One cache_stats context for the whole batch: the in-process caches are
     # shared, so aggregate counters reflect the batch's behavior — the property
