@@ -15,7 +15,7 @@ from discogs.models import (
     TrackItem,
     TrackReleasesResponse,
 )
-from discogs.service import DiscogsApiCheckResult, DiscogsService
+from discogs.service import DiscogsApiCheckResult, DiscogsService, find_track_position
 
 
 def test_no_lockfree_lazy_init_in_get_client():
@@ -2141,6 +2141,61 @@ class TestGetTrackCreditOnRelease:
         with patch.object(service, "get_release", new_callable=AsyncMock, return_value=release):
             credit = await service.get_track_credit_on_release(34993109, "A Star Is Born")
         assert credit == "Bill Orcutt Tashi Shelley Robbie Miller"
+
+
+# ---------------------------------------------------------------------------
+# find_track_position (LML#699 Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestFindTrackPosition:
+    """Artist-blind sibling of ``_scan_tracklist_for_credit``: surfaces *where*
+    the played track sits (its display ``position``) so the BMI writer-credit
+    enrichment can scope per-track credits to the resolved track. Reuses the
+    shared ``_iter_title_matched_items`` title rule.
+    """
+
+    def _release(self, tracklist: list[TrackItem]) -> ReleaseMetadataResponse:
+        return ReleaseMetadataResponse(
+            release_id=1,
+            title="An Album",
+            artist="Sessa",
+            release_url="https://discogs.com/release/1",
+            tracklist=tracklist,
+        )
+
+    def test_returns_matched_track_position(self) -> None:
+        release = self._release(
+            [
+                TrackItem(position="A1", title="First Track", artists=[]),
+                TrackItem(position="A2", title="Pequena Vertigem", artists=[]),
+            ]
+        )
+        assert find_track_position(release, "Pequena Vertigem") == "A2"
+
+    def test_returns_first_match_position(self) -> None:
+        # The first title-matched track wins, mirroring the credit scan.
+        release = self._release(
+            [
+                TrackItem(position="A1", title="Repeat", artists=[]),
+                TrackItem(position="B5", title="Repeat", artists=[]),
+            ]
+        )
+        assert find_track_position(release, "Repeat") == "A1"
+
+    def test_returns_none_when_no_title_matches(self) -> None:
+        release = self._release([TrackItem(position="A1", title="Something Else", artists=[])])
+        assert find_track_position(release, "Pequena Vertigem") is None
+
+    def test_returns_none_when_matched_position_empty(self) -> None:
+        # A title-matched track with an empty position yields None so the
+        # caller falls back to release-level credits.
+        release = self._release([TrackItem(position="", title="Pequena Vertigem", artists=[])])
+        assert find_track_position(release, "Pequena Vertigem") is None
+
+    def test_returns_none_for_empty_tracklist(self) -> None:
+        release = self._release([])
+        assert find_track_position(release, "Pequena Vertigem") is None
 
 
 # ---------------------------------------------------------------------------

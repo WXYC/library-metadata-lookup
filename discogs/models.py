@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Discriminator
+from pydantic import BaseModel, Discriminator, Field
 
 from generated.api_models import (
     Alias,
@@ -36,10 +36,31 @@ TrackItem = DiscogsTrackItem
 ReleaseVideo = DiscogsReleaseVideo
 ReleaseInfo = DiscogsReleaseInfo
 TrackReleasesResponse = DiscogsTrackReleasesResponse
-ReleaseMetadataResponse = DiscogsReleaseMetadata
 WriterCredits = DiscogsWriterCredits
 ArtistRef = Alias
 MemberRef = Member
+
+
+class ReleaseMetadataResponse(DiscogsReleaseMetadata):
+    """``DiscogsReleaseMetadata`` plus an LML-internal per-track writer map (LML#699).
+
+    ``track_writers`` maps a track's display ``position`` (e.g. ``"A1"`` / ``"5"``)
+    to the writer-role subset of that track's per-track Discogs credits
+    (``release_track_artist`` ``extra = 1`` rows), populated by the cache read in
+    ``discogs/cache_service.get_release``. It lets the BMI writer-credit
+    enrichment (``discogs/writer_roles.py``) scope composer credits to the
+    resolved playcut (``provenance="track"``) instead of the whole-release
+    approximation. Internal-only: ``exclude=True`` keeps it off the wire, so the
+    response contract — and ``DiscogsTrackItem.artists`` — is unchanged. ``None``
+    when the release has no per-track writer credits (or was built from the
+    Discogs API path, which does not source them).
+
+    Subclasses the generated model (mirroring ``EnrichedDiscogsMatchResult``) so
+    it passes Pydantic validation everywhere ``DiscogsReleaseMetadata`` is
+    expected; the regen overwrites only ``generated/api_models.py``.
+    """
+
+    track_writers: dict[str, list[DiscogsArtistCredit]] | None = Field(default=None, exclude=True)
 
 
 class TracksAutocompleteResponse(BaseModel):
