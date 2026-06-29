@@ -1600,11 +1600,19 @@ def find_track_position(release: ReleaseMetadataResponse, track: str) -> str | N
     can scope per-track composer credits to the resolved playcut. Reuses the
     shared :func:`_iter_title_matched_items` title rule, so the position resolves
     identically to the validation / credit scans. The first title-matched track
-    wins (the playcut). Returns ``None`` when no title matches or the matched
-    track has an empty position — the caller then falls back to release-level
-    credits. ``track`` is raw; it is normalized here.
+    *with a non-empty position* wins (the playcut); a title-matched track whose
+    position is empty is skipped, so a later same-titled track that carries a
+    position is still found rather than forfeited (mirroring how
+    :func:`_scan_tracklist_for_credit` skips items lacking the wanted field).
+    Returns ``None`` when ``track`` normalizes empty (an empty needle would
+    substring-match every track), no title matches, or no matched track carries
+    a position — the caller then falls back to release-level credits. ``track``
+    is raw; it is normalized here.
     """
     track_lower = normalize_for_track_comparison(track)
+    if not track_lower:
+        return None
     for item in _iter_title_matched_items(release, track_lower):
-        return item.position or None
+        if item.position:
+            return item.position
     return None

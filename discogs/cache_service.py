@@ -707,12 +707,22 @@ class DiscogsCacheService:
             # Re-key the per-track writer credits by display position (the only
             # track identifier `TrackItem` carries downstream). A writer row
             # whose `track_sequence` has no tracklist row, or whose position is
-            # empty, is dropped — it can't be looked up by position anyway.
+            # empty, is dropped — it can't be looked up by position anyway. A
+            # position shared by more than one track is AMBIGUOUS (Discogs
+            # `position` is non-unique text; multi-disc / mispressed releases
+            # repeat the bare position) and is dropped rather than merged, so the
+            # track-level path falls back to the release-level credit instead of
+            # attributing one track's composers to a co-positioned sibling — a
+            # wrong-attribution we must never make on a BMI royalty field.
+            position_track_counts: dict[str, int] = {}
+            for position in seq_to_position.values():
+                if position:
+                    position_track_counts[position] = position_track_counts.get(position, 0) + 1
             track_writers: dict[str, list[ArtistCredit]] = {}
             for seq, credits in track_writers_by_seq.items():
                 position = seq_to_position.get(seq)
-                if position:
-                    track_writers.setdefault(position, []).extend(credits)
+                if position and position_track_counts.get(position) == 1:
+                    track_writers[position] = credits
 
             videos = [
                 ReleaseVideo(
