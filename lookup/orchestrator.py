@@ -3709,7 +3709,24 @@ async def enrich_artwork_results(
                 # release-level writer-role subset of the already-fetched
                 # ``extra_artists`` (no new Discogs call). ``None`` for comps or
                 # when no writer resolves. Per-track precision is Phase 2.
-                update["writer_credits"] = writer_credits_from_release(top1_release)
+                #
+                # Unlike the sibling album-derived fields above, writer credits
+                # are *person* attribution consumed for BMI royalty reporting,
+                # so they additionally require artist-identity verification
+                # (``is_artist_derived_eligible``) — the intersection of the
+                # album and artist gates. A fuzzy album-title collision with a
+                # *different* artist's release (``library_row_acceptable`` true
+                # but the artist gate false) must not leak that artist's
+                # composers as the played track's writers, the worst failure
+                # mode for a royalty-reporting field. Falls back to the album
+                # gate alone when the split gate is off (``is_artist_derived_
+                # eligible`` then equals ``library_row_acceptable``), so this is
+                # a no-op until the artist-identity split gate is enabled.
+                update["writer_credits"] = (
+                    writer_credits_from_release(top1_release)
+                    if is_artist_derived_eligible
+                    else None
+                )
             # ``artist_image_url`` stays gated on ``is_album_derived_eligible``
             # despite being artist-scoped: neither wxyc-ios-64 nor
             # wxyc-dj-tool-ios mounts a UI affordance for it

@@ -81,13 +81,21 @@ def extract_writer_names(credits: list[ArtistCredit]) -> list[str]:
 
 
 def _matched_roles(credits: list[ArtistCredit]) -> list[str]:
-    """Distinct verbatim role strings that classified as writer credits."""
+    """Distinct verbatim writer-role strings, from credits that carry a name.
+
+    Gated on ``credit.name`` (not just ``credit.role``) so the audit-trail
+    roles stay in sync with the names ``extract_writer_names`` keeps: a
+    writer-role credit with an empty name is dropped from both, never surfacing
+    a role with no corresponding writer. (``is_writer_role`` already guarantees
+    ``credit.role`` is non-empty, so the dedup key is safe.)
+    """
     roles: list[str] = []
     seen: set[str] = set()
     for credit in credits:
-        if is_writer_role(credit.role) and credit.role and credit.role not in seen:
-            seen.add(credit.role)
-            roles.append(credit.role)
+        role = credit.role
+        if role and credit.name and is_writer_role(role) and role not in seen:
+            seen.add(role)
+            roles.append(role)
     return roles
 
 
