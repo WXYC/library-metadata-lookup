@@ -1,47 +1,52 @@
-"""Unit tests for the polymorphic /lookup streaming-URL post-process (LML#573).
+"""Unit tests for the polymorphic /lookup streaming-URL post-process.
 
 ``apply_streaming_url_postprocess`` generalizes the Apple-only
 ``apply_apple_music_postprocess`` (LML#571) across every configured service.
 It runs inside the orchestrator's per-item enrichment: for each service in
-``STREAMING_URL_CACHE_CONFIG`` whose per-service flag is on, whose URL field
-in the ``update`` dict came out null, and whose client is present, it runs the
-cache-backed resolver with the REQUEST's ``(artist, album)``, mutates the
-``update`` dict in place, and mints the parsed external_id on
-``live_resolved`` outcomes only.
+``STREAMING_URL_CACHE_CONFIG`` whose per-service flag is on, whose URL field in
+the ``update`` dict came out null, and whose client is present.
 
-Concurrency model (preempts #594): each service's resolver is wrapped in its
-own ``asyncio.wait_for(_effective_probe_timeout_s(cfg))`` inside one
-``gather(return_exceptions=True)`` — one service timing out does NOT cancel
-the others, and a timeout surfaces as the ``live_error`` outcome with no URL
-and no cache write. The per-service ceiling is the static ``probe_timeout_s``,
-env-overridable via ``cfg.timeout_env_var`` (Apple only).
+**Hot path vs. background warm (LML#706).** The response path is now
+**cache-read-only**: it calls ``get_cached_streaming_url`` (a pure SELECT) per
+service. On a cache **hit** it fills ``update[cfg.url_field]`` synchronously and
+does not mint (cache hits already minted on their original resolution). On a
+cache **miss** it leaves the field null and enqueues **one** bounded,
+deduplicated background task that runs the live probe
+(``resolve_streaming_url_with_cache``) → cache UPSERT → mint-on-``live_resolved``.
+Streaming URLs are therefore *eventually consistent*: the first lookup of an
+uncached album returns without that service's URL; the background warm fills the
+cache within seconds so the next lookup is warm. The response path does **zero**
+synchronous external HTTP — that is the cure for the cold-tail latency in #706.
 
-Sentry: ``streaming_url.persistent_lookup.fired.<service>`` plus
-``streaming_url.persistent_lookup.<outcome>.<service>`` via
-``scope.transaction.set_data`` — no parallel emission of the old
-``apple_music.persistent_lookup.*`` shape.
+Dedup is process-global, keyed ``(service, to_match_form(artist),
+to_match_form(album))`` — two concurrent identical misses enqueue a single
+probe. Background concurrency is bounded by ``LML_STREAMING_WARM_CONCURRENCY``
+(separate from the bio warm's bound).
 
-PG, the streaming clients, the entity store, and the cache resolver are
-mocked. Integration coverage is in
-``tests/integration/test_streaming_url_persistent_lookup.py``.
+Sentry (hot-path only): ``streaming_url.persistent_lookup.fired.<service>`` plus
+``streaming_url.persistent_lookup.<cache_hit|cache_miss_enqueued>.<service>`` via
+``scope.transaction.set_data``. The background task never writes to the active
+scope (the request scope has closed by then) — it logs its ``live_*`` outcome.
+
+PG, the streaming clients, the entity store, and the cache layer are mocked. The
+cache-layer behavior itself is covered in
+``tests/unit/test_streaming_resolve_with_cache.py`` and
+``tests/unit/test_streaming_url_cache.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 from types import SimpleNamespace
-from typing import get_args
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
 from entity.sources import PgSource
 from entity.store import EntityStore
-from entity.streaming_url_cache import ResolveOutcome, ResolveSource
+from entity.streaming_url_cache import ResolveOutcome
 from identity.release_validation import (
     RELEASE_SOURCE_CONFIG,
-    InvalidReleaseExternalIdError,
 )
 from lookup import streaming_url_postprocess as mod
 from lookup.streaming_url_postprocess import (
@@ -49,12 +54,10 @@ from lookup.streaming_url_postprocess import (
     apply_streaming_url_postprocess,
 )
 
-_RESOLVE_SOURCE_VALUES: set[str] = set(get_args(ResolveSource))
-
-# Per-service test data. The cache module is service-agnostic; what differs
-# per service is the URL field, client attr, per-service flag, and a
-# resolved-URL/external-id pair that the registry's url_to_external_id
-# extractor + validator round-trip cleanly.
+# Per-service test data. The cache module is service-agnostic; what differs per
+# service is the URL field, client attr, per-service flag, and a
+# resolved-URL/external-id pair that the registry's url_to_external_id extractor
+# + validator round-trip cleanly.
 _CASES: dict[str, dict] = {
     "apple_music_album": {
         "url_field": "apple_music_url",
@@ -98,6 +101,26 @@ _CASES: dict[str, dict] = {
 _FLAG_BY_SERVICE = {service: case["flag_setting"] for service, case in _CASES.items()}
 _URL_FIELDS = [case["url_field"] for case in _CASES.values()]
 
+_ARTIST = "Hyd"
+_ALBUM = "Hold Onto Me Infinity"
+
+
+@pytest.fixture(autouse=True)
+def _reset_warm_state():
+    """Isolate the module-global warm state (semaphore, dedup set, task set).
+
+    These are process-global by design (one warm per worker, not per request).
+    Reset around every test so a leaked dedup key or a semaphore bound to a
+    prior event loop can't leak across tests.
+    """
+    mod._streaming_warm_semaphore = None
+    mod._streaming_warm_in_flight.clear()
+    mod._background_tasks.clear()
+    yield
+    mod._streaming_warm_in_flight.clear()
+    mod._background_tasks.clear()
+    mod._streaming_warm_semaphore = None
+
 
 def _settings(*enabled_services: str, master: bool = True) -> SimpleNamespace:
     """A Settings-like stub with the AND-gate flags the post-process reads."""
@@ -129,7 +152,9 @@ def _clients(**overrides) -> dict:
 
 
 def _entity_store() -> MagicMock:
-    return MagicMock(spec=EntityStore)
+    store = MagicMock(spec=EntityStore)
+    store.mint_or_get_release_identity = AsyncMock(return_value=(7, True))
+    return store
 
 
 def _sentry_scope():
@@ -140,38 +165,62 @@ def _sentry_scope():
     return scope, transaction
 
 
+def _patch_cache_get(return_value):
+    """Patch the hot-path cache read. ``return_value`` is a URL (hit) or None."""
+    return patch.object(mod, "get_cached_streaming_url", new=AsyncMock(return_value=return_value))
+
+
+def _patch_resolver(**kwargs):
+    """Patch the background-warm probe (``resolve_streaming_url_with_cache``)."""
+    return patch.object(mod, "resolve_streaming_url_with_cache", new=AsyncMock(**kwargs))
+
+
+async def _drain_background_tasks() -> None:
+    """Await every scheduled warm so its done-callbacks (and asserts) can run."""
+    while mod._background_tasks:
+        await asyncio.gather(*list(mod._background_tasks), return_exceptions=True)
+
+
+async def _run(update, *, settings, clients=None, entity_store=None, pg=None):
+    """Invoke the post-process with this module's standard request shape."""
+    await apply_streaming_url_postprocess(
+        update,
+        clients=clients if clients is not None else _clients(),
+        pg=pg if pg is not None else AsyncMock(spec=PgSource),
+        entity_store=entity_store if entity_store is not None else _entity_store(),
+        request_artist=_ARTIST,
+        request_album=_ALBUM,
+        settings=settings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Skip conditions: nothing reads the cache, nothing is enqueued.
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
 class TestSkipConditions:
     async def test_master_flag_off_short_circuits_all_services(self):
         update = _blank_update()
-        with patch.object(mod, "resolve_streaming_url_with_cache") as resolve:
-            await apply_streaming_url_postprocess(
+        with _patch_cache_get(None) as cache_get, _patch_resolver() as resolve:
+            await _run(
                 update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=_entity_store(),
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                # master off, both per-service ON — master must still win.
+                # master off, per-service ON — master must still win.
                 settings=_settings("apple_music_album", "spotify_album", master=False),
             )
+        cache_get.assert_not_called()
         resolve.assert_not_called()
         assert update == _blank_update()
+        assert not mod._background_tasks
 
     async def test_master_on_but_all_per_service_off_does_nothing(self):
-        # The subtle AND-gate: master defaulting True alone enables nothing.
         update = _blank_update()
-        with patch.object(mod, "resolve_streaming_url_with_cache") as resolve:
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=_entity_store(),
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(master=True),  # no per-service enabled
-            )
+        with _patch_cache_get(None) as cache_get, _patch_resolver() as resolve:
+            await _run(update, settings=_settings(master=True))
+        cache_get.assert_not_called()
         resolve.assert_not_called()
+        assert not mod._background_tasks
 
     @pytest.mark.parametrize("missing", ["pg", "entity_store", "artist", "album"])
     async def test_skips_when_precondition_missing(self, missing):
@@ -180,8 +229,8 @@ class TestSkipConditions:
             "clients": _clients(),
             "pg": AsyncMock(spec=PgSource),
             "entity_store": _entity_store(),
-            "request_artist": "Hyd",
-            "request_album": "Hold Onto Me Infinity",
+            "request_artist": _ARTIST,
+            "request_album": _ALBUM,
             "settings": _settings("apple_music_album", "spotify_album"),
         }
         if missing == "pg":
@@ -192,9 +241,16 @@ class TestSkipConditions:
             kwargs["request_artist"] = ""
         elif missing == "album":
             kwargs["request_album"] = None
-        with patch.object(mod, "resolve_streaming_url_with_cache") as resolve:
+        with _patch_cache_get(None) as cache_get, _patch_resolver() as resolve:
             await apply_streaming_url_postprocess(update, **kwargs)
+        cache_get.assert_not_called()
         resolve.assert_not_called()
+        assert not mod._background_tasks
+
+
+# ---------------------------------------------------------------------------
+# Per-service gating: a skipped service neither reads the cache nor enqueues.
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -204,379 +260,343 @@ class TestPerServiceGating:
         case = _CASES[service]
         update = _blank_update()
         update[case["url_field"]] = "https://existing.test/x"
-        with patch.object(mod, "resolve_streaming_url_with_cache") as resolve:
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=_entity_store(),
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(service),
-            )
-        resolve.assert_not_called()
+        with _patch_cache_get(None) as cache_get, _patch_resolver():
+            await _run(update, settings=_settings(service))
+        cache_get.assert_not_called()
         assert update[case["url_field"]] == "https://existing.test/x"
+        assert not mod._background_tasks
 
     async def test_empty_string_sentinel_is_respected(self, service):
-        # "" means "explicitly checked, nothing to surface" — must NOT trigger
-        # a fresh probe (``is not None``, not truthiness).
+        # "" means "explicitly checked, nothing to surface" — must NOT trigger a
+        # fresh cache read/probe (``is not None``, not truthiness).
         case = _CASES[service]
         update = _blank_update()
         update[case["url_field"]] = ""
-        with patch.object(mod, "resolve_streaming_url_with_cache") as resolve:
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=_entity_store(),
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(service),
-            )
-        resolve.assert_not_called()
+        with _patch_cache_get(None) as cache_get, _patch_resolver():
+            await _run(update, settings=_settings(service))
+        cache_get.assert_not_called()
         assert update[case["url_field"]] == ""
+        assert not mod._background_tasks
 
     async def test_skips_service_when_client_is_none(self, service):
-        # clients dict carries None for the unconfigured service — skip it,
-        # don't error.
         case = _CASES[service]
         update = _blank_update()
-        with patch.object(mod, "resolve_streaming_url_with_cache") as resolve:
-            await apply_streaming_url_postprocess(
+        with _patch_cache_get(None) as cache_get, _patch_resolver():
+            await _run(
                 update,
                 clients=_clients(**{case["client_attr"]: None}),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=_entity_store(),
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
                 settings=_settings(service),
             )
-        resolve.assert_not_called()
+        cache_get.assert_not_called()
         assert update[case["url_field"]] is None
+        assert not mod._background_tasks
 
-    async def test_per_service_flag_off_skips_only_that_service(self, service):
-        # Enable the OTHER service only; the parametrized service stays off.
+    async def test_per_service_flag_off_reads_only_the_enabled_service(self, service):
+        # Enable the OTHER service only; the parametrized service stays off. The
+        # enabled service hits the cache (sync fill); the disabled one is never
+        # read.
         case = _CASES[service]
         other = next(s for s in _CASES if s != service)
+        other_url = _CASES[other]["resolved_url"]
         update = _blank_update()
-        calls: list[str] = []
+        read_services: list[str] = []
 
-        async def fake_resolve(pg, client, *, service, artist, album, **kwargs):
-            calls.append(service)
-            return ResolveOutcome(url=_CASES[service]["resolved_url"], source="live_resolved")
+        async def fake_get(pg, *, service, artist, album, **kwargs):
+            read_services.append(service)
+            return other_url
 
-        with patch.object(
-            mod, "resolve_streaming_url_with_cache", new=AsyncMock(side_effect=fake_resolve)
+        with (
+            patch.object(mod, "get_cached_streaming_url", new=AsyncMock(side_effect=fake_get)),
+            _patch_resolver(),
         ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=_entity_store(),
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(other),
-            )
-        assert calls == [other]
+            await _run(update, settings=_settings(other))
+        assert read_services == [other]
         assert update[case["url_field"]] is None
-        assert update[_CASES[other]["url_field"]] == _CASES[other]["resolved_url"]
+        assert update[_CASES[other]["url_field"]] == other_url
+        assert not mod._background_tasks
+
+
+# ---------------------------------------------------------------------------
+# Cache hit: synchronous fill, no probe, no task, no mint.
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("service", list(_CASES))
-class TestUrlUpdateAndMint:
-    async def test_live_resolved_writes_url_and_mints(self, service):
+class TestCacheHit:
+    async def test_hit_fills_url_synchronously_without_probe_task_or_mint(self, service):
         case = _CASES[service]
         update = _blank_update()
         entity_store = _entity_store()
-        entity_store.mint_or_get_release_identity = AsyncMock(return_value=(7, True))
+        scope, transaction = _sentry_scope()
 
-        with patch.object(
-            mod,
-            "resolve_streaming_url_with_cache",
-            new=AsyncMock(
-                return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
-            ),
+        with (
+            _patch_cache_get(case["resolved_url"]),
+            _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=entity_store,
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(service),
-            )
+            await _run(update, settings=_settings(service), entity_store=entity_store)
 
         assert update[case["url_field"]] == case["resolved_url"]
+        resolve.assert_not_called()
+        entity_store.mint_or_get_release_identity.assert_not_called()
+        assert not mod._background_tasks
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get(f"streaming_url.persistent_lookup.fired.{service}") is True
+        assert calls.get(f"streaming_url.persistent_lookup.cache_hit.{service}") is True
+
+
+# ---------------------------------------------------------------------------
+# Cache miss: the response returns without the URL; one bounded background warm
+# is enqueued; the probe runs (and mints) only in that background task.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCacheMissEnqueuesBackgroundWarm:
+    async def test_miss_does_not_probe_on_the_response_path(self):
+        # The architectural invariant for #706: a miss must NOT await the live
+        # probe synchronously. Gate the probe on an Event so even if the task
+        # starts it cannot complete; assert the response returns with the field
+        # still null and the probe not yet awaited-to-completion.
+        service = "apple_music_album"
+        case = _CASES[service]
+        update = _blank_update()
+        release = asyncio.Event()
+        probed: list[str] = []
+
+        async def gated_resolve(pg, client, *, service, artist, album, **kwargs):
+            probed.append(service)
+            await release.wait()
+            return ResolveOutcome(url=case["resolved_url"], source="live_resolved")
+
+        with (
+            _patch_cache_get(None),
+            patch.object(
+                mod, "resolve_streaming_url_with_cache", new=AsyncMock(side_effect=gated_resolve)
+            ),
+        ):
+            await _run(update, settings=_settings(service))
+            # Response path completed: field still null, exactly one warm queued,
+            # and the probe has NOT returned a URL onto the response.
+            assert update[case["url_field"]] is None
+            assert len(mod._background_tasks) == 1
+
+            # Let the gated warm finish; it writes the cache (mocked) but must
+            # NOT backfill the already-returned response dict.
+            release.set()
+            await _drain_background_tasks()
+
+        assert probed == [service]
+        assert update[case["url_field"]] is None
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+
+    @pytest.mark.parametrize("service", list(_CASES))
+    async def test_background_warm_runs_probe_and_mints_on_live_resolved(self, service):
+        case = _CASES[service]
+        update = _blank_update()
+        entity_store = _entity_store()
+        pg = AsyncMock(spec=PgSource)
+
+        with (
+            _patch_cache_get(None),
+            _patch_resolver(
+                return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
+            ) as resolve,
+        ):
+            await _run(update, settings=_settings(service), entity_store=entity_store, pg=pg)
+            # Nothing minted or probed synchronously.
+            resolve.assert_not_awaited()
+            entity_store.mint_or_get_release_identity.assert_not_called()
+
+            await _drain_background_tasks()
+
+        # The background task ran the live probe with the shared pool + request
+        # values, then minted the parsed external_id.
+        resolve.assert_awaited_once()
+        _, kwargs = resolve.await_args
+        assert kwargs["service"] == service
+        assert kwargs["artist"] == _ARTIST
+        assert kwargs["album"] == _ALBUM
         entity_store.mint_or_get_release_identity.assert_awaited_once_with(
             source=service, external_id=case["external_id"]
         )
 
-    async def test_cache_hit_writes_url_without_minting(self, service):
-        case = _CASES[service]
-        update = _blank_update()
-        entity_store = _entity_store()
-        entity_store.mint_or_get_release_identity = AsyncMock(return_value=(7, False))
-
-        with patch.object(
-            mod,
-            "resolve_streaming_url_with_cache",
-            new=AsyncMock(
-                return_value=ResolveOutcome(url=case["resolved_url"], source="cache_hit")
-            ),
-        ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=entity_store,
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(service),
-            )
-
-        assert update[case["url_field"]] == case["resolved_url"]
-        entity_store.mint_or_get_release_identity.assert_not_called()
-
     @pytest.mark.parametrize("source", ["cache_miss_recent", "live_miss", "live_error"])
-    async def test_no_url_outcomes_leave_field_null_and_do_not_mint(self, service, source):
-        case = _CASES[service]
+    async def test_background_warm_no_url_outcomes_do_not_mint(self, source):
+        service = "apple_music_album"
         update = _blank_update()
         entity_store = _entity_store()
-        entity_store.mint_or_get_release_identity = AsyncMock(return_value=(7, True))
-
-        with patch.object(
-            mod,
-            "resolve_streaming_url_with_cache",
-            new=AsyncMock(return_value=ResolveOutcome(url=None, source=source)),
-        ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=entity_store,
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(service),
-            )
-
-        assert update[case["url_field"]] is None
-        entity_store.mint_or_get_release_identity.assert_not_called()
-
-    async def test_unparseable_url_surfaces_but_skips_mint(self, service):
-        case = _CASES[service]
-        update = _blank_update()
-        entity_store = _entity_store()
-        entity_store.mint_or_get_release_identity = AsyncMock(return_value=(7, True))
-        url = case["unmintable_but_parseable_url"]
-
-        with patch.object(
-            mod,
-            "resolve_streaming_url_with_cache",
-            new=AsyncMock(return_value=ResolveOutcome(url=url, source="live_resolved")),
-        ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=entity_store,
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(service),
-            )
-
-        assert update[case["url_field"]] == url
-        entity_store.mint_or_get_release_identity.assert_not_called()
-
-    async def test_mint_validation_rejection_swallowed_url_surfaces(self, service):
-        # Best-effort mint: a validation rejection must not roll back the URL.
-        case = _CASES[service]
-        update = _blank_update()
-        entity_store = _entity_store()
-        entity_store.mint_or_get_release_identity = AsyncMock(return_value=(7, True))
 
         with (
-            patch.object(
-                mod,
-                "resolve_streaming_url_with_cache",
-                new=AsyncMock(
-                    return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
-                ),
-            ),
-            patch.object(
-                mod,
-                "validate_and_canonicalize_external_id",
-                side_effect=InvalidReleaseExternalIdError("nope"),
-            ),
+            _patch_cache_get(None),
+            _patch_resolver(return_value=ResolveOutcome(url=None, source=source)),
         ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=entity_store,
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(service),
-            )
+            await _run(update, settings=_settings(service), entity_store=entity_store)
+            await _drain_background_tasks()
 
-        assert update[case["url_field"]] == case["resolved_url"]
+        assert update["apple_music_url"] is None
         entity_store.mint_or_get_release_identity.assert_not_called()
 
-    async def test_mint_pg_error_swallowed_url_surfaces(self, service):
+    async def test_background_warm_unparseable_url_surfaces_but_skips_mint(self):
+        service = "apple_music_album"
+        case = _CASES[service]
+        update = _blank_update()
+        entity_store = _entity_store()
+        url = case["unmintable_but_parseable_url"]
+
+        with (
+            _patch_cache_get(None),
+            _patch_resolver(return_value=ResolveOutcome(url=url, source="live_resolved")),
+        ):
+            await _run(update, settings=_settings(service), entity_store=entity_store)
+            await _drain_background_tasks()
+
+        entity_store.mint_or_get_release_identity.assert_not_called()
+
+    async def test_background_warm_mint_failure_is_swallowed(self):
+        # The mint is best-effort: a PG failure inside the background task must
+        # not escape (it is a fire-and-forget task that must never crash the loop).
+        service = "apple_music_album"
         case = _CASES[service]
         update = _blank_update()
         entity_store = _entity_store()
         entity_store.mint_or_get_release_identity = AsyncMock(side_effect=RuntimeError("PG down"))
 
-        with patch.object(
-            mod,
-            "resolve_streaming_url_with_cache",
-            new=AsyncMock(
+        with (
+            _patch_cache_get(None),
+            _patch_resolver(
                 return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
             ),
         ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=entity_store,
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(service),
-            )
+            await _run(update, settings=_settings(service), entity_store=entity_store)
+            await _drain_background_tasks()
 
+        # Reached the mint, swallowed the error, left the task set clean.
         entity_store.mint_or_get_release_identity.assert_awaited_once()
-        assert update[case["url_field"]] == case["resolved_url"]
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+
+    async def test_background_warm_probe_exception_is_swallowed(self):
+        # resolve_streaming_url_with_cache swallows its own client errors, but a
+        # wait_for timeout (or any surprise) must not escape the task either.
+        service = "apple_music_album"
+        update = _blank_update()
+
+        with (
+            _patch_cache_get(None),
+            _patch_resolver(side_effect=TimeoutError("probe timed out")),
+        ):
+            await _run(update, settings=_settings(service))
+            await _drain_background_tasks()
+
+        assert update["apple_music_url"] is None
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+
+
+# ---------------------------------------------------------------------------
+# Dedup: identical concurrent misses enqueue a single probe.
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestConcurrencyAndTimeout:
-    async def test_one_service_timeout_does_not_cancel_the_other(self):
-        # Both services active. The slow one exceeds its per-service
-        # probe_timeout_s and surfaces as live_error (no URL); the healthy one
-        # still resolves and updates its URL field.
-        slow = "apple_music_album"
-        fast = "spotify_album"
-        update = _blank_update()
-        entity_store = _entity_store()
-        entity_store.mint_or_get_release_identity = AsyncMock(return_value=(7, True))
-        scope, transaction = _sentry_scope()
+class TestDedup:
+    async def test_two_identical_concurrent_misses_enqueue_one_probe(self):
+        service = "apple_music_album"
+        case = _CASES[service]
+        release = asyncio.Event()
+        probed: list[str] = []
 
-        async def fake_resolve(pg, client, *, service, artist, album, **kwargs):
-            if service == slow:
-                await asyncio.sleep(1.0)  # cancelled by wait_for before this returns
-                return ResolveOutcome(url="unreachable", source="live_resolved")
-            return ResolveOutcome(url=_CASES[fast]["resolved_url"], source="live_resolved")
+        async def gated_resolve(pg, client, *, service, artist, album, **kwargs):
+            probed.append(service)
+            await release.wait()
+            return ResolveOutcome(url=case["resolved_url"], source="live_resolved")
 
-        # Shrink the per-service timeouts so the slow leg trips fast. Also
-        # strip timeout_env_var: Apple's entry honors LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS
-        # via _effective_probe_timeout_s, so an ambient env var would otherwise
-        # override the 0.05 ceiling and make this test environment-coupled.
-        fast_config = {
-            k: dataclasses.replace(v, probe_timeout_s=0.05, timeout_env_var=None)
-            for k, v in STREAMING_URL_CACHE_CONFIG.items()
-        }
         with (
-            patch.object(mod, "STREAMING_URL_CACHE_CONFIG", fast_config),
+            _patch_cache_get(None),
             patch.object(
-                mod, "resolve_streaming_url_with_cache", new=AsyncMock(side_effect=fake_resolve)
+                mod, "resolve_streaming_url_with_cache", new=AsyncMock(side_effect=gated_resolve)
             ),
-            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=entity_store,
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings(slow, fast),
+            # Fire two concurrent lookups for the SAME (artist, album); the
+            # enqueue is synchronous so only the first wins the dedup set.
+            await asyncio.gather(
+                _run(_blank_update(), settings=_settings(service)),
+                _run(_blank_update(), settings=_settings(service)),
             )
+            assert len(mod._background_tasks) == 1
 
-        # Fast service surfaced; slow service timed out → no URL.
-        assert update[_CASES[fast]["url_field"]] == _CASES[fast]["resolved_url"]
-        assert update[_CASES[slow]["url_field"]] is None
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        # The timed-out service projects live_error; the healthy one live_resolved.
-        assert calls.get(f"streaming_url.persistent_lookup.live_error.{slow}") is True
-        assert calls.get(f"streaming_url.persistent_lookup.live_resolved.{fast}") is True
+            release.set()
+            await _drain_background_tasks()
+
+        assert probed == [service]
+        assert not mod._streaming_warm_in_flight
+
+    async def test_dedup_key_clears_after_warm_completes(self):
+        # A second lookup AFTER the first warm drained must enqueue afresh
+        # (the dedup set is cleaned in the done-callback, not leaked).
+        service = "apple_music_album"
+        case = _CASES[service]
+        with (
+            _patch_cache_get(None),
+            _patch_resolver(
+                return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
+            ) as resolve,
+        ):
+            await _run(_blank_update(), settings=_settings(service))
+            await _drain_background_tasks()
+            assert not mod._streaming_warm_in_flight
+
+            await _run(_blank_update(), settings=_settings(service))
+            await _drain_background_tasks()
+
+        assert resolve.await_count == 2
 
 
-def _patch_resolver_returning(source: ResolveSource, url: str | None):
-    return patch.object(
-        mod,
-        "resolve_streaming_url_with_cache",
-        new=AsyncMock(return_value=ResolveOutcome(url=url, source=source)),
-    )
-
-
-_SENTRY_CASES = [
-    ("cache_hit", _CASES["apple_music_album"]["resolved_url"]),
-    ("cache_miss_recent", None),
-    ("live_resolved", _CASES["apple_music_album"]["resolved_url"]),
-    ("live_miss", None),
-    ("live_error", None),
-]
-
-
-def test_sentry_cases_cover_every_resolve_source():
-    parametrized = {source for source, _ in _SENTRY_CASES}
-    assert parametrized == _RESOLVE_SOURCE_VALUES, (
-        f"Sentry parametrize list drifted from ResolveSource: "
-        f"missing {_RESOLVE_SOURCE_VALUES - parametrized}; extra {parametrized - _RESOLVE_SOURCE_VALUES}"
-    )
+# ---------------------------------------------------------------------------
+# Sentry: the hot path tags the active transaction; the background task does not.
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestSentryProjection:
-    @pytest.mark.parametrize(("source", "resolved_url"), _SENTRY_CASES)
-    async def test_fired_and_outcome_keys_set_for_apple(self, source, resolved_url):
+    async def test_miss_projects_enqueued_and_background_never_touches_active_scope(self):
+        service = "apple_music_album"
+        case = _CASES[service]
         update = _blank_update()
         scope, transaction = _sentry_scope()
-        entity_store = _entity_store()
-        entity_store.mint_or_get_release_identity = AsyncMock(return_value=(7, True))
 
         with (
-            _patch_resolver_returning(source, resolved_url),
+            _patch_cache_get(None),
+            _patch_resolver(
+                return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
+            ),
             patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=entity_store,
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings("apple_music_album"),
-            )
+            await _run(update, settings=_settings(service))
+            await _drain_background_tasks()
 
-        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
-        assert calls.get("streaming_url.persistent_lookup.fired.apple_music_album") is True
-        assert calls.get(f"streaming_url.persistent_lookup.{source}.apple_music_album") is True
-        # No old-namespace emission.
-        assert not any(k.startswith("apple_music.persistent_lookup") for k in calls)
-        # Only the observed outcome key for this service is set.
-        for other in _RESOLVE_SOURCE_VALUES - {source}:
-            assert f"streaming_url.persistent_lookup.{other}.apple_music_album" not in calls
+        keys = {c.args[0] for c in transaction.set_data.call_args_list}
+        assert f"streaming_url.persistent_lookup.fired.{service}" in keys
+        assert f"streaming_url.persistent_lookup.cache_miss_enqueued.{service}" in keys
+        # The background ``live_resolved`` outcome must NOT land on the active
+        # transaction — the request scope has closed; a tag here would
+        # mis-attribute to the next request (mirrors _warm_bio_cache).
+        assert not any(".live_resolved." in k for k in keys)
+        assert not any(".cache_hit." in k for k in keys)
 
     async def test_no_active_transaction_does_not_crash(self):
         update = _blank_update()
         scope = Mock()
         scope.transaction = None
         with (
-            _patch_resolver_returning("live_resolved", _CASES["apple_music_album"]["resolved_url"]),
+            _patch_cache_get(_CASES["apple_music_album"]["resolved_url"]),
+            _patch_resolver(),
             patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=_entity_store(),
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings("apple_music_album"),
-            )
+            await _run(update, settings=_settings("apple_music_album"))
         assert update["apple_music_url"] == _CASES["apple_music_album"]["resolved_url"]
 
     async def test_set_data_failure_does_not_break_request(self):
@@ -586,19 +606,42 @@ class TestSentryProjection:
         scope = Mock()
         scope.transaction = transaction
         with (
-            _patch_resolver_returning("live_resolved", _CASES["apple_music_album"]["resolved_url"]),
+            _patch_cache_get(_CASES["apple_music_album"]["resolved_url"]),
+            _patch_resolver(),
             patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
-            await apply_streaming_url_postprocess(
-                update,
-                clients=_clients(),
-                pg=AsyncMock(spec=PgSource),
-                entity_store=_entity_store(),
-                request_artist="Hyd",
-                request_album="Hold Onto Me Infinity",
-                settings=_settings("apple_music_album"),
-            )
+            await _run(update, settings=_settings("apple_music_album"))
         assert update["apple_music_url"] == _CASES["apple_music_album"]["resolved_url"]
+
+
+# ---------------------------------------------------------------------------
+# Background-warm concurrency bound (LML_STREAMING_WARM_CONCURRENCY).
+# ---------------------------------------------------------------------------
+
+
+class TestWarmConcurrencyBound:
+    def test_env_var_name_and_default(self):
+        assert mod._STREAMING_WARM_CONCURRENCY_ENV_VAR == "LML_STREAMING_WARM_CONCURRENCY"
+        assert mod._STREAMING_WARM_CONCURRENCY_DEFAULT == 4
+
+    def test_semaphore_uses_env_override(self, monkeypatch):
+        monkeypatch.setenv(mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, "2")
+        mod._streaming_warm_semaphore = None
+        sem = mod._get_streaming_warm_semaphore()
+        assert sem._value == 2
+        mod._streaming_warm_semaphore = None
+
+    def test_semaphore_falls_back_to_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv(mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, raising=False)
+        mod._streaming_warm_semaphore = None
+        sem = mod._get_streaming_warm_semaphore()
+        assert sem._value == mod._STREAMING_WARM_CONCURRENCY_DEFAULT
+        mod._streaming_warm_semaphore = None
+
+
+# ---------------------------------------------------------------------------
+# Registry invariants (unchanged by #706) + per-service timeout resolution.
+# ---------------------------------------------------------------------------
 
 
 class TestRegistryInvariants:
@@ -609,14 +652,9 @@ class TestRegistryInvariants:
         assert set(_CASES) == set(STREAMING_URL_CACHE_CONFIG.keys())
 
     def test_cache_config_is_subset_of_release_source_config(self):
-        # Parity invariant: every cached service must be identity-mintable.
         assert set(STREAMING_URL_CACHE_CONFIG.keys()) <= set(RELEASE_SOURCE_CONFIG.keys())
 
     def test_cache_config_matches_table_check_constraint_allowlist(self):
-        # The cache table's named CHECK constraint pins the allowed ``service``
-        # values from ``_SERVICES``. A registry service NOT in that allowlist
-        # would fail every UPSERT at runtime; an allowlist value with no
-        # registry entry would be dead. Lock them together.
         from entity.streaming_url_cache import _SERVICES
 
         assert set(STREAMING_URL_CACHE_CONFIG.keys()) == set(_SERVICES)
@@ -636,16 +674,9 @@ class TestRegistryInvariants:
         assert cfg.client_attr == case["client_attr"]
         assert cfg.flag_setting == case["flag_setting"]
         assert cfg.probe_timeout_s == case["probe_timeout_s"]
-        # The service key doubles as the mint source; the subset invariant
-        # (test_cache_config_is_subset_of_release_source_config) guarantees it
-        # keys into RELEASE_SOURCE_CONFIG, so there's no mint_source field.
         assert service in RELEASE_SOURCE_CONFIG
 
     def test_every_flag_setting_is_a_real_settings_attribute(self):
-        # `apply_streaming_url_postprocess` reads `getattr(settings,
-        # cfg.flag_setting, False)` — a typo'd flag_setting would silently
-        # default to False and disable the service with no error. Assert each
-        # names a real Settings field so a typo fails CI, not prod.
         from config.settings import Settings
 
         settings = Settings()
@@ -656,10 +687,9 @@ class TestRegistryInvariants:
 
 
 class TestPerServiceTimeoutResolution:
-    """LML#573 preserves the `LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS` back-compat
-    knob for the Apple post-process leg (the old apply_apple_music_postprocess
-    honored it). The effective per-service ceiling is env-overridable only for
-    services whose registry entry carries a `timeout_env_var`."""
+    """The per-service wall-clock ceiling (now applied to the background probe)
+    is env-overridable only for services whose registry entry carries a
+    ``timeout_env_var`` (Apple, for LML#449/#450 back-compat)."""
 
     def test_apple_entry_carries_back_compat_env_var(self):
         from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
@@ -670,18 +700,14 @@ class TestPerServiceTimeoutResolution:
         )
 
     def test_spotify_entry_has_no_env_var(self):
-        # New service — no back-compat env knob; static per-service default.
         assert STREAMING_URL_CACHE_CONFIG["spotify_album"].timeout_env_var is None
 
     def test_bandcamp_entry_has_no_env_var(self):
-        # New service — no back-compat env knob; static per-service default.
         assert STREAMING_URL_CACHE_CONFIG["bandcamp"].timeout_env_var is None
 
     def test_bandcamp_effective_timeout_is_static_nine_seconds(self, monkeypatch):
         from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
 
-        # Apple's env must not bleed into Bandcamp; its ceiling stays the loose
-        # 9.0s static default (tightened once the offline warmer lands).
         monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
         assert mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG["bandcamp"]) == 9.0
 
@@ -704,6 +730,5 @@ class TestPerServiceTimeoutResolution:
     def test_spotify_effective_timeout_ignores_apple_env(self, monkeypatch):
         from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
 
-        # Apple's env must not bleed into a service without a timeout_env_var.
         monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
         assert mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG["spotify_album"]) == 4.0
