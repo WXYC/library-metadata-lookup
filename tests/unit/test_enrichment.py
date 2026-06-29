@@ -2390,6 +2390,61 @@ class TestArtistIdentitySplitGate:
         assert enriched.profile_tokens is None
 
     @pytest.mark.asyncio
+    async def test_release_side_drift_suppresses_writer_credits(self):
+        """BMI writer credits are *person* attribution for royalty reporting,
+        so they ride the artist-identity gate, not just the album-title gate.
+        When the library row's title matches the request
+        (``library_row_acceptable=True``) but the top-1 release's artist drifts
+        (``release_side_artist_verified=False``), the wrong artist's composers
+        must NOT leak — even though album-derived fields like ``tracklist``
+        still surface from the title-matched release. Regression guard for the
+        worst case of a royalty-reporting feature (LML#699)."""
+        item = make_library_item(id=42, artist="Noura Mint Seymali", title="Tzenni")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Noura Mint Seymali",
+            album="Tzenni",
+            artwork_url="https://example.com/tzenni.jpg",
+        )
+
+        discogs_service = AsyncMock()
+        # Release-side artist drift — release.artist is NOT Noura — but the
+        # release still carries a writer-role credit that WOULD surface under
+        # the album-only gate.
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Tzenni",
+            artist="Completely Different Artist",
+            artist_id=99,
+            release_url="https://discogs.com/release/1",
+            tracklist=[TrackItem(position="1", title="Tzenni", artists=[])],
+            extra_artists=[ArtistCredit(name="Some Other Writer", role="Written-By")],
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Completely Different Artist",
+            profile="A bio that does NOT belong to Noura.",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Tzenni",
+            album="Tzenni",
+            artist="Noura Mint Seymali",
+            extended=True,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # Artist identity failed → bio AND writer_credits suppressed...
+        assert enriched.artist_bio is None
+        assert enriched.writer_credits is None
+        # ...while the album-title match still surfaces album-derived fields,
+        # proving writer_credits follows the artist gate, not the album gate.
+        assert enriched.tracklist is not None
+
+    @pytest.mark.asyncio
     async def test_empty_request_artist_falls_back_to_legacy_gate(self):
         """Album-only lookups (``parsed.artist=None``) — a supported path
         per ``lookup/orchestrator.py:888`` — would silently lose bio under

@@ -32,6 +32,10 @@ WRITER_ROLES = [
     "Written-By [Sample]",
     "Composed By [Composition By]",
     "Songwriter [All Songs By]",
+    # Bracket-internal comma: the qualifier is stripped BEFORE the comma split,
+    # so the role is not fragmented into "Written-By [Words" + " Music]". Locks
+    # the strip-then-split ordering the module docstring declares load-bearing.
+    "Written-By [Words, Music]",
 ]
 
 NON_WRITER_ROLES = [
@@ -120,3 +124,40 @@ def test_writer_credits_from_release_no_writer_returns_none() -> None:
         [ArtistCredit(name="An Engineer", role="Mixed By")],
     )
     assert writer_credits_from_release(release) is None
+
+
+def test_writer_credits_roles_exclude_empty_name_credit() -> None:
+    # A writer-role credit with an empty name is dropped from BOTH names and
+    # roles, so the audit-trail ``roles`` never references a writer with no
+    # name (no phantom unattributed role in the BMI payload). ``roles`` must
+    # stay in sync with the ``names`` they were drawn from.
+    release = _release(
+        "Sessa",
+        [
+            ArtistCredit(name="Sessa", role="Music By"),
+            ArtistCredit(name="", role="Lyrics By"),  # empty name → dropped from both
+        ],
+    )
+    wc = writer_credits_from_release(release)
+    assert wc is not None
+    assert wc.names == ["Sessa"]
+    assert wc.roles == ["Music By"]
+
+
+def test_writer_credits_names_dedup_by_name_roles_dedup_by_role() -> None:
+    # The two lists use different dedup keys by design: ``names`` dedups by
+    # name (one artist under multiple writer roles collapses to one name),
+    # ``roles`` dedups by verbatim role (one role shared by multiple writers
+    # collapses to one role).
+    release = _release(
+        "Stereolab",
+        [
+            ArtistCredit(name="Tim Gane", role="Composed By"),
+            ArtistCredit(name="Tim Gane", role="Written-By"),  # dup name, new role
+            ArtistCredit(name="Laetitia Sadier", role="Written-By"),  # new name, dup role
+        ],
+    )
+    wc = writer_credits_from_release(release)
+    assert wc is not None
+    assert wc.names == ["Tim Gane", "Laetitia Sadier"]
+    assert wc.roles == ["Composed By", "Written-By"]
