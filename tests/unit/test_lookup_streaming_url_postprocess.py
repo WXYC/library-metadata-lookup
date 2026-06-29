@@ -6,27 +6,34 @@ It runs inside the orchestrator's per-item enrichment: for each service in
 ``STREAMING_URL_CACHE_CONFIG`` whose per-service flag is on, whose URL field in
 the ``update`` dict came out null, and whose client is present.
 
-**Hot path vs. background warm (LML#706).** The response path is now
-**cache-read-only**: it calls ``get_cached_streaming_url`` (a pure SELECT) per
-service. On a cache **hit** it fills ``update[cfg.url_field]`` synchronously and
-does not mint (cache hits already minted on their original resolution). On a
-cache **miss** it leaves the field null and enqueues **one** bounded,
-deduplicated background task that runs the live probe
-(``resolve_streaming_url_with_cache``) → cache UPSERT → mint-on-``live_resolved``.
+**Hot path vs. background warm (LML#706).** The response path is
+**cache-read-only**: it calls ``peek_cached_streaming_url`` (a pure SELECT) per
+service and makes the same three-way choice the resolver makes, without probing:
+
+* cache **hit** → fill ``update[cfg.url_field]`` synchronously, no mint (cache
+  hits already minted);
+* known **recent miss** (no url, fresh "not found" within TTL) → do nothing (a
+  warm would just re-derive the same verdict);
+* genuine **miss** (absent/stale) → leave the field null and enqueue **one**
+  bounded, deduplicated background task that runs the live probe
+  (``resolve_streaming_url_with_cache``) → cache UPSERT → mint-on-``live_resolved``.
+
 Streaming URLs are therefore *eventually consistent*: the first lookup of an
 uncached album returns without that service's URL; the background warm fills the
-cache within seconds so the next lookup is warm. The response path does **zero**
-synchronous external HTTP — that is the cure for the cold-tail latency in #706.
+cache so the next lookup is warm. The response path does **zero** synchronous
+external HTTP — the cure for the cold-tail latency in #706. The warm is
+suppressed for the whole context on the ``/lookup/bulk`` path
+(``should_suppress_streaming_warm()``), which then does cache read-fill only.
 
 Dedup is process-global, keyed ``(service, to_match_form(artist),
-to_match_form(album))`` — two concurrent identical misses enqueue a single
-probe. Background concurrency is bounded by ``LML_STREAMING_WARM_CONCURRENCY``
-(separate from the bio warm's bound).
+to_match_form(album))``. Background concurrency is bounded by
+``LML_STREAMING_WARM_CONCURRENCY`` (separate from the bio warm's bound).
 
 Sentry (hot-path only): ``streaming_url.persistent_lookup.fired.<service>`` plus
-``streaming_url.persistent_lookup.<cache_hit|cache_miss_enqueued>.<service>`` via
-``scope.transaction.set_data``. The background task never writes to the active
-scope (the request scope has closed by then) — it logs its ``live_*`` outcome.
+``streaming_url.persistent_lookup.<outcome>.<service>`` where ``<outcome>`` is
+``cache_hit`` / ``cache_miss_recent`` / ``cache_miss_enqueued`` /
+``cache_miss_unwarmed``. The background task never writes to the active scope
+(the request scope has closed by then) — it logs its ``live_*`` outcome.
 
 PG, the streaming clients, the entity store, and the cache layer are mocked. The
 cache-layer behavior itself is covered in
@@ -52,6 +59,7 @@ from lookup import streaming_url_postprocess as mod
 from lookup.streaming_url_postprocess import (
     STREAMING_URL_CACHE_CONFIG,
     apply_streaming_url_postprocess,
+    set_suppress_streaming_warm,
 )
 
 # Per-service test data. The cache module is service-agnostic; what differs per
@@ -107,19 +115,22 @@ _ALBUM = "Hold Onto Me Infinity"
 
 @pytest.fixture(autouse=True)
 def _reset_warm_state():
-    """Isolate the module-global warm state (semaphore, dedup set, task set).
+    """Isolate the module-global warm state (semaphore, dedup set, task set, and
+    the bulk-suppression ContextVar).
 
     These are process-global by design (one warm per worker, not per request).
-    Reset around every test so a leaked dedup key or a semaphore bound to a
-    prior event loop can't leak across tests.
+    Reset around every test so a leaked dedup key, a semaphore bound to a prior
+    event loop, or a stuck suppression flag can't leak across tests.
     """
     mod._streaming_warm_semaphore = None
     mod._streaming_warm_in_flight.clear()
     mod._background_tasks.clear()
+    set_suppress_streaming_warm(False)
     yield
     mod._streaming_warm_in_flight.clear()
     mod._background_tasks.clear()
     mod._streaming_warm_semaphore = None
+    set_suppress_streaming_warm(False)
 
 
 def _settings(*enabled_services: str, master: bool = True) -> SimpleNamespace:
@@ -165,9 +176,16 @@ def _sentry_scope():
     return scope, transaction
 
 
-def _patch_cache_get(return_value):
-    """Patch the hot-path cache read. ``return_value`` is a URL (hit) or None."""
-    return patch.object(mod, "get_cached_streaming_url", new=AsyncMock(return_value=return_value))
+def _patch_cache_peek(url, has_fresh_decision=None):
+    """Patch the hot-path cache peek, returning ``(url, has_fresh_decision)``.
+
+    ``has_fresh_decision`` defaults to ``url is not None`` — a hit always has a
+    fresh row. For a url-less peek, pass ``True`` for a known-recent-miss (the
+    cache holds a fresh "not found") or leave it ``None`` (→ ``False``) for a
+    genuine absent/stale miss.
+    """
+    fresh = has_fresh_decision if has_fresh_decision is not None else (url is not None)
+    return patch.object(mod, "peek_cached_streaming_url", new=AsyncMock(return_value=(url, fresh)))
 
 
 def _patch_resolver(**kwargs):
@@ -176,7 +194,8 @@ def _patch_resolver(**kwargs):
 
 
 async def _drain_background_tasks() -> None:
-    """Await every scheduled warm so its done-callbacks (and asserts) can run."""
+    """Await every scheduled warm so its done-callbacks run (clearing the task
+    set and the dedup key), letting post-drain assertions observe the result."""
     while mod._background_tasks:
         await asyncio.gather(*list(mod._background_tasks), return_exceptions=True)
 
@@ -203,22 +222,22 @@ async def _run(update, *, settings, clients=None, entity_store=None, pg=None):
 class TestSkipConditions:
     async def test_master_flag_off_short_circuits_all_services(self):
         update = _blank_update()
-        with _patch_cache_get(None) as cache_get, _patch_resolver() as resolve:
+        with _patch_cache_peek(None) as peek, _patch_resolver() as resolve:
             await _run(
                 update,
                 # master off, per-service ON — master must still win.
                 settings=_settings("apple_music_album", "spotify_album", master=False),
             )
-        cache_get.assert_not_called()
+        peek.assert_not_called()
         resolve.assert_not_called()
         assert update == _blank_update()
         assert not mod._background_tasks
 
     async def test_master_on_but_all_per_service_off_does_nothing(self):
         update = _blank_update()
-        with _patch_cache_get(None) as cache_get, _patch_resolver() as resolve:
+        with _patch_cache_peek(None) as peek, _patch_resolver() as resolve:
             await _run(update, settings=_settings(master=True))
-        cache_get.assert_not_called()
+        peek.assert_not_called()
         resolve.assert_not_called()
         assert not mod._background_tasks
 
@@ -241,9 +260,9 @@ class TestSkipConditions:
             kwargs["request_artist"] = ""
         elif missing == "album":
             kwargs["request_album"] = None
-        with _patch_cache_get(None) as cache_get, _patch_resolver() as resolve:
+        with _patch_cache_peek(None) as peek, _patch_resolver() as resolve:
             await apply_streaming_url_postprocess(update, **kwargs)
-        cache_get.assert_not_called()
+        peek.assert_not_called()
         resolve.assert_not_called()
         assert not mod._background_tasks
 
@@ -260,9 +279,9 @@ class TestPerServiceGating:
         case = _CASES[service]
         update = _blank_update()
         update[case["url_field"]] = "https://existing.test/x"
-        with _patch_cache_get(None) as cache_get, _patch_resolver():
+        with _patch_cache_peek(None) as peek, _patch_resolver():
             await _run(update, settings=_settings(service))
-        cache_get.assert_not_called()
+        peek.assert_not_called()
         assert update[case["url_field"]] == "https://existing.test/x"
         assert not mod._background_tasks
 
@@ -272,22 +291,22 @@ class TestPerServiceGating:
         case = _CASES[service]
         update = _blank_update()
         update[case["url_field"]] = ""
-        with _patch_cache_get(None) as cache_get, _patch_resolver():
+        with _patch_cache_peek(None) as peek, _patch_resolver():
             await _run(update, settings=_settings(service))
-        cache_get.assert_not_called()
+        peek.assert_not_called()
         assert update[case["url_field"]] == ""
         assert not mod._background_tasks
 
     async def test_skips_service_when_client_is_none(self, service):
         case = _CASES[service]
         update = _blank_update()
-        with _patch_cache_get(None) as cache_get, _patch_resolver():
+        with _patch_cache_peek(None) as peek, _patch_resolver():
             await _run(
                 update,
                 clients=_clients(**{case["client_attr"]: None}),
                 settings=_settings(service),
             )
-        cache_get.assert_not_called()
+        peek.assert_not_called()
         assert update[case["url_field"]] is None
         assert not mod._background_tasks
 
@@ -301,12 +320,12 @@ class TestPerServiceGating:
         update = _blank_update()
         read_services: list[str] = []
 
-        async def fake_get(pg, *, service, artist, album, **kwargs):
+        async def fake_peek(pg, *, service, artist, album, **kwargs):
             read_services.append(service)
-            return other_url
+            return other_url, True
 
         with (
-            patch.object(mod, "get_cached_streaming_url", new=AsyncMock(side_effect=fake_get)),
+            patch.object(mod, "peek_cached_streaming_url", new=AsyncMock(side_effect=fake_peek)),
             _patch_resolver(),
         ):
             await _run(update, settings=_settings(other))
@@ -331,7 +350,7 @@ class TestCacheHit:
         scope, transaction = _sentry_scope()
 
         with (
-            _patch_cache_get(case["resolved_url"]),
+            _patch_cache_peek(case["resolved_url"]),
             _patch_resolver() as resolve,
             patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
@@ -347,7 +366,35 @@ class TestCacheHit:
 
 
 # ---------------------------------------------------------------------------
-# Cache miss: the response returns without the URL; one bounded background warm
+# Known recent miss: the cache already holds a fresh "not found" — no warm.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("service", list(_CASES))
+class TestKnownRecentMiss:
+    async def test_recent_miss_does_not_enqueue_a_no_op_warm(self, service):
+        case = _CASES[service]
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+
+        with (
+            _patch_cache_peek(None, has_fresh_decision=True),
+            _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            await _run(update, settings=_settings(service))
+
+        assert update[case["url_field"]] is None
+        resolve.assert_not_called()
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_recent.{service}") is True
+
+
+# ---------------------------------------------------------------------------
+# Genuine miss: response returns without the URL; one bounded background warm
 # is enqueued; the probe runs (and mints) only in that background task.
 # ---------------------------------------------------------------------------
 
@@ -371,7 +418,7 @@ class TestCacheMissEnqueuesBackgroundWarm:
             return ResolveOutcome(url=case["resolved_url"], source="live_resolved")
 
         with (
-            _patch_cache_get(None),
+            _patch_cache_peek(None),
             patch.object(
                 mod, "resolve_streaming_url_with_cache", new=AsyncMock(side_effect=gated_resolve)
             ),
@@ -400,7 +447,7 @@ class TestCacheMissEnqueuesBackgroundWarm:
         pg = AsyncMock(spec=PgSource)
 
         with (
-            _patch_cache_get(None),
+            _patch_cache_peek(None),
             _patch_resolver(
                 return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
             ) as resolve,
@@ -430,7 +477,7 @@ class TestCacheMissEnqueuesBackgroundWarm:
         entity_store = _entity_store()
 
         with (
-            _patch_cache_get(None),
+            _patch_cache_peek(None),
             _patch_resolver(return_value=ResolveOutcome(url=None, source=source)),
         ):
             await _run(update, settings=_settings(service), entity_store=entity_store)
@@ -439,7 +486,10 @@ class TestCacheMissEnqueuesBackgroundWarm:
         assert update["apple_music_url"] is None
         entity_store.mint_or_get_release_identity.assert_not_called()
 
-    async def test_background_warm_unparseable_url_surfaces_but_skips_mint(self):
+    async def test_background_warm_unparseable_url_skips_mint(self):
+        # The off-path warm never backfills ``update``; here we only assert the
+        # validate-before-mint guard: an Apple id of '000000' parses (\d{6,})
+        # but fails the leading-zero validator, so the warm skips the mint.
         service = "apple_music_album"
         case = _CASES[service]
         update = _blank_update()
@@ -447,7 +497,7 @@ class TestCacheMissEnqueuesBackgroundWarm:
         url = case["unmintable_but_parseable_url"]
 
         with (
-            _patch_cache_get(None),
+            _patch_cache_peek(None),
             _patch_resolver(return_value=ResolveOutcome(url=url, source="live_resolved")),
         ):
             await _run(update, settings=_settings(service), entity_store=entity_store)
@@ -465,7 +515,7 @@ class TestCacheMissEnqueuesBackgroundWarm:
         entity_store.mint_or_get_release_identity = AsyncMock(side_effect=RuntimeError("PG down"))
 
         with (
-            _patch_cache_get(None),
+            _patch_cache_peek(None),
             _patch_resolver(
                 return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
             ),
@@ -485,7 +535,7 @@ class TestCacheMissEnqueuesBackgroundWarm:
         update = _blank_update()
 
         with (
-            _patch_cache_get(None),
+            _patch_cache_peek(None),
             _patch_resolver(side_effect=TimeoutError("probe timed out")),
         ):
             await _run(update, settings=_settings(service))
@@ -494,6 +544,92 @@ class TestCacheMissEnqueuesBackgroundWarm:
         assert update["apple_music_url"] is None
         assert not mod._background_tasks
         assert not mod._streaming_warm_in_flight
+
+
+# ---------------------------------------------------------------------------
+# Hot-path robustness: a cache-peek error degrades to a skip, never a 500.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCachePeekError:
+    async def test_peek_exception_skips_service_without_raising_or_enqueuing(self):
+        # peek normally swallows PG errors, but the gather must contain any
+        # surprise so the post-process never propagates out of /lookup.
+        update = _blank_update()
+        with (
+            patch.object(
+                mod,
+                "peek_cached_streaming_url",
+                new=AsyncMock(side_effect=RuntimeError("normalization blew up")),
+            ),
+            _patch_resolver() as resolve,
+        ):
+            await _run(update, settings=_settings("apple_music_album"))
+
+        assert update["apple_music_url"] is None
+        resolve.assert_not_called()
+        assert not mod._background_tasks
+
+    async def test_one_service_peek_error_does_not_block_the_other(self):
+        # Apple peek raises; Spotify hits. The healthy service must still fill.
+        update = _blank_update()
+
+        async def flaky_peek(pg, *, service, artist, album, **kwargs):
+            if service == "apple_music_album":
+                raise RuntimeError("boom")
+            return _CASES["spotify_album"]["resolved_url"], True
+
+        with (
+            patch.object(mod, "peek_cached_streaming_url", new=AsyncMock(side_effect=flaky_peek)),
+            _patch_resolver(),
+        ):
+            await _run(update, settings=_settings("apple_music_album", "spotify_album"))
+
+        assert update["apple_music_url"] is None
+        assert update["spotify_url"] == _CASES["spotify_album"]["resolved_url"]
+        assert not mod._background_tasks
+
+
+# ---------------------------------------------------------------------------
+# Bulk suppression: the /lookup/bulk context fills from cache but never warms.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBulkSuppression:
+    async def test_genuine_miss_does_not_enqueue_when_suppressed(self):
+        service = "apple_music_album"
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+        set_suppress_streaming_warm(True)
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            await _run(update, settings=_settings(service))
+
+        assert update["apple_music_url"] is None
+        resolve.assert_not_called()
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
+
+    async def test_cache_hit_still_fills_when_suppressed(self):
+        # Suppression disables the warm, NOT the synchronous cache read-fill.
+        service = "apple_music_album"
+        case = _CASES[service]
+        update = _blank_update()
+        set_suppress_streaming_warm(True)
+
+        with _patch_cache_peek(case["resolved_url"]), _patch_resolver():
+            await _run(update, settings=_settings(service))
+
+        assert update[case["url_field"]] == case["resolved_url"]
+        assert not mod._background_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +651,7 @@ class TestDedup:
             return ResolveOutcome(url=case["resolved_url"], source="live_resolved")
 
         with (
-            _patch_cache_get(None),
+            _patch_cache_peek(None),
             patch.object(
                 mod, "resolve_streaming_url_with_cache", new=AsyncMock(side_effect=gated_resolve)
             ),
@@ -540,7 +676,7 @@ class TestDedup:
         service = "apple_music_album"
         case = _CASES[service]
         with (
-            _patch_cache_get(None),
+            _patch_cache_peek(None),
             _patch_resolver(
                 return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
             ) as resolve,
@@ -569,7 +705,7 @@ class TestSentryProjection:
         scope, transaction = _sentry_scope()
 
         with (
-            _patch_cache_get(None),
+            _patch_cache_peek(None),
             _patch_resolver(
                 return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
             ),
@@ -592,7 +728,7 @@ class TestSentryProjection:
         scope = Mock()
         scope.transaction = None
         with (
-            _patch_cache_get(_CASES["apple_music_album"]["resolved_url"]),
+            _patch_cache_peek(_CASES["apple_music_album"]["resolved_url"]),
             _patch_resolver(),
             patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
@@ -606,7 +742,7 @@ class TestSentryProjection:
         scope = Mock()
         scope.transaction = transaction
         with (
-            _patch_cache_get(_CASES["apple_music_album"]["resolved_url"]),
+            _patch_cache_peek(_CASES["apple_music_album"]["resolved_url"]),
             _patch_resolver(),
             patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):

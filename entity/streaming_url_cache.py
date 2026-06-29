@@ -209,6 +209,37 @@ async def get_cached_streaming_url(
     return result.url
 
 
+async def peek_cached_streaming_url(
+    pg: PgSource,
+    *,
+    service: str,
+    artist: str,
+    album: str,
+    miss_ttl: timedelta = DEFAULT_MISS_TTL,
+    now: datetime | None = None,
+) -> tuple[str | None, bool]:
+    """Read the cache decision for ``(service, artist, album)`` WITHOUT probing.
+
+    Returns ``(url, has_fresh_decision)``:
+
+    * ``url`` — the cached URL, or ``None`` for a miss (known or absent).
+    * ``has_fresh_decision`` — ``True`` when the cache already holds a fresh row
+      (a hit, OR a known-miss still inside ``miss_ttl``): no live probe is
+      warranted. ``False`` for an absent or stale row, where a probe/warm is.
+
+    Lets the ``/lookup`` post-process make the same three-way decision
+    ``resolve_streaming_url_with_cache`` makes (hit / recent-miss / probe)
+    without paying the live probe on the response path (LML#706) — so it can
+    skip scheduling a no-op background warm for a row the cache already knows
+    is a recent miss. Same PG-error posture as ``get_cached_streaming_url``:
+    failures surface as ``(None, False)`` (treated as "absent → probe").
+    """
+    result = await _fetch_cached_row(
+        pg, service=service, artist=artist, album=album, miss_ttl=miss_ttl, now=now
+    )
+    return result.url, result.was_present
+
+
 async def _fetch_cached_row(
     pg: PgSource,
     *,
