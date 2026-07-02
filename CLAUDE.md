@@ -12,6 +12,7 @@ CLAUDE.md is a router for the always-loaded reference card. Topic depth lives in
 - **[`docs/testing.md`](docs/testing.md)** — Unit/integration test patterns, bug-fix protocol, TDD rules, pytest markers (`pg`, `external_api`), CI marker sync
 - **[`docs/deployment.md`](docs/deployment.md)** — Railway infrastructure, branch strategy, CI/CD pipeline table, CI pin maintenance (Railway CLI, workflow `permissions:`, `@gha/v1` reusable refs), library.db / streaming_availability.db upload + download, `/health` semantics
 - **[`docs/scripts.md`](docs/scripts.md)** — Streaming report stats regenerator, Discogs cache benchmark, API model generation, VA disambiguation, Bandcamp pipeline, resolver calibration, artist name variation audit
+- **[`docs/observability-rowless-flag.md`](docs/observability-rowless-flag.md)** — `LML_RESOLVE_NONLIBRARY_RELEASE` degradation alerts (LML#683): the PostHog + Sentry alerts on the LML#681 `cache.*` counters, their thresholds + 3-day baseline rationale, and the kill-switch response runbook
 
 For the org-wide cache-hierarchy reference (LML's in-memory + PG cache tiers in context with upstream iOS and downstream Backend-Service tiers), see [`WXYC/wiki/architecture/cache-hierarchy.md`](https://github.com/WXYC/wiki/blob/main/architecture/cache-hierarchy.md).
 
