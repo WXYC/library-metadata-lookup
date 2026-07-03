@@ -439,6 +439,47 @@ class TestCacheMissEnqueuesBackgroundWarm:
         assert not mod._background_tasks
         assert not mod._streaming_warm_in_flight
 
+    async def test_response_path_records_zero_probe_awaits_even_when_probe_raises(self):
+        # PR2 of #706 hardens the Event-gated ordering test above into a
+        # raise-if-awaited spy. The distinction matters: the post-process
+        # contains ``return_exceptions=True`` and the warm swallows every
+        # exception, so a regression that re-inlines the probe would NOT
+        # surface as a raised error — the request would silently block again.
+        # The spy therefore RECORDS each await; the load-bearing assertion is
+        # that the record is empty when the response path returns, regardless
+        # of what the probe does (here: fail fast, the cheapest probe there is
+        # — if even a raise-immediately probe leaves a record before the
+        # response completes, the probe is back on the hot path).
+        service = "apple_music_album"
+        update = _blank_update()
+        probe_awaits: list[str] = []
+
+        async def raise_if_awaited(pg, client, *, service, artist, album, **kwargs):
+            probe_awaits.append(service)
+            raise AssertionError("streaming probe awaited on the /lookup response path")
+
+        with (
+            _patch_cache_peek(None),
+            patch.object(
+                mod,
+                "resolve_streaming_url_with_cache",
+                new=AsyncMock(side_effect=raise_if_awaited),
+            ),
+        ):
+            await _run(update, settings=_settings(service))
+            # Response path complete: the probe was never awaited, not even a
+            # variant that would have returned control immediately.
+            assert probe_awaits == []
+            assert len(mod._background_tasks) == 1
+
+            await _drain_background_tasks()
+
+        # The warm DID run the probe off-path and swallowed its failure.
+        assert probe_awaits == [service]
+        assert update["apple_music_url"] is None
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+
     @pytest.mark.parametrize("service", list(_CASES))
     async def test_background_warm_runs_probe_and_mints_on_live_resolved(self, service):
         case = _CASES[service]
