@@ -61,6 +61,7 @@ from lookup.streaming_url_postprocess import (
     apply_streaming_url_postprocess,
     set_suppress_streaming_warm,
 )
+from tests.conftest import drain_streaming_warm_tasks, reset_streaming_warm_state
 
 # Per-service test data. The cache module is service-agnostic; what differs per
 # service is the URL field, client attr, per-service flag, and a
@@ -115,22 +116,16 @@ _ALBUM = "Hold Onto Me Infinity"
 
 @pytest.fixture(autouse=True)
 def _reset_warm_state():
-    """Isolate the module-global warm state (semaphore, dedup set, task set, and
-    the bulk-suppression ContextVar).
+    """Isolate the module-global warm state around every test.
 
-    These are process-global by design (one warm per worker, not per request).
-    Reset around every test so a leaked dedup key, a semaphore bound to a prior
-    event loop, or a stuck suppression flag can't leak across tests.
+    Delegates to the shared ``tests.conftest.reset_streaming_warm_state`` so
+    this file and the endpoint-level suite in
+    ``tests/integration/test_api_lookup_hard_timeout.py`` reset the exact same
+    globals — the two used to carry diverging per-file copies.
     """
-    mod._streaming_warm_semaphore = None
-    mod._streaming_warm_in_flight.clear()
-    mod._background_tasks.clear()
-    set_suppress_streaming_warm(False)
+    reset_streaming_warm_state()
     yield
-    mod._streaming_warm_in_flight.clear()
-    mod._background_tasks.clear()
-    mod._streaming_warm_semaphore = None
-    set_suppress_streaming_warm(False)
+    reset_streaming_warm_state()
 
 
 def _settings(*enabled_services: str, master: bool = True) -> SimpleNamespace:
@@ -193,11 +188,9 @@ def _patch_resolver(**kwargs):
     return patch.object(mod, "resolve_streaming_url_with_cache", new=AsyncMock(**kwargs))
 
 
-async def _drain_background_tasks() -> None:
-    """Await every scheduled warm so its done-callbacks run (clearing the task
-    set and the dedup key), letting post-drain assertions observe the result."""
-    while mod._background_tasks:
-        await asyncio.gather(*list(mod._background_tasks), return_exceptions=True)
+# Bounded drain shared with the endpoint-level suite (single source of truth
+# for the subtle while-loop-because-done-callbacks-run-late semantics).
+_drain_background_tasks = drain_streaming_warm_tasks
 
 
 async def _run(update, *, settings, clients=None, entity_store=None, pg=None):
@@ -468,7 +461,13 @@ class TestCacheMissEnqueuesBackgroundWarm:
         ):
             await _run(update, settings=_settings(service))
             # Response path complete: the probe was never awaited, not even a
-            # variant that would have returned control immediately.
+            # variant that would have returned control immediately. NOTE: this
+            # also pins that the enqueue loop is the function's tail — a
+            # benign trailing await added after the loop would give the warm
+            # task a slot to start and trip this assertion even though the hot
+            # path stayed probe-free. That's deliberate strictness; if you add
+            # such an await, update this assertion knowingly (the Event-gated
+            # test above still carries the pure does-not-WAIT invariant).
             assert probe_awaits == []
             assert len(mod._background_tasks) == 1
 

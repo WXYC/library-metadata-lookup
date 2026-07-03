@@ -1,13 +1,62 @@
 """Shared test fixtures for pytest."""
 
+import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from wxyc_fastapi.observability import RequestTelemetry
 
 from discogs.service import DiscogsApiCheckResult
+from lookup import streaming_url_postprocess as _streaming_mod
+from lookup.streaming_url_postprocess import set_suppress_streaming_warm
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_library_item
+
+
+def reset_streaming_warm_state() -> None:
+    """Reset the LML#706 streaming-warm module globals to a pristine state.
+
+    The warm machinery is process-global by design (one bound per worker, not
+    per request): the lazily-built semaphore, the dedup set, the strong-ref
+    task set, and the bulk-suppression ContextVar. Any test module that
+    touches the ``/lookup`` post-process should call this from an autouse
+    fixture (setup AND teardown) so a leaked dedup key, a semaphore bound to
+    a prior event loop, or a stuck suppression flag can't leak across tests.
+    Single source of truth — the unit and integration suites previously
+    carried diverging per-file copies of this reset.
+    """
+    _streaming_mod._streaming_warm_semaphore = None
+    _streaming_mod._streaming_warm_in_flight.clear()
+    _streaming_mod._background_tasks.clear()
+    set_suppress_streaming_warm(False)
+
+
+async def drain_streaming_warm_tasks(timeout_s: float = 5.0) -> None:
+    """Await every scheduled streaming-URL warm, bounded by ``timeout_s``.
+
+    Loops because a task's done-callbacks (which discard it from the set and
+    clear its dedup key) run after the ``gather`` returns, so one pass can
+    observe a non-empty set. The deadline converts two regression shapes that
+    would otherwise hang CI forever (the repo has no pytest-timeout and the
+    workflow no ``timeout-minutes``) into an immediate, diagnosable failure:
+    a warm that never completes blocks the ``gather`` until the deadline; a
+    broken discard done-callback leaves completed tasks in the set and would
+    busy-spin, which the per-iteration deadline check cuts off.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while _streaming_mod._background_tasks:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            pytest.fail(
+                f"streaming-warm drain exceeded {timeout_s}s; "
+                f"{len(_streaming_mod._background_tasks)} task(s) still tracked, "
+                f"in-flight keys: {_streaming_mod._streaming_warm_in_flight}"
+            )
+        await asyncio.wait_for(
+            asyncio.gather(*list(_streaming_mod._background_tasks), return_exceptions=True),
+            timeout=remaining,
+        )
 
 
 def make_lml_telemetry() -> RequestTelemetry:
