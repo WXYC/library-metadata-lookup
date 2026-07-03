@@ -34,7 +34,7 @@ from core.dependencies import (
     get_musicbrainz_pg,
     get_posthog_client,
 )
-from core.search import SEARCH_API_CALL_CAP_FIRED_STAT_KEY
+from core.search import SEARCH_API_CALL_CAP_FIRED_STAT_KEY, resolve_positive_int_env
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
 from discogs.service import DiscogsService
@@ -75,6 +75,58 @@ router = APIRouter(tags=["lookup"])
 _BULK_LOOKUP_INPUT_CAP = 100
 
 _BULK_LOOKUP_DEFAULT_CONCURRENCY = 10
+
+# Process-wide cap on concurrent single `/lookup` requests (LML#706 PR3). The
+# #706 collapse compounded because single `/lookup` had NO in-flight bound:
+# cold requests piled up (Little's law), each holding the one event loop
+# through seconds of external I/O and contending for the 5-connection asyncpg
+# pool, inflating even trivial PG spans to tens of seconds. Excess requests
+# QUEUE on the semaphore — no 429/503 shedding; callers see latency, never a
+# new error mode. Deliberately separate from `LML_BULK_MAX_CONCURRENT`: the
+# bulk knob bounds items INSIDE one batch (per-request semaphore); this one
+# bounds requests ACROSS the process. Default 8: above the warm path's needs
+# (~5 ms hits never stack that deep at production arrival rates) and low
+# enough that a cold storm can't re-enter the pool-starvation regime.
+_LOOKUP_MAX_CONCURRENT_ENV_VAR = "LML_LOOKUP_MAX_CONCURRENT"
+_LOOKUP_DEFAULT_MAX_CONCURRENT = 8
+
+_lookup_semaphore: asyncio.Semaphore | None = None
+"""Lazily constructed (needs a running loop); built on the first request.
+Reading the env at construction time makes the cap a no-redeploy Railway
+lever (mirrors the LML#706 streaming-warm semaphore)."""
+
+
+def _get_lookup_semaphore() -> asyncio.Semaphore:
+    """Lazily build the process-global `/lookup` in-flight semaphore.
+
+    Sized from ``LML_LOOKUP_MAX_CONCURRENT`` (read once, at first
+    construction; unparseable/zero/negative values WARN and fall back — a 0
+    cap would deadlock every request forever).
+    """
+    global _lookup_semaphore
+    if _lookup_semaphore is None:
+        _lookup_semaphore = asyncio.Semaphore(
+            resolve_positive_int_env(_LOOKUP_MAX_CONCURRENT_ENV_VAR, _LOOKUP_DEFAULT_MAX_CONCURRENT)
+        )
+    return _lookup_semaphore
+
+
+def _project_inflight_capped() -> None:
+    """Tag the active transaction when a request queues behind the cap.
+
+    ``lml.lookup.inflight_capped`` is the post-deploy signal that the #706
+    cap actually engaged — set only on requests that found the semaphore
+    saturated, so uncontended traffic stays untagged and the flag is a clean
+    filter in the Sentry trace explorer. Observability must not break the
+    request path; failures log and continue.
+    """
+    try:
+        scope = sentry_sdk.get_current_scope()
+        if scope.transaction is not None:
+            scope.transaction.set_data("lml.lookup.inflight_capped", True)
+    except Exception as e:
+        logger.warning("Failed to project inflight_capped onto Sentry transaction: %s", e)
+
 
 # LML#681 flag-tag keys. Recorded once per cache_stats context at the router
 # (see ``_record_lml_flag_tags``) as a clean 0/1, so flag-on vs flag-off is
@@ -248,20 +300,29 @@ async def handle_lookup(
     )
 
     try:
-        response = await perform_lookup(
-            request=request,
-            db=db,
-            discogs_service=discogs_service,
-            telemetry=telemetry,
-            entity_store=entity_store,
-            discogs_cache=discogs_cache,
-            mb_pg=mb_pg,
-            apple_music=apple_music,
-            spotify=spotify,
-            bandcamp=bandcamp,
-            discogs_cache_pg=discogs_cache_pg,
-            caller_budget_ms=x_caller_budget_ms,
-        )
+        # LML#706 PR3: bound in-flight lookups process-wide. `locked()` before
+        # acquiring is a benign read-then-act race (a permit may free between
+        # the check and the acquire) — the tag marks "found the cap saturated
+        # on arrival", which is exactly the congestion signal wanted; the
+        # acquire itself is race-free.
+        semaphore = _get_lookup_semaphore()
+        if semaphore.locked():
+            _project_inflight_capped()
+        async with semaphore:
+            response = await perform_lookup(
+                request=request,
+                db=db,
+                discogs_service=discogs_service,
+                telemetry=telemetry,
+                entity_store=entity_store,
+                discogs_cache=discogs_cache,
+                mb_pg=mb_pg,
+                apple_music=apple_music,
+                spotify=spotify,
+                bandcamp=bandcamp,
+                discogs_cache_pg=discogs_cache_pg,
+                caller_budget_ms=x_caller_budget_ms,
+            )
 
         # Attach cache stats. wxyc-shared#86 has shipped the typed CacheStats
         # Pydantic model, so the response field is no longer dict-shaped —
