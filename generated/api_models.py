@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import date as date_aliased
 from datetime import time as time_aliased
-from enum import IntEnum, StrEnum
+from enum import Enum, IntEnum, StrEnum
 from typing import Any, Literal
 
 from pydantic import (
@@ -1671,6 +1671,252 @@ class LiveFsRefetchEvent(BaseModel):
     type: Literal["refetch"]
     payload: Payload
     timestamp: AwareDatetime
+
+
+class AutoDJState(StrEnum):
+    BOOTING = "BOOTING"
+    CONNECTING = "CONNECTING"
+    CONNECTED = "CONNECTED"
+    ERROR_STATE = "ERROR_STATE"
+
+
+class AutoDJTransport(StrEnum):
+    ethernet = "ethernet"
+    wifi = "wifi"
+
+
+class AutoDJCommandAction(StrEnum):
+    set_config = "set_config"
+    pause = "pause"
+    resume = "resume"
+    end_show = "end_show"
+    restart = "restart"
+    ping = "ping"
+
+
+class AutoDJErrorLevel(StrEnum):
+    warning = "warning"
+    error = "error"
+    fatal = "fatal"
+
+
+class AutoDJErrorCode(StrEnum):
+    HTTP_TIMEOUT = "HTTP_TIMEOUT"
+    JSON_PARSE = "JSON_PARSE"
+    WIFI_DISCONNECT = "WIFI_DISCONNECT"
+    WS_DISCONNECT = "WS_DISCONNECT"
+    TLS_HANDSHAKE = "TLS_HANDSHAKE"
+    NTP_FAIL = "NTP_FAIL"
+    KVSTORE_WRITE = "KVSTORE_WRITE"
+    FLOWSHEET_POST = "FLOWSHEET_POST"
+    AZURACAST_POLL = "AZURACAST_POLL"
+
+
+class AutoDJActivationSourceType(StrEnum):
+    virtual_switch = "virtual_switch"
+    button = "button"
+    relay = "relay"
+
+
+class AutoDJRelayState(StrEnum):
+    auto_dj_active = "auto_dj_active"
+    dj_live = "dj_live"
+
+
+class AutoDJLastTrack(BaseModel):
+    artist: str
+    title: str
+    posted_at: int = Field(..., description="Unix timestamp")
+
+
+class Type5(StrEnum):
+    heartbeat = "heartbeat"
+
+
+class AutoDJHeartbeat(BaseModel):
+    type: Literal["heartbeat"]
+    state: AutoDJState
+    transport: AutoDJTransport
+    uptime_s: int
+    wifi_rssi: int | None = None
+    free_ram: int
+    radio_show_id: int | None = Field(
+        None,
+        description="Always null in the reporter model; retained for schema compatibility.",
+    )
+    last_track: AutoDJLastTrack | None = None
+    last_error: str | None = None
+    firmware_version: str
+    config_hash: str
+    loop_max_ms: int
+    reconnect_count: int
+    tracks_detected: int
+    tracks_posted: int
+    errors_since_boot: int
+    button_press_count: int | None = Field(
+        None,
+        description="Button presses since last heartbeat (HTTP/WiFi fallback; orchestrator toggles if odd). 0 if none.",
+    )
+    relay_auto_dj_active: bool | None = Field(
+        None,
+        description="Current debounced relay level. true = relay reports auto-DJ-active (no live DJ); false = live DJ on air.",
+    )
+
+
+class Type6(StrEnum):
+    command = "command"
+
+
+class AutoDJCommand(BaseModel):
+    type: Literal["command"]
+    id: str = Field(..., description="Unique command ID for ack correlation")
+    action: AutoDJCommandAction
+    key: str | None = Field(None, description="Config key (only for set_config)")
+    value: str | None = Field(None, description="Config value (only for set_config)")
+
+
+class Type7(StrEnum):
+    ack = "ack"
+
+
+class Status1(StrEnum):
+    ok = "ok"
+    error = "error"
+    unknown_command = "unknown_command"
+
+
+class AutoDJAck(BaseModel):
+    type: Literal["ack"]
+    id: str = Field(..., description="The id from the command being acknowledged")
+    status: Status1
+    error: str | None = Field(None, description="Error message (only when status is error)")
+    result: dict[str, Any] | None = Field(
+        None,
+        description="Optional result data (e.g. { active: boolean } for button_toggle acks)",
+    )
+
+
+class Type8(StrEnum):
+    now_playing = "now_playing"
+
+
+class AutoDJNowPlaying(BaseModel):
+    type: Literal["now_playing"]
+    sh_id: int = Field(..., description="AzuraCast song history ID")
+    artist: str
+    title: str
+    album: str
+    is_live: bool = Field(..., description="Whether a live DJ is streaming")
+
+
+class Type9(StrEnum):
+    error = "error"
+
+
+class AutoDJErrorReport(BaseModel):
+    type: Literal["error"]
+    level: AutoDJErrorLevel
+    module: str = Field(..., description="Source module (e.g. mgmt_client, relay_monitor)")
+    code: AutoDJErrorCode
+    message: str
+    state: AutoDJState
+    uptime_s: int
+    free_ram: int
+    count: int = Field(..., description="Occurrences since last report")
+
+
+class Type10(StrEnum):
+    button_toggle = "button_toggle"
+
+
+class AutoDJButtonToggle(BaseModel):
+    type: Literal["button_toggle"]
+    timestamp: int = Field(..., description="Unix timestamp of the button press (from NTP)")
+
+
+class AutoDJWebSocketMessage(
+    RootModel[
+        AutoDJHeartbeat
+        | AutoDJCommand
+        | AutoDJAck
+        | AutoDJNowPlaying
+        | AutoDJErrorReport
+        | AutoDJButtonToggle
+    ]
+):
+    root: (
+        AutoDJHeartbeat
+        | AutoDJCommand
+        | AutoDJAck
+        | AutoDJNowPlaying
+        | AutoDJErrorReport
+        | AutoDJButtonToggle
+    ) = Field(..., discriminator="type")
+
+
+class Transport(StrEnum):
+    ethernet = "ethernet"
+    wifi = "wifi"
+    none = "none"
+
+
+class AutoDJDeviceStatus(BaseModel):
+    connected: bool
+    transport: Transport
+    last_heartbeat_at: AwareDatetime
+    last_heartbeat: AutoDJHeartbeat | None = None
+    pending_commands: int | None = Field(
+        None, description="Number of unacknowledged commands in the queue"
+    )
+    firmware_version: str
+    device_id: str | None = Field(None, description="MAC address or other unique identifier")
+
+
+class AutoDJActivationSource(BaseModel):
+    source: AutoDJActivationSourceType
+    userId: str | None = Field(
+        None, description="Better Auth user ID (only for virtual_switch source)"
+    )
+    userName: str | None = Field(None, description="Display name (only for virtual_switch source)")
+    detail: str | None = Field(
+        None,
+        description='Additional context (e.g. "Live DJ detected" for relay source)',
+    )
+
+
+class AutoDJCurrentTrack(BaseModel):
+    artist: str
+    title: str
+    album: str
+    detectedAt: AwareDatetime
+
+
+class AutoDJDeviceSummary(BaseModel):
+    online: bool
+    transport: AutoDJTransport
+    lastHeartbeat: AwareDatetime
+    relayState: AutoDJRelayState
+
+
+class AutoDJStatus(BaseModel):
+    active: bool
+    activatedBy: AutoDJActivationSource | None = None
+    activatedAt: AwareDatetime | None = None
+    showId: int | None = None
+    currentTrack: AutoDJCurrentTrack | None = None
+    lastDeactivatedAt: AwareDatetime | None = None
+    lastDeactivatedBy: AutoDJActivationSource | None = None
+    device: AutoDJDeviceSummary | None = None
+
+
+class Active(Enum):
+    boolean_False = False
+
+
+class AutoDJDeactivateResponse(BaseModel):
+    active: Active
+    deactivatedBy: AutoDJActivationSource
+    deactivatedAt: AwareDatetime
 
 
 class FlowsheetEntryResponse(FlowsheetEntryBase):
