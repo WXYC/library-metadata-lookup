@@ -59,6 +59,28 @@ async def drain_streaming_warm_tasks(timeout_s: float = 5.0) -> None:
         )
 
 
+@pytest.fixture(autouse=True)
+def _reset_lookup_inflight_cap():
+    """Suite-wide reset of the LML#706 ``/lookup`` in-flight semaphore.
+
+    ``lookup.router._lookup_semaphore`` is a process-global lazily built by
+    the FIRST test in the session that POSTs ``/api/v1/lookup`` — whatever
+    file that happens to live in. Left unreset, it (a) freezes that test's
+    ``LML_LOOKUP_MAX_CONCURRENT`` snapshot for the rest of the session and
+    (b) binds to that test's event loop at the first *contended* acquire,
+    after which a contended acquire from a different pytest-asyncio
+    function-scoped loop raises ``RuntimeError(... bound to a different event
+    loop)`` — surfacing as order-dependent 500s in unrelated files. Autouse
+    at the root (not per-file) because the exposure is every lookup-hitting
+    test module, and the reset is one attribute write.
+    """
+    from lookup import router as _lookup_router
+
+    _lookup_router._lookup_semaphore = None
+    yield
+    _lookup_router._lookup_semaphore = None
+
+
 def make_lml_telemetry() -> RequestTelemetry:
     """Build a `RequestTelemetry` with LML's production parameters.
 

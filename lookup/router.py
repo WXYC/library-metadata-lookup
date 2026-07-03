@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
@@ -84,16 +85,23 @@ _BULK_LOOKUP_DEFAULT_CONCURRENCY = 10
 # QUEUE on the semaphore — no 429/503 shedding; callers see latency, never a
 # new error mode. Deliberately separate from `LML_BULK_MAX_CONCURRENT`: the
 # bulk knob bounds items INSIDE one batch (per-request semaphore); this one
-# bounds requests ACROSS the process. Default 8: above the warm path's needs
-# (~5 ms hits never stack that deep at production arrival rates) and low
-# enough that a cold storm can't re-enter the pool-starvation regime.
+# bounds SINGLE-`/lookup` requests across the process. Scope note: it does
+# NOT cover the other perform_lookup/pool consumers — `/lookup/bulk` batches
+# (per-batch bound only, unbounded concurrent batches), the identity
+# bulk-resolve and cache-refresh dispatchers, `/streaming-check` — which
+# share the same loop + 5-conn pool; a storm made of those can still starve
+# the pool. Default 8: above the warm path's needs (~5 ms hits never stack
+# that deep at production arrival rates) and low enough that a single-lookup
+# cold storm can't re-enter the pool-starvation regime.
 _LOOKUP_MAX_CONCURRENT_ENV_VAR = "LML_LOOKUP_MAX_CONCURRENT"
 _LOOKUP_DEFAULT_MAX_CONCURRENT = 8
 
 _lookup_semaphore: asyncio.Semaphore | None = None
-"""Lazily constructed (needs a running loop); built on the first request.
-Reading the env at construction time makes the cap a no-redeploy Railway
-lever (mirrors the LML#706 streaming-warm semaphore)."""
+"""Lazily constructed on the first request — NOT because a semaphore needs a
+running loop (3.10+ binds a loop only at the first contended acquire), but so
+the env is read at request time (the no-redeploy Railway lever, mirroring the
+LML#706 streaming-warm semaphore) and so tests can reset the global between
+event loops (the suite-wide autouse fixture in ``tests/conftest.py``)."""
 
 
 def _get_lookup_semaphore() -> asyncio.Semaphore:
@@ -111,19 +119,30 @@ def _get_lookup_semaphore() -> asyncio.Semaphore:
     return _lookup_semaphore
 
 
-def _project_inflight_capped() -> None:
-    """Tag the active transaction when a request queues behind the cap.
+def _project_inflight_capped(wait_ms: float) -> None:
+    """Project cap engagement onto Sentry for a request that queued.
 
-    ``lml.lookup.inflight_capped`` is the post-deploy signal that the #706
-    cap actually engaged — set only on requests that found the semaphore
-    saturated, so uncontended traffic stays untagged and the flag is a clean
-    filter in the Sentry trace explorer. Observability must not break the
-    request path; failures log and continue.
+    Two channels, following the LML#683 lesson (recorded on
+    ``_project_cache_stats_to_transaction`` below): ``set_data`` alone reads
+    back as "Unknown attribute" in the spans dataset, so it can't back a
+    query or an alert. Therefore:
+
+    * ``sentry_sdk.set_tag("lml.lookup.inflight_capped", "true")`` — the
+      filterable engagement flag (mirrors ``lml.client_aborted``). Set only
+      on requests that found the cap saturated, so uncontended traffic stays
+      untagged.
+    * ``set_measurement("lml.lookup.inflight_wait_ms", ...)`` — the
+      quantitative series (p95 queue wait) that decides whether the default
+      cap of 8 is tuned right.
+
+    Observability must not break the request path; failures log and continue.
     """
     try:
+        sentry_sdk.set_tag("lml.lookup.inflight_capped", "true")
         scope = sentry_sdk.get_current_scope()
         if scope.transaction is not None:
-            scope.transaction.set_data("lml.lookup.inflight_capped", True)
+            scope.transaction.set_measurement("lml.lookup.inflight_wait_ms", wait_ms)
+            scope.transaction.set_data("lml.lookup.inflight_wait_ms", wait_ms)
     except Exception as e:
         logger.warning("Failed to project inflight_capped onto Sentry transaction: %s", e)
 
@@ -293,22 +312,40 @@ async def handle_lookup(
     _record_lml_flag_tags()
     if skip_cache:
         set_skip_cache(True)
-    telemetry = RequestTelemetry(
-        api_call_keys=["discogs"],
-        distinct_id="library-metadata-lookup-service",
-        event_prefix="lookup",
-    )
 
     try:
-        # LML#706 PR3: bound in-flight lookups process-wide. `locked()` before
-        # acquiring is a benign read-then-act race (a permit may free between
-        # the check and the acquire) — the tag marks "found the cap saturated
-        # on arrival", which is exactly the congestion signal wanted; the
-        # acquire itself is race-free.
+        # LML#706 PR3: bound in-flight lookups process-wide. On this repo's
+        # Python (>=3.12) the `locked()` pre-check is EXACT, not racy: there is
+        # no await between the check and the acquire (one event-loop slice),
+        # and 3.12's `locked()` returns True when the value is exhausted OR
+        # waiters exist — the same predicate `acquire()` uses to decide whether
+        # to park. So `capped_on_arrival` ⇔ this request actually queued.
         semaphore = _get_lookup_semaphore()
-        if semaphore.locked():
-            _project_inflight_capped()
+        capped_on_arrival = semaphore.locked()
+        wait_start = time.perf_counter()
         async with semaphore:
+            if capped_on_arrival:
+                wait_ms = (time.perf_counter() - wait_start) * 1000.0
+                _project_inflight_capped(wait_ms)
+                # Debit the queue wait from the caller's budget so the A8 /
+                # LML#345 contract ("LML returns slightly before the caller
+                # times out") holds under saturation — the pipeline's budget
+                # clock only starts inside perform_lookup. Floor at 1: the
+                # budget resolver treats non-positive as "unset → env
+                # default", which would hand the MOST delayed caller the
+                # LARGEST budget. A 1ms budget short-circuits the pipeline
+                # almost immediately — the cheap outcome the (likely already
+                # timed-out) caller would want.
+                if x_caller_budget_ms is not None and x_caller_budget_ms > 0:
+                    x_caller_budget_ms = max(1, x_caller_budget_ms - int(wait_ms))
+            # Constructed inside the permit so telemetry's total-duration
+            # series keeps meaning "lookup work", not "queue wait + work" —
+            # the wait is reported separately via the Sentry measurement.
+            telemetry = RequestTelemetry(
+                api_call_keys=["discogs"],
+                distinct_id="library-metadata-lookup-service",
+                event_prefix="lookup",
+            )
             response = await perform_lookup(
                 request=request,
                 db=db,
