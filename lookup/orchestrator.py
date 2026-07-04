@@ -1698,6 +1698,20 @@ def _release_matches_library_row(release: ReleaseInfo, item: LibraryItem) -> boo
 # verification; this tightens the LML lookup result itself.
 _ALBUM_MATCH_FLOOR = 80.0
 
+# Lenient artist-overlap backstop for the album-title fallback's
+# ``skip_artist_match_filter=True`` path (``process_release``). That path
+# intentionally drops the strict prefix filter so reordered/collaborative
+# credits (e.g. "Orcutt, Bill / Shelley, Chris / Miller, Mette" for a typed
+# "Orcutt Shelley Miller") still reach ``validate_track_on_release``. But that
+# validator checks the *Discogs release*, not the surfaced *library row*, so a
+# pure album-title fuzz collision can bind a wrong-artist row (the "Galaxy
+# Garden" → "Galaxy to Galaxy" by Galaxy 2 Galaxy case for a "Lone" request).
+# This floor rejects rows whose artist shares essentially no fuzzy overlap with
+# the request. Deliberately far below the usual 70/80 floors: reordered
+# collaborators score ~65 (must survive) while coincidental collisions score
+# ~17 (must drop). Measured on those two anchors; keep the margin if retuning.
+_FALLBACK_ARTIST_SIMILARITY_FLOOR = 40.0
+
 
 def _filter_results_by_album_match(
     results: list[LibraryItem],
@@ -2218,6 +2232,29 @@ async def search_compilations_for_track(
                                 f"(title_score={title_score:.0f})"
                             )
                 matches = filtered_matches
+            elif matches and lib_artist and skip_artist_match_filter:
+                # The strict prefix filter above is deferred on this path, but
+                # ``validate_track_on_release`` only vets the Discogs release —
+                # not the surfaced library row. Apply a lenient library-side
+                # artist backstop so an album-title fuzz collision can't bind a
+                # wrong-artist row (see ``_FALLBACK_ARTIST_SIMILARITY_FLOOR``).
+                from rapidfuzz import fuzz as _fuzz
+
+                lib_artist_norm = normalize_for_comparison(lib_artist)
+                matches = [
+                    match
+                    for match in matches
+                    if max(
+                        _fuzz.token_set_ratio(
+                            lib_artist_norm, normalize_for_comparison(match.artist or "")
+                        ),
+                        _fuzz.token_set_ratio(
+                            lib_artist_norm,
+                            normalize_for_comparison(match.alternate_artist_name or ""),
+                        ),
+                    )
+                    >= _FALLBACK_ARTIST_SIMILARITY_FLOOR
+                ]
 
             if not matches:
                 return []
