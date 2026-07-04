@@ -341,6 +341,92 @@ class TestAlbumTitleFallback:
         service.validate_track_on_release.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_fallback_drops_wrong_artist_row_matched_only_by_album_title(self):
+        """Regression: a wrong-*artist* library row matched purely on album-title
+        fuzz must NOT surface through the fallback.
+
+        Repro (Lone / "Galaxy Garden" / "Crystal Caverns 1991"): "Galaxy Garden"
+        isn't in the WXYC library, so Wave A is empty and the album-title
+        fallback fires. Its Discogs candidate is Lone's real "Galaxy Garden"
+        release, but ``search_album_fuzzy(db, "Galaxy Garden")`` fuzz-matches the
+        library row "Galaxy to Galaxy" by *Galaxy 2 Galaxy*
+        (``album_title_acceptable`` → True, token_set_ratio 80). Because the
+        fallback runs ``process_release(..., skip_artist_match_filter=True)`` and
+        ``validate_track_on_release`` validates the (correct) Discogs release, the
+        wrong-artist row surfaces — and, being a non-empty result, structurally
+        preempts the ``_resolve_nonlibrary_release`` carry-through (gated on
+        ``not results``) that would have resolved the correct row-less release.
+
+        The artist ("Galaxy 2 Galaxy") shares essentially no fuzzy overlap with
+        the request ("Lone") — token_set_ratio ~17, far below the reordered-
+        collaborator cases the flag protects (65-70). The fallback must reject it.
+        """
+        wrong_artist_item = make_library_item(
+            id=70229,
+            artist="Galaxy 2 Galaxy",
+            title="Galaxy to Galaxy",
+        )
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[wrong_artist_item])
+
+        # The album-title fallback probe returns Lone's actual "Galaxy Garden"
+        # release; validate_track_on_release confirms the *release* (as in prod).
+        lone_galaxy_garden = TrackReleasesResponse(
+            track="Crystal Caverns 1991",
+            artist="Lone",
+            releases=[
+                ReleaseInfo(
+                    album="Galaxy Garden",
+                    artist="Lone",
+                    release_id=4030652,
+                    release_url="https://www.discogs.com/release/4030652",
+                    is_compilation=False,
+                )
+            ],
+            total=1,
+        )
+
+        service = AsyncMock()
+        service.cache_service = AsyncMock()
+        service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
+        service.search_releases_by_track = AsyncMock(return_value=_empty_response())
+        service.search_releases_by_album_title = AsyncMock(return_value=lone_galaxy_garden)
+        service.validate_track_on_release = AsyncMock(return_value=True)
+
+        parsed = ParsedRequest(
+            artist="Lone",
+            album="Galaxy Garden",
+            song="Crystal Caverns 1991",
+            raw_message="Lone - Crystal Caverns 1991",
+        )
+
+        with (
+            patch(
+                "lookup.orchestrator.lookup_releases_by_track",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            # Isolate the fallback's artist gating from the downstream
+            # non-library carry-through (not under test here).
+            patch(
+                "lookup.orchestrator._resolve_nonlibrary_release",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            results, _titles = await search_compilations_for_track(
+                db, parsed, discogs_service=service
+            )
+
+        assert not any(r.id == 70229 for r in results), (
+            "Wrong-artist library row 70229 ('Galaxy 2 Galaxy' / 'Galaxy to "
+            "Galaxy') must not surface for request artist 'Lone' — it matched "
+            "only on album-title fuzz, and its artist has ~zero overlap with the "
+            f"request. Got: {[(r.id, r.title) for r in results]}"
+        )
+
+    @pytest.mark.asyncio
     async def test_fallback_release_still_rejected_when_validate_track_returns_false(self):
         """Even with skip_artist_match_filter=True, validate_track_on_release
         is the last line of defense — if the Discogs-side fuzzy validator says
