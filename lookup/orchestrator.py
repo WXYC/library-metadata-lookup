@@ -2241,20 +2241,34 @@ async def search_compilations_for_track(
                 from rapidfuzz import fuzz as _fuzz
 
                 lib_artist_norm = normalize_for_comparison(lib_artist)
-                matches = [
-                    match
-                    for match in matches
-                    if max(
-                        _fuzz.token_set_ratio(
-                            lib_artist_norm, normalize_for_comparison(match.artist or "")
-                        ),
-                        _fuzz.token_set_ratio(
-                            lib_artist_norm,
-                            normalize_for_comparison(match.alternate_artist_name or ""),
-                        ),
+                discogs_is_compilation = release_info.is_compilation
+                release_album_lower = release_album.lower()
+
+                def _fallback_row_acceptable(match: LibraryItem) -> bool:
+                    # Legitimate Various-Artists compilation rows share no artist
+                    # tokens with a typed solo/track artist, so the fuzzy floor
+                    # would wrongly drop them. Keep them on a title match instead,
+                    # mirroring the strict branch's compilation carve-out above.
+                    # ``is_compilation_artist`` is False for coincidental
+                    # wrong-artist collisions (e.g. "Galaxy 2 Galaxy"), so this
+                    # does not re-open the #717 bug.
+                    if discogs_is_compilation and is_compilation_artist(match.artist or ""):
+                        title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
+                        return title_score >= 80
+                    return (
+                        max(
+                            _fuzz.token_set_ratio(
+                                lib_artist_norm, normalize_for_comparison(match.artist or "")
+                            ),
+                            _fuzz.token_set_ratio(
+                                lib_artist_norm,
+                                normalize_for_comparison(match.alternate_artist_name or ""),
+                            ),
+                        )
+                        >= _FALLBACK_ARTIST_SIMILARITY_FLOOR
                     )
-                    >= _FALLBACK_ARTIST_SIMILARITY_FLOOR
-                ]
+
+                matches = [match for match in matches if _fallback_row_acceptable(match)]
 
             if not matches:
                 return []

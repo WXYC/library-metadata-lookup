@@ -427,6 +427,79 @@ class TestAlbumTitleFallback:
         )
 
     @pytest.mark.asyncio
+    async def test_fallback_keeps_various_artists_comp_row_despite_zero_artist_overlap(self):
+        """A genuine Various-Artists compilation row must survive the fallback's
+        lenient artist backstop even though its artist string ("Various Artists")
+        shares no tokens with the typed solo artist.
+
+        This is the case ``search_compilations_for_track`` exists to serve: the
+        WXYC library files a compilation under "Various Artists", the user types
+        the *track* artist ("Sun Ra"), and Wave A finds nothing. The album-title
+        fallback fires and ``search_album_fuzzy`` surfaces the VA row on a title
+        match. ``token_set_ratio("Sun Ra", "Various Artists") ≈ 29`` is far below
+        ``_FALLBACK_ARTIST_SIMILARITY_FLOOR`` (40), so a naive floor would drop
+        it — but the Discogs release is a compilation and the row is a
+        compilation artist whose title matches, so the fallback must keep it
+        (mirroring the strict branch's compilation carve-out). ``is_compilation_
+        artist`` is False for the "Galaxy 2 Galaxy" collision, so this carve-out
+        does not re-open the #717 wrong-artist bug.
+        """
+        va_comp_item = make_library_item(
+            id=88123,
+            artist="Various Artists",
+            title="Freedom Jazz Dance",
+        )
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        db.search = AsyncMock(return_value=[va_comp_item])
+
+        comp_release = TrackReleasesResponse(
+            track="Space Is the Place",
+            artist=None,
+            releases=[
+                ReleaseInfo(
+                    album="Freedom Jazz Dance",
+                    artist="Various",
+                    release_id=5551234,
+                    release_url="https://www.discogs.com/release/5551234",
+                    is_compilation=True,
+                )
+            ],
+            total=1,
+        )
+
+        service = AsyncMock()
+        service.cache_service = AsyncMock()
+        service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
+        service.search_releases_by_track = AsyncMock(return_value=_empty_response())
+        service.search_releases_by_album_title = AsyncMock(return_value=comp_release)
+        service.validate_track_on_release = AsyncMock(return_value=True)
+
+        parsed = ParsedRequest(
+            artist="Sun Ra",
+            album="Freedom Jazz Dance",
+            song="Space Is the Place",
+            raw_message="Sun Ra - Space Is the Place",
+        )
+
+        with patch(
+            "lookup.orchestrator.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            results, _titles = await search_compilations_for_track(
+                db, parsed, discogs_service=service
+            )
+
+        assert any(r.id == 88123 for r in results), (
+            "Expected the Various-Artists compilation row 88123 ('Various "
+            "Artists' / 'Freedom Jazz Dance') to surface for track artist 'Sun "
+            "Ra' via the album-title fallback. It is a legitimate compilation "
+            "match (is_compilation_artist + title match), so the lenient artist "
+            f"floor must not drop it. Got: {[(r.id, r.title) for r in results]}"
+        )
+
+    @pytest.mark.asyncio
     async def test_fallback_release_still_rejected_when_validate_track_returns_false(self):
         """Even with skip_artist_match_filter=True, validate_track_on_release
         is the last line of defense — if the Discogs-side fuzzy validator says
