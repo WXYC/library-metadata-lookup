@@ -38,7 +38,7 @@ class TestNonlibraryReleaseSurfacedCounter:
 
     def test_make_rowless_item_increments_counter(self):
         """The single row-less chokepoint records one surfaced emission."""
-        from lookup.orchestrator import (
+        from lookup.rowless import (
             NONLIBRARY_RELEASE_SURFACED_STAT_KEY,
             _make_rowless_item,
         )
@@ -56,10 +56,8 @@ class TestNonlibraryReleaseSurfacedCounter:
         flag-scoped counter — else the "0 when flag off" property breaks and two
         independent features get conflated."""
         from discogs.models import DiscogsSearchResponse
-        from lookup.orchestrator import (
-            NONLIBRARY_RELEASE_SURFACED_STAT_KEY,
-            _library_miss_discogs_search,
-        )
+        from lookup.orchestrator import _library_miss_discogs_search
+        from lookup.rowless import NONLIBRARY_RELEASE_SURFACED_STAT_KEY
         from services.parser import MessageType, ParsedRequest
         from tests.factories import make_discogs_result
 
@@ -318,12 +316,12 @@ class TestPayloadShapeStability:
             RELEASE_RESOLUTION_CACHE_MISS_STAT_KEY,
             RELEASE_RESOLUTION_CACHE_UNAVAILABLE_STAT_KEY,
         )
-        from lookup.orchestrator import NONLIBRARY_RELEASE_SURFACED_STAT_KEY
         from lookup.router import (
             _LML_CACHE_STATS_EXTRA_KEYS,
             LML_RESOLVE_COMPILATION_RELEASE_STAT_KEY,
             LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY,
         )
+        from lookup.rowless import NONLIBRARY_RELEASE_SURFACED_STAT_KEY
 
         for key in (
             LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY,

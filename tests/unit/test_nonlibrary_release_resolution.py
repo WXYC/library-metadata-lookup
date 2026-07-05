@@ -29,7 +29,7 @@ from discogs.models import (
     TrackReleasesResponse,
 )
 from entity.release_resolution_cache import ReleaseResolution
-from lookup.orchestrator import _resolve_nonlibrary_release
+from lookup.rowless import _resolve_nonlibrary_release
 
 RELEASE_ID = 36907527
 RELEASE_URL = f"https://www.discogs.com/release/{RELEASE_ID}"
@@ -202,9 +202,9 @@ async def test_fresh_known_miss_short_circuits_without_probe(monkeypatch):
     async def _miss(*_a, **_k):
         return ReleaseResolution(release_id=None, was_present=True)
 
-    monkeypatch.setattr("lookup.orchestrator.get_cached_release_id", AsyncMock(side_effect=_miss))
+    monkeypatch.setattr("lookup.rowless.get_cached_release_id", AsyncMock(side_effect=_miss))
     set_spy = AsyncMock()
-    monkeypatch.setattr("lookup.orchestrator.set_cached_release_id", set_spy)
+    monkeypatch.setattr("lookup.rowless.set_cached_release_id", set_spy)
 
     result = await _resolve_nonlibrary_release(
         svc, object(), song=TRACK, artist=ARTIST, album=ALBUM, is_track=True
@@ -256,14 +256,14 @@ async def test_bounded_resolver_is_used_not_l1_wrapper(monkeypatch):
     svc = _resolving_service()
 
     bounded = AsyncMock(return_value=[])
-    monkeypatch.setattr("lookup.orchestrator.resolve_release_for_track", bounded)
+    monkeypatch.setattr("lookup.rowless.resolve_release_for_track", bounded)
     # If the L1 wrapper is ever imported into orchestrator and used, this spy
     # would catch it. It is intentionally NOT referenced by the helper.
     monkeypatch.setattr(
-        "lookup.orchestrator.get_cached_release_id",
+        "lookup.rowless.get_cached_release_id",
         AsyncMock(return_value=ReleaseResolution(release_id=None, was_present=False)),
     )
-    monkeypatch.setattr("lookup.orchestrator.set_cached_release_id", AsyncMock())
+    monkeypatch.setattr("lookup.rowless.set_cached_release_id", AsyncMock())
 
     await _resolve_nonlibrary_release(
         svc, None, song=TRACK, artist=ARTIST, album=ALBUM, is_track=True
@@ -287,12 +287,12 @@ async def test_album_title_wave_gated_on_album_presence(monkeypatch, album, expe
     svc = _resolving_service()
 
     bounded = AsyncMock(return_value=[])
-    monkeypatch.setattr("lookup.orchestrator.resolve_release_for_track", bounded)
+    monkeypatch.setattr("lookup.rowless.resolve_release_for_track", bounded)
     monkeypatch.setattr(
-        "lookup.orchestrator.get_cached_release_id",
+        "lookup.rowless.get_cached_release_id",
         AsyncMock(return_value=ReleaseResolution(release_id=None, was_present=False)),
     )
-    monkeypatch.setattr("lookup.orchestrator.set_cached_release_id", AsyncMock())
+    monkeypatch.setattr("lookup.rowless.set_cached_release_id", AsyncMock())
 
     await _resolve_nonlibrary_release(
         svc, None, song=TRACK, artist=ARTIST, album=album, is_track=True
@@ -321,7 +321,7 @@ def _non_comp_release(release_id: int) -> ReleaseInfo:
 class TestRecoverTrackCredit:
     @pytest.mark.asyncio
     async def test_returns_first_recoverable_per_track_credit(self):
-        from lookup.orchestrator import _recover_track_credit
+        from lookup.rowless import _recover_track_credit
 
         svc = AsyncMock()
         svc.get_track_credit_on_release = AsyncMock(return_value=ARTIST)
@@ -333,7 +333,7 @@ class TestRecoverTrackCredit:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_release_exposes_credit(self):
-        from lookup.orchestrator import _recover_track_credit
+        from lookup.rowless import _recover_track_credit
 
         svc = AsyncMock()
         svc.get_track_credit_on_release = AsyncMock(return_value=None)
@@ -346,7 +346,7 @@ class TestRecoverTrackCredit:
     async def test_scans_compilations_before_own_releases(self):
         """The per-track credit lives on the V/A comp, so comps are fetched first
         even when an own-artist release precedes them in the probe results."""
-        from lookup.orchestrator import _recover_track_credit
+        from lookup.rowless import _recover_track_credit
 
         svc = AsyncMock()
         svc.get_track_credit_on_release = AsyncMock(return_value=ARTIST)
@@ -361,10 +361,10 @@ class TestRecoverTrackCredit:
     async def test_bounds_fetches_to_the_cap(self, monkeypatch):
         """A popular track with many credit-less candidates must not fan out an
         unbounded number of release fetches."""
-        from lookup import orchestrator
-        from lookup.orchestrator import _recover_track_credit
+        from lookup import rowless
+        from lookup.rowless import _recover_track_credit
 
-        monkeypatch.setattr(orchestrator, "_MAX_CREDIT_RECOVERY_FETCHES", 3)
+        monkeypatch.setattr(rowless, "_MAX_CREDIT_RECOVERY_FETCHES", 3)
         svc = AsyncMock()
         svc.get_track_credit_on_release = AsyncMock(return_value=None)
         releases = [_non_comp_release(i) for i in range(1, 11)]
@@ -379,10 +379,10 @@ class TestRecoverTrackCredit:
         """A release with no usable ``release_id`` is unfetchable, so it must not
         burn a slot of the fetch budget — the cap bounds *real* fetches. A creditful
         release sitting behind id-less ones is still reached within the cap."""
-        from lookup import orchestrator
-        from lookup.orchestrator import _recover_track_credit
+        from lookup import rowless
+        from lookup.rowless import _recover_track_credit
 
-        monkeypatch.setattr(orchestrator, "_MAX_CREDIT_RECOVERY_FETCHES", 2)
+        monkeypatch.setattr(rowless, "_MAX_CREDIT_RECOVERY_FETCHES", 2)
         svc = AsyncMock()
         svc.get_track_credit_on_release = AsyncMock(return_value=ARTIST)
 

@@ -45,7 +45,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from discogs.models import ArtistDetails, ReleaseMetadataResponse, TrackItem
-from lookup.orchestrator import ROWLESS_LIBRARY_ID, enrich_artwork_results
+from lookup.orchestrator import enrich_artwork_results
+from lookup.rowless import ROWLESS_LIBRARY_ID
 from tests.factories import make_discogs_result, make_library_item
 
 # A non-library release that resolves on Discogs. The request album is
