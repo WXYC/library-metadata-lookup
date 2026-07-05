@@ -5,7 +5,7 @@ See WXYC/library-metadata-lookup#318.
 Sweeps the trigram-similarity floor used by ``resolve_canonical_artist`` to
 decide whether to swap an inbound artist name for its Discogs-canonical form.
 The chosen floor is then committed to ``CANONICAL_ARTIST_SIMILARITY_FLOOR``
-in ``lookup/orchestrator.py``.
+in ``core/thresholds.py``.
 
 Output files in ``--output-dir``:
 
@@ -55,7 +55,7 @@ from pathlib import Path
 
 import asyncpg
 
-from lookup.orchestrator import CANONICAL_ARTIST_SIMILARITY_FLOOR
+from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from scripts.resolver_calibration.synthetic_typos import generate_typos
 
 logger = logging.getLogger("resolver_calibration")
@@ -482,7 +482,7 @@ async def main_async(args: argparse.Namespace) -> int:
     if abs(chosen_floor - CANONICAL_ARTIST_SIMILARITY_FLOOR) > 0.01:
         logger.warning(
             "Empirical floor differs from code-level constant — update "
-            "CANONICAL_ARTIST_SIMILARITY_FLOOR in lookup/orchestrator.py"
+            "CANONICAL_ARTIST_SIMILARITY_FLOOR in core/thresholds.py"
         )
     return 0
 

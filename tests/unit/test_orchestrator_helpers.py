@@ -3111,9 +3111,9 @@ class TestLogReleaseResolutionBind:
     observable in Railway logs and the Sentry trace without a wire field."""
 
     def test_logs_payload_on_bind(self):
-        from lookup.orchestrator import _log_release_resolution_bind
+        from lookup.artist_resolution import _log_release_resolution_bind
 
-        with patch("lookup.orchestrator.logger") as mock_logger:
+        with patch("lookup.artist_resolution.logger") as mock_logger:
             _log_release_resolution_bind(
                 song="Message to Black Youth",
                 artist="A Guy Called Gerald",
@@ -3134,8 +3134,8 @@ class TestLogReleaseResolutionBind:
         """Per-item event → an accumulating Sentry breadcrumb (like
         _log_track_validation), NOT transaction.set_data with a fixed key, which
         would last-write-win across multiple items binding in one request."""
-        with patch("lookup.orchestrator.sentry_sdk.add_breadcrumb") as mock_breadcrumb:
-            from lookup.orchestrator import _log_release_resolution_bind
+        with patch("lookup.artist_resolution.sentry_sdk.add_breadcrumb") as mock_breadcrumb:
+            from lookup.artist_resolution import _log_release_resolution_bind
 
             _log_release_resolution_bind(
                 song="Message to Black Youth",
@@ -3150,10 +3150,10 @@ class TestLogReleaseResolutionBind:
         assert mock_breadcrumb.call_args.kwargs["data"]["release_id"] == 36907527
 
     def test_swallows_sentry_failure(self):
-        from lookup.orchestrator import _log_release_resolution_bind
+        from lookup.artist_resolution import _log_release_resolution_bind
 
         with patch(
-            "lookup.orchestrator.sentry_sdk.add_breadcrumb",
+            "lookup.artist_resolution.sentry_sdk.add_breadcrumb",
             side_effect=RuntimeError("boom"),
         ):
             # Observability must never break /lookup — no exception escapes.

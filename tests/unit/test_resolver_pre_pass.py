@@ -30,13 +30,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from discogs.models import ReleaseInfo, TrackReleasesResponse
-from lookup.orchestrator import (
-    CANONICAL_ARTIST_SIMILARITY_FLOOR,
-    ResolverOutcome,
-    resolve_canonical_artist,
-    search_compilations_for_track,
-)
+from lookup.artist_resolution import ResolverOutcome, resolve_canonical_artist
+from lookup.orchestrator import search_compilations_for_track
 from services.parser import ParsedRequest
 from tests.factories import make_library_item
 
