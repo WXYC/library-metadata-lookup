@@ -840,6 +840,84 @@ class TestFindTrackMetadata:
         assert match.url == url
 
 
+class TestFindTrackMetadataTitleSubsetInflation:
+    """LML#719: the token_set_ratio track probe must not accept a candidate
+    whose title clears the floor purely by subset-inflation.
+
+    ``token_set_ratio`` returns 100 whenever the shorter string's tokens are a
+    subset of the longer's, regardless of how much unrelated material the longer
+    side carries. On a Various-Artists request (no discriminating artist name),
+    a short generic query title (``Hound Dog``) buried inside a long unrelated
+    candidate (``Black leather (The hound dog mix)``) scores a perfect 100 — so
+    the matcher accepts an unrelated (AI-spam) track and its URL. The title axis
+    is normally the disambiguator; here it carries no signal. The fix additionally
+    requires the title clear the suffix-stripped ``token_sort`` floor, which
+    admits legitimate variant subsets but rejects the degenerate one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rejects_va_title_subset_inflation(self, es256_keypair):
+        """Production LML#638 telemetry (2026-07-01): ``Various Artists - Blues``
+        / ``Hound Dog`` accepted ``Various artists Suno`` /
+        ``Black leather (The hound dog mix)`` — artist axis 85.7 (shared
+        ``various artists`` cluster), title axis 100 (``hound dog`` ⊂ candidate).
+        Both cleared 80/80, caching an AI-spam track's URL. Must now reject."""
+        client = _client(es256_keypair)
+        suno_spam = _make_song_data(
+            name="Black leather (The hound dog mix)",
+            artist_name="Various artists Suno",
+            url="https://music.apple.com/us/song/black-leather/999",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([suno_spam]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata("Various Artists - Blues", "Hound Dog", album=None)
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_retains_legitimate_title_suffix_subset(self, es256_keypair):
+        """No-regression: a candidate whose title differs only by a recognized
+        variant/reissue suffix (``Back, Baby`` vs ``Back, Baby (Remastered)``)
+        is a *legitimate* subset — ``score_match_track`` strips the suffix and
+        the sides match. The guard must not reject it."""
+        client = _client(es256_keypair)
+        reissue = _make_song_data(
+            name="Back, Baby (Remastered)",
+            artist_name="Jessica Pratt",
+            album_name="On Your Own Love Again",
+            url="https://music.apple.com/us/song/back-baby/123",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([reissue]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata("Jessica Pratt", "Back, Baby", album=None)
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/back-baby/123"
+
+    @pytest.mark.asyncio
+    async def test_retains_artist_leader_ensemble_subset(self, es256_keypair):
+        """No-regression: the fix is title-axis only. The artist axis keeps
+        ``token_set_ratio`` so a leader->ensemble subset (``J. Mascis`` ->
+        ``J Mascis + The Fog``, artist token_set 100) still matches when the
+        title genuinely agrees. Pins that the guard didn't leak onto the
+        artist axis the ``Yves`` -> ``Yves Tumor`` floor exists to admit."""
+        client = _client(es256_keypair)
+        ensemble = _make_song_data(
+            name="Little Fury Things",
+            artist_name="J Mascis + The Fog",
+            url="https://music.apple.com/us/song/little-fury-things/321",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([ensemble]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata("J. Mascis", "Little Fury Things", album=None)
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/little-fury-things/321"
+
+
 class TestFindTrackMetadataEmits:
     """LML#592: the Apple track probe (``token_set_ratio``) emits match
     telemetry for the winner under ``surface="track"``.
