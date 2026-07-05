@@ -1,9 +1,10 @@
 """Pure matching predicates, filters, and score floors for the lookup pipeline.
 
 Leaf module: no service handles, no I/O, no async. Everything here operates on
-already-fetched values (`LibraryItem` rows, parsed request fields, title
-strings), so it can be imported from any layer of `lookup/` — and unit-tested
-without mocks. Extracted verbatim from ``lookup/orchestrator.py`` (LML#723).
+already-fetched value objects (`LibraryItem` rows, Discogs `ReleaseInfo`
+models, parsed request fields, title strings), so it can be imported from any
+layer of `lookup/` — and unit-tested without mocks. Extracted verbatim from
+``lookup/orchestrator.py`` (LML#723).
 """
 
 import logging
@@ -289,9 +290,10 @@ def _va_series_title_match(query_lower: str, item: LibraryItem) -> bool:
 
     The library files V/A compilations under a terse ``<base>, vol. N`` series
     identifier (filing convention preserved in ``library.artist_name``), while
-    Discogs returns the canonical release with a long descriptive subtitle. Neither the prefix branch nor the
-    length-sensitive ``fuzz.ratio`` branch of ``album_title_acceptable`` can
-    bridge that asymmetry, so V/A series rows stay hidden.
+    Discogs returns the canonical release with a long descriptive subtitle.
+    Neither the prefix branch nor the length-sensitive ``fuzz.ratio`` branch
+    of ``album_title_acceptable`` can bridge that asymmetry, so V/A series
+    rows stay hidden.
 
     This accepts when:
 

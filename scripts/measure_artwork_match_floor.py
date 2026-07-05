@@ -58,11 +58,10 @@ from discogs.cache_service import DiscogsCacheService
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
 from discogs.service import DiscogsService
 from library.db import LibraryDB
+from lookup.matching import is_self_titled, map_library_format_to_discogs
 from lookup.orchestrator import (
     COMPILATION_ARTIST_CANONICAL_FORM,
     COMPILATION_ARTIST_SEARCH_FORM,
-    is_self_titled,
-    map_library_format_to_discogs,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
