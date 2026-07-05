@@ -309,6 +309,40 @@ def is_acceptable_match(artist_score: float, title_score: float) -> bool:
     )
 
 
+def title_subset_is_degenerate(query_title: str, candidate_title: str) -> bool:
+    """True when a title's ``token_set_ratio`` clear is pure subset-inflation (LML#719).
+
+    ``token_set_ratio`` returns 100 whenever one side's tokens are a subset of
+    the other's, regardless of how much unrelated material the longer side
+    carries. So a short generic query title (``Hound Dog``) buried inside a long
+    *unrelated* candidate (``Black leather (The hound dog mix)``) clears the
+    acceptance floor with no real title agreement — fatal on Various-Artists
+    requests, where the artist axis can't disambiguate and the title is normally
+    the only signal (LML#638 / LML#592).
+
+    A *legitimate* subset, by contrast, differs only by a recognized
+    variant/reissue suffix (``la paradoja`` vs ``la paradoja (Live)``) — material
+    that ``score_match_track`` strips before scoring, leaving the two sides equal.
+    That makes the two separable by ``score_match_track`` (suffix-strip +
+    ``token_sort_ratio``):
+
+    * degenerate:  ``Hound Dog`` vs ``Black leather (The hound dog mix)`` -> 42.9
+    * legitimate:  ``la paradoja`` vs ``la paradoja (Live)``             -> 100
+    * legitimate:  ``Back, Baby`` vs ``Back, Baby (Remastered)``         -> 100
+
+    Returns True (degenerate — reject) when the pair falls below the acceptance
+    floor under ``score_match_track``. A caller scoring the title axis with
+    ``token_set_ratio`` should reject any candidate for which this returns True
+    *after* it has cleared the ``token_set_ratio`` floor. Callers that score the
+    title axis with ``token_sort``/``score_match`` already can't subset-inflate,
+    so they need no guard. Applies to the *title* axis only — the artist axis
+    keeps ``token_set_ratio`` on purpose (``Yves`` -> ``Yves Tumor``,
+    ``J. Mascis`` -> ``J Mascis + The Fog`` are legitimate leader->ensemble
+    subsets the floor exists to admit).
+    """
+    return score_match_track(query_title, candidate_title) < SCORE_MATCH_ACCEPTANCE_FLOOR
+
+
 # LML#592 telemetry bands. The 80/80 floor admits organic short-name artist
 # collisions on a shared album title ("Wand" vs "Wanda" scores 88.89 against
 # an identical title at 100). These bands classify the *signature* of such a

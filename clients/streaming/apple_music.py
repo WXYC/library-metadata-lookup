@@ -49,6 +49,7 @@ from clients.streaming.matching import (
     SCORE_MATCH_ACCEPTANCE_FLOOR,
     find_best_source_match,
     record_match_telemetry,
+    title_subset_is_degenerate,
 )
 from streaming.models import SourceMatch
 
@@ -411,6 +412,17 @@ class AppleMusicClient(BaseStreamingClient):
                 norm_song, normalize_for_comparison(attrs.get("name") or "")
             )
             if artist_score < _APPLE_MUSIC_MATCH_FLOOR or track_score < _APPLE_MUSIC_MATCH_FLOOR:
+                continue
+            # LML#719: token_set_ratio returns 100 for any token-subset, so a
+            # short generic query title buried in a long unrelated candidate
+            # clears the floor with no real signal — fatal on Various-Artists
+            # requests where the artist axis can't disambiguate (a `Various
+            # Artists` request shares the `various artists` token cluster with
+            # any VA-credited catalog spam). Reject the title axis's degenerate
+            # subsets while keeping the legitimate variant subsets the
+            # token_set path exists to admit. Title axis only — the artist axis
+            # keeps token_set for leader->ensemble subsets (Yves -> Yves Tumor).
+            if title_subset_is_degenerate(song, attrs.get("name") or ""):
                 continue
             if norm_album is not None:
                 album_score = fuzz.token_set_ratio(

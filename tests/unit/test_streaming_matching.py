@@ -15,6 +15,7 @@ from clients.streaming.matching import (
     strip_format_suffix,
     strip_the_prefix,
     strip_track_suffix,
+    title_subset_is_degenerate,
 )
 
 
@@ -366,6 +367,39 @@ class TestIsAcceptableMatch:
 
     def test_both_below_threshold_rejected(self):
         assert is_acceptable_match(50.0, 50.0) is False
+
+
+class TestTitleSubsetIsDegenerate:
+    """LML#719: the title-axis guard for ``token_set_ratio`` matchers. Separates
+    a *degenerate* subset (short generic query buried in a long unrelated
+    candidate, ``token_set_ratio`` == 100 with no real signal) from a *legitimate*
+    one (differs only by a recognized variant/reissue suffix). The boundary is
+    ``score_match_track`` (suffix-strip + ``token_sort_ratio``) below the floor.
+    """
+
+    def test_rejects_generic_title_buried_in_unrelated_candidate(self):
+        # The production bug: `hound dog` ⊂ `black leather (the hound dog mix)`
+        # scores token_set 100 but score_match_track 42.9.
+        assert title_subset_is_degenerate("Hound Dog", "Black leather (The hound dog mix)") is True
+
+    def test_retains_variant_suffix_subset_live(self):
+        # `(Live)` is stripped by score_match_track → the sides match.
+        assert title_subset_is_degenerate("la paradoja", "la paradoja (Live)") is False
+
+    def test_retains_variant_suffix_subset_remaster(self):
+        assert title_subset_is_degenerate("Back, Baby", "Back, Baby (Remastered)") is False
+
+    def test_retains_feat_suffix_subset(self):
+        assert (
+            title_subset_is_degenerate("Call Your Name", "Call Your Name (feat. Someone)") is False
+        )
+
+    def test_retains_leading_stopword_drop(self):
+        # DJ typed a shortened form dropping a leading article — not degenerate.
+        assert title_subset_is_degenerate("Sentimental Mood", "In a Sentimental Mood") is False
+
+    def test_identical_titles_not_degenerate(self):
+        assert title_subset_is_degenerate("Back, Baby", "Back, Baby") is False
 
 
 class TestStripDiscogsSuffix:
