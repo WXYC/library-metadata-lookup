@@ -80,7 +80,7 @@ The runtime schema lives in the discogs-cache PG, owned by the discogs-cache rep
            # No re-raise: the cache layer's get/set will catch and degrade gracefully.
    ```
 
-   This matches the existing posture in `lookup/orchestrator.py` for the resolver pre-pass (degrade to no-op when PG is unavailable). The cache service's `get`/`set` wrap their queries in `try/except` and return "miss" on any PG error, so a bootstrap failure doesn't break /lookup — the post-process just becomes one extra Apple API call per request, same as today. Mirrors the integration-test fixture pattern at `tests/integration/conftest.py::set_up_entity_schema`.
+   This matches the existing posture in `lookup/artist_resolution.py` (né `lookup/orchestrator.py`) for the resolver pre-pass (degrade to no-op when PG is unavailable). The cache service's `get`/`set` wrap their queries in `try/except` and return "miss" on any PG error, so a bootstrap failure doesn't break /lookup — the post-process just becomes one extra Apple API call per request, same as today. Mirrors the integration-test fixture pattern at `tests/integration/conftest.py::set_up_entity_schema`.
 3. **Cache service**: new module `entity/apple_music_album_cache.py` exporting:
    - `async def set_up_apple_music_cache_schema(pg) -> None` — idempotent `CREATE TABLE IF NOT EXISTS`, called from the startup hook above.
    - `async def get(pg, artist: str, album: str) -> CacheResult` — returns `(url: str | None, is_known_miss: bool, is_stale: bool)`. `is_stale` honors the 7d miss TTL.
