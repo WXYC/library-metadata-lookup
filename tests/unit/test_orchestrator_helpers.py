@@ -30,7 +30,6 @@ from generated.api_models import (
 )
 from lookup.matching import artist_matches_item, filter_results_by_artist
 from lookup.orchestrator import (
-    ROWLESS_LIBRARY_ID,
     ROWLESS_NO_ALBUM_CONFIDENCE,
     _resolve_fallback_artwork,
     build_context_message,
@@ -44,6 +43,7 @@ from lookup.orchestrator import (
     search_with_alternative_interpretation,
 )
 from lookup.release_resolution import ResolvedRelease
+from lookup.rowless import ROWLESS_LIBRARY_ID
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_discogs_result, make_library_item
 

@@ -56,7 +56,8 @@ from lookup.models import (
     LookupRequest,
     LookupResponse,
 )
-from lookup.orchestrator import NONLIBRARY_RELEASE_SURFACED_STAT_KEY, perform_lookup
+from lookup.orchestrator import perform_lookup
+from lookup.rowless import NONLIBRARY_RELEASE_SURFACED_STAT_KEY
 from lookup.streaming_url_postprocess import set_suppress_streaming_warm
 from streaming.dependencies import (
     get_apple_music_client,
