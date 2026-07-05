@@ -18,8 +18,9 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from discogs.cache_service import DiscogsCacheService
-from lookup.orchestrator import CANONICAL_ARTIST_SIMILARITY_FLOOR, resolve_canonical_artist
+from lookup.artist_resolution import resolve_canonical_artist
 
 DATABASE_URL = os.environ.get("DATABASE_URL_DISCOGS")
 pytestmark = [

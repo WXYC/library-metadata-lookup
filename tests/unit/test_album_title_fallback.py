@@ -20,8 +20,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from discogs.models import ReleaseInfo, TrackReleasesResponse
-from lookup.orchestrator import CANONICAL_ARTIST_SIMILARITY_FLOOR, search_compilations_for_track
+from lookup.orchestrator import search_compilations_for_track
 from services.parser import ParsedRequest
 from tests.factories import make_library_item
 

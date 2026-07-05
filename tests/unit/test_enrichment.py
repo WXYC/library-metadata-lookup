@@ -2854,7 +2854,7 @@ class TestArtistIdentitySplitGate:
             urls=["https://en.wikipedia.org/wiki/Noura_Mint_Seymali"],
         )
 
-        with patch("lookup.orchestrator.sentry_sdk.add_breadcrumb") as mock_breadcrumb:
+        with patch("lookup.artist_resolution.sentry_sdk.add_breadcrumb") as mock_breadcrumb:
             await enrich_artwork_results(
                 [(item, tzenni_artwork)],
                 discogs_service,
@@ -3274,7 +3274,7 @@ class TestArtistIdentitySplitGate:
                     "os.environ",
                     {"LML_ARTIST_IDENTITY_SPLIT_GATE": flag_value},
                 ),
-                patch("lookup.orchestrator.sentry_sdk.add_breadcrumb") as mock_breadcrumb,
+                patch("lookup.artist_resolution.sentry_sdk.add_breadcrumb") as mock_breadcrumb,
             ):
                 await enrich_artwork_results(
                     [(item, tzenni_artwork)],
@@ -3475,7 +3475,7 @@ class TestArtistIdentitySplitGate:
             urls=["https://en.wikipedia.org/wiki/Stereolab"],
         )
 
-        with patch("lookup.orchestrator.sentry_sdk.add_breadcrumb") as mock_breadcrumb:
+        with patch("lookup.artist_resolution.sentry_sdk.add_breadcrumb") as mock_breadcrumb:
             await enrich_artwork_results(
                 [(item, artwork)],
                 discogs_service,
