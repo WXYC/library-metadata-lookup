@@ -395,7 +395,7 @@ class LibraryDB:
         album title is the most reliable signal of a library row, and the FTS5
         path otherwise truncates by rowid and can drop exact-title matches
         whose row was added later in the catalog (see
-        ``lookup.orchestrator.search_album_fuzzy``).
+        ``lookup.strategies.track_release_matching.search_album_fuzzy``).
 
         Returns every match — no implicit ``LIMIT``. Library rows are
         intrinsically bounded by catalog conventions (high-collision titles

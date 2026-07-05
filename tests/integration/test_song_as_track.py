@@ -27,7 +27,7 @@ import pytest_asyncio
 from discogs.cache_service import DiscogsCacheService
 from discogs.service import DiscogsService
 from generated.api_models import TrackMatchSource
-from lookup.orchestrator import search_song_as_track
+from lookup.strategies.song_as_track import search_song_as_track
 
 DATABASE_URL = os.environ.get("DATABASE_URL_DISCOGS")
 pytestmark = [

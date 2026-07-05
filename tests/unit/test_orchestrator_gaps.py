@@ -9,12 +9,12 @@ from lookup.orchestrator import (
     fetch_artwork_for_items,
     filter_results_by_track_validation,
     resolve_albums_for_track,
-    search_album_fuzzy,
     search_compilations_for_track,
     search_library_with_fallback,
     search_song_as_artist,
-    search_with_alternative_interpretation,
 )
+from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
+from lookup.strategies.track_release_matching import search_album_fuzzy
 from services.parser import ParsedRequest
 from tests.factories import make_discogs_result
 from tests.factories import make_library_item as _item

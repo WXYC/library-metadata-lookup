@@ -1,4 +1,4 @@
-"""Behavior tests for ``lookup.orchestrator.search_album_fuzzy``.
+"""Behavior tests for ``lookup.strategies.track_release_matching.search_album_fuzzy``.
 
 The reproducer comes from a real lookup miss: ``Tenant by Siouxsie and the
 Banshees``. The library has three releases literally titled "Kaleidoscope"
@@ -30,7 +30,8 @@ import pytest
 from discogs.models import DiscogsSearchResponse, ReleaseInfo, TrackReleasesResponse
 from library.db import LibraryDB
 from lookup.models import LookupRequest
-from lookup.orchestrator import perform_lookup, search_album_fuzzy
+from lookup.orchestrator import perform_lookup
+from lookup.strategies.track_release_matching import search_album_fuzzy
 from tests.conftest import make_lml_telemetry
 
 

@@ -16,7 +16,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from discogs.models import ReleaseInfo, TrackReleasesResponse
-from lookup.orchestrator import search_album_fuzzy, search_compilations_for_track
+from lookup.orchestrator import search_compilations_for_track
+from lookup.strategies.track_release_matching import search_album_fuzzy
 from services.parser import ParsedRequest
 
 
