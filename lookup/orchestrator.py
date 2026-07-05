@@ -7,11 +7,8 @@ track validation -> artwork fetch -> metadata enrichment -> context message.
 
 import asyncio
 import logging
-import os
-import random
 import re
 from collections.abc import Coroutine
-from dataclasses import dataclass
 from functools import partial
 from typing import Any
 from urllib.parse import quote
@@ -48,7 +45,6 @@ from discogs.markup_parser import (
     parse,
     parse_async,
 )
-from discogs.memory_cache import create_ttl_cache, should_skip_cache
 from discogs.models import (
     ArtistDetails,
     DiscogsSearchRequest,
@@ -75,6 +71,17 @@ from generated.api_models import (
 )
 from library.db import STOPWORDS, LibraryDB
 from library.models import LibraryItem
+from lookup.artist_resolution import (
+    ResolverOutcome,
+    _artist_identity_split_gate_enabled,
+    _artist_pair_verified,
+    _log_artist_identity_split_gate,
+    _log_release_resolution_bind,
+    _log_resolver_pre_pass,
+    _mb_rescue_song_match_required,
+    _project_mb_rescue_attrs,
+    resolve_canonical_artist,
+)
 from lookup.concurrency import _chunked_gather
 from lookup.external_search import (
     search_external_albums,
@@ -167,187 +174,6 @@ https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
 """
 
 
-_ARTIST_IDENTITY_SPLIT_GATE_ENV_VAR = "LML_ARTIST_IDENTITY_SPLIT_GATE"
-"""When set to any common false spelling (``false``, ``0``, ``no``, ``off``,
-``disabled``), the LML#504 artist-scoped gate is bypassed and ``artist_bio`` /
-``wikipedia_url`` / ``profile_tokens`` revert to the broader
-``is_album_derived_eligible`` predicate. Emergency rollback only — default
-is ``true`` (on)."""
-
-_FALSE_FLAG_VALUES: frozenset[str] = frozenset({"false", "0", "no", "off", "disabled"})
-"""Strings (case-insensitive, whitespace-trimmed) that disable a default-on
-boolean env flag. Mirrors the wider Pydantic ``BoolField`` accept-set so an
-operator typing the same value across knobs gets the same result."""
-
-
-def _artist_identity_split_gate_enabled() -> bool:
-    """Read the rollback flag at request time (no Settings indirection) so the
-    knob can be flipped via Railway env vars without a redeploy. See
-    ``LML_ARTIST_IDENTITY_SPLIT_GATE`` in ``docs/env-vars.md``."""
-    raw = os.getenv(_ARTIST_IDENTITY_SPLIT_GATE_ENV_VAR)
-    if raw is None:
-        return True
-    return raw.strip().lower() not in _FALSE_FLAG_VALUES
-
-
-_MB_RESCUE_REQUIRE_SONG_MATCH_ENV_VAR = "LML_MB_RESCUE_REQUIRE_SONG_MATCH"
-"""When set to any common false spelling (``false``, ``0``, ``no``, ``off``,
-``disabled``), the LML#506 post-rescue song-sanity check is bypassed and the
-MB tracklist is surfaced unconditionally — reverting to the pre-LML#506
-``LIMIT 1``-trust behaviour. Emergency rollback only — default is ``true``
-(on)."""
-
-
-def _mb_rescue_song_match_required() -> bool:
-    """Read the LML#506 rollback flag at request time. See
-    ``LML_MB_RESCUE_REQUIRE_SONG_MATCH`` in ``docs/env-vars.md``."""
-    raw = os.getenv(_MB_RESCUE_REQUIRE_SONG_MATCH_ENV_VAR)
-    if raw is None:
-        return True
-    return raw.strip().lower() not in _FALSE_FLAG_VALUES
-
-
-def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
-    """Score-floor + V/A guard for one (request, candidate-artist) hop.
-
-    Returns True iff:
-
-    * ``query_stripped`` is non-empty (caller has already stripped),
-    * ``candidate`` is a non-empty string after stripping disambiguation
-      suffixes (``Stereolab (2)`` → ``Stereolab``) and surrounding whitespace,
-    * ``score_match(query, candidate)`` meets the shared acceptance floor, and
-    * ``candidate`` is not a compilation/V-A alias.
-
-    The disambiguation strip is applied symmetrically to BOTH sides — Discogs
-    assigns ``(N)`` / ``(UK)`` / ``(band)`` suffixes for any artist name with
-    collisions, and a caller may pre-resolve the request artist to its
-    canonical Discogs form (e.g. via the LML resolver pre-pass), arriving
-    here with the suffix intact. Stripping the query side too keeps the
-    helper agnostic to whether the request value was a raw user input or a
-    canonicalized Discogs identifier. Verified empirically: ``Sessa`` vs
-    ``Sessa (2)`` = 71.43, ``Stereolab`` vs ``Stereolab (UK)`` = 78.26 — both
-    fail the 80 floor without the strip; both pass after symmetric strip.
-    """
-    if not query_stripped:
-        return False
-    if not isinstance(candidate, str):
-        return False
-    candidate_stripped = strip_discogs_disambig(candidate).strip()
-    if not candidate_stripped:
-        return False
-    if is_compilation_artist(candidate_stripped):
-        return False
-    query_stripped_canonical = strip_discogs_disambig(query_stripped).strip()
-    if not query_stripped_canonical:
-        return False
-    return score_match(query_stripped_canonical, candidate_stripped) >= SCORE_MATCH_ACCEPTANCE_FLOOR
-
-
-CANONICAL_ARTIST_SIMILARITY_FLOOR: float = 0.70
-"""Trigram-similarity floor for swapping an inbound artist name with its canonical
-Discogs form.
-
-Provisional. Replaced by the offline calibration sweep produced by
-``scripts.resolver_calibration`` against the WXYC discogs-cache; see
-``docs/resolver-calibration/README.md`` for the chosen value and its FP-rate
-tolerance (target ≤ 0.5%). See WXYC/library-metadata-lookup#318.
-"""
-
-_resolver_cache = create_ttl_cache(maxsize=512, ttl=300)
-"""TTL cache for ``resolve_canonical_artist``. Keyed on the diacritic-stripped,
-lowercased input so equivalent strings within a burst share one PG round-trip.
-Registered with the global cache registry so ``clear_all_caches()`` resets it.
-"""
-
-
-@dataclass(frozen=True)
-class ResolverOutcome:
-    """Result of the canonical-artist resolver pre-pass.
-
-    Attributes:
-        original: The input artist string as received from the caller.
-        canonical: The canonical Discogs artist name when ``swapped`` is True;
-            otherwise identical to ``original``.
-        score: Trigram similarity score of the top cache candidate (0.0-1.0).
-            ``0.0`` when no candidate was found.
-        swapped: Whether ``canonical`` differs from ``original`` and met the
-            similarity floor. Callers use this to decide whether to forward
-            ``canonical`` into downstream Discogs probes.
-    """
-
-    original: str
-    canonical: str
-    score: float
-    swapped: bool
-
-
-async def resolve_canonical_artist(
-    artist: str,
-    *,
-    cache_service: DiscogsCacheService | None,
-) -> ResolverOutcome:
-    """Resolve ``artist`` to the canonical Discogs name when confidence allows.
-
-    Runs a trigram fuzzy search against ``artist`` + ``artist_name_variation``
-    in the discogs-cache PG database. When the top score meets
-    ``CANONICAL_ARTIST_SIMILARITY_FLOOR``, returns a ``ResolverOutcome`` with
-    ``swapped=True`` and the canonical name; otherwise returns the original
-    input with ``swapped=False``. Results are memoized in-process keyed on the
-    diacritic-stripped lowercased input.
-
-    Failure modes (no cache, empty input, PG error) all degrade to
-    ``swapped=False`` so the resolver never breaks /lookup.
-
-    See WXYC/library-metadata-lookup#318.
-    """
-    original = artist or ""
-
-    if not original.strip():
-        return ResolverOutcome(original=original, canonical=original, score=0.0, swapped=False)
-
-    if cache_service is None:
-        return ResolverOutcome(original=original, canonical=original, score=0.0, swapped=False)
-
-    cache_key = normalize_for_comparison(original)
-
-    if not should_skip_cache():
-        cached = _resolver_cache.get(cache_key)
-        if cached is not None:
-            get_cache_stats_recorder().record_memory_cache_hit()
-            return ResolverOutcome(
-                original=original,
-                canonical=cached.canonical,
-                score=cached.score,
-                swapped=cached.swapped,
-            )
-        get_cache_stats_recorder().record_memory_cache_miss()
-
-    try:
-        candidates = await cache_service.search_artists_by_name(original, limit=5)
-    except Exception as e:
-        logger.warning("resolver_pre_pass cache lookup failed for %r: %s", original, e)
-        return ResolverOutcome(original=original, canonical=original, score=0.0, swapped=False)
-
-    if not candidates:
-        outcome = ResolverOutcome(original=original, canonical=original, score=0.0, swapped=False)
-        _resolver_cache[cache_key] = outcome
-        return outcome
-
-    top = candidates[0]
-    score = float(top.get("score", 0.0))
-    candidate_name = top.get("name") or original
-    swapped = score >= CANONICAL_ARTIST_SIMILARITY_FLOOR
-
-    outcome = ResolverOutcome(
-        original=original,
-        canonical=candidate_name if swapped else original,
-        score=score,
-        swapped=swapped,
-    )
-    _resolver_cache[cache_key] = outcome
-    return outcome
-
-
 def _log_album_title_fallback(
     *,
     album: str,
@@ -384,203 +210,6 @@ def _log_album_title_fallback(
             transaction.set_data("album_title_fallback", payload)
     except Exception as e:
         logger.warning("Failed to project album_title_fallback onto Sentry transaction: %s", e)
-
-
-def _log_release_resolution_bind(
-    *,
-    song: str,
-    artist: str,
-    album: str | None,
-    bound: bool,
-    release_id: int | None,
-) -> None:
-    """Emit telemetry each time the lazy release-resolution fallback fires (LML#604).
-
-    An INFO log line plus an accumulating Sentry breadcrumb (``category:
-    release_resolution_bind``). Logged on every fire (whether or not it bound)
-    so the trace explorer can answer "what fraction of lookups trigger the
-    compilation fallback, and what's its bind rate?" — the adoption + Discogs-
-    cost signal for the staged rollout — without re-pulling Railway logs.
-
-    This is a *per-item* event (``fetch_one`` fires it once per library row that
-    reaches the fallback), so it uses ``add_breadcrumb`` like the per-call
-    ``_log_track_validation`` — NOT ``transaction.set_data`` with a fixed key,
-    which would last-write-win across multiple items binding in one request and
-    undercount the fire/bind rate. Any SDK error is swallowed so observability
-    never breaks /lookup.
-    """
-    payload: dict[str, Any] = {
-        "song": song,
-        "artist": artist,
-        "album": album,
-        "bound": bound,
-        "release_id": release_id,
-    }
-    logger.info("release_resolution_bind %s", payload)
-    try:
-        sentry_sdk.add_breadcrumb(
-            category="release_resolution_bind",
-            level="info",
-            data=payload,
-        )
-    except Exception as e:
-        logger.warning("Failed to add release_resolution_bind breadcrumb: %s", e)
-
-
-def _project_mb_rescue_attrs(
-    *,
-    attempted: bool,
-    tracklist_found: bool,
-    song_sanity_checked: bool = False,
-    song_sanity_rejected: bool = False,
-) -> None:
-    """Project MusicBrainz tracklist-rescue outcome onto the active Sentry trace.
-
-    Called from the synth path only when the rescue was eligible (top-1 +
-    extended + ``mb_pg`` set + non-empty artist + non-empty album), so the
-    trace gets an attr per eligible call — non-eligible lookups never emit
-    the boolean, keeping the trace explorer's filter on ``attempted=true``
-    informative.
-
-    The LML#506 song-sanity check has THREE outcomes, projected via two
-    booleans so they're independently filterable:
-
-    * ``song_sanity_checked=False, song_sanity_rejected=False`` — the
-      check was skipped. Three distinct scenarios collapse onto this
-      pair: (a) the request had no ``song`` (artist+album picker call),
-      (b) the rollback flag was off, OR (c) the resolver returned no
-      candidate at all (``tracklist_found=False``). To split (c) from
-      (a)+(b), join with ``tracklist_found`` and / or
-      ``lookup.mb_resolver.returned_album`` in the trace explorer.
-    * ``song_sanity_checked=True, song_sanity_rejected=False`` — the
-      check ran and the requested song appeared in the rescued
-      tracklist. Happy path.
-    * ``song_sanity_checked=True, song_sanity_rejected=True`` — the
-      check ran and dropped the tracklist (likely sibling-release leak,
-      bonus-only-track Deluxe cohort). Distinct from
-      ``tracklist_found=False`` (resolver returned nothing) so the trace
-      explorer can split the rejection cohort from the no-candidate
-      cohort.
-
-    Silent on Sentry SDK errors; observability never breaks /lookup.
-    """
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("lookup.mb_rescue.attempted", attempted)
-            transaction.set_data("lookup.mb_rescue.tracklist_found", tracklist_found)
-            transaction.set_data("lookup.mb_rescue.song_sanity_checked", song_sanity_checked)
-            transaction.set_data("lookup.mb_rescue.song_sanity_rejected", song_sanity_rejected)
-    except Exception as e:
-        logger.warning("Failed to project mb_rescue attrs onto Sentry transaction: %s", e)
-
-
-def _log_resolver_pre_pass(outcome: ResolverOutcome, *, actual_swap: bool) -> None:
-    """Emit shadow-mode telemetry for the resolver pre-pass.
-
-    Runs unconditionally — regardless of the enforcement flag — so the
-    queryable shadow dataset accumulates in production from day one and the
-    floor can be re-calibrated against real traffic without a code change.
-
-    ``actual_swap`` is what the orchestrator actually did this request
-    (``outcome.swapped AND lml_resolve_artist_canonical``). ``would_swap`` is
-    the resolver's recommendation independent of the flag — what the swap
-    decision *would* be if the flag were enabled. Filtering Sentry traces on
-    ``data.resolver_pre_pass.would_swap=true`` while the flag is off is the
-    shadow dataset; ``swapped`` is non-zero only after the flag flips.
-
-    Two surfaces:
-
-    1. Structured INFO log line for log-pipeline tools.
-    2. ``set_data("resolver_pre_pass", ...)`` on the active Sentry
-       transaction, mirroring ``lookup/router._project_cache_stats_to_transaction``.
-       No-op when there is no active transaction. Any Sentry SDK error is
-       swallowed so observability cannot break /lookup.
-    """
-    if not outcome.original.strip():
-        return
-    payload = {
-        "original": outcome.original,
-        "candidate": outcome.canonical,
-        "score": outcome.score,
-        "swapped": actual_swap,
-        "would_swap": outcome.swapped,
-    }
-    logger.info("resolver_pre_pass %s", payload)
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("resolver_pre_pass", payload)
-    except Exception as e:
-        logger.warning("Failed to project resolver_pre_pass onto Sentry transaction: %s", e)
-
-
-def _log_artist_identity_split_gate(
-    *,
-    library_row_acceptable: bool,
-    artist_identity_verified: bool,
-    library_row_artist_verified: bool,
-    release_side_artist_verified: bool,
-    release_anchor_present: bool,
-    use_split_gate: bool,
-    sample_rate: float = 0.01,
-) -> None:
-    """Emit shadow-mode telemetry when LML#504's artist-identity gate
-    diverges from the legacy ``library_row_acceptable`` gate.
-
-    Fires on actual divergence in bio-surfacing intent — not on raw
-    predicate differences — so artist-only and V/A lookups (where the
-    predicates trivially diverge without affecting the response shape)
-    don't flood the signal. Runs *regardless of* ``use_split_gate`` so
-    the rollback flag preserves the divergence dataset needed to plan
-    re-enablement; ``data.use_split_gate=false`` filters the rollback
-    population.
-
-    Three surfaces (matching ``_log_resolver_pre_pass``):
-
-    1. ``set_data("artist_identity_split_gate", ...)`` on the active Sentry
-       transaction — queryable in the trace explorer at production rate.
-    2. ``add_breadcrumb`` for events that get captured (errors/sampled
-       transactions).
-    3. Structured INFO log on a 1% sample — cheap Railway-log grep target.
-
-    All SDK exceptions swallowed; same pattern as the other ``_log_*``
-    helpers in this module.
-    """
-    # The two terminal verdicts (``library_row_acceptable`` = legacy gate's
-    # bio decision; ``artist_identity_verified`` = new gate's decision)
-    # are sufficient to compute "would surface" / "would suppress" in any
-    # downstream query — XOR them. Keeping derivable fields out of the
-    # payload prevents Sentry breadcrumb size bloat at BS write-path scale
-    # and makes the contract crisp: two verdicts, three diagnostic flags
-    # explaining how each side reached its decision.
-    payload: dict[str, Any] = {
-        "library_row_acceptable": library_row_acceptable,
-        "artist_identity_verified": artist_identity_verified,
-        "library_row_artist_verified": library_row_artist_verified,
-        "release_side_artist_verified": release_side_artist_verified,
-        "release_anchor_present": release_anchor_present,
-        "use_split_gate": use_split_gate,
-    }
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None:
-            transaction.set_data("artist_identity_split_gate", payload)
-    except Exception as e:
-        logger.warning(
-            "Failed to project artist_identity_split_gate onto Sentry transaction: %s", e
-        )
-    try:
-        sentry_sdk.add_breadcrumb(
-            category="artist_identity_split_gate",
-            level="info",
-            data=payload,
-        )
-    except Exception as e:
-        logger.warning("Failed to add artist_identity_split_gate breadcrumb: %s", e)
-
-    if random.random() < sample_rate:
-        logger.info("artist_identity_split_gate %s", payload)
 
 
 async def resolve_albums_for_track(

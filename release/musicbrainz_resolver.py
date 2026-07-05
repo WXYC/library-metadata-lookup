@@ -29,6 +29,7 @@ from typing import Any
 
 import sentry_sdk
 
+from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from entity.sources import PgSourceProtocol
 from generated.api_models import DiscogsTrackItem
 
@@ -56,14 +57,6 @@ def _project_resolver_attrs(*, requested_album: str | None, returned_album: str 
     except Exception as e:
         logger.warning("Failed to project mb_resolver attrs onto Sentry transaction: %s", e)
 
-
-# Matches `CANONICAL_ARTIST_SIMILARITY_FLOOR` in ``lookup/orchestrator.py``.
-# Kept duplicated rather than imported to avoid a circular import with the
-# orchestrator (which imports this module). Bump both together on calibration.
-# False-positive tracklists are worse than no tracklist — the DJ types the
-# correct tracks in 10s either way, but a wrong tracklist gets unknowingly
-# committed to the flowsheet.
-_SIMILARITY_FLOOR: float = 0.70
 
 # Hard ceiling on the PG round trip. The rescue fires inside
 # ``enrich_artwork_results``, AFTER the cascade's ``LML_SEARCH_HARD_TIMEOUT_MS``
@@ -139,7 +132,7 @@ async def resolve_tracklist_via_musicbrainz(
     - ``artist`` or ``album`` is blank
     - PG returns zero rows (no candidate cleared the trigram cutoff)
     - the winning candidate's artist or album similarity is below
-      ``_SIMILARITY_FLOOR``
+      ``CANONICAL_ARTIST_SIMILARITY_FLOOR``
     - the PG query raises (logged at WARN; never re-raised)
     """
     if mb_pg is None:
@@ -195,7 +188,13 @@ async def resolve_tracklist_via_musicbrainz(
     # two values are easier to query than three-from-one with overloaded "".
     returned_album_title = first.get("release_title")
     _project_resolver_attrs(requested_album=album, returned_album=returned_album_title)
-    if album_score < _SIMILARITY_FLOOR or artist_score < _SIMILARITY_FLOOR:
+    # False-positive tracklists are worse than no tracklist — the DJ types the
+    # correct tracks in 10s either way, but a wrong tracklist gets unknowingly
+    # committed to the flowsheet.
+    if (
+        album_score < CANONICAL_ARTIST_SIMILARITY_FLOOR
+        or artist_score < CANONICAL_ARTIST_SIMILARITY_FLOOR
+    ):
         logger.info(
             "MB tracklist candidate for (%r, %r) below floor: artist=%.2f album=%.2f",
             artist,
