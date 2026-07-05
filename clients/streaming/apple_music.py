@@ -422,6 +422,17 @@ class AppleMusicClient(BaseStreamingClient):
             # subsets while keeping the legitimate variant subsets the
             # token_set path exists to admit. Title axis only — the artist axis
             # keeps token_set for leader->ensemble subsets (Yves -> Yves Tumor).
+            #
+            # Recall cost (accepted): the guard is unconditional, so a genuine
+            # partial/truncated query title that is a NON-suffix token-subset
+            # (`Fade` -> `Fade Into You`, `Motion` -> `Motion Sickness`) now
+            # drops even when the artist axis is an exact match — these scored
+            # token_set 100 pre-LML#719. This is the fail-safe trade: dropping
+            # Apple enrichment (URL/artwork/year) beats caching a wrong one, and
+            # the loss only bites when the track is ALSO absent from the WXYC
+            # library (the synthesis path is the sole find_track_metadata
+            # caller; in-catalog rows source artwork from the library row, not
+            # this probe). Never alters the DJ's typed artist/song text.
             if title_subset_is_degenerate(song, attrs.get("name") or ""):
                 continue
             if norm_album is not None:
