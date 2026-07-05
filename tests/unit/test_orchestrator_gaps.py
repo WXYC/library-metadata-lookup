@@ -4,9 +4,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from lookup.matching import _va_series_title_match, album_title_acceptable
 from lookup.orchestrator import (
-    _va_series_title_match,
-    album_title_acceptable,
     fetch_artwork_for_items,
     filter_results_by_track_validation,
     resolve_albums_for_track,

@@ -6,7 +6,7 @@ import pytest
 import pytest_asyncio
 
 from library.db import LibraryDB
-from lookup.orchestrator import filter_results_by_artist
+from lookup.matching import filter_results_by_artist
 
 
 class TestAlternateArtistIntegration:
