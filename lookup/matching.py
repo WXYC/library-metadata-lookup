@@ -1,0 +1,386 @@
+"""Pure matching predicates, filters, and score floors for the lookup pipeline.
+
+Leaf module: no service handles, no I/O, no async. Everything here operates on
+already-fetched values (`LibraryItem` rows, parsed request fields, title
+strings), so it can be imported from any layer of `lookup/` — and unit-tested
+without mocks. Extracted verbatim from ``lookup/orchestrator.py`` (LML#723).
+"""
+
+import logging
+import re
+
+from wxyc_etl.text import is_compilation_artist
+from wxyc_etl.text import to_match_form as normalize_for_comparison
+
+from core.text import strip_leading_article
+from discogs.models import ReleaseInfo
+from library.models import LibraryItem
+from services.parser import ParsedRequest
+
+logger = logging.getLogger(__name__)
+
+MAX_SEARCH_RESULTS = 5
+"""Maximum number of results to return from search operations."""
+
+SELF_TITLED_PATTERNS = frozenset({"s/t", "s.t.", "self-titled", "self titled"})
+"""Common abbreviations for self-titled albums (case-insensitive exact match)."""
+
+
+def is_self_titled(title: str) -> bool:
+    """Check if an album title indicates a self-titled release.
+
+    Args:
+        title: Album title to check
+
+    Returns:
+        True if title is a common self-titled abbreviation (e.g. "S/t", "S.T.")
+    """
+    return title.strip().lower() in SELF_TITLED_PATTERNS
+
+
+def map_library_format_to_discogs(fmt: str | None) -> str | None:
+    """Map a WXYC library format value to a Discogs API format parameter.
+
+    Library format values like "cd", "vinyl - 12\\"", "cd x 2" are mapped to
+    the corresponding Discogs search API format terms ("CD", "12\\"", etc.).
+
+    Returns None if the format is not recognized or is empty.
+    """
+    if not fmt:
+        return None
+    normalized = fmt.strip().lower()
+    if normalized.startswith("cdr"):
+        return "CDr"
+    if normalized.startswith("cd"):
+        return "CD"
+    if 'vinyl - 12"' in normalized or "vinyl - 12" in normalized:
+        return '12"'
+    if 'vinyl - 7"' in normalized or "vinyl - 7" in normalized:
+        return '7"'
+    if 'vinyl - 10"' in normalized or "vinyl - 10" in normalized:
+        return '10"'
+    if normalized.startswith("vinyl"):
+        return "Vinyl"
+    return None
+
+
+_FETCH_LIMIT = MAX_SEARCH_RESULTS * 10
+"""Internal fetch limit for FTS queries that are post-filtered by artist.
+
+FTS5 ranks results by term frequency, not by artist-prefix relevance, so the
+target artist's entries may fall outside a tight SQL LIMIT.  Fetching more rows
+ensures enough candidates survive ``filter_results_by_artist`` before we trim
+back to ``MAX_SEARCH_RESULTS``.
+"""
+
+
+def limit_results(results: list) -> list:
+    """Limit results to MAX_SEARCH_RESULTS."""
+    return results[:MAX_SEARCH_RESULTS]
+
+
+def artist_matches_item(item: LibraryItem, artist: str) -> bool:
+    """Check if a library item matches the given artist name.
+
+    Compares against both ``item.artist`` and ``item.alternate_artist_name``.
+    Tolerates a leading-article asymmetry between query and catalog —
+    library catalogers commonly file "The Black Dog" as "Black Dog
+    Productions" while user input and Discogs credits keep the article,
+    and the reverse ("Beatles" vs "The Beatles") also occurs. Both sides
+    are compared as-is first; on miss, both are also compared with the
+    leading article stripped. The stripped path is skipped when stripping
+    leaves the query empty so a bare "The" doesn't match arbitrary rows.
+    """
+    artist_normalized = normalize_for_comparison(artist)
+    artist_no_article = strip_leading_article(artist_normalized)
+
+    for candidate in (item.artist, item.alternate_artist_name):
+        if not candidate:
+            continue
+        cand_normalized = normalize_for_comparison(candidate)
+        if cand_normalized.startswith(artist_normalized):
+            return True
+        if artist_no_article and strip_leading_article(cand_normalized).startswith(
+            artist_no_article
+        ):
+            return True
+    return False
+
+
+def library_artist_for(parsed: ParsedRequest) -> str | None:
+    """The artist name the *library-side* legs should search/match against.
+
+    Library channel of the two-channel seam (WXYC/library-metadata-lookup#626):
+    the fuzzy correction on ``parsed.library_artist`` when present, else the
+    typed ``parsed.artist``. Read by ``db.search`` query construction and the
+    ``artist_matches_item`` match-backs — never by the Discogs-facing probes or
+    ``validate_release_for_track``, which always use the typed ``parsed.artist``.
+    """
+    return parsed.library_artist or parsed.artist
+
+
+def filter_results_by_artist(
+    results: list[LibraryItem],
+    artist: str | None,
+) -> list[LibraryItem]:
+    """Filter library results to only include those matching the artist.
+
+    Requires the searched artist name to appear at the START of the result's
+    artist field (case-insensitive).
+    """
+    if not artist:
+        return results
+
+    filtered = []
+    for item in results:
+        if artist_matches_item(item, artist):
+            filtered.append(item)
+
+    if len(filtered) < len(results):
+        logger.info(
+            f"Filtered {len(results)} results to {len(filtered)} matching artist '{artist}'"
+        )
+
+    return filtered
+
+
+def _release_matches_library_row(release: ReleaseInfo, item: LibraryItem) -> bool:
+    """Predicate: does ``release``'s artist credit match ``item``'s library artist?
+
+    Compilation-aware: for VA releases (``release.is_compilation``), any library
+    row whose artist field is itself a compilation marker (e.g., "Various
+    Artists - Rock - D") qualifies. For non-compilations, the library row's
+    artist must prefix-match the Discogs release artist via the existing
+    ``artist_matches_item`` rules.
+    """
+    if release.is_compilation and is_compilation_artist(item.artist or ""):
+        return True
+    if item.artist and artist_matches_item(item, release.artist):
+        return True
+    return False
+
+
+# Minimum fuzzy score (0-100) for accepting a library-row title as a genuine
+# album match for the DJ-typed album. Mirrors the 80-floor in
+# `clients/streaming/apple_music._APPLE_MUSIC_MATCH_FLOOR` and the
+# streaming-availability batch matcher. When the artist-fallback branches
+# of `search_library_with_fallback` surface a row whose title doesn't clear
+# this floor against the typed album, the row would otherwise carry the
+# matched Discogs release's `release_year` / `apple_music_url` / `spotify_url`
+# / `discogs_url` / `artwork_url` onto a flowsheet row tagged with a
+# completely different album — the contamination shape documented in #400
+# (~184k rows; 16,532 distinct Discogs URLs each attached to many distinct
+# DJ-typed `(artist, album)` pairs). #390 / #398 tightened the result
+# verification; this tightens the LML lookup result itself.
+_ALBUM_MATCH_FLOOR = 80.0
+
+# Lenient artist-overlap backstop for the album-title fallback's
+# ``skip_artist_match_filter=True`` path (``process_release``). That path
+# intentionally drops the strict prefix filter so reordered/collaborative
+# credits (e.g. "Orcutt, Bill / Shelley, Chris / Miller, Mette" for a typed
+# "Orcutt Shelley Miller") still reach ``validate_track_on_release``. But that
+# validator checks the *Discogs release*, not the surfaced *library row*, so a
+# pure album-title fuzz collision can bind a wrong-artist row (the "Galaxy
+# Garden" → "Galaxy to Galaxy" by Galaxy 2 Galaxy case for a "Lone" request).
+# This floor rejects rows whose artist shares essentially no fuzzy overlap with
+# the request. Deliberately far below the usual 70/80 floors: reordered
+# collaborators score ~65 (must survive) while coincidental collisions score
+# ~17 (must drop). Measured on those two anchors; keep the margin if retuning.
+_FALLBACK_ARTIST_SIMILARITY_FLOOR = 40.0
+
+
+def _filter_results_by_album_match(
+    results: list[LibraryItem],
+    album: str | None,
+) -> list[LibraryItem]:
+    """Drop library rows whose title doesn't clear `_ALBUM_MATCH_FLOOR` against
+    the typed album. No-ops when `album` is empty or whitespace-only.
+    """
+    if not album or not album.strip():
+        return results
+    from rapidfuzz import fuzz
+
+    norm_album = normalize_for_comparison(album)
+    kept: list[LibraryItem] = []
+    for item in results:
+        title_norm = normalize_for_comparison(item.title or "")
+        if fuzz.token_set_ratio(norm_album, title_norm) >= _ALBUM_MATCH_FLOOR:
+            kept.append(item)
+    if len(kept) < len(results):
+        logger.info(
+            f"Album-match floor dropped {len(results) - len(kept)} of {len(results)} "
+            f"artist-fallback candidates against typed album '{album}'"
+        )
+    return kept
+
+
+# Minimum fuzzy score for promoting an artist-fallback row whose *title*
+# matches the requested "song" — i.e. recognising the parsed song as the
+# album the user actually wanted. Set higher than `_ALBUM_MATCH_FLOOR`
+# because the consequence here is asserting the user's intent (album,
+# not track); a borderline match should *not* override the song-not-found
+# message.
+_SONG_AS_ALBUM_TITLE_FLOOR = 90.0
+
+
+def _filter_results_by_song_as_album_title(
+    results: list[LibraryItem],
+    song: str | None,
+) -> list[LibraryItem]:
+    """Pick artist-fallback rows whose title matches the requested song.
+
+    Handles the request shape "on patrol, sun araw" — request-o-matic routes
+    it as ``song="On Patrol"`` / ``artist="Sun Araw"``, but the user typed
+    an album name. The artist+song FTS branch of
+    ``search_library_with_fallback`` surfaces the matching album because
+    the album title contains the song words; per-result track validation
+    then reasonably comes back empty (no track titled "On Patrol" exists on
+    that album — it IS the album) and ``song_not_found`` stays set,
+    producing the misleading 'not on any album' context message about a
+    result sitting in its own list.
+
+    Floor is ``_SONG_AS_ALBUM_TITLE_FLOOR`` (>= 90 via
+    ``rapidfuzz.fuzz.token_set_ratio``) — high enough that a coincidental
+    word overlap won't override the song-not-found path.
+
+    Returns the subset of ``results`` whose normalised title clears the
+    floor against the normalised song. Empty input or whitespace-only song
+    returns ``[]`` cleanly.
+    """
+    if not song or not song.strip() or not results:
+        return []
+    from rapidfuzz import fuzz
+
+    norm_song = normalize_for_comparison(song)
+    matches: list[LibraryItem] = []
+    for item in results:
+        title_norm = normalize_for_comparison(item.title or "")
+        if fuzz.token_set_ratio(norm_song, title_norm) >= _SONG_AS_ALBUM_TITLE_FLOOR:
+            matches.append(item)
+    return matches
+
+
+# V/A series suffixes catalogued in WXYC library as "<base>, vol. N" or close
+# variants. See WXYC/library-metadata-lookup#531 — Discogs returns the canonical
+# release with a long parenthetical subtitle ("Disco Not Disco (Post Punk,
+# Electro & Leftfield Disco Classics 1974-1986)") while the library keeps the
+# terse series identifier ("Disco Not Disco, vol. 1"), so the standard
+# length-sensitive fuzz.ratio path in ``album_title_acceptable`` rejects them.
+_VA_VOLUME_SUFFIX_RE = re.compile(r"[,\s]+vol(?:\.|ume)?\s+\w+\s*$", re.IGNORECASE)
+
+
+def _va_series_base(library_title_lower: str) -> str | None:
+    """If ``library_title_lower`` is a ``<base>, vol. N`` series identifier,
+    return the lowercased ``<base>``. Otherwise return ``None``.
+
+    Strips trailing ``, vol. N`` / ``, volume N`` / `` vol. N`` / `` volume N``
+    (and ``vol N`` without the dot). The numeric tail is ``\\w+`` so roman
+    numerals ("vol. III") and mixed identifiers ("vol. 2a") also match.
+    """
+    match = _VA_VOLUME_SUFFIX_RE.search(library_title_lower)
+    if not match:
+        return None
+    base = library_title_lower[: match.start()].rstrip(" ,")
+    return base or None
+
+
+def _va_series_title_match(query_lower: str, item: LibraryItem) -> bool:
+    """Special-case for V/A series releases catalogued as ``<base>, vol. N``.
+
+    The library files V/A compilations under a terse ``<base>, vol. N`` series
+    identifier (filing convention preserved in ``library.artist_name``), while
+    Discogs returns the canonical release with a long descriptive subtitle. Neither the prefix branch nor the
+    length-sensitive ``fuzz.ratio`` branch of ``album_title_acceptable`` can
+    bridge that asymmetry, so V/A series rows stay hidden.
+
+    This accepts when:
+
+    1. The library item is a V/A row (``is_compilation_artist`` on the artist
+       string — gate keeps the looser path from grandfathering non-V/A albums
+       with the same shape, e.g. an artist's own ``Live Sessions, vol. 2``).
+    2. The library title parses as ``<base>, vol. N`` (or close-cousin
+       ``vol. N`` / ``volume N`` variants).
+    3. The Discogs query title starts with ``<base>`` followed by a
+       non-alphanumeric boundary — protects against base-prefix collisions like
+       ``Disco`` matching every Discogs release that happens to start with
+       that word.
+
+    Returns True when all three hold; the caller then bypasses
+    ``album_title_acceptable`` for this row.
+
+    See WXYC/library-metadata-lookup#531.
+    """
+    if not is_compilation_artist(item.artist or ""):
+        return False
+    library_title_lower = (item.title or "").lower()
+    base = _va_series_base(library_title_lower)
+    if not base:
+        return False
+    if not query_lower.startswith(base):
+        return False
+    # Require a word boundary after the base so "Disco" doesn't grandfather
+    # every Discogs release whose title starts with that token.
+    tail = query_lower[len(base) :]
+    if tail and tail[0].isalnum():
+        return False
+    return True
+
+
+def album_title_acceptable(query_lower: str, result_lower: str) -> bool:
+    """Check if a library album title is an acceptable match for a Discogs album title.
+
+    Uses prefix matching (handles parenthetical suffixes like edition names) and
+    length-sensitive fuzz.ratio to reject subset matches that token_set_ratio
+    would incorrectly accept.
+
+    Also rejects numbered series albums (e.g., "Chicago V" vs "Chicago 16",
+    "Led Zeppelin II" vs "Led Zeppelin IV") by checking that when titles share
+    a long common prefix, the short distinguishing suffixes are also similar.
+    """
+    from rapidfuzz import fuzz
+
+    if query_lower.startswith(result_lower) or result_lower.startswith(query_lower):
+        return True
+
+    # Find common prefix length
+    common = 0
+    for a, b in zip(query_lower, result_lower, strict=False):
+        if a != b:
+            break
+        common += 1
+
+    # Reject numbered series: titles that share a dominant prefix but differ
+    # in a short identifier suffix (e.g., "V" vs "16", "II" vs "IV").
+    if common > 0:
+        remainder_q = query_lower[common:].strip()
+        remainder_r = result_lower[common:].strip()
+        min_len = min(len(query_lower), len(result_lower))
+        if (
+            remainder_q
+            and remainder_r
+            and len(remainder_q) <= 5
+            and len(remainder_r) <= 5
+            and common >= min_len * 0.5
+        ):
+            if fuzz.ratio(remainder_q, remainder_r) < 50:
+                return False
+
+    return fuzz.ratio(query_lower, result_lower) >= 50
+
+
+# Strip *all* trailing parenthetical suffixes from a Discogs album query before
+# search. See WXYC/library-metadata-lookup#531 — Discogs ``release.title`` often
+# carries a long descriptive subtitle in parentheses (e.g. ``Disco Not Disco
+# (Post Punk, Electro & Leftfield Disco Classics 1974-1986)``) and routinely
+# stacks multiple groups (``Album (Deluxe Edition) (Remastered)``, ``Album
+# (Live) (Bonus Track)``). The library catalogues only the base (``Disco Not
+# Disco, vol. 1``); the full Discogs title fails the FTS5 query in different
+# ways depending on its shape (see the block comment on the retry in
+# ``search_album_fuzzy``). Stripping the parenthetical(s) produces a query that
+# FTS5 surfaces to the right rows, and the existing prefix branch in
+# ``album_title_acceptable`` accepts the library row via
+# ``result.startswith(query)``. The ``+`` makes this idempotent over stacked
+# groups so a single ``sub`` call peels all trailing parens — ``Album (Live)
+# (Remastered)`` strips to ``Album``, not ``Album (Live)`` which would still be
+# an FTS5 syntax error.
+_TRAILING_PARENTHETICAL_RE = re.compile(r"(?:\s*\([^)]*\)\s*)+$")
