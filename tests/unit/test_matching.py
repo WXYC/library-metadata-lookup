@@ -11,7 +11,7 @@ from discogs.matching import (
     strip_discogs_suffix,
 )
 from discogs.service import calculate_confidence
-from lookup.orchestrator import is_self_titled, map_library_format_to_discogs
+from lookup.matching import is_self_titled, map_library_format_to_discogs
 
 # ---------------------------------------------------------------------------
 # strip_discogs_suffix

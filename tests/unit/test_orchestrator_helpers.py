@@ -28,14 +28,13 @@ from generated.api_models import (
     DiscogsTrackReleasesResponse,
     TrackMatchSource,
 )
+from lookup.matching import artist_matches_item, filter_results_by_artist
 from lookup.orchestrator import (
     ROWLESS_LIBRARY_ID,
     ROWLESS_NO_ALBUM_CONFIDENCE,
     _resolve_fallback_artwork,
-    artist_matches_item,
     build_context_message,
     fetch_artwork_for_items,
-    filter_results_by_artist,
     filter_results_by_track_validation,
     find_library_albums_with_cached_track,
     resolve_albums_for_track,
@@ -3030,7 +3029,7 @@ class TestSearchSongAsTrack:
         # ``_chunked_gather``, which the three call sites pin to
         # ``MAX_SEARCH_RESULTS``. Pin the invariant against the same constant
         # so the test still tracks if the value is tuned later.
-        from lookup.orchestrator import MAX_SEARCH_RESULTS as _CAP
+        from lookup.matching import MAX_SEARCH_RESULTS as _CAP
 
         await search_song_as_track(db, "t", discogs_service=svc)
 
@@ -3061,7 +3060,7 @@ class TestSearchSongAsTrack:
         the function must surface exactly ``MAX_SEARCH_RESULTS`` results and
         fire at most ``MAX_SEARCH_RESULTS`` validate calls.
         """
-        from lookup.orchestrator import MAX_SEARCH_RESULTS
+        from lookup.matching import MAX_SEARCH_RESULTS
 
         n_candidates = MAX_SEARCH_RESULTS * 3
         items = [
@@ -3280,7 +3279,7 @@ class TestSearchCompilationsEarlyExit:
         cost lever isn't just rate-limiter pressure — it's wall time and
         Discogs quota.
         """
-        from lookup.orchestrator import MAX_SEARCH_RESULTS
+        from lookup.matching import MAX_SEARCH_RESULTS
 
         n_candidates = MAX_SEARCH_RESULTS * 3
         items = [
@@ -3373,7 +3372,7 @@ def _fire_cap_via_recorder():
     """Drive the production cap-fire site so tests exercise both
     ``record_search_api_call_cap_fired`` paths (telemetry counter + runner
     ContextVar bump) without duplicating the helper's body."""
-    from lookup.orchestrator import _record_search_api_call_cap_fired
+    from lookup.concurrency import _record_search_api_call_cap_fired
 
     _record_search_api_call_cap_fired(cap=3, spent=5, items_remaining=10, items_total=15)
 
@@ -3427,7 +3426,7 @@ class TestApiCallCap:
             init_cache_stats,
         )
 
-        from lookup.orchestrator import MAX_SEARCH_RESULTS
+        from lookup.matching import MAX_SEARCH_RESULTS
 
         monkeypatch.setenv("LML_SEARCH_MAX_API_CALLS", "3")
         init_cache_stats()
@@ -3498,7 +3497,8 @@ class TestApiCallCap:
             init_cache_stats,
         )
 
-        from lookup.orchestrator import MAX_SEARCH_RESULTS, _chunked_gather
+        from lookup.concurrency import _chunked_gather
+        from lookup.matching import MAX_SEARCH_RESULTS
 
         monkeypatch.setenv("LML_SEARCH_MAX_API_CALLS", "3")
         init_cache_stats()
