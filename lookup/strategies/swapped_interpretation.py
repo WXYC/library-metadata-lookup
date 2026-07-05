@@ -54,7 +54,7 @@ class SwappedInterpretation:
 
     db: LibraryDB
     execute: SwappedInterpretationExecute
-    """Production: ``lookup.orchestrator.search_with_alternative_interpretation``."""
+    """Production: :func:`search_with_alternative_interpretation` (this module)."""
 
     def should_attempt(self, parsed: ParsedRequest, state: SearchState, raw_message: str) -> bool:
         return no_results_and_ambiguous_format(parsed, state, raw_message)

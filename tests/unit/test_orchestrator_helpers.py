@@ -39,11 +39,11 @@ from lookup.orchestrator import (
     resolve_albums_for_track,
     search_compilations_for_track,
     search_library_with_fallback,
-    search_song_as_track,
-    search_with_alternative_interpretation,
 )
 from lookup.release_resolution import ResolvedRelease
 from lookup.rowless import ROWLESS_LIBRARY_ID
+from lookup.strategies.song_as_track import search_song_as_track
+from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_discogs_result, make_library_item
 
