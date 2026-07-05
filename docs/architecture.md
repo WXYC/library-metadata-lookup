@@ -34,7 +34,11 @@ Strategies never mutate `SearchState`; they return an `Outcome` and the runner a
 
 ## Key Files
 
-- `lookup/orchestrator.py` -- Core search logic: `perform_lookup()` and all helper functions
+- `lookup/orchestrator.py` -- Pipeline spine: `perform_lookup()` and the search-strategy implementations (decomposition in progress, LML#722)
+- `lookup/matching.py` -- Pure matching predicates, filters, and score floors
+- `lookup/concurrency.py` -- `_chunked_gather` + the per-invocation Discogs API-call cap
+- `lookup/artist_resolution.py` -- Canonical-artist resolver (`resolve_canonical_artist`) + its flag gates and telemetry projections
+- `lookup/rowless.py` -- Row-less (non-library) release synthesis + credit recovery
 - `lookup/models.py` -- Re-exports generated API contract models (`LookupRequest`, `LookupResponse`, `LookupResultItem`)
 - `generated/api_models.py` -- Pydantic v2 models generated from `wxyc-shared/api.yaml`
 - `lookup/router.py` -- `POST /lookup` endpoint

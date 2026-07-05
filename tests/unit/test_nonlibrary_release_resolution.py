@@ -257,7 +257,7 @@ async def test_bounded_resolver_is_used_not_l1_wrapper(monkeypatch):
 
     bounded = AsyncMock(return_value=[])
     monkeypatch.setattr("lookup.rowless.resolve_release_for_track", bounded)
-    # If the L1 wrapper is ever imported into orchestrator and used, this spy
+    # If the L1 wrapper is ever imported into rowless and used, this spy
     # would catch it. It is intentionally NOT referenced by the helper.
     monkeypatch.setattr(
         "lookup.rowless.get_cached_release_id",
