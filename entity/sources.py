@@ -21,10 +21,18 @@ from typing import Any, Protocol, runtime_checkable
 import asyncpg
 import httpx
 
+from core.search import resolve_positive_int_env
+
 logger = logging.getLogger(__name__)
 
 _QID_PATTERN = re.compile(r"^Q\d+$")
 _RATE_INTERVAL = 1.0  # seconds between Wikidata requests
+
+# LML#706: owned PgSource pools (currently musicbrainz) are env-sizable, mirroring
+# the discogs hot-path pool's LML_DISCOGS_POOL_MAX_SIZE. Default 5 keeps the
+# historical #241 sizing. See docs/env-vars.md.
+_PG_POOL_MAX_SIZE_ENV_VAR = "LML_PG_POOL_MAX_SIZE"
+_PG_POOL_MAX_SIZE_DEFAULT = 5
 
 
 @runtime_checkable
@@ -98,7 +106,13 @@ class PgSource:
         assert self._dsn is not None  # narrowed by __init__ XOR check
         async with self._pool_lock:
             if self._pool is None:
-                self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+                self._pool = await asyncpg.create_pool(
+                    self._dsn,
+                    min_size=1,
+                    max_size=resolve_positive_int_env(
+                        _PG_POOL_MAX_SIZE_ENV_VAR, _PG_POOL_MAX_SIZE_DEFAULT
+                    ),
+                )
             return self._pool
 
     async def fetchall(self, query: str, *args: Any) -> list[dict[str, Any]]:

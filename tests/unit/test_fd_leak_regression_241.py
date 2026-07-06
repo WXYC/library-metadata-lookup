@@ -112,6 +112,47 @@ class TestPgSourcePoolRace:
         )
 
 
+class TestPgSourcePoolMaxSize:
+    """LML#706: the owned PgSource pool (currently musicbrainz) is env-sizable.
+
+    Same hardcoded-5 smell as the discogs hot-path pool. Once UVICORN_WORKERS
+    multiplies every pool, operators need one knob per pool to keep the total
+    connection budget in view. Default 5 keeps historical behavior inert.
+    """
+
+    @pytest.mark.asyncio
+    async def test_owned_pool_max_size_defaults_to_5(self, monkeypatch):
+        from entity.sources import PgSource
+
+        monkeypatch.delenv("LML_PG_POOL_MAX_SIZE", raising=False)
+        calls: list[tuple] = []
+
+        async def fake_create_pool(*args, **kwargs):
+            calls.append((args, kwargs))
+            return AsyncMock(name="pool")
+
+        with patch("entity.sources.asyncpg.create_pool", side_effect=fake_create_pool):
+            await PgSource("postgres://fake/db")._get_pool()
+
+        assert calls[0][1]["max_size"] == 5
+
+    @pytest.mark.asyncio
+    async def test_owned_pool_max_size_from_env(self, monkeypatch):
+        from entity.sources import PgSource
+
+        monkeypatch.setenv("LML_PG_POOL_MAX_SIZE", "12")
+        calls: list[tuple] = []
+
+        async def fake_create_pool(*args, **kwargs):
+            calls.append((args, kwargs))
+            return AsyncMock(name="pool")
+
+        with patch("entity.sources.asyncpg.create_pool", side_effect=fake_create_pool):
+            await PgSource("postgres://fake/db")._get_pool()
+
+        assert calls[0][1]["max_size"] == 12
+
+
 class TestGetDiscogsServicePoolRace:
     """Hypothesis #2b: ``core.dependencies.get_discogs_service`` is racy.
 
