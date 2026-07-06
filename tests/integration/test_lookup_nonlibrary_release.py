@@ -7,8 +7,9 @@ release validates from the inputs (#536 defers track-validation until after the
 library gate). LML#628 wires the row-less carry-through: when the flag is on and
 no library row matches, the strategy resolves + validates the release and emits
 the ``LibraryItem(id=0)`` + real ``DiscogsSearchResult`` shape the library-miss
-search already produces (orchestrator.py ``_library_miss_discogs_search``),
-rather than the BS#1185 ``release_id=0`` sentinel.
+search already produces (``lookup/strategies/library_miss.py``
+``_library_miss_discogs_search``), rather than the BS#1185 ``release_id=0``
+sentinel.
 
 Spine case (the #604 repro shape): A Guy Called Gerald — "When There Is No Sun"
 (a track on a Various-Artists compilation filed under the track artist, so the
@@ -27,6 +28,7 @@ exercised. Flag default-off asserts today's empty/sentinel behavior.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -38,9 +40,10 @@ from discogs.models import (
     ReleaseMetadataResponse,
     TrackReleasesResponse,
 )
-from lookup import orchestrator
+from lookup import rowless
 from lookup.models import LookupRequest
 from lookup.orchestrator import ROWLESS_NO_ALBUM_CONFIDENCE, perform_lookup
+from lookup.strategies import track_on_compilation, track_release_matching
 from tests.conftest import make_lml_telemetry
 
 # A real-looking Discogs release id + canonical URL for the non-library
@@ -152,6 +155,7 @@ def _surfaced_rowless(response) -> bool:
     )
 
 
+@contextmanager
 def _spy_resolve_nonlibrary():
     """Patch ``_resolve_nonlibrary_release`` with a pass-through spy.
 
@@ -159,12 +163,19 @@ def _spy_resolve_nonlibrary():
     carry-through (and the row-less assertions fail too); the fixed gate never
     awaits it. Lets ``assert_not_awaited()`` pin LML#652's core invariant
     directly, not just by proxy through the cache-write count.
+
+    One shared spy is bound into both consumer namespaces: TRACK_ON_COMPILATION
+    reads ``lookup.strategies.track_on_compilation``'s module global, while
+    SONG_AS_TRACK and SWAPPED_INTERPRETATION reach the resolve through the
+    shared kernel in ``lookup.strategies.track_release_matching``. Patching
+    both means each kill-switch test intercepts the path it actually drives.
     """
-    return patch.object(
-        orchestrator,
-        "_resolve_nonlibrary_release",
-        new=AsyncMock(wraps=orchestrator._resolve_nonlibrary_release),
-    )
+    spy = AsyncMock(wraps=rowless._resolve_nonlibrary_release)
+    with (
+        patch.object(track_on_compilation, "_resolve_nonlibrary_release", new=spy),
+        patch.object(track_release_matching, "_resolve_nonlibrary_release", new=spy),
+    ):
+        yield spy
 
 
 # ---------------------------------------------------------------------------

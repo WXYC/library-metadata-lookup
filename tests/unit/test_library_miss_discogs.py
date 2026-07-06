@@ -29,7 +29,8 @@ import pytest
 
 from discogs.models import DiscogsSearchResponse
 from lookup.models import LookupRequest, LookupResponse
-from lookup.orchestrator import _library_miss_discogs_search, perform_lookup
+from lookup.orchestrator import perform_lookup
+from lookup.strategies.library_miss import _library_miss_discogs_search
 from services.parser import MessageType, ParsedRequest
 from tests.conftest import make_lml_telemetry
 from tests.factories import make_discogs_result, make_library_item

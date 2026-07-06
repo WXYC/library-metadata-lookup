@@ -78,7 +78,7 @@ def _base_mock() -> AsyncMock:
 def _patch_artist_releases():
     """Patch the artist-search seam so SONG_AS_ARTIST resolves the Sessa release."""
     return patch(
-        "lookup.orchestrator.lookup_releases_by_artist",
+        "lookup.strategies.song_as_artist.lookup_releases_by_artist",
         new_callable=AsyncMock,
         return_value=[
             make_discogs_result(

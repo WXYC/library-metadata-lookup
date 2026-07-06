@@ -58,7 +58,7 @@ class ArtistPlusAlbum:
     """Library database handle. Passed to the execute func at call time."""
 
     execute: ArtistPlusAlbumExecute
-    """Production: ``lookup.orchestrator.search_library_with_fallback``."""
+    """Production: :func:`search_library_with_fallback` (this module)."""
 
     def should_attempt(self, parsed: ParsedRequest, state: SearchState, raw_message: str) -> bool:
         return has_artist_or_album_or_song(parsed, state, raw_message)

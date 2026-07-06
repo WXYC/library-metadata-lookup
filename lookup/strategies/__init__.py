@@ -14,13 +14,13 @@ an :class:`core.search.Outcome` and the runner applies it via
 cancelled ``attempt()`` never returns an Outcome, so no state commit happens.
 
 The execute funcs that do the actual library / Discogs work are injected
-into each strategy class at construction time. SONG_AS_TRACK's and
-SWAPPED_INTERPRETATION's live in this package (their strategy modules, over
-the shared ``track_release_matching`` kernel); the remaining three still live
-in ``lookup.orchestrator`` until PR 4b of LML#722. The injection seam means
-this package has no dependency on the orchestrator module (avoids the obvious
-circular import). Tests construct strategies with ``AsyncMock`` execute funcs
-to drive the pipeline through the public seam.
+into each strategy class at construction time. Every execute func lives in
+this package, in the same module as its strategy class (SONG_AS_TRACK's and
+SWAPPED_INTERPRETATION's over the shared ``track_release_matching`` kernel;
+LML#722). The injection seam means this package has no dependency on the
+orchestrator module (avoids the obvious circular import). Tests construct
+strategies with ``AsyncMock`` execute funcs to drive the pipeline through
+the public seam.
 
 Production construction lives in :func:`lookup.orchestrator.perform_lookup`;
 the :func:`build_strategies` factory below is the seam tests use.

@@ -56,8 +56,8 @@ class TestNonlibraryReleaseSurfacedCounter:
         flag-scoped counter — else the "0 when flag off" property breaks and two
         independent features get conflated."""
         from discogs.models import DiscogsSearchResponse
-        from lookup.orchestrator import _library_miss_discogs_search
         from lookup.rowless import NONLIBRARY_RELEASE_SURFACED_STAT_KEY
+        from lookup.strategies.library_miss import _library_miss_discogs_search
         from services.parser import MessageType, ParsedRequest
         from tests.factories import make_discogs_result
 

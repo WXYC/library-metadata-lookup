@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from discogs.models import ReleaseInfo, TrackReleasesResponse
-from lookup.orchestrator import search_compilations_for_track
+from lookup.strategies.track_on_compilation import search_compilations_for_track
 from lookup.strategies.track_release_matching import search_album_fuzzy
 from services.parser import ParsedRequest
 
@@ -174,7 +174,7 @@ async def test_non_va_paren_match_filtered_by_downstream_artist_gate(library_db)
     )
 
     with patch(
-        "lookup.orchestrator.lookup_releases_by_track",
+        "lookup.strategies.track_on_compilation.lookup_releases_by_track",
         new_callable=AsyncMock,
         return_value=[],
     ):

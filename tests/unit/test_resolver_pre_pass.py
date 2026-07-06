@@ -33,7 +33,7 @@ import pytest
 from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from discogs.models import ReleaseInfo, TrackReleasesResponse
 from lookup.artist_resolution import ResolverOutcome, resolve_canonical_artist
-from lookup.orchestrator import search_compilations_for_track
+from lookup.strategies.track_on_compilation import search_compilations_for_track
 from services.parser import ParsedRequest
 from tests.factories import make_library_item
 
@@ -199,7 +199,7 @@ class TestResolverPrePassCallSite:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -251,7 +251,7 @@ class TestResolverPrePassCallSite:
             )
 
             with patch(
-                "lookup.orchestrator.lookup_releases_by_track",
+                "lookup.strategies.track_on_compilation.lookup_releases_by_track",
                 new_callable=AsyncMock,
                 return_value=[],
             ):
@@ -297,7 +297,7 @@ class TestResolverPrePassCallSite:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -367,7 +367,7 @@ class TestLibraryCorrectionTwoChannelSeam:
         )
 
         with patch(
-            "lookup.orchestrator.validate_release_for_track",
+            "lookup.strategies.track_on_compilation.validate_release_for_track",
             new_callable=AsyncMock,
             return_value=True,
         ) as mock_validate:
@@ -440,7 +440,7 @@ class TestLibraryCorrectionTwoChannelSeam:
         )
 
         with patch(
-            "lookup.orchestrator.validate_release_for_track",
+            "lookup.strategies.track_on_compilation.validate_release_for_track",
             new_callable=AsyncMock,
             return_value=True,
         ):

@@ -27,7 +27,7 @@ from __future__ import annotations
 import pytest
 
 from lookup.matching import _ALBUM_MATCH_FLOOR
-from lookup.orchestrator import search_library_with_fallback
+from lookup.strategies.artist_plus_album import search_library_with_fallback
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_library_item
 
