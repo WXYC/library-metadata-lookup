@@ -35,7 +35,7 @@ Strategies never mutate `SearchState`; they return an `Outcome` and the runner a
 ## Key Files
 
 - `lookup/orchestrator.py` -- Pipeline spine: `perform_lookup()` + spine-scoped helpers (`resolve_albums_for_track`, `build_context_message`, identity resolution; decomposition in progress, LML#722)
-- `lookup/enrichment/` -- Step-4b metadata enrichment (`enrich_artwork_results`): top-1 release/artist/bio fetch, per-item streaming-URL assignment, the `extended` payload, and the fire-and-forget bio cache warm (`_warm_bio_cache`, bounded by `_WARM_CACHE_CONCURRENCY`)
+- `lookup/enrichment/` -- Step-4b metadata enrichment. `__init__.py` holds the `enrich_artwork_results` coordinator, which builds the frozen `EnrichmentContext` (`context.py` — service handles + request scalars) and delegates: `top1.py` (top-1 release/artist/bio fetch, `fetch_top1_release_details`), `item.py` (per-item gates, streaming-URL assignment, and the `extended` payload, `enrich_one`), `background.py` (fire-and-forget bio cache warm, `_warm_bio_cache` bounded by `_WARM_CACHE_CONCURRENCY`)
 - `lookup/strategies/` -- Strategy classes (gating predicate + `attempt` per module), the `build_strategies` factory, and every strategy's execute func (`SONG_AS_TRACK`/`SWAPPED_INTERPRETATION` over the shared `track_release_matching` kernel), plus the step-3a library-miss Discogs probe (`library_miss.py`)
 - `lookup/matching.py` -- Pure matching predicates, filters, and score floors
 - `lookup/concurrency.py` -- `_chunked_gather` + the per-invocation Discogs API-call cap
