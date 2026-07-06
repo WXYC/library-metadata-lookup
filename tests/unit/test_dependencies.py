@@ -293,6 +293,50 @@ class TestGetDiscogsService:
             mock_svc_cls.assert_called_once_with(token="test-token", cache_service=mock_cache)
 
     @pytest.mark.asyncio
+    async def test_pool_max_size_defaults_to_5(self, mock_settings, monkeypatch):
+        """With LML_DISCOGS_POOL_MAX_SIZE unset the hot-path pool stays at its
+        historical 5-connection size — the env knob is inert by default so
+        merging the LML#706 sizing lever changes nothing until an operator
+        tunes it on staging.
+
+        Exercises the ``_build_discogs_pool`` factory directly rather than
+        ``get_discogs_service`` so it never enters the ``async_singleton``
+        getter, whose import-time ``asyncio.Lock`` binds to the first loop that
+        acquires it and then breaks cross-loop suite ordering.
+        """
+        monkeypatch.delenv("LML_DISCOGS_POOL_MAX_SIZE", raising=False)
+        mock_settings.database_url_discogs = "postgresql://localhost/test"
+
+        with (
+            patch("core.dependencies.get_settings", return_value=mock_settings),
+            patch("core.dependencies.asyncpg.create_pool", new_callable=AsyncMock) as mock_create,
+        ):
+            mock_create.return_value = AsyncMock()
+            await deps_module._build_discogs_pool()
+
+            mock_create.assert_called_once()
+            assert mock_create.call_args.kwargs["max_size"] == 5
+
+    @pytest.mark.asyncio
+    async def test_pool_max_size_from_env(self, mock_settings, monkeypatch):
+        """LML_DISCOGS_POOL_MAX_SIZE raises the hot-path pool ceiling so the
+        in-flight cap (default 8) stops fighting a smaller pool — the LML#706
+        loop/pool-starvation lever. Read via the shared resolve_positive_int_env
+        helper, so it flips from Railway without a redeploy."""
+        monkeypatch.setenv("LML_DISCOGS_POOL_MAX_SIZE", "15")
+        mock_settings.database_url_discogs = "postgresql://localhost/test"
+
+        with (
+            patch("core.dependencies.get_settings", return_value=mock_settings),
+            patch("core.dependencies.asyncpg.create_pool", new_callable=AsyncMock) as mock_create,
+        ):
+            mock_create.return_value = AsyncMock()
+            await deps_module._build_discogs_pool()
+
+            mock_create.assert_called_once()
+            assert mock_create.call_args.kwargs["max_size"] == 15
+
+    @pytest.mark.asyncio
     async def test_pool_error_degrades_gracefully(self, mock_settings):
         mock_settings.discogs_token = "test-token"
         mock_settings.database_url_discogs = "postgresql://localhost/test"

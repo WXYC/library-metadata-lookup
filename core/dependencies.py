@@ -12,6 +12,7 @@ from wxyc_fastapi.observability import get_posthog_client as _shared_posthog_cli
 
 from config.settings import Settings, get_settings
 from core.exceptions import ServiceInitializationError
+from core.search import resolve_positive_int_env
 from discogs.cache_service import DiscogsCacheService
 from discogs.service import DiscogsService
 from entity.sources import PgSource
@@ -21,6 +22,17 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from posthog import Posthog
+
+# LML#706: the discogs-cache pool is THE hot-path pool — the trigram release
+# match, the `album_streaming_url_cache` read, and every identity mint borrow
+# it (the #395 shared-seam). During the cold-tail incident 8 in-flight
+# `/lookup` requests (the LML_LOOKUP_MAX_CONCURRENT default) contended for its
+# 5 connections, so even the trivial connection-reset span inflated to seconds.
+# Env-tunable so the pool ceiling can be raised to >= the in-flight cap from
+# Railway without a redeploy; default 5 keeps historical behavior (inert until
+# an operator tunes it). See docs/env-vars.md.
+_DISCOGS_POOL_MAX_SIZE_ENV_VAR = "LML_DISCOGS_POOL_MAX_SIZE"
+_DISCOGS_POOL_MAX_SIZE_DEFAULT = 5
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +103,9 @@ async def _build_discogs_pool() -> asyncpg.Pool | None:
         pool = await asyncpg.create_pool(
             settings.database_url_discogs,
             min_size=1,
-            max_size=5,
+            max_size=resolve_positive_int_env(
+                _DISCOGS_POOL_MAX_SIZE_ENV_VAR, _DISCOGS_POOL_MAX_SIZE_DEFAULT
+            ),
             timeout=10,
         )
         logger.info("Discogs cache pool connected")
