@@ -21,12 +21,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from discogs.models import ReleaseInfo
-from lookup.orchestrator import (
-    ROWLESS_NO_ALBUM_CONFIDENCE,
-    find_library_albums_with_cached_track,
-)
 from lookup.release_resolution import ResolvedRelease
-from lookup.rowless import ROWLESS_LIBRARY_ID
+from lookup.rowless import ROWLESS_LIBRARY_ID, ROWLESS_NO_ALBUM_CONFIDENCE
+from lookup.validation import find_library_albums_with_cached_track
 
 
 @pytest.fixture

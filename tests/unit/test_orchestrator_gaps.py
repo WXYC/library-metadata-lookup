@@ -4,17 +4,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from lookup.artwork import fetch_artwork_for_items
 from lookup.matching import _va_series_title_match, album_title_acceptable
-from lookup.orchestrator import (
-    fetch_artwork_for_items,
-    filter_results_by_track_validation,
-    resolve_albums_for_track,
-)
+from lookup.orchestrator import resolve_albums_for_track
 from lookup.strategies.artist_plus_album import search_library_with_fallback
 from lookup.strategies.song_as_artist import search_song_as_artist
 from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
 from lookup.strategies.track_on_compilation import search_compilations_for_track
 from lookup.strategies.track_release_matching import search_album_fuzzy
+from lookup.validation import filter_results_by_track_validation
 from services.parser import ParsedRequest
 from tests.factories import make_discogs_result
 from tests.factories import make_library_item as _item

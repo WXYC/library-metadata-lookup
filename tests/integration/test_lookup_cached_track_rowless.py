@@ -35,7 +35,8 @@ from discogs.models import (
     TrackReleasesResponse,
 )
 from lookup.models import LookupRequest
-from lookup.orchestrator import ROWLESS_NO_ALBUM_CONFIDENCE, perform_lookup
+from lookup.orchestrator import perform_lookup
+from lookup.rowless import ROWLESS_NO_ALBUM_CONFIDENCE
 from tests.conftest import make_lml_telemetry
 
 ARTIST = "Lee 'Scratch' Perry"  # seeded cluster (six albums), no "Bucky Skank" row

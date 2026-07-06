@@ -42,7 +42,8 @@ from discogs.models import (
 )
 from lookup import rowless
 from lookup.models import LookupRequest
-from lookup.orchestrator import ROWLESS_NO_ALBUM_CONFIDENCE, perform_lookup
+from lookup.orchestrator import perform_lookup
+from lookup.rowless import ROWLESS_NO_ALBUM_CONFIDENCE
 from lookup.strategies import track_on_compilation, track_release_matching
 from tests.conftest import make_lml_telemetry
 
