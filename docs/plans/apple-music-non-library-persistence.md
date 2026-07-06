@@ -15,7 +15,7 @@ For every `/api/v1/lookup` request, return a non-null `apple_music_url` whenever
 
 ## Problem (today)
 
-`lookup/orchestrator.py:2333` runs the Apple Music probe with `(row_artist, search_term)` where `row_artist = item.alternate_artist_name or item.artist` (line 2255) — the artist of the **library row that survived resolution**, not the request's artist. Two failure modes flow from this:
+The Apple Music probe (now `lookup/enrichment/__init__.py`; `lookup/orchestrator.py:2333` at writing) runs with `(row_artist, search_term)` where `row_artist = item.alternate_artist_name or item.artist` (line 2255) — the artist of the **library row that survived resolution**, not the request's artist. Two failure modes flow from this:
 
 1. **No library match** → either zero results returned by the orchestrator (Sessa case from the live repro) or a wrong-row fallback (Hyd → "Angel" by "Angel"). The probe is either skipped entirely or runs with the wrong artist, producing `apple_music_url: null`.
 2. **Library match with shaky title** → LML#487 widens the synth branch to fire when the row's title doesn't fuzzy-match the request, LML#505 then nulls any curated streaming URLs. Apple has no search-URL fallback at `:2509-2525`, so it stays null.
@@ -87,7 +87,7 @@ The runtime schema lives in the discogs-cache PG, owned by the discogs-cache rep
    - `async def set(pg, artist: str, album: str, url: str | None) -> None` — UPSERT via `INSERT ... ON CONFLICT (artist_normalized, album_normalized) DO UPDATE`.
 
    The module is the **single owner** of normalization. Both `get` and `set` call `wxyc_etl.text.to_match_form` on the inbound `artist` / `album` strings before keying. The orchestrator passes raw request strings; it does NOT pre-normalize. This keeps the normalization invariant local to the cache and prevents key drift if the orchestrator's normalization choices change in the future. Import: `from wxyc_etl.text import to_match_form` (already used in `clients/streaming/apple_music.py:53` for the same purpose).
-4. **Orchestrator post-process**: in `lookup/orchestrator.py:enrich_one`, after the existing `update` dict is built (around line 2536) but before return, run the post-process. Reuses the in-scope `apple_music` client. Guarded by a feature flag (`LML_PERSIST_APPLE_MUSIC_URL`, default `false` initially, flipped to `true` after one staging tick) so the rollout is reversible without a re-deploy.
+4. **Orchestrator post-process**: in `enrich_one` (now `lookup/enrichment/__init__.py`; `lookup/orchestrator.py` at writing), after the existing `update` dict is built (around line 2536) but before return, run the post-process. Reuses the in-scope `apple_music` client. Guarded by a feature flag (`LML_PERSIST_APPLE_MUSIC_URL`, default `false` initially, flipped to `true` after one staging tick) so the rollout is reversible without a re-deploy.
 
    The flag is added to `config/settings.py` as `lml_persist_apple_music_url: bool = Field(default=False, ...)` (matching the `LML_RESOLVE_ARTIST_CANONICAL` pattern at the existing settings file), and documented in `docs/env-vars.md` under the "feature flags" section with default + rollback guidance.
 5. **Mint into release_identity**: when a fresh URL is resolved, extract the album_id and call `EntityStore.mint_or_get_release_identity("apple_music_album", album_id)`. Failures here are logged but don't block the response (the URL is already cached and returned).

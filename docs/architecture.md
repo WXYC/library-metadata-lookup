@@ -7,7 +7,7 @@
 3. **Search Pipeline**: Execute strategies in order until results are found (see below)
 4. **Track Validation**: If fallback returned all artist albums, validate each against Discogs tracklists (`filter_results_by_track_validation()` in `lookup/validation.py`). When validation can't confirm any candidate AND we're showing artist-fallback results, `find_library_albums_with_cached_track()` (same module) consults the local PG cache directly ("releases by this artist whose tracklist contains this song") and promotes any matching library album over the unrelated fallback. Cache-only — never falls back to the API.
 5. **Artwork Fetch**: Fetch album art from Discogs for each result (`fetch_artwork_for_items()` in `lookup/artwork.py`)
-6. **Metadata Enrichment**: Populate `release_year`, `artist_bio`, `wikipedia_url`, streaming URLs. Release/artist details are fetched only for `items_with_artwork[0]` — BS/iOS only consume the top-1 result, so paying N Discogs round-trips for non-top-1 items is waste. Streaming-URL fallbacks stay per-result. Gating is *positional*: if the top-1 entry has `artwork=None`, no item carries release-year/bio/wiki, even if items further down have artwork. The lookup pipeline guarantees the strongest match is in position 0, so this is fine in practice. See `enrich_artwork_results()` in `lookup/orchestrator.py`.
+6. **Metadata Enrichment**: Populate `release_year`, `artist_bio`, `wikipedia_url`, streaming URLs. Release/artist details are fetched only for `items_with_artwork[0]` — BS/iOS only consume the top-1 result, so paying N Discogs round-trips for non-top-1 items is waste. Streaming-URL fallbacks stay per-result. Gating is *positional*: if the top-1 entry has `artwork=None`, no item carries release-year/bio/wiki, even if items further down have artwork. The lookup pipeline guarantees the strongest match is in position 0, so this is fine in practice. See `enrich_artwork_results()` in `lookup/enrichment/__init__.py`.
 7. **Context Message**: Generate context string for the caller
 
 ### `LookupRequest` opt-in flags
@@ -34,7 +34,8 @@ Strategies never mutate `SearchState`; they return an `Outcome` and the runner a
 
 ## Key Files
 
-- `lookup/orchestrator.py` -- Pipeline spine: `perform_lookup()` plus the not-yet-extracted enrichment steps (decomposition in progress, LML#722)
+- `lookup/orchestrator.py` -- Pipeline spine: `perform_lookup()` + spine-scoped helpers (`resolve_albums_for_track`, `build_context_message`, identity resolution; decomposition in progress, LML#722)
+- `lookup/enrichment/` -- Step-4b metadata enrichment (`enrich_artwork_results`): top-1 release/artist/bio fetch, per-item streaming-URL assignment, the `extended` payload, and the fire-and-forget bio cache warm (`_warm_bio_cache`, bounded by `_WARM_CACHE_CONCURRENCY`)
 - `lookup/strategies/` -- Strategy classes (gating predicate + `attempt` per module), the `build_strategies` factory, and every strategy's execute func (`SONG_AS_TRACK`/`SWAPPED_INTERPRETATION` over the shared `track_release_matching` kernel), plus the step-3a library-miss Discogs probe (`library_miss.py`)
 - `lookup/matching.py` -- Pure matching predicates, filters, and score floors
 - `lookup/concurrency.py` -- `_chunked_gather` + the per-invocation Discogs API-call cap
