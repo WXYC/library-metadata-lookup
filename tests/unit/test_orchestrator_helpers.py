@@ -28,22 +28,22 @@ from generated.api_models import (
     DiscogsTrackReleasesResponse,
     TrackMatchSource,
 )
+from lookup.artwork import _resolve_fallback_artwork, fetch_artwork_for_items
 from lookup.matching import artist_matches_item, filter_results_by_artist
 from lookup.orchestrator import (
-    ROWLESS_NO_ALBUM_CONFIDENCE,
-    _resolve_fallback_artwork,
     build_context_message,
-    fetch_artwork_for_items,
-    filter_results_by_track_validation,
-    find_library_albums_with_cached_track,
     resolve_albums_for_track,
 )
 from lookup.release_resolution import ResolvedRelease
-from lookup.rowless import ROWLESS_LIBRARY_ID
+from lookup.rowless import ROWLESS_LIBRARY_ID, ROWLESS_NO_ALBUM_CONFIDENCE
 from lookup.strategies.artist_plus_album import search_library_with_fallback
 from lookup.strategies.song_as_track import search_song_as_track
 from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
 from lookup.strategies.track_on_compilation import search_compilations_for_track
+from lookup.validation import (
+    filter_results_by_track_validation,
+    find_library_albums_with_cached_track,
+)
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_discogs_result, make_library_item
 

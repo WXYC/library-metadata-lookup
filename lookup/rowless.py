@@ -142,6 +142,19 @@ def _select_rowless_artist_release(
 # call-number sentinel BS already understands.
 ROWLESS_LIBRARY_ID = 0
 
+ROWLESS_NO_ALBUM_CONFIDENCE: float = 0.8
+"""Soft confidence for a row-less non-library release that was not album-matched
+(A2, LML#629).
+
+Applied when a row-less bind is *not* a user-confirmed album — either because the
+request typed no album (song-only / artist+song), or because the binding route
+never matched the release against the typed album. The latter is the cached-track
+safety net (A4), which picks by track only; it stamps this on the seam so the
+bind stays soft even when an album was typed. An album-ranked carry-through
+(A1/#628 with a typed album) keeps the full 1.0 — the typed album shaped the
+pick. Lets a consumer (request-o-matic) treat the soft results as tentative.
+"""
+
 # LML#681 observability. Recorded once per flag-gated row-less emission at the
 # single ``_make_rowless_item`` chokepoint that all four
 # ``lml_resolve_nonlibrary_release``-gated producers route through (SONG_AS_ARTIST,

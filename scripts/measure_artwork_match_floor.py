@@ -58,11 +58,11 @@ from discogs.cache_service import DiscogsCacheService
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
 from discogs.service import DiscogsService
 from library.db import LibraryDB
-from lookup.matching import is_self_titled, map_library_format_to_discogs
-from lookup.orchestrator import (
+from lookup.artwork import (
     COMPILATION_ARTIST_CANONICAL_FORM,
     COMPILATION_ARTIST_SEARCH_FORM,
 )
+from lookup.matching import is_self_titled, map_library_format_to_discogs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -93,7 +93,7 @@ class QueryShape:
 def build_query(item: SampledItem) -> QueryShape:
     """Mirror fetch_one's query construction — the search-query mutations AND
     the score-variant lists. Must stay byte-for-byte aligned with
-    ``lookup.orchestrator.fetch_artwork_for_items.fetch_one``; any drift makes
+    ``lookup.artwork.fetch_artwork_for_items.fetch_one``; any drift makes
     the measurement compare apples to oranges.
     """
     album = item.title

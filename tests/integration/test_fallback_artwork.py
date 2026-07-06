@@ -20,7 +20,7 @@ import pytest
 
 from discogs.models import DiscogsSearchRequest
 from discogs.service import DiscogsService
-from lookup.orchestrator import _resolve_fallback_artwork
+from lookup.artwork import _resolve_fallback_artwork
 
 DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN")
 
