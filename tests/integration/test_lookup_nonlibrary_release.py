@@ -169,6 +169,13 @@ def _spy_resolve_nonlibrary():
     SONG_AS_TRACK and SWAPPED_INTERPRETATION reach the resolve through the
     shared kernel in ``lookup.strategies.track_release_matching``. Patching
     both means each kill-switch test intercepts the path it actually drives.
+
+    Topology warning: this interception depends on both consumers binding the
+    name at module level via ``from lookup.rowless import ...``. If either
+    module ever switches to a lazy/function-local import, the corresponding
+    ``patch.object`` here silently stops intercepting and the negative asserts
+    below go vacuous (the PR-4a dormancy shape, LML#722). If you move or
+    re-import the resolve, re-bind the spy where the calling code reads it.
     """
     spy = AsyncMock(wraps=rowless._resolve_nonlibrary_release)
     with (
