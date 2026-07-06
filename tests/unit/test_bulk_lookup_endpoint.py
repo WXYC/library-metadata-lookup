@@ -9,6 +9,7 @@ are isolated so one item cannot poison the batch.
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -135,7 +136,7 @@ class TestBulkLookupEndpoint:
         assert mock_lookup.await_args.kwargs.get("allow_release_resolution_fallback") is False
 
     @pytest.mark.asyncio
-    async def test_bulk_hard_pins_warm_cache_off(self, app_client):
+    async def test_bulk_hard_pins_warm_cache_off(self, app_client, caplog):
         """A bulk item that sets ``warm_cache: true`` reaches perform_lookup with
         ``request.warm_cache`` falsy (LML#742). ``warm_cache`` gates the
         fire-and-forget ``_warm_bio_cache`` deep parse (per-bio-ref live Discogs
@@ -143,7 +144,11 @@ class TestBulkLookupEndpoint:
         posture forbids — same rationale as the ``bandcamp`` /
         ``allow_release_resolution_fallback`` pins at the same call site. The
         pin must be surgical: sibling per-item flags (``extended``) ride
-        through untouched."""
+        through untouched. And it must be observable: unlike the sibling pins
+        (server-side kwargs), warm_cache is a caller-supplied field being
+        discarded, and post-pin the Sentry ``lml.lookup.warm_cache`` tag records
+        the pinned value — so a warning at the pin site is the only signal that
+        distinguishes a misconfigured caller from a compliant one."""
         with patch(
             "lookup.router.perform_lookup",
             new_callable=AsyncMock,
@@ -152,19 +157,20 @@ class TestBulkLookupEndpoint:
             async with AsyncClient(
                 transport=ASGITransport(app=app_client), base_url="http://test"
             ) as ac:
-                resp = await ac.post(
-                    "/api/v1/lookup/bulk",
-                    json={
-                        "items": [
-                            {
-                                "artist": "Chuquimamani-Condori",
-                                "album": "Edits",
-                                "extended": True,
-                                "warm_cache": True,
-                            }
-                        ]
-                    },
-                )
+                with caplog.at_level(logging.WARNING, logger="lookup.router"):
+                    resp = await ac.post(
+                        "/api/v1/lookup/bulk",
+                        json={
+                            "items": [
+                                {
+                                    "artist": "Chuquimamani-Condori",
+                                    "album": "Edits",
+                                    "extended": True,
+                                    "warm_cache": True,
+                                }
+                            ]
+                        },
+                    )
 
         assert resp.status_code == 200
         assert mock_lookup.await_count == 1
@@ -172,6 +178,39 @@ class TestBulkLookupEndpoint:
         assert not forwarded.warm_cache
         assert forwarded.extended is True
         assert forwarded.artist == "Chuquimamani-Condori"
+        pin_warnings = [
+            r for r in caplog.records if "warm_cache" in r.message and "pinned" in r.message
+        ]
+        assert len(pin_warnings) == 1, (
+            f"expected one warm_cache-pin warning, got: {[r.message for r in caplog.records]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bulk_warm_cache_pin_is_silent_for_compliant_callers(self, app_client, caplog):
+        """The pin warning fires only when a caller actually sets
+        ``warm_cache: true`` — a compliant item (flag unset) must not log,
+        so the warning stays a high-signal misconfiguration marker instead
+        of per-item batch noise."""
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_no_match_response(),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                with caplog.at_level(logging.WARNING, logger="lookup.router"):
+                    resp = await ac.post(
+                        "/api/v1/lookup/bulk",
+                        json={
+                            "items": [
+                                {"artist": "Jessica Pratt", "album": "On Your Own Love Again"}
+                            ]
+                        },
+                    )
+
+        assert resp.status_code == 200
+        assert not [r for r in caplog.records if "warm_cache" in r.message]
 
     @pytest.mark.asyncio
     async def test_bulk_forwards_per_item_extended_true(self, app_client):

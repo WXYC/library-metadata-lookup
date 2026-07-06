@@ -546,6 +546,18 @@ async def handle_bulk_lookup(
             # is a copied item rather than a kwarg. The offline warmer (#548)
             # remains the right tier for bulk cache population.
             if item.warm_cache:
+                # Warn per pinned item: unlike the sibling pins (server-side
+                # kwargs), this discards a caller-supplied field, and post-pin
+                # the Sentry `lml.lookup.warm_cache` tag records the pinned
+                # False — without this line a misconfigured caller is
+                # indistinguishable from a compliant one in every telemetry
+                # surface. Volume is bounded by the batch cap, and only misuse
+                # triggers it.
+                logger.warning(
+                    "bulk item %d: per-item warm_cache=true pinned off (LML#742); "
+                    "use the offline warmer (#548) for bulk bio-cache population",
+                    index,
+                )
                 item = item.model_copy(update={"warm_cache": False})
             # Per-item telemetry instance: required by perform_lookup's signature
             # and avoids the `_current_step` race that would happen with a shared
