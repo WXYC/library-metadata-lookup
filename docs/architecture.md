@@ -2,13 +2,18 @@
 
 ## Lookup Flow
 
-1. **Artist Correction**: Fuzzy match artist against library catalog to fix typos
-2. **Album Resolution**: If song provided without album, query Discogs for album names
-3. **Search Pipeline**: Execute strategies in order until results are found (see below)
-4. **Track Validation**: If fallback returned all artist albums, validate each against Discogs tracklists (`filter_results_by_track_validation()` in `lookup/validation.py`). When validation can't confirm any candidate AND we're showing artist-fallback results, `find_library_albums_with_cached_track()` (same module) consults the local PG cache directly ("releases by this artist whose tracklist contains this song") and promotes any matching library album over the unrelated fallback. Cache-only — never falls back to the API.
-5. **Artwork Fetch**: Fetch album art from Discogs for each result (`fetch_artwork_for_items()` in `lookup/artwork.py`)
-6. **Metadata Enrichment**: Populate `release_year`, `artist_bio`, `wikipedia_url`, streaming URLs. Release/artist details are fetched only for `items_with_artwork[0]` — BS/iOS only consume the top-1 result, so paying N Discogs round-trips for non-top-1 items is waste. Streaming-URL fallbacks stay per-result. Gating is *positional*: if the top-1 entry has `artwork=None`, no item carries release-year/bio/wiki, even if items further down have artwork. The lookup pipeline guarantees the strongest match is in position 0, so this is fine in practice. See `enrich_artwork_results()` in `lookup/enrichment/__init__.py`.
-7. **Context Message**: Generate context string for the caller
+Step labels match the `_step_*` spine in `lookup/orchestrator.py` (`perform_lookup`); each step function's docstring declares the `LookupState` fields it reads and writes.
+
+- **Steps 1+2 — Artist Correction + Album Resolution** (`_step_prepare_request`): Fuzzy-match the artist against the library catalog to fix typos; if a song is provided without an album, query Discogs for album names. The two run in parallel when the request carries an artist.
+- **Step 3 — Search Pipeline** (`_step_search_pipeline`): Execute strategies in order until results are found (see below)
+- **Step 3a — Library-Miss Discogs Probe** (`_step_library_miss_probe`, LML#583): When the pipeline missed on an artist+album request, probe Discogs directly (`lookup/strategies/library_miss.py`); a confident match is synthesized as a row-less `LibraryItem(id=0)` pair, bypassing steps 3b and 4. Skipped on `/lookup/bulk` (LML#671).
+- **Step 3b — Track Validation** (`_step_validate_tracks`): If fallback returned all artist albums, validate each against Discogs tracklists (`filter_results_by_track_validation()` in `lookup/validation.py`). When validation can't confirm any candidate AND we're showing artist-fallback results, `find_library_albums_with_cached_track()` (same module) consults the local PG cache directly ("releases by this artist whose tracklist contains this song") and promotes any matching library album over the unrelated fallback. Cache-only — never falls back to the API.
+- **Step 3c — Streaming Status** (`_step_populate_streaming_status`): Populate each result's `on_streaming` flag from the library DB.
+- **Step 4 — Artwork Fetch** (`_step_fetch_artwork`): Fetch album art from Discogs for each result (`fetch_artwork_for_items()` in `lookup/artwork.py`)
+- **Step 4b — Metadata Enrichment** (`_step_enrich_metadata`): Populate `release_year`, `artist_bio`, `wikipedia_url`, streaming URLs. Release/artist details are fetched only for `items_with_artwork[0]` — BS/iOS only consume the top-1 result, so paying N Discogs round-trips for non-top-1 items is waste. Streaming-URL fallbacks stay per-result. Gating is *positional*: if the top-1 entry has `artwork=None`, no item carries release-year/bio/wiki, even if items further down have artwork. The lookup pipeline guarantees the strongest match is in position 0, so this is fine in practice. See `enrich_artwork_results()` in `lookup/enrichment/__init__.py`.
+- **Step 5 — Context Message** (`build_context_message`): Generate context string for the caller
+- **Step 6 — Identity Resolution** (`_step_resolve_result_identities`): Resolve external identifiers for each result's artist via the entity store.
+- **Step 7 — External-Cache Fallback** (`_step_external_cache_fallback`): Opt-in (`include_external_caches`) mojibake recovery — see the dedicated External-Cache Fallback section below.
 
 ### `LookupRequest` opt-in flags
 

@@ -65,7 +65,8 @@ def _build_rowless_response_via_perform_lookup(library_db, discogs_service):
 
     Library search misses (empty + no similar artist); Discogs confidently
     identifies the (artist, album) pair, so Step 3a synthesizes the
-    `LibraryItem(id=0)` + real `DiscogsSearchResult` pair and Step 6 builds the
+    `LibraryItem(id=0)` + real `DiscogsSearchResult` pair and the response
+    build (`_build_result_items` in `lookup/orchestrator.py`) produces the
     `LookupResultItem` we assert on. `get_release` returns None so the artwork
     enrichment pass is a no-op and the resolved `release_id`/`release_url`
     survive untouched onto the wire.
@@ -190,7 +191,8 @@ class TestRowlessResultContract:
         assert "id" in LibraryCatalogItem.model_fields
 
         # The row-less catalog item is constructible with id=0 and no album_id —
-        # mirroring the "(external)" item the orchestrator builds at Step 6.
+        # mirroring the "(external)" item the response build (_build_result_items
+        # in lookup/orchestrator.py) produces.
         rowless_catalog_item = LibraryCatalogItem(
             id=0,
             artist="Sessa",
@@ -201,13 +203,14 @@ class TestRowlessResultContract:
         assert rowless_catalog_item.id == 0
 
     def test_rowless_item_constructs_directly_from_domain_conversion(self):
-        """The Step-6 building blocks compose into the row-less shape directly.
+        """The response-build building blocks compose into the row-less shape directly.
 
         A focused unit check on the construction primitives the orchestrator uses
         (`LibraryCatalogItem` for the id=0 row + `DiscogsSearchResult.to_match_result`
         for the artwork), independent of the full `perform_lookup` wiring. Mirrors
-        `orchestrator.py` Step 6 (~L3487-3508): id=0 items get the "(external)"
-        catalog item, and the real Discogs identity rides in `artwork`.
+        the response build (`_build_result_items` in `lookup/orchestrator.py`):
+        id=0 items get the "(external)" catalog item, and the real Discogs
+        identity rides in `artwork`.
         """
         catalog_item = LibraryCatalogItem(
             id=0,
