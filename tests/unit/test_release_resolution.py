@@ -479,6 +479,43 @@ class TestBoundedEarlyExit:
         assert svc.validate_track_on_release.await_count == 1
         assert svc.validate_track_on_release.await_args.args[0] == 40
 
+    @pytest.mark.asyncio
+    async def test_no_album_single_artist_retrospective_outranks_remix_single(self):
+        """A single-artist retrospective — Discogs flags it ``Compilation`` but it
+        is credited to a real artist, not "Various" — is the canonical home of an
+        artist's original track, so it must rank as an own-release. It must NOT be
+        deprioritized below a later non-compilation single that only carries a
+        remix of the same track.
+
+        Regression for the "Me & Mr Jones by Plug" case: the original lives on the
+        retrospective "Drum 'n' Bass for Papa" (lower id, ``is_compilation=True``),
+        while the remix lives on a plain single (higher id, ``is_compilation=
+        False``). The old ``bool(is_compilation)`` prerank sorted the remix single
+        first and surfaced it; the true-V/A gate ranks the retrospective first.
+        """
+        from lookup.release_resolution import resolve_release_for_track
+
+        retrospective = _single_artist(30, "Drum 'n' Bass For Papa", is_compilation=True)
+        remix_single = _single_artist(70, "Me & Mr. Sutton", is_compilation=False)
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(
+            return_value=_track_response(remix_single, retrospective)
+        )
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album=None,
+            discogs_service=svc,
+            max_validations=5,
+        )
+
+        # The retrospective (id 30) ranks as an own-release and, being the lower
+        # id, is probed first and validates → early-exit on it, not the remix.
+        assert [r.release_id for r in resolved] == [30]
+        assert svc.validate_track_on_release.await_args.args[0] == 30
+
 
 class TestValidateReleaseForTrack:
     """The shared validate+telemetry primitive both strategies delegate to."""

@@ -188,9 +188,22 @@ def prerank_candidates_for_validation(
     """
     album_query = (album or "").strip()
     if not album_query:
-        # ``ReleaseInfo.is_compilation`` is ``bool | None``; coerce so a ``None``
-        # never lands in the sort tuple (``None < False`` raises TypeError).
-        return sorted(candidates, key=lambda r: (bool(r.is_compilation), r.release_id))
+        # Deprioritize only TRUE Various-Artists compilations — the ``Compilation``
+        # flag AND a compilation-artist credit ("Various") — not single-artist
+        # retrospectives, which Discogs also flags ``Compilation`` yet are the
+        # canonical home of an artist's original tracks. Gating on
+        # ``is_compilation`` alone sank a retrospective below a later plain single
+        # carrying only a remix (the "Me & Mr Jones by Plug" case). Mirrors the
+        # true-V/A test in ``merge_wave_b_compilations``. ``is_compilation`` is
+        # ``bool | None``; ``bool()`` coerces so a ``None`` never lands in the sort
+        # tuple (``None < False`` raises TypeError).
+        return sorted(
+            candidates,
+            key=lambda r: (
+                bool(r.is_compilation) and is_compilation_artist(r.artist or ""),
+                r.release_id,
+            ),
+        )
     return sorted(
         candidates,
         key=lambda r: (-score_match(album_query, r.album), r.release_id),
