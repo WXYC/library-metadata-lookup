@@ -253,10 +253,11 @@ class TestBulkLookupEndpoint:
 
         The bulk route forwards the item untouched, so ``perform_lookup`` sees
         the ``LookupRequest.extended`` wire default of ``None`` — no accidental
-        opt-in. (In production ``perform_lookup`` coerces ``None`` to off via
-        ``extended_mode = bool(request.extended)``; that coercion is exercised
-        by the orchestrator-level tests, not here — ``perform_lookup`` is mocked
-        on this route test.)
+        opt-in. (In production the spine coerces ``None`` to off once at the
+        ``LookupServices`` bundle build — ``extended=bool(request.extended)``
+        in ``lookup/orchestrator.py``; that coercion is exercised by the
+        orchestrator-level tests, not here — ``perform_lookup`` is mocked on
+        this route test.)
         """
         with patch(
             "lookup.router.perform_lookup",

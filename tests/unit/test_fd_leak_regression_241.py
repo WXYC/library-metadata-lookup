@@ -80,12 +80,14 @@ class TestLookupHotPathOwnsNoHttpxClients:
         import lookup.orchestrator as orchestrator_module
 
         hot_path_files = [Path(orchestrator_module.__file__)]
-        # Skip dot-prefixed names (Emacs lock files are dangling symlinks that
-        # crash the sweep); a dot-prefixed name can never be an imported module.
+        # Skip dot-prefixed path components (Emacs lock files are dangling
+        # symlinks that crash the sweep); a dot-prefixed name can never be an
+        # imported module.
+        enrichment_root = Path(enrichment_module.__file__).parent
         hot_path_files += sorted(
             f
-            for f in Path(enrichment_module.__file__).parent.rglob("*.py")
-            if not f.name.startswith(".")
+            for f in enrichment_root.rglob("*.py")
+            if not any(part.startswith(".") for part in f.relative_to(enrichment_root).parts)
         )
         assert len(hot_path_files) >= 2, "expected orchestrator + enrichment sources"
 
