@@ -5,8 +5,8 @@
 1. **Artist Correction**: Fuzzy match artist against library catalog to fix typos
 2. **Album Resolution**: If song provided without album, query Discogs for album names
 3. **Search Pipeline**: Execute strategies in order until results are found (see below)
-4. **Track Validation**: If fallback returned all artist albums, validate each against Discogs tracklists. When validation can't confirm any candidate AND we're showing artist-fallback results, `find_library_albums_with_cached_track()` consults the local PG cache directly ("releases by this artist whose tracklist contains this song") and promotes any matching library album over the unrelated fallback. Cache-only — never falls back to the API.
-5. **Artwork Fetch**: Fetch album art from Discogs for each result
+4. **Track Validation**: If fallback returned all artist albums, validate each against Discogs tracklists (`filter_results_by_track_validation()` in `lookup/validation.py`). When validation can't confirm any candidate AND we're showing artist-fallback results, `find_library_albums_with_cached_track()` (same module) consults the local PG cache directly ("releases by this artist whose tracklist contains this song") and promotes any matching library album over the unrelated fallback. Cache-only — never falls back to the API.
+5. **Artwork Fetch**: Fetch album art from Discogs for each result (`fetch_artwork_for_items()` in `lookup/artwork.py`)
 6. **Metadata Enrichment**: Populate `release_year`, `artist_bio`, `wikipedia_url`, streaming URLs. Release/artist details are fetched only for `items_with_artwork[0]` — BS/iOS only consume the top-1 result, so paying N Discogs round-trips for non-top-1 items is waste. Streaming-URL fallbacks stay per-result. Gating is *positional*: if the top-1 entry has `artwork=None`, no item carries release-year/bio/wiki, even if items further down have artwork. The lookup pipeline guarantees the strongest match is in position 0, so this is fine in practice. See `enrich_artwork_results()` in `lookup/orchestrator.py`.
 7. **Context Message**: Generate context string for the caller
 
@@ -34,12 +34,14 @@ Strategies never mutate `SearchState`; they return an `Outcome` and the runner a
 
 ## Key Files
 
-- `lookup/orchestrator.py` -- Pipeline spine: `perform_lookup()` plus the not-yet-extracted enrichment/artwork/validation steps (decomposition in progress, LML#722)
+- `lookup/orchestrator.py` -- Pipeline spine: `perform_lookup()` plus the not-yet-extracted enrichment steps (decomposition in progress, LML#722)
 - `lookup/strategies/` -- Strategy classes (gating predicate + `attempt` per module), the `build_strategies` factory, and every strategy's execute func (`SONG_AS_TRACK`/`SWAPPED_INTERPRETATION` over the shared `track_release_matching` kernel), plus the step-3a library-miss Discogs probe (`library_miss.py`)
 - `lookup/matching.py` -- Pure matching predicates, filters, and score floors
 - `lookup/concurrency.py` -- `_chunked_gather` + the per-invocation Discogs API-call cap
 - `lookup/artist_resolution.py` -- Canonical-artist resolver (`resolve_canonical_artist`) + its flag gates and telemetry projections
-- `lookup/rowless.py` -- Row-less (non-library) release synthesis + credit recovery
+- `lookup/rowless.py` -- Row-less (non-library) release synthesis + credit recovery; home of `ROWLESS_NO_ALBUM_CONFIDENCE`
+- `lookup/validation.py` -- Step-3b track validation (`filter_results_by_track_validation`) + the A4 cached-track safety net (`find_library_albums_with_cached_track`)
+- `lookup/artwork.py` -- Step-4 artwork fetch (`fetch_artwork_for_items`) with the LML#478 80/80 floor, the LML#604 release trust-and-bind, and the cover → artist-image → label-image fallback cascade
 - `lookup/models.py` -- Re-exports generated API contract models (`LookupRequest`, `LookupResponse`, `LookupResultItem`)
 - `generated/api_models.py` -- Pydantic v2 models generated from `wxyc-shared/api.yaml`
 - `lookup/router.py` -- `POST /lookup` endpoint
