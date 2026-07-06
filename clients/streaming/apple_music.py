@@ -100,7 +100,7 @@ _SEMAPHORE_LIMIT = 5
 # ``_MAX_RETRIES=4`` and a 60s ``Retry-After`` cap, a single sustained 429
 # storm pinned one of 5 Semaphore slots for up to 240s — bulk burst then
 # starved real-time ``/lookup`` (LML#449 + LML#450). Trim retries to 2
-# (degrade-fast on transient upstream) and rely on the orchestrator's
+# (degrade-fast on transient upstream) and rely on the enrichment probe's
 # ``asyncio.wait_for`` ceiling for the request-level latency cap.
 _MAX_RETRIES = 2
 
