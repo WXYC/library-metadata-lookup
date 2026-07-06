@@ -434,10 +434,11 @@ async def handle_lookup(
     Note the one bio-warm fan-out is gated on the SEPARATE ``warm_cache`` flag,
     NOT ``extended``: ``warm_cache: true`` schedules ``_warm_bio_cache``, which
     fires per-bio-ref live Discogs calls. On this path the flag is hard-pinned
-    off (LML#742) — a per-item ``warm_cache: true`` is silently discarded before
-    the item reaches ``perform_lookup``, same enforced guarantee as the
-    ``bandcamp`` / ``allow_release_resolution_fallback`` pins. Callers that want
-    the bio cache populated at bulk scale should use the offline warmer (#548).
+    off (LML#742) — a per-item ``warm_cache: true`` is discarded (with a
+    server-side warning log) before the item reaches ``perform_lookup``, same
+    enforced guarantee as the ``bandcamp`` / ``allow_release_resolution_fallback``
+    pins. Callers that want the bio cache populated at bulk scale should use
+    the offline warmer (#548).
     """,
     responses={
         200: {"description": "Per-item verdicts in input order."},
