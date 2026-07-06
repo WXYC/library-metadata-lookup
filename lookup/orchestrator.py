@@ -3,10 +3,18 @@
 This module contains the perform_lookup() function that orchestrates the full
 search pipeline: artist correction -> album resolution -> search strategies ->
 track validation -> artwork fetch -> metadata enrichment -> context message.
+
+Post-decomposition (LML#722) this module is the pipeline *spine* only: a
+mutable :class:`LookupState` threaded through named ``_step_*`` functions, plus
+the spine-scoped helpers (``resolve_albums_for_track``,
+``build_context_message``, ``_identity_to_reconciled``,
+``_resolve_identities``). Every concern the steps delegate to lives in its own
+``lookup/`` module.
 """
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
@@ -20,6 +28,7 @@ from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
 from core.search import (
+    SearchState,
     execute_search_pipeline,
     get_search_type_from_state,
 )
@@ -181,31 +190,140 @@ async def _resolve_identities(
     return result
 
 
-async def perform_lookup(
-    request: LookupRequest,
-    db: LibraryDB,
-    discogs_service: DiscogsService | None,
-    telemetry: RequestTelemetry,
-    *,
-    entity_store: EntityStore | None = None,
-    discogs_cache: DiscogsCacheService | None = None,
-    mb_pg: PgSourceProtocol | None = None,
-    apple_music: AppleMusicClient | None = None,
-    spotify: SpotifyClient | None = None,
-    bandcamp: BandcampClient | None = None,
-    discogs_cache_pg: PgSource | None = None,
-    caller_budget_ms: int | None = None,
-    allow_release_resolution_fallback: bool = True,
-) -> LookupResponse:
-    """Orchestrate the full lookup pipeline.
+@dataclass
+class LookupState:
+    """Mutable per-request state for one ``perform_lookup`` pass.
 
-    Steps:
-    1. Correct artist spelling
-    2. Resolve album names from Discogs (if song provided without album)
-    3. Execute search strategy pipeline
-    4. Validate fallback results against Discogs tracklists
-    5. Fetch artwork for results
-    6. Build context message
+    Created empty at the top of ``perform_lookup`` and mutated in place by the
+    ``_step_*`` functions, in spine order. Each field's docstring names the
+    steps that touch it; each step function's docstring declares the fields it
+    READS and WRITES. Values that cross only a single step boundary (the
+    ``ParsedRequest``, ``albums_for_search``, the raw ``SearchState``, the
+    built ``result_items``) ride as step parameters/returns instead of state.
+    """
+
+    library_results: list[LibraryItem] = field(default_factory=list)
+    """Library catalog rows for the response. Written by the search pipeline
+    (step 3) and narrowed/promoted by track validation (step 3b); step 3c sets
+    each row's ``on_streaming`` in place; read by the library-miss gate (3a),
+    artwork fetch (4), the trace projection, the context message (5), identity
+    resolution (6), and the response build."""
+
+    items_with_artwork: list[tuple[LibraryItem, DiscogsSearchResult | None]] = field(
+        default_factory=list
+    )
+    """``(library item, Discogs artwork match)`` pairs for the response. Built
+    by artwork fetch (step 4) from ``library_results`` — or synthesized
+    directly by the library-miss probe (step 3a), which bypasses steps 3b and 4
+    — then rebound to the enriched pairs by enrichment (4b). When non-empty it
+    takes precedence over ``library_results`` in the response build."""
+
+    song_not_found: bool = False
+    """True while the requested song/album is unconfirmed. Seeded by album
+    resolution (steps 1+2), updated by the search pipeline (3), cleared by the
+    library-miss probe (3a) on a synthesized hit and by track validation (3b)
+    on a confirmed or promoted match; read by the context message (5) and the
+    response."""
+
+    found_on_compilation: bool = False
+    """True when TRACK_ON_COMPILATION surfaced the track on a compilation.
+    Written by the search pipeline (step 3); routes track validation (3b),
+    threads into artwork fetch (4) and enrichment (4b), and shapes the context
+    message (5)."""
+
+    discogs_titles: dict[int, ResolvedRelease] = field(default_factory=dict)
+    """Library item id → resolved Discogs release, carried on the strategy seam
+    so artwork fetch binds ``discogs_url`` by id. Written by the search
+    pipeline (step 3), extended by the A4 cached-track promotion (3b, LML#629),
+    read by artwork fetch (4)."""
+
+    search_type: str = "none"
+    """Which strategy resolved the request (telemetry + response). Written by
+    the search pipeline (step 3); the default mirrors
+    ``get_search_type_from_state``'s no-strategies-tried value."""
+
+    library_miss_outcome: str | None = None
+    """LML#583 outcome marker (``library_miss_discogs_match`` /
+    ``library_miss_no_discogs_match``) for the Sentry trace projection. Written
+    by the library-miss probe (step 3a)."""
+
+    corrected_artist: str | None = None
+    """Fuzzy artist-spelling correction from the library vocabulary, reported
+    on the response. Written by the prepare step (steps 1+2); the correction
+    itself rides on ``parsed.library_artist`` (the LML#626 two-channel seam),
+    never on ``parsed.artist``."""
+
+
+@dataclass(frozen=True)
+class LookupServices:
+    """Internal read-only bundle of service handles + request-scoped config.
+
+    Exists purely to keep the ``_step_*`` function signatures short; it is not
+    exported and is not part of any wire contract. ``perform_lookup``'s public
+    signature stays the sole entry point — the bundle is built from it, once
+    per request.
+    """
+
+    db: LibraryDB
+    """Library SQLite handle (search, artist correction, streaming flags)."""
+
+    discogs_service: DiscogsService | None
+    """Discogs API/cache facade; ``None`` degrades every Discogs-touching step."""
+
+    telemetry: RequestTelemetry
+    """Per-request step timings + API-call counters."""
+
+    entity_store: EntityStore | None
+    """Identity store for step-6 artist identity resolution."""
+
+    discogs_cache: DiscogsCacheService | None
+    """Discogs PG cache for enrichment + the external-cache fallback (step 7)."""
+
+    mb_pg: PgSourceProtocol | None
+    """MusicBrainz cache PG source (enrichment + external-cache fallback)."""
+
+    apple_music: AppleMusicClient | None
+    """Apple Music client for enrichment's streaming-URL assignment."""
+
+    spotify: SpotifyClient | None
+    """Spotify client for enrichment's streaming-URL assignment."""
+
+    bandcamp: BandcampClient | None
+    """Bandcamp client for enrichment's streaming-URL assignment."""
+
+    discogs_cache_pg: PgSource | None
+    """Discogs-cache PG source: the #632 row-less resolution cache threaded
+    into the Discogs-aware strategies, plus the streaming-URL cache."""
+
+    # --- Request-scoped config (rides with the handles to keep signatures short) ---
+
+    caller_budget_ms: int | None
+    """Caller-imposed search budget forwarded to the strategy pipeline (step 3)."""
+
+    allow_release_resolution_fallback: bool
+    """LML#652/#671 bulk kill switch: ``False`` on /lookup/bulk suppresses every
+    per-row Discogs surfacing path (the row-less producers, the step-3a
+    library-miss probe, and step 4's lazy artwork fallback)."""
+
+
+async def _step_prepare_request(
+    request: LookupRequest,
+    state: LookupState,
+    services: LookupServices,
+) -> tuple[ParsedRequest, list[str]]:
+    """Steps 1+2 — prepare: build the ParsedRequest, correct artist spelling, resolve albums.
+
+    Artist correction (``db.find_similar_artist``) and album resolution
+    (``resolve_albums_for_track``) run in parallel when the request carries an
+    artist. A correction never overwrites ``parsed.artist`` — see the LML#626
+    two-channel seam comment inline.
+
+    READS: nothing from ``LookupState``.
+    WRITES: ``corrected_artist``, ``song_not_found``.
+
+    Returns ``(parsed, albums_for_search)``: the ParsedRequest threads through
+    every later step; ``albums_for_search`` feeds only the search pipeline
+    (step 3), so it rides as a return value rather than state.
     """
     # Build a ParsedRequest from the LookupRequest for compatibility with
     # search functions that expect ParsedRequest
@@ -218,25 +336,17 @@ async def perform_lookup(
         raw_message=request.raw_message,
     )
 
-    library_results: list[LibraryItem] = []
-    items_with_artwork: list[tuple[LibraryItem, DiscogsSearchResult | None]] = []
-    song_not_found = False
-    found_on_compilation = False
-    discogs_titles: dict[int, ResolvedRelease] = {}
-    corrected_artist: str | None = None
-
-    # Steps 1+2: Correct artist spelling and resolve albums (parallel)
     if parsed.artist:
-        correction_task = db.find_similar_artist(parsed.artist)
-        with telemetry.track_step("album_lookup"):
+        correction_task = services.db.find_similar_artist(parsed.artist)
+        with services.telemetry.track_step("album_lookup"):
             if parsed.song and not parsed.album:
-                telemetry.record_api_call("discogs")
+                services.telemetry.record_api_call("discogs")
             corrected, (albums_for_search, song_not_found) = await asyncio.gather(
                 correction_task,
-                resolve_albums_for_track(parsed, discogs_service),
+                resolve_albums_for_track(parsed, services.discogs_service),
             )
         if corrected:
-            corrected_artist = corrected
+            state.corrected_artist = corrected
             # Two-channel seam (WXYC/library-metadata-lookup#626): do NOT
             # overwrite ``parsed.artist``. The typed value must keep flowing to
             # every Discogs-facing path (the three Discogs-aware strategies'
@@ -248,13 +358,33 @@ async def perform_lookup(
             # match-backs).
             parsed.library_artist = corrected
     else:
-        with telemetry.track_step("album_lookup"):
+        with services.telemetry.track_step("album_lookup"):
             albums_for_search, song_not_found = await resolve_albums_for_track(
-                parsed, discogs_service
+                parsed, services.discogs_service
             )
 
-    # Step 3: Execute search strategy pipeline
-    with telemetry.track_step("library_search"):
+    state.song_not_found = song_not_found
+    return parsed, albums_for_search
+
+
+async def _step_search_pipeline(
+    request: LookupRequest,
+    parsed: ParsedRequest,
+    albums_for_search: list[str],
+    state: LookupState,
+    services: LookupServices,
+) -> SearchState:
+    """Step 3 — execute the search strategy pipeline.
+
+    READS: ``song_not_found`` (pipeline input, seeded by steps 1+2).
+    WRITES: ``library_results``, ``song_not_found``, ``found_on_compilation``,
+    ``discogs_titles``, ``search_type``.
+
+    Returns the raw ``SearchState``: later consumers need fields that are not
+    part of ``LookupState`` (``artist_fallback_results`` in step 3b,
+    ``matched_via_by_id`` and ``timed_out`` in the response build).
+    """
+    with services.telemetry.track_step("library_search"):
         # Strategies hold their own ``db`` handle (no per-call db arg on the
         # runner post-#399). The discogs_service is captured via ``partial`` on
         # the strategies that need it; ARTIST_PLUS_ALBUM is the only
@@ -271,30 +401,30 @@ async def perform_lookup(
         # row-less item surfaces, nor any carry-through resolve or #632 cache
         # write, on the backfill path.
         strategies = build_strategies(
-            db,
+            services.db,
             search_library_func=search_library_with_fallback,
             search_alternative_func=partial(
                 search_with_alternative_interpretation,
-                discogs_service=discogs_service,
-                pg=discogs_cache_pg,
-                allow_release_resolution_fallback=allow_release_resolution_fallback,
+                discogs_service=services.discogs_service,
+                pg=services.discogs_cache_pg,
+                allow_release_resolution_fallback=services.allow_release_resolution_fallback,
             ),
             search_compilations_func=partial(
                 search_compilations_for_track,
-                discogs_service=discogs_service,
-                pg=discogs_cache_pg,
-                allow_release_resolution_fallback=allow_release_resolution_fallback,
+                discogs_service=services.discogs_service,
+                pg=services.discogs_cache_pg,
+                allow_release_resolution_fallback=services.allow_release_resolution_fallback,
             ),
             search_song_as_artist_func=partial(
                 search_song_as_artist,
-                discogs_service=discogs_service,
-                allow_release_resolution_fallback=allow_release_resolution_fallback,
+                discogs_service=services.discogs_service,
+                allow_release_resolution_fallback=services.allow_release_resolution_fallback,
             ),
             search_song_as_track_func=partial(
                 search_song_as_track,
-                discogs_service=discogs_service,
-                pg=discogs_cache_pg,
-                allow_release_resolution_fallback=allow_release_resolution_fallback,
+                discogs_service=services.discogs_service,
+                pg=services.discogs_cache_pg,
+                allow_release_resolution_fallback=services.allow_release_resolution_fallback,
             ),
         )
 
@@ -303,20 +433,39 @@ async def perform_lookup(
             raw_message=request.raw_message or "",
             strategies=strategies,
             albums_for_search=albums_for_search,
-            song_not_found=song_not_found,
-            caller_budget_ms=caller_budget_ms,
+            song_not_found=state.song_not_found,
+            caller_budget_ms=services.caller_budget_ms,
         )
 
-        library_results = limit_results(search_state.results)
-        song_not_found = search_state.song_not_found
-        found_on_compilation = search_state.found_on_compilation
-        discogs_titles = search_state.discogs_titles
-        search_type = get_search_type_from_state(search_state)
+        state.library_results = limit_results(search_state.results)
+        state.song_not_found = search_state.song_not_found
+        state.found_on_compilation = search_state.found_on_compilation
+        state.discogs_titles = search_state.discogs_titles
+        state.search_type = get_search_type_from_state(search_state)
 
-        if found_on_compilation:
-            telemetry.record_api_call("discogs")
+        if state.found_on_compilation:
+            services.telemetry.record_api_call("discogs")
 
-    # Step 3a: Library-miss Discogs search (LML#583).
+    return search_state
+
+
+async def _step_library_miss_probe(
+    parsed: ParsedRequest,
+    state: LookupState,
+    services: LookupServices,
+) -> None:
+    """Step 3a — library-miss Discogs search (LML#583).
+
+    READS: ``library_results`` (the emptiness gate).
+    WRITES: ``items_with_artwork``, ``song_not_found``, ``library_miss_outcome``.
+
+    Ordering invariant (enforced here and at step 4's emptiness guard): on a
+    hit this step writes ``items_with_artwork`` directly and clears
+    ``song_not_found``, deliberately bypassing track validation (3b) and the
+    artwork fetch (4). The bypass holds because this step only fires when
+    ``library_results`` is empty — so 3b's and 4's non-empty gates never run on
+    this path and cannot overwrite the synthesized pair.
+    """
     # When the entire search pipeline returned no library results AND the request
     # carries both artist and album, probe Discogs directly. A confident match
     # (80/80-floor via find_best_typed_match) is synthesized into a
@@ -334,64 +483,78 @@ async def perform_lookup(
     # not the five song-bearing LML#652 producers — so gating it is what makes the
     # "no per-row Discogs surfacing/cost on bulk" guarantee true for the real drain.
     # /lookup keeps the default (``True``), so #583 fires there exactly as before.
-    library_miss_outcome: str | None = None
     if (
-        not library_results
-        and allow_release_resolution_fallback
+        not state.library_results
+        and services.allow_release_resolution_fallback
         and parsed.artist
         and parsed.album
         and parsed.album.strip()
     ):
-        with telemetry.track_step("library_miss_discogs_search"):
-            miss_match = await _library_miss_discogs_search(parsed, discogs_service)
+        with services.telemetry.track_step("library_miss_discogs_search"):
+            miss_match = await _library_miss_discogs_search(parsed, services.discogs_service)
         if miss_match is not None:
             synthesized_lib_item, discogs_result = miss_match
-            items_with_artwork = [(synthesized_lib_item, discogs_result)]
+            state.items_with_artwork = [(synthesized_lib_item, discogs_result)]
             # A synthesized Discogs match resolves the request — clear song_not_found so
             # build_context_message and LookupResponse.song_not_found reflect reality.
-            song_not_found = False
-            library_miss_outcome = "library_miss_discogs_match"
-            telemetry.record_api_call("discogs")
-        elif discogs_service is not None:
+            state.song_not_found = False
+            state.library_miss_outcome = "library_miss_discogs_match"
+            services.telemetry.record_api_call("discogs")
+        elif services.discogs_service is not None:
             # Discogs was available and searched but found no confident match.
-            library_miss_outcome = "library_miss_no_discogs_match"
+            state.library_miss_outcome = "library_miss_no_discogs_match"
 
-    # Step 3b: Validate results against Discogs track data.
-    # Synthesized id=0 items from Step 3a are excluded: library_results is empty
-    # on that path, so the gate below never fires. The filter on real_results is
-    # a defensive guard for any future path that might add id=0 items to
-    # library_results.
-    real_results = [r for r in library_results if r.id != 0]
+
+async def _step_validate_tracks(
+    parsed: ParsedRequest,
+    search_state: SearchState,
+    state: LookupState,
+    services: LookupServices,
+) -> None:
+    """Step 3b — validate results against Discogs track data.
+
+    READS: ``library_results``, ``found_on_compilation``, ``song_not_found``,
+    ``discogs_titles``; plus ``search_state.artist_fallback_results``.
+    WRITES: ``library_results``, ``song_not_found``, ``discogs_titles``.
+
+    Synthesized id=0 items from Step 3a are excluded: library_results is empty
+    on that path, so the gate below never fires. The filter on real_results is
+    a defensive guard for any future path that might add id=0 items to
+    library_results.
+    """
+    real_results = [r for r in state.library_results if r.id != 0]
     if real_results and parsed.song and parsed.artist:
-        if not found_on_compilation:
+        if not state.found_on_compilation:
             # Normal case: validate all results against Discogs tracklists
-            with telemetry.track_step("track_validation"):
+            with services.telemetry.track_step("track_validation"):
                 validated = await filter_results_by_track_validation(
-                    real_results, parsed.song, parsed.artist, discogs_service
+                    real_results, parsed.song, parsed.artist, services.discogs_service
                 )
                 if validated:
-                    library_results = validated
-                    song_not_found = False
-                elif song_not_found:
+                    state.library_results = validated
+                    state.song_not_found = False
+                elif state.song_not_found:
                     # Per-result validation confirmed nothing. Ask the local
                     # PG cache directly: "any release by this artist whose
                     # tracklist contains this song?" — and promote the matching
                     # library album. Catches the case where the upstream
                     # track→releases lookup missed a release the cache holds.
                     promoted, promoted_titles = await find_library_albums_with_cached_track(
-                        db,
+                        services.db,
                         parsed.song,
                         parsed.artist,
-                        discogs_service,
+                        services.discogs_service,
                         match_artist=library_artist_for(parsed),
-                        allow_release_resolution_fallback=allow_release_resolution_fallback,
+                        allow_release_resolution_fallback=(
+                            services.allow_release_resolution_fallback
+                        ),
                     )
                     if promoted:
-                        library_results = promoted
+                        state.library_results = promoted
                         # A4 (LML#629): a row-less promotion carries its resolved
                         # release on the seam so Step 4 binds discogs_url by id.
-                        discogs_titles = {**discogs_titles, **promoted_titles}
-                        song_not_found = False
+                        state.discogs_titles = {**state.discogs_titles, **promoted_titles}
+                        state.song_not_found = False
                     else:
                         # Last resort before declaring song-not-found: the
                         # request shape "<album-title>, <artist>" can route to
@@ -401,82 +564,138 @@ async def perform_lookup(
                         # album avoids the misleading 'not on any album'
                         # message about a row sitting in the result list.
                         title_matches = _filter_results_by_song_as_album_title(
-                            library_results, parsed.song
+                            state.library_results, parsed.song
                         )
                         if title_matches:
                             logger.info(
-                                f"Promoted {len(title_matches)} of {len(library_results)} "
+                                f"Promoted {len(title_matches)} of {len(state.library_results)} "
                                 f"artist-fallback row(s) whose title matches song "
                                 f"'{parsed.song}' — treating as album request"
                             )
-                            library_results = title_matches
-                            song_not_found = False
+                            state.library_results = title_matches
+                            state.song_not_found = False
         elif search_state.artist_fallback_results:
             # Compilation found, but the artist's own album may also contain the track.
             # Validate the artist fallback results (saved before compilation search
             # replaced them) and prepend any confirmed matches.
-            with telemetry.track_step("track_validation"):
+            with services.telemetry.track_step("track_validation"):
                 validated = await filter_results_by_track_validation(
                     search_state.artist_fallback_results,
                     parsed.song,
                     parsed.artist,
-                    discogs_service,
+                    services.discogs_service,
                 )
                 if validated:
-                    compilation_ids = {r.id for r in library_results}
+                    compilation_ids = {r.id for r in state.library_results}
                     merged = [r for r in validated if r.id not in compilation_ids]
-                    merged.extend(library_results)
-                    library_results = merged
+                    merged.extend(state.library_results)
+                    state.library_results = merged
 
-    # Step 3c: Populate streaming status
-    if library_results and getattr(db, "_has_streaming_links", None) is True:
-        streaming_status = await db.get_streaming_status([r.id for r in library_results])
-        for result in library_results:
+
+async def _step_populate_streaming_status(
+    state: LookupState,
+    services: LookupServices,
+) -> None:
+    """Step 3c — populate per-row streaming availability flags.
+
+    READS: ``library_results`` (sets each item's ``on_streaming`` in place).
+    WRITES: no ``LookupState`` field is rebound.
+    """
+    if state.library_results and getattr(services.db, "_has_streaming_links", None) is True:
+        streaming_status = await services.db.get_streaming_status(
+            [r.id for r in state.library_results]
+        )
+        for result in state.library_results:
             result.on_streaming = streaming_status.get(result.id, False)
 
-    # Step 4: Fetch artwork
-    with telemetry.track_step("artwork_fetch"):
-        if library_results:
-            for _ in library_results:
-                telemetry.record_api_call("discogs")
-            items_with_artwork = await fetch_artwork_for_items(
-                library_results,
-                discogs_service,
-                discogs_titles,
+
+async def _step_fetch_artwork(
+    parsed: ParsedRequest,
+    state: LookupState,
+    services: LookupServices,
+) -> None:
+    """Step 4 — fetch artwork for the library results.
+
+    READS: ``library_results``, ``discogs_titles``, ``found_on_compilation``.
+    WRITES: ``items_with_artwork`` (builds the ``(item, artwork)`` pairs every
+    later step consumes).
+
+    Ordering invariant (LML#583): the ``if library_results`` emptiness guard is
+    load-bearing — when Step 3a synthesized ``items_with_artwork``,
+    ``library_results`` is empty by 3a's own gate, so this step must not run
+    and overwrite the synthesized pair (re-searching here would re-open the
+    floor mis-selection risk 3a's bypass exists to avoid).
+    """
+    with services.telemetry.track_step("artwork_fetch"):
+        if state.library_results:
+            for _ in state.library_results:
+                services.telemetry.record_api_call("discogs")
+            state.items_with_artwork = await fetch_artwork_for_items(
+                state.library_results,
+                services.discogs_service,
+                state.discogs_titles,
                 song=parsed.song,
                 album=parsed.album,
-                allow_release_resolution_fallback=allow_release_resolution_fallback,
-                found_on_compilation=found_on_compilation,
+                allow_release_resolution_fallback=services.allow_release_resolution_fallback,
+                found_on_compilation=state.found_on_compilation,
             )
 
-    # The generated LookupRequest models these as bool | None (api.yaml
-    # describes them with `default: false` but the field is not in the
-    # required set, so callers can omit them). Coerce once and reuse.
-    extended_mode = bool(request.extended)
-    warm_cache_mode = bool(request.warm_cache)
 
-    # Step 4b: Enrich with release year, artist details, streaming links
-    with telemetry.track_step("metadata_enrichment"):
-        if items_with_artwork:
-            items_with_artwork = await enrich_artwork_results(
-                items_with_artwork,
-                discogs_service,
+async def _step_enrich_metadata(
+    parsed: ParsedRequest,
+    state: LookupState,
+    services: LookupServices,
+    *,
+    extended: bool,
+    warm_cache: bool,
+) -> None:
+    """Step 4b — enrich with release year, artist details, streaming links.
+
+    READS: ``items_with_artwork``, ``found_on_compilation``.
+    WRITES: ``items_with_artwork`` (rebound to the enriched pairs).
+
+    Ordering invariant: runs strictly after Step 4 built ``items_with_artwork``
+    — and after Step 3a, whose synthesized pair bypasses the artwork fetch and
+    lands here directly — because enrichment extends the pairs those steps
+    produced.
+    """
+    with services.telemetry.track_step("metadata_enrichment"):
+        if state.items_with_artwork:
+            state.items_with_artwork = await enrich_artwork_results(
+                state.items_with_artwork,
+                services.discogs_service,
                 song=parsed.song,
                 album=parsed.album,
                 artist=parsed.artist,
-                library_db=db,
-                extended=extended_mode,
-                warm_cache=warm_cache_mode,
-                discogs_cache=discogs_cache,
-                mb_pg=mb_pg,
-                apple_music=apple_music,
-                spotify=spotify,
-                bandcamp=bandcamp,
-                entity_store=entity_store,
-                discogs_cache_pg=discogs_cache_pg,
-                found_on_compilation=found_on_compilation,
+                library_db=services.db,
+                extended=extended,
+                warm_cache=warm_cache,
+                discogs_cache=services.discogs_cache,
+                mb_pg=services.mb_pg,
+                apple_music=services.apple_music,
+                spotify=services.spotify,
+                bandcamp=services.bandcamp,
+                entity_store=services.entity_store,
+                discogs_cache_pg=services.discogs_cache_pg,
+                found_on_compilation=state.found_on_compilation,
             )
 
+
+def _step_project_trace_attrs(
+    state: LookupState,
+    *,
+    extended: bool,
+    warm_cache: bool,
+) -> None:
+    """Project request flags and result-quality signals onto the Sentry transaction.
+
+    Runs between steps 4b and 5; not a numbered pipeline step (observability
+    only — it must never affect the response).
+
+    READS: ``items_with_artwork``, ``library_results``, ``search_type``,
+    ``library_miss_outcome``.
+    WRITES: nothing.
+    """
     # Project the request-side flags and result-quality signals onto the
     # active Sentry transaction so the trace can be filtered by request mode
     # (lml.lookup.extended, lml.lookup.warm_cache) and by match outcome
@@ -485,49 +704,71 @@ async def perform_lookup(
     try:
         scope = sentry_sdk.get_current_scope()
         if scope.transaction is not None:
-            scope.transaction.set_data("lml.lookup.extended", extended_mode)
-            scope.transaction.set_data("lml.lookup.warm_cache", warm_cache_mode)
+            scope.transaction.set_data("lml.lookup.extended", extended)
+            scope.transaction.set_data("lml.lookup.warm_cache", warm_cache)
             scope.transaction.set_data(
                 "lookup.results_count",
-                len(items_with_artwork) if items_with_artwork else len(library_results),
+                len(state.items_with_artwork)
+                if state.items_with_artwork
+                else len(state.library_results),
             )
-            scope.transaction.set_data("lookup.match_type", search_type)
-            if library_miss_outcome is not None:
-                scope.transaction.set_data("lookup.outcome", library_miss_outcome)
+            scope.transaction.set_data("lookup.match_type", state.search_type)
+            if state.library_miss_outcome is not None:
+                scope.transaction.set_data("lookup.outcome", state.library_miss_outcome)
     except Exception:
         # Observability must not break the request path.
         pass
 
-    # Step 5: Build context message
-    context = build_context_message(
-        parsed,
-        found_on_compilation,
-        song_not_found,
-        has_results=bool(library_results) or bool(items_with_artwork),
-    )
 
-    # Step 6: Resolve external identifiers for each result's artist.
+async def _step_resolve_result_identities(
+    state: LookupState,
+    services: LookupServices,
+) -> dict[str, ReconciledIdentity]:
+    """Step 6 — resolve external identifiers for each result's artist.
+
+    READS: ``library_results``, ``items_with_artwork``.
+    WRITES: nothing.
+
+    Returns identities keyed by artist name (missing key = "no identity");
+    consumed only by the response build, so the mapping rides as a return
+    value rather than state.
+    """
     # Collect artist names from library_results (normal path) and from
     # items_with_artwork (synthesized Step 3a path, where library_results is empty
     # but the synthesized LibraryItem carries a real artist name worth resolving).
     identities_by_artist: dict[str, ReconciledIdentity] = {}
-    _identity_artist_names = [item.artist for item in library_results if item.artist] + [
-        item.artist for item, _ in items_with_artwork if item.id == 0 and item.artist
+    _identity_artist_names = [item.artist for item in state.library_results if item.artist] + [
+        item.artist for item, _ in state.items_with_artwork if item.id == 0 and item.artist
     ]
-    if entity_store is not None and _identity_artist_names:
-        with telemetry.track_step("identity_resolution"):
-            identities_by_artist = await _resolve_identities(_identity_artist_names, entity_store)
+    if services.entity_store is not None and _identity_artist_names:
+        with services.telemetry.track_step("identity_resolution"):
+            identities_by_artist = await _resolve_identities(
+                _identity_artist_names, services.entity_store
+            )
+    return identities_by_artist
+
+
+def _build_result_items(
+    state: LookupState,
+    search_state: SearchState,
+    identities_by_artist: dict[str, ReconciledIdentity],
+) -> list[LookupResultItem]:
+    """Build the response items (convert internal models to API contract models).
+
+    READS: ``items_with_artwork`` (takes precedence when non-empty),
+    ``library_results``.
+    WRITES: nothing.
+    """
 
     def _identity_for(item: LibraryItem) -> ReconciledIdentity | None:
         if not item.artist:
             return None
         return identities_by_artist.get(item.artist)
 
-    # Build response (convert internal models to API contract models)
     matched_via_by_id = search_state.matched_via_by_id
     result_items = []
-    if items_with_artwork:
-        for item, artwork in items_with_artwork:
+    if state.items_with_artwork:
+        for item, artwork in state.items_with_artwork:
             # Synthesized items (id=0, from Step 3a) have no library call-number
             # components; build LibraryCatalogItem directly with the "(external)"
             # sentinel that Backend-Service already understands (same contract as
@@ -554,8 +795,8 @@ async def perform_lookup(
                     matched_via=None if item.id == 0 else matched_via_by_id.get(item.id),
                 )
             )
-    elif library_results:
-        for item in library_results:
+    elif state.library_results:
+        for item in state.library_results:
             result_items.append(
                 LookupResultItem(
                     library_item=item.to_catalog_item(),
@@ -563,8 +804,24 @@ async def perform_lookup(
                     matched_via=matched_via_by_id.get(item.id),
                 )
             )
+    return result_items
 
-    # Step 7: External-cache fallback (Phase 1.5 + 1.7 mojibake recovery).
+
+async def _step_external_cache_fallback(
+    request: LookupRequest,
+    parsed: ParsedRequest,
+    result_items: list[LookupResultItem],
+    services: LookupServices,
+) -> str | None:
+    """Step 7 — external-cache fallback (Phase 1.5 + 1.7 mojibake recovery).
+
+    READS/WRITES: no ``LookupState`` fields — operates on the built
+    ``result_items``, appending synthetic external rows on a fallback hit.
+
+    Returns the ``external_source`` provenance value for the response
+    (``"library"`` when the pipeline already produced results, the fallback
+    source name on a hit, else ``None``).
+    """
     # Opt-in via include_external_caches. The lossy-mojibake matcher sends
     # column-typed bodies, so we dispatch by which skeleton field is set:
     # artist takes precedence (highest-precision lookup), then album, then
@@ -575,27 +832,27 @@ async def perform_lookup(
         candidates: list[dict[str, Any]] = []
         source: str | None = None
         if parsed.artist:
-            with telemetry.track_step("external_cache_fallback"):
+            with services.telemetry.track_step("external_cache_fallback"):
                 rows, source = await search_external_artists(
                     parsed.artist,
-                    discogs_cache=discogs_cache,
-                    mb_pg=mb_pg,
+                    discogs_cache=services.discogs_cache,
+                    mb_pg=services.mb_pg,
                 )
             candidates = [{"artist": r["name"], "title": ""} for r in rows]
         elif parsed.album:
-            with telemetry.track_step("external_cache_fallback"):
+            with services.telemetry.track_step("external_cache_fallback"):
                 rows, source = await search_external_albums(
                     parsed.album,
-                    discogs_cache=discogs_cache,
-                    mb_pg=mb_pg,
+                    discogs_cache=services.discogs_cache,
+                    mb_pg=services.mb_pg,
                 )
             candidates = [{"artist": r["artist"], "title": r["title"]} for r in rows]
         elif parsed.song:
-            with telemetry.track_step("external_cache_fallback"):
+            with services.telemetry.track_step("external_cache_fallback"):
                 rows, source = await search_external_tracks(
                     parsed.song,
-                    discogs_cache=discogs_cache,
-                    mb_pg=mb_pg,
+                    discogs_cache=services.discogs_cache,
+                    mb_pg=services.mb_pg,
                 )
             candidates = [{"artist": r["artist"], "title": r["title"]} for r in rows]
 
@@ -614,13 +871,100 @@ async def perform_lookup(
                     )
                 )
 
+    return external_source
+
+
+async def perform_lookup(
+    request: LookupRequest,
+    db: LibraryDB,
+    discogs_service: DiscogsService | None,
+    telemetry: RequestTelemetry,
+    *,
+    entity_store: EntityStore | None = None,
+    discogs_cache: DiscogsCacheService | None = None,
+    mb_pg: PgSourceProtocol | None = None,
+    apple_music: AppleMusicClient | None = None,
+    spotify: SpotifyClient | None = None,
+    bandcamp: BandcampClient | None = None,
+    discogs_cache_pg: PgSource | None = None,
+    caller_budget_ms: int | None = None,
+    allow_release_resolution_fallback: bool = True,
+) -> LookupResponse:
+    """Orchestrate the full lookup pipeline.
+
+    The body is a spine of named ``_step_*`` calls sharing one mutable
+    :class:`LookupState`; each step's docstring declares the state fields it
+    READS and WRITES, and the ordering invariants are documented at the steps
+    that enforce them. Step numbering follows the pipeline's historical labels
+    (kept stable because tests and ``docs/architecture.md`` cross-reference
+    them):
+
+    - Steps 1+2. ``_step_prepare_request`` — artist correction + album resolution
+    - Step 3.    ``_step_search_pipeline`` — search strategy pipeline
+    - Step 3a.   ``_step_library_miss_probe`` — library-miss Discogs search (LML#583)
+    - Step 3b.   ``_step_validate_tracks`` — Discogs tracklist validation
+    - Step 3c.   ``_step_populate_streaming_status`` — per-row streaming flags
+    - Step 4.    ``_step_fetch_artwork`` — artwork fetch
+    - Step 4b.   ``_step_enrich_metadata`` — metadata enrichment
+    - (observability) ``_step_project_trace_attrs`` — Sentry trace projection
+    - Step 5.    ``build_context_message`` — context message
+    - Step 6.    ``_step_resolve_result_identities`` — artist identity resolution
+    - (response) ``_build_result_items`` — API-model conversion
+    - Step 7.    ``_step_external_cache_fallback`` — external-cache fallback
+    """
+    services = LookupServices(
+        db=db,
+        discogs_service=discogs_service,
+        telemetry=telemetry,
+        entity_store=entity_store,
+        discogs_cache=discogs_cache,
+        mb_pg=mb_pg,
+        apple_music=apple_music,
+        spotify=spotify,
+        bandcamp=bandcamp,
+        discogs_cache_pg=discogs_cache_pg,
+        caller_budget_ms=caller_budget_ms,
+        allow_release_resolution_fallback=allow_release_resolution_fallback,
+    )
+    state = LookupState()
+
+    parsed, albums_for_search = await _step_prepare_request(request, state, services)
+    search_state = await _step_search_pipeline(request, parsed, albums_for_search, state, services)
+    await _step_library_miss_probe(parsed, state, services)
+    await _step_validate_tracks(parsed, search_state, state, services)
+    await _step_populate_streaming_status(state, services)
+    await _step_fetch_artwork(parsed, state, services)
+
+    # The generated LookupRequest models these as bool | None (api.yaml
+    # describes them with `default: false` but the field is not in the
+    # required set, so callers can omit them). Coerce once and reuse.
+    extended_mode = bool(request.extended)
+    warm_cache_mode = bool(request.warm_cache)
+
+    await _step_enrich_metadata(
+        parsed, state, services, extended=extended_mode, warm_cache=warm_cache_mode
+    )
+    _step_project_trace_attrs(state, extended=extended_mode, warm_cache=warm_cache_mode)
+
+    # Step 5: Build context message
+    context = build_context_message(
+        parsed,
+        state.found_on_compilation,
+        state.song_not_found,
+        has_results=bool(state.library_results) or bool(state.items_with_artwork),
+    )
+
+    identities_by_artist = await _step_resolve_result_identities(state, services)
+    result_items = _build_result_items(state, search_state, identities_by_artist)
+    external_source = await _step_external_cache_fallback(request, parsed, result_items, services)
+
     return LookupResponse(
         results=result_items,
-        search_type=search_type,
-        song_not_found=song_not_found,
-        found_on_compilation=found_on_compilation,
+        search_type=state.search_type,
+        song_not_found=state.song_not_found,
+        found_on_compilation=state.found_on_compilation,
         context_message=context,
-        corrected_artist=corrected_artist,
+        corrected_artist=state.corrected_artist,
         external_source=external_source,
         timeout=search_state.timed_out,
     )
