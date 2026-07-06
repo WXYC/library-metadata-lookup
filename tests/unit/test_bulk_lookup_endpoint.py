@@ -135,6 +135,69 @@ class TestBulkLookupEndpoint:
         assert mock_lookup.await_args.kwargs.get("allow_release_resolution_fallback") is False
 
     @pytest.mark.asyncio
+    async def test_bulk_forwards_per_item_extended_true(self, app_client):
+        """A bulk item that sets ``extended: true`` reaches perform_lookup with
+        ``request.extended is True`` — the model path (BulkLookupRequest →
+        LookupRequest items) must not strip it (LML#685).
+
+        This is the contract BS#1442's 35k-row album_metadata backfill relies
+        on: the bulk drain is the only Discogs-ceiling-safe way to request the
+        extended DiscogsMatchResult fields at that scale. ``perform_lookup``
+        reads ``request.extended`` identically to the single ``/lookup`` route,
+        so forwarding the flag intact is the whole contract.
+        """
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_no_match_response(),
+        ) as mock_lookup:
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={
+                        "items": [
+                            {"artist": "Stereolab", "album": "Aluminum Tunes", "extended": True}
+                        ]
+                    },
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_count == 1
+        assert mock_lookup.await_args.kwargs["request"].extended is True
+
+    @pytest.mark.asyncio
+    async def test_bulk_omitted_extended_defaults_off(self, app_client):
+        """Omitting ``extended`` preserves today's bulk contract for non-iOS
+        callers (request-o-matic): the extended payload stays off (LML#685 — no
+        behavior change for non-extended bulk callers).
+
+        The bulk route forwards the item untouched, so ``perform_lookup`` sees
+        the ``LookupRequest.extended`` wire default of ``None`` — no accidental
+        opt-in. (In production ``perform_lookup`` coerces ``None`` to off via
+        ``extended_mode = bool(request.extended)``; that coercion is exercised
+        by the orchestrator-level tests, not here — ``perform_lookup`` is mocked
+        on this route test.)
+        """
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_no_match_response(),
+        ) as mock_lookup:
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={"items": [{"artist": "Juana Molina", "album": "DOGA"}]},
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_count == 1
+        assert mock_lookup.await_args.kwargs["request"].extended is None
+
+    @pytest.mark.asyncio
     async def test_bulk_does_not_forward_bandcamp_client(self, app_client):
         """The bulk drain must NOT run the Bandcamp leg: its client is rate-
         limited to 1 req/s, so a per-item live probe would serialize a 35k-album

@@ -991,6 +991,89 @@ class TestEnrichArtworkResultsExtended:
         assert match.wikipedia_url == "https://en.wikipedia.org/wiki/Artist"
         assert match.spotify_url == "https://open.spotify.com/search/Artist%20Song"
 
+    @pytest.mark.asyncio
+    async def test_extended_adds_no_incremental_discogs_calls(self):
+        """Bulk-safety pin (LML#685): flipping ``extended`` on adds ZERO live
+        Discogs API calls.
+
+        The bulk backfill (BS#1442) drains ~35k albums through this same
+        enrichment path with ``extended=True``. Its only safety margin is that
+        every extended field is plucked from the already-fetched ``top1_release``
+        / ``top1_details`` — or a cache-only bio parse / local MusicBrainz PG
+        query — never a new Discogs fetch. ``fetch_top1_release_details`` runs
+        ``get_release`` + ``get_artist_details`` regardless of ``extended`` (they
+        feed the base ``release_year`` / ``artist_bio`` / ``wikipedia_url``
+        scalars), so the extended payload rides those already-paid fetches.
+
+        This pins the invariant directly: with identical input, ``get_release``
+        and ``get_artist_details`` fire the SAME number of times whether
+        ``extended`` is False or True. ``warm_cache`` stays at its default
+        (False) — that is the separate flag that WOULD fan out per-ref Discogs
+        calls via ``_warm_bio_cache``, and the bulk drain must never set it.
+        """
+
+        def _make_service() -> AsyncMock:
+            svc = AsyncMock()
+            svc.get_release.return_value = ReleaseMetadataResponse(
+                release_id=10154369,
+                title="Aluminum Tunes",
+                artist="Stereolab",
+                year=1997,
+                label="Duophonic Ultra High Frequency Disks",
+                artist_id=42,
+                genres=["Electronic", "Rock"],
+                styles=["Indie Rock", "Experimental"],
+                tracklist=[TrackItem(position="1", title="Olv 26", artists=[])],
+                released="1997-09-22",
+                release_url="https://discogs.com/release/10154369",
+            )
+            svc.get_artist_details.return_value = ArtistDetails(
+                artist_id=42,
+                name="Stereolab",
+                profile="French-British band founded in 1990. See [a42].",
+                image_url="https://img.discogs.com/stereolab.jpg",
+                urls=["https://en.wikipedia.org/wiki/Stereolab"],
+            )
+            return svc
+
+        def _call_kwargs(svc: AsyncMock) -> dict:
+            item = make_library_item(artist="Stereolab", title="Aluminum Tunes")
+            artwork = make_discogs_result(
+                release_id=10154369, artist="Stereolab", album="Aluminum Tunes"
+            )
+            return {
+                "items_with_artwork": [(item, artwork)],
+                "discogs_service": svc,
+                "song": "Olv 26",
+                "artist": "Stereolab",
+            }
+
+        base_svc = _make_service()
+        await enrich_artwork_results(**_call_kwargs(base_svc), extended=False)
+
+        extended_svc = _make_service()
+        result = await enrich_artwork_results(**_call_kwargs(extended_svc), extended=True)
+
+        # The extended run actually populated the top-1 extended payload...
+        _, enriched = result[0]
+        assert enriched is not None
+        assert enriched.discogs_artist_id == 42
+        assert enriched.tracklist is not None
+
+        # ...yet made no MORE Discogs API calls than the non-extended run — and
+        # exactly the one release + one artist fetch the base path already pays.
+        assert extended_svc.get_release.call_count == base_svc.get_release.call_count == 1
+        assert (
+            extended_svc.get_artist_details.call_count
+            == base_svc.get_artist_details.call_count
+            == 1
+        )
+        # Method-agnostic backstop: total interactions with the Discogs service
+        # are identical on-vs-off, so a FUTURE extended branch that reached a
+        # different Discogs method (not just the two named above) would still
+        # trip this pin.
+        assert len(extended_svc.mock_calls) == len(base_svc.mock_calls)
+
 
 class TestMbTracklistRescue:
     """``mb_pg`` rescue: when the top-1 result has no Discogs artwork AND

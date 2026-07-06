@@ -414,6 +414,29 @@ async def handle_lookup(
     Amortizes per-row cold-cache cost two ways: one HTTP roundtrip per N
     items instead of N roundtrips, and the in-process TTL/LRU caches stay
     warm across all N items in a batch.
+
+    Per-item ``extended`` is honored (LML#685): each item is a full
+    ``LookupRequest`` forwarded verbatim to ``perform_lookup``, so an item with
+    ``extended: true`` gets the same extended-only ``DiscogsMatchResult`` fields
+    on its top-1 match as the single ``/lookup`` route — byte-identical contract
+    (the 8 ``album_metadata`` columns BS#1442 backfills — ``discogs_artist_id``,
+    ``label``, ``full_release_date``, ``genres``, ``styles``, ``tracklist``,
+    ``artist_image_url``, ``profile_tokens`` — plus ``writer_credits``, LML#699).
+
+    ``extended`` is Discogs-ceiling-safe: it is CACHE-ONLY on this path. It
+    plucks fields from the release/artist objects ``fetch_top1_release_details``
+    already fetched (which run regardless of ``extended``, feeding the base
+    ``release_year`` / ``artist_bio`` / ``wikipedia_url`` scalars), plus a
+    cache-only bio parse and a local MusicBrainz PG query — never a new Discogs
+    fetch. So flipping ``extended`` on adds ZERO incremental Discogs calls.
+
+    Note the one bio-warm fan-out is gated on the SEPARATE ``warm_cache`` flag,
+    NOT ``extended``: ``warm_cache: true`` schedules ``_warm_bio_cache``, which
+    fires per-bio-ref live Discogs calls. It defaults off and BS#1442 leaves it
+    unset, so the drain is safe today — but unlike ``bandcamp`` /
+    ``allow_release_resolution_fallback`` it is NOT hard-pinned here, so a caller
+    that sets it per item would re-open that fan-out mid-drain. Hard-pinning it
+    off on bulk (mirroring those two flags) is a candidate follow-up.
     """,
     responses={
         200: {"description": "Per-item verdicts in input order."},
