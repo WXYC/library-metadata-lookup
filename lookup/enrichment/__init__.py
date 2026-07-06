@@ -31,10 +31,14 @@ from lookup.artist_resolution import (
     _artist_identity_split_gate_enabled,
     _artist_pair_verified,
 )
-from lookup.enrichment.background import _background_tasks, _warm_bio_cache
+
+# Submodules are referenced via module attributes (``background._warm_bio_cache``,
+# ``item.enrich_one``, ``top1.fetch_top1_release_details``) rather than value
+# imports, so each submodule stays the single patch/rebind seam for its own
+# names — a value import here would bind a second copy on the package namespace
+# that patches against the submodule silently miss.
+from lookup.enrichment import background, item, top1
 from lookup.enrichment.context import EnrichmentContext
-from lookup.enrichment.item import enrich_one
-from lookup.enrichment.top1 import fetch_top1_release_details
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +80,8 @@ async def enrich_artwork_results(
     skipped and ``apple_music_url`` is set from the library DB
     ``streaming_links`` override (if present) or stays None. The DB
     override always wins over the probe — see the final assignment
-    ``apple_music_override or apple_music_url or None``.
+    ``apple_music_override or apple_music_url or None`` in
+    ``lookup/enrichment/item.py``.
 
     **Behavior change vs. v0.5.0:** release/artist details (release_year,
     artist_bio, wikipedia_url) are fetched only for ``items_with_artwork[0]``.
@@ -141,6 +146,7 @@ async def enrich_artwork_results(
     if not discogs_service or not items_with_artwork:
         return items_with_artwork
 
+    request_artist_stripped = (artist or "").strip()
     ctx = EnrichmentContext(
         discogs_service=discogs_service,
         mb_pg=mb_pg,
@@ -153,18 +159,20 @@ async def enrich_artwork_results(
         song=song,
         album=album,
         artist=artist,
+        request_artist_stripped=request_artist_stripped,
+        artist_identity_split_enabled=_artist_identity_split_gate_enabled(),
         extended=extended,
         found_on_compilation=found_on_compilation,
     )
 
-    artist_identity_split_enabled = _artist_identity_split_gate_enabled()
-    request_artist_stripped = (artist or "").strip()
-
-    # Top-1-only expensive enrichment. fetch_top1_release_details runs once;
-    # non-top-1 items reuse the same per-result streaming-URL build.
-    top1_year, top1_bio, top1_wiki, top1_release, top1_details = await fetch_top1_release_details(
-        ctx, items_with_artwork
-    )
+    # Top-1-only expensive enrichment; rationale in ``lookup/enrichment/top1.py``.
+    (
+        top1_year,
+        top1_bio,
+        top1_wiki,
+        top1_release,
+        top1_details,
+    ) = await top1.fetch_top1_release_details(discogs_service, items_with_artwork[0][1])
 
     # LML#504: release-side artist-identity hop. Computed once (shared across
     # all items in this batch) since ``top1_release`` is by definition top-1-only
@@ -206,9 +214,9 @@ async def enrich_artwork_results(
 
     enriched = await asyncio.gather(
         *[
-            enrich_one(
+            item.enrich_one(
                 ctx,
-                item,
+                library_item,
                 artwork,
                 is_top1=(idx == 0),
                 top1_year=top1_year,
@@ -217,12 +225,10 @@ async def enrich_artwork_results(
                 top1_release=top1_release,
                 top1_details=top1_details,
                 top1_profile_tokens=top1_profile_tokens,
-                request_artist_stripped=request_artist_stripped,
-                artist_identity_split_enabled=artist_identity_split_enabled,
                 release_side_artist_verified=release_side_artist_verified,
                 release_anchor_present=release_anchor_present,
             )
-            for idx, (item, artwork) in enumerate(items_with_artwork)
+            for idx, (library_item, artwork) in enumerate(items_with_artwork)
         ]
     )
 
@@ -242,8 +248,8 @@ async def enrich_artwork_results(
     top1_enriched_result = enriched[0][1] if enriched else None
     top1_bio_surfaced = top1_enriched_result is not None and bool(top1_enriched_result.artist_bio)
     if warm_cache and top1_bio and top1_bio_surfaced:
-        task = asyncio.create_task(_warm_bio_cache(top1_bio, discogs_service))
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        task = asyncio.create_task(background._warm_bio_cache(top1_bio, discogs_service))
+        background._background_tasks.add(task)
+        task.add_done_callback(background._background_tasks.discard)
 
     return list(enriched)
