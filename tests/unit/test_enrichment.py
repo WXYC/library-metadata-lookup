@@ -110,7 +110,7 @@ class TestEnrichArtworkResults:
         item = make_library_item(artist="Stereolab", title="Aluminum Tunes")
 
         # No ``apple_music`` argument — exercises the graceful-degrade path
-        # (the orchestrator skips the probe when the client is None).
+        # (``enrich_artwork_results`` skips the probe when the client is None).
         results = await enrich_artwork_results([(item, None)], AsyncMock(), song="French Disko")
 
         _, enriched = results[0]
@@ -193,7 +193,7 @@ class TestEnrichArtworkResults:
 
         discogs_service = AsyncMock()
         # Even if Discogs would return data for the lower item, top-1 gating
-        # means the orchestrator never calls it.
+        # means ``enrich_artwork_results`` never calls it.
         discogs_service.get_release.return_value = ReleaseMetadataResponse(
             release_id=42,
             title="Album 2",
@@ -1519,7 +1519,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
         # Corrupt-row shape: every title empty / whitespace-only. (The
         # resolver coerces NULL titles to "" via ``row.get("title") or ""``
-        # before constructing the DiscogsTrackItem, so the orchestrator
+        # before constructing the DiscogsTrackItem, so the enrichment code
         # only ever sees empty-string titles in this cohort, not None.)
         all_empty_titles = [
             DiscogsTrackItem(position="1", title="", duration=None, artists=[]),
@@ -1545,7 +1545,7 @@ class TestMbTracklistRescue:
 
 
 class TestEnrichArtworkResultsWithAppleMusicClient:
-    """LML#443/#444: orchestrator hot path consumes ``AppleMusicClient.find_track_url``.
+    """LML#443/#444: enrichment hot path consumes ``AppleMusicClient.find_track_url``.
 
     These tests pin the contract — ``enrich_artwork_results`` accepts an
     ``apple_music`` client and threads the call.
@@ -1645,7 +1645,7 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         """A single ``find_track_metadata`` exception must NOT propagate
         through ``asyncio.gather`` and fail the entire enrichment — the
         underlying search-song loop has no top-level exception handler
-        around its result iteration, so the orchestrator wraps the call
+        around its result iteration, so the enrichment wraps the call
         defensively. Bulk lookups would otherwise regress to 500 if Apple
         returns a malformed result. Same shape as LML#444.
         """

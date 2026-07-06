@@ -7,7 +7,7 @@ redeploy — mirrors the ``LML_BULK_MAX_CONCURRENT`` and
 ``LML_SEARCH_BUDGET_MS`` patterns.
 
 ``probe_timeout_s_from_env`` is the shared resolver: the in-line per-item
-Apple probe (``lookup/orchestrator.py::enrich_artwork_results``) uses it via
+Apple probe (``lookup/enrichment``'s ``enrich_artwork_results``) uses it via
 the ``apple_music_lookup_timeout_s`` wrapper, and the persistent streaming-URL
 post-process (``lookup/streaming_url_postprocess.py``) uses it too — its
 ``STREAMING_URL_CACHE_CONFIG`` Apple entry carries ``timeout_env_var =
@@ -25,7 +25,7 @@ from core.search import resolve_positive_int_env
 _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S = 4.0
 """Default wall-clock ceiling for a single Apple Music probe from the
 lookup hot path. Sized to the legacy iTunes Search ``httpx`` timeout (5s)
-with margin so the orchestrator's ``asyncio.wait_for`` trips before the
+with margin so the enrichment probe's ``asyncio.wait_for`` trips before the
 underlying ``BaseStreamingClient`` httpx timeout. LML#449 + LML#450."""
 
 APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR = "LML_APPLE_MUSIC_LOOKUP_TIMEOUT_MS"
@@ -51,7 +51,7 @@ def apple_music_lookup_timeout_s() -> float:
     """Per-call wall-clock ceiling for a single Apple Music probe.
 
     Thin back-compat wrapper over ``probe_timeout_s_from_env`` for the in-line
-    per-item Apple probe (``lookup/orchestrator.py``). The default is 4s. See
+    per-item Apple probe (``lookup/enrichment``). The default is 4s. See
     LML#449 + LML#450.
     """
     return probe_timeout_s_from_env(

@@ -4,7 +4,7 @@ album's status in ``library.db``.
 
 Generalizes the Apple-Music-specific ``lookup/apple_music_postprocess.py``
 (LML#571) across every service in ``STREAMING_URL_CACHE_CONFIG`` (Apple +
-Spotify + Bandcamp). Called by ``lookup/orchestrator.py``'s per-item enrichment
+Spotify + Bandcamp). Called by ``lookup/enrichment``'s per-item enrichment
 after the existing per-item enrichment has assembled the ``update`` dict.
 
 **Cache-read on the hot path, live probe off it (LML#706).** The response path
@@ -32,7 +32,7 @@ whose client is present in ``clients``, this:
    URLs are *eventually consistent*: the first lookup of an uncached album omits
    that service's URL; the warm fills the cache so the next lookup is a hit.
    Artwork is unaffected (it never flowed through here — the synthesis-path
-   Apple probe in ``orchestrator.py`` stays synchronous). The warm is suppressed
+   Apple probe in ``lookup/enrichment`` stays synchronous). The warm is suppressed
    for the whole context when ``should_suppress_streaming_warm()`` is set (the
    ``/lookup/bulk`` path), which then does cache read-fill only.
 
@@ -126,7 +126,8 @@ two cold lookups on different request tasks dedup to one probe."""
 _background_tasks: set[asyncio.Task] = set()
 """Strong refs to fire-and-forget warm tasks. ``asyncio.create_task`` returns a
 weak reference; without anchoring it the GC can reap the warm mid-flight. Each
-task removes itself in a done-callback (mirrors ``orchestrator._background_tasks``)."""
+task removes itself in a done-callback (mirrors
+``lookup.enrichment._background_tasks``)."""
 
 _suppress_streaming_warm_var: ContextVar[bool] = ContextVar(
     "lml_suppress_streaming_warm", default=False

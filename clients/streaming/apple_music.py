@@ -15,7 +15,7 @@ Public surface:
   `/streaming-check` via `streaming/router.handle_streaming_check`.
 - `find_track_url(artist, song, album=None)` — thin wrapper around
   `find_track_metadata` (LML#500). Used by the lookup hot path in
-  `lookup/orchestrator.enrich_artwork_results` when the WXYC library
+  `lookup.enrichment.enrich_artwork_results` when the WXYC library
   row clears the LML#477 title gate (just need the URL for the
   ``apple_music_url`` slot). Inherits `find_track_metadata`'s 3-way
   fuzz floor + artwork-preference tie-break so the two methods cannot
