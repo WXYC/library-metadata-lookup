@@ -81,6 +81,40 @@ def _reset_lookup_inflight_cap():
     _lookup_router._lookup_semaphore = None
 
 
+@pytest.fixture(autouse=True)
+def _reset_discogs_pool_singleton():
+    """Suite-wide reset of the discogs-cache ``async_singleton`` lock (LML#706).
+
+    Sibling of ``_reset_lookup_inflight_cap`` for the same failure mode, one
+    layer deeper. ``async_singleton`` (``wxyc_fastapi``) builds a single
+    ``asyncio.Lock`` at import (captured in the ``get_discogs_pool`` closure)
+    and caches the pool instance; neither is reset by the closer. Under
+    pytest-asyncio's function-scoped loops, a test whose loop is torn down
+    while ``_build_discogs_pool`` is mid-acquire — the offline
+    ``asyncpg.create_pool`` never connects to :5433, so the getter sits inside
+    ``async with lock`` — leaves the lock ``[locked]`` and bound to a dead
+    loop. The next test that resolves the pool (traced through
+    ``get_discogs_cache_pg`` in the ``/lookup`` Depends chain) then raises
+    ``RuntimeError(... bound to a different event loop)``, surfacing as an
+    order-dependent failure in an unrelated file. Replace the shared closure
+    cells so every by-reference importer of the getter (``identity.dependencies``,
+    ``main``) starts each test with a fresh unbound lock and no stale pool.
+    """
+    from core import dependencies as _core_deps
+
+    def _reset() -> None:
+        getter = _core_deps.get_discogs_pool
+        for name, cell in zip(getter.__code__.co_freevars, getter.__closure__ or (), strict=True):
+            if name == "lock":
+                cell.cell_contents = asyncio.Lock()
+            elif name == "instance":
+                cell.cell_contents = None
+
+    _reset()
+    yield
+    _reset()
+
+
 def make_lml_telemetry() -> RequestTelemetry:
     """Build a `RequestTelemetry` with LML's production parameters.
 
