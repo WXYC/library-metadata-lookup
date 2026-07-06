@@ -416,7 +416,8 @@ async def handle_lookup(
     warm across all N items in a batch.
 
     Per-item ``extended`` is honored (LML#685): each item is a full
-    ``LookupRequest`` forwarded verbatim to ``perform_lookup``, so an item with
+    ``LookupRequest`` forwarded intact to ``perform_lookup`` (sole exception:
+    the ``warm_cache`` pin below), so an item with
     ``extended: true`` gets the same extended-only ``DiscogsMatchResult`` fields
     on its top-1 match as the single ``/lookup`` route — byte-identical contract
     (the 8 ``album_metadata`` columns BS#1442 backfills — ``discogs_artist_id``,
@@ -432,11 +433,11 @@ async def handle_lookup(
 
     Note the one bio-warm fan-out is gated on the SEPARATE ``warm_cache`` flag,
     NOT ``extended``: ``warm_cache: true`` schedules ``_warm_bio_cache``, which
-    fires per-bio-ref live Discogs calls. It defaults off and BS#1442 leaves it
-    unset, so the drain is safe today — but unlike ``bandcamp`` /
-    ``allow_release_resolution_fallback`` it is NOT hard-pinned here, so a caller
-    that sets it per item would re-open that fan-out mid-drain. Hard-pinning it
-    off on bulk (mirroring those two flags) is a candidate follow-up.
+    fires per-bio-ref live Discogs calls. On this path the flag is hard-pinned
+    off (LML#742) — a per-item ``warm_cache: true`` is silently discarded before
+    the item reaches ``perform_lookup``, same enforced guarantee as the
+    ``bandcamp`` / ``allow_release_resolution_fallback`` pins. Callers that want
+    the bio cache populated at bulk scale should use the offline warmer (#548).
     """,
     responses={
         200: {"description": "Per-item verdicts in input order."},
@@ -536,6 +537,16 @@ async def handle_bulk_lookup(
 
     async def _run_one(index: int, item: LookupRequest) -> BulkLookupResultItem:
         async with semaphore:
+            # Hard-pin warm_cache off (LML#742), completing the set with
+            # `bandcamp=None` / `allow_release_resolution_fallback=False` below:
+            # a truthy per-item flag would schedule the `_warm_bio_cache`
+            # per-bio-ref live Discogs fan-out for every batch item. Unlike its
+            # two siblings, warm_cache is read from the request *inside*
+            # perform_lookup (whose signature is frozen for LML#722), so the pin
+            # is a copied item rather than a kwarg. The offline warmer (#548)
+            # remains the right tier for bulk cache population.
+            if item.warm_cache:
+                item = item.model_copy(update={"warm_cache": False})
             # Per-item telemetry instance: required by perform_lookup's signature
             # and avoids the `_current_step` race that would happen with a shared
             # instance across concurrent items.
