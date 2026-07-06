@@ -119,7 +119,12 @@ def _reset_discogs_pool_singleton():
             "get_discogs_pool has no 'lock' free variable — wxyc_fastapi "
             "async_singleton internals changed; update this reset."
         )
-        for name, cell in zip(freevars, getter.__closure__, strict=True):
+        # Non-empty freevars => a real closure, so __closure__ is not None
+        # (CPython invariant). The assert both narrows the type for mypy and
+        # documents the invariant.
+        closure = getter.__closure__
+        assert closure is not None
+        for name, cell in zip(freevars, closure, strict=True):
             if name == "lock":
                 cell.cell_contents = asyncio.Lock()
 
