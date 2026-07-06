@@ -28,8 +28,8 @@ investigation as concrete contracts the code should satisfy:
 
 from __future__ import annotations
 
+import ast
 import asyncio
-import re
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -49,11 +49,26 @@ class TestLookupHotPathOwnsNoHttpxClients:
     typically the first step toward a per-call client construction — fails
     this test before it can ship the FD-leak shape from issue #241.
 
-    Source-text sweep rather than ``hasattr`` on the module objects so the
-    pin covers every file the enrichment package grows: LML#730 splits the
-    coordinator into submodules, and a submodule's imports never appear on
-    the package namespace (mirrors the ``test_no_global_*`` pins below).
+    AST import walk rather than ``hasattr`` on the module objects so the
+    pin covers every file under the enrichment package (recursively — a
+    nested subpackage escapes neither the sweep nor its intent): LML#730
+    splits the coordinator into submodules, and a submodule's imports never
+    appear on the package namespace. The walk catches every static import
+    form — ``import httpx``, ``import a, httpx``, ``import httpx as x``,
+    ``from httpx import ...``, and function-level imports — where the old
+    ``hasattr`` check saw only module-global bindings.
     """
+
+    @staticmethod
+    def _imports_httpx(path: Path) -> bool:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                if any(alias.name.split(".")[0] == "httpx" for alias in node.names):
+                    return True
+            elif isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module and node.module.split(".")[0] == "httpx":
+                    return True
+        return False
 
     def test_hot_path_modules_do_not_import_httpx(self):
         """The lookup hot path must source HTTP clients via
@@ -65,11 +80,10 @@ class TestLookupHotPathOwnsNoHttpxClients:
         import lookup.orchestrator as orchestrator_module
 
         hot_path_files = [Path(orchestrator_module.__file__)]
-        hot_path_files += sorted(Path(enrichment_module.__file__).parent.glob("*.py"))
+        hot_path_files += sorted(Path(enrichment_module.__file__).parent.rglob("*.py"))
         assert len(hot_path_files) >= 2, "expected orchestrator + enrichment sources"
 
-        httpx_import = re.compile(r"^\s*(import httpx\b|from httpx\b)", re.MULTILINE)
-        offenders = [str(f) for f in hot_path_files if httpx_import.search(f.read_text())]
+        offenders = [str(f) for f in hot_path_files if self._imports_httpx(f)]
         assert not offenders, (
             f"lookup hot-path modules import httpx: {offenders}. Every "
             "outbound HTTP client in this service is a process-lifetime "

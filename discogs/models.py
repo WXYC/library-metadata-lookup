@@ -264,8 +264,8 @@ class DiscogsSearchResult(BaseModel):
     artist_image_url: str | None = None
     profile_tokens: list[ResolvedToken] | None = None
     # Songwriter/composer credits for BMI reporting (LML#699), populated by the
-    # orchestrator enrichment seam from the resolved release's writer-role
-    # credits. Rides the same extended gate as the other enriched fields.
+    # lookup enrichment seam (``lookup/enrichment``) from the resolved release's
+    # writer-role credits. Rides the same extended gate as the other enriched fields.
     writer_credits: WriterCredits | None = None
 
     def to_match_result(self) -> EnrichedDiscogsMatchResult:

@@ -2,7 +2,7 @@
 
 ``apply_streaming_url_postprocess`` generalizes the Apple-only
 ``apply_apple_music_postprocess`` (LML#571) across every configured service.
-It runs inside the orchestrator's per-item enrichment: for each service in
+It runs inside ``lookup/enrichment``'s per-item enrichment: for each service in
 ``STREAMING_URL_CACHE_CONFIG`` whose per-service flag is on, whose URL field in
 the ``update`` dict came out null, and whose client is present.
 

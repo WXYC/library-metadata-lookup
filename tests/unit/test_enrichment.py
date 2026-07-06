@@ -253,7 +253,7 @@ class TestEnrichArtworkResults:
         Previously every result in ``items_with_artwork`` ran
         ``fetch_release_details`` even though BS/iOS only consume the top
         result — paying N round-trips of Discogs cache (and on miss, API)
-        latency for nothing. The orchestrator now gates the expensive
+        latency for nothing. ``enrich_artwork_results`` now gates the expensive
         enrichment to ``items_with_artwork[0]`` while keeping the cheap
         streaming-URL fallback per-result.
 
@@ -308,7 +308,7 @@ class TestTop1SentinelGuard:
     `discogs_service.get_release(0)` which hits the Discogs API at
     `/releases/0` (404) before the `if not release` branch swallows the
     response. The sentinel is a documented cross-service contract; the
-    orchestrator owns the per-call-site gating (see issue #518)."""
+    enrichment owns the per-call-site gating (see issue #518)."""
 
     @pytest.mark.asyncio
     async def test_top1_artwork_with_release_id_zero_skips_get_release(self):
@@ -727,7 +727,7 @@ class TestEnrichArtworkResultsExtended:
     async def test_warm_cache_schedules_background_task(self):
         """warm_cache=True schedules a fire-and-forget deep-async bio parse.
 
-        The orchestrator must NOT await the warming task — it runs after
+        The enrichment must NOT await the warming task — it runs after
         the response is built so write-path callers (Backend-Service's
         flowsheet-linkage) pay zero added latency.
         """
@@ -849,7 +849,7 @@ class TestEnrichArtworkResultsExtended:
 
     @pytest.mark.asyncio
     async def test_warm_task_anchored_so_gc_cannot_reap_it(self):
-        """asyncio.create_task returns a weak reference. The orchestrator
+        """asyncio.create_task returns a weak reference. The enrichment
         must park the task in a strong-ref container until it completes,
         or the GC can drop the warm mid-execution. Verify the task lands
         in the module-level set and is removed via the done_callback.
@@ -1689,11 +1689,11 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
     async def test_apple_music_find_track_url_timeout_degrades_to_none(self):
         """LML#449 + LML#450: a single Apple Music probe call that exceeds
         the call-site timeout must NOT pull the rest of the request past
-        its deadline. The orchestrator wraps the call in ``asyncio.wait_for``
+        its deadline. The enrichment wraps the call in ``asyncio.wait_for``
         with a tight ceiling; on TimeoutError the item degrades to no Apple
         URL, same as the LML#444 exception path. Pins the upper bound so
         the worst-case 4×60s retry loop in LML#450 cannot block enrichment.
-        Post-LML#487 the orchestrator drives ``find_track_metadata`` in
+        Post-LML#487 the enrichment drives ``find_track_metadata`` in
         the synthesis path (no library row to project) — the timeout
         semantics are identical because both methods share the
         ``search_song`` rate-limited endpoint.
@@ -1746,8 +1746,9 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         never ran' — the LML#444 silent-failure shape, just for a different
         failure mode.
 
-        Mirrors the `_log_resolver_pre_pass` / `_log_album_title_fallback`
-        shape (lookup/orchestrator.py:262-298, 393-415): project onto
+        Mirrors the `_log_resolver_pre_pass` (lookup/artist_resolution.py) /
+        `_log_album_title_fallback` (lookup/strategies/track_on_compilation.py)
+        shape: project onto
         `sentry_sdk.get_current_scope().transaction.set_data(...)` with a
         try/except so observability never breaks /lookup. The logger.warning
         line stays — this test only pins the additional Sentry projection.
@@ -1897,7 +1898,7 @@ class TestStreamingLinksTitleGate:
     accepts ``token_set_ratio >= 70`` — permissive enough to surface
     sibling-artist rows where the artist matches but the album doesn't
     (e.g. requesting "Yenbett" returns "Tzenni" because both are Noura
-    Mint Seymali albums). Without a gate at the orchestrator's
+    Mint Seymali albums). Without a gate at the enrichment's
     streaming-link projection site, those rows' verified Spotify/Apple
     URLs would propagate into the response as if they pointed at the
     requested album. The 80 floor mirrors ``is_acceptable_match`` in
@@ -2625,7 +2626,7 @@ class TestArtistIdentitySplitGate:
     @pytest.mark.asyncio
     async def test_empty_request_artist_falls_back_to_legacy_gate(self):
         """Album-only lookups (``parsed.artist=None``) — a supported path
-        per ``lookup/orchestrator.py:888`` — would silently lose bio under
+        per the album-only fallback in ``lookup/enrichment`` — would silently lose bio under
         a strict artist-identity gate (no request anchor to score against).
         The new gate falls back to ``library_row_acceptable`` semantics
         when ``request_artist`` is empty/whitespace, preserving the legacy
@@ -3073,7 +3074,7 @@ class TestArtistIdentitySplitGate:
 
     @pytest.mark.asyncio
     async def test_alternate_artist_name_match_surfaces_bio(self):
-        """`artist_matches_item` (orchestrator.py:527) consults BOTH
+        """`artist_matches_item` (lookup/matching.py) consults BOTH
         ``item.artist`` and ``item.alternate_artist_name``. The gate
         must mirror that — a row filed by catalogers as 'Black Dog
         Productions' with alternate_artist_name='The Black Dog' would
@@ -3957,7 +3958,7 @@ class TestSiblingOverrideProbeDivergence:
 
 
 class TestBandcampStreamingUrlPostprocessWiring:
-    """LML#573 PR-3: the orchestrator must thread the Bandcamp client into the
+    """LML#573 PR-3: the enrichment must thread the Bandcamp client into the
     streaming-URL cache post-process, AND defer Bandcamp's templated search-URL
     fallback until *after* the post-process so a resolved album page wins over
     the generic search link (the post-process only fires when the field is
