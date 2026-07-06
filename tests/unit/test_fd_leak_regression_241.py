@@ -8,13 +8,14 @@ the container; the leak source survives until something changes.
 These tests encode the two prime hypotheses identified during incident
 investigation as concrete contracts the code should satisfy:
 
-1. The artwork-enrichment hot path must NOT construct ``httpx.AsyncClient``
+1. The lookup hot path must NOT construct ``httpx.AsyncClient``
    instances. Every outbound client in the service (Discogs, Spotify,
    Deezer, Bandcamp, AppleMusicClient) is a process-lifetime singleton with
    explicit ``close()`` on shutdown. The legacy ``_fetch_apple_music_url``
    used to construct a fresh client per call — that was removed in LML#241
-   and the function itself in LML#444; the orchestrator no longer imports
-   ``httpx`` at all.
+   and the function itself in LML#444; neither ``lookup.orchestrator`` (the
+   ``perform_lookup`` spine) nor the ``lookup.enrichment`` package (the
+   enrichment hot path's home since LML#729) imports ``httpx`` at all.
 
 2. Two lazy-init asyncpg pools have a TOCTOU race:
    ``entity/sources.py:PgSource._get_pool`` and
@@ -28,40 +29,54 @@ investigation as concrete contracts the code should satisfy:
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 
-class TestOrchestratorOwnsNoHttpxClients:
-    """Hypothesis #1: the artwork-enrichment hot path must not own transient
+class TestLookupHotPathOwnsNoHttpxClients:
+    """Hypothesis #1: the lookup hot path must not own transient
     ``httpx.AsyncClient`` instances.
 
-    Strongest form of the invariant: ``lookup.enrichment`` (the enrichment
-    hot path's home since the orchestrator decomposition, LML#729) does not
-    import ``httpx`` at all (LML#444 removed the last reference when
-    ``_fetch_apple_music_url`` was deleted). Any future regression that
-    re-introduces ``import httpx`` into the module — typically the first
-    step toward a per-call client construction — fails this test before it
-    can ship the FD-leak shape from issue #241.
+    Strongest form of the invariant: neither ``lookup.orchestrator`` (the
+    ``perform_lookup`` spine) nor any module in the ``lookup.enrichment``
+    package (the enrichment hot path's home since the orchestrator
+    decomposition, LML#729) imports ``httpx`` at all (LML#444 removed the
+    last reference when ``_fetch_apple_music_url`` was deleted). Any future
+    regression that re-introduces ``import httpx`` into these modules —
+    typically the first step toward a per-call client construction — fails
+    this test before it can ship the FD-leak shape from issue #241.
+
+    Source-text sweep rather than ``hasattr`` on the module objects so the
+    pin covers every file the enrichment package grows: LML#730 splits the
+    coordinator into submodules, and a submodule's imports never appear on
+    the package namespace (mirrors the ``test_no_global_*`` pins below).
     """
 
-    def test_enrichment_does_not_import_httpx(self):
-        """The enrichment hot path must source HTTP clients via
+    def test_hot_path_modules_do_not_import_httpx(self):
+        """The lookup hot path must source HTTP clients via
         DI (e.g. ``AppleMusicClient``) rather than construct them. The
         BaseStreamingClient singleton pattern guarantees one process-lifetime
         ``httpx.AsyncClient`` per service with explicit shutdown.
         """
         import lookup.enrichment as enrichment_module
+        import lookup.orchestrator as orchestrator_module
 
-        assert not hasattr(enrichment_module, "httpx"), (
-            "lookup.enrichment must not import httpx. Every outbound HTTP "
-            "client in this service is a process-lifetime singleton with "
-            "explicit close() on shutdown — the enrichment path sources from "
-            "DI rather than constructing. Re-introducing httpx here is the "
-            "first step toward the per-call construction pattern that "
-            "leaked FDs in issue #241."
+        hot_path_files = [Path(orchestrator_module.__file__)]
+        hot_path_files += sorted(Path(enrichment_module.__file__).parent.glob("*.py"))
+        assert len(hot_path_files) >= 2, "expected orchestrator + enrichment sources"
+
+        httpx_import = re.compile(r"^\s*(import httpx\b|from httpx\b)", re.MULTILINE)
+        offenders = [str(f) for f in hot_path_files if httpx_import.search(f.read_text())]
+        assert not offenders, (
+            f"lookup hot-path modules import httpx: {offenders}. Every "
+            "outbound HTTP client in this service is a process-lifetime "
+            "singleton with explicit close() on shutdown — the hot path "
+            "sources from DI rather than constructing. Re-introducing httpx "
+            "here is the first step toward the per-call construction "
+            "pattern that leaked FDs in issue #241."
         )
 
 
