@@ -91,10 +91,10 @@ class PgSource:
         self._owns_pool: bool = pool is None
         # Serializes concurrent first-callers to ``_get_pool``. Without it,
         # both callers pass the ``self._pool is None`` check and each await
-        # ``asyncpg.create_pool``, orphaning all but one pool with up to 5
-        # open connections (FDs). See issue #241. Only meaningful for the
-        # owned-pool path; the borrowed-pool path never enters the
-        # create-pool branch.
+        # ``asyncpg.create_pool``, orphaning all but one pool with up to
+        # ``LML_PG_POOL_MAX_SIZE`` (default 5) open connections (FDs). See
+        # issue #241. Only meaningful for the owned-pool path; the
+        # borrowed-pool path never enters the create-pool branch.
         self._pool_lock: asyncio.Lock = asyncio.Lock()
 
     async def _get_pool(self) -> asyncpg.Pool:

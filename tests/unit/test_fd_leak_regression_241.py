@@ -145,9 +145,9 @@ class TestPgSourcePoolRace:
 class TestPgSourcePoolMaxSize:
     """LML#706: the owned PgSource pool (currently musicbrainz) is env-sizable.
 
-    Same hardcoded-5 smell as the discogs hot-path pool. Once UVICORN_WORKERS
-    multiplies every pool, operators need one knob per pool to keep the total
-    connection budget in view. Default 5 keeps historical behavior inert.
+    Same hardcoded-5 smell as the discogs hot-path pool; every PG pool's
+    connection budget should be tunable. Default 5 keeps historical behavior
+    inert.
     """
 
     @pytest.mark.asyncio
