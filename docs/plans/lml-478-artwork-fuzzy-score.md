@@ -6,7 +6,7 @@
 
 ## Problem
 
-`fetch_artwork_for_items` → `fetch_one` in [`lookup/orchestrator.py:1607-1638`](https://github.com/WXYC/library-metadata-lookup/blob/main/lookup/orchestrator.py#L1607-L1638) calls `discogs_service.search(...)` and unconditionally takes `response.results[0]`. There is no fuzzy-match floor, no ranking by the supplied artist/album. Discogs's search ranking optimizes for popularity/recency, not textual proximity — so when an item appears on multiple releases (compilations, reissues, live albums, multi-release artists), the top result can be the wrong release and the field returns wrong artwork rather than `None`.
+`fetch_artwork_for_items` → `fetch_one` (now `lookup/artwork.py`; at writing [`lookup/orchestrator.py:1607-1638`](https://github.com/WXYC/library-metadata-lookup/blob/main/lookup/orchestrator.py#L1607-L1638)) calls `discogs_service.search(...)` and unconditionally takes `response.results[0]`. There is no fuzzy-match floor, no ranking by the supplied artist/album. Discogs's search ranking optimizes for popularity/recency, not textual proximity — so when an item appears on multiple releases (compilations, reissues, live albums, multi-release artists), the top result can be the wrong release and the field returns wrong artwork rather than `None`.
 
 **Concrete repro:** Noura Mint Seymali's "Hebebeb (Zrag)" appears on both *Tzenni* (2014) and *Yenbett* (2025). The DJ supplies the correct album title; LML returns the wrong release's artwork.
 
@@ -18,7 +18,7 @@ In `fetch_one`, after `discogs_service.search` returns, score candidates against
 
 ## The change
 
-### Where: `lookup/orchestrator.py`, `fetch_one` inside `fetch_artwork_for_items`
+### Where: `fetch_one` inside `fetch_artwork_for_items` (now `lookup/artwork.py`; `lookup/orchestrator.py` at writing)
 
 Current shape (lines 1607–1638):
 

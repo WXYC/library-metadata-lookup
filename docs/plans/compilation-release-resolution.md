@@ -10,12 +10,12 @@ Streaming buttons and cover art *do* appear because they resolve through compila
 
 Two independent facts combine:
 
-1. **No producer fires for a found album row.** Every LML path that resolves a *specific* V/A `release_id` by track — `TRACK_ON_COMPILATION`, `SONG_AS_TRACK`, and the library-miss probe (`lookup/orchestrator.py:3108`) — is gated on `song_not_found` / library-miss. The enrichment worker supplies the album, so:
-   - `resolve_albums_for_track` short-circuits at `lookup/orchestrator.py:826` (album present, ≠ artist) → returns `song_not_found=False` (it never runs the Discogs track lookup).
+1. **No producer fires for a found album row.** Every LML path that resolves a *specific* V/A `release_id` by track — `TRACK_ON_COMPILATION`, `SONG_AS_TRACK`, and the library-miss probe (now `lookup/strategies/library_miss.py`; `lookup/orchestrator.py:3108` at writing) — is gated on `song_not_found` / library-miss. The enrichment worker supplies the album, so:
+   - `resolve_albums_for_track` short-circuits at `lookup/orchestrator.py:826` (at writing) (album present, ≠ artist) → returns `song_not_found=False` (it never runs the Discogs track lookup).
    - That `False` seeds the pipeline (`:3084`); `ARTIST_PLUS_ALBUM` finds the row and returns `Outcome.album_match`, which **leaves `song_not_found` untouched** (`core/search.py:476`).
    - `TrackOnCompilation.should_attempt = song_not_found_with_artist_and_song` (`core/search.py:633`, gate at `lookup/strategies/track_on_compilation.py:50`) → `False`. The compilation strategy never runs.
 
-2. **The binding step re-derives the release through an artist floor that rejects "Various".** `fetch_artwork_for_items.fetch_one` (`lookup/orchestrator.py:2145+`) re-searches Discogs by `item.alternate_artist_name or item.artist` (`:2155`) — the track artist — and only swaps in the "Various" search form `if is_compilation_artist(artist)` (`:2156`), i.e. only when the *library row itself* is filed under "Various". For a track-artist row it scores candidates with `find_best_typed_match` at the 80/80 **artist floor** (`:2188`); "A Guy Called Gerald" can never clear 80 against a release credited "Various", so the result is `None` → no `DiscogsMatchResult` → no `discogs_url`.
+2. **The binding step re-derives the release through an artist floor that rejects "Various".** `fetch_artwork_for_items.fetch_one` (now `lookup/artwork.py`; `lookup/orchestrator.py:2145+` at writing) re-searches Discogs by `item.alternate_artist_name or item.artist` (`:2155`) — the track artist — and only swaps in the "Various" search form `if is_compilation_artist(artist)` (`:2156`), i.e. only when the *library row itself* is filed under "Various". For a track-artist row it scores candidates with `find_best_typed_match` at the 80/80 **artist floor** (`:2188`); "A Guy Called Gerald" can never clear 80 against a release credited "Various", so the result is `None` → no `DiscogsMatchResult` → no `discogs_url`.
 
 **Why the fix is possible:** `validate_track_on_release` matches the *per-track* artist credit (`discogs/service.py:1432-1436`, `_scan_tracklist_for_match`), not the release-level credit. "Message to Black Youth" credits "A Guy Called Gerald" on its own tracklist row, so the comp validates `True` for the track artist. The artist floor lives only in the artwork re-search; routing the binding step through validation instead of the floor is the bypass.
 
@@ -107,7 +107,7 @@ Trust is sound: a carried release was validated this same request; a lazily-reso
 
 **Goal:** the symptom fix. All structural plumbing (module, widened seam) already landed in PR1; PR2 changes only how the binding step *consumes* the seam, behind a flag.
 
-- `fetch_one` (`lookup/orchestrator.py:2145+`): add two paths — (a) **carried-release trust-and-bind** (a `ResolvedRelease` is present in the seam → synthesize `DiscogsSearchResult` from `release_id`/`release_url`, art via `_resolve_fallback_artwork(release_id)`, skip `search()`+floor); (b) **lazy fallback** — when no carried release AND the floor search returned `None` AND `song` is present AND the flag is on AND `allow_release_resolution_fallback`, call `resolve_release_for_track`, take `[0]`, trust-and-bind.
+- `fetch_one` (now `lookup/artwork.py`; `lookup/orchestrator.py:2145+` at writing): add two paths — (a) **carried-release trust-and-bind** (a `ResolvedRelease` is present in the seam → synthesize `DiscogsSearchResult` from `release_id`/`release_url`, art via `_resolve_fallback_artwork(release_id)`, skip `search()`+floor); (b) **lazy fallback** — when no carried release AND the floor search returned `None` AND `song` is present AND the flag is on AND `allow_release_resolution_fallback`, call `resolve_release_for_track`, take `[0]`, trust-and-bind.
 - **Flag** — add to `config/settings.py` (mirror `lml_resolve_artist_canonical`):
   ```python
   lml_resolve_compilation_release: bool = Field(
