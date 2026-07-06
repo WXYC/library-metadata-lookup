@@ -27,16 +27,21 @@ Library Metadata Lookup is a FastAPI service that accepts pre-parsed fields (art
 
 ## The lookup pipeline
 
-A single call to `perform_lookup()` passes through six steps. Each step can short-circuit or enrich the data for the next.
+A single call to `perform_lookup()` passes through the step-labeled pipeline below. Each step can short-circuit or enrich the data for the next. Labels match the `_step_*` spine in `lookup/orchestrator.py` and the flow list in `docs/architecture.md`.
 
 | Step | What it does | Key function |
 |------|-------------|--------------|
 | 1. Artist correction | Fuzzy-match artist against catalog to fix typos | `LibraryDB.find_similar_artist()` |
 | 2. Album resolution | If song provided without album, ask Discogs which albums contain it | `resolve_albums_for_track()` |
 | 3. Strategy execution | Run search strategies in order until results found | `execute_search_pipeline()` |
-| 4. Track validation | If fallback returned all artist albums, validate each against Discogs tracklists | `filter_results_by_track_validation()` |
-| 5. Artwork fetch | Fetch album art from Discogs for each result (parallel) | `fetch_artwork_for_items()` |
-| 6. Context message | Generate human-readable summary of what happened | `build_context_message()` |
+| 3a. Library-miss Discogs probe | On a pipeline miss with artist+album, probe Discogs directly; a confident match is synthesized as a row-less result | `lookup/strategies/library_miss.py` |
+| 3b. Track validation | If fallback returned all artist albums, validate each against Discogs tracklists | `filter_results_by_track_validation()` |
+| 3c. Streaming status | Populate each result row's `on_streaming` flag from the library DB | `_step_populate_streaming_status()` |
+| 4. Artwork fetch | Fetch album art from Discogs for each result (parallel) | `fetch_artwork_for_items()` |
+| 4b. Metadata enrichment | Populate release year, artist bio, Wikipedia and streaming URLs | `enrich_artwork_results()` |
+| 5. Context message | Generate human-readable summary of what happened | `build_context_message()` |
+| 6. Identity resolution | Resolve external identifiers for each result's artist | `_step_resolve_result_identities()` |
+| 7. External-cache fallback | Opt-in mojibake recovery over the Discogs/MusicBrainz caches when the pipeline produced nothing | `_step_external_cache_fallback()` |
 
 ```mermaid
 flowchart TD
