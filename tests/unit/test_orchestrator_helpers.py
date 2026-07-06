@@ -37,13 +37,13 @@ from lookup.orchestrator import (
     filter_results_by_track_validation,
     find_library_albums_with_cached_track,
     resolve_albums_for_track,
-    search_compilations_for_track,
-    search_library_with_fallback,
 )
 from lookup.release_resolution import ResolvedRelease
 from lookup.rowless import ROWLESS_LIBRARY_ID
+from lookup.strategies.artist_plus_album import search_library_with_fallback
 from lookup.strategies.song_as_track import search_song_as_track
 from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
+from lookup.strategies.track_on_compilation import search_compilations_for_track
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_discogs_result, make_library_item
 
@@ -3231,7 +3231,7 @@ class TestSearchCompilationsCarriedTitleRank:
     async def test_title_ranks_when_flag_on(self, enable_compilation_release):
         db, svc, parsed, item = self._setup()
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -3247,7 +3247,7 @@ class TestSearchCompilationsCarriedTitleRank:
         get_settings.cache_clear()  # default-off
         db, svc, parsed, item = self._setup()
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -3334,7 +3334,7 @@ class TestSearchCompilationsEarlyExit:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):

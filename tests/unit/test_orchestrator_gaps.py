@@ -9,11 +9,11 @@ from lookup.orchestrator import (
     fetch_artwork_for_items,
     filter_results_by_track_validation,
     resolve_albums_for_track,
-    search_compilations_for_track,
-    search_library_with_fallback,
-    search_song_as_artist,
 )
+from lookup.strategies.artist_plus_album import search_library_with_fallback
+from lookup.strategies.song_as_artist import search_song_as_artist
 from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
+from lookup.strategies.track_on_compilation import search_compilations_for_track
 from lookup.strategies.track_release_matching import search_album_fuzzy
 from services.parser import ParsedRequest
 from tests.factories import make_discogs_result
@@ -104,7 +104,7 @@ class TestSearchSongAsArtist:
         discogs = AsyncMock()
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(
@@ -124,7 +124,7 @@ class TestSearchSongAsArtist:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -143,7 +143,7 @@ class TestSearchSongAsArtist:
         db.search = AsyncMock(side_effect=[[], [comp_item]])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(release_id=3, artist="SomeArtist", album="Indie Comp 2020")
@@ -162,7 +162,7 @@ class TestSearchSongAsArtist:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(release_id=10, artist="Artist", album=""),
@@ -213,7 +213,7 @@ class TestSearchSongAsArtistRowless:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(
@@ -243,7 +243,7 @@ class TestSearchSongAsArtistRowless:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(release_id=42, artist="Stereolab", album="Dots and Loops")
@@ -268,7 +268,7 @@ class TestSearchSongAsArtistRowless:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[make_discogs_result(release_id=555, artist="Sessa", album="Grandeza")],
         ):
@@ -290,7 +290,7 @@ class TestSearchSongAsArtistRowless:
         db.search = AsyncMock(side_effect=[[], [lib_item]])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(release_id=99, artist="Stereolab", album="Dots and Loops")
@@ -311,7 +311,7 @@ class TestSearchSongAsArtistRowless:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(
@@ -344,7 +344,7 @@ class TestSearchSongAsArtistRowless:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(release_id=0, artist="Sessa", album="Grandeza"),
@@ -377,7 +377,7 @@ class TestSearchSongAsArtistRowless:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(
@@ -412,7 +412,7 @@ class TestSearchSongAsArtistRowless:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[make_discogs_result(release_id=556, artist="", album="Sessa")],
         ):
@@ -436,7 +436,7 @@ class TestSearchSongAsArtistRowless:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(release_id=557, artist="", album="Sessa – Estrela Acesa")
@@ -465,7 +465,7 @@ class TestSearchSongAsArtistRowless:
         db.search = AsyncMock(return_value=[])
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_artist",
+            "lookup.strategies.song_as_artist.lookup_releases_by_artist",
             new_callable=AsyncMock,
             return_value=[
                 make_discogs_result(release_id=560, artist="", album="Various"),
@@ -578,7 +578,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -605,7 +605,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[("Various Artists", "Rock Classics")],
         ):
@@ -629,7 +629,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ) as mock_track_lookup:
@@ -653,7 +653,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[("Queen", "Queen")],  # album name == artist name
         ):
@@ -675,7 +675,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[("Queen", "XY")],  # too short
         ):
@@ -700,7 +700,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[("Various Artists", "Rock Comp")],
         ):
@@ -734,7 +734,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[("Various Artists", "Get On The Dance Floor Volume 5")],
         ):
@@ -777,7 +777,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=releases,
         ):
@@ -803,7 +803,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             side_effect=Exception("Discogs down"),
         ):
@@ -836,7 +836,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[("808 State", "The Best Of 808 State: Blueprint")],
         ):
@@ -871,7 +871,7 @@ class TestSearchCompilationsForTrack:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[("Chicago", "Chicago 16")],
         ):
@@ -909,7 +909,7 @@ class TestSearchCompilationsForTrack:
 
         # Discogs found Poodle Hat (which contains "Bob"), but it's not in the library
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[('"Weird Al" Yankovic', "Poodle Hat")],
         ):

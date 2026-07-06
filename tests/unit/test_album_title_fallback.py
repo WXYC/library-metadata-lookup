@@ -22,7 +22,7 @@ import pytest
 
 from core.thresholds import CANONICAL_ARTIST_SIMILARITY_FLOOR
 from discogs.models import ReleaseInfo, TrackReleasesResponse
-from lookup.orchestrator import search_compilations_for_track
+from lookup.strategies.track_on_compilation import search_compilations_for_track
 from services.parser import ParsedRequest
 from tests.factories import make_library_item
 
@@ -72,7 +72,7 @@ class TestAlbumTitleFallback:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -101,7 +101,7 @@ class TestAlbumTitleFallback:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -144,7 +144,7 @@ class TestAlbumTitleFallback:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -216,7 +216,7 @@ class TestAlbumTitleFallback:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -275,7 +275,7 @@ class TestAlbumTitleFallback:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -324,7 +324,7 @@ class TestAlbumTitleFallback:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -404,14 +404,14 @@ class TestAlbumTitleFallback:
 
         with (
             patch(
-                "lookup.orchestrator.lookup_releases_by_track",
+                "lookup.strategies.track_on_compilation.lookup_releases_by_track",
                 new_callable=AsyncMock,
                 return_value=[],
             ),
             # Isolate the fallback's artist gating from the downstream
             # non-library carry-through (not under test here).
             patch(
-                "lookup.orchestrator._resolve_nonlibrary_release",
+                "lookup.strategies.track_on_compilation._resolve_nonlibrary_release",
                 new_callable=AsyncMock,
                 return_value=None,
             ),
@@ -484,7 +484,7 @@ class TestAlbumTitleFallback:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -529,7 +529,7 @@ class TestAlbumTitleFallback:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -592,7 +592,7 @@ class TestAlbumTitleProbeConcurrency:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):
@@ -656,11 +656,11 @@ class TestAlbumTitleProbeConcurrency:
 
         with (
             patch(
-                "lookup.orchestrator.lookup_releases_by_track",
+                "lookup.strategies.track_on_compilation.lookup_releases_by_track",
                 new_callable=AsyncMock,
                 return_value=[],
             ),
-            patch("lookup.orchestrator._log_album_title_fallback") as mock_log,
+            patch("lookup.strategies.track_on_compilation._log_album_title_fallback") as mock_log,
         ):
             results, _ = await search_compilations_for_track(db, parsed, discogs_service=service)
 
@@ -706,7 +706,7 @@ class TestAlbumTitleProbeConcurrency:
         )
 
         with patch(
-            "lookup.orchestrator.lookup_releases_by_track",
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
             new_callable=AsyncMock,
             return_value=[],
         ):

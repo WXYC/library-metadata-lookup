@@ -18,7 +18,7 @@
 
 ## Search Strategy Pipeline
 
-The strategy seam (`Outcome` value type, `Strategy` Protocol, `_apply` write site, `execute_search_pipeline` runner) lives in `core/search.py`. Each concrete strategy is a `@dataclass(frozen=True)` class in `lookup/strategies/`, one module per strategy; the execute funcs that do the actual library/Discogs work are injected into each strategy at construction time. `SONG_AS_TRACK`'s and `SWAPPED_INTERPRETATION`'s execute funcs live in their strategy modules (over the shared kernel in `lookup/strategies/track_release_matching.py`); the other three still live in `lookup/orchestrator.py` (decomposition in progress, LML#722).
+The strategy seam (`Outcome` value type, `Strategy` Protocol, `_apply` write site, `execute_search_pipeline` runner) lives in `core/search.py`. Each concrete strategy is a `@dataclass(frozen=True)` class in `lookup/strategies/`, one module per strategy; the execute funcs that do the actual library/Discogs work are injected into each strategy at construction time and live in the same module as their strategy class (`SONG_AS_TRACK` and `SWAPPED_INTERPRETATION` over the shared kernel in `lookup/strategies/track_release_matching.py`; LML#722).
 
 | Strategy | Trigger | Class | Execute func |
 |---|---|---|---|
@@ -34,8 +34,8 @@ Strategies never mutate `SearchState`; they return an `Outcome` and the runner a
 
 ## Key Files
 
-- `lookup/orchestrator.py` -- Pipeline spine: `perform_lookup()` and the not-yet-extracted strategy implementations (decomposition in progress, LML#722)
-- `lookup/strategies/` -- Strategy classes (gating predicate + `attempt` per module), the `build_strategies` factory, and the extracted execute funcs (`song_as_track`, `swapped_interpretation`) over the shared `track_release_matching` kernel
+- `lookup/orchestrator.py` -- Pipeline spine: `perform_lookup()` plus the not-yet-extracted enrichment/artwork/validation steps (decomposition in progress, LML#722)
+- `lookup/strategies/` -- Strategy classes (gating predicate + `attempt` per module), the `build_strategies` factory, and every strategy's execute func (`SONG_AS_TRACK`/`SWAPPED_INTERPRETATION` over the shared `track_release_matching` kernel), plus the step-3a library-miss Discogs probe (`library_miss.py`)
 - `lookup/matching.py` -- Pure matching predicates, filters, and score floors
 - `lookup/concurrency.py` -- `_chunked_gather` + the per-invocation Discogs API-call cap
 - `lookup/artist_resolution.py` -- Canonical-artist resolver (`resolve_canonical_artist`) + its flag gates and telemetry projections
@@ -101,7 +101,7 @@ When a `pg_read` raises one of a narrow set of "DB unreachable" exceptions — `
 
 The arming exception set lives in `_ARMING_EXCEPTIONS` in `discogs/fallthrough.py` and is pinned by tests in `tests/unit/test_fallthrough.py` so a future asyncpg release adding new exception classes can't silently widen the arming criteria.
 
-Cool-down arm projects `data.cache_fallback_fired = {reason, error_class, cool_down_seconds}` onto the active Sentry transaction, matching the pattern used by `_log_album_title_fallback` in `lookup/orchestrator.py`. Queryable in the Sentry trace explorer to track outage incidents.
+Cool-down arm projects `data.cache_fallback_fired = {reason, error_class, cool_down_seconds}` onto the active Sentry transaction, matching the pattern used by `_log_album_title_fallback` in `lookup/strategies/track_on_compilation.py`. Queryable in the Sentry trace explorer to track outage incidents.
 
 ## External-Cache Fallback for `/api/v1/lookup` (Phase 1.5 mojibake recovery)
 
