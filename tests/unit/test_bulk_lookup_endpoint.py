@@ -135,6 +135,45 @@ class TestBulkLookupEndpoint:
         assert mock_lookup.await_args.kwargs.get("allow_release_resolution_fallback") is False
 
     @pytest.mark.asyncio
+    async def test_bulk_hard_pins_warm_cache_off(self, app_client):
+        """A bulk item that sets ``warm_cache: true`` reaches perform_lookup with
+        ``request.warm_cache`` falsy (LML#742). ``warm_cache`` gates the
+        fire-and-forget ``_warm_bio_cache`` deep parse (per-bio-ref live Discogs
+        calls), so on a 35k-item drain it is exactly the fan-out the bulk
+        posture forbids — same rationale as the ``bandcamp`` /
+        ``allow_release_resolution_fallback`` pins at the same call site. The
+        pin must be surgical: sibling per-item flags (``extended``) ride
+        through untouched."""
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_no_match_response(),
+        ) as mock_lookup:
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={
+                        "items": [
+                            {
+                                "artist": "Chuquimamani-Condori",
+                                "album": "Edits",
+                                "extended": True,
+                                "warm_cache": True,
+                            }
+                        ]
+                    },
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_count == 1
+        forwarded = mock_lookup.await_args.kwargs["request"]
+        assert not forwarded.warm_cache
+        assert forwarded.extended is True
+        assert forwarded.artist == "Chuquimamani-Condori"
+
+    @pytest.mark.asyncio
     async def test_bulk_forwards_per_item_extended_true(self, app_client):
         """A bulk item that sets ``extended: true`` reaches perform_lookup with
         ``request.extended is True`` — the model path (BulkLookupRequest →
