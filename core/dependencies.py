@@ -29,8 +29,8 @@ if TYPE_CHECKING:
 # `/lookup` requests (the LML_LOOKUP_MAX_CONCURRENT default) contended for its
 # 5 connections, so even the trivial connection-reset span inflated to seconds.
 # Env-tunable so the pool ceiling can be raised to >= the in-flight cap from
-# Railway without a redeploy; default 5 keeps historical behavior (inert until
-# an operator tunes it). See docs/env-vars.md.
+# Railway (applies on the next restart); default 5 keeps historical behavior
+# (inert until an operator tunes it). See docs/env-vars.md.
 _DISCOGS_POOL_MAX_SIZE_ENV_VAR = "LML_DISCOGS_POOL_MAX_SIZE"
 _DISCOGS_POOL_MAX_SIZE_DEFAULT = 5
 

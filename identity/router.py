@@ -24,6 +24,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
 from core.bulk_concurrency import cancel_and_drain, max_concurrency_from_env, watch_disconnect
+from core.dependencies import _DISCOGS_POOL_MAX_SIZE_DEFAULT, _DISCOGS_POOL_MAX_SIZE_ENV_VAR
+from core.search import resolve_positive_int_env
 from entity.store import EntityStore, Identity
 from generated.api_models import (
     BulkResolveInput,
@@ -51,18 +53,28 @@ from identity.release_validation import (
 # Per api.yaml: max 1,000 inputs per request; over-cap returns 413.
 _BULK_RESOLVE_INPUT_CAP = 1000
 
-# Default ceiling on concurrent per-input lookups (LML#278). The discogs-cache
-# asyncpg pool is built with ``max_size=5`` (``core.dependencies._build_discogs_pool``),
-# and each per-input coroutine holds at most one pooled connection at a time —
-# ``resolve_library_name``'s three legs and ``compose_for_identity``'s provenance
-# read are sequential awaits within a single coroutine, never concurrent — so a
-# semaphore sized to the pool's ``max_size`` saturates the pool without
-# coroutines queueing on ``pool.acquire()`` (which would otherwise block up to the
-# pool's 10 s acquire timeout). Overridable at runtime via the shared
-# ``LML_BULK_MAX_CONCURRENT`` env knob (see ``core.bulk_concurrency``); the
-# default IS the pool max, per the issue's "default to the asyncpg pool's
-# max_size" acceptance criterion.
-_BULK_RESOLVE_DEFAULT_CONCURRENCY = 5
+
+def _bulk_resolve_default_concurrency() -> int:
+    """Default ceiling on concurrent per-input lookups (LML#278).
+
+    Each per-input coroutine holds at most one pooled connection at a time —
+    ``resolve_library_name``'s three legs and ``compose_for_identity``'s
+    provenance read are sequential awaits within a single coroutine, never
+    concurrent — so a semaphore sized to the discogs-cache pool's ``max_size``
+    saturates the pool without coroutines queueing on ``pool.acquire()`` (which
+    would otherwise block up to the pool's 10 s acquire timeout). The default
+    therefore IS the pool max, per the issue's "default to the asyncpg pool's
+    max_size" acceptance criterion.
+
+    Reads the SAME ``LML_DISCOGS_POOL_MAX_SIZE`` knob the pool is built from
+    (``core.dependencies._build_discogs_pool``, LML#706) so raising or lowering
+    the pool moves this cap with it — a hardcoded ``5`` would silently
+    under-parallelize a widened pool, or (worse) admit more coroutines than a
+    narrowed pool has connections. Still overridable at runtime via the shared
+    ``LML_BULK_MAX_CONCURRENT`` knob (see ``core.bulk_concurrency``).
+    """
+    return resolve_positive_int_env(_DISCOGS_POOL_MAX_SIZE_ENV_VAR, _DISCOGS_POOL_MAX_SIZE_DEFAULT)
+
 
 logger = logging.getLogger(__name__)
 
@@ -244,11 +256,11 @@ async def bulk_resolve_libraries(
     # Worst case drops from ~3,000 sequential PG round-trips for a 1,000-row
     # miss-heavy batch to ~``ceil(N / max_concurrent)`` waves. The semaphore is
     # sized to the discogs-cache pool's ``max_size`` (see
-    # ``_BULK_RESOLVE_DEFAULT_CONCURRENCY``) so we parallelize without exhausting
+    # ``_bulk_resolve_default_concurrency``) so we parallelize without exhausting
     # the asyncpg pool. ``min(..., inputs_count)`` avoids over-allocating permits
     # for small batches; ``max(1, ...)`` keeps ``Semaphore(0)`` (which would
     # deadlock any acquire) off the table for an empty-input request.
-    max_concurrent = max_concurrency_from_env(_BULK_RESOLVE_DEFAULT_CONCURRENCY)
+    max_concurrent = max_concurrency_from_env(_bulk_resolve_default_concurrency())
     semaphore = asyncio.Semaphore(max(1, min(max_concurrent, inputs_count)))
 
     async def _resolve_one(input_row: BulkResolveInput) -> BulkResolveResult:

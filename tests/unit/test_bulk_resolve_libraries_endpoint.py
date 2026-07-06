@@ -950,3 +950,29 @@ class TestBulkResolveConcurrency:
         # No partial results leak: the body is the 503 error envelope, not a
         # 200 `results` payload.
         assert "results" not in resp.json()
+
+
+class TestBulkResolveDefaultConcurrencyTracksPool:
+    """LML#706: the bulk-resolve semaphore default mirrors the discogs-cache
+    pool's ``max_size``.
+
+    ``identity/router`` documents that the default "IS the pool max" so the
+    semaphore saturates the pool without coroutines queueing on
+    ``pool.acquire()``. Once the pool became env-tunable
+    (``LML_DISCOGS_POOL_MAX_SIZE``), a hardcoded ``5`` would break that coupling:
+    raise the pool and bulk-resolve stays under-parallelized; lower the pool and
+    the semaphore admits more coroutines than the pool has connections. The
+    default must track the same env var.
+    """
+
+    def test_default_is_pool_default_when_unset(self, monkeypatch):
+        from identity.router import _bulk_resolve_default_concurrency
+
+        monkeypatch.delenv("LML_DISCOGS_POOL_MAX_SIZE", raising=False)
+        assert _bulk_resolve_default_concurrency() == 5
+
+    def test_default_tracks_pool_env(self, monkeypatch):
+        from identity.router import _bulk_resolve_default_concurrency
+
+        monkeypatch.setenv("LML_DISCOGS_POOL_MAX_SIZE", "8")
+        assert _bulk_resolve_default_concurrency() == 8

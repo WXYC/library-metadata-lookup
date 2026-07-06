@@ -96,19 +96,32 @@ def _reset_discogs_pool_singleton():
     loop. The next test that resolves the pool (traced through
     ``get_discogs_cache_pg`` in the ``/lookup`` Depends chain) then raises
     ``RuntimeError(... bound to a different event loop)``, surfacing as an
-    order-dependent failure in an unrelated file. Replace the shared closure
-    cells so every by-reference importer of the getter (``identity.dependencies``,
-    ``main``) starts each test with a fresh unbound lock and no stale pool.
+    order-dependent failure in an unrelated file. Replace the shared ``lock``
+    closure cell so every by-reference importer of the getter
+    (``identity.dependencies``, ``main``) starts each test with a fresh,
+    unbound lock.
+
+    Only the lock is reset — the cached pool ``instance`` is left to the
+    existing closers (``close_discogs_pool`` in the ``app_client`` /
+    ``reset_globals`` teardowns). On the flake path ``instance`` is still
+    ``None`` (the mid-acquire ``create_pool`` never returned), so nulling it
+    here is unnecessary; doing it *without* ``aclose`` would instead orphan a
+    live asyncpg pool in the pg suite (a connection leak), so we don't.
     """
     from core import dependencies as _core_deps
 
     def _reset() -> None:
         getter = _core_deps.get_discogs_pool
-        for name, cell in zip(getter.__code__.co_freevars, getter.__closure__ or (), strict=True):
+        freevars = getter.__code__.co_freevars
+        # Fail loud if async_singleton's internals are renamed: a silent no-op
+        # here would let the cross-loop flake return with zero test signal.
+        assert "lock" in freevars, (
+            "get_discogs_pool has no 'lock' free variable — wxyc_fastapi "
+            "async_singleton internals changed; update this reset."
+        )
+        for name, cell in zip(freevars, getter.__closure__, strict=True):
             if name == "lock":
                 cell.cell_contents = asyncio.Lock()
-            elif name == "instance":
-                cell.cell_contents = None
 
     _reset()
     yield
