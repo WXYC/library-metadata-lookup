@@ -54,7 +54,14 @@ MODULE_BUDGETS: dict[str, int] = {
 
 def _lookup_files() -> list[str]:
     """Every ``.py`` file under ``lookup/``, as a repo-relative POSIX path."""
-    return sorted(p.relative_to(REPO_ROOT).as_posix() for p in LOOKUP_ROOT.rglob("*.py"))
+    # Dot-prefixed components (Emacs lock files and the like) can never be valid
+    # modules, so they are skipped; untracked non-dot scratch files deliberately
+    # keep failing (pre-push signal).
+    return sorted(
+        p.relative_to(REPO_ROOT).as_posix()
+        for p in LOOKUP_ROOT.rglob("*.py")
+        if not any(part.startswith(".") for part in p.relative_to(LOOKUP_ROOT).parts)
+    )
 
 
 @pytest.mark.parametrize("rel_path", _lookup_files())
@@ -64,19 +71,16 @@ def test_lookup_module_within_budget(rel_path: str) -> None:
     if ceiling is None:
         pytest.fail(
             f"{rel_path} has no entry in MODULE_BUDGETS ({__file__}). "
-            "Every lookup/ module must carry an explicit line ceiling — add one "
-            "sized to the file's intended scope (the convention is the smallest "
-            "multiple of 50 at or above 1.3x its initial size). The guardrail "
-            "cannot be dodged by putting growth in a new, unbudgeted file."
+            "Add a ceiling sized per the calibration convention in this module's "
+            "docstring — the guardrail cannot be dodged by putting growth in a "
+            "new, unbudgeted file."
         )
-    actual = len((REPO_ROOT / rel_path).read_text(encoding="utf-8").splitlines())
+    actual = (REPO_ROOT / rel_path).read_bytes().count(b"\n")
     assert actual <= ceiling, (
         f"{rel_path} is {actual} lines, over its {ceiling}-line budget. "
-        "Extract a module, don't append: move the growing concern into its own "
-        "lookup/ module (see the key-files map in docs/architecture.md for where "
-        "each concern lives). Raising a ceiling is a deliberate, reviewed "
-        "decision — justify it in the PR, don't bump the number to make the "
-        "build pass."
+        "Extract the growing concern into its own lookup/ module — see this "
+        "module's docstring for the ceiling policy and the key-files map in "
+        "docs/architecture.md for where each concern lives."
     )
 
 

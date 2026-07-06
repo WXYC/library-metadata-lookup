@@ -28,6 +28,7 @@ from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
 from core.search import (
+    SEARCH_TYPE_NONE,
     SearchState,
     execute_search_pipeline,
     get_search_type_from_state,
@@ -197,9 +198,11 @@ class LookupState:
     Created empty at the top of ``perform_lookup`` and mutated in place by the
     ``_step_*`` functions, in spine order. Each field's docstring names the
     steps that touch it; each step function's docstring declares the fields it
-    READS and WRITES. Values that cross only a single step boundary (the
-    ``ParsedRequest``, ``albums_for_search``, the raw ``SearchState``, the
-    built ``result_items``) ride as step parameters/returns instead of state.
+    READS and WRITES. Cross-step mutable accumulators that shape the response
+    live on this state; step-derived pipeline products (the ``ParsedRequest``,
+    ``albums_for_search``, the raw ``SearchState``, the built ``result_items``)
+    ride as step parameters/returns because each is produced once by one step
+    and consumed read-mostly downstream.
     """
 
     library_results: list[LibraryItem] = field(default_factory=list)
@@ -215,8 +218,11 @@ class LookupState:
     """``(library item, Discogs artwork match)`` pairs for the response. Built
     by artwork fetch (step 4) from ``library_results`` — or synthesized
     directly by the library-miss probe (step 3a), which bypasses steps 3b and 4
-    — then rebound to the enriched pairs by enrichment (4b). When non-empty it
-    takes precedence over ``library_results`` in the response build."""
+    — then rebound to the enriched pairs by enrichment (4b). Read by the trace
+    projection (results_count), the context message (5, via ``has_results``),
+    and identity resolution (6, which collects artist names from the
+    synthesized id=0 pairs); when non-empty it takes precedence over
+    ``library_results`` in the response build."""
 
     song_not_found: bool = False
     """True while the requested song/album is unconfirmed. Seeded by album
@@ -229,7 +235,8 @@ class LookupState:
     """True when TRACK_ON_COMPILATION surfaced the track on a compilation.
     Written by the search pipeline (step 3); routes track validation (3b),
     threads into artwork fetch (4) and enrichment (4b), and shapes the context
-    message (5)."""
+    message (5); reported on the response
+    (``LookupResponse.found_on_compilation``)."""
 
     discogs_titles: dict[int, ResolvedRelease] = field(default_factory=dict)
     """Library item id → resolved Discogs release, carried on the strategy seam
@@ -237,10 +244,10 @@ class LookupState:
     pipeline (step 3), extended by the A4 cached-track promotion (3b, LML#629),
     read by artwork fetch (4)."""
 
-    search_type: str = "none"
+    search_type: str = SEARCH_TYPE_NONE
     """Which strategy resolved the request (telemetry + response). Written by
-    the search pipeline (step 3); the default mirrors
-    ``get_search_type_from_state``'s no-strategies-tried value."""
+    the search pipeline (step 3); read by the trace projection and the
+    response build."""
 
     library_miss_outcome: str | None = None
     """LML#583 outcome marker (``library_miss_discogs_match`` /
@@ -252,6 +259,18 @@ class LookupState:
     on the response. Written by the prepare step (steps 1+2); the correction
     itself rides on ``parsed.library_artist`` (the LML#626 two-channel seam),
     never on ``parsed.artist``."""
+
+    @property
+    def result_count(self) -> int:
+        """Row count for the response; ``items_with_artwork`` takes precedence when non-empty."""
+        if self.items_with_artwork:
+            return len(self.items_with_artwork)
+        return len(self.library_results)
+
+    @property
+    def has_results(self) -> bool:
+        """True when the response will carry any result rows (see ``result_count``)."""
+        return self.result_count > 0
 
 
 @dataclass(frozen=True)
@@ -304,6 +323,22 @@ class LookupServices:
     """LML#652/#671 bulk kill switch: ``False`` on /lookup/bulk suppresses every
     per-row Discogs surfacing path (the row-less producers, the step-3a
     library-miss probe, and step 4's lazy artwork fallback)."""
+
+    extended: bool
+    """Extended-payload opt-in for enrichment (4b) and the trace projection.
+    The generated LookupRequest models it as ``bool | None`` (api.yaml gives it
+    ``default: false`` but leaves it out of the required set, so callers can
+    omit it); coerced once at bundle build."""
+
+    warm_cache: bool
+    """Fire-and-forget bio-cache warm opt-in for enrichment (4b) and the trace
+    projection. Same ``bool | None`` wire shape as ``extended``; coerced once
+    at bundle build."""
+
+    include_external_caches: bool
+    """Step-7 mojibake-fallback opt-in. Already a plain ``bool`` on the LML
+    LookupRequest subclass (``lookup/models.py``) — a straight copy, no
+    coercion."""
 
 
 async def _step_prepare_request(
@@ -368,7 +403,6 @@ async def _step_prepare_request(
 
 
 async def _step_search_pipeline(
-    request: LookupRequest,
     parsed: ParsedRequest,
     albums_for_search: list[str],
     state: LookupState,
@@ -430,7 +464,7 @@ async def _step_search_pipeline(
 
         search_state = await execute_search_pipeline(
             parsed=parsed,
-            raw_message=request.raw_message or "",
+            raw_message=parsed.raw_message,
             strategies=strategies,
             albums_for_search=albums_for_search,
             song_not_found=state.song_not_found,
@@ -645,13 +679,11 @@ async def _step_enrich_metadata(
     parsed: ParsedRequest,
     state: LookupState,
     services: LookupServices,
-    *,
-    extended: bool,
-    warm_cache: bool,
 ) -> None:
     """Step 4b — enrich with release year, artist details, streaming links.
 
-    READS: ``items_with_artwork``, ``found_on_compilation``.
+    READS: ``items_with_artwork``, ``found_on_compilation``; plus
+    ``services.extended`` and ``services.warm_cache``.
     WRITES: ``items_with_artwork`` (rebound to the enriched pairs).
 
     Ordering invariant: runs strictly after Step 4 built ``items_with_artwork``
@@ -668,8 +700,8 @@ async def _step_enrich_metadata(
                 album=parsed.album,
                 artist=parsed.artist,
                 library_db=services.db,
-                extended=extended,
-                warm_cache=warm_cache,
+                extended=services.extended,
+                warm_cache=services.warm_cache,
                 discogs_cache=services.discogs_cache,
                 mb_pg=services.mb_pg,
                 apple_music=services.apple_music,
@@ -683,17 +715,16 @@ async def _step_enrich_metadata(
 
 def _step_project_trace_attrs(
     state: LookupState,
-    *,
-    extended: bool,
-    warm_cache: bool,
+    services: LookupServices,
 ) -> None:
     """Project request flags and result-quality signals onto the Sentry transaction.
 
     Runs between steps 4b and 5; not a numbered pipeline step (observability
     only — it must never affect the response).
 
-    READS: ``items_with_artwork``, ``library_results``, ``search_type``,
-    ``library_miss_outcome``.
+    READS: ``result_count`` (via ``items_with_artwork``/``library_results``),
+    ``search_type``, ``library_miss_outcome``; plus ``services.extended`` and
+    ``services.warm_cache``.
     WRITES: nothing.
     """
     # Project the request-side flags and result-quality signals onto the
@@ -704,14 +735,9 @@ def _step_project_trace_attrs(
     try:
         scope = sentry_sdk.get_current_scope()
         if scope.transaction is not None:
-            scope.transaction.set_data("lml.lookup.extended", extended)
-            scope.transaction.set_data("lml.lookup.warm_cache", warm_cache)
-            scope.transaction.set_data(
-                "lookup.results_count",
-                len(state.items_with_artwork)
-                if state.items_with_artwork
-                else len(state.library_results),
-            )
+            scope.transaction.set_data("lml.lookup.extended", services.extended)
+            scope.transaction.set_data("lml.lookup.warm_cache", services.warm_cache)
+            scope.transaction.set_data("lookup.results_count", state.result_count)
             scope.transaction.set_data("lookup.match_type", state.search_type)
             if state.library_miss_outcome is not None:
                 scope.transaction.set_data("lookup.outcome", state.library_miss_outcome)
@@ -755,7 +781,8 @@ def _build_result_items(
 ) -> list[LookupResultItem]:
     """Build the response items (convert internal models to API contract models).
 
-    READS: ``items_with_artwork`` (takes precedence when non-empty),
+    READS: ``items_with_artwork`` (takes precedence when non-empty — the
+    canonical rule statement is ``LookupState.result_count``),
     ``library_results``.
     WRITES: nothing.
     """
@@ -808,7 +835,6 @@ def _build_result_items(
 
 
 async def _step_external_cache_fallback(
-    request: LookupRequest,
     parsed: ParsedRequest,
     result_items: list[LookupResultItem],
     services: LookupServices,
@@ -816,7 +842,8 @@ async def _step_external_cache_fallback(
     """Step 7 — external-cache fallback (Phase 1.5 + 1.7 mojibake recovery).
 
     READS/WRITES: no ``LookupState`` fields — operates on the built
-    ``result_items``, appending synthetic external rows on a fallback hit.
+    ``result_items``, appending synthetic external rows on a fallback hit;
+    gated on ``services.include_external_caches``.
 
     Returns the ``external_source`` provenance value for the response
     (``"library"`` when the pipeline already produced results, the fallback
@@ -828,7 +855,7 @@ async def _step_external_cache_fallback(
     # song. A bare raw_message with no typed field skips the fallback —
     # LABEL_NAME is too noisy to be useful here.
     external_source: str | None = "library" if result_items else None
-    if not result_items and request.include_external_caches:
+    if not result_items and services.include_external_caches:
         candidates: list[dict[str, Any]] = []
         source: str | None = None
         if parsed.artist:
@@ -925,38 +952,32 @@ async def perform_lookup(
         discogs_cache_pg=discogs_cache_pg,
         caller_budget_ms=caller_budget_ms,
         allow_release_resolution_fallback=allow_release_resolution_fallback,
+        extended=bool(request.extended),
+        warm_cache=bool(request.warm_cache),
+        include_external_caches=request.include_external_caches,
     )
     state = LookupState()
 
     parsed, albums_for_search = await _step_prepare_request(request, state, services)
-    search_state = await _step_search_pipeline(request, parsed, albums_for_search, state, services)
+    search_state = await _step_search_pipeline(parsed, albums_for_search, state, services)
     await _step_library_miss_probe(parsed, state, services)
     await _step_validate_tracks(parsed, search_state, state, services)
     await _step_populate_streaming_status(state, services)
     await _step_fetch_artwork(parsed, state, services)
-
-    # The generated LookupRequest models these as bool | None (api.yaml
-    # describes them with `default: false` but the field is not in the
-    # required set, so callers can omit them). Coerce once and reuse.
-    extended_mode = bool(request.extended)
-    warm_cache_mode = bool(request.warm_cache)
-
-    await _step_enrich_metadata(
-        parsed, state, services, extended=extended_mode, warm_cache=warm_cache_mode
-    )
-    _step_project_trace_attrs(state, extended=extended_mode, warm_cache=warm_cache_mode)
+    await _step_enrich_metadata(parsed, state, services)
+    _step_project_trace_attrs(state, services)
 
     # Step 5: Build context message
     context = build_context_message(
         parsed,
         state.found_on_compilation,
         state.song_not_found,
-        has_results=bool(state.library_results) or bool(state.items_with_artwork),
+        has_results=state.has_results,
     )
 
     identities_by_artist = await _step_resolve_result_identities(state, services)
     result_items = _build_result_items(state, search_state, identities_by_artist)
-    external_source = await _step_external_cache_fallback(request, parsed, result_items, services)
+    external_source = await _step_external_cache_fallback(parsed, result_items, services)
 
     return LookupResponse(
         results=result_items,

@@ -71,6 +71,14 @@ loopback-to-Railway-edge round-trip with margin; if measurements ever show
 a tighter bound, narrow this constant rather than the caller-side header.
 """
 
+SEARCH_TYPE_NONE = "none"
+"""Sentinel search type: no strategy produced the result.
+
+Mirrored as the ``LookupState.search_type`` default and pinned to
+``generated.api_models.SearchType.none`` on the wire — changing the value
+requires a wxyc-shared contract bump.
+"""
+
 
 def resolve_positive_int_env(env_var: str, default: int) -> int:
     """Read a positive integer from ``env_var``, falling back to ``default`` with a WARN.
@@ -942,7 +950,7 @@ def get_search_type_from_state(state: SearchState) -> str:
         return "compilation"
 
     if not state.strategies_tried:
-        return "none"
+        return SEARCH_TYPE_NONE
 
     last_strategy = state.strategies_tried[-1]
 
@@ -960,4 +968,4 @@ def get_search_type_from_state(state: SearchState) -> str:
         # caller's lens, track-driven matches are compilation-class.
         return "compilation"
 
-    return "none"
+    return SEARCH_TYPE_NONE

@@ -23,7 +23,7 @@ from generated.api_models import (
 )
 from library.models import LibraryItem
 from lookup.models import LookupRequest, LookupResponse
-from lookup.orchestrator import perform_lookup
+from lookup.orchestrator import LookupState, perform_lookup
 from tests.conftest import make_lml_telemetry
 from tests.factories import make_discogs_result, make_library_item
 
@@ -1909,3 +1909,36 @@ class TestPerformLookupExternalCacheFallback:
         discogs_cache.search_artists_by_name.assert_awaited_once()
         discogs_cache.search_releases_by_title.assert_not_called()
         discogs_cache.search_tracks_by_title.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: LookupState result precedence properties
+# ---------------------------------------------------------------------------
+
+
+class TestLookupStateResultPrecedence:
+    """LookupState.result_count / has_results encode the response precedence rule.
+
+    ``items_with_artwork`` takes precedence over ``library_results`` when
+    non-empty — the same rule ``_build_result_items`` dispatches on.
+    """
+
+    @pytest.mark.parametrize(
+        ("n_artwork_pairs", "n_library_rows", "expected_count"),
+        [
+            pytest.param(2, 0, 2, id="items_with_artwork_only"),
+            pytest.param(0, 3, 3, id="library_results_only"),
+            pytest.param(1, 3, 1, id="both_populated_artwork_wins"),
+            pytest.param(0, 0, 0, id="neither"),
+        ],
+    )
+    def test_result_count_and_has_results(self, n_artwork_pairs, n_library_rows, expected_count):
+        state = LookupState()
+        state.items_with_artwork = [
+            (make_library_item(id=100 + i), make_discogs_result(release_id=200 + i))
+            for i in range(n_artwork_pairs)
+        ]
+        state.library_results = [make_library_item(id=i + 1) for i in range(n_library_rows)]
+
+        assert state.result_count == expected_count
+        assert state.has_results is (expected_count > 0)
