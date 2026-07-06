@@ -696,6 +696,54 @@ class TestBulkResolveConcurrency:
         )
 
     @pytest.mark.asyncio
+    async def test_semaphore_bound_tracks_discogs_pool_size(
+        self, app_client, mock_entity_store, monkeypatch
+    ):
+        """End-to-end: with ``LML_BULK_MAX_CONCURRENT`` unset, the endpoint's
+        in-flight bound tracks ``LML_DISCOGS_POOL_MAX_SIZE`` (LML#706).
+
+        The unit tests for ``_bulk_resolve_default_concurrency`` prove the helper
+        reads the pool knob; this proves the *endpoint* actually wires that
+        default into its semaphore. Guards against a refactor that keeps the
+        helper correct but stops feeding it to ``asyncio.Semaphore`` — which
+        would leave the unit tests green while silently losing the pool-tracking.
+        """
+        monkeypatch.delenv("LML_BULK_MAX_CONCURRENT", raising=False)
+        monkeypatch.setenv("LML_DISCOGS_POOL_MAX_SIZE", "2")
+
+        in_flight = 0
+        max_in_flight = 0
+        lock = asyncio.Lock()
+
+        async def tracked_lookup(name: str):
+            nonlocal in_flight, max_in_flight
+            async with lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.02)
+            async with lock:
+                in_flight -= 1
+            return None
+
+        mock_entity_store.resolve_library_name.side_effect = tracked_lookup
+
+        inputs = [
+            {"library_id": i, "artist_name": f"Artist {i}", "album_title": "x"} for i in range(6)
+        ]
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/api/v1/identity/bulk-resolve-libraries", json={"inputs": inputs})
+
+        assert resp.status_code == 200
+        assert max_in_flight == 2, (
+            f"Expected LML_DISCOGS_POOL_MAX_SIZE=2 to cap in-flight lookups at 2; "
+            f"observed peak {max_in_flight}. The pool-derived default is not reaching "
+            f"the endpoint's semaphore."
+        )
+
+    @pytest.mark.asyncio
     async def test_input_order_preserved_under_staggered_completion(
         self, app_client, mock_entity_store
     ):

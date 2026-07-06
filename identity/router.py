@@ -24,8 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
 from core.bulk_concurrency import cancel_and_drain, max_concurrency_from_env, watch_disconnect
-from core.dependencies import _DISCOGS_POOL_MAX_SIZE_DEFAULT, _DISCOGS_POOL_MAX_SIZE_ENV_VAR
-from core.search import resolve_positive_int_env
+from core.dependencies import discogs_pool_max_size
 from entity.store import EntityStore, Identity
 from generated.api_models import (
     BulkResolveInput,
@@ -66,14 +65,15 @@ def _bulk_resolve_default_concurrency() -> int:
     therefore IS the pool max, per the issue's "default to the asyncpg pool's
     max_size" acceptance criterion.
 
-    Reads the SAME ``LML_DISCOGS_POOL_MAX_SIZE`` knob the pool is built from
-    (``core.dependencies._build_discogs_pool``, LML#706) so raising or lowering
-    the pool moves this cap with it — a hardcoded ``5`` would silently
-    under-parallelize a widened pool, or (worse) admit more coroutines than a
-    narrowed pool has connections. Still overridable at runtime via the shared
-    ``LML_BULK_MAX_CONCURRENT`` knob (see ``core.bulk_concurrency``).
+    Delegates to :func:`core.dependencies.discogs_pool_max_size` — the same
+    accessor the pool is built from (LML#706) — so raising or lowering the pool
+    moves this cap with it: a hardcoded ``5`` would silently under-parallelize a
+    widened pool, or (worse) admit more coroutines than a narrowed pool has
+    connections. Still overridable at runtime via the shared
+    ``LML_BULK_MAX_CONCURRENT`` knob (see ``core.bulk_concurrency``), which — when
+    set — supersedes this pool-derived default entirely.
     """
-    return resolve_positive_int_env(_DISCOGS_POOL_MAX_SIZE_ENV_VAR, _DISCOGS_POOL_MAX_SIZE_DEFAULT)
+    return discogs_pool_max_size()
 
 
 logger = logging.getLogger(__name__)

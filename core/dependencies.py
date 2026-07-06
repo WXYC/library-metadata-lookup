@@ -34,6 +34,20 @@ if TYPE_CHECKING:
 _DISCOGS_POOL_MAX_SIZE_ENV_VAR = "LML_DISCOGS_POOL_MAX_SIZE"
 _DISCOGS_POOL_MAX_SIZE_DEFAULT = 5
 
+
+def discogs_pool_max_size() -> int:
+    """Effective ``max_size`` for the discogs-cache pool (LML#706).
+
+    The single source of truth read from ``LML_DISCOGS_POOL_MAX_SIZE`` (default
+    5), shared by the pool builder (:func:`_build_discogs_pool`) and the
+    ``/api/v1/identity/bulk-resolve-libraries`` semaphore default
+    (``identity/router._bulk_resolve_default_concurrency``) so the semaphore can
+    never drift from the pool it is sized to mirror — a semaphore wider than the
+    pool would queue coroutines on ``pool.acquire()``.
+    """
+    return resolve_positive_int_env(_DISCOGS_POOL_MAX_SIZE_ENV_VAR, _DISCOGS_POOL_MAX_SIZE_DEFAULT)
+
+
 logger = logging.getLogger(__name__)
 
 # `_library_db` keeps its bespoke lazy lifecycle (sync construct + async
@@ -103,9 +117,7 @@ async def _build_discogs_pool() -> asyncpg.Pool | None:
         pool = await asyncpg.create_pool(
             settings.database_url_discogs,
             min_size=1,
-            max_size=resolve_positive_int_env(
-                _DISCOGS_POOL_MAX_SIZE_ENV_VAR, _DISCOGS_POOL_MAX_SIZE_DEFAULT
-            ),
+            max_size=discogs_pool_max_size(),
             timeout=10,
         )
         logger.info("Discogs cache pool connected")
