@@ -51,7 +51,7 @@ whose client is present in ``clients``, this:
   still wraps the probe inside the task.
 * **No Sentry tag** — the request scope has closed by the time a warm finishes,
   so a tag on the active scope would mis-attribute to the next request (the same
-  reason ``orchestrator._warm_bio_cache`` sets none). The warm logs its
+  reason ``lookup.enrichment._warm_bio_cache`` sets none). The warm logs its
   ``live_*`` outcome instead.
 
 Sentry on the hot path projects, per active service:
@@ -378,7 +378,7 @@ def _get_streaming_warm_semaphore() -> asyncio.Semaphore:
     """Lazily build the process-global warm semaphore on the running loop.
 
     Sized from ``LML_STREAMING_WARM_CONCURRENCY`` (read once, at first
-    construction). Mirrors ``orchestrator._warm_cache_semaphore``'s lazy build
+    construction). Mirrors ``lookup.enrichment._warm_cache_semaphore``'s lazy build
     but reads the env so the bound is a no-redeploy Railway lever.
     """
     global _streaming_warm_semaphore
@@ -442,7 +442,7 @@ async def _warm_streaming_url_cache(
     process-global warm semaphore. Every exception is logged and swallowed — a
     fire-and-forget task must never propagate to the event loop. No Sentry tag
     is set: the request scope has long since closed (mirrors
-    ``orchestrator._warm_bio_cache``).
+    ``lookup.enrichment._warm_bio_cache``).
     """
     semaphore = _get_streaming_warm_semaphore()
     try:
