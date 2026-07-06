@@ -69,8 +69,6 @@ async def enrich_one(
     top1_release: ReleaseMetadataResponse | None,
     top1_details: ArtistDetails | None,
     top1_profile_tokens: list[ResolvedToken] | None,
-    request_artist_stripped: str,
-    artist_identity_split_enabled: bool,
     release_side_artist_verified: bool,
     release_anchor_present: bool,
 ) -> tuple[LibraryItem, DiscogsSearchResult | None]:
@@ -82,10 +80,11 @@ async def enrich_one(
     acceptable, returns the LML#401 synthesized streaming-only result
     (``release_id=0`` BS#1185 sentinel) instead.
     """
-    # ``row_artist`` (not ``ctx.artist``) — the context field ``ctx.artist``
-    # carries the request artist used by the LML#504 gate; conflating the
-    # two here would silently break the gate for any future modification
-    # that reaches for the request-side value.
+    # ``row_artist`` (not ``ctx.artist``) — the context fields ``ctx.artist``
+    # / ``ctx.request_artist_stripped`` carry the request artist the LML#504
+    # gate scores against; conflating the row-side and request-side values
+    # here would silently break the gate for any future modification that
+    # reaches for the request-side value.
     row_artist = item.alternate_artist_name or item.artist or ""
     search_term = ctx.song or item.title or ""
 
@@ -302,8 +301,8 @@ async def enrich_one(
     # own probe artwork to verify), so hoisting to top-1-only would
     # silently suppress every non-top-1 probe artwork.
     library_row_artist_verified = _artist_pair_verified(
-        request_artist_stripped, item.artist
-    ) or _artist_pair_verified(request_artist_stripped, item.alternate_artist_name)
+        ctx.request_artist_stripped, item.artist
+    ) or _artist_pair_verified(ctx.request_artist_stripped, item.alternate_artist_name)
     # Composite: when the release has no usable artist anchor
     # (``top1_release`` is None OR ``release.artist`` is empty/whitespace),
     # fall through to library-row-only verification. Covers the
@@ -334,8 +333,8 @@ async def enrich_one(
     #   first hop would always fail with no candidate to score against.
     use_split_gate = (
         ctx.extended
-        and artist_identity_split_enabled
-        and bool(request_artist_stripped)
+        and ctx.artist_identity_split_enabled
+        and bool(ctx.request_artist_stripped)
         and library_row_anchor_present
     )
     is_artist_derived_eligible = is_top1 and (
@@ -348,7 +347,7 @@ async def enrich_one(
     # gate would land bio/wiki on a result where the legacy gate would
     # not (the synth-recovery this ticket exists for) or vice-versa
     # (gate-tightening regressions). Fires *regardless of*
-    # ``artist_identity_split_enabled`` so the rollback flag preserves
+    # ``ctx.artist_identity_split_enabled`` so the rollback flag preserves
     # the divergence signal needed to plan re-enablement. Gated on
     # ``extended`` + non-empty ``request_artist`` + library-row anchor
     # present — outside those preconditions the split gate can never
@@ -359,7 +358,7 @@ async def enrich_one(
     if (
         is_top1
         and ctx.extended
-        and bool(request_artist_stripped)
+        and bool(ctx.request_artist_stripped)
         and library_row_anchor_present
         and artist_identity_verified != library_row_acceptable
     ):

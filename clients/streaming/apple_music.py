@@ -334,7 +334,8 @@ class AppleMusicClient(BaseStreamingClient):
         two methods in lockstep by construction.
 
         Returns only the ``url`` slot of the match — the happy path
-        (``library_row_acceptable=True`` in ``enrich_artwork_results``)
+        (``library_row_acceptable=True`` in ``enrich_one``,
+        ``lookup/enrichment/item.py``)
         does not consume ``artwork_url`` or ``release_year`` (the
         Discogs-derived library row supplies those), so dropping them
         here keeps the existing call-site shape.

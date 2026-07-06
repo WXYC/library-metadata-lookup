@@ -8,11 +8,14 @@ stay constant across every item in the batch. The coordinator in
 it to ``lookup.enrichment.top1.fetch_top1_release_details`` and
 ``lookup.enrichment.item.enrich_one``.
 
-Per-request *derived* values (the top-1 release payload, the LML#504
+Post-top-1-fetch *derived* values (the top-1 release payload, the LML#504
 release-side verification flags, the pre-parsed profile tokens) are computed
 by the coordinator after the top-1 fetch and passed to ``enrich_one`` as
 explicit keyword parameters — they cannot live here because the frozen
-context is constructed before that fetch runs.
+context is constructed before that fetch runs. That is the boundary:
+anything derivable at construction time belongs on the context (e.g.
+``request_artist_stripped``, ``artist_identity_split_enabled``); only
+fetch-dependent values ride as kwargs.
 
 Two ``enrich_artwork_results`` parameters are deliberately absent because
 neither closure captured them; both are consumed only by coordinator-inline
@@ -77,6 +80,15 @@ class EnrichmentContext:
 
     artist: str | None
     """Request-side artist (not the library row's); anchor for the LML#504 gate."""
+
+    request_artist_stripped: str
+    """``artist`` with surrounding whitespace stripped (``""`` when absent) — the
+    exact form the LML#504 artist-identity gate scores against. Derived once by
+    the coordinator so the gate and the raw ``artist`` reads cannot drift."""
+
+    artist_identity_split_enabled: bool
+    """LML#504 split-gate rollout flag, env-read ONCE per request by the
+    coordinator — per-item re-reads would break the read-once invariant."""
 
     extended: bool
     """Extended-payload mode (tracklist, genres, writer credits, profile tokens)."""

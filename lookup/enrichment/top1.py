@@ -1,20 +1,23 @@
 """Top-1 release/artist/bio fetch (LML#730).
 
 The former ``fetch_top1_release_details`` closure from
-``enrich_artwork_results``, un-nested into a module function taking the
-frozen ``EnrichmentContext``. Top-1-only expensive enrichment: the
-coordinator calls this once per request; non-top-1 items reuse the same
-per-result streaming-URL build in ``lookup.enrichment.item``.
+``enrich_artwork_results``, un-nested into a module function. Its true
+dependency surface is deliberately narrow — one service handle and the
+top-1 artwork — rather than the full ``EnrichmentContext``: this stage
+must not reach the per-item handles (apple_music, library_db, …), and a
+caller shouldn't need a 15-field context to fetch one release. Top-1-only
+expensive enrichment: the coordinator calls this once per request;
+non-top-1 items reuse the same per-result streaming-URL build in
+``lookup.enrichment.item``.
 """
 
 from discogs.models import ArtistDetails, DiscogsSearchResult, ReleaseMetadataResponse
-from library.models import LibraryItem
-from lookup.enrichment.context import EnrichmentContext
+from discogs.service import DiscogsService
 
 
 async def fetch_top1_release_details(
-    ctx: EnrichmentContext,
-    items_with_artwork: list[tuple[LibraryItem, DiscogsSearchResult | None]],
+    discogs_service: DiscogsService,
+    top_artwork: DiscogsSearchResult | None,
 ) -> tuple[
     int | None,
     str | None,
@@ -28,7 +31,6 @@ async def fetch_top1_release_details(
     scalars so the extended-field population can pluck additional
     fields without re-fetching.
     """
-    top_artwork = items_with_artwork[0][1]
     # `release_id <= 0` short-circuits the LML#401 streaming-only
     # synthesis sentinel (see issue #518): the synthesized result
     # carries `release_id=0` as a BS#1185 cross-service contract,
@@ -37,7 +39,7 @@ async def fetch_top1_release_details(
     if top_artwork is None or top_artwork.release_id <= 0:
         return None, None, None, None, None
     try:
-        release = await ctx.discogs_service.get_release(top_artwork.release_id)
+        release = await discogs_service.get_release(top_artwork.release_id)
         if not release:
             return None, None, None, None, None
 
@@ -46,7 +48,7 @@ async def fetch_top1_release_details(
         if not isinstance(artist_id, int) or artist_id <= 0:
             return year, None, None, release, None
 
-        details = await ctx.discogs_service.get_artist_details(artist_id)
+        details = await discogs_service.get_artist_details(artist_id)
         if not details:
             return year, None, None, release, None
 

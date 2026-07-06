@@ -248,8 +248,9 @@ class TestEnrichArtworkResults:
     async def test_top1_gating_only_release_details_for_first_item(self):
         """Only ``results[0]`` should trigger the release+artist Discogs fetch.
 
-        Previously every result in ``items_with_artwork`` ran
-        ``fetch_release_details`` even though BS/iOS only consume the top
+        Previously every result in ``items_with_artwork`` ran the release
+        fetch (now ``fetch_top1_release_details`` in ``lookup/enrichment/
+        top1.py``) even though BS/iOS only consume the top
         result — paying N round-trips of Discogs cache (and on miss, API)
         latency for nothing. ``enrich_artwork_results`` now gates the expensive
         enrichment to ``items_with_artwork[0]`` while keeping the cheap
