@@ -13,10 +13,8 @@ from discogs.models import (
     ReleaseMetadataResponse,
     TrackItem,
 )
-from lookup.enrichment import (
-    _build_streaming_search_url,
-    enrich_artwork_results,
-)
+from lookup.enrichment import enrich_artwork_results
+from lookup.enrichment.item import _build_streaming_search_url
 from tests.factories import make_discogs_result, make_library_item
 
 
@@ -854,7 +852,7 @@ class TestEnrichArtworkResultsExtended:
         or the GC can drop the warm mid-execution. Verify the task lands
         in the module-level set and is removed via the done_callback.
         """
-        from lookup.enrichment import _background_tasks
+        from lookup.enrichment.background import _background_tasks
 
         item = make_library_item()
         artwork = make_discogs_result()
@@ -1113,7 +1111,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=self._track_items()),
         ) as resolver:
             results = await enrich_artwork_results(
@@ -1136,7 +1134,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(),
         ) as resolver:
             await enrich_artwork_results(
@@ -1154,7 +1152,7 @@ class TestMbTracklistRescue:
         item = make_library_item(artist="Stereolab", title="Emperor Tomato Ketchup")
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(),
         ) as resolver:
             await enrich_artwork_results(
@@ -1184,7 +1182,7 @@ class TestMbTracklistRescue:
         )
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(),
         ) as resolver:
             await enrich_artwork_results(
@@ -1203,7 +1201,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(),
         ) as resolver:
             await enrich_artwork_results(
@@ -1224,7 +1222,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=None),
         ) as resolver:
             results = await enrich_artwork_results(
@@ -1253,7 +1251,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=self._track_items()),
         ) as resolver:
             results = await enrich_artwork_results(
@@ -1281,7 +1279,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=self._track_items()),
         ) as resolver:
             results = await enrich_artwork_results(
@@ -1310,7 +1308,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=self._track_items()),
         ) as resolver:
             results = await enrich_artwork_results(
@@ -1347,7 +1345,7 @@ class TestMbTracklistRescue:
         ]
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=tracklist_with_live_marker),
         ) as resolver:
             results = await enrich_artwork_results(
@@ -1374,7 +1372,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=self._track_items()),
         ) as resolver:
             results = await enrich_artwork_results(
@@ -1411,7 +1409,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=self._track_items()),  # Original's tracklist
         ):
             results = await enrich_artwork_results(
@@ -1449,7 +1447,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=self._track_items()),
         ):
             results = await enrich_artwork_results(
@@ -1488,7 +1486,7 @@ class TestMbTracklistRescue:
         mb_pg = AsyncMock()
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=self._track_items()),
         ):
             results = await enrich_artwork_results(
@@ -1527,7 +1525,7 @@ class TestMbTracklistRescue:
         ]
 
         with patch(
-            "lookup.enrichment.resolve_tracklist_via_musicbrainz",
+            "lookup.enrichment.item.resolve_tracklist_via_musicbrainz",
             new=AsyncMock(return_value=all_empty_titles),
         ):
             results = await enrich_artwork_results(
@@ -1719,7 +1717,7 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
 
         # Patch the call-site timeout to a tiny value so the test runs in
         # milliseconds and the asyncio.wait_for ceiling fires deterministically.
-        with patch("lookup.enrichment.apple_music_lookup_timeout_s", return_value=0.05):
+        with patch("lookup.enrichment.item.apple_music_lookup_timeout_s", return_value=0.05):
             results = await enrich_artwork_results(
                 items_with_artwork,
                 AsyncMock(),
@@ -1774,9 +1772,9 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         scope.transaction = transaction
 
         with (
-            patch("lookup.enrichment.apple_music_lookup_timeout_s", return_value=0.05),
+            patch("lookup.enrichment.item.apple_music_lookup_timeout_s", return_value=0.05),
             patch(
-                "lookup.enrichment.sentry_sdk.get_current_scope",
+                "lookup.enrichment.item.sentry_sdk.get_current_scope",
                 return_value=scope,
             ),
         ):
@@ -1827,9 +1825,9 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         scope.transaction = None
 
         with (
-            patch("lookup.enrichment.apple_music_lookup_timeout_s", return_value=0.05),
+            patch("lookup.enrichment.item.apple_music_lookup_timeout_s", return_value=0.05),
             patch(
-                "lookup.enrichment.sentry_sdk.get_current_scope",
+                "lookup.enrichment.item.sentry_sdk.get_current_scope",
                 return_value=scope,
             ),
         ):
@@ -3974,7 +3972,7 @@ class TestBandcampStreamingUrlPostprocessWiring:
         spotify = AsyncMock()
 
         with patch(
-            "lookup.enrichment.apply_streaming_url_postprocess",
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
             new=AsyncMock(),
         ) as postprocess:
             await enrich_artwork_results(
@@ -4009,7 +4007,7 @@ class TestBandcampStreamingUrlPostprocessWiring:
             update["bandcamp_url"] = album_url
 
         with patch(
-            "lookup.enrichment.apply_streaming_url_postprocess",
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
             new=AsyncMock(side_effect=_resolve),
         ):
             results = await enrich_artwork_results(
@@ -4051,7 +4049,7 @@ class TestBandcampStreamingUrlPostprocessWiring:
             captured["bandcamp_url_at_call"] = update["bandcamp_url"]
 
         with patch(
-            "lookup.enrichment.apply_streaming_url_postprocess",
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
             new=AsyncMock(side_effect=_capture),
         ):
             await enrich_artwork_results(
@@ -4105,7 +4103,7 @@ class TestBandcampStreamingUrlPostprocessWiring:
         item = make_library_item(artist="Juana Molina", title="DOGA")
 
         with patch(
-            "lookup.enrichment.apply_streaming_url_postprocess",
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
             new=AsyncMock(),
         ):
             results = await enrich_artwork_results(
