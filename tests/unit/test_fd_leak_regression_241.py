@@ -38,26 +38,27 @@ class TestOrchestratorOwnsNoHttpxClients:
     """Hypothesis #1: the artwork-enrichment hot path must not own transient
     ``httpx.AsyncClient`` instances.
 
-    Strongest form of the invariant: ``lookup.orchestrator`` does not import
-    ``httpx`` at all (LML#444 removed the last reference when ``_fetch_apple_music_url``
-    was deleted). Any future regression that re-introduces ``import httpx``
-    into the module — typically the first step toward a per-call client
-    construction — fails this test before it can ship the FD-leak shape from
-    issue #241.
+    Strongest form of the invariant: ``lookup.enrichment`` (the enrichment
+    hot path's home since the orchestrator decomposition, LML#729) does not
+    import ``httpx`` at all (LML#444 removed the last reference when
+    ``_fetch_apple_music_url`` was deleted). Any future regression that
+    re-introduces ``import httpx`` into the module — typically the first
+    step toward a per-call client construction — fails this test before it
+    can ship the FD-leak shape from issue #241.
     """
 
-    def test_orchestrator_does_not_import_httpx(self):
-        """The orchestrator's request hot path must source HTTP clients via
+    def test_enrichment_does_not_import_httpx(self):
+        """The enrichment hot path must source HTTP clients via
         DI (e.g. ``AppleMusicClient``) rather than construct them. The
         BaseStreamingClient singleton pattern guarantees one process-lifetime
         ``httpx.AsyncClient`` per service with explicit shutdown.
         """
-        import lookup.orchestrator as orchestrator_module
+        import lookup.enrichment as enrichment_module
 
-        assert not hasattr(orchestrator_module, "httpx"), (
-            "lookup.orchestrator must not import httpx. Every outbound HTTP "
+        assert not hasattr(enrichment_module, "httpx"), (
+            "lookup.enrichment must not import httpx. Every outbound HTTP "
             "client in this service is a process-lifetime singleton with "
-            "explicit close() on shutdown — the orchestrator sources from "
+            "explicit close() on shutdown — the enrichment path sources from "
             "DI rather than constructing. Re-introducing httpx here is the "
             "first step toward the per-call construction pattern that "
             "leaked FDs in issue #241."
