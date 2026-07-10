@@ -1016,6 +1016,57 @@ class TestBulkLookupClientAbort:
         )
 
     @pytest.mark.asyncio
+    async def test_client_disconnect_releases_global_permits(self, app_client, monkeypatch):
+        """Every LML#716 global permit is back after a mid-batch abort.
+
+        The global permit is held INSIDE the per-item `async with`, so
+        cancellation unwinding the item must release it — otherwise one
+        aborted drain permanently shrinks the process-wide budget for every
+        bulk-family endpoint. Pinned by re-acquiring the full budget after
+        the 499: if any permit leaked, the acquire times out.
+        """
+        monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "10")
+        monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "3")
+
+        async def slow_lookup(request, **kwargs):
+            await asyncio.sleep(5)
+            return _match_response(request.artist or "?", request.album or "?")
+
+        with (
+            patch(
+                "lookup.router.perform_lookup",
+                new_callable=AsyncMock,
+                side_effect=slow_lookup,
+            ),
+            patch("lookup.router.watch_disconnect", self._disconnect_after()),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await asyncio.wait_for(
+                    ac.post(
+                        "/api/v1/lookup/bulk",
+                        json={"items": [{"artist": f"a{i}", "album": "x"} for i in range(6)]},
+                    ),
+                    timeout=3.0,
+                )
+
+        assert resp.status_code == 499
+
+        from core.bulk_concurrency import acquire_bulk_global_permit
+
+        async def _acquire_full_budget():
+            async with (
+                acquire_bulk_global_permit(),
+                acquire_bulk_global_permit(),
+                acquire_bulk_global_permit(),
+            ):
+                pass
+
+        # All 3 permits must be immediately re-acquirable; a leak deadlocks.
+        await asyncio.wait_for(_acquire_full_budget(), timeout=1.0)
+
+    @pytest.mark.asyncio
     async def test_client_disconnect_sets_sentry_tag(self, app_client):
         """`lml.client_aborted=true` lands on the active Sentry scope on abort.
 

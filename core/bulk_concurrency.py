@@ -30,8 +30,11 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
+import weakref
 from typing import Any
 
+import sentry_sdk
 from fastapi import Request
 
 logger = logging.getLogger(__name__)
@@ -114,10 +117,58 @@ def _get_bulk_global_semaphore() -> asyncio.Semaphore:
     return _bulk_global_semaphore
 
 
+_global_wait_max_by_transaction: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+"""Per-transaction running max of capped-acquire waits.
+
+Keyed weakly by the Sentry transaction object so entries vanish with the
+transaction — a bulk request's items each acquire the permit independently,
+and the measurement should carry the WORST wait the request saw, not
+whichever item happened to write last.
+"""
+
+
+def _project_global_capped(wait_ms: float) -> None:
+    """Project a capped global-permit acquire onto Sentry (LML#716).
+
+    Same two-channel shape as ``lookup.router._project_inflight_capped``
+    (the LML#683 lesson — ``set_data`` alone is unqueryable):
+
+    * ``lml.bulk.global_capped: true`` tag — the filterable engagement flag,
+      set only when the acquire found the budget saturated.
+    * ``lml.bulk.global_wait_ms`` measurement — the quantitative series for
+      tuning ``LML_BULK_GLOBAL_MAX_CONCURRENT``; running max across the
+      transaction's items.
+
+    Observability must not break the request path; failures log and continue.
+    """
+    try:
+        sentry_sdk.set_tag("lml.bulk.global_capped", "true")
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is not None and wait_ms > _global_wait_max_by_transaction.get(
+            transaction, 0.0
+        ):
+            _global_wait_max_by_transaction[transaction] = wait_ms
+            transaction.set_measurement("lml.bulk.global_wait_ms", wait_ms)
+            transaction.set_data("lml.bulk.global_wait_ms", wait_ms)
+    except Exception as e:
+        logger.warning("Failed to project global_capped onto Sentry transaction: %s", e)
+
+
 @contextlib.asynccontextmanager
 async def acquire_bulk_global_permit():
-    """Hold one process-global bulk-item permit for the duration of the block."""
-    async with _get_bulk_global_semaphore():
+    """Hold one process-global bulk-item permit for the duration of the block.
+
+    On Python >=3.12 the ``locked()`` pre-check is exact (True when the value
+    is exhausted OR waiters exist), so "arrived to a saturated budget" is
+    detected without a race — same mechanism as the #714 single-``/lookup``
+    cap.
+    """
+    semaphore = _get_bulk_global_semaphore()
+    capped_on_arrival = semaphore.locked()
+    wait_start = time.perf_counter()
+    async with semaphore:
+        if capped_on_arrival:
+            _project_global_capped((time.perf_counter() - wait_start) * 1000.0)
         yield
 
 
