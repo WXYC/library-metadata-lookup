@@ -88,4 +88,6 @@ class TestCacheRefreshGlobalBound:
         assert resp_b.status_code == 200
         assert [r["status"] for r in resp_a.json()["results"]] == ["warmed"] * 4
         assert [r["status"] for r in resp_b.json()["results"]] == ["warmed"] * 4
-        assert peak <= 2, f"Peak cross-request concurrency was {peak}; global permit did not bound it"
+        assert peak <= 2, (
+            f"Peak cross-request concurrency was {peak}; global permit did not bound it"
+        )

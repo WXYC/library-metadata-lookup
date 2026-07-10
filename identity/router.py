@@ -77,6 +77,12 @@ def _bulk_resolve_default_concurrency() -> int:
     connections. Still overridable at runtime via the shared
     ``LML_BULK_MAX_CONCURRENT`` knob (see ``core.bulk_concurrency``), which — when
     set — supersedes this pool-derived default entirely.
+
+    This per-request gate deliberately coexists with the LML#716 global
+    permit (``acquire_bulk_global_permit``): this one is the within-request
+    fairness bound (one request self-limits to the pool width), the global
+    permit is the cross-request budget — without it, N concurrent requests
+    would multiply this cap N-fold against the shared pool.
     """
     return discogs_pool_max_size()
 

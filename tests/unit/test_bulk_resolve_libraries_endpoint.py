@@ -67,7 +67,9 @@ def _identity(
 
 class TestBulkResolveGlobalBound:
     @pytest.mark.asyncio
-    async def test_concurrent_requests_share_the_global_bound(self, app_client, mock_entity_store, monkeypatch):
+    async def test_concurrent_requests_share_the_global_bound(
+        self, app_client, mock_entity_store, monkeypatch
+    ):
         """Two concurrent bulk-resolve requests never exceed LML_BULK_GLOBAL_MAX_CONCURRENT (LML#716).
 
         The per-request semaphore multiplies across concurrent requests; the
@@ -113,7 +115,9 @@ class TestBulkResolveGlobalBound:
         # Queue-don't-shed: every input in both requests still resolves.
         assert len(resp_a.json()["results"]) == 4
         assert len(resp_b.json()["results"]) == 4
-        assert peak <= 2, f"Peak cross-request concurrency was {peak}; global permit did not bound it"
+        assert peak <= 2, (
+            f"Peak cross-request concurrency was {peak}; global permit did not bound it"
+        )
 
 
 class TestBulkResolveLibrariesEndpoint:

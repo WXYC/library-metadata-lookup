@@ -99,9 +99,9 @@ class TestBulkGlobalPermitSizing:
             release.set()
             await asyncio.gather(*holders)
 
-        assert any(
-            "LML_BULK_GLOBAL_MAX_CONCURRENT" in rec.message for rec in caplog.records
-        ), "expected a fallback warning naming the misconfigured env var"
+        assert any("LML_BULK_GLOBAL_MAX_CONCURRENT" in rec.message for rec in caplog.records), (
+            "expected a fallback warning naming the misconfigured env var"
+        )
 
 
 class TestGlobalPermitTelemetry:
@@ -148,9 +148,7 @@ class TestGlobalPermitTelemetry:
             first = asyncio.create_task(_first_holder())
             await asyncio.sleep(0)
             # First holder took the permit uncontended: no tag.
-            assert not any(
-                c.args[0] == "lml.bulk.global_capped" for c in set_tag.call_args_list
-            )
+            assert not any(c.args[0] == "lml.bulk.global_capped" for c in set_tag.call_args_list)
 
             second = asyncio.create_task(_second_holder(release))
             # Park the second holder deterministically before releasing.

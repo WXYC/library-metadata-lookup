@@ -5,10 +5,19 @@ Hoisted out of ``lookup/router.py`` so both ``/api/v1/lookup/bulk`` and the
 same shape — bounded outer semaphore, client-disconnect sentinel race, and
 ``CancelledError``-safe future drain.
 
-The three pieces:
+The pieces:
 
 - ``max_concurrency_from_env(default)`` — resolves ``LML_BULK_MAX_CONCURRENT``,
   floored at 1 so a misconfigured ``0`` can't hang the gather.
+- ``acquire_bulk_global_permit()`` — the LML#716 cross-request budget. The
+  per-request semaphore above multiplies across concurrent requests (N
+  batches admit N × ``LML_BULK_MAX_CONCURRENT`` items against the one event
+  loop + discogs-cache pool); this process-global semaphore
+  (``LML_BULK_GLOBAL_MAX_CONCURRENT``, default = ``discogs_pool_max_size()``)
+  is consulted inside every bulk-family per-item runner so the total is
+  bounded process-wide. Always per-request OUTER, global INNER.
+  ``/streaming-check`` is deliberately NOT under this budget — it borrows no
+  pool connection; its loop-time residual is LML#753.
 - ``watch_disconnect(request)`` — sentinel coroutine that returns when uvicorn
   delivers an ``http.disconnect`` ASGI message. Used in an ``asyncio.wait``
   race against the actual work so a client abort releases any per-replica
@@ -18,10 +27,14 @@ The three pieces:
   calling ``.cancel()`` doesn't free the permits until the task observes the
   cancel and unwinds.
 
-The env knob (default 10) is shared between both endpoints intentionally —
-they have the same outer/inner gate shape and similar per-item work profile.
-If observed behavior diverges, splitting into per-endpoint knobs (with the
-shared one as fallback) is mechanical.
+The per-request env knob (default 10) is shared between the endpoints
+intentionally — they have the same outer/inner gate shape and similar
+per-item work profile. If observed behavior diverges, splitting into
+per-endpoint knobs (with the shared one as fallback) is mechanical.
+
+If ``UVICORN_WORKERS > 1`` ever ships (LML#747), the "process-global" budget
+silently becomes a per-worker bound — same caveat the #714 single-``/lookup``
+cap carries; re-derive the sizing math before relying on it.
 """
 
 from __future__ import annotations
@@ -187,6 +200,7 @@ async def cancel_and_drain(future: asyncio.Future[Any]) -> None:
 
 
 __all__ = [
+    "acquire_bulk_global_permit",
     "cancel_and_drain",
     "max_concurrency_from_env",
     "watch_disconnect",
