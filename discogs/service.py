@@ -460,12 +460,17 @@ class DiscogsService:
         # than once per request — a span-count schema change documented in the
         # #569 PR (no current dashboard/alert aggregates on that count).
         for attempt in range(max_retries + 1):
-            # LML#755 in-flight shed (FIX 3): re-check the breaker at the top of
-            # each attempt. A request already past the entry gate must not ride
-            # its full ~62s backoff after the breaker opens mid-flight — the
-            # whole point of the shed is bounded wall time. The first attempt
+            # LML#755 in-flight shed (FIX 3 / R2-1): re-check the breaker at the
+            # top of each attempt via the READ-ONLY ``should_shed_inflight`` —
+            # NOT the state-mutating ``allow_request``. A request already past
+            # the entry gate must not ride its full ~62s backoff after the
+            # breaker opens mid-flight, but it must also not promote itself to
+            # the half-open trial (it holds its stale entry ``epoch``, so its
+            # terminal ``record_*`` would epoch-mismatch and latch the breaker
+            # HALF_OPEN forever — R2-1). The predicate lets the genuine trial
+            # (matching epoch) finish and sheds everyone else. The first attempt
             # (attempt 0) was just admitted above, so only re-check on retries.
-            if attempt > 0 and breaker.allow_request() is None:
+            if attempt > 0 and breaker.should_shed_inflight(epoch):
                 self._record_breaker_shed(method, path)
                 raise DiscogsBreakerOpenError(
                     f"Discogs saturation breaker opened mid-flight: {method} {path}"

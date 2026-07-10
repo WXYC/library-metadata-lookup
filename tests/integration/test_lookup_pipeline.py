@@ -1005,3 +1005,95 @@ class TestPromoteAlbumFromCachedTrackData:
         assert len(response.results) >= 1
         for r in response.results:
             assert "Perry" in (r.library_item.artist or "")
+
+
+class TestBreakerShedDegradesTo200:
+    """R2-2 (integration): with the Discogs saturation breaker forced OPEN, a
+    ``/lookup`` that fans out to Discogs must return HTTP 200 cache-only —
+    library rows retained, live-probe tail shed — NOT a 500. Covers the
+    song-only/SWAPPED path, the TRACK_ON_COMPILATION path, and bulk.
+
+    A REAL ``DiscogsService`` is used (token only, no cache), so the pipeline's
+    live probes hit ``_request_with_retry``, which sheds (raises) before any
+    network call because the breaker is OPEN. The runner + ``perform_lookup``
+    backstops must catch it.
+    """
+
+    @pytest.fixture
+    def open_breaker_client(self, library_db, test_settings):
+        from httpx import ASGITransport, AsyncClient
+
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from discogs.ratelimit import get_discogs_breaker, reset_rate_limiting
+        from discogs.service import DiscogsService
+        from main import app
+
+        service = DiscogsService(token="test-token")
+        service.cache_service = None
+
+        app.dependency_overrides[get_library_db] = lambda: library_db
+        app.dependency_overrides[get_discogs_service] = lambda: service
+        app.dependency_overrides[get_posthog_client] = lambda: None
+        app.dependency_overrides[get_settings] = lambda: test_settings
+
+        async def _make():
+            # Trip the per-loop breaker OPEN so every live probe sheds.
+            get_discogs_breaker().force_open()
+            return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+        yield _make
+
+        reset_rate_limiting()
+        app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_song_and_artist_lookup_degrades_to_200(self, open_breaker_client):
+        client = await open_breaker_client()
+        async with client:
+            resp = await client.post(
+                "/api/v1/lookup",
+                json={
+                    "artist": "Stereolab",
+                    "song": "Fuses",
+                    "raw_message": "Stereolab - Fuses",
+                },
+            )
+        # The library walk finds Stereolab rows; the Discogs validation tail is
+        # shed. Must be a 200 cache-only degrade, never a 500.
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_track_on_compilation_shape_degrades_to_200(self, open_breaker_client):
+        client = await open_breaker_client()
+        async with client:
+            resp = await client.post(
+                "/api/v1/lookup",
+                json={
+                    "artist": "A Guy Called Gerald",
+                    "song": "Message to Black Youth",
+                    "raw_message": "A Guy Called Gerald - Message to Black Youth",
+                },
+            )
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_bulk_lookup_degrades_to_200(self, open_breaker_client):
+        client = await open_breaker_client()
+        async with client:
+            resp = await client.post(
+                "/api/v1/lookup/bulk",
+                json={
+                    "items": [
+                        {
+                            "artist": "Stereolab",
+                            "song": "Fuses",
+                            "raw_message": "Stereolab - Fuses",
+                        },
+                    ]
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        # The item did not error out — it degraded to a (cache-only) lookup.
+        assert data["results"][0]["status"] != "error"

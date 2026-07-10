@@ -1272,6 +1272,85 @@ class TestPerStrategyWaitFor:
         assert SearchStrategyType.ARTIST_PLUS_ALBUM in state.strategies_tried
 
 
+class TestBreakerShedInRunner:
+    """R2-2: a ``DiscogsBreakerOpenError`` raised from a strategy is caught in
+    the runner's per-strategy try (the ONE catch boundary) and converted to the
+    same cache-only/empty outcome a strategy miss produces — never propagated to
+    a 500.
+    """
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_from_strategy_degrades_to_empty(self, monkeypatch):
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "60000")
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
+
+        async def shed_attempt(parsed, state, raw_message):  # noqa: ARG001
+            raise DiscogsBreakerOpenError("Discogs saturation breaker open")
+
+        strategies = [
+            _StubStrategy(
+                name=SearchStrategyType.TRACK_ON_COMPILATION,
+                condition=lambda *_a: True,
+                attempt_func=shed_attempt,
+            )
+        ]
+        parsed = ParsedRequest(
+            artist="A Guy Called Gerald",
+            song="Message to Black Youth",
+            raw_message="A Guy Called Gerald - Message to Black Youth",
+        )
+
+        # Must NOT raise — the shed degrades to an empty (cache-only) outcome.
+        state = await execute_search_pipeline(
+            parsed,
+            "A Guy Called Gerald - Message to Black Youth",
+            strategies,
+            song_not_found=True,
+        )
+
+        assert state.results == []
+        assert SearchStrategyType.TRACK_ON_COMPILATION in state.strategies_tried
+
+    @pytest.mark.asyncio
+    async def test_shed_in_one_strategy_does_not_abort_the_cascade(self, monkeypatch):
+        """A shed in an early strategy is contained: later strategies still run
+        (the shed is treated as a miss, not a fatal cascade abort)."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "60000")
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
+
+        recovered = _item(id=7, artist="Stereolab", title="Aluminum Tunes", genre="Rock")
+
+        async def shed_attempt(parsed, state, raw_message):  # noqa: ARG001
+            raise DiscogsBreakerOpenError("shed")
+
+        async def healthy_attempt(parsed, state, raw_message):  # noqa: ARG001
+            return Outcome.found([recovered])
+
+        strategies = [
+            _StubStrategy(
+                name=SearchStrategyType.TRACK_ON_COMPILATION,
+                condition=lambda *_a: True,
+                attempt_func=shed_attempt,
+            ),
+            _StubStrategy(
+                name=SearchStrategyType.SONG_AS_ARTIST,
+                condition=lambda *_a: True,
+                attempt_func=healthy_attempt,
+            ),
+        ]
+        parsed = ParsedRequest(artist="Stereolab", song="Fuses", raw_message="x")
+
+        state = await execute_search_pipeline(parsed, "x", strategies, song_not_found=True)
+
+        # The later strategy still ran and surfaced its match despite the shed.
+        assert [i.id for i in state.results] == [7]
+        assert SearchStrategyType.SONG_AS_ARTIST in state.strategies_tried
+
+
 class TestHardCapSoftBudgetIndependence:
     """The hard cap (LML#370) and soft budget (LML#340) are layered knobs.
 

@@ -183,6 +183,31 @@ class DiscogsCircuitBreaker:
         # HALF_OPEN: a trial is in flight; shed everyone else.
         return None
 
+    def should_shed_inflight(self, epoch: int | None) -> bool:
+        """READ-ONLY, epoch-aware in-flight shed predicate (R2-1).
+
+        Used to re-check a request that is already past the entry gate (mid
+        retry loop) so it sheds promptly when the breaker opens mid-flight,
+        instead of riding its full ~62s backoff. Unlike :meth:`allow_request`
+        this **must not mutate state** — it never bumps the epoch and never
+        promotes a half-open trial. Using the mutating ``allow_request`` here
+        would promote a *retrying* request (which still holds its stale entry
+        epoch) to the trial; its terminal ``record_*`` would then epoch-mismatch,
+        never CLOSE, and the breaker would latch HALF_OPEN forever.
+
+        Returns ``True`` (shed) unless the caller may proceed:
+        - CLOSED → never shed.
+        - HALF_OPEN and ``epoch`` matches the current trial → the caller IS the
+          trial; let it finish its own retries.
+        - OPEN, or HALF_OPEN with a non-matching epoch → shed (a non-trial
+          request must not consume the single trial slot).
+        """
+        if self._state is BreakerState.CLOSED:
+            return False
+        if self._state is BreakerState.HALF_OPEN and epoch == self._epoch:
+            return False
+        return True
+
     def record_success(self, remaining: int | None = None, *, epoch: int | None = None) -> None:
         """Record a genuine 2xx Discogs response.
 

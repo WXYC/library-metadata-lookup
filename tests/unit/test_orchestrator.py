@@ -163,6 +163,38 @@ class TestPerformLookupBasic:
         assert response.song_not_found is False
 
     @pytest.mark.asyncio
+    async def test_breaker_shed_in_tail_degrades_to_cache_only_not_500(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """R2-2 backstop: a ``DiscogsBreakerOpenError`` raised from a post-search
+        step (here artwork fetch) must be caught in ``perform_lookup`` and
+        degraded to a cache-only/partial response — the library results already
+        found are returned, artwork/enrichment pending — NOT propagated to a 500.
+        Defense in depth beyond the runner catch."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        mock_library_db.search.return_value = [queen_item]
+
+        request = LookupRequest(
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="Play A Night at the Opera by Queen",
+        )
+
+        async def _shed(*_a, **_k):
+            raise DiscogsBreakerOpenError("shed mid-enrichment")
+
+        with patch("lookup.orchestrator._step_fetch_artwork", side_effect=_shed):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        # 200-shaped degrade: the library match survives, no exception.
+        assert isinstance(response, LookupResponse)
+        assert len(response.results) == 1
+        assert response.results[0].library_item.artist == "Queen"
+
+    @pytest.mark.asyncio
     async def test_no_results_returns_empty(self, mock_library_db, mock_discogs_service, telemetry):
         """When nothing matches, return empty results."""
         mock_library_db.search.return_value = []

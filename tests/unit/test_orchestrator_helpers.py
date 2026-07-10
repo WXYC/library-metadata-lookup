@@ -1074,6 +1074,61 @@ class TestFilterResultsByTrackValidation:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_breaker_shed_keeps_the_row_not_dropped_to_none(self, mock_discogs_service):
+        """R2-4: when validation sheds (``DiscogsBreakerOpenError``) — the breaker
+        is OPEN — a real library row must be KEPT (returned unvalidated), NOT
+        dropped to ``None``. Dropping it laundered a shed into song-not-found: a
+        wrong 200. The user should still get their library match, validation
+        pending, during a flood."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        items = [
+            make_library_item(id=1, artist="Stereolab", title="Aluminum Tunes"),
+            make_library_item(id=2, artist="Stereolab", title="Dots and Loops"),
+        ]
+
+        # Discogs search returns the matching album per library title, so both
+        # rows pass the album-title gate and reach the validation probe.
+        async def _search(req):
+            title = req.album or ""
+            return DiscogsSearchResponse(
+                results=[
+                    make_discogs_result(
+                        release_id=hash(title) % 9999, album=title, artist="Stereolab"
+                    )
+                ]
+            )
+
+        mock_discogs_service.search.side_effect = _search
+        # The validation probe sheds for every candidate.
+        mock_discogs_service.validate_track_on_release.side_effect = DiscogsBreakerOpenError("shed")
+
+        validated = await filter_results_by_track_validation(
+            items, "Fuses", "Stereolab", mock_discogs_service
+        )
+
+        # The rows are retained (not None), so the orchestrator won't mark
+        # song_not_found. Both rows that reached the shed are kept.
+        assert validated is not None
+        assert {i.id for i in validated} == {1, 2}
+
+    @pytest.mark.asyncio
+    async def test_shed_on_search_probe_also_keeps_the_row(self, mock_discogs_service):
+        """R2-4: the shed can also come from the ``search`` probe (before
+        validation). That, too, must KEEP the row rather than drop it."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        items = [make_library_item(id=3, artist="Stereolab", title="Emperor Tomato Ketchup")]
+        mock_discogs_service.search.side_effect = DiscogsBreakerOpenError("shed")
+
+        validated = await filter_results_by_track_validation(
+            items, "Cybele's Reverie", "Stereolab", mock_discogs_service
+        )
+
+        assert validated is not None
+        assert {i.id for i in validated} == {3}
+
+    @pytest.mark.asyncio
     async def test_rejects_when_discogs_returns_different_album(self, mock_discogs_service):
         """Discogs search for library album '808 State' returns 'The Best Of 808 State:
         Blueprint' — a different album that contains the track. The validation should

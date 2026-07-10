@@ -238,3 +238,53 @@ class TestHalfOpenTransitions:
         # The stale CLOSED-era response lands now — it must NOT close the trial.
         breaker.record_success(remaining=50, epoch=stale_epoch)
         assert breaker.state is BreakerState.HALF_OPEN
+
+
+class TestShouldShedInflight:
+    """R2-1: the READ-ONLY, epoch-aware in-flight predicate.
+
+    ``allow_request()`` is state-mutating (it consumes the cool-down and
+    promotes a trial). Using it for the mid-flight re-check would promote a
+    *retrying* request — which still holds its stale entry epoch — to the trial,
+    so its terminal ``record_*`` epoch-mismatches, never CLOSES, and the breaker
+    latches HALF_OPEN forever. ``should_shed_inflight`` must NOT mutate state.
+    """
+
+    def test_closed_never_sheds(self, clock):
+        breaker = _breaker(clock)
+        epoch = breaker.allow_request()
+        assert breaker.should_shed_inflight(epoch) is False
+
+    def test_open_sheds_and_does_not_mutate(self, clock):
+        breaker = _breaker(clock, cooldown_seconds=30.0)
+        for _ in range(3):
+            breaker.record_failure()
+        assert breaker.state is BreakerState.OPEN
+        # Even after the cool-down elapses, the read-only predicate must NOT
+        # promote a half-open trial — it only reports "shed".
+        clock.advance(31.0)
+        assert breaker.should_shed_inflight(0) is True
+        assert breaker.state is BreakerState.OPEN  # unchanged — no promotion
+
+    def test_half_open_current_trial_is_not_shed(self, clock):
+        breaker = _breaker(clock, cooldown_seconds=30.0)
+        for _ in range(3):
+            breaker.record_failure()
+        clock.advance(31.0)
+        trial_epoch = breaker.allow_request()  # promotes to HALF_OPEN
+        assert breaker.state is BreakerState.HALF_OPEN
+        # The caller that IS the trial must be allowed to finish its retries.
+        assert breaker.should_shed_inflight(trial_epoch) is False
+        assert breaker.state is BreakerState.HALF_OPEN
+
+    def test_half_open_non_trial_request_is_shed(self, clock):
+        breaker = _breaker(clock, cooldown_seconds=30.0)
+        for _ in range(3):
+            breaker.record_failure()
+        clock.advance(31.0)
+        trial_epoch = breaker.allow_request()
+        assert breaker.state is BreakerState.HALF_OPEN
+        # A DIFFERENT in-flight request (stale epoch) is shed — it must not
+        # consume the single trial slot.
+        assert breaker.should_shed_inflight(trial_epoch - 1) is True
+        assert breaker.state is BreakerState.HALF_OPEN
