@@ -23,6 +23,7 @@ from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
 from config.settings import get_settings
 from core.bulk_concurrency import (
+    acquire_bulk_global_permit,
     cancel_and_drain,
     max_concurrency_from_env,
     watch_disconnect,
@@ -537,7 +538,13 @@ async def handle_bulk_lookup(
     )
 
     async def _run_one(index: int, item: LookupRequest) -> BulkLookupResultItem:
-        async with semaphore:
+        # Batch semaphore OUTER, global permit INNER — the one consistent
+        # order every bulk-family dispatcher uses (LML#716). The per-batch
+        # semaphore bounds items inside THIS request; the global permit is
+        # the cross-request budget shared with identity bulk-resolve and
+        # cache refresh, so N concurrent batches can't multiply into N x
+        # LML_BULK_MAX_CONCURRENT in-flight items against the shared pool.
+        async with semaphore, acquire_bulk_global_permit():
             # Hard-pin warm_cache off (LML#742), completing the set with
             # `bandcamp=None` / `allow_release_resolution_fallback=False` below:
             # a truthy per-item flag would schedule the `_warm_bio_cache`
