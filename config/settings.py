@@ -130,6 +130,39 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Discogs Saturation Circuit-Breaker (LML#755)
+    # When the outbound Discogs path saturates under a sustained flood (the
+    # 2026-07-10 flowsheet-metadata-backfill incident), the retry/backoff loop
+    # converts excess load into unbounded per-request latency → BS 35s timeouts
+    # → 502s. This breaker sheds the live-probe tail instead, fast-failing
+    # lookups to cache-only. Per-event-loop (process-global on the single-worker
+    # deployment today; re-size if UVICORN_WORKERS > 1 ever ships — LML#747).
+    discogs_breaker_failure_threshold: int = Field(
+        default=8,
+        description=(
+            "Consecutive Discogs 429s that trip the saturation breaker OPEN. Sized above the "
+            "brief 429 flurry a single warm-cache lookup can absorb via retry (a healthy "
+            "response resets the run), so only a *sustained* rate-limited window opens it."
+        ),
+    )
+    discogs_breaker_remaining_floor: int = Field(
+        default=3,
+        description=(
+            "Proactive trip point on `X-Discogs-Ratelimit-Remaining`: when a response reports "
+            "this many tokens or fewer left in the shared 60/min bucket, open the breaker "
+            "before the next wave of live probes starts 429ing. Set 0 to disable the proactive "
+            "floor and rely solely on observed 429s."
+        ),
+    )
+    discogs_breaker_cooldown_seconds: float = Field(
+        default=20.0,
+        description=(
+            "How long the breaker stays OPEN (shedding live probes to cache-only) before "
+            "admitting a single half-open trial request. Roughly a third of the Discogs 60s "
+            "rate-limit window, so the bucket has partially refilled before we re-probe."
+        ),
+    )
+
     # Admin Configuration
     admin_token: str | None = Field(
         None, description="Bearer token for admin endpoints (e.g. library.db upload)"

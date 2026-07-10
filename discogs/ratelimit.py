@@ -11,11 +11,27 @@ import logging
 
 from aiolimiter import AsyncLimiter
 
+from discogs.breaker import DiscogsCircuitBreaker
+
 logger = logging.getLogger(__name__)
 
 # Lazily-initialized rate limiting primitives, stored per event loop
 _rate_limiters: dict[asyncio.AbstractEventLoop, AsyncLimiter] = {}
 _semaphores: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+# LML#755 saturation circuit-breaker, stored per event loop alongside the
+# limiter/semaphore (same process-global-on-single-worker scope).
+_breakers: dict[asyncio.AbstractEventLoop, DiscogsCircuitBreaker] = {}
+
+
+def _build_breaker() -> DiscogsCircuitBreaker:
+    from config.settings import get_settings
+
+    settings = get_settings()
+    return DiscogsCircuitBreaker(
+        failure_threshold=settings.discogs_breaker_failure_threshold,
+        remaining_floor=settings.discogs_breaker_remaining_floor,
+        cooldown_seconds=settings.discogs_breaker_cooldown_seconds,
+    )
 
 
 def get_rate_limiter() -> AsyncLimiter:
@@ -64,9 +80,31 @@ def get_semaphore() -> asyncio.Semaphore:
     return _semaphores[loop]
 
 
+def get_discogs_breaker() -> DiscogsCircuitBreaker:
+    """Get or create the saturation circuit-breaker for the current event loop.
+
+    Stored per event loop (same pattern and scope as the limiter/semaphore).
+    Without a running loop — the handful of legacy direct-call tests — returns
+    a fresh breaker each time; those paths never depend on shared breaker state.
+
+    Returns:
+        The per-loop :class:`~discogs.breaker.DiscogsCircuitBreaker`.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return _build_breaker()
+
+    if loop not in _breakers:
+        _breakers[loop] = _build_breaker()
+        logger.debug("Created Discogs saturation circuit-breaker")
+    return _breakers[loop]
+
+
 def reset_rate_limiting() -> None:
     """Reset rate limiting state for testing."""
-    global _rate_limiters, _semaphores
+    global _rate_limiters, _semaphores, _breakers
     _rate_limiters.clear()
     _semaphores.clear()
+    _breakers.clear()
     logger.debug("Reset rate limiting state")
