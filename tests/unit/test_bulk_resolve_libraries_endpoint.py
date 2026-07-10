@@ -65,6 +65,57 @@ def _identity(
     )
 
 
+class TestBulkResolveGlobalBound:
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_share_the_global_bound(self, app_client, mock_entity_store, monkeypatch):
+        """Two concurrent bulk-resolve requests never exceed LML_BULK_GLOBAL_MAX_CONCURRENT (LML#716).
+
+        The per-request semaphore multiplies across concurrent requests; the
+        process-global permit (shared with /lookup/bulk and cache refresh) is
+        the cross-request bound. Per-request knob wide (10), global knob 2,
+        two 4-input requests → peak in-flight store lookups <= 2.
+        """
+        monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "10")
+        monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "2")
+
+        in_flight = 0
+        peak = 0
+        lock = asyncio.Lock()
+
+        async def fake_resolve(artist_name: str):
+            nonlocal in_flight, peak
+            async with lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            async with lock:
+                in_flight -= 1
+            return None
+
+        mock_entity_store.resolve_library_name.side_effect = fake_resolve
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            body = {
+                "inputs": [
+                    {"library_id": i, "artist_name": f"Artist {i}", "album_title": f"Album {i}"}
+                    for i in range(4)
+                ]
+            }
+            resp_a, resp_b = await asyncio.gather(
+                ac.post("/api/v1/identity/bulk-resolve-libraries", json=body),
+                ac.post("/api/v1/identity/bulk-resolve-libraries", json=body),
+            )
+
+        assert resp_a.status_code == 200
+        assert resp_b.status_code == 200
+        # Queue-don't-shed: every input in both requests still resolves.
+        assert len(resp_a.json()["results"]) == 4
+        assert len(resp_b.json()["results"]) == 4
+        assert peak <= 2, f"Peak cross-request concurrency was {peak}; global permit did not bound it"
+
+
 class TestBulkResolveLibrariesEndpoint:
     @pytest.mark.asyncio
     async def test_single_artist_returns_main_and_provenance(self, app_client, mock_entity_store):

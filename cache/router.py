@@ -47,6 +47,7 @@ from cache.models import (
     CacheRefreshResultItem,
 )
 from core.bulk_concurrency import (
+    acquire_bulk_global_permit,
     cancel_and_drain,
     max_concurrency_from_env,
     watch_disconnect,
@@ -197,7 +198,12 @@ async def handle_refresh_for_identities(
     semaphore = asyncio.Semaphore(max_concurrent)
 
     async def _run_one(identity_id: int) -> CacheRefreshResultItem:
-        async with semaphore:
+        # Batch semaphore OUTER, global permit INNER — the consistent order
+        # every bulk-family dispatcher uses (LML#716): the batch semaphore
+        # bounds items inside THIS request, the global permit is the
+        # cross-request budget shared with /lookup/bulk and identity
+        # bulk-resolve.
+        async with semaphore, acquire_bulk_global_permit():
             if identity_id not in provenance:
                 return CacheRefreshResultItem(
                     identity_id=identity_id,

@@ -10,8 +10,12 @@ test module.
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from httpx import ASGITransport, AsyncClient
+
+from tests.unit.conftest import override_deps
 
 
 async def _hold_permit(entered: list[int], release: asyncio.Event) -> None:
@@ -98,3 +102,80 @@ class TestBulkGlobalPermitSizing:
         assert any(
             "LML_BULK_GLOBAL_MAX_CONCURRENT" in rec.message for rec in caplog.records
         ), "expected a fallback warning naming the misconfigured env var"
+
+
+class TestCrossEndpointBudgetSharing:
+    @pytest.mark.asyncio
+    async def test_bulk_lookup_and_identity_resolve_share_one_budget(
+        self, mock_settings, monkeypatch
+    ):
+        """A /lookup/bulk batch and a bulk-resolve request draw from ONE budget.
+
+        Guards the LML#716 core property against a future per-endpoint split:
+        with the global knob at 2 and per-request knobs wide, combined
+        in-flight items across BOTH endpoints never exceed 2.
+        """
+        monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "10")
+        monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "2")
+
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from identity.dependencies import get_entity_store
+        from main import app
+        from tests.unit.test_bulk_lookup_endpoint import _no_match_response
+
+        in_flight = 0
+        peak = 0
+        lock = asyncio.Lock()
+
+        async def _track():
+            nonlocal in_flight, peak
+            async with lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            async with lock:
+                in_flight -= 1
+
+        async def fake_lookup(request, **kwargs):
+            await _track()
+            return _no_match_response()
+
+        async def fake_resolve(artist_name: str):
+            await _track()
+            return None
+
+        mock_entity_store = AsyncMock()
+        mock_entity_store.resolve_library_name.side_effect = fake_resolve
+
+        with override_deps(
+            app,
+            {
+                get_library_db: AsyncMock(),
+                get_discogs_service: None,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+                get_entity_store: mock_entity_store,
+            },
+        ):
+            with patch(
+                "lookup.router.perform_lookup", new_callable=AsyncMock, side_effect=fake_lookup
+            ):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as ac:
+                    lookup_body = {"items": [{"artist": f"a{i}", "album": "x"} for i in range(4)]}
+                    resolve_body = {
+                        "inputs": [
+                            {"library_id": i, "artist_name": f"b{i}", "album_title": "y"}
+                            for i in range(4)
+                        ]
+                    }
+                    resp_lookup, resp_resolve = await asyncio.gather(
+                        ac.post("/api/v1/lookup/bulk", json=lookup_body),
+                        ac.post("/api/v1/identity/bulk-resolve-libraries", json=resolve_body),
+                    )
+
+        assert resp_lookup.status_code == 200
+        assert resp_resolve.status_code == 200
+        assert peak <= 2, f"Combined cross-endpoint peak was {peak}; budgets are not shared"
