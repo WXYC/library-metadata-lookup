@@ -85,7 +85,10 @@ def get_discogs_breaker() -> DiscogsCircuitBreaker:
 
     Stored per event loop (same pattern and scope as the limiter/semaphore).
     Without a running loop — the handful of legacy direct-call tests — returns
-    a fresh breaker each time; those paths never depend on shared breaker state.
+    a fresh, *unshared* breaker each time, so those off-loop paths get **no
+    cross-request shedding** (each call starts CLOSED). This is latent and
+    affects only direct-call tests, not the running service (all production
+    callers share the one per-loop breaker).
 
     Returns:
         The per-loop :class:`~discogs.breaker.DiscogsCircuitBreaker`.

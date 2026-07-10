@@ -66,6 +66,38 @@ class TestResolveReleaseForTrack:
         ]
 
     @pytest.mark.asyncio
+    async def test_open_breaker_sheds_before_probing(self):
+        """LML#755 FIX 1: when the saturation breaker is OPEN, the resolver
+        raises ``DiscogsBreakerOpenError`` before probing rather than returning
+        ``[]`` — so its L1 ``@async_cached`` wrapper never memoizes an empty
+        (which would pin a 7-day miss sourced from a shed), and the row-less
+        binder never writes a null-pin. All probes would shed anyway, so the
+        early raise is also strictly cheaper."""
+        from unittest.mock import MagicMock
+
+        from discogs.breaker import BreakerState, DiscogsBreakerOpenError
+        from lookup.release_resolution import resolve_release_for_track
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(_va_comp()))
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+
+        open_breaker = MagicMock()
+        open_breaker.state = BreakerState.OPEN
+
+        with patch("lookup.release_resolution.get_discogs_breaker", return_value=open_breaker):
+            with pytest.raises(DiscogsBreakerOpenError):
+                await resolve_release_for_track(
+                    song="Message to Black Youth",
+                    artist="A Guy Called Gerald",
+                    album="When There Is No Sun",
+                    discogs_service=svc,
+                )
+
+        # It shed before probing.
+        svc.search_releases_by_track.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_drops_releases_that_fail_track_credit_validation(self):
         """A probed release whose track-credit doesn't validate is excluded."""
         from lookup.release_resolution import resolve_release_for_track
@@ -613,6 +645,44 @@ class TestErrorHandling:
         )
 
         assert resolved == []
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_is_not_memoized_by_the_l1_wrapper(self):
+        """LML#755 FIX 1: a shed must not be laundered into a memoized ``[]`` by
+        ``resolve_release_for_track_cached``'s ``@async_cached``. Because the
+        uncached resolver RAISES on an open breaker (not returns ``[]``), the L1
+        decorator never writes an entry — a later call with a healthy breaker
+        re-probes and resolves normally instead of serving a stale empty."""
+        from unittest.mock import MagicMock
+
+        from discogs.breaker import BreakerState, DiscogsBreakerOpenError
+        from discogs.memory_cache import get_release_resolution_cache
+        from lookup.release_resolution import resolve_release_for_track_cached
+
+        get_release_resolution_cache().clear()
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(_va_comp()))
+        svc.validate_track_on_release = AsyncMock(return_value=True)
+
+        open_breaker = MagicMock(state=BreakerState.OPEN)
+        closed_breaker = MagicMock(state=BreakerState.CLOSED)
+
+        # First call: breaker OPEN → shed → raises, nothing memoized.
+        with patch("lookup.release_resolution.get_discogs_breaker", return_value=open_breaker):
+            with pytest.raises(DiscogsBreakerOpenError):
+                await resolve_release_for_track_cached(
+                    svc, "Message to Black Youth", "A Guy Called Gerald", "When There Is No Sun"
+                )
+
+        # Second call with the breaker CLOSED must re-probe (no memoized empty).
+        with patch("lookup.release_resolution.get_discogs_breaker", return_value=closed_breaker):
+            resolved = await resolve_release_for_track_cached(
+                svc, "Message to Black Youth", "A Guy Called Gerald", "When There Is No Sun"
+            )
+
+        assert [r.release_id for r in resolved] == [36907527]
+        svc.search_releases_by_track.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_single_validation_failure_preserves_other_releases(self):

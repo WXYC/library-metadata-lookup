@@ -311,6 +311,7 @@ class TestPayloadShapeStability:
     PostHog/Sentry payload shape stays stable across requests (LML#544)."""
 
     def test_all_new_keys_seeded(self):
+        from discogs.service import BREAKER_OPEN_STAT_KEY
         from entity.release_resolution_cache import (
             RELEASE_RESOLUTION_CACHE_HIT_STAT_KEY,
             RELEASE_RESOLUTION_CACHE_MISS_STAT_KEY,
@@ -330,6 +331,9 @@ class TestPayloadShapeStability:
             RELEASE_RESOLUTION_CACHE_HIT_STAT_KEY,
             RELEASE_RESOLUTION_CACHE_MISS_STAT_KEY,
             RELEASE_RESOLUTION_CACHE_UNAVAILABLE_STAT_KEY,
+            # LML#755: the breaker-shed counter must seed to 0 (AC2) so
+            # breaker-open time is a queryable baseline series.
+            BREAKER_OPEN_STAT_KEY,
         ):
             assert key in _LML_CACHE_STATS_EXTRA_KEYS
 

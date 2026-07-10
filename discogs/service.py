@@ -21,6 +21,7 @@ from wxyc_fastapi.observability import (
 )
 
 from config.settings import get_settings
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.fallthrough import apply_request_ctx_tags, fallthrough, request_context
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import (
@@ -120,6 +121,21 @@ def _approx_semaphore_queue_depth(semaphore: asyncio.Semaphore) -> int:
         return len(waiters) if waiters else 0
     except AttributeError:
         return -1
+
+
+def _parse_ratelimit_remaining(raw: str | None) -> int | None:
+    """Parse the ``X-Discogs-Ratelimit-Remaining`` header into an int, or None.
+
+    Feeds the LML#755 breaker's proactive floor. A missing/non-numeric header is
+    ``None`` (unknown), which the breaker treats as "no floor signal" rather than
+    zero — a malformed header must not spuriously trip the shed.
+    """
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def _compute_retry_delay(attempt: int, retry_after_header: str | None) -> float:
@@ -368,6 +384,16 @@ class DiscogsService:
         sentry_sdk.set_tag("discogs_api.check", result.value)
         return result
 
+    def _record_breaker_shed(self, method: str, path: str) -> None:
+        """Record one LML#755 breaker shed on the #683 ``cache.*`` counter.
+
+        Per-shed logging is ``debug`` on purpose (FIX 7): the human-readable
+        OPEN/CLOSED transitions are logged once by the breaker itself, so a
+        per-shed ``warning`` would flood the log through a multi-hour flood.
+        """
+        get_cache_stats_recorder().record(BREAKER_OPEN_STAT_KEY)
+        logger.debug("Discogs saturation breaker shed live request: %s %s", method, path)
+
     async def _request_with_retry(
         self,
         method: str,
@@ -394,21 +420,21 @@ class DiscogsService:
         rate_limiter = get_rate_limiter()
         breaker = get_discogs_breaker()
 
-        # LML#755 saturation shed. When the breaker is OPEN, fast-fail to
-        # ``None`` *before* ``rate_limiter.acquire()`` — no queuing on the 50/min
-        # limiter, no network call, no 429 backoff sleep. Callers already treat a
-        # ``None`` response as "no live result" (every call site guards with
-        # ``if response is not None``), so the lookup degrades to whatever the
-        # library + cached-Discogs legs produced (cache-only) fast, instead of
-        # parking into Backend-Service's 35s client timeout. Cache hits never
-        # reach here — they short-circuit in ``fallthrough`` before the live
-        # probe — so only the live-probe tail is shed.
-        if not breaker.allow_request():
-            get_cache_stats_recorder().record(BREAKER_OPEN_STAT_KEY)
-            logger.warning(
-                "Discogs saturation breaker OPEN, shedding live request: %s %s", method, path
-            )
-            return None
+        # LML#755 saturation shed. When the breaker is OPEN, fast-fail *before*
+        # ``rate_limiter.acquire()`` — no queuing on the 50/min limiter, no
+        # network call, no 429 backoff sleep. The shed raises
+        # ``DiscogsBreakerOpenError`` (NOT a ``None`` return): a shed is
+        # "couldn't ask, try later", which callers must treat as *unknown* —
+        # never a confirmed-empty verdict that would poison a durable negative
+        # cache (LML#755 review, FIX 1). Cache hits never reach here — they
+        # short-circuit in ``fallthrough`` before the live probe — so only the
+        # live-probe tail is shed. ``epoch`` guards the half-open trial: the
+        # terminal ``record_*`` below only drives a half-open transition when its
+        # epoch still matches (FIX 6).
+        epoch = breaker.allow_request()
+        if epoch is None:
+            self._record_breaker_shed(method, path)
+            raise DiscogsBreakerOpenError(f"Discogs saturation breaker open: {method} {path}")
 
         # LML#537: tag both wait spans with the seam's method + cache_state
         # via ``apply_request_ctx_tags`` (a no-op when no context is active —
@@ -434,6 +460,17 @@ class DiscogsService:
         # than once per request — a span-count schema change documented in the
         # #569 PR (no current dashboard/alert aggregates on that count).
         for attempt in range(max_retries + 1):
+            # LML#755 in-flight shed (FIX 3): re-check the breaker at the top of
+            # each attempt. A request already past the entry gate must not ride
+            # its full ~62s backoff after the breaker opens mid-flight — the
+            # whole point of the shed is bounded wall time. The first attempt
+            # (attempt 0) was just admitted above, so only re-check on retries.
+            if attempt > 0 and breaker.allow_request() is None:
+                self._record_breaker_shed(method, path)
+                raise DiscogsBreakerOpenError(
+                    f"Discogs saturation breaker opened mid-flight: {method} {path}"
+                )
+
             # Explicit acquire/release (not `async with semaphore:`) so the wait
             # is wrapped in a Sentry span. The 5-permit semaphore is the dominant
             # source of pre-request dark time on backfill cascades — sampling the
@@ -453,23 +490,10 @@ class DiscogsService:
 
                 response = await client.request(method, path, params=params)
 
-                # Log rate limit remaining for observability, and feed it to the
-                # LML#755 breaker so a nearly-empty token bucket trips the shed
-                # proactively (before the next wave of probes starts 429ing).
+                # Log rate limit remaining for observability.
                 remaining = response.headers.get("X-Discogs-Ratelimit-Remaining")
                 if remaining:
                     logger.debug(f"Discogs rate limit remaining: {remaining}")
-
-                if response.status_code == 429:
-                    breaker.record_failure()
-                else:
-                    remaining_value: int | None = None
-                    if remaining is not None:
-                        try:
-                            remaining_value = int(remaining)
-                        except ValueError:
-                            remaining_value = None
-                    breaker.record_success(remaining=remaining_value)
             except httpx.RequestError as e:
                 logger.error(
                     "Discogs request failed: %s %s -> %s: %r",
@@ -485,7 +509,20 @@ class DiscogsService:
                 # error/cancellation in this attempt — one release per acquire.
                 semaphore.release()
 
+            # LML#755: feed the breaker **once per request, on the terminal
+            # outcome** (FIX 2/5), not per attempt — the counting unit is failed
+            # *requests*, not failed attempts. A non-429 terminal response ends
+            # the loop, so we record here and return; a 429 that still has
+            # retries left loops WITHOUT recording (the failure is only terminal
+            # once retries are exhausted).
+            remaining_value = _parse_ratelimit_remaining(remaining)
             if response.status_code != 429:
+                if response.status_code >= 500:
+                    # 5xx is neutral: don't reset the failure run, don't close a
+                    # half-open trial (FIX 5). Only opens on an exhausted floor.
+                    breaker.record_server_error(remaining=remaining_value, epoch=epoch)
+                else:
+                    breaker.record_success(remaining=remaining_value, epoch=epoch)
                 return response
 
             if attempt < max_retries:
@@ -500,7 +537,12 @@ class DiscogsService:
                 await asyncio.sleep(delay)
                 continue
 
+            # Retries exhausted: this request definitively 429'd. Record exactly
+            # one failure (per-request unit) carrying the last-seen remaining so
+            # an at/below-floor bucket opens proactively even before the reactive
+            # threshold (FIX 2).
             logger.error("Discogs rate limit hit, max retries exhausted")
+            breaker.record_failure(remaining=remaining_value, epoch=epoch)
             return None
 
         return None
@@ -564,6 +606,15 @@ class DiscogsService:
         async def _api_fetch() -> TrackReleasesResponse | None:
             releases: list[ReleaseInfo] = []
             seen_albums: set = set()
+            # LML#755 FIX 1: track whether any live Discogs call failed to
+            # return a response (breaker shed → raise, or retry-exhaustion /
+            # httpx-error → ``None``). A shed/absent call is "couldn't ask", NOT
+            # "we asked, nothing" — so if any leg couldn't ask we return ``None``
+            # instead of the empty response, and the seam skips the durable
+            # negative-cache write. (The shed *raises*; the ``except`` below
+            # already returns ``None``. This flag additionally catches the
+            # ``None``-return laundering that predates the breaker.)
+            any_call_absent = False
 
             params: dict = {
                 "type": "release",
@@ -598,6 +649,8 @@ class DiscogsService:
                         release_info = self._process_search_result(result, seen_albums)
                         if release_info:
                             releases.append(release_info)
+                else:
+                    any_call_absent = True
 
                 logger.info(f"Track search found {len(releases)} releases")
 
@@ -630,6 +683,15 @@ class DiscogsService:
                                 releases.append(release_info)
 
                         logger.info(f"After keyword search: {len(releases)} total releases")
+                    else:
+                        any_call_absent = True
+
+                # If any live leg couldn't ask AND we have nothing to show, this
+                # is an "unknown", not a confirmed-empty — return ``None`` so the
+                # seam skips the negative-cache write. A partial result (some
+                # releases found despite one absent leg) is still returned.
+                if any_call_absent and not releases:
+                    return None
 
                 return TrackReleasesResponse(
                     track=track,
@@ -642,11 +704,11 @@ class DiscogsService:
             except Exception as e:
                 logger.error(f"Discogs search failed: {e}")
                 # An exception-path empty is NOT a "we asked, nothing" verdict
-                # — it's "we couldn't ask, try later." Return ``None`` so the
-                # seam skips both the write-back and negative-record paths
-                # (both are best-effort writes triggered only on a successful
-                # API result). The caller wraps ``None`` into an empty
-                # ``TrackReleasesResponse`` for the API consumer.
+                # — it's "we couldn't ask, try later" (a breaker shed raises
+                # ``DiscogsBreakerOpenError`` here; 5xx via ``raise_for_status``
+                # lands here too). Return ``None`` so the seam skips both the
+                # write-back and negative-record paths. The caller wraps
+                # ``None`` into an empty ``TrackReleasesResponse``.
                 return None
 
         cache = self.cache_service
@@ -977,6 +1039,13 @@ class DiscogsService:
                     videos=videos,
                 )
 
+            except DiscogsBreakerOpenError:
+                # LML#755 FIX 1: a breaker shed is "couldn't ask" — propagate it
+                # so ``validate_track_on_release`` doesn't turn a missing release
+                # into a definitive ``False`` (dropping a valid candidate). A
+                # genuine 404/None or network/5xx error still degrades to ``None``
+                # below.
+                raise
             except Exception as e:
                 logger.error(f"Failed to fetch release {release_id}: {e}")
                 return None

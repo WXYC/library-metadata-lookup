@@ -39,7 +39,7 @@ from core.dependencies import (
 from core.search import SEARCH_API_CALL_CAP_FIRED_STAT_KEY, resolve_positive_int_env
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
-from discogs.service import DiscogsService
+from discogs.service import BREAKER_OPEN_STAT_KEY, DiscogsService
 from entity.release_resolution_cache import (
     RELEASE_RESOLUTION_CACHE_HIT_STAT_KEY,
     RELEASE_RESOLUTION_CACHE_MISS_STAT_KEY,
@@ -171,6 +171,9 @@ _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     RELEASE_RESOLUTION_CACHE_HIT_STAT_KEY,
     RELEASE_RESOLUTION_CACHE_MISS_STAT_KEY,
     RELEASE_RESOLUTION_CACHE_UNAVAILABLE_STAT_KEY,
+    # LML#755 Discogs saturation breaker: shed counter seeds to 0 so
+    # breaker-open time is an alertable baseline series on the #683 surface.
+    BREAKER_OPEN_STAT_KEY,
 )
 """LML-specific keys seeded into every request's cache_stats dict so PostHog
 and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and

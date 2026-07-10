@@ -138,28 +138,35 @@ class Settings(BaseSettings):
     # lookups to cache-only. Per-event-loop (process-global on the single-worker
     # deployment today; re-size if UVICORN_WORKERS > 1 ever ships — LML#747).
     discogs_breaker_failure_threshold: int = Field(
-        default=8,
+        default=4,
+        ge=1,
         description=(
-            "Consecutive Discogs 429s that trip the saturation breaker OPEN. Sized above the "
-            "brief 429 flurry a single warm-cache lookup can absorb via retry (a healthy "
-            "response resets the run), so only a *sustained* rate-limited window opens it."
+            "Consecutive **failed requests** (not attempts) that trip the saturation breaker "
+            "OPEN. Each `_request_with_retry` that exhausts its retries into 429s records ONE "
+            "failure, so this counts requests, not the per-attempt 429s (which are bounded by "
+            "`discogs_max_retries + 1`). A single healthy response resets the run, so only a "
+            "*sustained* rate-limited window — 4 lookups in a row all failing — opens it. "
+            "Must be >= 1 (a pydantic validation error is raised otherwise)."
         ),
     )
     discogs_breaker_remaining_floor: int = Field(
         default=3,
+        ge=0,
         description=(
-            "Proactive trip point on `X-Discogs-Ratelimit-Remaining`: when a response reports "
-            "this many tokens or fewer left in the shared 60/min bucket, open the breaker "
-            "before the next wave of live probes starts 429ing. Set 0 to disable the proactive "
-            "floor and rely solely on observed 429s."
+            "Proactive trip point on `X-Discogs-Ratelimit-Remaining`: when a response — 429 OR "
+            "success — reports this many tokens or fewer left in the shared 60/min bucket, open "
+            "the breaker before the next wave of live probes starts 429ing. Set 0 to disable the "
+            "proactive floor and rely solely on observed 429s. Must be >= 0."
         ),
     )
     discogs_breaker_cooldown_seconds: float = Field(
         default=20.0,
+        ge=0.0,
         description=(
             "How long the breaker stays OPEN (shedding live probes to cache-only) before "
             "admitting a single half-open trial request. Roughly a third of the Discogs 60s "
-            "rate-limit window, so the bucket has partially refilled before we re-probe."
+            "rate-limit window, so the bucket has partially refilled before we re-probe. "
+            "Must be >= 0."
         ),
     )
 

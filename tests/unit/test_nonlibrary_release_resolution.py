@@ -235,6 +235,31 @@ async def test_cold_miss_writes_known_miss_to_cache(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_breaker_shed_does_not_pin_a_known_miss(monkeypatch):
+    """LML#755 FIX 1: when the bounded resolve is shed by an OPEN breaker
+    (``DiscogsBreakerOpenError``), the helper must NOT write a fresh 7-day
+    known-miss null-pin — a shed is "couldn't ask", not "confirmed no release".
+    The shed propagates out (the caller treats it as unknown / cache-only)."""
+    from discogs.breaker import DiscogsBreakerOpenError
+
+    svc = _resolving_service()
+
+    async def _shed(*_a, **_k):
+        raise DiscogsBreakerOpenError("shed")
+
+    monkeypatch.setattr("lookup.rowless.resolve_release_for_track", AsyncMock(side_effect=_shed))
+    pg = _RecordingPg()
+
+    with pytest.raises(DiscogsBreakerOpenError):
+        await _resolve_nonlibrary_release(
+            svc, pg, song=TRACK, artist=ARTIST, album=ALBUM, is_track=True
+        )
+
+    # No known-miss row written — the durable negative cache is not poisoned.
+    assert pg.execute_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_no_pg_resolves_uncached_and_does_not_crash():
     """With no PG handle the helper still resolves via the bounded resolver —
     the cache is best-effort, not required."""
