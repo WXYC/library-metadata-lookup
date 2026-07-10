@@ -478,7 +478,9 @@ class TestBulkLookupEndpoint:
         # Queue-don't-shed: every item in both batches still completes.
         assert all(r["status"] == "match" for r in resp_a.json()["results"])
         assert all(r["status"] == "match" for r in resp_b.json()["results"])
-        assert peak <= 3, f"Peak cross-request concurrency was {peak}; global permit did not bound it"
+        assert peak <= 3, (
+            f"Peak cross-request concurrency was {peak}; global permit did not bound it"
+        )
 
     @pytest.mark.asyncio
     async def test_no_match_status_when_results_empty(self, app_client):

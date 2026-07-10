@@ -27,7 +27,7 @@ Behavior per id:
 
 Response carries per-id results only — no top-level counters. Callers derive them via `Counter(r.status for r in results)`, matching the `BulkLookupResultItem` precedent.
 
-The dispatcher loop mirrors `/api/v1/lookup/bulk` (`lookup/router.py`): `asyncio.gather` under a bounded semaphore (`LML_BULK_MAX_CONCURRENT`, default 10, shared with the lookup endpoint), per-item `try/except` so one identity's failure cannot poison siblings, and a `watch_disconnect` sentinel race so a client abort cancels the gather and frees downstream Discogs rate-limit / semaphore permits. Per-replica Discogs concurrency / rate-limit gates from `discogs/ratelimit.py` apply for free through `DiscogsService.get_release` / `get_artist_details`.
+The dispatcher loop mirrors `/api/v1/lookup/bulk` (`lookup/router.py`): `asyncio.gather` under a bounded semaphore (`LML_BULK_MAX_CONCURRENT`, default 10, shared with the lookup endpoint), each item additionally holding one LML#716 process-global bulk permit (`LML_BULK_GLOBAL_MAX_CONCURRENT` — the cross-request budget shared with `/lookup/bulk` and identity bulk-resolve; see `docs/env-vars.md`), per-item `try/except` so one identity's failure cannot poison siblings, and a `watch_disconnect` sentinel race so a client abort cancels the gather and frees downstream Discogs rate-limit / semaphore permits. Per-replica Discogs concurrency / rate-limit gates from `discogs/ratelimit.py` apply for free through `DiscogsService.get_release` / `get_artist_details`.
 
 Implementation lives in `cache/`:
 - `cache/models.py` — Pydantic shapes (the api.yaml entry generates structurally identical types on the Backend-Service side).

@@ -87,12 +87,15 @@ _BULK_LOOKUP_DEFAULT_CONCURRENCY = 10
 # QUEUE on the semaphore — no 429/503 shedding; callers see latency, never a
 # new error mode. Deliberately separate from `LML_BULK_MAX_CONCURRENT`: the
 # bulk knob bounds items INSIDE one batch (per-request semaphore); this one
-# bounds SINGLE-`/lookup` requests across the process. Scope note: it does
-# NOT cover the other perform_lookup/pool consumers — `/lookup/bulk` batches
-# (per-batch bound only, unbounded concurrent batches), the identity
-# bulk-resolve and cache-refresh dispatchers, `/streaming-check` — which
-# share the same loop + 5-conn pool; a storm made of those can still starve
-# the pool. Default 8: above the warm path's needs (~5 ms hits never stack
+# bounds SINGLE-`/lookup` requests across the process. Scope note: the
+# bulk-family consumers (`/lookup/bulk`, identity bulk-resolve, cache
+# refresh) are bounded by their own cross-request budget, the LML#716 global
+# permit (`LML_BULK_GLOBAL_MAX_CONCURRENT` in core/bulk_concurrency.py) —
+# peak discogs-pool contention when both gates saturate is
+# LML_LOOKUP_MAX_CONCURRENT + LML_BULK_GLOBAL_MAX_CONCURRENT, so size the
+# pool against that SUM. `/streaming-check` sits under neither cap (it
+# borrows no pool connection); its loop-time residual is LML#753.
+# Default 8: above the warm path's needs (~5 ms hits never stack
 # that deep at production arrival rates) and low enough that a single-lookup
 # cold storm can't re-enter the pool-starvation regime.
 _LOOKUP_MAX_CONCURRENT_ENV_VAR = "LML_LOOKUP_MAX_CONCURRENT"
