@@ -335,8 +335,15 @@ class FlowsheetV2MessageEntry(FlowsheetV2Base):
     message: str
 
 
+class OnAirInfo(BaseModel):
+    dj_name: str = Field(..., description="Display name of the DJ currently on air.")
+
+
 class OnAirDJ(BaseModel):
-    id: int
+    id: str = Field(
+        ...,
+        description="The DJ's better-auth `auth_user.id` (an opaque `varchar(255)` string), or `null` for a legacy/tubafrenzy-mirrored show whose on-air DJ has no Backend-Service account (their identity is `legacy_dj_name`, surfaced on `/flowsheet/djs-on-air` with a null id). Historically mistyped as `integer`; corrected to the nullable string it is at runtime (BS#1547).",
+    )
     dj_name: str
 
 
@@ -1946,6 +1953,18 @@ class FlowsheetEntryResponse(FlowsheetEntryBase):
         description='Track position on the release (e.g., "A1", "B2", "5"). Populated when the flowsheet entry was created via the dj-site picker after release selection (catalog-track-search plan §5.3 / Track 3). String-typed to match Discogs\'s `release_track.position`. Null for free-text entries and legacy rows.\n',
     )
     metadata_status: MetadataStatus | None = None
+    entry_type: FlowsheetEntryType | None = None
+    add_time: AwareDatetime | None = Field(
+        None, description="The instant this row was logged (ISO 8601)."
+    )
+    radio_hour: AwareDatetime | None = Field(
+        None,
+        description="Top-of-hour a breakpoint row marks (ISO 8601), sourced from tubafrenzy's RADIO_HOUR. Null on non-breakpoint rows and rows predating the producer rollout. Mirrors the V2 breakpoint entry.",
+    )
+    dj_name: str | None = Field(
+        None,
+        description="Resolved public display name of the DJ on the row's show. Nullable per the PII-safe resolution chain (BS#1371): user.djName -> shows.legacy_dj_name -> null; never the real-name PII column.",
+    )
 
 
 class FlowsheetV2TrackEntry(FlowsheetV2Base):
@@ -2016,6 +2035,10 @@ class FlowsheetV2PaginatedResponse(BaseModel):
     limit: int
     total: int = Field(..., description="Total number of entries")
     totalPages: int = Field(..., description="Total number of pages")
+    on_air: OnAirInfo | None = Field(
+        None,
+        description='The DJ currently on air, when known. An object with `dj_name` means a named DJ is live; JSON `null` means the station is confirmed on automation ("Auto DJ"); the field being absent entirely means the server does not report on-air status (older backends / non-default query branches) and clients should treat it as unknown rather than asserting automation. Not in `required` so absence stays distinct from an explicit `null`.\n\nCodegen note: this three-way distinction (object / null / absent) survives openapi-typescript (`on_air?: OnAirInfo | null`), but a *synthesized* decoder in Swift (Codable `decodeIfPresent`), Kotlin (kotlinx default value), or Python (pydantic `| None = None`) collapses JSON `null` and an absent key into the same value. A consumer that needs the third state must decode by key presence (e.g. Swift\'s `container.contains` + `decodeNil`), as the iOS app does — do not rely on a generated model to tell `null` from absent.',
+    )
 
 
 class ShowPlaylist(BaseModel):
