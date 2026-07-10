@@ -104,6 +104,101 @@ class TestBulkGlobalPermitSizing:
         ), "expected a fallback warning naming the misconfigured env var"
 
 
+class TestGlobalPermitTelemetry:
+    """Capped acquires must be queryable in Sentry (the LML#683 lesson).
+
+    Mirrors the #714 `lml.lookup.inflight_capped` / `inflight_wait_ms` pair:
+    a filterable tag for "this request queued on the global budget" plus a
+    quantitative wait measurement for tuning the knob. ``set_data`` alone is
+    unqueryable in the spans dataset.
+    """
+
+    @staticmethod
+    def _sentry_mocks():
+        from unittest.mock import Mock
+
+        transaction = Mock()
+        scope = Mock()
+        scope.transaction = transaction
+        return transaction, scope, Mock()
+
+    @pytest.mark.asyncio
+    async def test_capped_acquire_sets_tag_and_wait_measurement(self, monkeypatch):
+        monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "1")
+
+        from core import bulk_concurrency as bc
+
+        transaction, scope, set_tag = self._sentry_mocks()
+
+        async def _second_holder(release: asyncio.Event):
+            async with bc.acquire_bulk_global_permit():
+                release.set()
+
+        with (
+            patch.object(bc.sentry_sdk, "get_current_scope", return_value=scope),
+            patch.object(bc.sentry_sdk, "set_tag", set_tag),
+        ):
+            release = asyncio.Event()
+            first_release = asyncio.Event()
+
+            async def _first_holder():
+                async with bc.acquire_bulk_global_permit():
+                    await first_release.wait()
+
+            first = asyncio.create_task(_first_holder())
+            await asyncio.sleep(0)
+            # First holder took the permit uncontended: no tag.
+            assert not any(
+                c.args[0] == "lml.bulk.global_capped" for c in set_tag.call_args_list
+            )
+
+            second = asyncio.create_task(_second_holder(release))
+            # Park the second holder deterministically before releasing.
+            semaphore = bc._get_bulk_global_semaphore()
+            for _ in range(100):
+                if semaphore._waiters:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                pytest.fail("second holder never parked on the global permit")
+
+            first_release.set()
+            await asyncio.gather(first, second)
+
+        capped_tags = [
+            c for c in set_tag.call_args_list if c.args == ("lml.bulk.global_capped", "true")
+        ]
+        assert len(capped_tags) == 1
+        wait_measurements = [
+            c
+            for c in transaction.set_measurement.call_args_list
+            if c.args[0] == "lml.bulk.global_wait_ms"
+        ]
+        assert len(wait_measurements) == 1
+        assert wait_measurements[0].args[1] > 0
+
+    @pytest.mark.asyncio
+    async def test_uncontended_acquire_sets_no_tag_or_measurement(self, monkeypatch):
+        monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "4")
+
+        from core import bulk_concurrency as bc
+
+        transaction, scope, set_tag = self._sentry_mocks()
+
+        with (
+            patch.object(bc.sentry_sdk, "get_current_scope", return_value=scope),
+            patch.object(bc.sentry_sdk, "set_tag", set_tag),
+        ):
+            async with bc.acquire_bulk_global_permit():
+                pass
+
+        assert not any(c.args[0] == "lml.bulk.global_capped" for c in set_tag.call_args_list)
+        assert not any(
+            c.args[0] == "lml.bulk.global_wait_ms"
+            for c in transaction.set_measurement.call_args_list
+        )
+
+
 class TestCrossEndpointBudgetSharing:
     @pytest.mark.asyncio
     async def test_bulk_lookup_and_identity_resolve_share_one_budget(
@@ -179,3 +274,69 @@ class TestCrossEndpointBudgetSharing:
         assert resp_lookup.status_code == 200
         assert resp_resolve.status_code == 200
         assert peak <= 2, f"Combined cross-endpoint peak was {peak}; budgets are not shared"
+
+
+class TestBudgetFairness:
+    @pytest.mark.asyncio
+    async def test_small_batch_completes_while_drain_holds_the_budget(
+        self, mock_settings, monkeypatch
+    ):
+        """A 3-item batch finishes while a 30-item drain is still in flight.
+
+        The motivating LML#716 scenario is a 35k-album operator drain running
+        alongside interactive callers. ``asyncio.Semaphore`` waiters are FIFO,
+        so the small batch's items interleave with the drain's instead of
+        parking behind all of them — this pins that operator-relevant
+        property rather than assuming it.
+        """
+        monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "10")
+        monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "2")
+
+        import time
+
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+        from tests.unit.test_bulk_lookup_endpoint import _no_match_response
+
+        async def fake_lookup(request, **kwargs):
+            await asyncio.sleep(0.01)
+            return _no_match_response()
+
+        with override_deps(
+            app,
+            {
+                get_library_db: AsyncMock(),
+                get_discogs_service: None,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            with patch(
+                "lookup.router.perform_lookup", new_callable=AsyncMock, side_effect=fake_lookup
+            ):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as ac:
+
+                    async def _timed_post(items: int) -> float:
+                        body = {"items": [{"artist": f"a{i}", "album": "x"} for i in range(items)]}
+                        resp = await ac.post("/api/v1/lookup/bulk", json=body)
+                        assert resp.status_code == 200
+                        return time.monotonic()
+
+                    async def _small_after_drain_starts() -> float:
+                        # Let the drain occupy the budget before the small
+                        # batch arrives — the adversarial ordering.
+                        await asyncio.sleep(0.02)
+                        return await _timed_post(3)
+
+                    drain_done, small_done = await asyncio.gather(
+                        _timed_post(30),
+                        _small_after_drain_starts(),
+                    )
+
+        assert small_done < drain_done, (
+            "small batch finished after the drain — FIFO interleaving is broken and "
+            "interactive callers would park behind entire operator drains"
+        )
