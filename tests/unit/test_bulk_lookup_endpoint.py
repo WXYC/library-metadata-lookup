@@ -436,6 +436,51 @@ class TestBulkLookupEndpoint:
         assert peak <= 2, f"Peak concurrency was {peak}; semaphore did not bound it"
 
     @pytest.mark.asyncio
+    async def test_concurrent_batches_share_the_global_bound(self, app_client, monkeypatch):
+        """Two concurrent batches never exceed LML_BULK_GLOBAL_MAX_CONCURRENT (LML#716).
+
+        The per-batch semaphore multiplies across requests (N batches admit
+        N x LML_BULK_MAX_CONCURRENT items). The process-global permit is the
+        cross-request bound: with the per-batch knob wide (10) and the global
+        knob at 3, two 6-item batches must peak at <= 3 in-flight items.
+        """
+        monkeypatch.setenv("LML_BULK_MAX_CONCURRENT", "10")
+        monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "3")
+
+        import asyncio
+
+        in_flight = 0
+        peak = 0
+        lock = asyncio.Lock()
+
+        async def fake_lookup(request, **kwargs):
+            nonlocal in_flight, peak
+            async with lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            async with lock:
+                in_flight -= 1
+            return _match_response(request.artist or "?", request.album or "?")
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock, side_effect=fake_lookup):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                batch = {"items": [{"artist": f"a{i}", "album": "x"} for i in range(6)]}
+                resp_a, resp_b = await asyncio.gather(
+                    ac.post("/api/v1/lookup/bulk", json=batch),
+                    ac.post("/api/v1/lookup/bulk", json=batch),
+                )
+
+        assert resp_a.status_code == 200
+        assert resp_b.status_code == 200
+        # Queue-don't-shed: every item in both batches still completes.
+        assert all(r["status"] == "match" for r in resp_a.json()["results"])
+        assert all(r["status"] == "match" for r in resp_b.json()["results"])
+        assert peak <= 3, f"Peak cross-request concurrency was {peak}; global permit did not bound it"
+
+    @pytest.mark.asyncio
     async def test_no_match_status_when_results_empty(self, app_client):
         """`results: []` in the per-item LookupResponse → top-level status no_match."""
         with patch(

@@ -87,6 +87,40 @@ async def watch_disconnect(request: Request) -> None:
             return
 
 
+_BULK_GLOBAL_MAX_CONCURRENT_ENV = "LML_BULK_GLOBAL_MAX_CONCURRENT"
+
+_bulk_global_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_bulk_global_semaphore() -> asyncio.Semaphore:
+    """Lazily build the process-global bulk-item permit semaphore (LML#716).
+
+    Default tracks ``discogs_pool_max_size()`` — the budget bounds contention
+    on the discogs-cache asyncpg pool, so its default follows the pool's
+    ``max_size`` knob (``LML_DISCOGS_POOL_MAX_SIZE``, LML#745) rather than
+    adding a third hand-synced literal.
+    """
+    global _bulk_global_semaphore
+    if _bulk_global_semaphore is None:
+        # Imported here, not at module top: core.dependencies pulls in the DI
+        # graph (pool builders, service singletons), which this leaf module
+        # must not load as an import-time side effect.
+        from core.dependencies import discogs_pool_max_size
+        from core.search import resolve_positive_int_env
+
+        _bulk_global_semaphore = asyncio.Semaphore(
+            resolve_positive_int_env(_BULK_GLOBAL_MAX_CONCURRENT_ENV, discogs_pool_max_size())
+        )
+    return _bulk_global_semaphore
+
+
+@contextlib.asynccontextmanager
+async def acquire_bulk_global_permit():
+    """Hold one process-global bulk-item permit for the duration of the block."""
+    async with _get_bulk_global_semaphore():
+        yield
+
+
 async def cancel_and_drain(future: asyncio.Future[Any]) -> None:
     """Cancel a future and swallow the resulting ``CancelledError``.
 

@@ -60,6 +60,26 @@ async def drain_streaming_warm_tasks(timeout_s: float = 5.0) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _reset_bulk_global_permit():
+    """Suite-wide reset of the LML#716 process-global bulk-item permit.
+
+    Sibling of ``_reset_lookup_inflight_cap`` below, same two failure modes:
+    ``core.bulk_concurrency._bulk_global_semaphore`` is lazily built by the
+    first bulk-family test in the session, which would (a) freeze that test's
+    ``LML_BULK_GLOBAL_MAX_CONCURRENT`` snapshot for the rest of the run and
+    (b) bind the semaphore to that test's event loop at the first contended
+    acquire, surfacing as order-dependent ``RuntimeError(... bound to a
+    different event loop)`` in unrelated files under pytest-asyncio's
+    function-scoped loops.
+    """
+    from core import bulk_concurrency as _bulk_concurrency
+
+    _bulk_concurrency._bulk_global_semaphore = None
+    yield
+    _bulk_concurrency._bulk_global_semaphore = None
+
+
+@pytest.fixture(autouse=True)
 def _reset_lookup_inflight_cap():
     """Suite-wide reset of the LML#706 ``/lookup`` in-flight semaphore.
 
