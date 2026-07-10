@@ -25,8 +25,10 @@ import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
 
 from clients.streaming.matching import score_match
+from discogs.breaker import BreakerState, DiscogsBreakerOpenError
 from discogs.memory_cache import async_cached, get_release_resolution_cache
 from discogs.models import ReleaseInfo
+from discogs.ratelimit import get_discogs_breaker
 from discogs.service import DiscogsService
 
 logger = logging.getLogger(__name__)
@@ -286,6 +288,20 @@ async def resolve_release_for_track(
     """
     if discogs_service is None or not song or not artist:
         return []
+
+    # LML#755 FIX 1: if the saturation breaker is already OPEN, every live probe
+    # below would shed. Raise ``DiscogsBreakerOpenError`` *before* probing so the
+    # shed propagates as "couldn't ask" rather than being laundered (by
+    # ``search_releases_by_track``'s never-abort swallow) into a ``[]`` that the
+    # L1 ``@async_cached`` wrapper would memoize and the row-less binder would
+    # pin as a 7-day known-miss. ``@async_cached`` never caches on an exception,
+    # so this keeps a shed out of the durable negative caches. (The
+    # ``allow_request`` epoch is not consumed here — we only read state — because
+    # this is a pre-flight guard, not a request that will record an outcome.)
+    if get_discogs_breaker().state is BreakerState.OPEN:
+        raise DiscogsBreakerOpenError(
+            f"Discogs saturation breaker open; not resolving {song!r} by {artist!r}"
+        )
 
     fire_album = also_probe_album_title and bool(album)
 

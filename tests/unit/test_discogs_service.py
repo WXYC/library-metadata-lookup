@@ -844,6 +844,49 @@ class TestSearchReleasesByTrack:
         service_with_cache.cache_service.record_lookup_negative.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_breaker_shed_does_not_write_negative_cache(self, service_with_cache):
+        """LML#755 FIX 1: a breaker shed (``DiscogsBreakerOpenError``) is
+        "couldn't ask", NOT "we asked, nothing" — it must not persist a 7-day
+        negative-cache row."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        service_with_cache.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+        service_with_cache.cache_service.lookup_negative_hit = AsyncMock(return_value=False)
+        service_with_cache.cache_service.record_lookup_negative = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            side_effect=DiscogsBreakerOpenError("shed"),
+        ):
+            result = await service_with_cache.search_releases_by_track("X", "Y")
+
+        assert result.releases == []
+        service_with_cache.cache_service.record_lookup_negative.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_exhaustion_none_does_not_write_negative_cache(self, service_with_cache):
+        """LML#755 FIX 1: retry-exhaustion / httpx-error (``_request_with_retry``
+        returns ``None``) must not be laundered into a confirmed-empty verdict.
+        The empty response returned to the caller must NOT trigger the
+        negative-cache write."""
+        service_with_cache.cache_service.search_releases_by_track = AsyncMock(return_value=[])
+        service_with_cache.cache_service.lookup_negative_hit = AsyncMock(return_value=False)
+        service_with_cache.cache_service.record_lookup_negative = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=None,  # retry-exhaustion / httpx-error sentinel
+        ):
+            result = await service_with_cache.search_releases_by_track("X", "Y")
+
+        assert result.releases == []
+        service_with_cache.cache_service.record_lookup_negative.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_negative_cache_consulted_for_artist_as_keyword(self, service_with_cache):
         """The negative cache also covers the keyword path — its key dimension distinguishes shapes."""
         service_with_cache.cache_service.search_releases_by_track = AsyncMock(return_value=[])
@@ -907,6 +950,39 @@ class TestGetRelease:
         assert result.year == 1980
         assert result.artwork_url == "https://img.com/cover.jpg"
         assert len(result.tracklist) == 1
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_propagates_not_swallowed_to_none(self, service):
+        """LML#755 FIX 1: ``get_release``'s broad ``except`` must NOT swallow a
+        breaker shed into ``None`` (which downstream ``validate_track_on_release``
+        would turn into a definitive ``False``). The shed propagates as
+        ``DiscogsBreakerOpenError`` so callers can distinguish "couldn't ask"
+        from a genuine 404/None. A non-breaker error (network, 5xx) still
+        returns ``None`` as before."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        with patch.object(
+            service,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            side_effect=DiscogsBreakerOpenError("shed"),
+        ):
+            with pytest.raises(DiscogsBreakerOpenError):
+                await service.get_release(12345)
+
+    @pytest.mark.asyncio
+    async def test_non_breaker_error_still_returns_none(self, service):
+        """The FIX 1 re-raise is narrow: only ``DiscogsBreakerOpenError`` escapes.
+        A generic error is still swallowed to ``None`` (the pre-existing
+        graceful-degrade contract)."""
+        with patch.object(
+            service,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("discogs 500"),
+        ):
+            result = await service.get_release(12345)
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_cached_release(self, service_with_cache):
@@ -1681,6 +1757,23 @@ class TestValidateTrackOnRelease:
         with patch.object(service, "get_release", new_callable=AsyncMock, return_value=None):
             result = await service.validate_track_on_release(1, "Song", "Artist")
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_propagates_not_returns_false(self, service):
+        """LML#755 FIX 1: a breaker shed while fetching the release is "couldn't
+        ask", NOT a definitive "track not on release". It must propagate as
+        ``DiscogsBreakerOpenError`` rather than return ``False`` — a ``False``
+        would drop a valid candidate the caller would otherwise keep."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        with patch.object(
+            service,
+            "get_release",
+            new_callable=AsyncMock,
+            side_effect=DiscogsBreakerOpenError("shed"),
+        ):
+            with pytest.raises(DiscogsBreakerOpenError):
+                await service.validate_track_on_release(1, "Song", "Artist")
 
     @pytest.mark.asyncio
     async def test_quoted_artist_name_matches(self, service):
