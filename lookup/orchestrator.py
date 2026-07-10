@@ -33,6 +33,7 @@ from core.search import (
     execute_search_pipeline,
     get_search_type_from_state,
 )
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import DiscogsCacheService
 from discogs.lookup import lookup_releases_by_track
 from discogs.models import (
@@ -960,11 +961,29 @@ async def perform_lookup(
 
     parsed, albums_for_search = await _step_prepare_request(request, state, services)
     search_state = await _step_search_pipeline(parsed, albums_for_search, state, services)
-    await _step_library_miss_probe(parsed, state, services)
-    await _step_validate_tracks(parsed, search_state, state, services)
-    await _step_populate_streaming_status(state, services)
-    await _step_fetch_artwork(parsed, state, services)
-    await _step_enrich_metadata(parsed, state, services)
+
+    # LML#755 R2-2 backstop. The runner (`core/search.py`) already catches a
+    # Discogs saturation-breaker shed *inside* the search pipeline and degrades
+    # to cache-only. This try is defense in depth for the remaining tail steps
+    # (library-miss probe, track validation, artwork, enrichment, identity
+    # resolution) — a shed raised from any of them must degrade to whatever the
+    # library + already-cached legs produced, NOT 500. A shed is "couldn't ask",
+    # never a fatal error. We keep the library results found so far and skip the
+    # live-Discogs-dependent enrichment tail.
+    try:
+        await _step_library_miss_probe(parsed, state, services)
+        await _step_validate_tracks(parsed, search_state, state, services)
+        await _step_populate_streaming_status(state, services)
+        await _step_fetch_artwork(parsed, state, services)
+        await _step_enrich_metadata(parsed, state, services)
+    except DiscogsBreakerOpenError:
+        logger.info(
+            "Discogs saturation breaker shed the enrichment tail; "
+            "returning cache-only lookup for %r",
+            request.raw_message,
+        )
+        return _build_degraded_response(state, search_state)
+
     _step_project_trace_attrs(state, services)
 
     # Step 5: Build context message
@@ -975,7 +994,16 @@ async def perform_lookup(
         has_results=state.has_results,
     )
 
-    identities_by_artist = await _step_resolve_result_identities(state, services)
+    try:
+        identities_by_artist = await _step_resolve_result_identities(state, services)
+    except DiscogsBreakerOpenError:
+        logger.info(
+            "Discogs saturation breaker shed identity resolution; "
+            "returning cache-only lookup for %r",
+            request.raw_message,
+        )
+        return _build_degraded_response(state, search_state)
+
     result_items = _build_result_items(state, search_state, identities_by_artist)
     external_source = await _step_external_cache_fallback(parsed, result_items, services)
 
@@ -987,5 +1015,28 @@ async def perform_lookup(
         context_message=context,
         corrected_artist=state.corrected_artist,
         external_source=external_source,
+        timeout=search_state.timed_out,
+    )
+
+
+def _build_degraded_response(state: LookupState, search_state: SearchState) -> LookupResponse:
+    """Build a cache-only ``LookupResponse`` after a Discogs-breaker shed (R2-2).
+
+    Returns the library rows accumulated so far with **no** live-Discogs
+    enrichment (artwork/streaming/identity resolution shed) and no context
+    message. Identities are empty (identity resolution itself can shed), so
+    ``_build_result_items`` binds each row with ``reconciled_identity=None``.
+    ``timeout`` is left as the search pipeline reported it. This degrades the
+    hot path to fast, partial metadata instead of a 500.
+    """
+    result_items = _build_result_items(state, search_state, {})
+    return LookupResponse(
+        results=result_items,
+        search_type=state.search_type,
+        song_not_found=state.song_not_found,
+        found_on_compilation=state.found_on_compilation,
+        context_message=None,
+        corrected_artist=state.corrected_artist,
+        external_source=None,
         timeout=search_state.timed_out,
     )

@@ -13,6 +13,7 @@ import asyncio
 import logging
 
 from config.settings import get_settings
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import DiscogsSearchRequest
 from discogs.service import DiscogsService
 from library.db import LibraryDB
@@ -86,6 +87,19 @@ async def filter_results_by_track_validation(
                         f"(release {best_result.release_id})"
                     )
                     return item
+        except DiscogsBreakerOpenError:
+            # LML#755 R2-4: the Discogs saturation breaker shed a live probe
+            # (search or validate). A shed is "couldn't ask", NOT "confirmed not
+            # on the album" — dropping the row here would launder the shed into
+            # song-not-found (a wrong 200). KEEP the real library row unvalidated
+            # so the user still gets their match, validation pending, during a
+            # flood. Genuine validation errors still fall through to the broad
+            # ``except`` below and drop the row as before.
+            logger.info(
+                "Track validation shed by Discogs breaker for '%s'; keeping row unvalidated",
+                item.title,
+            )
+            return item
         except Exception as e:
             logger.warning(f"Track validation failed for '{item.title}': {e}")
         return None

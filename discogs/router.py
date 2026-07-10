@@ -7,6 +7,7 @@ import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from core.dependencies import get_discogs_cache_service, get_discogs_service
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.markup_parser import DiscogsServiceResolver, parse_async
 from discogs.memory_cache import evict_cached
@@ -107,7 +108,16 @@ async def get_release(
     svc = _require_service(service)
     if refresh:
         _refresh_l1(DiscogsService.get_release, release_id)
-    result = await svc.get_release(release_id)
+    try:
+        result = await svc.get_release(release_id)
+    except DiscogsBreakerOpenError as e:
+        # LML#755 R2-3: the Discogs saturation breaker shed this live probe. 503
+        # (transient / retryable), not a raw 500 — the caller should back off and
+        # retry rather than treat this as a hard failure.
+        raise HTTPException(
+            status_code=503,
+            detail="Discogs temporarily shed (rate-saturated); retry shortly.",
+        ) from e
 
     if result is None:
         raise HTTPException(
@@ -187,23 +197,33 @@ async def resolve_entity(
     if refresh:
         _refresh_l1(cached_funcs_by_type[entity_type], entity_id)
 
-    if entity_type == EntityType.artist:
-        artist = await svc.get_artist_details(entity_id)
-        if artist is None:
-            raise HTTPException(status_code=404, detail=f"Artist {entity_id} not found")
-        return EntityResolveResponse(name=artist.name, type=entity_type, id=entity_id)
+    try:
+        if entity_type == EntityType.artist:
+            artist = await svc.get_artist_details(entity_id)
+            if artist is None:
+                raise HTTPException(status_code=404, detail=f"Artist {entity_id} not found")
+            return EntityResolveResponse(name=artist.name, type=entity_type, id=entity_id)
 
-    elif entity_type == EntityType.release:
-        release = await svc.get_release(entity_id)
-        if release is None:
-            raise HTTPException(status_code=404, detail=f"Release {entity_id} not found")
-        return EntityResolveResponse(name=release.title, type=entity_type, id=entity_id)
+        elif entity_type == EntityType.release:
+            release = await svc.get_release(entity_id)
+            if release is None:
+                raise HTTPException(status_code=404, detail=f"Release {entity_id} not found")
+            return EntityResolveResponse(name=release.title, type=entity_type, id=entity_id)
 
-    else:  # master
-        master = await svc.get_master(entity_id)
-        if master is None:
-            raise HTTPException(status_code=404, detail=f"Master {entity_id} not found")
-        return EntityResolveResponse(name=master.title, type=entity_type, id=entity_id)
+        else:  # master
+            master = await svc.get_master(entity_id)
+            if master is None:
+                raise HTTPException(status_code=404, detail=f"Master {entity_id} not found")
+            return EntityResolveResponse(name=master.title, type=entity_type, id=entity_id)
+    except DiscogsBreakerOpenError as e:
+        # LML#755 R2-3: a saturation-breaker shed on this diagnostic route → 503
+        # (transient), not a raw 500. Currently only the release branch's
+        # ``get_release`` re-raises the shed, but wrapping the whole dispatch
+        # keeps the contract if another branch's fetch ever propagates it too.
+        raise HTTPException(
+            status_code=503,
+            detail="Discogs temporarily shed (rate-saturated); retry shortly.",
+        ) from e
 
 
 @router.get(

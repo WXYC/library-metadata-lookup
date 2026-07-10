@@ -291,3 +291,77 @@ async def test_closed_breaker_actually_rides_the_backoff_when_not_shed():
     # The CLOSED path DID reach the backoff sleep (unlike the shed path).
     sleep_spy.assert_awaited_once()
     assert client.request.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_inflight_shed_during_cooldown_does_not_latch_the_breaker():
+    """R2-1 regression: a request that is mid-retry when the cool-down elapses
+    must shed WITHOUT consuming the trial slot, so the breaker is not stuck
+    HALF_OPEN. A subsequent fresh request must still be admitted as the trial and
+    CLOSE the breaker on recovery.
+
+    The stuck-breaker bug: FIX 3 used the state-mutating ``allow_request()`` for
+    the re-check, which would promote the retrying request to the trial under a
+    fresh epoch — but that request holds its stale entry epoch, so its terminal
+    ``record_*`` never CLOSES, and every other request is then shed in HALF_OPEN
+    → the breaker sheds all live traffic until restart.
+    """
+
+    class Clock:
+        def __init__(self) -> None:
+            self.t = 1000.0
+
+        def __call__(self) -> float:
+            return self.t
+
+    clock = Clock()
+    breaker = DiscogsCircuitBreaker(
+        failure_threshold=1, remaining_floor=0, cooldown_seconds=30.0, now=clock
+    )
+
+    # A retrying request: 429 on the first attempt, and while it sleeps another
+    # coroutine trips the breaker OPEN, then the cool-down elapses (clock jumps
+    # past the window) before its next attempt's re-check.
+    retrying_client = MagicMock()
+    retrying_client.request = AsyncMock(return_value=_response(429, {"Retry-After": "30"}))
+    retrying_service = _make_service(retrying_client)
+
+    async def open_and_elapse_cooldown(_delay: float) -> None:
+        breaker.force_open()
+        clock.t += 31.0  # push past the cool-down while this request sleeps
+
+    fake_limiter = MagicMock()
+    fake_limiter.acquire = AsyncMock()
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+        patch("discogs.service.asyncio.sleep", side_effect=open_and_elapse_cooldown),
+    ):
+        # The retrying request sheds on its second attempt (breaker OPEN,
+        # cool-down elapsed) WITHOUT promoting itself to the trial.
+        with pytest.raises(DiscogsBreakerOpenError):
+            await retrying_service._request_with_retry("GET", "/database/search", max_retries=5)
+
+    # The breaker must NOT be stuck: it is still OPEN (not latched HALF_OPEN by
+    # the shed request), so the cool-down promotion is still available.
+    assert breaker.state.value == "open"
+
+    # A subsequent fresh request is admitted as the genuine trial and CLOSES the
+    # breaker on a healthy response — proving recovery is still possible.
+    healthy_client = MagicMock()
+    healthy_client.request = AsyncMock(
+        return_value=_response(200, {"X-Discogs-Ratelimit-Remaining": "50"})
+    )
+    healthy_service = _make_service(healthy_client)
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+    ):
+        result = await healthy_service._request_with_retry("GET", "/database/search")
+
+    assert result is not None
+    assert breaker.state.value == "closed"

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import sentry_sdk
 
+from discogs.breaker import DiscogsBreakerOpenError
 from generated.api_models import TrackMatchHint
 from library.models import LibraryItem
 from services.parser import ParsedRequest
@@ -905,6 +906,20 @@ async def _run_strategy_pipeline(
                 hard_cap_ms=hard_cap_ms,
             )
             break
+        except DiscogsBreakerOpenError:
+            # LML#755 R2-2: the Discogs saturation breaker shed a live probe
+            # inside this strategy. A shed means "couldn't ask" — degrade to the
+            # same empty (cache-only) outcome a strategy miss produces, so the
+            # lookup returns library + already-cached results instead of 500ing.
+            # This is the ONE catch boundary for the shed on the search path: all
+            # strategies that fan out to Discogs are covered here, so no strategy
+            # needs its own catch. We ``continue`` (not ``break``) so a later
+            # strategy — which may hit only the cache — still runs.
+            logger.info(
+                "Discogs saturation breaker shed strategy %s; degrading to cache-only",
+                strategy.name,
+            )
+            outcome = Outcome.empty()
 
         # The one write site: every per-strategy ``SearchState`` mutation
         # happens here, driven by the outcome's flags. See :func:`_apply`.

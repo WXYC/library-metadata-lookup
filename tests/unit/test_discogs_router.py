@@ -146,6 +146,21 @@ class TestGetRelease:
 
         assert resp.status_code == 503
 
+    @pytest.mark.asyncio
+    async def test_breaker_shed_returns_503(self, app_with_discogs, mock_discogs):
+        """R2-3: a saturation-breaker shed on this diagnostic route returns 503
+        (transient / retryable), NOT a raw 500."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        mock_discogs.get_release = AsyncMock(side_effect=DiscogsBreakerOpenError("shed"))
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_discogs), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/v1/discogs/release/123")
+
+        assert resp.status_code == 503
+
 
 class TestSearchReleasesRemoved:
     """The /discogs/search endpoint has been removed. All callers use /lookup instead."""
@@ -297,6 +312,21 @@ class TestResolveEntity:
             resp = await client.get("/api/v1/discogs/entity/release/999999")
 
         assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_release_breaker_shed_returns_503(self, app_with_discogs, mock_discogs):
+        """R2-3: the entity-release branch also degrades a saturation-breaker shed
+        to 503 (transient), not a raw 500."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        mock_discogs.get_release = AsyncMock(side_effect=DiscogsBreakerOpenError("shed"))
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_discogs), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/v1/discogs/entity/release/789")
+
+        assert resp.status_code == 503
 
     @pytest.mark.asyncio
     async def test_master_not_found(self, app_with_discogs, mock_discogs):
