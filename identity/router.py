@@ -23,7 +23,12 @@ from asyncpg.exceptions import PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
-from core.bulk_concurrency import cancel_and_drain, max_concurrency_from_env, watch_disconnect
+from core.bulk_concurrency import (
+    acquire_bulk_global_permit,
+    cancel_and_drain,
+    max_concurrency_from_env,
+    watch_disconnect,
+)
 from core.dependencies import discogs_pool_max_size
 from entity.store import EntityStore, Identity
 from generated.api_models import (
@@ -275,7 +280,14 @@ async def bulk_resolve_libraries(
         from "PG died before this row was tried", so the fail-closed posture is
         load-bearing (same contract as ``/identity/bulk``).
         """
-        async with semaphore:
+        # Per-request semaphore OUTER, global permit INNER — the consistent
+        # order every bulk-family dispatcher uses (LML#716). Both gates stay:
+        # the per-request semaphore is the within-request fairness bound
+        # (sized to the pool so one request self-limits), the global permit
+        # is the cross-request budget shared with /lookup/bulk and cache
+        # refresh, so unbounded concurrent bulk-resolve requests can't
+        # multiply against the shared pool.
+        async with semaphore, acquire_bulk_global_permit():
             if is_compilation_artist(input_row.artist_name):
                 return compilation_result(input_row.library_id)
 
