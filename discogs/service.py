@@ -49,7 +49,7 @@ from discogs.models import (
     TrackItem,
     TrackReleasesResponse,
 )
-from discogs.ratelimit import get_rate_limiter, get_semaphore
+from discogs.ratelimit import get_discogs_breaker, get_rate_limiter, get_semaphore
 
 if TYPE_CHECKING:
     from discogs.cache_service import DiscogsCacheService
@@ -73,6 +73,12 @@ DISCOGS_API_BASE = "https://api.discogs.com"
 # seconds; once we cross that, the bucket has reset and there's no benefit to
 # waiting longer for the same 429.
 _MAX_RETRY_DELAY_SECONDS = 60.0
+
+# LML#755 saturation-breaker counter. Emitted on the #683 ``cache.*`` counter
+# surface (``get_cache_stats_recorder().record(...)``) every time a live Discogs
+# request is shed because the breaker is OPEN, so breaker-open time is alertable
+# on the same PostHog/Sentry seam as the row-less flag degradation alerts.
+BREAKER_OPEN_STAT_KEY = "discogs_breaker_open_shed"
 
 # Fuzzy fallback for `validate_track_on_release` artist matching. Strict substring
 # matching loses on collaboration trios where neither name is a substring of the
@@ -386,6 +392,23 @@ class DiscogsService:
         client = await self._get_client()
         semaphore = get_semaphore()
         rate_limiter = get_rate_limiter()
+        breaker = get_discogs_breaker()
+
+        # LML#755 saturation shed. When the breaker is OPEN, fast-fail to
+        # ``None`` *before* ``rate_limiter.acquire()`` — no queuing on the 50/min
+        # limiter, no network call, no 429 backoff sleep. Callers already treat a
+        # ``None`` response as "no live result" (every call site guards with
+        # ``if response is not None``), so the lookup degrades to whatever the
+        # library + cached-Discogs legs produced (cache-only) fast, instead of
+        # parking into Backend-Service's 35s client timeout. Cache hits never
+        # reach here — they short-circuit in ``fallthrough`` before the live
+        # probe — so only the live-probe tail is shed.
+        if not breaker.allow_request():
+            get_cache_stats_recorder().record(BREAKER_OPEN_STAT_KEY)
+            logger.warning(
+                "Discogs saturation breaker OPEN, shedding live request: %s %s", method, path
+            )
+            return None
 
         # LML#537: tag both wait spans with the seam's method + cache_state
         # via ``apply_request_ctx_tags`` (a no-op when no context is active —
@@ -430,10 +453,23 @@ class DiscogsService:
 
                 response = await client.request(method, path, params=params)
 
-                # Log rate limit remaining for observability
+                # Log rate limit remaining for observability, and feed it to the
+                # LML#755 breaker so a nearly-empty token bucket trips the shed
+                # proactively (before the next wave of probes starts 429ing).
                 remaining = response.headers.get("X-Discogs-Ratelimit-Remaining")
                 if remaining:
                     logger.debug(f"Discogs rate limit remaining: {remaining}")
+
+                if response.status_code == 429:
+                    breaker.record_failure()
+                else:
+                    remaining_value: int | None = None
+                    if remaining is not None:
+                        try:
+                            remaining_value = int(remaining)
+                        except ValueError:
+                            remaining_value = None
+                    breaker.record_success(remaining=remaining_value)
             except httpx.RequestError as e:
                 logger.error(
                     "Discogs request failed: %s %s -> %s: %r",

@@ -111,6 +111,21 @@ The arming exception set lives in `_ARMING_EXCEPTIONS` in `discogs/fallthrough.p
 
 Cool-down arm projects `data.cache_fallback_fired = {reason, error_class, cool_down_seconds}` onto the active Sentry transaction, matching the pattern used by `_log_album_title_fallback` in `lookup/strategies/track_on_compilation.py`. Queryable in the Sentry trace explorer to track outage incidents.
 
+### Discogs saturation circuit-breaker (LML#755)
+
+Distinct from the cache-outage cool-down above (which shorts the *PG read* leg when the discogs-cache DB is unreachable), this breaker shorts the *live Discogs API* leg when the outbound Discogs path is **rate-saturated**. It lives in `discogs/breaker.py` (`DiscogsCircuitBreaker`) with a per-event-loop accessor in `discogs/ratelimit.py` (`get_discogs_breaker`), the same process-global-on-single-worker scope as the limiter/semaphore.
+
+Root cause it addresses: the outbound limiter (`DISCOGS_RATE_LIMIT` 50/min + a 5-permit semaphore) bounds egress *rate*, but under sustained over-demand (the 2026-07-10 `flowsheet-metadata-backfill` flood) it converts excess load into unbounded per-request *latency* — live probes queue on the 50/min `rate_limiter.acquire()` and 429 backoff stacks to ~62s/call, so a lookup's wall time runs past Backend-Service's 35s client timeout → timeouts → worker saturation → 502s.
+
+The breaker is checked in `discogs/service.py:_request_with_retry` **before** `rate_limiter.acquire()`. When OPEN it returns `None` immediately — no queuing, no network, no backoff — and every call site already guards with `if response is not None`, so the lookup **fast-fails to cache-only**: library + already-cached-Discogs results, live probe shed. Cache hits never reach this seam (they short-circuit in `fallthrough()` above), so only the live-probe tail is degraded; healthy cache-hit behavior is unchanged.
+
+State machine (fed from `_request_with_retry`: 429 → `record_failure`, non-429 → `record_success(remaining)`):
+- **CLOSED** → requests flow. `DISCOGS_BREAKER_FAILURE_THRESHOLD` consecutive 429s (default 8) or a response reporting `X-Discogs-Ratelimit-Remaining` ≤ `DISCOGS_BREAKER_REMAINING_FLOOR` (default 3) trip it OPEN. A single healthy response resets the consecutive-failure run.
+- **OPEN** → requests shed for `DISCOGS_BREAKER_COOLDOWN_SECONDS` (default 20s), then a single half-open trial is admitted.
+- **HALF_OPEN** → one trial in flight (concurrent callers still shed); a healthy response CLOSES the breaker, a 429 or still-exhausted remaining re-OPENS it.
+
+Every shed increments `discogs_breaker_open_shed` on the per-request `cache_stats` dict — the same #683 `cache.*` counter surface (`cache.discogs_breaker_open_shed` in PostHog, `lml.cache.discogs_breaker_open_shed` on the Sentry transaction) the row-less flag degradation alerts use, so breaker-open time is alertable. Env-var reference in [`env-vars.md`](env-vars.md).
+
 ## External-Cache Fallback for `/api/v1/lookup` (Phase 1.5 mojibake recovery)
 
 `POST /api/v1/lookup` accepts an opt-in `include_external_caches: bool` flag (default `false`). When the WXYC library catalog returns no results AND the request supplies an `artist` field AND the flag is set, the orchestrator runs a fuzzy artist-name search against the discogs-cache PostgreSQL DB; on miss it falls through to musicbrainz-cache. The matched canonical name is wrapped in a synthetic `LookupResultItem` (`library_item.id = 0`, `call_number = "(external)"`, `library_url = ""`) so the caller's existing scoring code applies as-is. The response carries an `external_source` field — `'library' | 'discogs' | 'musicbrainz' | null` — for provenance.
