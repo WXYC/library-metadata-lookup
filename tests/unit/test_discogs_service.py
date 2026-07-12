@@ -3202,10 +3202,48 @@ class TestSearchArtists:
         assert results == [DiscogsArtistSearchResult(artist_id=9, title="L'Rain")]
 
     @pytest.mark.asyncio
-    async def test_blank_name_short_circuits_without_api_call(self, service):
+    async def test_wrong_shaped_body_returns_none(self, service):
+        """A 200 body that parses as JSON but isn't the expected shape is
+        "couldn't measure" → ``None``, never an uncaught exception. An
+        intermediary (CDN error page, proxy) can 200 with anything."""
+        for body in [{"results": None}, ["not", "a", "dict"], "a string", {"results": "nope"}]:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.raise_for_status = MagicMock()
+            mock_resp.json.return_value = body
+            with patch.object(
+                service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+            ):
+                assert await service.search_artists("Wishy") is None, f"body={body!r}"
+
+    @pytest.mark.asyncio
+    async def test_wrong_typed_item_returns_none(self, service):
+        """An item whose fields defeat model validation means the page shape
+        isn't understood — the whole observation is untrusted (``None``),
+        because a partially-read page could produce a false-unique
+        ``candidate_count`` and mint a wrong identity."""
+        mock_resp = make_artist_search_response(
+            [
+                {"id": 9, "title": "L'Rain", "type": "artist"},
+                {"id": [1], "title": "Bad Id Shape", "type": "artist"},
+            ]
+        )
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            assert await service.search_artists("L'Rain") is None
+
+    @pytest.mark.asyncio
+    async def test_blank_name_raises_value_error(self, service):
+        """Blank input is a caller error, not a measurement: returning ``[]``
+        would fabricate a "Discogs answered, zero candidates" observation for
+        a probe that was never sent. The resolver short-circuits empty
+        identity-match forms before this tier."""
         with patch.object(service, "_request_with_retry", new_callable=AsyncMock) as mock_req:
-            assert await service.search_artists("") == []
-            assert await service.search_artists("   ") == []
+            with pytest.raises(ValueError, match="blank"):
+                await service.search_artists("")
+            with pytest.raises(ValueError, match="blank"):
+                await service.search_artists("   ")
         mock_req.assert_not_awaited()
 
     @pytest.mark.asyncio

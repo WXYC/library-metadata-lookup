@@ -2358,6 +2358,16 @@ class TestArtistTrigramCandidates:
         assert result["Popsicle"] == {5001, 5002}
 
     @pytest.mark.asyncio
+    async def test_threshold_below_pg_trgm_floor_raises(self, cache_service, mock_asyncpg_pool):
+        """A threshold under pg_trgm's session ``similarity_threshold`` floor
+        (default 0.3) would silently drop candidates in the gap — the ``%``
+        operator pre-filters at the floor before ``similarity() >= $2`` runs.
+        Reject loudly instead of under-returning."""
+        with pytest.raises(ValueError, match="0.3"):
+            await cache_service.artist_trigram_candidates(["Stereolab"], threshold=0.2)
+        mock_asyncpg_pool.fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_db_error_wrapped_as_cache_unavailable(self, cache_service, mock_asyncpg_pool):
         mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn refused"))
         with pytest.raises(CacheUnavailableError):

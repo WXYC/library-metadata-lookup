@@ -9,7 +9,6 @@ Requires: DATABASE_URL_TEST env var or Docker postgres on port 5433.
 
 from __future__ import annotations
 
-from typing import ClassVar
 from unittest.mock import AsyncMock
 
 import pytest
@@ -28,7 +27,14 @@ from scripts.entity_resolution.discogs import DiscogsReconciler, ReconciliationM
 
 # ``pg_pool`` (max_size=3) lives in conftest; ``DATABASE_URL`` is imported from
 # there for the ``source._dsn`` wiring and ``monkeypatch.setenv`` calls below.
-from tests.integration.conftest import DATABASE_URL
+# The stub-schema helpers are shared with ``test_artist_candidate_sets.py`` so
+# the discogs-cache mirrors can't drift per-file.
+from tests.integration.conftest import (
+    DATABASE_URL,
+    F_UNACCENT_WRAPPER_SQL,
+    RECONCILER_TABLE_DDL,
+    skip_unless_wxyc_identity_match_artist,
+)
 
 
 @pytest_asyncio.fixture
@@ -215,15 +221,6 @@ class TestDiscogsReconciliationSQLSmoke:
     source tree and is vendored byte-for-byte into each cache repo.
     """
 
-    _STUB_TABLES: ClassVar[dict[str, str]] = {
-        "release_artist": (
-            "release_id INTEGER, artist_id INTEGER, artist_name TEXT, extra INTEGER DEFAULT 0"
-        ),
-        "artist_member": "artist_id INTEGER, member_id INTEGER, member_name TEXT",
-        "artist_alias": "artist_id INTEGER, alias_name TEXT",
-        "artist_name_variation": "artist_id INTEGER, name TEXT",
-    }
-
     @pytest_asyncio.fixture(autouse=True)
     async def ensure_reconciler_schema(self, pg_pool):
         """Skip when ``wxyc_identity_match_artist`` isn't deployed, otherwise
@@ -238,18 +235,9 @@ class TestDiscogsReconciliationSQLSmoke:
         stubs we created get dropped, so cross-test pollution can't accrete.
         """
         async with pg_pool.acquire() as conn:
-            exists = await conn.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = $1)",
-                "wxyc_identity_match_artist",
-            )
-            if not exists:
-                pytest.skip(
-                    "wxyc_identity_match_artist not deployed -- needs alembic 0004 "
-                    "from WXYC/discogs-etl. CI's plain postgres-16 service container "
-                    "doesn't have it. See class docstring for the TODO."
-                )
+            await skip_unless_wxyc_identity_match_artist(conn)
             created_tables: set[str] = set()
-            for table_name, columns in self._STUB_TABLES.items():
+            for table_name, columns in RECONCILER_TABLE_DDL.items():
                 pre_existing = await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
                     "WHERE table_schema = current_schema() AND table_name = $1)",
@@ -382,14 +370,9 @@ class TestTrigramFallbackSQLIntegration:
 
             # IMMUTABLE f_unaccent wrapper mirroring discogs-cache, so the
             # trigram operator can ride a functional GIN index. Idempotent.
+            await conn.execute(F_UNACCENT_WRAPPER_SQL)
             await conn.execute(
-                "CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text "
-                "AS $$ SELECT unaccent('unaccent', $1) $$ "
-                "LANGUAGE sql IMMUTABLE PARALLEL SAFE"
-            )
-            await conn.execute(
-                "CREATE TABLE release_artist ("
-                "release_id INTEGER, artist_id INTEGER, artist_name TEXT, extra INTEGER DEFAULT 0)"
+                f"CREATE TABLE release_artist ({RECONCILER_TABLE_DDL['release_artist']})"
             )
             await conn.executemany(
                 "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "

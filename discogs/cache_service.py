@@ -100,18 +100,31 @@ _ARTIST_SEARCH_CACHE = create_ttl_cache(maxsize=2000, ttl=3600)
 # dict collapse is correct for its library-name inputs (the corpus was
 # filtered around exactly those artists), but the bare-name resolver must
 # see every id an overloaded form points at — "ambiguous names must not
-# mint" is unenforceable on a collapsed result. Keep the per-leg predicates
-# (``extra = 0``, NOT NULL filters, ``wxyc_identity_match_artist`` on the
-# column side) byte-compatible with the reconciler so both consumers see the
-# same candidate universe.
+# mint" is unenforceable on a collapsed result.
+#
+# Candidate-universe parity with the reconciler: the *matching* predicates
+# (``extra = 0``, ``wxyc_identity_match_artist(col) = ANY($1)``) match its
+# SQL byte-for-byte and must stay that way. The ``IS NOT NULL`` id filters
+# here have no counterpart in the reconciler's SQL because it drops NULL
+# ids Python-side (the ``if row[...] is not None`` comprehensions in its
+# ``_member_match`` / ``_alias_match`` / ``_name_variation_match``) — same
+# universe, filtered on a different side of the wire. Don't "fix" either
+# side to match the other.
 #
 # All four legs for the whole batch ride one round-trip (UNION ALL + a
 # ``leg`` label column); the batched PG pre-pass budget for a resolve
-# request is 1-3 round-trips total. Inputs are pre-normalized
-# identity-match forms — ``wxyc_etl.text.to_identity_match_form`` on the
-# Python side, ``wxyc_identity_match_artist(col)`` on the column side, the
-# symmetric pair from wiki ``plans/library-hook-canonicalization.md``
-# §3.3.5 (same as the reconciler; rides the same functional indexes).
+# request is 1-3 round-trips total. That's the *wire* cost only: no
+# expression index over ``wxyc_identity_match_artist(...)`` exists yet
+# (the discogs-etl index build is tracked separately — see the reconciler
+# module docstring), so ``= ANY(...)`` evaluates the function per row and
+# each call is four sequential scans of large tables on the shared
+# discogs-cache PG. Acceptable for the offline resolver/drain tier this
+# serves; do NOT wire these queries into the /lookup hot path until the
+# expression indexes land. Inputs are pre-normalized identity-match forms
+# — ``wxyc_etl.text.to_identity_match_form`` on the Python side,
+# ``wxyc_identity_match_artist(col)`` on the column side, the symmetric
+# pair from wiki ``plans/library-hook-canonicalization.md`` §3.3.5 (same
+# as the reconciler).
 _ARTIST_EQUALITY_CANDIDATES_SQL = """\
 SELECT 'exact' AS leg,
        wxyc_identity_match_artist(ra.artist_name) AS form,
@@ -459,6 +472,12 @@ class DiscogsCacheService:
         candidate sets and how they deliberately diverge from the
         reconciler's first-match-wins cascade.
 
+        One round-trip is the wire cost, not the execution cost: with no
+        ``wxyc_identity_match_artist`` expression index deployed yet, each
+        call sequential-scans four large tables on the shared discogs-cache
+        PG. Offline resolver/drain tier only — do not call from the
+        /lookup hot path (see the SQL comment).
+
         Args:
             forms: Identity-match forms, pre-normalized on the Python side
                 via ``wxyc_etl.text.to_identity_match_form`` (the symmetric
@@ -477,17 +496,14 @@ class DiscogsCacheService:
         try:
             rows = await self.pool.fetch(_ARTIST_EQUALITY_CANDIDATES_SQL, forms)
             results = {form: ArtistEqualityCandidates() for form in forms}
-            leg_sets = {
-                "exact": lambda c: c.exact,
-                "member": lambda c: c.member,
-                "alias": lambda c: c.alias,
-                "name_variation": lambda c: c.name_variation,
-            }
             for row in rows:
-                candidates = results.get(row["form"])
-                if candidates is None:
-                    continue
-                leg_sets[row["leg"]](candidates).update(row["artist_ids"])
+                # The SQL's leg labels are the dataclass field names, and
+                # ``= ANY($1)`` guarantees every returned form is an input
+                # form — direct access, so any future violation of either
+                # invariant fails LOUDLY (KeyError/AttributeError → wrapped
+                # below) instead of silently dropping candidate ids, which
+                # would let an ambiguous name read as unique and mint.
+                getattr(results[row["form"]], row["leg"]).update(row["artist_ids"])
             return results
         except Exception as e:
             logger.error(f"Cache artist_equality_candidates failed: {e}")
@@ -524,14 +540,23 @@ class DiscogsCacheService:
         """
         if not names:
             return {}
+        if threshold < 0.3:
+            # pg_trgm's session ``similarity_threshold`` floor (default 0.3)
+            # pre-filters the ``%`` operator before ``similarity() >= $2``
+            # runs, so a lower threshold would silently drop candidates in
+            # the [threshold, floor) gap. Reject loudly.
+            raise ValueError(
+                f"threshold {threshold} is below pg_trgm's similarity_threshold floor (0.3); "
+                "candidates in the gap would be silently dropped by the % pre-filter"
+            )
         try:
             rows = await self.pool.fetch(_ARTIST_TRIGRAM_CANDIDATES_SQL, names, threshold)
             results: dict[str, set[int]] = {name: set() for name in names}
             for row in rows:
-                candidates = results.get(row["input"])
-                if candidates is None:
-                    continue
-                candidates.update(row["artist_ids"])
+                # ``unnest($1)`` guarantees every returned input is an input
+                # key — direct access so a violation fails loudly (wrapped
+                # below) rather than silently dropping a candidate set.
+                results[row["input"]].update(row["artist_ids"])
             return results
         except Exception as e:
             logger.error(f"Cache artist_trigram_candidates failed: {e}")

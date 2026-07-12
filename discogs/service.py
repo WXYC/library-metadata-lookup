@@ -441,7 +441,7 @@ class DiscogsService:
         # via ``apply_request_ctx_tags`` (a no-op when no context is active —
         # the case for the small handful of legacy direct-call tests).
         # Production callers enter via ``fallthrough()`` (dominant) or via
-        # the ``request_context()`` helper (the three API-only methods that
+        # the ``request_context()`` helper (the four API-only methods that
         # bypass the seam and the four ``cache is None`` fallback branches).
 
         # The semaphore wraps a single attempt, not the whole retry loop
@@ -857,10 +857,20 @@ class DiscogsService:
           measured single-page observation. Titles are raw Discogs strings,
           "(N)" disambiguator intact (see ``DiscogsArtistSearchResult``).
         - ``None``: couldn't ask — 429-exhausted, network error, non-2xx,
-          or unparseable body. Callers must treat it as *unknown*, never
-          as a confirmed-empty verdict.
+          or a body whose shape defeats parsing (a partially-understood
+          page could yield a false-unique ``candidate_count``, so the
+          whole observation is untrusted). Callers must treat ``None`` as
+          *unknown*, never as a confirmed-empty verdict — in particular,
+          never coalesce it away with ``results or []`` / ``if not
+          results``, which silently turns "couldn't ask" into "measured
+          zero".
 
         Raises:
+            ValueError: on blank/whitespace-only ``name`` — a caller error,
+                not a measurement. Returning ``[]`` here would fabricate a
+                "Discogs answered, zero candidates" observation for a probe
+                that was never sent; the resolver short-circuits empty
+                identity-match forms before this tier.
             DiscogsBreakerOpenError: propagated from ``_request_with_retry``
                 when the LML#755 saturation breaker sheds the call, so the
                 resolver can short-circuit the rest of its batch to
@@ -868,10 +878,11 @@ class DiscogsService:
                 remaining name.
         """
         if not name or not name.strip():
-            return []
+            raise ValueError("search_artists requires a non-blank name")
 
         params: dict[str, Any] = {"type": "artist", "q": name, "per_page": 100}
 
+        add_discogs_breadcrumb("search_artists", {"name": name})
         with request_context("search_artists"):
             async with timed_api():
                 response = await self._request_with_retry("GET", "/database/search", params=params)
@@ -883,17 +894,17 @@ class DiscogsService:
         try:
             response.raise_for_status()
             data = response.json()
+            results: list[DiscogsArtistSearchResult] = []
+            for item in data.get("results", []):
+                artist_id = item.get("id")
+                title = item.get("title")
+                if artist_id is None or not title:
+                    continue
+                results.append(DiscogsArtistSearchResult(artist_id=artist_id, title=title))
         except Exception as e:
             logger.warning(f"search_artists failed for '{name}': {e}")
             return None
 
-        results: list[DiscogsArtistSearchResult] = []
-        for item in data.get("results", []):
-            artist_id = item.get("id")
-            title = item.get("title")
-            if artist_id is None or not title:
-                continue
-            results.append(DiscogsArtistSearchResult(artist_id=artist_id, title=title))
         return results
 
     def _process_search_result(self, result: dict, seen_albums: set) -> ReleaseInfo | None:

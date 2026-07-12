@@ -1,7 +1,7 @@
 """Tests for the LML#537 rate-limiter telemetry tags.
 
 When the ``fallthrough`` seam (or the ``request_context`` helper used by
-the three API-only methods that bypass it) falls through to the API leg,
+the four API-only methods that bypass it) falls through to the API leg,
 it sets ``_request_context_var`` carrying the seam's ``label`` and the
 resolved ``cache_state``. ``_request_with_retry`` reads that contextvar
 inside its ``lml.discogs.semaphore`` and ``lml.discogs.rate_limiter``
@@ -21,8 +21,9 @@ Covered:
    handful of legacy tests) don't have a contextvar set; spans should
    not blow up and should not carry the tags.
 5. **request_context helper** — used by ``search_releases_by_album_title``,
-   ``get_label_image``, ``get_master`` (the three API-only methods that
-   bypass ``fallthrough``); spans get tagged the same as the seam path.
+   ``get_label_image``, ``get_master``, ``search_artists`` (the four
+   API-only methods that bypass ``fallthrough``); spans get tagged the
+   same as the seam path.
 """
 
 from __future__ import annotations

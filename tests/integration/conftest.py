@@ -59,6 +59,57 @@ async def pg_pool():
         yield pool
 
 
+# ---------------------------------------------------------------------------
+# Shared discogs-cache stubbing helpers (reconciler / #759 candidate-set SQL)
+# ---------------------------------------------------------------------------
+
+# IMMUTABLE f_unaccent wrapper mirroring discogs-cache, so trigram operators
+# can ride a functional GIN index. Idempotent. Shared by every fixture that
+# stubs discogs-cache tables on a bare PG (``test_entity_resolution.py``,
+# ``test_artist_candidate_sets.py``) so the schema mirror can't drift
+# per-file — the suites it backs exist to prove SQL that must stay
+# predicate-compatible across two modules.
+F_UNACCENT_WRAPPER_SQL = (
+    "CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text "
+    "AS $$ SELECT unaccent('unaccent', $1) $$ "
+    "LANGUAGE sql IMMUTABLE PARALLEL SAFE"
+)
+
+# Stub DDL for the four discogs-cache tables read by the reconciler cascade
+# legs (``scripts/entity_resolution/discogs.py``) and the #759 candidate-set
+# queries (``discogs/cache_service.py``). One shared map so the stub shape
+# the two suites test against can't silently diverge.
+RECONCILER_TABLE_DDL: dict[str, str] = {
+    "release_artist": (
+        "release_id INTEGER, artist_id INTEGER, artist_name TEXT, extra INTEGER DEFAULT 0"
+    ),
+    "artist_member": "artist_id INTEGER, member_id INTEGER, member_name TEXT",
+    "artist_alias": "artist_id INTEGER, alias_name TEXT",
+    "artist_name_variation": "artist_id INTEGER, name TEXT",
+}
+
+
+async def skip_unless_wxyc_identity_match_artist(conn) -> None:
+    """``pytest.skip`` unless ``wxyc_identity_match_artist`` is deployed.
+
+    The function family ships via alembic 0004 from WXYC/discogs-etl and
+    depends on the ``wxyc_unaccent`` text-search dictionary (a server-side
+    rules file), so CI's plain ``postgres:16-alpine`` service container
+    doesn't have it. See ``TestDiscogsReconciliationSQLSmoke`` for the
+    provisioning TODO.
+    """
+    exists = await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = $1)",
+        "wxyc_identity_match_artist",
+    )
+    if not exists:
+        pytest.skip(
+            "wxyc_identity_match_artist not deployed -- needs alembic 0004 "
+            "from WXYC/discogs-etl. CI's plain postgres-16 service container "
+            "doesn't have it."
+        )
+
+
 @pytest_asyncio.fixture
 async def pg_pool_large():
     """Real asyncpg pool (``max_size=4``); skips on connect failure.
