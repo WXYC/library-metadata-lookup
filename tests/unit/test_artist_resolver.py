@@ -31,11 +31,20 @@ def _identity(library_name: str, **kwargs) -> Identity:
     return Identity(id=1, library_name=library_name, reconciliation_status="reconciled", **kwargs)
 
 
-def _pages(mapping: dict[str, list[DiscogsArtistSearchResult]]):
-    """search_artists side_effect: canned single-page observations by probe."""
+def _pages(mapping: dict[str, list[DiscogsArtistSearchResult] | None]):
+    """search_artists side_effect: canned single-page observations by probe.
+
+    Unmapped probes raise KeyError so a drift in probe derivation fails
+    the test loudly instead of degrading to a vacuous measured-zero
+    not_found (the same "couldn't ask" vs "measured zero" distinction the
+    real service refuses to coalesce). Map a probe to ``None`` to model
+    "couldn't ask", or to ``[]`` for an explicit measured-empty page.
+    """
 
     async def _search(name: str):
-        return mapping.get(name, [])
+        if name not in mapping:
+            raise KeyError(f"unexpected probe {name!r}; test mapped {sorted(mapping)}")
+        return mapping[name]
 
     return _search
 
@@ -93,8 +102,18 @@ class TestInputValidation:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "bad_name",
-        ["   ", "\t", "Ol\x00ga", "\x1c", "\ud800"],
-        ids=["spaces", "tab", "embedded-nul", "separator-control", "lone-surrogate"],
+        ["   ", "\t", "Ol\x00ga", "\x1c", "\ud800", "´", "(2)", " (2) ", "（２）"],
+        ids=[
+            "spaces",
+            "tab",
+            "embedded-nul",
+            "control-char-blank",
+            "lone-surrogate",
+            "empty-form-acute-accent",
+            "qualifier-only",
+            "qualifier-only-padded",
+            "qualifier-only-fullwidth",
+        ],
     )
     async def test_invalid_name_raises_before_any_probe(
         self, resolver, entity_store, discogs_cache, discogs_service, bad_name
@@ -407,8 +426,11 @@ class TestApiVerdicts:
 
         (result,) = results
         assert result.unresolved_reason == "not_found"
-        # A measured zero — the API tier ran and testified.
+        # A measured zero — the API tier ran and testified. The probe
+        # assert keeps this from going vacuous if probe derivation drifts
+        # (_pages also raises on unmapped probes).
         assert result.candidate_count == 0
+        discogs_service.search_artists.assert_awaited_once_with("REZN")
         entity_store.upsert_identity.assert_not_awaited()
         assert stats.not_found == 1
 
@@ -779,3 +801,267 @@ class TestWriteBack:
 
         with pytest.raises(PostgresError):
             await resolver.resolve(["Wishy"])
+
+
+class TestQualifierGeneralization:
+    """Qualifier detection rides the normalizer's own folds: any trailing
+    parenthesized/bracketed group — not just the ASCII "(N)" spelling —
+    separates a name from its bare form (round-2 review)."""
+
+    @pytest.mark.asyncio
+    async def test_width_variant_qualifier_groups_with_ascii_twin(self, resolver, discogs_service):
+        """NFKC folding keys '（２）' with '(2)': one group, one probe."""
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages(
+                {"Popsicle (2)": [DiscogsArtistSearchResult(artist_id=20, title="Popsicle (2)")]}
+            )
+        )
+
+        results, stats = await resolver.resolve(["Popsicle (2)", "Popsicle （２）"])
+
+        assert stats.deduped == 1
+        assert [r.discogs_artist_id for r in results] == [20, 20]
+
+    @pytest.mark.asyncio
+    async def test_bracket_variant_never_joins_bare_group(
+        self, resolver, entity_store, discogs_service
+    ):
+        """'Popsicle [2]' must not inherit the stored bare row's id — the
+        normalizer strips bracketed qualifiers too, so grouping must
+        treat them as qualified (the round-2 empirical hole)."""
+        entity_store.bulk_resolve_library_names = AsyncMock(
+            return_value={"Popsicle": _identity("Popsicle", discogs_artist_id=10)}
+        )
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages(
+                {
+                    "Popsicle [2]": [
+                        DiscogsArtistSearchResult(artist_id=10, title="Popsicle"),
+                        DiscogsArtistSearchResult(artist_id=20, title="Popsicle (2)"),
+                    ]
+                }
+            )
+        )
+
+        results, stats = await resolver.resolve(["Popsicle", "Popsicle [2]"])
+
+        assert stats.deduped == 2
+        assert results[0].discogs_artist_id == 10
+        assert results[0].method == "identity_store"
+        assert results[1].unresolved_reason == "ambiguous"
+        assert results[1].discogs_artist_id is None
+        entity_store.upsert_identity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_case_variant_qualified_store_row_decides(
+        self, resolver, entity_store, discogs_service
+    ):
+        """A stored 'Popsicle (2)' row matched via the LOWER leg for input
+        'POPSICLE (2)' carries the SAME qualifier — it IS that artist's
+        row and must decide (byte-exact comparison would make the name
+        permanently unresolvable, since qualified groups never mint)."""
+        entity_store.bulk_resolve_library_names = AsyncMock(
+            return_value={"POPSICLE (2)": _identity("Popsicle (2)", discogs_artist_id=20)}
+        )
+
+        results, stats = await resolver.resolve(["POPSICLE (2)"])
+
+        assert results[0].discogs_artist_id == 20
+        assert results[0].method == "identity_store"
+        discogs_service.search_artists.assert_not_awaited()
+        assert stats.api_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_qualified_groups_skip_cache_evidence(
+        self, resolver, discogs_cache, discogs_service
+    ):
+        """Cache legs key on the qualifier-stripped form and cannot
+        distinguish family members — for qualified groups the evidence is
+        skipped, not consulted."""
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages(
+                {"Popsicle (2)": [DiscogsArtistSearchResult(artist_id=20, title="Popsicle (2)")]}
+            )
+        )
+
+        results, _ = await resolver.resolve(["Popsicle (2)"])
+
+        assert results[0].discogs_artist_id == 20
+        assert results[0].cache_corroboration == []
+        discogs_cache.artist_equality_candidates.assert_not_awaited()
+        discogs_cache.artist_trigram_candidates.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_decorated_name_is_conservative_never_bare_winner(
+        self, resolver, entity_store, discogs_service
+    ):
+        """A legitimately-decorated input ('!!! (Chk Chk Chk)') resolves
+        only when Discogs titles the artist with the same qualifier; a
+        bare-titled winner is by construction not what the qualifier
+        names — ambiguous, and no mint either way (documented v1 recall
+        tradeoff: never a wrong mint)."""
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages(
+                {"!!! (Chk Chk Chk)": [DiscogsArtistSearchResult(artist_id=77, title="!!!")]}
+            )
+        )
+
+        results, _ = await resolver.resolve(["!!! (Chk Chk Chk)"])
+
+        assert results[0].unresolved_reason == "ambiguous"
+        assert results[0].candidate_count == 1
+        entity_store.upsert_identity.assert_not_awaited()
+
+
+class TestWinnerQualifierRule:
+    """The lone exact-form candidate's OWN title qualifier must equal the
+    group's — a mismatch in either direction is family evidence, not a
+    resolution (round-2 review)."""
+
+    @pytest.mark.asyncio
+    async def test_bare_group_never_mints_suffix_titled_winner(
+        self, resolver, entity_store, discogs_service
+    ):
+        """Page 1 for 'Popsicle' holding only 'Popsicle (2)' means the
+        bare member missed the page, not that the family is a singleton —
+        minting id 20 under key 'Popsicle' would be the durable wrong mint
+        the whole design exists to prevent."""
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages(
+                {"Popsicle": [DiscogsArtistSearchResult(artist_id=20, title="Popsicle (2)")]}
+            )
+        )
+
+        results, stats = await resolver.resolve(["Popsicle"])
+
+        (result,) = results
+        assert result.unresolved_reason == "ambiguous"
+        assert result.candidate_count == 1
+        entity_store.upsert_identity.assert_not_awaited()
+        assert stats.minted == 0
+
+    @pytest.mark.asyncio
+    async def test_qualified_group_never_resolves_bare_titled_winner(
+        self, resolver, entity_store, discogs_service
+    ):
+        """'Popsicle (2)' with a page holding only bare 'Popsicle' must not
+        hand the suffixed input the bare artist's id — the suffix exists
+        because the bare name is someone else."""
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages(
+                {"Popsicle (2)": [DiscogsArtistSearchResult(artist_id=10, title="Popsicle")]}
+            )
+        )
+
+        results, _ = await resolver.resolve(["Popsicle (2)"])
+
+        (result,) = results
+        assert result.unresolved_reason == "ambiguous"
+        assert result.candidate_count == 1
+        assert result.discogs_artist_id is None
+        entity_store.upsert_identity.assert_not_awaited()
+
+
+class TestStoreConflict:
+    """Two group verbatims hitting store rows with different Discogs ids
+    is the store contradicting itself: conflict means doubt, doubt means
+    NULL — and the verdict must not flip with input order."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "batch",
+        [["The Tubs", "Tubs"], ["Tubs", "The Tubs"]],
+        ids=["article-first", "bare-first"],
+    )
+    async def test_conflicting_store_ids_are_ambiguous_in_both_orders(
+        self, resolver, entity_store, discogs_service, batch
+    ):
+        entity_store.bulk_resolve_library_names = AsyncMock(
+            return_value={
+                "The Tubs": _identity("The Tubs", discogs_artist_id=111),
+                "Tubs": _identity("Tubs", discogs_artist_id=999),
+            }
+        )
+
+        results, stats = await resolver.resolve(batch)
+
+        assert [r.unresolved_reason for r in results] == ["ambiguous", "ambiguous"]
+        # The API tier never ran — nothing was measured.
+        assert all(r.candidate_count is None for r in results)
+        discogs_service.search_artists.assert_not_awaited()
+        assert stats.api_calls == 0
+        assert stats.ambiguous == 2
+        entity_store.upsert_identity.assert_not_awaited()
+
+
+class TestInputHygiene:
+    @pytest.mark.asyncio
+    async def test_padded_name_mints_trimmed_key_and_echoes_raw(
+        self, resolver, entity_store, discogs_service
+    ):
+        """A stray trailing space must not mint a padded library_name the
+        store's exact leg would never find — internal work uses the
+        trimmed spelling, the response echoes the raw input."""
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages({"Wishy": [DiscogsArtistSearchResult(artist_id=123, title="Wishy")]})
+        )
+
+        results, _ = await resolver.resolve(["Wishy "])
+
+        assert results[0].name == "Wishy "
+        assert results[0].discogs_artist_id == 123
+        (queried,) = entity_store.bulk_resolve_library_names.await_args[0]
+        assert queried == ["Wishy"]
+        entity_store.upsert_identity.assert_awaited_once_with("Wishy", discogs_artist_id=123)
+
+    @pytest.mark.asyncio
+    async def test_padded_and_clean_spellings_share_one_group(self, resolver, discogs_service):
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages({"Wishy": [DiscogsArtistSearchResult(artist_id=123, title="Wishy")]})
+        )
+
+        results, stats = await resolver.resolve(["Wishy", " Wishy "])
+
+        assert stats.deduped == 1
+        assert [r.name for r in results] == ["Wishy", " Wishy "]
+        assert all(r.discogs_artist_id == 123 for r in results)
+
+
+class TestStatsInvariants:
+    @pytest.mark.asyncio
+    async def test_verdict_counters_partition_names(self, resolver, entity_store, discogs_service):
+        """resolved + not_found + ambiguous + escalation_unavailable must
+        equal names in a batch exercising every verdict kind at once — the
+        route's telemetry treats the counters as a partition."""
+        entity_store.bulk_resolve_library_names = AsyncMock(
+            return_value={"Juana Molina": _identity("Juana Molina", discogs_artist_id=187553)}
+        )
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages(
+                {
+                    "Wishy": [DiscogsArtistSearchResult(artist_id=123, title="Wishy")],
+                    "REZN": [],
+                    "Popsicle": [
+                        DiscogsArtistSearchResult(artist_id=10, title="Popsicle"),
+                        DiscogsArtistSearchResult(artist_id=20, title="Popsicle (2)"),
+                    ],
+                    "The Tubs": None,  # couldn't ask
+                }
+            )
+        )
+
+        names = ["Juana Molina", "Wishy", "wishy", "REZN", "Popsicle", "The Tubs"]
+        results, stats = await resolver.resolve(names)
+
+        assert stats.names == len(names) == len(results)
+        assert (
+            stats.resolved + stats.not_found + stats.ambiguous + stats.escalation_unavailable
+            == stats.names
+        )
+        assert stats.resolved == 3  # identity hit + Wishy + wishy (dup)
+        assert stats.not_found == 1
+        assert stats.ambiguous == 1
+        assert stats.escalation_unavailable == 1
+        assert stats.deduped == 5
+        assert stats.api_calls == 4
+        assert stats.minted == 1

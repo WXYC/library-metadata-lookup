@@ -10,44 +10,67 @@ check against the Discogs API. Cache results are evidence (corroboration
 not mint, because nothing self-corrects a wrong row (see the write-back
 note below).
 
-Inputs are validated before any tier runs: NUL-bearing, blank,
-non-encodable, and empty-identity-form names raise ``ValueError`` (the
-route maps it to 422) rather than receiving an in-band verdict — the
-wire contract's ``not_found`` means "the API tier ran and measured
-zero", which is never true of garbage input, and a NUL reaching the
-tier-2 PG binds would 503 the whole batch as a fake cache outage.
+Inputs are trimmed, then validated before any tier runs: NUL-bearing,
+blank, non-encodable, empty-identity-form, and qualifier-only names
+raise ``ValueError`` (the route maps it to 422) rather than receiving an
+in-band verdict — the wire contract's ``not_found`` means "the API tier
+ran and measured zero", which is never true of garbage input, and a NUL
+reaching the tier-2 PG binds would 503 the whole batch as a fake cache
+outage.
 
-Work units are groups keyed on ``(identity_match_form, "(N)" suffix)``.
-The form strips Discogs's trailing "(N)" disambiguator, which is
-load-bearing for overload DETECTION at the API tier — but a raw input
-that carries the suffix denotes a *different artist* than the bare name
-by Discogs convention, so suffixed inputs get their own group instead of
-inheriting the bare form's verdict (a stored ``Popsicle`` row must never
-answer for ``Popsicle (2)``).
+Work units are groups keyed on ``(identity_match_form, trailing
+qualifier)``. The identity-match form strips a trailing parenthesized or
+bracketed qualifier — Discogs's "(N)" disambiguator is the motivating
+case — which is load-bearing for overload DETECTION at the API tier. But
+a raw input carrying a qualifier denotes something other than the bare
+name (a different same-named artist, a scraper artifact, a decoration),
+so qualified inputs get their own group instead of inheriting the bare
+form's verdict: a stored ``Popsicle`` row must never answer for
+``Popsicle (2)``. Qualifiers are detected on the NFKC-folded, lowercased
+raw name so width/case variants ("（２）") key with their ASCII twins —
+the same folds the normalizer itself applies. The deliberate cost: a
+legitimately-decorated name ("!!! (Chk Chk Chk)") resolves only when
+Discogs titles the artist with the same qualifier; otherwise it lands
+``ambiguous``/``not_found`` and surfaces in the drain residual rather
+than risk a wrong mint.
 
 Tiers, per group:
 
 1. ``EntityStore.bulk_resolve_library_names`` over **every** distinct
    verbatim in the group — a group-mate's exact stored row must not be
-   invisible just because a different spelling came first. A row
-   carrying ``discogs_artist_id`` decides (``method: identity_store``);
-   for suffix-bearing groups only an exact ``library_name`` match may
-   decide (the store's canonical read leg strips the suffix too, and a
-   bare-form row must not answer for the suffixed artist). A
-   Discogs-id-less row does not decide, but its stored key becomes the
-   mint target so the upsert fills that row in place instead of
-   accreting a near-duplicate key.
+   invisible just because a different spelling came first. A row may
+   decide only when its OWN stored key carries the group's qualifier
+   (the store's canonical read leg strips qualifiers too, so a bare-form
+   row can come back for a qualified read; byte-equality is NOT required
+   — a case/width variant of a genuinely-qualified stored key still
+   decides). Rows carrying ``discogs_artist_id`` decide
+   (``method: identity_store``) — unless two distinct ids surface across
+   the group's verbatims, which is the store contradicting itself:
+   conflict means doubt, doubt means NULL (``ambiguous``, and
+   deterministic in batch content where first-wins would flip with input
+   order). A Discogs-id-less row does not decide, but for unqualified
+   groups its stored key becomes the mint target so the upsert fills
+   that row in place instead of accreting a near-duplicate key.
 2. ``DiscogsCacheService.artist_equality_candidates`` +
    ``artist_trigram_candidates`` — candidate SETS (an equality-leg
    candidate that disagrees with the API winner forces ``ambiguous``;
-   trigram neighbors are yield telemetry and never veto).
+   trigram neighbors are yield telemetry and never veto). **Unqualified
+   groups only**: the cache legs key on the qualifier-stripped form, so
+   for a qualified group they cannot distinguish the family member the
+   qualifier names — evidence that can neither corroborate nor veto a
+   specific member is skipped, not consulted (it would also bind
+   non-fixed-point forms like ``sault (2)`` that the SQL normalizer
+   strips differently, measuring false zeroes).
 3. ``DiscogsService.search_artists`` — the exact-form uniqueness check,
-   probed with a deterministic representative of the group
-   (``min()`` of its verbatims) so the single-page observation universe
-   cannot vary with input order. Serial, never fanned out: the shared
-   limiter paces globally at 50/min, so intra-request concurrency can't
-   beat it and only starves interleaved live-lookup traffic of
-   semaphore slots (LML#370/#372).
+   probed with a deterministic representative of the group (``min()`` of
+   its verbatims) so the single-page observation universe cannot vary
+   with input order. The lone exact-form candidate's OWN title qualifier
+   must equal the group's: a "(N)"-titled singleton answering a bare
+   input is evidence of an overloaded family whose bare member missed
+   the page (and vice versa) — ``ambiguous``, never a guess. Serial,
+   never fanned out: the shared limiter paces globally at 50/min, so
+   intra-request concurrency can't beat it and only starves interleaved
+   live-lookup traffic of semaphore slots (LML#370/#372).
 
 Write-back: ``upsert_identity``'s ON CONFLICT arm is
 ``COALESCE(EXCLUDED.discogs_artist_id, existing)`` — **new wins when
@@ -56,9 +79,12 @@ overwriting an existing id therefore rests on the tier-1 read gate,
 which is up to ~30s stale at mint time under the serial API pacing — a
 concurrent writer in that window is silently overwritten (LML#766
 tracks the store-level fill-if-null primitive that closes this).
-Suffix-bearing groups never mint: a "(N)"-keyed row is unreachable via
-the three-leg read and pure pollution (per the #759 design), so a
-suffixed winner is returned to the caller but not persisted.
+Qualifier-bearing groups never mint: a qualified key is unreachable via
+the bare-name reads Backend actually issues (only an exact-leg read of
+the same qualified string finds it — which is also why such a stored row
+may legitimately decide its own group) and is pure pollution per the
+#759 design, so a qualified winner is returned to the caller but not
+persisted.
 
 The deliberate divergence from the reconciler's first-match-wins cascade
 (``scripts/entity_resolution/discogs.py``) is documented on the
@@ -69,14 +95,16 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from wxyc_etl.text import to_identity_match_form
 
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import DiscogsCacheService
+from discogs.models import DiscogsArtistSearchResult
 from discogs.service import DiscogsService
-from entity.store import EntityStore
+from entity.store import EntityStore, Identity
 from generated.api_models import (
     ArtistResolveCacheLeg,
     ArtistResolveMethod,
@@ -86,10 +114,28 @@ from generated.api_models import (
 
 logger = logging.getLogger(__name__)
 
-# Discogs's trailing artist disambiguator ("Popsicle (2)"). Applied to the
-# RAW input: the identity-match form strips it, so it is the only signal
-# separating a suffixed input from its bare-form namesake.
-_DISAMBIG_SUFFIX_RE = re.compile(r"\((\d+)\)\s*$")
+# A trailing parenthesized/bracketed qualifier — Discogs's "(N)" artist
+# disambiguator is the motivating case, but the identity-match form strips
+# ANY trailing group (including "[2]", "(Sweden)", "(1975)"), so qualifier
+# detection must cover the same surface or a variant spelling silently
+# rejoins the bare group. Matched against the NFKC-folded lowercase name
+# (below) so fullwidth "（２）" keys identically to "(2)".
+_TRAILING_QUALIFIER_RE = re.compile(r"([(\[][^()\[\]]*[)\]])\s*$")
+
+
+def _split_trailing_qualifier(name: str) -> tuple[str | None, str]:
+    """Return ``(qualifier, prefix)`` from the NFKC-folded lowercase name.
+
+    ``qualifier`` is the folded trailing group text (``None`` when the
+    name has no trailing qualifier); ``prefix`` is the folded text before
+    it. Folding mirrors the normalizer's own width/case folds so this
+    yields one canonical qualifier key per semantic spelling.
+    """
+    folded = unicodedata.normalize("NFKC", name).lower()
+    match = _TRAILING_QUALIFIER_RE.search(folded)
+    if match is None:
+        return None, folded
+    return match.group(1), folded[: match.start()]
 
 
 @dataclass
@@ -98,11 +144,14 @@ class ResolveStats:
 
     Verdict counters count response POSITIONS (duplicates share their
     group's verdict), so they sum to ``names``. ``deduped`` counts unique
-    ``(form, disambiguator)`` groups and ``minted`` counts upserts
-    performed. ``api_calls`` counts ``search_artists`` probes that
-    reached the outbound path — including ones that came back ``None``
-    (a 429-exhausted or distrusted probe still consumed shared-limiter
-    budget); breaker-shed names never probe and are not counted.
+    ``(form, qualifier)`` groups and ``minted`` counts upserts performed.
+    ``api_calls`` counts ``search_artists`` probes that returned to the
+    resolver — including ``None`` returns (a 429-exhausted or distrusted
+    probe still consumed shared-limiter budget). A probe shed by the
+    breaker is not counted: usually it was refused at entry before any
+    HTTP left the building, though a mid-flight open may have spent
+    attempts first — the service-level cache-stats counters carry the
+    exact per-request HTTP tally.
     """
 
     names: int = 0
@@ -117,16 +166,17 @@ class ResolveStats:
 
 @dataclass
 class _FormGroup:
-    """One unique ``(identity-match form, "(N)" suffix)``: the unit of work."""
+    """One unique ``(identity-match form, trailing qualifier)`` work unit."""
 
     form: str
-    disambig: int | None
-    first_verbatim: str
-    # Key the mint targets: the first occurrence's verbatim, or the stored
-    # ``library_name`` when tier 1 found a Discogs-id-less row to fill.
+    qualifier: str | None
+    # Key the mint targets: the first occurrence's trimmed verbatim, or
+    # the stored ``library_name`` when tier 1 found a Discogs-id-less row
+    # to fill (unqualified groups only — qualified groups never mint).
     mint_key: str
-    # Distinct raw spellings in position order; tier 1 reads all of them,
-    # tier 3 probes with min() so the verdict can't depend on input order.
+    # Distinct trimmed spellings in position order; tier 1 reads all of
+    # them, tier 3 probes with min() so the observation universe can't
+    # depend on input order.
     verbatims: list[str] = field(default_factory=list)
     corroboration: list[ArtistResolveCacheLeg] = field(default_factory=list)
     equality_union: set[int] = field(default_factory=set)
@@ -134,9 +184,31 @@ class _FormGroup:
     result: ArtistResolveResult | None = None
 
     @property
+    def first_verbatim(self) -> str:
+        return self.verbatims[0]
+
+    @property
     def probe(self) -> str:
         """Deterministic tier-3 query string (content-, not order-, derived)."""
         return min(self.verbatims)
+
+    def resolved(
+        self,
+        *,
+        discogs_artist_id: int,
+        method: ArtistResolveMethod,
+        canonical_name: str | None,
+        candidate_count: int | None,
+    ) -> ArtistResolveResult:
+        return ArtistResolveResult(
+            name=self.first_verbatim,
+            discogs_artist_id=discogs_artist_id,
+            canonical_name=canonical_name,
+            method=method,
+            cache_corroboration=self.corroboration,
+            unresolved_reason=None,
+            candidate_count=candidate_count,
+        )
 
     def unresolved(
         self,
@@ -155,21 +227,21 @@ class _FormGroup:
         )
 
 
-def _validate_name(index: int, name: str) -> str:
-    """Return the identity-match form, or raise ValueError (route → 422).
+def _validate_name(index: int, name: str) -> tuple[str, str | None]:
+    """Return ``(identity-match form, qualifier)`` or raise ValueError.
 
-    Garbage input must not receive an in-band verdict: ``not_found`` is a
-    measured zero a consumer may durably negative-cache, and a NUL that
-    reaches the tier-2 PG binds fails the whole batch as a fake cache
-    outage (PG rejects U+0000 in text). Note the empty-form rejection is
-    a v1 recall limit for names that are ALL punctuation-stripped by the
-    normalizer (e.g. the band "!!!" survives — its form is "!!!" — but a
-    name normalizing to "" has no queryable identity anywhere in the
-    pipeline).
+    ``name`` arrives pre-trimmed. Garbage input must not receive an
+    in-band verdict: ``not_found`` is a measured zero a consumer may
+    durably negative-cache, and a NUL that reaches the tier-2 PG binds
+    fails the whole batch as a fake cache outage (PG rejects U+0000 in
+    text). The empty-form and qualifier-only rejections are a v1 recall
+    limit for names with no identity content — the band "!!!" survives
+    (its form is "!!!"), but "" and "(2)" have nothing to resolve.
+    The route maps ValueError to 422.
     """
     if "\x00" in name:
         raise ValueError(f"names[{index}] contains U+0000 (NUL); fix the input at its source")
-    if not name.strip():
+    if not name:
         raise ValueError(f"names[{index}] is blank")
     try:
         form = to_identity_match_form(name)
@@ -177,7 +249,13 @@ def _validate_name(index: int, name: str) -> str:
         raise ValueError(f"names[{index}] is not encodable Unicode (lone surrogate?)") from e
     if not form:
         raise ValueError(f"names[{index}] normalizes to an empty identity-match form")
-    return form
+    qualifier, prefix = _split_trailing_qualifier(name)
+    if qualifier is not None and not prefix.strip():
+        raise ValueError(
+            f"names[{index}] is only a trailing qualifier (e.g. a bare Discogs "
+            "disambiguator) with no artist name before it"
+        )
+    return form, qualifier
 
 
 class BareNameArtistResolver:
@@ -207,13 +285,19 @@ class BareNameArtistResolver:
     ) -> tuple[list[ArtistResolveResult], ResolveStats]:
         """Resolve a batch of bare names; results are index-aligned with it.
 
+        Each ``results[i].name`` echoes ``names[i]`` byte-for-byte; all
+        internal work (grouping, store reads, probes, mint keys) uses the
+        whitespace-trimmed spelling so a stray trailing space can't mint
+        a padded ``library_name`` the store's exact leg would never find.
+
         ``dry_run`` runs every tier identically — including live API
         verification — but skips the ``entity.identity`` upsert.
 
         Raises:
             ValueError: on invalid input names (NUL, blank, lone
-                surrogates, empty identity-match form) — caller error,
-                not a measurement; the route maps it to 422.
+                surrogates, empty identity-match form, qualifier-only
+                strings) — caller error, not a measurement; the route
+                maps it to 422.
             CacheUnavailableError: tier-2 PG failure (route → 503).
             PostgresError / OSError: tier-1 or write-back PG failure
                 (route → 503). Discogs API failures never raise — they
@@ -221,87 +305,120 @@ class BareNameArtistResolver:
         """
         stats = ResolveStats(names=len(names))
 
-        # Group on (form, disambiguator); dict order = first occurrence.
+        # Group on (form, qualifier); dict order = first occurrence.
         # ``order[i]`` is names[i]'s group, so fan-back never re-normalizes.
-        groups: dict[tuple[str, int | None], _FormGroup] = {}
+        groups: dict[tuple[str, str | None], _FormGroup] = {}
         order: list[_FormGroup] = []
         for index, name in enumerate(names):
-            form = _validate_name(index, name)
-            suffix = _DISAMBIG_SUFFIX_RE.search(name)
-            key = (form, int(suffix.group(1)) if suffix else None)
+            trimmed = name.strip()
+            form, qualifier = _validate_name(index, trimmed)
+            key = (form, qualifier)
             group = groups.get(key)
             if group is None:
-                group = _FormGroup(form=form, disambig=key[1], first_verbatim=name, mint_key=name)
+                group = _FormGroup(form=form, qualifier=qualifier, mint_key=trimmed)
                 groups[key] = group
-            if name not in group.verbatims:
-                group.verbatims.append(name)
+            if trimmed not in group.verbatims:
+                group.verbatims.append(trimmed)
             order.append(group)
         stats.deduped = len(groups)
 
         # --- Tier 1: batched three-leg entity.identity read. -------------
-        # Every distinct verbatim is read (identical strings can't span
-        # groups, so the flattened list stays duplicate-free).
+        # Every distinct trimmed verbatim is read (identical strings can't
+        # span groups, so the flattened list stays duplicate-free).
         identities = await self._entity_store.bulk_resolve_library_names(
             [verbatim for group in groups.values() for verbatim in group.verbatims]
         )
         pending: list[_FormGroup] = []
         for group in groups.values():
-            decided = None
-            fillable = None
+            decided: dict[int, Identity] = {}
+            fillables: list[Identity] = []
             for verbatim in group.verbatims:
                 identity = identities.get(verbatim)
                 if identity is None:
                     continue
-                if group.disambig is not None and identity.library_name != verbatim:
-                    # The store's canonical leg strips "(N)" too, so a
-                    # bare-form row can answer a suffixed read. Only an
-                    # exact stored key may decide a suffixed group — the
-                    # suffix exists because the bare name is someone else.
+                row_qualifier, _ = _split_trailing_qualifier(identity.library_name)
+                if row_qualifier != group.qualifier:
+                    # The store's LOWER/canonical legs can hand back a
+                    # bare-form row for a qualified read (the canonical
+                    # leg strips qualifiers too) — only a row whose OWN
+                    # key carries the group's qualifier may speak for it.
+                    # Compared on the folded qualifier, not byte equality,
+                    # so a case/width variant of a genuinely-qualified
+                    # stored key still decides (refusing it would make the
+                    # name permanently unresolvable here, since qualified
+                    # groups never mint).
                     continue
                 if identity.discogs_artist_id is not None:
-                    decided = identity
-                    break
-                if fillable is None:
-                    # Row exists but can't answer — fill IT on mint, in
-                    # place, instead of accreting a near-duplicate key.
-                    fillable = identity
-            if decided is not None:
-                group.result = ArtistResolveResult(
-                    name=group.first_verbatim,
-                    discogs_artist_id=decided.discogs_artist_id,
-                    # entity.identity stores no Discogs title.
-                    canonical_name=None,
-                    method=ArtistResolveMethod.identity_store,
-                    # The store decides before cache evidence is consulted.
-                    cache_corroboration=[],
-                    unresolved_reason=None,
+                    decided[identity.discogs_artist_id] = identity
+                elif group.qualifier is None:
+                    fillables.append(identity)
+            if len(decided) > 1:
+                # Two verbatims of one group hit store rows with different
+                # ids — near-duplicate-key accretion contradicting itself.
+                # First-wins would flip the verdict with input order;
+                # conflict means doubt, doubt means NULL. candidate_count
+                # stays null: the API tier never ran, nothing was measured.
+                logger.warning(
+                    "artist-resolve store conflict for form '%s': ids %s",
+                    group.form,
+                    sorted(decided),
+                )
+                group.result = group.unresolved(
+                    reason=ArtistResolveUnresolvedReason.ambiguous,
                     candidate_count=None,
                 )
                 continue
-            if fillable is not None:
-                group.mint_key = fillable.library_name
+            if decided:
+                (artist_id,) = decided
+                group.result = group.resolved(
+                    discogs_artist_id=artist_id,
+                    method=ArtistResolveMethod.identity_store,
+                    # entity.identity stores no Discogs title.
+                    canonical_name=None,
+                    # The store decides before cache evidence is consulted;
+                    # corroboration stays empty, count stays unmeasured.
+                    candidate_count=None,
+                )
+                continue
+            if fillables:
+                # Deterministic fill target (content-, not order-, derived):
+                # fill IT in place instead of accreting a near-duplicate key.
+                group.mint_key = min(fillables, key=lambda row: row.library_name).library_name
             pending.append(group)
 
         # --- Tier 2: batched cache evidence (corroboration, never verdicts).
-        if pending:
-            # Groups can share a form (bare + suffixed); dedupe the binds.
+        # Unqualified groups only — the cache legs key on the
+        # qualifier-stripped form and cannot distinguish which family
+        # member a qualifier names, so their evidence can neither
+        # corroborate nor veto a qualified group (and multi-qualifier
+        # forms like "sault (2)" aren't fixed points of the normalizer,
+        # so binding them would measure false zeroes).
+        evidence_groups = [group for group in pending if group.qualifier is None]
+        if evidence_groups:
             equality = await self._discogs_cache.artist_equality_candidates(
-                list(dict.fromkeys(group.form for group in pending))
+                list(dict.fromkeys(group.form for group in evidence_groups))
             )
             trigram = await self._discogs_cache.artist_trigram_candidates(
-                [group.probe for group in pending]
+                [group.probe for group in evidence_groups]
             )
-            for group in pending:
+            for group in evidence_groups:
                 # Direct indexing on purpose: both queries promise every
                 # input key present (measured zeroes as empty sets), and a
                 # silent .get() default would mask a contract break that
                 # must fail loudly (a dropped candidate set can mint).
                 legs = equality[group.form]
                 # Leg field names are the wire enum values minus the
-                # "cache_" prefix — a rename fails loudly here.
-                group.corroboration = [
-                    ArtistResolveCacheLeg(f"cache_{leg}") for leg in legs.nonempty_legs()
-                ]
+                # "cache_" prefix. A missing twin is a SERVER contract
+                # break — RuntimeError, not the ValueError the route maps
+                # to 422 (that would blame the caller for our drift).
+                try:
+                    group.corroboration = [
+                        ArtistResolveCacheLeg(f"cache_{leg}") for leg in legs.nonempty_legs()
+                    ]
+                except ValueError as e:
+                    raise RuntimeError(
+                        f"equality leg has no ArtistResolveCacheLeg twin: {e}"
+                    ) from e
                 if trigram[group.probe]:
                     group.corroboration.append(ArtistResolveCacheLeg.cache_trigram)
                 # Trigram neighbors are excluded on purpose: the conflict
@@ -362,7 +479,7 @@ class BareNameArtistResolver:
     async def _api_verdict(
         self,
         group: _FormGroup,
-        page: list,
+        page: list[DiscogsArtistSearchResult],
         *,
         dry_run: bool,
         stats: ResolveStats,
@@ -370,7 +487,7 @@ class BareNameArtistResolver:
         """Apply the verdict table to a measured single-page observation."""
         # Exact-form family, distinct by artist id (first title per id
         # wins — page order is the API's relevance order). The
-        # identity-match form strips the "(N)" disambiguator, so
+        # identity-match form strips the trailing qualifier, so
         # "Popsicle (2)" collides with "Popsicle" — that strip IS the
         # overload detection.
         candidates: dict[int, str] = {}
@@ -409,6 +526,18 @@ class BareNameArtistResolver:
             )
 
         ((winner_id, winner_title),) = candidates.items()
+        winner_qualifier, _ = _split_trailing_qualifier(winner_title)
+        if winner_qualifier != group.qualifier:
+            # A "(N)"-titled singleton answering a bare input means the
+            # family is overloaded on Discogs and the bare member simply
+            # missed the page (a "(2)" exists only because a namesake
+            # does) — and a bare-titled singleton answering a qualified
+            # input is the bare artist, who is by construction not the
+            # one the qualifier names. Either direction: doubt → NULL.
+            return group.unresolved(
+                reason=ArtistResolveUnresolvedReason.ambiguous,
+                candidate_count=1,
+            )
         if group.equality_union - {winner_id}:
             # An equality-leg cache candidate points at a different artist:
             # conflict means doubt, doubt means NULL.
@@ -417,13 +546,14 @@ class BareNameArtistResolver:
                 candidate_count=1,
             )
 
-        if not dry_run and group.disambig is None:
+        if not dry_run and group.qualifier is None:
             # discogs_artist_id only — other id columns belong to their own
             # enrichment flows. COALESCE guards NULL-overwrites only; not
             # clobbering an EXISTING id rests on the tier-1 gate, which is
             # a stale read by mint time (LML#766 tracks the store-level
-            # fill-if-null fix). Suffix-bearing groups skip the mint
-            # entirely: a "(N)" key is unreachable via the three-leg read.
+            # fill-if-null fix). Qualifier-bearing groups skip the mint
+            # entirely: a qualified key is unreachable via the bare-name
+            # reads Backend issues, i.e. pure pollution.
             upserted = await self._entity_store.upsert_identity(
                 group.mint_key, discogs_artist_id=winner_id
             )
@@ -438,14 +568,11 @@ class BareNameArtistResolver:
                 )
             else:
                 stats.minted += 1
-        return ArtistResolveResult(
-            name=group.first_verbatim,
+        return group.resolved(
             discogs_artist_id=winner_id,
-            # The raw Discogs title, "(N)" suffix included — provenance
-            # wants the true Discogs string.
-            canonical_name=winner_title,
             method=ArtistResolveMethod.api_search,
-            cache_corroboration=group.corroboration,
-            unresolved_reason=None,
+            # The raw Discogs title, qualifier included — provenance wants
+            # the true Discogs string.
+            canonical_name=winner_title,
             candidate_count=1,
         )
