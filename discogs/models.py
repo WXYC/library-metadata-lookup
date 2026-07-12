@@ -306,6 +306,21 @@ class DiscogsSearchResponse(BaseModel):
     cached: bool = False
 
 
+class DiscogsArtistSearchResult(BaseModel):
+    """One artist hit from a ``/database/search?type=artist`` page (LML#759).
+
+    ``title`` is the raw Discogs artist title with any "(N)" disambiguator
+    intact. The bare-name resolver's overload detection normalizes it via
+    ``to_identity_match_form`` — which strips the parenthetical — so
+    "Popsicle (2)" collides with "Popsicle" and the family reads as
+    ambiguous. Stripping the suffix here would erase that signal, and
+    provenance wants the true Discogs string anyway.
+    """
+
+    artist_id: int
+    title: str
+
+
 class EnrichedDiscogsMatchResult(_GeneratedDiscogsMatchResult):
     """Extends the generated DiscogsMatchResult with enriched metadata fields.
 

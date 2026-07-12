@@ -12,6 +12,7 @@ The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 import asyncio
 import hashlib
 import logging
+from dataclasses import dataclass, field
 
 from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison
@@ -38,6 +39,23 @@ class CacheUnavailableError(Exception):
     """Raised when the PostgreSQL cache is unreachable."""
 
     pass
+
+
+@dataclass
+class ArtistEqualityCandidates:
+    """Per-form candidate id sets from the four equality legs (LML#759).
+
+    One entry per queried identity-match form; a leg with no matches is an
+    empty set (a measured zero, distinct from "not queried"). Sets — not a
+    single id — because the bare-name resolver's conflict rule needs every
+    candidate an overloaded form points at; collapsing to one would let an
+    ambiguous name mint.
+    """
+
+    exact: set[int] = field(default_factory=set)
+    member: set[int] = field(default_factory=set)
+    alias: set[int] = field(default_factory=set)
+    name_variation: set[int] = field(default_factory=set)
 
 
 # Mirrors ``_ARTIST_FUZZY_MATCH_THRESHOLD`` in ``discogs/service.py`` — the
@@ -72,6 +90,92 @@ _NEGATIVE_CACHE_DEFAULT_TTL_SECONDS = 604_800
 # ``create_ttl_cache`` so ``clear_all_caches()`` resets it alongside the
 # Discogs API memory caches. Per WXYC/library-metadata-lookup#359.
 _ARTIST_SEARCH_CACHE = create_ttl_cache(maxsize=2000, ttl=3600)
+
+# --- LML#759 candidate-set queries -----------------------------------------
+#
+# These are the reconciler's cascade legs (scripts/entity_resolution/
+# discogs.py) deliberately rewritten to return candidate SETS via
+# ``array_agg(DISTINCT ...)`` instead of ``SELECT DISTINCT`` rows. The
+# divergence is intentional, not drift: the reconciler's first-match-wins
+# dict collapse is correct for its library-name inputs (the corpus was
+# filtered around exactly those artists), but the bare-name resolver must
+# see every id an overloaded form points at — "ambiguous names must not
+# mint" is unenforceable on a collapsed result. Keep the per-leg predicates
+# (``extra = 0``, NOT NULL filters, ``wxyc_identity_match_artist`` on the
+# column side) byte-compatible with the reconciler so both consumers see the
+# same candidate universe.
+#
+# All four legs for the whole batch ride one round-trip (UNION ALL + a
+# ``leg`` label column); the batched PG pre-pass budget for a resolve
+# request is 1-3 round-trips total. Inputs are pre-normalized
+# identity-match forms — ``wxyc_etl.text.to_identity_match_form`` on the
+# Python side, ``wxyc_identity_match_artist(col)`` on the column side, the
+# symmetric pair from wiki ``plans/library-hook-canonicalization.md``
+# §3.3.5 (same as the reconciler; rides the same functional indexes).
+_ARTIST_EQUALITY_CANDIDATES_SQL = """\
+SELECT 'exact' AS leg,
+       wxyc_identity_match_artist(ra.artist_name) AS form,
+       array_agg(DISTINCT ra.artist_id) AS artist_ids
+FROM release_artist ra
+WHERE ra.extra = 0
+  AND ra.artist_id IS NOT NULL
+  AND wxyc_identity_match_artist(ra.artist_name) = ANY($1)
+GROUP BY wxyc_identity_match_artist(ra.artist_name)
+UNION ALL
+SELECT 'member' AS leg,
+       wxyc_identity_match_artist(am.member_name) AS form,
+       array_agg(DISTINCT am.member_id) AS artist_ids
+FROM artist_member am
+WHERE am.member_id IS NOT NULL
+  AND wxyc_identity_match_artist(am.member_name) = ANY($1)
+GROUP BY wxyc_identity_match_artist(am.member_name)
+UNION ALL
+SELECT 'alias' AS leg,
+       wxyc_identity_match_artist(aa.alias_name) AS form,
+       array_agg(DISTINCT aa.artist_id) AS artist_ids
+FROM artist_alias aa
+WHERE aa.artist_id IS NOT NULL
+  AND wxyc_identity_match_artist(aa.alias_name) = ANY($1)
+GROUP BY wxyc_identity_match_artist(aa.alias_name)
+UNION ALL
+SELECT 'name_variation' AS leg,
+       wxyc_identity_match_artist(nv.name) AS form,
+       array_agg(DISTINCT nv.artist_id) AS artist_ids
+FROM artist_name_variation nv
+WHERE nv.artist_id IS NOT NULL
+  AND wxyc_identity_match_artist(nv.name) = ANY($1)
+GROUP BY wxyc_identity_match_artist(nv.name)\
+"""
+
+# Batched analog of the reconciler's Stage 6 ``_TRIGRAM_FALLBACK_SQL``:
+# ``unnest`` the input names and let the pg_trgm ``%`` operator ride the
+# existing functional GIN index on ``lower(f_unaccent(artist_name))`` per
+# outer row (same expression as ``search_artists_by_name``; deliberately
+# NOT ``wxyc_identity_match_artist``, which has no trigram index). Unlike
+# the reconciler this returns the full above-threshold candidate set per
+# input, not the top-1 — trigram evidence feeds corroboration/telemetry
+# only and must expose every neighbor. The threshold is applied in SQL
+# because no caller needs the scores; note pg_trgm's session
+# ``similarity_threshold`` (``show_limit()``, default 0.3) pre-filters the
+# ``%`` operator, so a threshold below that floor would silently drop
+# candidates in the gap (same caveat as the reconciler's Stage 6).
+_ARTIST_TRIGRAM_CANDIDATES_SQL = """\
+SELECT q.input,
+       array_agg(DISTINCT ra.artist_id) AS artist_ids
+FROM unnest($1::text[]) AS q(input)
+JOIN release_artist ra
+  ON ra.extra = 0
+ AND ra.artist_id IS NOT NULL
+ AND lower(f_unaccent(ra.artist_name)) % lower(f_unaccent(q.input))
+ AND similarity(lower(f_unaccent(ra.artist_name)), lower(f_unaccent(q.input))) >= $2
+GROUP BY q.input\
+"""
+
+# Mirrors ``_DEFAULT_TRIGRAM_THRESHOLD`` in ``scripts/entity_resolution/
+# discogs.py`` — the acceptance floor validated in LML#215. Tied by intent:
+# a candidate the reconciler would not accept as a match is not evidence
+# the resolver should count either.
+_ARTIST_TRIGRAM_CANDIDATE_THRESHOLD = 0.85
 
 
 def _negative_cache_key_hash(artist: str | None, track: str, artist_as_keyword: bool) -> bytes:
@@ -343,6 +447,95 @@ class DiscogsCacheService:
         except Exception as e:
             logger.error(f"Cache search_artists_by_name failed: {e}")
             raise CacheUnavailableError(f"Cache search_artists_by_name failed: {e}") from e
+
+    async def artist_equality_candidates(
+        self, forms: list[str]
+    ) -> dict[str, ArtistEqualityCandidates]:
+        """Batched equality-leg candidate sets for identity-match forms (LML#759).
+
+        The bare-name resolver's tier-2 evidence pass: exact / member /
+        alias / name_variation legs for every form in one round-trip. See
+        the ``_ARTIST_EQUALITY_CANDIDATES_SQL`` comment for why these are
+        candidate sets and how they deliberately diverge from the
+        reconciler's first-match-wins cascade.
+
+        Args:
+            forms: Identity-match forms, pre-normalized on the Python side
+                via ``wxyc_etl.text.to_identity_match_form`` (the symmetric
+                partner of the SQL's ``wxyc_identity_match_artist``).
+                Passing raw names silently misses.
+
+        Returns:
+            One ``ArtistEqualityCandidates`` per input form — every key
+            present, with empty sets for legs that had no candidates.
+
+        Raises:
+            CacheUnavailableError: If the database is unreachable.
+        """
+        if not forms:
+            return {}
+        try:
+            rows = await self.pool.fetch(_ARTIST_EQUALITY_CANDIDATES_SQL, forms)
+            results = {form: ArtistEqualityCandidates() for form in forms}
+            leg_sets = {
+                "exact": lambda c: c.exact,
+                "member": lambda c: c.member,
+                "alias": lambda c: c.alias,
+                "name_variation": lambda c: c.name_variation,
+            }
+            for row in rows:
+                candidates = results.get(row["form"])
+                if candidates is None:
+                    continue
+                leg_sets[row["leg"]](candidates).update(row["artist_ids"])
+            return results
+        except Exception as e:
+            logger.error(f"Cache artist_equality_candidates failed: {e}")
+            raise CacheUnavailableError(f"Cache artist_equality_candidates failed: {e}") from e
+
+    async def artist_trigram_candidates(
+        self,
+        names: list[str],
+        *,
+        threshold: float = _ARTIST_TRIGRAM_CANDIDATE_THRESHOLD,
+    ) -> dict[str, set[int]]:
+        """Batched trigram-neighbor candidate sets for raw names (LML#759).
+
+        The resolver's fuzzy evidence leg — yield telemetry and
+        near-miss counting only, never a veto or a verdict (the #759
+        conflict rule is scoped to the equality legs). Takes RAW names,
+        not identity-match forms: the SQL applies ``lower(f_unaccent(...))``
+        to both sides so the ``%`` operator rides the existing GIN trigram
+        index, mirroring the reconciler's Stage 6 asymmetry note.
+
+        Args:
+            names: Raw artist names as received (first-occurrence verbatim
+                per deduped form, by the resolver's convention).
+            threshold: Minimum pg_trgm similarity [0, 1] for a candidate to
+                count. Values below pg_trgm's session floor (default 0.3)
+                silently drop candidates in the gap — see the SQL comment.
+
+        Returns:
+            Candidate ``artist_id`` sets keyed by input name — every key
+            present, empty set when nothing cleared the threshold.
+
+        Raises:
+            CacheUnavailableError: If the database is unreachable.
+        """
+        if not names:
+            return {}
+        try:
+            rows = await self.pool.fetch(_ARTIST_TRIGRAM_CANDIDATES_SQL, names, threshold)
+            results: dict[str, set[int]] = {name: set() for name in names}
+            for row in rows:
+                candidates = results.get(row["input"])
+                if candidates is None:
+                    continue
+                candidates.update(row["artist_ids"])
+            return results
+        except Exception as e:
+            logger.error(f"Cache artist_trigram_candidates failed: {e}")
+            raise CacheUnavailableError(f"Cache artist_trigram_candidates failed: {e}") from e
 
     async def search_releases_by_title(self, title: str, *, limit: int = 5) -> list[dict]:
         """Fuzzy-match an album/release title against ``release.title``.
