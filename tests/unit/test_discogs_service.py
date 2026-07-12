@@ -3185,21 +3185,26 @@ class TestSearchArtists:
             await service.search_artists("The Tubs")
 
     @pytest.mark.asyncio
-    async def test_skips_malformed_result_items(self, service):
-        mock_resp = make_artist_search_response(
-            [
-                {"title": "No Id", "type": "artist"},
-                {"id": None, "title": "Null Id", "type": "artist"},
-                {"id": 5, "type": "artist"},  # no title
-                {"id": 7, "title": "", "type": "artist"},  # empty title
-                {"id": 9, "title": "L'Rain", "type": "artist"},
-            ]
-        )
-        with patch.object(
-            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
-        ):
-            results = await service.search_artists("L'Rain")
-        assert results == [DiscogsArtistSearchResult(artist_id=9, title="L'Rain")]
+    async def test_malformed_item_distrusts_whole_page(self, service):
+        """A page containing ANY malformed item (missing/null id, missing/
+        empty title) is an observation we don't fully understand → ``None``.
+        Silently skipping the bad item would return a truncated page as a
+        trusted measurement — e.g. dropping a null-id "Popsicle (2)" leaves
+        ``candidate_count=1``, a false-unique that mints the wrong artist."""
+        malformed_variants = [
+            {"title": "No Id", "type": "artist"},
+            {"id": None, "title": "Null Id", "type": "artist"},
+            {"id": 5, "type": "artist"},  # no title
+            {"id": 7, "title": "", "type": "artist"},  # empty title
+        ]
+        for bad_item in malformed_variants:
+            mock_resp = make_artist_search_response(
+                [{"id": 9, "title": "L'Rain", "type": "artist"}, bad_item]
+            )
+            with patch.object(
+                service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+            ):
+                assert await service.search_artists("L'Rain") is None, f"item={bad_item!r}"
 
     @pytest.mark.asyncio
     async def test_wrong_shaped_body_returns_none(self, service):

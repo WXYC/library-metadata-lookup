@@ -283,10 +283,10 @@ async def test_no_tag_when_called_outside_seam(service, captured_spans):
 async def test_request_context_tags_direct_caller_spans(
     service, captured_spans, _ensure_skip_cache_clear
 ):
-    """``search_releases_by_album_title``, ``get_label_image``, ``get_master``
-    each call ``_request_with_retry`` directly (no fallthrough). The
-    ``request_context`` helper they wrap their call in must propagate the
-    method tag + cache_state=no_pg the same way the seam does."""
+    """``search_releases_by_album_title``, ``get_label_image``, ``get_master``,
+    and ``search_artists`` each call ``_request_with_retry`` directly (no
+    fallthrough). The ``request_context`` helper they wrap their call in must
+    propagate the method tag + cache_state=no_pg the same way the seam does."""
     with request_context("get_label_image"):
         await _drive_request_with_retry(service)
 

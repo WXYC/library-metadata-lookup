@@ -104,12 +104,14 @@ _ARTIST_SEARCH_CACHE = create_ttl_cache(maxsize=2000, ttl=3600)
 #
 # Candidate-universe parity with the reconciler: the *matching* predicates
 # (``extra = 0``, ``wxyc_identity_match_artist(col) = ANY($1)``) match its
-# SQL byte-for-byte and must stay that way. The ``IS NOT NULL`` id filters
-# here have no counterpart in the reconciler's SQL because it drops NULL
-# ids Python-side (the ``if row[...] is not None`` comprehensions in its
-# ``_member_match`` / ``_alias_match`` / ``_name_variation_match``) — same
-# universe, filtered on a different side of the wire. Don't "fix" either
-# side to match the other.
+# SQL byte-for-byte and must stay that way. NULL-id filtering differs by
+# leg: the exact leg's ``artist_id IS NOT NULL`` matches the reconciler's
+# ``_EXACT_MATCH_SQL`` byte-for-byte too, but the member/alias/
+# name_variation ``IS NOT NULL`` filters here have no SQL counterpart —
+# the reconciler drops those NULL ids Python-side (the ``if row[...] is
+# not None`` comprehensions in its ``_member_match`` / ``_alias_match`` /
+# ``_name_variation_match``; ``_exact_match`` carries a redundant one).
+# Same universe either way. Don't "fix" either side to match the other.
 #
 # All four legs for the whole batch ride one round-trip (UNION ALL + a
 # ``leg`` label column); the batched PG pre-pass budget for a resolve
@@ -168,10 +170,10 @@ GROUP BY wxyc_identity_match_artist(nv.name)\
 # the reconciler this returns the full above-threshold candidate set per
 # input, not the top-1 — trigram evidence feeds corroboration/telemetry
 # only and must expose every neighbor. The threshold is applied in SQL
-# because no caller needs the scores; note pg_trgm's session
-# ``similarity_threshold`` (``show_limit()``, default 0.3) pre-filters the
-# ``%`` operator, so a threshold below that floor would silently drop
-# candidates in the gap (same caveat as the reconciler's Stage 6).
+# because no caller needs the scores. The ``%`` operator's pre-filter
+# floor (the ``pg_trgm.similarity_threshold`` GUC) is pinned to 0.3 with
+# ``SET LOCAL`` in the executing transaction, and thresholds below it are
+# rejected up front — see ``artist_trigram_candidates``.
 _ARTIST_TRIGRAM_CANDIDATES_SQL = """\
 SELECT q.input,
        array_agg(DISTINCT ra.artist_id) AS artist_ids
@@ -524,33 +526,45 @@ class DiscogsCacheService:
         to both sides so the ``%`` operator rides the existing GIN trigram
         index, mirroring the reconciler's Stage 6 asymmetry note.
 
+        The query runs in its own transaction with ``SET LOCAL
+        pg_trgm.similarity_threshold = 0.3``: the GUC is settable at
+        server/database/role scope, so without the pin a DBA tuning the
+        shared discogs-cache could raise the ``%`` pre-filter floor above
+        a caller's ``threshold`` and silently drop candidates in the gap.
+        ``SET LOCAL`` reverts at transaction end — no session pollution on
+        the pooled connection. (Same posture as the canonicalization
+        scripts' explicit ``SET``.)
+
         Args:
             names: Raw artist names as received (first-occurrence verbatim
                 per deduped form, by the resolver's convention).
             threshold: Minimum pg_trgm similarity [0, 1] for a candidate to
-                count. Values below pg_trgm's session floor (default 0.3)
-                silently drop candidates in the gap — see the SQL comment.
+                count. Must be >= 0.3 (the pinned ``%`` pre-filter floor);
+                lower values raise ``ValueError`` because candidates in the
+                [threshold, 0.3) gap would be silently dropped.
 
         Returns:
             Candidate ``artist_id`` sets keyed by input name — every key
             present, empty set when nothing cleared the threshold.
 
         Raises:
+            ValueError: If ``threshold`` is below the 0.3 pre-filter floor.
+                Raised even for an empty ``names`` batch so a misconfigured
+                constant fails a dry run, not the first real batch.
             CacheUnavailableError: If the database is unreachable.
         """
-        if not names:
-            return {}
         if threshold < 0.3:
-            # pg_trgm's session ``similarity_threshold`` floor (default 0.3)
-            # pre-filters the ``%`` operator before ``similarity() >= $2``
-            # runs, so a lower threshold would silently drop candidates in
-            # the [threshold, floor) gap. Reject loudly.
             raise ValueError(
                 f"threshold {threshold} is below pg_trgm's similarity_threshold floor (0.3); "
                 "candidates in the gap would be silently dropped by the % pre-filter"
             )
+        if not names:
+            return {}
         try:
-            rows = await self.pool.fetch(_ARTIST_TRIGRAM_CANDIDATES_SQL, names, threshold)
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute("SET LOCAL pg_trgm.similarity_threshold = 0.3")
+                    rows = await conn.fetch(_ARTIST_TRIGRAM_CANDIDATES_SQL, names, threshold)
             results: dict[str, set[int]] = {name: set() for name in names}
             for row in rows:
                 # ``unnest($1)`` guarantees every returned input is an input
