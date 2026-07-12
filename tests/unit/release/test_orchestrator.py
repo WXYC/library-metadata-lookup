@@ -410,6 +410,73 @@ class TestIdentityWriteBack:
         assert not any("identifiers" in w.lower() for w in response.warnings)
 
     @pytest.mark.asyncio
+    async def test_writes_both_ids_when_discogs_and_bandcamp_present(self):
+        """LML#766: when the release carries BOTH a discogs_artist_id and a
+        bandcamp id, the two writes fire — fill-if-null for the contested
+        discogs_artist_id, COALESCE-additive upsert for the bandcamp_id."""
+        discogs = AsyncMock()
+        discogs.get_release.return_value = _make_release()
+        store = AsyncMock()
+        deps = _deps(discogs=discogs, entity_store=store)
+
+        # A bandcamp source promoted by the streaming check gives the release a
+        # bandcamp_album_url alongside the Discogs artist id.
+        streaming = _stream()
+        streaming.sources.bandcamp = SourceMatch(
+            url="https://juana-molina.bandcamp.com/album/doga", confidence=100.0
+        )
+        with patch(
+            "release.orchestrator.check_streaming_availability",
+            new=AsyncMock(return_value=streaming),
+        ):
+            await resolve_release(
+                ReleaseResolveRequest(url="https://www.discogs.com/release/12345"), deps
+            )
+
+        # Contested id → fill-if-null; bandcamp id → additive upsert. Both run.
+        store.fill_identity_discogs_id.assert_awaited_once_with("Juana Molina", 999)
+        store.upsert_identity.assert_awaited_once()
+        assert store.upsert_identity.call_args.kwargs["bandcamp_id"] == "juana-molina"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_delete_of_row_is_logged_not_silent(self, caplog):
+        """LML#766: the fill primitive's concurrent-delete path returns
+        ``identity=None`` (the row vanished between the blocked upsert and the
+        read-back). With no bandcamp id the additive upsert is skipped, so the
+        learned id is not re-stamped — but the drop must not be silent."""
+        import logging
+
+        from entity.store import FillOutcome
+
+        discogs = AsyncMock()
+        discogs.get_release.return_value = _make_release()
+        store = AsyncMock()
+        store.fill_identity_discogs_id.return_value = FillOutcome(
+            identity=None, filled=False, lost_race=False, previous_discogs_artist_id=None
+        )
+        deps = _deps(discogs=discogs, entity_store=store)
+
+        with (
+            patch(
+                "release.orchestrator.check_streaming_availability",
+                new=AsyncMock(return_value=_stream()),
+            ),
+            caplog.at_level(logging.WARNING, logger="release.orchestrator"),
+        ):
+            response = await resolve_release(
+                ReleaseResolveRequest(url="https://www.discogs.com/release/12345"), deps
+            )
+
+        # No bandcamp id and a discogs id present → additive upsert skipped.
+        store.upsert_identity.assert_not_called()
+        # Response is unaffected, but the vanished-row drop left a trail.
+        assert response.canonical.artist == "Juana Molina"
+        assert any(
+            "Juana Molina" in rec.getMessage() and "999" in rec.getMessage()
+            for rec in caplog.records
+        ), caplog.text
+
+    @pytest.mark.asyncio
     async def test_skips_when_store_unavailable(self):
         discogs = AsyncMock()
         discogs.get_release.return_value = _make_release()
