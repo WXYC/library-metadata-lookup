@@ -19,7 +19,21 @@ import pytest_asyncio
 
 # ``pg_pool`` (max_size=3) lives in conftest; ``DATABASE_URL`` is imported from
 # there for the ``monkeypatch.setenv("DATABASE_URL_DISCOGS", ...)`` wiring below.
-from tests.integration.conftest import DATABASE_URL
+from tests.integration.conftest import (
+    DATABASE_URL,
+    ENTITY_IDENTITY_DDL,
+    skip_if_drop_targets_populated,
+)
+
+# The five public-schema discogs-cache tables this fixture drops and
+# recreates (the composer's read surface).
+_PUBLIC_DROP_TARGETS = (
+    "artist",
+    "artist_alias",
+    "artist_name_variation",
+    "artist_member",
+    "artist_url",
+)
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -38,166 +52,121 @@ async def set_up_schemas(pg_pool):
     points at the developer's local discogs-cache, which may also host
     a populated `entity.identity` from a prior reconciliation campaign.
     Wiping either set is catastrophic (the cache rebuild + reconcile
-    re-run takes hours). We refuse to run when ANY of the about-to-drop
-    tables already has rows, so the operator must point
-    ``DATABASE_URL_TEST`` at a clean DB.
+    re-run takes hours). We refuse to run when ANYTHING the fixture would
+    drop already has rows (the entity side swept dynamically from
+    ``pg_class`` — see ``skip_if_drop_targets_populated``), so the
+    operator must point ``DATABASE_URL_TEST`` at a clean DB.
     """
-
-    async def _table_row_count(conn, schema: str, table: str) -> int | None:
-        """Return row count, or None if the table doesn't exist."""
-        exists = await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
-            "WHERE table_schema = $1 AND table_name = $2)",
-            schema,
-            table,
-        )
-        if not exists:
-            return None
-        return await conn.fetchval(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
-
     async with pg_pool.acquire() as conn:
-        # All tables this fixture will DROP. If any has data, bail.
-        targets: list[tuple[str, str]] = [
-            ("entity", "identity"),
-            ("entity", "reconciliation_log"),
-            # DROP SCHEMA entity CASCADE also destroys these; a populated
-            # release_identity must veto the run even when entity.identity
-            # happens to be empty (post-truncate, mid-rebuild).
-            ("entity", "release_identity"),
-            ("entity", "release_reconciliation_log"),
-            ("public", "artist"),
-            ("public", "artist_alias"),
-            ("public", "artist_name_variation"),
-            ("public", "artist_member"),
-            ("public", "artist_url"),
-        ]
-        populated: list[tuple[str, str, int]] = []
-        for schema, table in targets:
-            count = await _table_row_count(conn, schema, table)
-            if count is not None and count > 0:
-                populated.append((schema, table, count))
-        if populated:
-            details = ", ".join(f"{s}.{t}={n}" for s, t, n in populated)
-            pytest.skip(
-                "DATABASE_URL_TEST points at a populated DB; refusing to "
-                f"DROP tables that hold data ({details}). Point "
-                "DATABASE_URL_TEST at a clean PG before running this suite."
-            )
-        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
-        await conn.execute("CREATE SCHEMA entity")
-        await conn.execute("""
-            CREATE TABLE entity.identity (
-                id SERIAL PRIMARY KEY,
-                library_name TEXT NOT NULL UNIQUE,
-                discogs_artist_id INTEGER,
-                wikidata_qid TEXT,
-                musicbrainz_artist_id TEXT,
-                spotify_artist_id TEXT,
-                apple_music_artist_id TEXT,
-                bandcamp_id TEXT,
-                reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-        # Discogs cache child tables. Drop first so prior runs don't poison
-        # them — these live in the public schema in test as in prod.
-        await conn.execute("DROP TABLE IF EXISTS artist_alias CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS artist_name_variation CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS artist_member CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS artist_url CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS artist CASCADE")
-        await conn.execute("""
-            CREATE TABLE artist (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                profile TEXT,
-                image_url TEXT,
-                fetched_at TIMESTAMPTZ
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE artist_alias (
-                artist_id INTEGER NOT NULL REFERENCES artist(id),
-                alias_id INTEGER,
-                alias_name TEXT NOT NULL
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE artist_name_variation (
-                artist_id INTEGER NOT NULL REFERENCES artist(id),
-                name TEXT NOT NULL
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE artist_member (
-                artist_id INTEGER NOT NULL REFERENCES artist(id),
-                member_id INTEGER,
-                member_name TEXT NOT NULL,
-                active BOOLEAN
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE artist_url (
-                artist_id INTEGER NOT NULL REFERENCES artist(id),
-                url TEXT NOT NULL
-            )
-        """)
+        await skip_if_drop_targets_populated(conn, _PUBLIC_DROP_TARGETS)
 
-        # Seed entity.identity rows.
-        await conn.execute(
-            """
-            INSERT INTO entity.identity (library_name, discogs_artist_id)
-            VALUES
-                ('Stereolab', 2154),
-                ('Juana Molina', 305253),
-                ('Cat Power', NULL)
-            """
-        )
+    # Creation and seeding inside the try: a mid-seed failure must still
+    # drop whatever was created (same posture as the resolve-bulk sibling)
+    # instead of stranding seeded rows that veto the next run.
+    try:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+            await conn.execute("CREATE SCHEMA entity")
+            await conn.execute(ENTITY_IDENTITY_DDL)
+            # Discogs cache child tables. Drop first so prior runs don't
+            # poison them — these live in the public schema in test as in
+            # prod.
+            await conn.execute("DROP TABLE IF EXISTS artist_alias CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS artist_name_variation CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS artist_member CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS artist_url CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS artist CASCADE")
+            await conn.execute("""
+                CREATE TABLE artist (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    profile TEXT,
+                    image_url TEXT,
+                    fetched_at TIMESTAMPTZ
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE artist_alias (
+                    artist_id INTEGER NOT NULL REFERENCES artist(id),
+                    alias_id INTEGER,
+                    alias_name TEXT NOT NULL
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE artist_name_variation (
+                    artist_id INTEGER NOT NULL REFERENCES artist(id),
+                    name TEXT NOT NULL
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE artist_member (
+                    artist_id INTEGER NOT NULL REFERENCES artist(id),
+                    member_id INTEGER,
+                    member_name TEXT NOT NULL,
+                    active BOOLEAN
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE artist_url (
+                    artist_id INTEGER NOT NULL REFERENCES artist(id),
+                    url TEXT NOT NULL
+                )
+            """)
 
-        # Seed discogs cache: Stereolab gets one entry in each child table so
-        # we can assert source-tagging end-to-end. Juana Molina is in the
-        # ``artist`` table but has no children (the "ran the leg, found
-        # nothing" case). 305253 IS in artist so cache lookup hits; we just
-        # leave the child tables empty for that row.
-        #
-        # ``fetched_at = now()`` matches the shape ``write_artist_details``
-        # produces in production (any row LML writes has it stamped). The
-        # stub-row edge case (``fetched_at IS NULL``, the monthly-rebuild
-        # leftover) is exercised by NULL-ing the column per-test in
-        # ``TestGetArtistDetailsBulkFetchedAt`` below -- the fixture defaults
-        # to the common case so a new endpoint test added here inherits the
-        # production shape, not the edge case. Writer-side stamping is
-        # pinned in ``tests/integration/test_cache_service_artist_writer.py``.
-        await conn.execute(
-            """
-            INSERT INTO artist (id, name, profile, image_url, fetched_at)
-            VALUES
-                (2154, 'Stereolab', NULL, NULL, now()),
-                (305253, 'Juana Molina', NULL, NULL, now())
-            """
-        )
-        await conn.execute(
-            "INSERT INTO artist_alias (artist_id, alias_id, alias_name) "
-            "VALUES (2154, 999, 'Monade')"
-        )
-        await conn.execute(
-            "INSERT INTO artist_name_variation (artist_id, name) VALUES (2154, 'The Stereolab')"
-        )
-        await conn.execute(
-            "INSERT INTO artist_member (artist_id, member_id, member_name, active) "
-            "VALUES (2154, 200, 'Laetitia Sadier', TRUE)"
-        )
+            # Seed entity.identity rows.
+            await conn.execute(
+                """
+                INSERT INTO entity.identity (library_name, discogs_artist_id)
+                VALUES
+                    ('Stereolab', 2154),
+                    ('Juana Molina', 305253),
+                    ('Cat Power', NULL)
+                """
+            )
 
-    yield
+            # Seed discogs cache: Stereolab gets one entry in each child table so
+            # we can assert source-tagging end-to-end. Juana Molina is in the
+            # ``artist`` table but has no children (the "ran the leg, found
+            # nothing" case). 305253 IS in artist so cache lookup hits; we just
+            # leave the child tables empty for that row.
+            #
+            # ``fetched_at = now()`` matches the shape ``write_artist_details``
+            # produces in production (any row LML writes has it stamped). The
+            # stub-row edge case (``fetched_at IS NULL``, the monthly-rebuild
+            # leftover) is exercised by NULL-ing the column per-test in
+            # ``TestGetArtistDetailsBulkFetchedAt`` below -- the fixture defaults
+            # to the common case so a new endpoint test added here inherits the
+            # production shape, not the edge case. Writer-side stamping is
+            # pinned in ``tests/integration/test_cache_service_artist_writer.py``.
+            await conn.execute(
+                """
+                INSERT INTO artist (id, name, profile, image_url, fetched_at)
+                VALUES
+                    (2154, 'Stereolab', NULL, NULL, now()),
+                    (305253, 'Juana Molina', NULL, NULL, now())
+                """
+            )
+            await conn.execute(
+                "INSERT INTO artist_alias (artist_id, alias_id, alias_name) "
+                "VALUES (2154, 999, 'Monade')"
+            )
+            await conn.execute(
+                "INSERT INTO artist_name_variation (artist_id, name) VALUES (2154, 'The Stereolab')"
+            )
+            await conn.execute(
+                "INSERT INTO artist_member (artist_id, member_id, member_name, active) "
+                "VALUES (2154, 200, 'Laetitia Sadier', TRUE)"
+            )
 
-    async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS artist_alias CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS artist_name_variation CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS artist_member CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS artist_url CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS artist CASCADE")
+        yield
+    finally:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS artist_alias CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS artist_name_variation CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS artist_member CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS artist_url CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS artist CASCADE")
 
 
 @pytest_asyncio.fixture

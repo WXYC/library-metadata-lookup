@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from artists.resolver import InvalidNameError
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import ArtistEqualityCandidates, DiscogsCacheService
 from discogs.models import DiscogsArtistSearchResult
@@ -132,8 +133,6 @@ class TestInputValidation:
     async def test_invalid_name_raises_before_any_probe(
         self, resolver, entity_store, discogs_cache, discogs_service, bad_name
     ):
-        from artists.resolver import InvalidNameError
-
         with pytest.raises(InvalidNameError, match=r"names\[1\]"):
             await resolver.resolve(["Wishy", bad_name])
 
@@ -182,7 +181,7 @@ class TestIdentityStoreShortCircuit:
 
         discogs_service.search_artists.assert_not_awaited()
         entity_store.upsert_identity.assert_not_awaited()
-        assert stats.api_calls == 0
+        assert stats.discogs_api_calls == 0
         assert stats.minted == 0
         assert stats.resolved == 1
 
@@ -224,7 +223,7 @@ class TestIdentityStoreShortCircuit:
 
         assert results[0].method == "api_search"
         assert results[0].discogs_artist_id == 123
-        assert stats.api_calls == 1
+        assert stats.discogs_api_calls == 1
 
     @pytest.mark.asyncio
     async def test_every_group_verbatim_is_read(self, resolver, entity_store, discogs_service):
@@ -241,7 +240,7 @@ class TestIdentityStoreShortCircuit:
         assert [r.discogs_artist_id for r in results] == [999, 999]
         assert all(r.method == "identity_store" for r in results)
         discogs_service.search_artists.assert_not_awaited()
-        assert stats.api_calls == 0
+        assert stats.discogs_api_calls == 0
 
 
 class TestDisambiguatedInputs:
@@ -309,7 +308,7 @@ class TestDisambiguatedInputs:
         assert results[0].discogs_artist_id == 20
         assert results[0].method == "identity_store"
         discogs_service.search_artists.assert_not_awaited()
-        assert stats.api_calls == 0
+        assert stats.discogs_api_calls == 0
 
     @pytest.mark.asyncio
     async def test_qualified_singleton_resolves_without_mint(
@@ -448,7 +447,7 @@ class TestApiVerdicts:
         assert result.candidate_count is None
         entity_store.upsert_identity.assert_not_awaited()
         # The probe itself was placed and consumed limiter budget.
-        assert stats.api_calls == 1
+        assert stats.discogs_api_calls == 1
 
 
 class TestProbeDeterminism:
@@ -548,7 +547,7 @@ class TestEscalationUnavailable:
         # One shed, not one per remaining name — and a shed probe never
         # reached the API, so it must not count as an api_call.
         assert discogs_service.search_artists.await_count == 1
-        assert stats.api_calls == 0
+        assert stats.discogs_api_calls == 0
         assert stats.escalation_unavailable == 3
         entity_store.upsert_identity.assert_not_awaited()
 
@@ -573,7 +572,7 @@ class TestEscalationUnavailable:
         assert [r.unresolved_reason for r in results[1:]] == ["escalation_unavailable"] * 2
         # Two probes placed (one measured, one shed), third short-circuited.
         assert discogs_service.search_artists.await_count == 2
-        assert stats.api_calls == 1
+        assert stats.discogs_api_calls == 1
         entity_store.upsert_identity.assert_awaited_once_with("Wishy", discogs_artist_id=123)
         assert stats.minted == 1
         assert stats.resolved == 1
@@ -592,7 +591,7 @@ class TestEscalationUnavailable:
         assert results[0].candidate_count is None
         assert results[1].discogs_artist_id == 5
         assert discogs_service.search_artists.await_count == 2
-        assert stats.api_calls == 2
+        assert stats.discogs_api_calls == 2
         assert stats.escalation_unavailable == 1
         assert stats.resolved == 1
 
@@ -617,7 +616,7 @@ class TestEscalationUnavailable:
         assert results[1].unresolved_reason == "escalation_unavailable"
         assert stats.resolved == 1
         assert stats.escalation_unavailable == 1
-        assert stats.api_calls == 0
+        assert stats.discogs_api_calls == 0
 
     @pytest.mark.asyncio
     async def test_escalation_unavailable_still_carries_cache_corroboration(
@@ -687,7 +686,7 @@ class TestWriteBack:
         assert result.discogs_artist_id == 123
         assert result.method == "api_search"
         assert result.candidate_count == 1
-        assert stats.api_calls == 1
+        assert stats.discogs_api_calls == 1
         # ...except the persistence.
         entity_store.upsert_identity.assert_not_awaited()
         assert stats.minted == 0
@@ -825,7 +824,7 @@ class TestQualifierGeneralization:
         assert results[0].discogs_artist_id == 20
         assert results[0].method == "identity_store"
         discogs_service.search_artists.assert_not_awaited()
-        assert stats.api_calls == 0
+        assert stats.discogs_api_calls == 0
 
     @pytest.mark.asyncio
     async def test_qualified_groups_skip_cache_evidence(
@@ -941,7 +940,7 @@ class TestStoreConflict:
         assert all(r.candidate_count is None for r in results)
         assert all(r.cache_corroboration == [] for r in results)
         discogs_service.search_artists.assert_not_awaited()
-        assert stats.api_calls == 0
+        assert stats.discogs_api_calls == 0
         assert stats.ambiguous == 2
         entity_store.upsert_identity.assert_not_awaited()
 
@@ -1012,7 +1011,7 @@ class TestStatsInvariants:
         assert stats.ambiguous == 1
         assert stats.escalation_unavailable == 1
         assert stats.deduped == 5
-        assert stats.api_calls == 4
+        assert stats.discogs_api_calls == 4
         assert stats.minted == 1
 
 
@@ -1137,7 +1136,7 @@ class TestQualifierNormalizerParity:
     ):
         """'(2)\\u200b' is the bare-disambiguator garbage shape wearing an
         invisible character — sanitation runs before validation."""
-        with pytest.raises(ValueError, match=r"names\[0\]"):
+        with pytest.raises(InvalidNameError, match=r"names\[0\]"):
             await resolver.resolve(["(2)​"])
 
         entity_store.bulk_resolve_library_names.assert_not_awaited()
@@ -1168,7 +1167,7 @@ class TestTierOneRowSelection:
         assert all(r.method == "identity_store" for r in results)
         discogs_service.search_artists.assert_not_awaited()
         entity_store.upsert_identity.assert_not_awaited()
-        assert stats.api_calls == 0
+        assert stats.discogs_api_calls == 0
 
     @pytest.mark.asyncio
     @BOTH_ORDERS
@@ -1313,7 +1312,7 @@ class TestRoundFourPins:
         """The gate fires on the FIXED-POINT form, so a bare-number base
         wearing further qualifier tails is caught too — it must never
         burn a rate-limited probe or land a negative-cacheable verdict."""
-        with pytest.raises(ValueError, match=r"names\[0\]"):
+        with pytest.raises(InvalidNameError, match=r"names\[0\]"):
             await resolver.resolve([garbage])
 
         entity_store.bulk_resolve_library_names.assert_not_awaited()

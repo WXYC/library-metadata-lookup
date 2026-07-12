@@ -26,8 +26,10 @@ import pytest_asyncio
 from discogs.models import DiscogsArtistSearchResult
 from tests.integration.conftest import (
     DATABASE_URL,
+    ENTITY_IDENTITY_DDL,
     F_UNACCENT_WRAPPER_SQL,
     RECONCILER_TABLE_DDL,
+    skip_if_drop_targets_populated,
     skip_unless_wxyc_identity_match_artist,
 )
 
@@ -68,22 +70,13 @@ async def set_up_schemas(pg_pool):
     side seeds the four reconciler tables the #759 candidate-set queries
     read (``RECONCILER_TABLE_DDL``), not the composer's ``artist`` family.
 
-    SAFETY: refuses to run when any about-to-drop table already has rows —
-    the default ``DATABASE_URL_TEST`` may point at a real discogs-cache
-    whose ``entity.identity`` took hours to reconcile.
+    SAFETY: refuses to run when anything the fixture would drop already
+    has rows — the default ``DATABASE_URL_TEST`` may point at a real
+    discogs-cache whose ``entity.*`` took hours to reconcile. The entity
+    side of the guard sweeps ``pg_class`` dynamically, matching what
+    ``DROP SCHEMA entity CASCADE`` actually destroys (see
+    ``skip_if_drop_targets_populated``).
     """
-
-    async def _table_row_count(conn, schema: str, table: str) -> int | None:
-        exists = await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
-            "WHERE table_schema = $1 AND table_name = $2)",
-            schema,
-            table,
-        )
-        if not exists:
-            return None
-        return await conn.fetchval(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
-
     async with pg_pool.acquire() as conn:
         await skip_unless_wxyc_identity_match_artist(conn)
         try:
@@ -92,30 +85,7 @@ async def set_up_schemas(pg_pool):
         except Exception as e:  # locked-down Postgres without contrib
             pytest.skip(f"pg_trgm/unaccent extensions unavailable: {e}")
 
-        # DROP SCHEMA entity CASCADE destroys EVERY table in the
-        # schema, so the guard must count every entity table a real
-        # discogs-cache carries — release_identity holds hours of
-        # rate-limited minting and is exactly the loss the SAFETY
-        # docstring promises to prevent.
-        targets: list[tuple[str, str]] = [
-            ("entity", "identity"),
-            ("entity", "reconciliation_log"),
-            ("entity", "release_identity"),
-            ("entity", "release_reconciliation_log"),
-            *(("public", t) for t in RECONCILER_TABLE_DDL),
-        ]
-        populated: list[tuple[str, str, int]] = []
-        for schema, table in targets:
-            count = await _table_row_count(conn, schema, table)
-            if count is not None and count > 0:
-                populated.append((schema, table, count))
-        if populated:
-            details = ", ".join(f"{s}.{t}={n}" for s, t, n in populated)
-            pytest.skip(
-                "DATABASE_URL_TEST points at a populated DB; refusing to "
-                f"DROP tables that hold data ({details}). Point "
-                "DATABASE_URL_TEST at a clean PG before running this suite."
-            )
+        await skip_if_drop_targets_populated(conn, RECONCILER_TABLE_DDL)
 
     # Creation and seeding inside the try: a mid-seed failure must still
     # drop whatever was created (see test_artist_candidate_sets.py).
@@ -124,21 +94,7 @@ async def set_up_schemas(pg_pool):
         async with pg_pool.acquire() as conn:
             await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
             await conn.execute("CREATE SCHEMA entity")
-            await conn.execute("""
-                CREATE TABLE entity.identity (
-                    id SERIAL PRIMARY KEY,
-                    library_name TEXT NOT NULL UNIQUE,
-                    discogs_artist_id INTEGER,
-                    wikidata_qid TEXT,
-                    musicbrainz_artist_id TEXT,
-                    spotify_artist_id TEXT,
-                    apple_music_artist_id TEXT,
-                    bandcamp_id TEXT,
-                    reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-            """)
+            await conn.execute(ENTITY_IDENTITY_DDL)
             await conn.execute(F_UNACCENT_WRAPPER_SQL)
             for table_name, columns in RECONCILER_TABLE_DDL.items():
                 await conn.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE")

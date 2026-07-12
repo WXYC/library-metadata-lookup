@@ -270,13 +270,16 @@ class ResolveStats:
     (an upsert that returned None — the store's swallowed-failure
     contract — is logged but not counted, so ``minted`` tracks rows
     actually persisted, not write attempts).
-    ``api_calls`` counts ``search_artists`` probes that returned to the
-    resolver — including ``None`` returns (a 429-exhausted or distrusted
-    probe still consumed shared-limiter budget). A probe shed by the
-    breaker is not counted: usually it was refused at entry before any
-    HTTP left the building, though a mid-flight open may have spent
+    ``discogs_api_calls`` counts ``search_artists`` probes that returned
+    to the resolver — including ``None`` returns (a 429-exhausted or
+    distrusted probe still consumed shared-limiter budget). A probe shed
+    by the breaker is not counted: usually it was refused at entry before
+    any HTTP left the building, though a mid-flight open may have spent
     attempts first — the service-level cache-stats counters carry the
-    exact per-request HTTP tally.
+    exact per-request HTTP tally. The service-qualified name is
+    deliberate: every field lands verbatim as a span key and PostHog
+    property, and a bare ``api_calls`` would shadow the framework's
+    per-service map that rides on every ``*_completed`` event.
     """
 
     names: int = 0
@@ -285,7 +288,7 @@ class ResolveStats:
     not_found: int = 0
     ambiguous: int = 0
     escalation_unavailable: int = 0
-    api_calls: int = 0
+    discogs_api_calls: int = 0
     minted: int = 0
 
 
@@ -544,7 +547,7 @@ class BareNameArtistResolver:
                 # Leg field names are the wire enum values minus the
                 # "cache_" prefix. A missing twin is a SERVER contract
                 # break — RuntimeError, not an InvalidNameError-style 422
-                # to 422 (that would blame the caller for our drift).
+                # (that would blame the caller for our drift).
                 try:
                     group.corroboration = [
                         ArtistResolveCacheLeg(f"cache_{leg}") for leg in legs.nonempty_legs()
@@ -576,7 +579,7 @@ class BareNameArtistResolver:
                     )
                     shed = True
                 else:
-                    stats.api_calls += 1
+                    stats.discogs_api_calls += 1
             if page is None:
                 # Couldn't ask (no service / shed / 429-exhausted / network
                 # / distrusted page) — retryable, never a measured zero.
