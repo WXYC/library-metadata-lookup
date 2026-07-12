@@ -31,7 +31,11 @@ from entity.store import EntityStore
 
 # ``DATABASE_URL`` (and the conftest ``pg_pool_large``) come from conftest;
 # imported here for the ``source._dsn`` wiring and ``monkeypatch.setenv`` below.
-from tests.integration.conftest import DATABASE_URL
+from tests.integration.conftest import (
+    DATABASE_URL,
+    ENTITY_IDENTITY_DDL,
+    skip_if_drop_targets_populated,
+)
 
 
 @pytest_asyncio.fixture
@@ -55,72 +59,74 @@ async def pg_source(pg_pool):
 
 @pytest_asyncio.fixture(autouse=True)
 async def set_up_entity_schema(pg_pool):
-    """Drop + recreate the entity schema, including the new release tables."""
+    """Drop + recreate the entity schema, including the new release tables.
+
+    SAFETY: refuses to run when anything this fixture would drop already
+    holds rows — the default ``DATABASE_URL_TEST`` may point at a real
+    discogs-cache whose ``entity.*`` took hours of rate-limited
+    reconciliation to build. The guard sweeps the entity schema dynamically
+    from ``pg_class`` (see ``skip_if_drop_targets_populated``); this fixture
+    drops no public tables, so its public-table list is empty.
+    """
     async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
-        await conn.execute("CREATE SCHEMA entity")
-        # Artist-side tables — required so the entity store probe passes.
-        await conn.execute("""
-            CREATE TABLE entity.identity (
-                id SERIAL PRIMARY KEY,
-                library_name TEXT NOT NULL UNIQUE,
-                discogs_artist_id INTEGER,
-                wikidata_qid TEXT,
-                musicbrainz_artist_id TEXT,
-                spotify_artist_id TEXT,
-                apple_music_artist_id TEXT,
-                bandcamp_id TEXT,
-                reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        await skip_if_drop_targets_populated(conn, ())
+
+    # Creation inside the try: a mid-setup failure must still drop whatever
+    # was created instead of stranding rows that veto the next run (same
+    # posture as the artists-route siblings).
+    try:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+            await conn.execute("CREATE SCHEMA entity")
+            # Artist-side tables — required so the entity store probe passes.
+            await conn.execute(ENTITY_IDENTITY_DDL)
+            await conn.execute("""
+                CREATE TABLE entity.reconciliation_log (
+                    id SERIAL PRIMARY KEY,
+                    identity_id INTEGER NOT NULL REFERENCES entity.identity(id),
+                    source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    confidence REAL,
+                    method TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            # Release-side tables — added by LML#526.
+            await conn.execute("""
+                CREATE TABLE entity.release_identity (
+                    id SERIAL PRIMARY KEY,
+                    discogs_release_id INTEGER UNIQUE,
+                    discogs_master_id INTEGER UNIQUE,
+                    musicbrainz_release_id TEXT UNIQUE,
+                    spotify_album_id TEXT UNIQUE,
+                    apple_music_album_id TEXT UNIQUE,
+                    bandcamp_album_url TEXT UNIQUE,
+                    reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE entity.release_reconciliation_log (
+                    id SERIAL PRIMARY KEY,
+                    identity_id INTEGER NOT NULL REFERENCES entity.release_identity(id),
+                    source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    confidence REAL,
+                    method TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            # Mirrors the production DDL in entity/release_identity.sql so the
+            # fixture has the same query-plan shape as prod.
+            await conn.execute(
+                "CREATE INDEX idx_release_reconciliation_log_identity_id "
+                "ON entity.release_reconciliation_log(identity_id)"
             )
-        """)
-        await conn.execute("""
-            CREATE TABLE entity.reconciliation_log (
-                id SERIAL PRIMARY KEY,
-                identity_id INTEGER NOT NULL REFERENCES entity.identity(id),
-                source TEXT NOT NULL,
-                external_id TEXT NOT NULL,
-                confidence REAL,
-                method TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-        # Release-side tables — added by LML#526.
-        await conn.execute("""
-            CREATE TABLE entity.release_identity (
-                id SERIAL PRIMARY KEY,
-                discogs_release_id INTEGER UNIQUE,
-                discogs_master_id INTEGER UNIQUE,
-                musicbrainz_release_id TEXT UNIQUE,
-                spotify_album_id TEXT UNIQUE,
-                apple_music_album_id TEXT UNIQUE,
-                bandcamp_album_url TEXT UNIQUE,
-                reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE entity.release_reconciliation_log (
-                id SERIAL PRIMARY KEY,
-                identity_id INTEGER NOT NULL REFERENCES entity.release_identity(id),
-                source TEXT NOT NULL,
-                external_id TEXT NOT NULL,
-                confidence REAL,
-                method TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-        # Mirrors the production DDL in entity/release_identity.sql so the
-        # fixture has the same query-plan shape as prod.
-        await conn.execute(
-            "CREATE INDEX idx_release_reconciliation_log_identity_id "
-            "ON entity.release_reconciliation_log(identity_id)"
-        )
-    yield
-    async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+        yield
+    finally:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
 
 
 @pytest.mark.pg
