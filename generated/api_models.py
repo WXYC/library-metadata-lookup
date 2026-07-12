@@ -17,6 +17,7 @@ from pydantic import (
     RootModel,
     confloat,
     conint,
+    constr,
 )
 
 
@@ -735,6 +736,67 @@ class DeviceToken(BaseModel):
     expires_at: AwareDatetime
 
 
+class Venue(BaseModel):
+    id: int
+    slug: str = Field(..., description='Stable scraper seed key (e.g. "cats-cradle").')
+    name: str
+    city: str
+    state: str
+    address: str
+
+
+class ConcertStatus(StrEnum):
+    on_sale = "on_sale"
+    sold_out = "sold_out"
+    cancelled = "cancelled"
+    rescheduled = "rescheduled"
+
+
+class Concert(BaseModel):
+    id: int
+    venue: Venue
+    starts_on: date_aliased = Field(
+        ..., description="Venue-local (America/New_York) calendar date."
+    )
+    starts_at: AwareDatetime = Field(
+        ..., description="Exact start instant; null for date-only events."
+    )
+    doors_at: AwareDatetime = Field(
+        ..., description="Doors-open instant, when the source publishes one."
+    )
+    headlining_artist_raw: str = Field(
+        ..., description="Headliner billing string exactly as the source displays it."
+    )
+    headlining_artist_id: int = Field(
+        ...,
+        description="WXYC catalog artist id when the resolver matched the headliner; null otherwise. A non-null id is what `curated=true` filters on.",
+    )
+    title: str = Field(
+        ...,
+        description="Event name as the source displays it, when distinct from the artist billing.",
+    )
+    supporting_artists_raw: list[str] = Field(
+        ..., description="Supporting-act billing strings, in source order."
+    )
+    ticket_url: str
+    image_url: str
+    event_url: str = Field(
+        ...,
+        description="The venue's own event-detail page, distinct from `ticket_url` (often a third-party seller like Etix/Ticketmaster). Null when no venue page is known; clients fall back to `ticket_url`.",
+    )
+    price_min: float = Field(..., description="Dollars. Free events carry price_min = 0.")
+    price_max: float = Field(..., description="Dollars.")
+    age_restriction: str = Field(
+        ..., description='Source-displayed age restriction (e.g. "18+", "All Ages").'
+    )
+    status: ConcertStatus
+
+
+class ConcertsResponse(BaseModel):
+    concerts: list[Concert]
+    pagination: PaginationInfo
+
+
 class DeviceAuthCodeRequest(BaseModel):
     client_id: str = Field(
         ..., description="The client ID of the application requesting authorization."
@@ -1299,6 +1361,71 @@ class ArtistSearchAliasesBulkResponse(BaseModel):
         description="Input names with no `entity.identity` row in LML — i.e., LML doesn't know any external IDs for these. BS can choose to retry later (after a discogs-cache rebuild and entity-resolution campaign) or leave them.\n",
     )
     cache_stats: CacheStats | None = None
+
+
+class ArtistResolveMethod(StrEnum):
+    identity_store = "identity_store"
+    api_search = "api_search"
+
+
+class ArtistResolveCacheLeg(StrEnum):
+    cache_exact = "cache_exact"
+    cache_member = "cache_member"
+    cache_alias = "cache_alias"
+    cache_name_variation = "cache_name_variation"
+    cache_trigram = "cache_trigram"
+
+
+class ArtistResolveUnresolvedReason(StrEnum):
+    not_found = "not_found"
+    ambiguous = "ambiguous"
+    escalation_unavailable = "escalation_unavailable"
+
+
+class ArtistResolveResult(BaseModel):
+    name: str = Field(..., description="Verbatim echo of the input name at this index.")
+    discogs_artist_id: int | None = Field(
+        None, description="The resolved Discogs artist id. Present iff resolved."
+    )
+    canonical_name: str | None = Field(
+        None,
+        description="The raw Discogs artist title, disambiguation suffix included (e.g. `Popsicle (2)`) — the true Discogs string, kept for provenance; callers render their own input name. Present iff resolved via `api_search`: `entity.identity` rows store no Discogs title, so `identity_store` resolutions omit it.\n",
+    )
+    method: ArtistResolveMethod | None = Field(
+        None, description="What decided the resolution. Present iff resolved.\n"
+    )
+    cache_corroboration: list[ArtistResolveCacheLeg] = Field(
+        ...,
+        description="Cache legs that produced at least one candidate for this name's identity-match form, on BOTH verdict kinds — the per-leg yield telemetry sizing a possible v2 alias arm. On resolved verdicts, listed equality legs necessarily agreed with the deciding tier (a disagreeing equality leg forces `ambiguous`), while `cache_trigram` entries are fuzzy near-misses that never veto. Empty when no leg produced candidates, and always empty on `identity_store` short-circuits — the store decides before cache evidence is consulted, and implementations report an empty array there.\n",
+    )
+    unresolved_reason: ArtistResolveUnresolvedReason | None = Field(
+        None, description="Why the name did not resolve. Present iff unresolved.\n"
+    )
+    candidate_count: int | None = Field(
+        None,
+        description='Exact-form candidates the API tier observed: 1 on resolved via `api_search`, 0 on not_found; on ambiguous, >= 2 for an overloaded family, or exactly 1 when the ambiguity is an equality-leg cache conflict. Always serialized — never omitted; null when the API tier did not run (identity_store short-circuit, escalation_unavailable) — null means "not measured," never zero.\n',
+    )
+
+
+class Name(RootModel[constr(min_length=1, max_length=255)]):
+    root: constr(min_length=1, max_length=255)
+
+
+class ArtistResolveBulkRequest(BaseModel):
+    names: list[Name] = Field(
+        ...,
+        description="Bare artist names to resolve, verbatim. Inputs are deduplicated internally on their normalized identity-match form: duplicate positions receive the shared verdict, and only the first occurrence's verbatim string mints.\n",
+        max_length=25,
+        min_length=1,
+    )
+    dry_run: bool | None = Field(
+        False,
+        description="Run every tier identically — including live Discogs API verification — but skip the `entity.identity` write-back. No partial-write mode.\n",
+    )
+
+
+class ArtistResolveBulkResponse(BaseModel):
+    results: list[ArtistResolveResult]
 
 
 class CacheRefreshSourceOutcome(StrEnum):
@@ -2002,6 +2129,10 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
     )
     styles: list[str] | None = Field(
         None, description="Discogs style tags (finer-grained than genres)."
+    )
+    upcoming_show: Concert | None = Field(
+        None,
+        description="An optional embedded upcoming Triangle-area concert whose headliner is this track's resolved catalog artist, attached server-side at feed-assembly time so the iOS \"Touring Soon\" Box Office CTA renders inline with no second round-trip.\n\nMatch rule (mirrors `GET /concerts?curated=true`): the track's resolved artist — `flowsheet.album_id → library.artist_id` — is matched against `concerts.headlining_artist_id` on curated, non-tombstoned, upcoming rows (`headlining_artist_id IS NOT NULL`, `removed_at IS NULL`, `starts_on >= today` America/New_York). When an artist has several upcoming dates the **soonest** wins (`ORDER BY starts_on ASC LIMIT 1`), so at most one concert rides each playcut.\n\nAbsent/null when the track has no resolved artist (free-form entries with no `album_id`, or an `album_id` whose library row has no matched artist) or when that artist has no curated upcoming date. The field is additive and optional — older app builds that don't decode it are unaffected. Reuses the `Concert` schema verbatim so iOS decodes one type across the Touring Soon tab and the playcut CTA; the `BoxOfficeTicketPresenter` reads `id`, `title` / `headlining_artist_raw`, `venue` (name + city), `starts_on`, `doors_at`, `status`, `price_min` / `price_max`, `ticket_url`, and `image_url` off it.\n",
     )
 
 
