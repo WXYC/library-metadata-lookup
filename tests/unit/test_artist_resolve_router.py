@@ -15,17 +15,26 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from artists.router import _RESOLVE_INPUT_CAP
-from discogs.cache_service import ArtistEqualityCandidates, CacheUnavailableError
+from discogs.cache_service import (
+    ArtistEqualityCandidates,
+    CacheUnavailableError,
+    DiscogsCacheService,
+)
 from discogs.models import DiscogsArtistSearchResult
+from discogs.service import DiscogsService
+from entity.store import EntityStore
 from generated.api_models import ArtistResolveBulkRequest
 from tests.unit.conftest import override_deps
 
 _ROUTE = "/api/v1/artists/resolve/bulk"
 
 
+# spec= throughout: the negative pins below (`assert_not_awaited`) are only
+# meaningful if a renamed resolver method can't silently auto-create the old
+# attribute on the mock.
 @pytest.fixture
 def mock_entity_store():
-    store = AsyncMock()
+    store = AsyncMock(spec=EntityStore)
     store.bulk_resolve_library_names = AsyncMock(return_value={})
     store.upsert_identity = AsyncMock(return_value=MagicMock())
     return store
@@ -33,7 +42,7 @@ def mock_entity_store():
 
 @pytest.fixture
 def mock_discogs_cache():
-    cache = AsyncMock()
+    cache = AsyncMock(spec=DiscogsCacheService)
 
     async def _equality(forms):
         return {form: ArtistEqualityCandidates() for form in forms}
@@ -48,11 +57,37 @@ def mock_discogs_cache():
 
 @pytest.fixture
 def mock_discogs_service():
-    service = AsyncMock()
+    service = AsyncMock(spec=DiscogsService)
     service.search_artists = AsyncMock(
         return_value=[DiscogsArtistSearchResult(artist_id=123, title="Wishy")]
     )
     return service
+
+
+class _FakeSpan:
+    """Recording double for the route's sentry span."""
+
+    def __init__(self, recorded: dict):
+        self._recorded = recorded
+
+    def set_data(self, key, value):
+        self._recorded[key] = value
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+@pytest.fixture
+def recorded_span(monkeypatch):
+    """Patch the route module's `start_span`; yields the recorded set_data dict."""
+    import artists.router as router_module
+
+    recorded: dict = {}
+    monkeypatch.setattr(router_module.sentry_sdk, "start_span", lambda **kw: _FakeSpan(recorded))
+    return recorded
 
 
 _UNSET = object()
@@ -111,7 +146,6 @@ class TestHappyPath:
         assert result["method"] == "api_search"
         assert result["unresolved_reason"] is None
         # Always serialized — never omitted (null means "not measured").
-        assert "candidate_count" in result
         assert result["candidate_count"] == 1
         mock_entity_store.upsert_identity.assert_awaited_once()
 
@@ -184,6 +218,23 @@ class TestBodyParse:
             resp = await _post(app, body)
         assert resp.status_code == 422
 
+    @pytest.mark.asyncio
+    async def test_client_disconnect_during_body_read_returns_400(self, make_app, monkeypatch):
+        """Mid-body client abort is the CLIENT's failure — the arm maps it
+        to 400 so error-class accounting stays clean (a dropped arm would
+        surface these as unhandled 500s in Sentry)."""
+        from starlette.requests import ClientDisconnect, Request
+
+        async def _gone(self):
+            raise ClientDisconnect()
+
+        monkeypatch.setattr(Request, "json", _gone)
+        ctx, app = make_app()
+        with ctx:
+            resp = await _post(app, {"names": ["Wishy"]})
+        assert resp.status_code == 400
+        assert "disconnected" in resp.json()["detail"]
+
 
 class TestServiceUnavailable:
     @pytest.mark.asyncio
@@ -219,14 +270,30 @@ class TestErrorClassRouting:
         assert "Discogs cache" in resp.json()["detail"]
 
     @pytest.mark.asyncio
-    async def test_entity_store_pg_failure_returns_503_with_entity_detail(
-        self, make_app, mock_entity_store
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            pytest.param("postgres", id="postgres-error"),
+            pytest.param("interface", id="interface-error"),
+            pytest.param("oserror", id="os-error"),
+        ],
+    )
+    async def test_entity_store_failure_returns_503_with_entity_detail(
+        self, make_app, mock_entity_store, exc
     ):
-        from asyncpg.exceptions import PostgresError
+        """The full transient tuple: PostgresError (server-side), asyncpg
+        InterfaceError (client-side pool/connection lifecycle — subclasses
+        neither PostgresError nor OSError, so a deploy-window pool teardown
+        would otherwise read as an application 500), and OSError
+        (socket-level resets)."""
+        from asyncpg.exceptions import InterfaceError, PostgresError
 
-        mock_entity_store.bulk_resolve_library_names = AsyncMock(
-            side_effect=PostgresError("connection reset")
-        )
+        side_effect = {
+            "postgres": PostgresError("connection reset"),
+            "interface": InterfaceError("pool is closing"),
+            "oserror": OSError("connection refused"),
+        }[exc]
+        mock_entity_store.bulk_resolve_library_names = AsyncMock(side_effect=side_effect)
         ctx, app = make_app()
         with ctx:
             resp = await _post(app, {"names": ["Wishy"]})
@@ -259,16 +326,15 @@ class TestErrorClassRouting:
 
 class TestPostHogTelemetry:
     @pytest.mark.asyncio
-    async def test_emits_one_aggregate_completed_event(self, make_app):
-        posthog = MagicMock()
-        ctx, app = make_app(posthog=posthog)
+    async def test_emits_one_aggregate_completed_event(self, make_app, mock_posthog_client):
+        ctx, app = make_app(posthog=mock_posthog_client)
         with ctx:
             resp = await _post(app, {"names": ["Wishy", "wishy"], "dry_run": True})
 
         assert resp.status_code == 200
         # One aggregate event per request — no per-name events.
-        assert posthog.capture.call_count == 1
-        kwargs = posthog.capture.call_args.kwargs
+        assert mock_posthog_client.capture.call_count == 1
+        kwargs = mock_posthog_client.capture.call_args.kwargs
         assert kwargs["event"] == "artist_resolve_completed"
         props = kwargs["properties"]
         assert props["names"] == 2
@@ -277,19 +343,21 @@ class TestPostHogTelemetry:
         assert props["not_found"] == 0
         assert props["ambiguous"] == 0
         assert props["escalation_unavailable"] == 0
-        # The resolver's probe counter rides as discogs_api_calls; the
-        # bare api_calls key stays the framework's per-service map (the
-        # shape every sibling *_completed event carries).
+        # The probe counter is service-qualified so it can't shadow the
+        # framework's per-service api_calls map; the map itself carries
+        # the count under the sibling *_completed slicing convention.
         assert props["discogs_api_calls"] == 1
-        assert isinstance(props["api_calls"], dict)
+        assert props["api_calls"] == {"discogs": 1}
+        # Shape stability (LML#544): the breaker-shed counter is seeded 0
+        # on every request, not present only when a shed happens.
+        assert props["cache"]["discogs_breaker_open_shed"] == 0
         assert props["minted"] == 0
         assert props["dry_run"] is True
 
     @pytest.mark.asyncio
-    async def test_capture_failure_never_breaks_the_response(self, make_app):
-        posthog = MagicMock()
-        posthog.capture.side_effect = RuntimeError("posthog down")
-        ctx, app = make_app(posthog=posthog)
+    async def test_capture_failure_never_breaks_the_response(self, make_app, mock_posthog_client):
+        mock_posthog_client.capture.side_effect = RuntimeError("posthog down")
+        ctx, app = make_app(posthog=mock_posthog_client)
         with ctx:
             resp = await _post(app, {"names": ["Wishy"]})
 
@@ -297,13 +365,31 @@ class TestPostHogTelemetry:
         assert resp.json()["results"][0]["discogs_artist_id"] == 123
         # The emit was ATTEMPTED and its failure swallowed — without this
         # pin, silently skipping the emit would also pass.
-        assert posthog.capture.call_count == 1
+        assert mock_posthog_client.capture.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_error_exit_emits_nothing(self, make_app, mock_entity_store, mock_posthog_client):
+        """Error exits deliberately emit no event — the Sentry span's
+        status pins carry error observability; a 503 must not inflate the
+        completed-event baseline any alert is calibrated on."""
+        from asyncpg.exceptions import PostgresError
+
+        mock_entity_store.bulk_resolve_library_names = AsyncMock(
+            side_effect=PostgresError("connection reset")
+        )
+        ctx, app = make_app(posthog=mock_posthog_client)
+        with ctx:
+            resp = await _post(app, {"names": ["Wishy"]})
+
+        assert resp.status_code == 503
+        mock_posthog_client.capture.assert_not_called()
 
 
-class TestResolverValueErrorMapping:
-    """The resolver's input-validation ValueError maps to 422 — a caller
-    error, never a 500 (pydantic's constr(min_length=1) admits the
-    whitespace/NUL shapes the resolver rejects)."""
+class TestInvalidNameErrorMapping:
+    """The resolver's `InvalidNameError` maps to 422 — a caller error
+    (pydantic's constr(min_length=1) admits the whitespace/NUL shapes the
+    resolver rejects). A BARE ValueError is a server bug and must surface
+    as 500 (see TestRouteEnvelopeGaps)."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -324,25 +410,6 @@ class TestResolverValueErrorMapping:
         mock_entity_store.bulk_resolve_library_names.assert_not_awaited()
 
 
-class TestInterfaceErrorMapping:
-    @pytest.mark.asyncio
-    async def test_asyncpg_interface_error_returns_503_not_500(self, make_app, mock_entity_store):
-        """asyncpg's client-side pool/connection errors subclass neither
-        PostgresError nor OSError; a deploy-window pool teardown must
-        read as the transient 503, not an application 500."""
-        from asyncpg.exceptions import InterfaceError
-
-        mock_entity_store.bulk_resolve_library_names = AsyncMock(
-            side_effect=InterfaceError("pool is closing")
-        )
-        ctx, app = make_app()
-        with ctx:
-            resp = await _post(app, {"names": ["Wishy"]})
-
-        assert resp.status_code == 503
-        assert "Entity store" in resp.json()["detail"]
-
-
 class TestRouteEnvelopeGaps:
     """Round-1 review pins for previously untested route branches."""
 
@@ -356,12 +423,18 @@ class TestRouteEnvelopeGaps:
         assert "JSON object" in resp.json()["detail"]
 
     @pytest.mark.asyncio
-    async def test_unexpected_exception_returns_500(self, make_app, mock_entity_store):
+    @pytest.mark.parametrize(
+        "server_bug",
+        [RuntimeError("group got no verdict"), ValueError("strict-zip drift")],
+        ids=["runtime-error", "bare-value-error"],
+    )
+    async def test_unexpected_exception_returns_500(self, make_app, mock_entity_store, server_bug):
         """The generic arm pins 500 on the span and re-raises; a server
-        bug (RuntimeError) must never dress up as a 4xx."""
-        mock_entity_store.bulk_resolve_library_names = AsyncMock(
-            side_effect=RuntimeError("group got no verdict")
-        )
+        bug must never dress up as a 4xx. The bare-ValueError case pins
+        that the InvalidNameError arm does not over-catch — a regression
+        to `except ValueError` would blame the caller (422) for our
+        drift."""
+        mock_entity_store.bulk_resolve_library_names = AsyncMock(side_effect=server_bug)
         ctx, app = make_app()
         with ctx:
             async with AsyncClient(
@@ -370,7 +443,7 @@ class TestRouteEnvelopeGaps:
                 try:
                     resp = await ac.post(_ROUTE, json={"names": ["Wishy"]})
                     status = resp.status_code
-                except RuntimeError:
+                except (RuntimeError, ValueError):
                     # TestClient re-raises unhandled app exceptions when no
                     # server error middleware intercepts; either surface is
                     # evidence the 4xx arms did NOT swallow the bug.
@@ -404,22 +477,7 @@ class TestSentrySpanContract:
     explorer queries in docs/api-endpoints.md key off these exact names."""
 
     @pytest.mark.asyncio
-    async def test_success_path_pins_all_documented_keys(self, make_app, monkeypatch):
-        import artists.router as router_module
-
-        recorded: dict = {}
-
-        class _FakeSpan:
-            def set_data(self, key, value):
-                recorded[key] = value
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        monkeypatch.setattr(router_module.sentry_sdk, "start_span", lambda **kw: _FakeSpan())
+    async def test_success_path_pins_all_documented_keys(self, make_app, recorded_span):
         ctx, app = make_app()
         with ctx:
             resp = await _post(app, {"names": ["Wishy", "wishy"], "dry_run": True})
@@ -433,30 +491,16 @@ class TestSentrySpanContract:
             "lml.artist_resolve.not_found": 0,
             "lml.artist_resolve.ambiguous": 0,
             "lml.artist_resolve.escalation_unavailable": 0,
-            "lml.artist_resolve.api_calls": 1,
+            "lml.artist_resolve.discogs_api_calls": 1,
             "lml.artist_resolve.minted": 0,
             "http.status_code": 200,
         }.items():
-            assert recorded.get(key) == expected, f"span key {key}: {recorded.get(key)!r}"
+            assert recorded_span.get(key) == expected, f"span key {key}: {recorded_span.get(key)!r}"
 
     @pytest.mark.asyncio
-    async def test_dep_503_pins_span_status(self, make_app, mock_discogs_cache, monkeypatch):
-        import artists.router as router_module
+    async def test_dep_503_pins_span_status(self, make_app, mock_discogs_cache, recorded_span):
         from discogs.cache_service import CacheUnavailableError
 
-        recorded: dict = {}
-
-        class _FakeSpan:
-            def set_data(self, key, value):
-                recorded[key] = value
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        monkeypatch.setattr(router_module.sentry_sdk, "start_span", lambda **kw: _FakeSpan())
         mock_discogs_cache.artist_equality_candidates = AsyncMock(
             side_effect=CacheUnavailableError("PG pool exhausted")
         )
@@ -465,4 +509,22 @@ class TestSentrySpanContract:
             resp = await _post(app, {"names": ["Wishy"]})
 
         assert resp.status_code == 503
-        assert recorded.get("http.status_code") == 503
+        assert recorded_span.get("http.status_code") == 503
+        # names/dry_run are pinned PRE-try from the request precisely so
+        # error exits still carry batch context in the trace explorer.
+        assert recorded_span.get("lml.artist_resolve.names") == 1
+        assert recorded_span.get("lml.artist_resolve.dry_run") is False
+
+    @pytest.mark.asyncio
+    async def test_client_abort_pins_499(self, make_app, mock_entity_store, recorded_span):
+        """The documented trace-explorer query for client aborts
+        (`op:http.server http.status_code:499`) depends on this pin."""
+        mock_entity_store.bulk_resolve_library_names = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+        ctx, app = make_app()
+        with ctx:
+            with pytest.raises((asyncio.CancelledError, RuntimeError)):
+                await _post(app, {"names": ["Wishy"]})
+
+        assert recorded_span.get("http.status_code") == 499

@@ -13,19 +13,21 @@ Run with: ``pytest -m external_api tests/integration/test_search_artists_live.py
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 
 import pytest
 
 from artists.resolver import _fixed_point_form
-from discogs.service import DiscogsService
+from discogs.breaker import DiscogsBreakerOpenError
+from discogs.service import SEARCH_ARTISTS_DISTRUST_LOG_PREFIX, DiscogsService
 
 
 @pytest.mark.external_api
 class TestSearchArtistsLive:
     @pytest.mark.asyncio
-    async def test_overload_family_shape_assumptions(self):
+    async def test_overload_family_shape_assumptions(self, caplog):
         """ "Popsicle" is a stable overload family on Discogs (the Swedish
         band plus at least one "(N)"-suffixed namesake — the #759 design's
         own motivating example). Pins, in one page: typed ids + raw titles
@@ -38,16 +40,35 @@ class TestSearchArtistsLive:
 
         service = DiscogsService(token=token, cache_service=None)
         try:
-            results = await service.search_artists("Popsicle")
+            with caplog.at_level(logging.WARNING, logger="discogs.service"):
+                try:
+                    results = await service.search_artists("Popsicle")
+                except DiscogsBreakerOpenError:
+                    # The LML#755 saturation breaker is a per-process
+                    # singleton shared with the other external_api suites;
+                    # under shared-prod-token contention it can shed this
+                    # probe. Same "couldn't ask" semantic as the None arm
+                    # below, raised instead of returned.
+                    pytest.skip("Discogs breaker open (shared-token saturation)")
         finally:
             await service.close()
 
         if results is None:
-            # "Couldn't ask" (429-exhausted / network / distrusted page) —
-            # the token is shared with prod, so limiter contention is
-            # realistic. A skip preserves the smoke's actual signal
-            # (payload-shape drift); failing here would train operators
-            # to ignore its reds.
+            # None conflates two very different things. The malformed-item
+            # distrust path is the ONE None cause that means "Discogs
+            # answered 200 and the items no longer carry id/title" — the
+            # exact payload-shape contract this smoke exists to pin — and
+            # it uniquely logs the distrust fingerprint.
+            if any(SEARCH_ARTISTS_DISTRUST_LOG_PREFIX in r.getMessage() for r in caplog.records):
+                pytest.fail(
+                    "Discogs answered but the page was distrusted — id/title "
+                    "payload-shape drift in the type=artist search response."
+                )
+            # Everything else (429-exhausted / network / non-2xx / JSON
+            # decode) is "couldn't ask" — the token is shared with prod, so
+            # limiter contention is realistic. A skip preserves the smoke's
+            # actual signal; failing here would train operators to ignore
+            # its reds.
             pytest.skip("Discogs probe unanswerable this run (rate-limit/transient)")
         assert results, "Expected at least one artist hit for 'Popsicle'"
         for r in results:

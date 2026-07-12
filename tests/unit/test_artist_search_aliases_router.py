@@ -128,6 +128,28 @@ class TestErrorClassRouting:
         assert "Entity store" in resp.json()["detail"]
 
     @pytest.mark.asyncio
+    async def test_asyncpg_interface_error_returns_503_not_500(self, app_client, mock_entity_store):
+        """asyncpg `InterfaceError` (client-side pool/connection lifecycle)
+        subclasses neither PostgresError nor OSError; a deploy-window pool
+        teardown must read as the transient 503, not an application 500 —
+        the same pin the resolve route carries."""
+        from asyncpg.exceptions import InterfaceError
+
+        mock_entity_store.bulk_resolve_library_names = AsyncMock(
+            side_effect=InterfaceError("pool is closing")
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/artists/search-aliases/bulk", json={"names": ["Stereolab"]}
+            )
+
+        assert resp.status_code == 503
+        assert "Entity store" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
     async def test_cancelled_error_logs_abort_and_propagates(
         self, app_client, mock_entity_store, caplog
     ):

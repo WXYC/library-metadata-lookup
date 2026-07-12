@@ -18,6 +18,7 @@ posture as `bulk-resolve-libraries`.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -36,7 +37,7 @@ from core.dependencies import (
     get_discogs_service,
 )
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
-from discogs.service import DiscogsService
+from discogs.service import BREAKER_OPEN_STAT_KEY, DiscogsService
 from entity.store import EntityStore
 from generated.api_models import (
     ArtistResolveBulkRequest,
@@ -100,6 +101,60 @@ _ENTITY_STORE_UNAVAILABLE_DETAIL = (
 _DISCOGS_CACHE_UNAVAILABLE_DETAIL = (
     "Discogs cache is not available. Ensure DATABASE_URL_DISCOGS is configured."
 )
+# Mid-flight variants: the dependency gates above prove the wiring existed at
+# request start, so a failure DURING the request is most often a transient
+# pool/connection loss (deploy-window teardown), with schema drift a distant
+# second. Distinct from the gate details so on-call doesn't chase
+# DATABASE_URL_DISCOGS for a blip that retrying clears.
+_ENTITY_STORE_QUERY_FAILED_DETAIL = (
+    "Entity store query failed — likely a transient connection loss (retrying "
+    "may succeed) or the entity schema has not been applied."
+)
+_DISCOGS_CACHE_QUERY_FAILED_DETAIL = (
+    "Discogs cache query failed — likely a transient connection loss; retrying may succeed."
+)
+
+
+async def _parse_bulk_names_body[RequestT: BaseModel](
+    http_request: Request,
+    model: type[RequestT],
+    cap: int,
+) -> RequestT:
+    """Shared request envelope for the bulk `names` routes in this router.
+
+    Manual 413 check before Pydantic validation (mirrors `bulk-resolve-
+    libraries`): the generated request models carry api.yaml's `maxItems`,
+    but Pydantic's enforcement is 422. The api.yaml contract documents 413
+    for cap exceedance, so the raw count is read first and 413 raised;
+    only then does the model validate.
+    """
+    try:
+        body = await http_request.json()
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=f"Malformed JSON body: {e}") from None
+    except ClientDisconnect:
+        # Client closed the connection before the body completed. There is
+        # no point sending a 5xx — the client is gone — but we want this to
+        # land as a 4xx in logs (the route did its job; the failure is the
+        # client's). Treat as 400 to keep error-class accounting clean.
+        raise HTTPException(
+            status_code=400,
+            detail="Client disconnected before request body completed.",
+        ) from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+    names_raw = body.get("names")
+    if not isinstance(names_raw, list):
+        raise HTTPException(status_code=422, detail="`names` must be a JSON array.")
+    if len(names_raw) > cap:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Batch exceeded the {cap}-name cap (received {len(names_raw)}).",
+        )
+    try:
+        return model.model_validate(body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors()) from None
 
 
 router = APIRouter(tags=["artists"])
@@ -131,39 +186,9 @@ async def search_aliases_bulk(
     `asyncio.gather` over per-name leaves (LML#370/#372 cascade-cascade
     avoidance).
     """
-    # Manual 413 check before Pydantic validation (mirrors `bulk-resolve-
-    # libraries`): the generated request model has `max_length=1000`
-    # from api.yaml's `maxItems`, but Pydantic's enforcement is 422.
-    # The api.yaml contract documents 413 for cap exceedance, so we read
-    # the raw count first and raise 413; only then validate.
-    try:
-        body = await http_request.json()
-    except (ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=f"Malformed JSON body: {e}") from None
-    except ClientDisconnect:
-        # Client closed the connection before the body completed. There is
-        # no point sending a 5xx — the client is gone — but we want this to
-        # land as a 4xx in logs (the route did its job; the failure is the
-        # client's). Treat as 400 to keep error-class accounting clean.
-        raise HTTPException(
-            status_code=400,
-            detail="Client disconnected before request body completed.",
-        ) from None
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
-    names_raw = body.get("names")
-    if not isinstance(names_raw, list):
-        raise HTTPException(status_code=422, detail="`names` must be a JSON array.")
-    if len(names_raw) > _BULK_INPUT_CAP:
-        raise HTTPException(
-            status_code=413,
-            detail=(f"Batch exceeded the {_BULK_INPUT_CAP}-name cap (received {len(names_raw)})."),
-        )
-
-    try:
-        request = ArtistSearchAliasesBulkRequest.model_validate(body)
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors()) from None
+    request = await _parse_bulk_names_body(
+        http_request, ArtistSearchAliasesBulkRequest, _BULK_INPUT_CAP
+    )
 
     if entity_store is None:
         raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL)
@@ -216,7 +241,9 @@ async def search_aliases_bulk(
                 names_count,
             )
             http_span.set_data("http.status_code", 503)
-            raise HTTPException(status_code=503, detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL) from None
+            raise HTTPException(
+                status_code=503, detail=_DISCOGS_CACHE_QUERY_FAILED_DETAIL
+            ) from None
         except (PostgresError, InterfaceError, OSError):
             # Phase 1: entity-store PG failure (raw asyncpg error — not
             # wrapped). Phase 2 errors are wrapped above; if a PostgresError
@@ -229,7 +256,7 @@ async def search_aliases_bulk(
                 names_count,
             )
             http_span.set_data("http.status_code", 503)
-            raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
+            raise HTTPException(status_code=503, detail=_ENTITY_STORE_QUERY_FAILED_DETAIL) from None
         except HTTPException:
             # HTTPException carries its own status code, set by whoever
             # raised it (either us above, or future inner code). Don't
@@ -263,25 +290,21 @@ def _emit_resolve_summary(
     summary: dict,
 ) -> None:
     """Best-effort aggregate emit — one `artist_resolve_completed` event per
-    SUCCESSFULLY COMPLETED request, no per-name events. The emit itself is
-    swallowed so it can never change the handler's outcome (the swallow
-    mirrors streaming-check's LML#639 posture; unlike streaming-check, error
-    exits deliberately emit nothing — the Sentry span's status pins carry
-    error-class observability for this offline-consumer route).
+    SUCCESSFULLY COMPLETED request, no per-name events. The entire emit path
+    is inside the swallow so it can never change the handler's outcome (the
+    swallow mirrors streaming-check's LML#639 posture; unlike streaming-check,
+    error exits deliberately emit nothing — the Sentry span's status pins
+    carry error-class observability for this offline-consumer route).
 
-    The resolver's probe counter is renamed to ``discogs_api_calls`` on the
-    wire: ``RequestTelemetry.send_to_posthog`` already emits an
-    ``api_calls`` property (its per-service map — the shape every sibling
-    ``*_completed`` event carries), and shadowing it with a scalar would
-    fork one property name across two types project-wide while silently
-    depending on the framework's dict-spread ordering.
+    No summary key may shadow a framework property (``api_calls``, ``steps``,
+    ``cache``, ``total_duration_ms``): ``ResolveStats`` names its probe
+    counter ``discogs_api_calls`` for exactly this reason, so the summary
+    passes through verbatim.
     """
     if not posthog_client:
         return
-    properties = {key: value for key, value in summary.items() if key != "api_calls"}
-    properties["discogs_api_calls"] = summary["api_calls"]
     try:
-        telemetry.send_to_posthog(posthog_client, properties)
+        telemetry.send_to_posthog(posthog_client, dict(summary))
     except Exception:
         logger.warning("artist-resolve telemetry emit failed", exc_info=True)
 
@@ -318,37 +341,9 @@ async def resolve_bulk(
     LML#755 breaker shed degrades per-name to `escalation_unavailable` —
     the PG tiers keep answering, never a batch-level 503.
     """
-    # Manual 413 check before Pydantic validation (mirrors the sibling
-    # bulk routes): Pydantic enforces api.yaml's `maxItems` as 422, but
-    # the contract documents 413 for cap exceedance.
-    try:
-        body = await http_request.json()
-    except (ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=f"Malformed JSON body: {e}") from None
-    except ClientDisconnect:
-        # Client closed the connection before the body completed — see the
-        # sibling route for why this is a 4xx, not a 5xx.
-        raise HTTPException(
-            status_code=400,
-            detail="Client disconnected before request body completed.",
-        ) from None
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
-    names_raw = body.get("names")
-    if not isinstance(names_raw, list):
-        raise HTTPException(status_code=422, detail="`names` must be a JSON array.")
-    if len(names_raw) > _RESOLVE_INPUT_CAP:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Batch exceeded the {_RESOLVE_INPUT_CAP}-name cap (received {len(names_raw)})."
-            ),
-        )
-
-    try:
-        request = ArtistResolveBulkRequest.model_validate(body)
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors()) from None
+    request = await _parse_bulk_names_body(
+        http_request, ArtistResolveBulkRequest, _RESOLVE_INPUT_CAP
+    )
 
     if entity_store is None:
         raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL)
@@ -366,12 +361,14 @@ async def resolve_bulk(
     logger.info("artist-resolve bulk start: names=%d dry_run=%s", len(names), dry_run)
 
     # Per-request telemetry bracket: `search_artists` records API calls into
-    # the cache-stats context, and RequestTelemetry carries the aggregate
-    # event. Explicit `http.server` span mirrors the siblings — query with
-    # `op:http.server span.description:*artists/resolve/bulk*`.
-    init_cache_stats()
+    # the cache-stats context (the breaker-shed counter seeds to 0 so it is
+    # a stable, alertable series rather than a key that appears only on shed
+    # requests — the LML#544 shape rule), and RequestTelemetry carries the
+    # aggregate event. Explicit `http.server` span mirrors the siblings —
+    # query with `op:http.server span.description:*artists/resolve/bulk*`.
+    init_cache_stats(extra_keys=(BREAKER_OPEN_STAT_KEY,))
     telemetry = RequestTelemetry(
-        api_call_keys=[],
+        api_call_keys=["discogs"],
         distinct_id="library-metadata-lookup-service",
         event_prefix="artist_resolve",
     )
@@ -409,19 +406,24 @@ async def resolve_bulk(
                 "Discogs cache unavailable during artist-resolve (names=%d)", len(names)
             )
             http_span.set_data("http.status_code", 503)
-            raise HTTPException(status_code=503, detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL) from None
+            raise HTTPException(
+                status_code=503, detail=_DISCOGS_CACHE_QUERY_FAILED_DETAIL
+            ) from None
         except (PostgresError, InterfaceError, OSError):
             # Tier-1 read or write-back: raw entity-store PG failure.
             # InterfaceError (asyncpg's client-side pool/connection
             # lifecycle errors) subclasses neither PostgresError nor
             # OSError — without it a pool-teardown race during deploy
             # would read as an application 500 instead of the transient
-            # 503 the sibling failure modes emit.
+            # 503 the sibling failure modes emit. The 503 classification
+            # hides nothing from Sentry: `logger.exception` is ERROR-level,
+            # which the default LoggingIntegration captures with the stack
+            # trace, so genuine server bugs in this class still page.
             logger.exception(
                 "Entity store query failed during artist-resolve (names=%d)", len(names)
             )
             http_span.set_data("http.status_code", 503)
-            raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
+            raise HTTPException(status_code=503, detail=_ENTITY_STORE_QUERY_FAILED_DETAIL) from None
         except HTTPException:
             # Carries its own status code — don't blanket-stamp 500.
             raise
@@ -429,17 +431,16 @@ async def resolve_bulk(
             http_span.set_data("http.status_code", 500)
             raise
 
-        summary = {
-            "names": stats.names,
-            "deduped": stats.deduped,
-            "resolved": stats.resolved,
-            "not_found": stats.not_found,
-            "ambiguous": stats.ambiguous,
-            "escalation_unavailable": stats.escalation_unavailable,
-            "api_calls": stats.api_calls,
-            "minted": stats.minted,
-            "dry_run": dry_run,
-        }
+        # Mirror the resolver's probe count into the framework per-service
+        # map so cross-event `api_calls.discogs` slicing (the sibling
+        # *_completed convention) includes this route. Same semantics as
+        # `discogs_api_calls`: probes dispatched, including failed returns.
+        telemetry.api_calls["discogs"] = stats.discogs_api_calls
+
+        # Every ResolveStats field lands verbatim as a span key, PostHog
+        # property, and log field — one enumeration, derived from the
+        # dataclass, so a new counter can't be dropped from one surface.
+        summary = {**dataclasses.asdict(stats), "dry_run": dry_run}
         for key, value in summary.items():
             if key in ("names", "dry_run"):
                 # Already pinned pre-try from the request, so error exits
@@ -451,16 +452,7 @@ async def resolve_bulk(
 
     _emit_resolve_summary(posthog_client, telemetry, summary)
     logger.info(
-        "artist-resolve bulk complete: names=%d deduped=%d resolved=%d not_found=%d "
-        "ambiguous=%d escalation_unavailable=%d api_calls=%d minted=%d dry_run=%s",
-        stats.names,
-        stats.deduped,
-        stats.resolved,
-        stats.not_found,
-        stats.ambiguous,
-        stats.escalation_unavailable,
-        stats.api_calls,
-        stats.minted,
-        dry_run,
+        "artist-resolve bulk complete: %s",
+        " ".join(f"{key}={value}" for key, value in summary.items()),
     )
     return ArtistResolveBulkResponse(results=results)

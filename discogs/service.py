@@ -82,6 +82,12 @@ _MAX_RETRY_DELAY_SECONDS = 60.0
 # on the same PostHog/Sentry seam as the row-less flag degradation alerts.
 BREAKER_OPEN_STAT_KEY = "discogs_breaker_open_shed"
 
+# Log fingerprint for `search_artists`' malformed-item page-distrust path.
+# The live smoke (tests/integration/test_search_artists_live.py) matches on
+# this to tell payload-shape drift (fail red) apart from transient
+# unavailability (skip) — both paths return None to callers.
+SEARCH_ARTISTS_DISTRUST_LOG_PREFIX = "search_artists distrusting page"
+
 # Fuzzy fallback for `validate_track_on_release` artist matching. Strict substring
 # matching loses on collaboration trios where neither name is a substring of the
 # other (e.g., request "Orcutt Shelley Miller" vs release artist
@@ -904,7 +910,8 @@ class DiscogsService:
                     # measurement — dropping a null-id "Popsicle (2)" leaves
                     # candidate_count=1, a false-unique that mints wrong.
                     logger.warning(
-                        f"search_artists distrusting page for '{name}': malformed item {item!r}"
+                        f"{SEARCH_ARTISTS_DISTRUST_LOG_PREFIX} for '{name}': "
+                        f"malformed item {item!r}"
                     )
                     return None
                 results.append(DiscogsArtistSearchResult(artist_id=artist_id, title=title))

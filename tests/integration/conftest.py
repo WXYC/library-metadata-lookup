@@ -88,6 +88,83 @@ RECONCILER_TABLE_DDL: dict[str, str] = {
     "artist_name_variation": "artist_id INTEGER, name TEXT",
 }
 
+# ``entity.identity`` stub DDL — mirrors discogs-cache alembic (the schema's
+# owner; see CLAUDE.md "PostgreSQL schema ownership": LML never CREATEs in
+# ``entity.*`` outside tests). One shared literal so per-file copies can't
+# silently diverge; when discogs-cache adds an identity column, this is the
+# single test-side mirror to update.
+ENTITY_IDENTITY_DDL = """
+    CREATE TABLE entity.identity (
+        id SERIAL PRIMARY KEY,
+        library_name TEXT NOT NULL UNIQUE,
+        discogs_artist_id INTEGER,
+        wikidata_qid TEXT,
+        musicbrainz_artist_id TEXT,
+        spotify_artist_id TEXT,
+        apple_music_artist_id TEXT,
+        bandcamp_id TEXT,
+        reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+"""
+
+
+async def skip_if_drop_targets_populated(conn, public_tables) -> None:
+    """``pytest.skip`` when anything a schema-dropping fixture would destroy holds rows.
+
+    The default ``DATABASE_URL_TEST`` may point at a real discogs-cache whose
+    ``entity.*`` rows took hours of rate-limited reconciliation to build.
+    Fixtures that run ``DROP SCHEMA entity CASCADE`` and drop named public
+    tables must call this FIRST.
+
+    The entity side is enumerated dynamically from ``pg_class`` (relkinds
+    r/p/m: ordinary + partitioned tables + matviews — everything row-bearing
+    the CASCADE destroys; matviews are invisible to ``information_schema``,
+    hence ``pg_class``). A hand-maintained list rots the day discogs-cache's
+    alembic adds a table — this guard's per-file precursors had to be widened
+    for ``release_identity`` after the fact. The public side stays an explicit
+    parameter: those fixtures drop only the named tables, never the schema.
+
+    No false veto: the calling fixtures drop the whole entity schema in
+    teardown, so between tests the sweep sees zero entity relations; residue
+    from a crashed setup SHOULD veto until an operator looks. Probes use
+    ``EXISTS``, not ``COUNT(*)`` — the veto needs has-rows only, and a COUNT
+    against a real discogs-cache would table-scan millions of rows in exactly
+    the mispointed-DSN case the guard exists for. A probe error (e.g. a
+    never-refreshed matview) fails toward veto.
+    """
+    entity_rels = await conn.fetch(
+        "SELECT c.relname FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'entity' AND c.relkind IN ('r', 'p', 'm')"
+    )
+    targets: list[tuple[str, str]] = [("entity", r["relname"]) for r in entity_rels]
+    for table in public_tables:
+        exists = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name = $1)",
+            table,
+        )
+        if exists:
+            targets.append(("public", table))
+
+    populated: list[str] = []
+    for schema, table in targets:
+        try:
+            has_rows = await conn.fetchval(f'SELECT EXISTS(SELECT 1 FROM "{schema}"."{table}")')
+        except Exception:
+            has_rows = True
+        if has_rows:
+            populated.append(f"{schema}.{table}")
+
+    if populated:
+        pytest.skip(
+            "DATABASE_URL_TEST points at a populated DB; refusing to DROP "
+            f"tables that hold data ({', '.join(populated)}). Point "
+            "DATABASE_URL_TEST at a clean PG before running this suite."
+        )
+
 
 async def skip_unless_wxyc_identity_match_artist(conn) -> None:
     """``pytest.skip`` unless ``wxyc_identity_match_artist`` is deployed.
