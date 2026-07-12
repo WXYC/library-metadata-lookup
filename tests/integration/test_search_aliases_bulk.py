@@ -60,6 +60,11 @@ async def set_up_schemas(pg_pool):
         targets: list[tuple[str, str]] = [
             ("entity", "identity"),
             ("entity", "reconciliation_log"),
+            # DROP SCHEMA entity CASCADE also destroys these; a populated
+            # release_identity must veto the run even when entity.identity
+            # happens to be empty (post-truncate, mid-rebuild).
+            ("entity", "release_identity"),
+            ("entity", "release_reconciliation_log"),
             ("public", "artist"),
             ("public", "artist_alias"),
             ("public", "artist_name_variation"),

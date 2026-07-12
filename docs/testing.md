@@ -53,7 +53,7 @@ Default `pytest` (no `-m`) runs every unmarked test across `tests/unit/`, `tests
 
 **Default Tests** runs `pytest -v --cov=...` -- pyproject's `addopts = "-m 'not pg and not external_api'"` excludes the infra-tagged tests.
 
-**External API Tests** runs `pytest -v -m external_api`. The `tests/e2e/discogs/*` suite and the `TestDiscogsApiSearch` / `TestEntityResolution` classes in `tests/integration/test_api_discogs.py` hit the real Discogs API; they self-skip at collection if `DISCOGS_TOKEN` is unset (PR runs from forks may have no secret access).
+**External API Tests** runs `pytest -v -m external_api`. The `tests/e2e/discogs/*` suite and the `TestDiscogsApiSearch` / `TestEntityResolution` classes in `tests/integration/test_api_discogs.py`, and the `type=artist` payload-shape smoke in `tests/integration/test_search_artists_live.py` (skips at runtime when `DISCOGS_TOKEN` is unset or the probe is rate-limited) hit the real Discogs API; they self-skip at collection if `DISCOGS_TOKEN` is unset (PR runs from forks may have no secret access).
 
 **PG Tests** runs `pytest -v -m pg` against a `postgres:16-alpine` service container on port 5433. The `EntityStore` CRUD tests in `tests/integration/test_entity_resolution.py` run end-to-end against a fresh `entity` schema. The Discogs reconciliation tests skip themselves when the `release_artist` table is missing -- that table is part of the discogs-cache fixture and is too large to load in CI. `tests/integration/test_va_discogs_lookup.py` self-skips without `DATABASE_URL_DISCOGS`, which is intentional in CI.
 

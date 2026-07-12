@@ -277,7 +277,11 @@ class TestPostHogTelemetry:
         assert props["not_found"] == 0
         assert props["ambiguous"] == 0
         assert props["escalation_unavailable"] == 0
-        assert props["api_calls"] == 1
+        # The resolver's probe counter rides as discogs_api_calls; the
+        # bare api_calls key stays the framework's per-service map (the
+        # shape every sibling *_completed event carries).
+        assert props["discogs_api_calls"] == 1
+        assert isinstance(props["api_calls"], dict)
         assert props["minted"] == 0
         assert props["dry_run"] is True
 
@@ -291,6 +295,9 @@ class TestPostHogTelemetry:
 
         assert resp.status_code == 200
         assert resp.json()["results"][0]["discogs_artist_id"] == 123
+        # The emit was ATTEMPTED and its failure swallowed — without this
+        # pin, silently skipping the emit would also pass.
+        assert posthog.capture.call_count == 1
 
 
 class TestResolverValueErrorMapping:
@@ -334,3 +341,128 @@ class TestInterfaceErrorMapping:
 
         assert resp.status_code == 503
         assert "Entity store" in resp.json()["detail"]
+
+
+class TestRouteEnvelopeGaps:
+    """Round-1 review pins for previously untested route branches."""
+
+    @pytest.mark.asyncio
+    async def test_non_dict_json_body_returns_400(self, make_app):
+        ctx, app = make_app()
+        with ctx:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.post(_ROUTE, json=["Wishy"])
+        assert resp.status_code == 400
+        assert "JSON object" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_returns_500(self, make_app, mock_entity_store):
+        """The generic arm pins 500 on the span and re-raises; a server
+        bug (RuntimeError) must never dress up as a 4xx."""
+        mock_entity_store.bulk_resolve_library_names = AsyncMock(
+            side_effect=RuntimeError("group got no verdict")
+        )
+        ctx, app = make_app()
+        with ctx:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test", timeout=5
+            ) as ac:
+                try:
+                    resp = await ac.post(_ROUTE, json={"names": ["Wishy"]})
+                    status = resp.status_code
+                except RuntimeError:
+                    # TestClient re-raises unhandled app exceptions when no
+                    # server error middleware intercepts; either surface is
+                    # evidence the 4xx arms did NOT swallow the bug.
+                    status = 500
+        assert status == 500
+
+    @pytest.mark.asyncio
+    async def test_exactly_cap_names_accepted(self, make_app):
+        """25 names — the documented page size — must pass the 413 gate;
+        the gate counts raw names, so 25 duplicates also pass (dedupe is
+        the resolver's job)."""
+        ctx, app = make_app()
+        with ctx:
+            resp = await _post(app, {"names": ["Wishy"] * _RESOLVE_INPUT_CAP})
+        assert resp.status_code == 200
+        assert len(resp.json()["results"]) == _RESOLVE_INPUT_CAP
+
+    @pytest.mark.asyncio
+    async def test_explicit_dry_run_false_mints(self, make_app, mock_entity_store):
+        """A present-but-false dry_run must behave exactly like absent —
+        bool coercion of the generated Optional field."""
+        ctx, app = make_app()
+        with ctx:
+            resp = await _post(app, {"names": ["Wishy"], "dry_run": False})
+        assert resp.status_code == 200
+        mock_entity_store.upsert_identity.assert_awaited_once()
+
+
+class TestSentrySpanContract:
+    """The documented lml.artist_resolve.* span surface — the trace
+    explorer queries in docs/api-endpoints.md key off these exact names."""
+
+    @pytest.mark.asyncio
+    async def test_success_path_pins_all_documented_keys(self, make_app, monkeypatch):
+        import artists.router as router_module
+
+        recorded: dict = {}
+
+        class _FakeSpan:
+            def set_data(self, key, value):
+                recorded[key] = value
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        monkeypatch.setattr(router_module.sentry_sdk, "start_span", lambda **kw: _FakeSpan())
+        ctx, app = make_app()
+        with ctx:
+            resp = await _post(app, {"names": ["Wishy", "wishy"], "dry_run": True})
+
+        assert resp.status_code == 200
+        for key, expected in {
+            "lml.artist_resolve.names": 2,
+            "lml.artist_resolve.dry_run": True,
+            "lml.artist_resolve.deduped": 1,
+            "lml.artist_resolve.resolved": 2,
+            "lml.artist_resolve.not_found": 0,
+            "lml.artist_resolve.ambiguous": 0,
+            "lml.artist_resolve.escalation_unavailable": 0,
+            "lml.artist_resolve.api_calls": 1,
+            "lml.artist_resolve.minted": 0,
+            "http.status_code": 200,
+        }.items():
+            assert recorded.get(key) == expected, f"span key {key}: {recorded.get(key)!r}"
+
+    @pytest.mark.asyncio
+    async def test_dep_503_pins_span_status(self, make_app, mock_discogs_cache, monkeypatch):
+        import artists.router as router_module
+        from discogs.cache_service import CacheUnavailableError
+
+        recorded: dict = {}
+
+        class _FakeSpan:
+            def set_data(self, key, value):
+                recorded[key] = value
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        monkeypatch.setattr(router_module.sentry_sdk, "start_span", lambda **kw: _FakeSpan())
+        mock_discogs_cache.artist_equality_candidates = AsyncMock(
+            side_effect=CacheUnavailableError("PG pool exhausted")
+        )
+        ctx, app = make_app()
+        with ctx:
+            resp = await _post(app, {"names": ["Wishy"]})
+
+        assert resp.status_code == 503
+        assert recorded.get("http.status_code") == 503
