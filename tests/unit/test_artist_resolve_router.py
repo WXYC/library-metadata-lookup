@@ -237,21 +237,30 @@ class TestBodyParse:
 
 
 class TestServiceUnavailable:
+    """Dependency-gate 503s carry the CONFIG-shaped detail — the wiring was
+    never there, so pointing at DATABASE_URL_DISCOGS is the right hint
+    (distinct from the mid-flight transient detail pinned in
+    TestErrorClassRouting)."""
+
     @pytest.mark.asyncio
     async def test_503_when_entity_store_none(self, make_app):
+        from artists.router import _ENTITY_STORE_UNAVAILABLE_DETAIL
+
         ctx, app = make_app(entity_store=None)
         with ctx:
             resp = await _post(app, {"names": ["Wishy"]})
         assert resp.status_code == 503
-        assert "Entity store" in resp.json()["detail"]
+        assert resp.json()["detail"] == _ENTITY_STORE_UNAVAILABLE_DETAIL
 
     @pytest.mark.asyncio
     async def test_503_when_discogs_cache_none(self, make_app):
+        from artists.router import _DISCOGS_CACHE_UNAVAILABLE_DETAIL
+
         ctx, app = make_app(discogs_cache=None)
         with ctx:
             resp = await _post(app, {"names": ["Wishy"]})
         assert resp.status_code == 503
-        assert "Discogs cache" in resp.json()["detail"]
+        assert resp.json()["detail"] == _DISCOGS_CACHE_UNAVAILABLE_DETAIL
 
 
 class TestErrorClassRouting:
@@ -259,6 +268,8 @@ class TestErrorClassRouting:
     async def test_cache_unavailable_returns_503_with_cache_detail(
         self, make_app, mock_discogs_cache
     ):
+        from artists.router import _DISCOGS_CACHE_QUERY_FAILED_DETAIL
+
         mock_discogs_cache.artist_equality_candidates = AsyncMock(
             side_effect=CacheUnavailableError("PG pool exhausted")
         )
@@ -267,7 +278,9 @@ class TestErrorClassRouting:
             resp = await _post(app, {"names": ["Wishy"]})
 
         assert resp.status_code == 503
-        assert "Discogs cache" in resp.json()["detail"]
+        # The TRANSIENT-shaped detail, not the dependency-gate config hint —
+        # the deps were wired; the query failed mid-flight.
+        assert resp.json()["detail"] == _DISCOGS_CACHE_QUERY_FAILED_DETAIL
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -288,6 +301,8 @@ class TestErrorClassRouting:
         (socket-level resets)."""
         from asyncpg.exceptions import InterfaceError, PostgresError
 
+        from artists.router import _ENTITY_STORE_QUERY_FAILED_DETAIL
+
         side_effect = {
             "postgres": PostgresError("connection reset"),
             "interface": InterfaceError("pool is closing"),
@@ -299,7 +314,7 @@ class TestErrorClassRouting:
             resp = await _post(app, {"names": ["Wishy"]})
 
         assert resp.status_code == 503
-        assert "Entity store" in resp.json()["detail"]
+        assert resp.json()["detail"] == _ENTITY_STORE_QUERY_FAILED_DETAIL
 
     @pytest.mark.asyncio
     async def test_cancelled_error_logs_abort_and_propagates(
@@ -366,6 +381,24 @@ class TestPostHogTelemetry:
         # The emit was ATTEMPTED and its failure swallowed — without this
         # pin, silently skipping the emit would also pass.
         assert mock_posthog_client.capture.call_count == 1
+
+    def test_summary_keys_cannot_shadow_framework_properties(self):
+        """`_emit_resolve_summary` passes the summary straight into
+        `send_to_posthog`, whose `**extra_properties` merges LAST — a
+        summary key colliding with a framework property silently replaces
+        it. The `api_calls` collision was fixed by renaming the field at
+        its source; this pins the invariant for every future field."""
+        import dataclasses
+
+        from artists.resolver import ResolveStats
+
+        framework_properties = {"total_duration_ms", "steps", "api_calls", "cache"}
+        summary_keys = {f.name for f in dataclasses.fields(ResolveStats)} | {"dry_run"}
+        collisions = summary_keys & framework_properties
+        assert not collisions, (
+            f"ResolveStats/summary keys shadow framework event properties: {collisions}. "
+            "Rename the field (service-qualify it, like discogs_api_calls)."
+        )
 
     @pytest.mark.asyncio
     async def test_error_exit_emits_nothing(self, make_app, mock_entity_store, mock_posthog_client):

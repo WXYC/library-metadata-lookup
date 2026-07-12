@@ -104,7 +104,11 @@ class TestErrorClassRouting:
             )
 
         assert resp.status_code == 503
-        assert "Discogs cache" in resp.json()["detail"]
+        # The TRANSIENT-shaped mid-flight detail, not the dependency-gate
+        # config hint (deps were wired; the query failed).
+        from artists.router import _DISCOGS_CACHE_QUERY_FAILED_DETAIL
+
+        assert resp.json()["detail"] == _DISCOGS_CACHE_QUERY_FAILED_DETAIL
 
     @pytest.mark.asyncio
     async def test_entity_store_pg_failure_returns_503_with_entity_detail(
@@ -125,7 +129,9 @@ class TestErrorClassRouting:
             )
 
         assert resp.status_code == 503
-        assert "Entity store" in resp.json()["detail"]
+        from artists.router import _ENTITY_STORE_QUERY_FAILED_DETAIL
+
+        assert resp.json()["detail"] == _ENTITY_STORE_QUERY_FAILED_DETAIL
 
     @pytest.mark.asyncio
     async def test_asyncpg_interface_error_returns_503_not_500(self, app_client, mock_entity_store):
@@ -147,7 +153,9 @@ class TestErrorClassRouting:
             )
 
         assert resp.status_code == 503
-        assert "Entity store" in resp.json()["detail"]
+        from artists.router import _ENTITY_STORE_QUERY_FAILED_DETAIL
+
+        assert resp.json()["detail"] == _ENTITY_STORE_QUERY_FAILED_DETAIL
 
     @pytest.mark.asyncio
     async def test_cancelled_error_logs_abort_and_propagates(
@@ -291,7 +299,9 @@ class TestServiceUnavailable:
                 )
 
         assert resp.status_code == 503
-        assert "Entity store" in resp.json()["detail"]
+        from artists.router import _ENTITY_STORE_UNAVAILABLE_DETAIL
+
+        assert resp.json()["detail"] == _ENTITY_STORE_UNAVAILABLE_DETAIL
 
     @pytest.mark.asyncio
     async def test_503_when_discogs_cache_none(self, mock_settings, mock_entity_store):
@@ -322,7 +332,9 @@ class TestServiceUnavailable:
                 )
 
         assert resp.status_code == 503
-        assert "Discogs cache" in resp.json()["detail"]
+        from artists.router import _DISCOGS_CACHE_UNAVAILABLE_DETAIL
+
+        assert resp.json()["detail"] == _DISCOGS_CACHE_UNAVAILABLE_DETAIL
 
 
 class TestDuplicateInputDedup:

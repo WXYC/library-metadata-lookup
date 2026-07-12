@@ -3239,6 +3239,39 @@ class TestSearchArtists:
             assert await service.search_artists("L'Rain") is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_item",
+        [
+            {"id": {"artist": 123}, "title": "Dict Id", "type": "artist"},
+            {"id": "a1b2-uuid", "title": "String Id", "type": "artist"},
+            "not-a-dict-item",
+        ],
+        ids=["dict-id", "string-id", "non-dict-item"],
+    )
+    async def test_item_parse_failure_logs_distrust_fingerprint(self, service, caplog, bad_item):
+        """Type-level item drift (model validation failure, non-dict items)
+        must log the DISTRUST fingerprint, same as the None-id guard — the
+        live smoke keys fail-vs-skip on that prefix, and routing these
+        through the generic 'failed' log would make the drift canary skip
+        forever on exactly the payload-shape drift it exists to catch."""
+        import logging
+
+        from discogs.service import SEARCH_ARTISTS_DISTRUST_LOG_PREFIX
+
+        mock_resp = make_artist_search_response(
+            [{"id": 9, "title": "L'Rain", "type": "artist"}, bad_item]
+        )
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            with caplog.at_level(logging.WARNING, logger="discogs.service"):
+                assert await service.search_artists("L'Rain") is None
+        assert any(SEARCH_ARTISTS_DISTRUST_LOG_PREFIX in r.getMessage() for r in caplog.records), (
+            f"expected distrust fingerprint for item {bad_item!r}; "
+            f"got {[r.getMessage() for r in caplog.records]}"
+        )
+
+    @pytest.mark.asyncio
     async def test_blank_name_raises_value_error(self, service):
         """Blank input is a caller error, not a measurement: returning ``[]``
         would fabricate a "Discogs answered, zero candidates" observation for

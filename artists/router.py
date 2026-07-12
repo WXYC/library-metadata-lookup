@@ -167,7 +167,8 @@ router = APIRouter(tags=["artists"])
     responses={
         200: {"description": "Composed variants per input name."},
         400: {"description": "Malformed JSON body."},
-        401: {"description": "Missing or invalid `LML_API_KEY` bearer token."},
+        401: {"description": "Missing `Authorization` header."},
+        403: {"description": "Present but invalid/malformed `LML_API_KEY` bearer token."},
         413: {"description": "Batch exceeded the per-request name cap."},
         422: {"description": "Request body failed Pydantic validation."},
         503: {"description": "Entity store or Discogs cache not available."},
