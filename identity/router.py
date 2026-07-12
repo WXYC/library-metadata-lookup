@@ -19,10 +19,13 @@ from collections import Counter
 from typing import Any
 
 import sentry_sdk
-from asyncpg.exceptions import PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import ValidationError
 
+from core.bulk_body import (
+    TRANSIENT_PG_ERRORS,
+    parse_bulk_body,
+    resolve_input_cap,
+)
 from core.bulk_concurrency import (
     acquire_bulk_global_permit,
     cancel_and_drain,
@@ -54,8 +57,10 @@ from identity.release_validation import (
 # Lazy imports inside the handler:
 #   wxyc_etl.text.is_compilation_artist — required at handler scope only.
 
-# Per api.yaml: max 1,000 inputs per request; over-cap returns 413.
-_BULK_RESOLVE_INPUT_CAP = 1000
+# Per api.yaml: max inputs per request; over-cap returns 413. Read from the
+# generated model's JSON schema so a regenerated `maxItems` moves the 413
+# gate in lockstep (LML#767 drift guard — the artists routes' pattern).
+_BULK_RESOLVE_INPUT_CAP = resolve_input_cap(BulkResolveLibrariesRequest, "inputs")
 
 
 def _bulk_resolve_default_concurrency() -> int:
@@ -129,7 +134,7 @@ async def resolve_identity(
     store = _require_entity_store(entity_store)
     try:
         identity = await store.get_identity(name)
-    except (PostgresError, OSError):
+    except TRANSIENT_PG_ERRORS:
         logger.exception("Entity store query failed for name=%r", name)
         raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
     if identity is None:
@@ -163,7 +168,7 @@ async def bulk_resolve_identities(
     for name in request.names:
         try:
             identity = await store.get_identity(name)
-        except (PostgresError, OSError):
+        except TRANSIENT_PG_ERRORS:
             # Fail closed on partial PG failure: the caller cannot distinguish
             # "name had no identity" from "PG died before this name was tried".
             logger.exception("Entity store query failed mid-bulk for name=%r", name)
@@ -218,35 +223,14 @@ async def bulk_resolve_libraries(
     # don't touch this endpoint) to the wxyc_etl ABI.
     from wxyc_etl.text import is_compilation_artist
 
-    # Parse + cap-check manually rather than via a typed body parameter:
-    # the codegen-derived `BulkResolveLibrariesRequest` carries
-    # `max_length=1000` (extracted from api.yaml's `maxItems: 1000`), which
-    # would let Pydantic short-circuit over-cap requests as 422. The
-    # api.yaml contract documents 413 explicitly for cap exceedance, so we
-    # check the raw input count first and raise 413; only then do we run
-    # full per-input validation.
-    try:
-        body = await http_request.json()
-    except (ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=f"Malformed JSON body: {e}") from None
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
-    inputs_raw = body.get("inputs")
-    if not isinstance(inputs_raw, list):
-        raise HTTPException(status_code=422, detail="`inputs` must be a JSON array.")
-    if len(inputs_raw) > _BULK_RESOLVE_INPUT_CAP:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Batch exceeded the {_BULK_RESOLVE_INPUT_CAP}-input cap "
-                f"(received {len(inputs_raw)})."
-            ),
-        )
-
-    try:
-        request = BulkResolveLibrariesRequest.model_validate(body)
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors()) from None
+    # Shared bulk envelope (LML#767): raw-JSON parse, ClientDisconnect -> 400,
+    # non-object -> 400, manual over-cap -> 413 before Pydantic (whose
+    # `max_length` would 422 an oversize batch, but api.yaml documents 413),
+    # then model_validate. An absent/wrong-type `inputs` field falls through
+    # to Pydantic's structured errors() rather than a bare-string 422.
+    request = await parse_bulk_body(
+        http_request, BulkResolveLibrariesRequest, _BULK_RESOLVE_INPUT_CAP, field="inputs"
+    )
 
     store = _require_entity_store(entity_store)
 
@@ -306,7 +290,7 @@ async def bulk_resolve_libraries(
                 # / etc. divergence when storage happens to be canonical).
                 # Strictly ≥ legacy `get_identity()` hit rate.
                 identity: Identity | None = await store.resolve_library_name(input_row.artist_name)
-            except (PostgresError, OSError):
+            except TRANSIENT_PG_ERRORS:
                 logger.exception(
                     "Entity store query failed mid-bulk-resolve for library_id=%d artist_name=%r",
                     input_row.library_id,
@@ -322,7 +306,7 @@ async def bulk_resolve_libraries(
                 # is covered by the same permit, so a resolved input never holds
                 # two pool connections at once.
                 return await compose_for_identity(input_row.library_id, identity, store)
-            except (PostgresError, OSError):
+            except TRANSIENT_PG_ERRORS:
                 logger.exception(
                     "Provenance fetch failed mid-bulk-resolve for library_id=%d",
                     input_row.library_id,
@@ -494,7 +478,7 @@ async def resolve_release_identity(
             identity_id, minted = await store.mint_or_get_release_identity(
                 source=source_value, external_id=canonical_external_id
             )
-        except (PostgresError, OSError):
+        except TRANSIENT_PG_ERRORS:
             logger.exception(
                 "release-identity resolve failed for source=%r external_id=%r",
                 source_value,

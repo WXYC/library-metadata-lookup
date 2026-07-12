@@ -1110,3 +1110,50 @@ class TestBulkLookupClientAbort:
         assert captured_tags.get("lml.client_aborted") == "true", (
             f"Expected lml.client_aborted=true tag; got {captured_tags!r}"
         )
+
+
+class TestBulkLookupFamilyAlignment:
+    """LML#767: the bulk-lookup route joins the shared envelope. It has no
+    batch-level transient-PG arm (per-item failures are isolated in
+    `_run_one`), so only the ClientDisconnect and structured-422 arms apply.
+    The 400 over-cap contract (LML#368) is preserved."""
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_during_body_read_returns_400(self, app_client, monkeypatch):
+        """A mid-body client abort maps to 400, not an unhandled 500."""
+        from starlette.requests import ClientDisconnect, Request
+
+        async def _gone(self):
+            raise ClientDisconnect()
+
+        monkeypatch.setattr(Request, "json", _gone)
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk", json={"items": [{"artist": "x", "album": "y"}]}
+                )
+
+        assert resp.status_code == 400
+        assert "disconnected" in resp.json()["detail"].lower()
+        mock_lookup.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_absent_items_field_returns_structured_422(self, app_client):
+        """A missing `items` field falls through to model_validate, so the
+        detail is Pydantic's structured errors() list, not a bare
+        "`items` must be a JSON array" string."""
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post("/api/v1/lookup/bulk", json={})
+
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert isinstance(detail, list)
+        assert detail[0]["loc"] == ["items"]
+        assert detail[0]["type"] == "missing"
+        mock_lookup.assert_not_awaited()

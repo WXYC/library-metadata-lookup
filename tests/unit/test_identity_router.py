@@ -267,3 +267,58 @@ class TestEntityStoreUnavailable:
 
         assert resp.status_code == 503
         assert "entity store" in resp.json()["detail"].lower()
+
+
+class TestInterfaceErrorMapping:
+    """LML#767 family alignment: asyncpg's client-side ``InterfaceError``
+    (raised for pool-lifecycle events — "pool is closing", "connection is
+    closed") subclasses neither ``PostgresError`` nor ``OSError``, so a
+    deploy-window pool teardown would otherwise surface as an application 500
+    on these routes. The transient tuple must catch it and return 503, the
+    same class the artists routes and ``discogs/fallthrough.py`` pin."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_returns_503_on_interface_error(self, app_client, mock_entity_store):
+        from asyncpg.exceptions import InterfaceError
+
+        mock_entity_store.get_identity.side_effect = InterfaceError("pool is closing")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.get("/identity/resolve", params={"name": "Stereolab"})
+
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_bulk_returns_503_on_interface_error(self, app_client, mock_entity_store):
+        from asyncpg.exceptions import InterfaceError
+
+        mock_entity_store.get_identity.side_effect = InterfaceError("connection is closed")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/identity/bulk", json={"names": ["Stereolab"]})
+
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_release_identity_resolve_returns_503_on_interface_error(
+        self, app_client, mock_entity_store
+    ):
+        from asyncpg.exceptions import InterfaceError
+
+        mock_entity_store.mint_or_get_release_identity.side_effect = InterfaceError(
+            "pool is closed"
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/identity/resolve",
+                json={"kind": "release", "source": "discogs_release", "external_id": "12345"},
+            )
+
+        assert resp.status_code == 503

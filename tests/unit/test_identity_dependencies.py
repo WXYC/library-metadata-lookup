@@ -264,3 +264,28 @@ class TestEntityStoreLazyInitRace:
         )
         # All callers must see the same EntityStore instance.
         assert len({id(r) for r in results}) == 1
+
+
+@pytest.mark.asyncio
+async def test_returns_none_when_probe_raises_interface_error(
+    monkeypatch, _fake_discogs_pool, caplog
+):
+    """LML#767: asyncpg's client-side InterfaceError (pool/connection
+    lifecycle) is classified as a transient DB-unreachable probe failure —
+    the same arm as PostgresError/OSError, distinguished from the generic
+    catch-all by the "probe failed; disabling identity routes" log line."""
+    import logging
+
+    async def boom(self, query, *args):
+        raise asyncpg.exceptions.InterfaceError("pool is closing")
+
+    monkeypatch.setattr("entity.sources.PgSource.fetchone", boom)
+    settings = _settings("postgresql://x:y@127.0.0.1:1/z")
+    monkeypatch.setattr("core.dependencies.get_settings", lambda: settings)
+
+    with caplog.at_level(logging.WARNING, logger="identity.dependencies"):
+        result = await deps.get_entity_store(settings)
+
+    assert result is None
+    assert deps._entity_probe_failed is True
+    assert any("probe failed; disabling identity routes" in r.getMessage() for r in caplog.records)

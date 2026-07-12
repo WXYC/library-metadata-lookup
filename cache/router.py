@@ -36,9 +36,7 @@ from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 import sentry_sdk
-from asyncpg.exceptions import PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import ValidationError
 
 from cache.dispatch import refresh_identity
 from cache.models import (
@@ -46,6 +44,7 @@ from cache.models import (
     BulkCacheRefreshResponse,
     CacheRefreshResultItem,
 )
+from core.bulk_body import TRANSIENT_PG_ERRORS, parse_bulk_body
 from core.bulk_concurrency import (
     acquire_bulk_global_permit,
     cancel_and_drain,
@@ -151,27 +150,18 @@ async def handle_refresh_for_identities(
     bandcamp_client: BandcampClient | None = Depends(get_bandcamp_client),
 ) -> BulkCacheRefreshResponse:
     """Bulk cache refresh. See route docstring for protocol."""
-    # Manual 400-on-overflow before Pydantic so oversize doesn't get 422'd.
-    # Same precedent as `/api/v1/lookup/bulk` (lookup/router.py:301-322).
-    try:
-        body = await http_request.json()
-    except (ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=f"Malformed JSON body: {e}") from None
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
-    ids_raw = body.get("identity_ids")
-    if not isinstance(ids_raw, list):
-        raise HTTPException(status_code=422, detail="`identity_ids` must be a JSON array.")
-    if len(ids_raw) > _REFRESH_INPUT_CAP:
-        raise HTTPException(
-            status_code=400,
-            detail=(f"Batch exceeded the {_REFRESH_INPUT_CAP}-id cap (received {len(ids_raw)})."),
-        )
-
-    try:
-        request = BulkCacheRefreshRequest.model_validate(body)
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors()) from None
+    # Shared bulk envelope (LML#767): raw-JSON parse, ClientDisconnect -> 400,
+    # non-object -> 400, manual over-cap before Pydantic, then model_validate.
+    # `cap_status=400` preserves this route's LML#525 over-cap contract (400,
+    # not the family's default 413). An absent/wrong-type `identity_ids` field
+    # falls through to Pydantic's structured errors() rather than a bare 422.
+    request = await parse_bulk_body(
+        http_request,
+        BulkCacheRefreshRequest,
+        _REFRESH_INPUT_CAP,
+        field="identity_ids",
+        cap_status=400,
+    )
 
     store = _require_entity_store(entity_store)
     discogs = _require_discogs_service(discogs_service)
@@ -187,7 +177,7 @@ async def handle_refresh_for_identities(
         provenance = await store.get_release_identity_provenance_bulk(
             list(dict.fromkeys(identity_ids))
         )
-    except (PostgresError, OSError) as e:
+    except TRANSIENT_PG_ERRORS as e:
         logger.exception("cache refresh: provenance bulk read failed for %d ids", len(identity_ids))
         raise HTTPException(
             status_code=503,
