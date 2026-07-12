@@ -373,6 +373,14 @@ class TestTrigramFallbackSQLIntegration:
             # IMMUTABLE f_unaccent wrapper mirroring discogs-cache, so the
             # trigram operator can ride a functional GIN index. Idempotent.
             await conn.execute(F_UNACCENT_WRAPPER_SQL)
+            # Drop-before-create keeps setup idempotent against an *empty*
+            # residual ``release_artist`` (e.g. a prior run SIGKILLed after the
+            # CREATE but before its teardown's DROP): the guard above only
+            # vetoes when the table holds rows, so an empty residue would reach
+            # a bare ``CREATE TABLE`` and raise DuplicateTableError. Mirrors the
+            # sibling entity fixtures' idempotent ``DROP ... CASCADE`` + CREATE
+            # and this fixture's own teardown.
+            await conn.execute("DROP TABLE IF EXISTS release_artist")
             await conn.execute(
                 f"CREATE TABLE release_artist ({RECONCILER_TABLE_DDL['release_artist']})"
             )

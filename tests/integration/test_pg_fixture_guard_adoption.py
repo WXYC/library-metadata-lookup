@@ -25,10 +25,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import asyncpg
 import pytest
 
 from tests.integration.conftest import (
     ENTITY_IDENTITY_DDL,
+    RECONCILER_TABLE_DDL,
     skip_if_drop_targets_populated,
 )
 
@@ -105,3 +107,48 @@ async def test_guard_vetoes_when_scratch_identity_holds_a_row(pg_pool) -> None:
             assert "entity.identity" in message
         finally:
             await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+async def test_trigram_fixture_setup_survives_empty_release_artist_residue(pg_pool) -> None:
+    """An *empty* residual ``release_artist`` must not error the trigram setup.
+
+    ``skip_if_drop_targets_populated`` only vetoes when the target holds rows,
+    so an empty ``release_artist`` left by a crash-interrupted prior run (SIGKILL
+    after the fixture's ``CREATE TABLE`` but before its teardown ``DROP``) sails
+    past the guard. Before the drop-before-create fix, the fixture's bare
+    ``CREATE TABLE release_artist`` then raised ``DuplicateTableError`` — where
+    the pre-#768 existence check would have skipped. This reproduces that
+    residue and asserts the migrated setup sequence (guard, then
+    drop-before-create) is idempotent instead.
+    """
+    async with pg_pool.acquire() as conn:
+        try:
+            # Simulate crash residue: an empty release_artist from an
+            # interrupted prior run whose teardown never ran.
+            await conn.execute("DROP TABLE IF EXISTS release_artist")
+            await conn.execute(
+                f"CREATE TABLE release_artist ({RECONCILER_TABLE_DDL['release_artist']})"
+            )
+
+            # Empty table → guard must NOT veto (it only vetoes on rows). If it
+            # raised Skipped here the test would report skipped, not passed.
+            await skip_if_drop_targets_populated(conn, ("release_artist",))
+
+            # The divergence this fix closes: a *bare* CREATE over the residue
+            # raises (the pre-fix fixture path), which is why the migrated setup
+            # must drop first.
+            with pytest.raises(asyncpg.exceptions.DuplicateTableError):
+                await conn.execute(
+                    f"CREATE TABLE release_artist ({RECONCILER_TABLE_DDL['release_artist']})"
+                )
+
+            # The migrated setup drops before creating, so re-running it over
+            # the empty residue is a no-op recreate rather than a duplicate.
+            await conn.execute("DROP TABLE IF EXISTS release_artist")
+            await conn.execute(
+                f"CREATE TABLE release_artist ({RECONCILER_TABLE_DDL['release_artist']})"
+            )
+        finally:
+            await conn.execute("DROP TABLE IF EXISTS release_artist")
