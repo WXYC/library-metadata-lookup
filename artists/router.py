@@ -22,7 +22,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import sentry_sdk
-from asyncpg.exceptions import PostgresError
+from asyncpg.exceptions import InterfaceError, PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ValidationError
 from starlette.requests import ClientDisconnect
@@ -372,6 +372,15 @@ async def resolve_bulk(
             http_span.set_data("http.status_code", 499)
             logger.warning("artist-resolve bulk aborted by client: names=%d", len(names))
             raise
+        except ValueError as e:
+            # The resolver's input-validation contract: semantically
+            # unresolvable names (blank, NUL, lone surrogates, empty
+            # identity-match form, bare parenthesized numbers) are caller
+            # errors, never in-band verdicts. Pydantic can't express these
+            # (constr(min_length=1) admits whitespace), so the resolver
+            # raises and the route maps to 422 per api.yaml.
+            http_span.set_data("http.status_code", 422)
+            raise HTTPException(status_code=422, detail=str(e)) from None
         except CacheUnavailableError:
             # Tier-2 candidate queries: discogs-cache pool/PG failure.
             logger.exception(
@@ -379,8 +388,13 @@ async def resolve_bulk(
             )
             http_span.set_data("http.status_code", 503)
             raise HTTPException(status_code=503, detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL) from None
-        except (PostgresError, OSError):
+        except (PostgresError, InterfaceError, OSError):
             # Tier-1 read or write-back: raw entity-store PG failure.
+            # InterfaceError (asyncpg's client-side pool/connection
+            # lifecycle errors) subclasses neither PostgresError nor
+            # OSError — without it a pool-teardown race during deploy
+            # would read as an application 500 instead of the transient
+            # 503 the sibling failure modes emit.
             logger.exception(
                 "Entity store query failed during artist-resolve (names=%d)", len(names)
             )

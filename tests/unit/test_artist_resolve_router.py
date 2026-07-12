@@ -291,3 +291,46 @@ class TestPostHogTelemetry:
 
         assert resp.status_code == 200
         assert resp.json()["results"][0]["discogs_artist_id"] == 123
+
+
+class TestResolverValueErrorMapping:
+    """The resolver's input-validation ValueError maps to 422 — a caller
+    error, never a 500 (pydantic's constr(min_length=1) admits the
+    whitespace/NUL shapes the resolver rejects)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["   ", "Ol\x00ga", "(2)"],
+        ids=["whitespace-only", "embedded-nul", "bare-disambiguator"],
+    )
+    async def test_semantically_invalid_name_returns_422(
+        self, make_app, mock_entity_store, bad_name
+    ):
+        ctx, app = make_app()
+        with ctx:
+            resp = await _post(app, {"names": ["Wishy", bad_name]})
+
+        assert resp.status_code == 422
+        assert "names[1]" in resp.json()["detail"]
+        # Validation precedes every tier.
+        mock_entity_store.bulk_resolve_library_names.assert_not_awaited()
+
+
+class TestInterfaceErrorMapping:
+    @pytest.mark.asyncio
+    async def test_asyncpg_interface_error_returns_503_not_500(self, make_app, mock_entity_store):
+        """asyncpg's client-side pool/connection errors subclass neither
+        PostgresError nor OSError; a deploy-window pool teardown must
+        read as the transient 503, not an application 500."""
+        from asyncpg.exceptions import InterfaceError
+
+        mock_entity_store.bulk_resolve_library_names = AsyncMock(
+            side_effect=InterfaceError("pool is closing")
+        )
+        ctx, app = make_app()
+        with ctx:
+            resp = await _post(app, {"names": ["Wishy"]})
+
+        assert resp.status_code == 503
+        assert "Entity store" in resp.json()["detail"]
