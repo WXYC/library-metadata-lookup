@@ -10,9 +10,13 @@ check against the Discogs API. Cache results are evidence (corroboration
 not mint, because nothing self-corrects a wrong row (see the write-back
 note below).
 
-Inputs are trimmed, then validated before any tier runs: NUL-bearing,
-blank, non-encodable, empty-identity-form, and qualifier-only names
-raise ``ValueError`` (the route maps it to 422) rather than receiving an
+Inputs are sanitized (Unicode format characters dropped, whitespace
+trimmed — the normalizer removes Cf characters too, and a ZWSP-bearing
+mint key would be invisible to every store read leg), then validated
+before any tier runs: NUL-bearing, blank, non-encodable,
+empty-identity-form, and bare-parenthesized-number names ("(2)" — a
+Discogs disambiguator whose artist name was lost upstream) raise
+``ValueError`` (the route maps it to 422) rather than receiving an
 in-band verdict — the wire contract's ``not_found`` means "the API tier
 ran and measured zero", which is never true of garbage input, and a NUL
 reaching the tier-2 PG binds would 503 the whole batch as a fake cache
@@ -26,10 +30,16 @@ a raw input carrying a qualifier denotes something other than the bare
 name (a different same-named artist, a scraper artifact, a decoration),
 so qualified inputs get their own group instead of inheriting the bare
 form's verdict: a stored ``Popsicle`` row must never answer for
-``Popsicle (2)``. Qualifiers are detected on the NFKC-folded, lowercased
-raw name so width/case variants ("（２）") key with their ASCII twins —
-the same folds the normalizer itself applies. The deliberate cost: a
-legitimately-decorated name ("!!! (Chk Chk Chk)") resolves only when
+``Popsicle (2)``. Qualifier detection mirrors the normalizer exactly: it
+peels EVERY balanced trailing ()/[] group (nested tails included) from
+the NFKC-folded lowercase name, canonicalizes bare-number groups across
+bracket/width/spacing spellings ("[2]", "( 2 )", "（２）" all key as
+"(2)"), concatenates multi-group tails ("(2)(uk)"), refuses to treat the
+group as a qualifier when peeling would empty the name (the normalizer
+makes the same refusal — "(Smog)" is a resolvable bare name), and the
+group's form is the normalizer's FIXED POINT so multi-qualified inputs
+still see their exact-form family at the API tier. The deliberate cost:
+a legitimately-decorated name ("!!! (Chk Chk Chk)") resolves only when
 Discogs titles the artist with the same qualifier; otherwise it lands
 ``ambiguous``/``not_found`` and surfaces in the drain residual rather
 than risk a wrong mint.
@@ -114,28 +124,114 @@ from generated.api_models import (
 
 logger = logging.getLogger(__name__)
 
-# A trailing parenthesized/bracketed qualifier — Discogs's "(N)" artist
+# Bracket pairs a trailing qualifier may use — Discogs's "(N)" artist
 # disambiguator is the motivating case, but the identity-match form strips
-# ANY trailing group (including "[2]", "(Sweden)", "(1975)"), so qualifier
+# ANY trailing parenthesized/bracketed group (including "[2]", "(Sweden)",
+# "(1975)", and NESTED tails like "(feat. Cindy (2))"), so qualifier
 # detection must cover the same surface or a variant spelling silently
-# rejoins the bare group. Matched against the NFKC-folded lowercase name
-# (below) so fullwidth "（２）" keys identically to "(2)".
-_TRAILING_QUALIFIER_RE = re.compile(r"([(\[][^()\[\]]*[)\]])\s*$")
+# rejoins the bare group. Curly/angle/CJK bracket families are content to
+# the normalizer and stay content here.
+_QUALIFIER_OPENERS = {")": "(", "]": "["}
+
+# The exact garbage shape rejected at validation: a name that IS a bare
+# parenthesized/bracketed number ("(2)", "[2]", "（２）" after folding) —
+# a disambiguator with the artist name lost upstream. Deliberately narrow:
+# a fully-parenthesized NON-numeric name ("(Smog)") is a real artist name
+# the normalizer also refuses to strip, and stays resolvable.
+_BARE_NUMBER_GROUP_RE = re.compile(r"[(\[]\s*(\d+)\s*[)\]]")
 
 
-def _split_trailing_qualifier(name: str) -> tuple[str | None, str]:
-    """Return ``(qualifier, prefix)`` from the NFKC-folded lowercase name.
+def _peel_trailing_group(text: str) -> tuple[str | None, str]:
+    """Split one balanced trailing bracket group off ``text``.
 
-    ``qualifier`` is the folded trailing group text (``None`` when the
-    name has no trailing qualifier); ``prefix`` is the folded text before
-    it. Folding mirrors the normalizer's own width/case folds so this
-    yields one canonical qualifier key per semantic spelling.
+    Returns ``(group, prefix)``, or ``(None, text)`` when the tail is not
+    a balanced ()/[] group. Balance-aware so nested tails the normalizer
+    strips whole ("(feat. Cindy (2))") peel as one group — a regex with a
+    no-brackets-inside class cannot see them.
+    """
+    stripped = text.rstrip()
+    if not stripped or stripped[-1] not in _QUALIFIER_OPENERS:
+        return None, text
+    closer = stripped[-1]
+    opener = _QUALIFIER_OPENERS[closer]
+    depth = 0
+    for i in range(len(stripped) - 1, -1, -1):
+        if stripped[i] == closer:
+            depth += 1
+        elif stripped[i] == opener:
+            depth -= 1
+            if depth == 0:
+                return stripped[i:], stripped[:i]
+    return None, text  # unbalanced tail: content, not a qualifier
+
+
+def _canonical_qualifier_group(group: str) -> str:
+    """One canonical key per semantic qualifier spelling.
+
+    A bare-number group canonicalizes to ``(N)`` — "[2]", "( 2 )", and
+    folded "（２）" all denote the Discogs disambiguator "(2)" (zero-padded
+    "(02)" is NOT the Discogs convention and stays distinct). Other
+    groups just drop internal whitespace so spacing variants share a key;
+    the key is only ever compared against keys built the same way.
+    """
+    match = _BARE_NUMBER_GROUP_RE.fullmatch(group.strip())
+    if match:
+        return f"({match.group(1)})"
+    return re.sub(r"\s+", "", group)
+
+
+def _split_trailing_qualifiers(name: str) -> tuple[str | None, str]:
+    """Return ``(qualifier key, folded remainder)`` for ``name``.
+
+    Peels EVERY balanced trailing group from the NFKC-folded lowercase
+    name (the same width/case folds the normalizer applies) and joins
+    their canonical forms into one key, so "Sault (2) (UK)" keys as
+    ``(2)(uk)`` rather than hiding its inner qualifier. When peeling
+    would leave nothing, the group IS the name, not a qualifier — the
+    normalizer makes the same refusal — so "(Smog)" returns
+    ``(None, "(smog)")`` and stays a resolvable bare name.
     """
     folded = unicodedata.normalize("NFKC", name).lower()
-    match = _TRAILING_QUALIFIER_RE.search(folded)
-    if match is None:
+    remainder = folded
+    groups: list[str] = []
+    while True:
+        group, prefix = _peel_trailing_group(remainder)
+        if group is None or not prefix.strip():
+            break
+        groups.append(group)
+        remainder = prefix
+    if not groups:
         return None, folded
-    return match.group(1), folded[: match.start()]
+    return "".join(_canonical_qualifier_group(g) for g in reversed(groups)), remainder
+
+
+def _fixed_point_form(name: str) -> str:
+    """Iterate ``to_identity_match_form`` to a fixed point.
+
+    The normalizer strips ONE trailing qualifier per pass, so a
+    multi-qualified input's single-pass form ("sault (2)") still carries
+    a tail — comparing API titles or cache binds against it measures
+    false zeroes. The fixed point ("sault") is the base name every family
+    member's own single-pass form can actually equal.
+    """
+    form = to_identity_match_form(name)
+    while form:
+        again = to_identity_match_form(form)
+        if again == form:
+            break
+        form = again
+    return form
+
+
+def _sanitize_name(name: str) -> str:
+    """Drop Unicode format (Cf) characters, then trim whitespace.
+
+    ZWSP/BOM/soft-hyphen survive ``str.strip()`` and would ride into
+    store keys and qualifier detection while the normalizer removes them
+    — a ``"Wishy\\u200b"`` mint would be invisible to every store read
+    leg. Congruent with the normalizer's own treatment.
+    """
+    return "".join(ch for ch in name if unicodedata.category(ch) != "Cf").strip()
 
 
 @dataclass
@@ -144,7 +240,10 @@ class ResolveStats:
 
     Verdict counters count response POSITIONS (duplicates share their
     group's verdict), so they sum to ``names``. ``deduped`` counts unique
-    ``(form, qualifier)`` groups and ``minted`` counts upserts performed.
+    ``(form, qualifier)`` groups and ``minted`` counts SUCCESSFUL upserts
+    (an upsert that returned None — the store's swallowed-failure
+    contract — is logged but not counted, so ``minted`` tracks rows
+    actually persisted, not write attempts).
     ``api_calls`` counts ``search_artists`` probes that returned to the
     resolver — including ``None`` returns (a 429-exhausted or distrusted
     probe still consumed shared-limiter budget). A probe shed by the
@@ -228,32 +327,36 @@ class _FormGroup:
 
 
 def _validate_name(index: int, name: str) -> tuple[str, str | None]:
-    """Return ``(identity-match form, qualifier)`` or raise ValueError.
+    """Return ``(fixed-point identity-match form, qualifier)`` or raise.
 
-    ``name`` arrives pre-trimmed. Garbage input must not receive an
-    in-band verdict: ``not_found`` is a measured zero a consumer may
-    durably negative-cache, and a NUL that reaches the tier-2 PG binds
-    fails the whole batch as a fake cache outage (PG rejects U+0000 in
-    text). The empty-form and qualifier-only rejections are a v1 recall
-    limit for names with no identity content — the band "!!!" survives
-    (its form is "!!!"), but "" and "(2)" have nothing to resolve.
-    The route maps ValueError to 422.
+    ``name`` arrives pre-sanitized (Cf-stripped + trimmed). Garbage input
+    must not receive an in-band verdict: ``not_found`` is a measured zero
+    a consumer may durably negative-cache, and a NUL that reaches the
+    tier-2 PG binds fails the whole batch as a fake cache outage (PG
+    rejects U+0000 in text). The empty-form and bare-number rejections
+    are a v1 recall limit for names with no identity content — "!!!"
+    survives (its form is "!!!") and so does the fully-parenthesized
+    real name "(Smog)", but "" and "(2)" (a Discogs disambiguator whose
+    artist name was lost upstream) have nothing to resolve. The route
+    maps ValueError to 422.
     """
     if "\x00" in name:
         raise ValueError(f"names[{index}] contains U+0000 (NUL); fix the input at its source")
     if not name:
         raise ValueError(f"names[{index}] is blank")
     try:
-        form = to_identity_match_form(name)
+        form = _fixed_point_form(name)
     except UnicodeEncodeError as e:
         raise ValueError(f"names[{index}] is not encodable Unicode (lone surrogate?)") from e
     if not form:
         raise ValueError(f"names[{index}] normalizes to an empty identity-match form")
-    qualifier, prefix = _split_trailing_qualifier(name)
-    if qualifier is not None and not prefix.strip():
+    qualifier, _ = _split_trailing_qualifiers(name)
+    if qualifier is None and _BARE_NUMBER_GROUP_RE.fullmatch(
+        unicodedata.normalize("NFKC", name).strip()
+    ):
         raise ValueError(
-            f"names[{index}] is only a trailing qualifier (e.g. a bare Discogs "
-            "disambiguator) with no artist name before it"
+            f"names[{index}] is only a bare parenthesized number — a Discogs "
+            "disambiguator with no artist name before it"
         )
     return form, qualifier
 
@@ -310,7 +413,7 @@ class BareNameArtistResolver:
         groups: dict[tuple[str, str | None], _FormGroup] = {}
         order: list[_FormGroup] = []
         for index, name in enumerate(names):
-            trimmed = name.strip()
+            trimmed = _sanitize_name(name)
             form, qualifier = _validate_name(index, trimmed)
             key = (form, qualifier)
             group = groups.get(key)
@@ -336,7 +439,7 @@ class BareNameArtistResolver:
                 identity = identities.get(verbatim)
                 if identity is None:
                     continue
-                row_qualifier, _ = _split_trailing_qualifier(identity.library_name)
+                row_qualifier, _ = _split_trailing_qualifiers(identity.library_name)
                 if row_qualifier != group.qualifier:
                     # The store's LOWER/canonical legs can hand back a
                     # bare-form row for a qualified read (the canonical
@@ -357,7 +460,9 @@ class BareNameArtistResolver:
                 # ids — near-duplicate-key accretion contradicting itself.
                 # First-wins would flip the verdict with input order;
                 # conflict means doubt, doubt means NULL. candidate_count
-                # stays null: the API tier never ran, nothing was measured.
+                # stays null (the API tier never ran) and corroboration
+                # stays [] (tier 2 was never consulted) — both documented
+                # in the wire contract's store-conflict arm.
                 logger.warning(
                     "artist-resolve store conflict for form '%s': ids %s",
                     group.form,
@@ -485,11 +590,14 @@ class BareNameArtistResolver:
         stats: ResolveStats,
     ) -> ArtistResolveResult:
         """Apply the verdict table to a measured single-page observation."""
-        # Exact-form family, distinct by artist id (first title per id
-        # wins — page order is the API's relevance order). The
-        # identity-match form strips the trailing qualifier, so
-        # "Popsicle (2)" collides with "Popsicle" — that strip IS the
-        # overload detection.
+        # Exact-form family, distinct by artist id; the setdefault keeps
+        # the first title per id in the API's relevance order.
+        # Deterministic in page CONTENT: Discogs carries one canonical
+        # title per artist id, so the first-title pick only matters under
+        # an API anomaly (one id under two titles on a single page). The
+        # FIXED-POINT identity-match form strips every trailing
+        # qualifier, so "Popsicle (2)" collides with "Popsicle" — that
+        # strip IS the overload detection.
         candidates: dict[int, str] = {}
         try:
             for item in page:
@@ -526,7 +634,7 @@ class BareNameArtistResolver:
             )
 
         ((winner_id, winner_title),) = candidates.items()
-        winner_qualifier, _ = _split_trailing_qualifier(winner_title)
+        winner_qualifier, _ = _split_trailing_qualifiers(winner_title)
         if winner_qualifier != group.qualifier:
             # A "(N)"-titled singleton answering a bare input means the
             # family is overloaded on Discogs and the bare member simply
