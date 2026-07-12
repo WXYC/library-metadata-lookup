@@ -16,7 +16,7 @@ mint key would be invisible to every store read leg), then validated
 before any tier runs: NUL-bearing, blank, non-encodable,
 empty-identity-form, and bare-parenthesized-number names ("(2)" — a
 Discogs disambiguator whose artist name was lost upstream) raise
-``ValueError`` (the route maps it to 422) rather than receiving an
+``InvalidNameError`` (the route maps it to 422) rather than receiving an
 in-band verdict — the wire contract's ``not_found`` means "the API tier
 ran and measured zero", which is never true of garbage input, and a NUL
 reaching the tier-2 PG binds would 503 the whole batch as a fake cache
@@ -127,6 +127,19 @@ from generated.api_models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class InvalidNameError(ValueError):
+    """An input name the resolver refuses to process — caller error.
+
+    Raised ONLY by ``_validate_name`` (blank, NUL, unencodable, empty
+    identity-match form, bare parenthesized number); the route maps it to
+    422. A dedicated subclass so the route never confuses it with a
+    ``ValueError`` escaping deeper code (e.g. a strict ``zip`` drift),
+    which is a server bug that must surface as a 500, not blame the
+    caller with an internal message in a 422 body.
+    """
+
 
 # Bracket pairs a trailing qualifier may use — Discogs's "(N)" artist
 # disambiguator is the motivating case, but the identity-match form strips
@@ -353,23 +366,23 @@ def _validate_name(index: int, name: str) -> tuple[str, str | None]:
     survives (its form is "!!!") and so does the fully-parenthesized
     real name "(Smog)", but "" and "(2)" (a Discogs disambiguator whose
     artist name was lost upstream) have nothing to resolve. The route
-    maps ValueError to 422.
+    maps InvalidNameError to 422.
     """
     if "\x00" in name:
-        raise ValueError(f"names[{index}] contains U+0000 (NUL); fix the input at its source")
+        raise InvalidNameError(f"names[{index}] contains U+0000 (NUL); fix the input at its source")
     if not name:
-        raise ValueError(f"names[{index}] is blank")
+        raise InvalidNameError(f"names[{index}] is blank")
     try:
         form = _fixed_point_form(name)
     except UnicodeEncodeError as e:
-        raise ValueError(f"names[{index}] is not encodable Unicode (lone surrogate?)") from e
+        raise InvalidNameError(f"names[{index}] is not encodable Unicode (lone surrogate?)") from e
     if not form:
-        raise ValueError(f"names[{index}] normalizes to an empty identity-match form")
+        raise InvalidNameError(f"names[{index}] normalizes to an empty identity-match form")
     # Gate on the FIXED-POINT form so a bare-number base wearing a
     # qualifier tail ("(2)(3)") is caught too — after peeling, "(2)" is
     # the group's entire identity content, the exact shape this rejects.
     if _BARE_NUMBER_GROUP_RE.fullmatch(form):
-        raise ValueError(
+        raise InvalidNameError(
             f"names[{index}] is only a bare parenthesized number — a Discogs "
             "disambiguator with no artist name before it"
         )
@@ -413,9 +426,9 @@ class BareNameArtistResolver:
         verification — but skips the ``entity.identity`` upsert.
 
         Raises:
-            ValueError: on invalid input names (NUL, blank, lone
-                surrogates, empty identity-match form, qualifier-only
-                strings) — caller error, not a measurement; the route
+            InvalidNameError: on invalid input names (NUL, blank, lone
+                surrogates, empty identity-match form, bare parenthesized
+                numbers) — caller error, not a measurement; the route
                 maps it to 422.
             CacheUnavailableError: tier-2 PG failure (route → 503).
             PostgresError / OSError: tier-1 or write-back PG failure
@@ -530,7 +543,7 @@ class BareNameArtistResolver:
                 legs = equality[group.form]
                 # Leg field names are the wire enum values minus the
                 # "cache_" prefix. A missing twin is a SERVER contract
-                # break — RuntimeError, not the ValueError the route maps
+                # break — RuntimeError, not an InvalidNameError-style 422
                 # to 422 (that would blame the caller for our drift).
                 try:
                     group.corroboration = [

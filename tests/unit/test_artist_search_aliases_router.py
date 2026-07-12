@@ -180,8 +180,10 @@ class TestInputCapGuard:
         """
         schema = ArtistSearchAliasesBulkRequest.model_json_schema()
         max_items = schema["properties"]["names"]["maxItems"]
-        # The gate uses the same source.
-        assert max_items == _BULK_INPUT_CAP
+        # The gate uses the same source — and the literal is pinned so an
+        # api.yaml copy-paste that shrinks THIS schema's cap (the resolve
+        # sibling is 25) can't silently 413 the alias-consumer ETL.
+        assert max_items == _BULK_INPUT_CAP == 1000
 
     @pytest.mark.asyncio
     async def test_413_when_over_input_cap(self, app_client, mock_entity_store):

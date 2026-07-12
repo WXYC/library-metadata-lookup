@@ -132,7 +132,9 @@ class TestInputValidation:
     async def test_invalid_name_raises_before_any_probe(
         self, resolver, entity_store, discogs_cache, discogs_service, bad_name
     ):
-        with pytest.raises(ValueError, match=r"names\[1\]"):
+        from artists.resolver import InvalidNameError
+
+        with pytest.raises(InvalidNameError, match=r"names\[1\]"):
             await resolver.resolve(["Wishy", bad_name])
 
         entity_store.bulk_resolve_library_names.assert_not_awaited()

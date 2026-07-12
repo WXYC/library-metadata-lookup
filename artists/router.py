@@ -29,7 +29,7 @@ from starlette.requests import ClientDisconnect
 from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
 
 from artists.composer import ArtistSearchAliasesComposer
-from artists.resolver import BareNameArtistResolver
+from artists.resolver import BareNameArtistResolver, InvalidNameError
 from core.dependencies import (
     get_artist_resolve_posthog_client,
     get_discogs_cache_service_from_pool,
@@ -217,10 +217,13 @@ async def search_aliases_bulk(
             )
             http_span.set_data("http.status_code", 503)
             raise HTTPException(status_code=503, detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL) from None
-        except (PostgresError, OSError):
+        except (PostgresError, InterfaceError, OSError):
             # Phase 1: entity-store PG failure (raw asyncpg error — not
             # wrapped). Phase 2 errors are wrapped above; if a PostgresError
             # reaches here, it came from `bulk_resolve_library_names`.
+            # InterfaceError: asyncpg's client-side pool-lifecycle errors
+            # subclass neither PostgresError nor OSError — same transient
+            # 503 class as the resolve route's arm.
             logger.exception(
                 "Entity store query failed during artist-search-alias compose (names=%d)",
                 names_count,
@@ -257,14 +260,26 @@ async def search_aliases_bulk(
 def _emit_resolve_summary(
     posthog_client: Posthog | None,
     telemetry: RequestTelemetry,
-    properties: dict,
+    summary: dict,
 ) -> None:
     """Best-effort aggregate emit — one `artist_resolve_completed` event per
-    request, no per-name events. The whole telemetry step is swallowed so it
-    can never change the handler's outcome (same posture as streaming-check,
-    LML#639)."""
+    SUCCESSFULLY COMPLETED request, no per-name events. The emit itself is
+    swallowed so it can never change the handler's outcome (the swallow
+    mirrors streaming-check's LML#639 posture; unlike streaming-check, error
+    exits deliberately emit nothing — the Sentry span's status pins carry
+    error-class observability for this offline-consumer route).
+
+    The resolver's probe counter is renamed to ``discogs_api_calls`` on the
+    wire: ``RequestTelemetry.send_to_posthog`` already emits an
+    ``api_calls`` property (its per-service map — the shape every sibling
+    ``*_completed`` event carries), and shadowing it with a scalar would
+    fork one property name across two types project-wide while silently
+    depending on the framework's dict-spread ordering.
+    """
     if not posthog_client:
         return
+    properties = {key: value for key, value in summary.items() if key != "api_calls"}
+    properties["discogs_api_calls"] = summary["api_calls"]
     try:
         telemetry.send_to_posthog(posthog_client, properties)
     except Exception:
@@ -278,9 +293,14 @@ def _emit_resolve_summary(
     responses={
         200: {"description": "Per-name verdicts, index-aligned with the request."},
         400: {"description": "Malformed JSON body."},
-        401: {"description": "Missing or invalid `LML_API_KEY` bearer token."},
+        401: {"description": "Missing `Authorization` header."},
+        403: {"description": "Present but invalid/malformed `LML_API_KEY` bearer token."},
         413: {"description": "Batch exceeded the per-request name cap."},
-        422: {"description": "Request body failed Pydantic validation."},
+        422: {
+            "description": "Request body failed Pydantic validation, or a name is "
+            "semantically unresolvable (blank, NUL, unencodable, empty identity-match "
+            "form, bare parenthesized number)."
+        },
         503: {"description": "Entity store or Discogs cache not available."},
     },
 )
@@ -372,13 +392,15 @@ async def resolve_bulk(
             http_span.set_data("http.status_code", 499)
             logger.warning("artist-resolve bulk aborted by client: names=%d", len(names))
             raise
-        except ValueError as e:
+        except InvalidNameError as e:
             # The resolver's input-validation contract: semantically
             # unresolvable names (blank, NUL, lone surrogates, empty
             # identity-match form, bare parenthesized numbers) are caller
             # errors, never in-band verdicts. Pydantic can't express these
             # (constr(min_length=1) admits whitespace), so the resolver
-            # raises and the route maps to 422 per api.yaml.
+            # raises and the route maps to 422 per api.yaml. The dedicated
+            # subclass — never bare ValueError — keeps a server-side
+            # ValueError from masquerading as caller error.
             http_span.set_data("http.status_code", 422)
             raise HTTPException(status_code=422, detail=str(e)) from None
         except CacheUnavailableError:
@@ -419,6 +441,11 @@ async def resolve_bulk(
             "dry_run": dry_run,
         }
         for key, value in summary.items():
+            if key in ("names", "dry_run"):
+                # Already pinned pre-try from the request, so error exits
+                # carry them too; re-writing from stats would put two
+                # provenances behind one span key.
+                continue
             http_span.set_data(f"lml.artist_resolve.{key}", value)
         http_span.set_data("http.status_code", 200)
 

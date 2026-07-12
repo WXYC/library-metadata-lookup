@@ -6,7 +6,9 @@ canned single-page observations (live response-shape assumptions are
 pinned separately in the ``external_api``-marked smoke). This is the
 full-chain tier the issue's test plan calls for: the two-route AC flow,
 the dry_run inverse, the seeded overload family, the cache-conflict rule,
-COALESCE non-clobber, auth, and the normalization-parity canary.
+COALESCE non-clobber, auth (401/403/200), the normalization-parity
+canary, and the qualifier semantics (winner-title mismatch,
+qualified-never-mint, the batch 422 input contract).
 
 Requires ``wxyc_identity_match_artist`` (alembic 0004 from
 WXYC/discogs-etl) for the equality-leg SQL — self-skips without it, same
@@ -15,6 +17,7 @@ posture as ``test_artist_candidate_sets.py``. Run with: ``pytest -m pg -v``
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
@@ -89,9 +92,16 @@ async def set_up_schemas(pg_pool):
         except Exception as e:  # locked-down Postgres without contrib
             pytest.skip(f"pg_trgm/unaccent extensions unavailable: {e}")
 
+        # DROP SCHEMA entity CASCADE destroys EVERY table in the
+        # schema, so the guard must count every entity table a real
+        # discogs-cache carries — release_identity holds hours of
+        # rate-limited minting and is exactly the loss the SAFETY
+        # docstring promises to prevent.
         targets: list[tuple[str, str]] = [
             ("entity", "identity"),
             ("entity", "reconciliation_log"),
+            ("entity", "release_identity"),
+            ("entity", "release_reconciliation_log"),
             *(("public", t) for t in RECONCILER_TABLE_DDL),
         ]
         populated: list[tuple[str, str, int]] = []
@@ -179,21 +189,33 @@ def mock_discogs_service():
     return service
 
 
-@pytest_asyncio.fixture
-async def app_client(monkeypatch, mock_discogs_service):
-    """ASGI client on the test PG, auth off, API tier mocked."""
+@asynccontextmanager
+async def _resolve_app_client(monkeypatch, mock_discogs_service, *, require_auth: bool):
+    """Shared ASGI-client wiring: test PG, mocked API tier, PostHog off.
+
+    One factory behind both fixtures — the teardown resets module-global
+    singletons and closes shared pools, and two hand-maintained copies
+    would drift exactly there (a leaked pool fails whichever pg test runs
+    next, flakily by ordering). ENABLE_TELEMETRY is forced off and the
+    PostHog dep overridden: this is the first pg-tested route that emits,
+    and a stray POSTHOG_API_KEY in the environment would otherwise send
+    real artist_resolve_completed events into the production project.
+    """
     from httpx import ASGITransport, AsyncClient
 
     import core.dependencies as core_deps
     import identity.dependencies as deps
     from config.settings import get_settings
-    from core.dependencies import get_discogs_service
+    from core.dependencies import get_artist_resolve_posthog_client, get_discogs_service
     from main import app
 
     monkeypatch.setenv("DATABASE_URL_DISCOGS", DATABASE_URL)
-    # Happy-path posture mirrors the sibling; auth enforcement gets its own
-    # fixture + tests below.
-    monkeypatch.setenv("LML_REQUIRE_AUTH", "false")
+    monkeypatch.setenv("ENABLE_TELEMETRY", "false")
+    if require_auth:
+        monkeypatch.setenv("LML_REQUIRE_AUTH", "true")
+        monkeypatch.setenv("LML_API_KEY", "test-artist-resolve-key")
+    else:
+        monkeypatch.setenv("LML_REQUIRE_AUTH", "false")
     get_settings.cache_clear()
     deps._entity_store = None
     deps._entity_probe_failed = False
@@ -201,16 +223,32 @@ async def app_client(monkeypatch, mock_discogs_service):
     await core_deps.close_discogs_service()
 
     app.dependency_overrides[get_discogs_service] = lambda: mock_discogs_service
+    app.dependency_overrides[get_artist_resolve_posthog_client] = lambda: None
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
             yield ac
     finally:
         app.dependency_overrides.pop(get_discogs_service, None)
+        app.dependency_overrides.pop(get_artist_resolve_posthog_client, None)
         deps._entity_store = None
         deps._entity_probe_failed = False
         await core_deps.close_discogs_pool()
         await core_deps.close_discogs_service()
         get_settings.cache_clear()
+
+
+@pytest_asyncio.fixture
+async def app_client(monkeypatch, mock_discogs_service):
+    """ASGI client on the test PG, auth off, API tier mocked."""
+    async with _resolve_app_client(monkeypatch, mock_discogs_service, require_auth=False) as ac:
+        yield ac
+
+
+@pytest_asyncio.fixture
+async def app_client_authed(monkeypatch, mock_discogs_service):
+    """Same wiring as ``app_client`` but with bearer enforcement ON."""
+    async with _resolve_app_client(monkeypatch, mock_discogs_service, require_auth=True) as ac:
+        yield ac
 
 
 @pytest.mark.pg
@@ -313,10 +351,12 @@ class TestArtistResolveBulkEndpoint:
 
     @pytest.mark.asyncio
     async def test_normalization_parity_canary(self, app_client):
-        """Diacritic + "(N)"-suffix axis through both normalizers at once:
-        the umlaut input matches the diacritic-free PG row (SQL side) and
-        the suffixed raw API title (Python side). Parity itself is locked
-        upstream in wxyc-etl — this just makes a break surface here."""
+        """Diacritic axis through both normalizers at once: the umlaut
+        input matches the diacritic-free PG row (SQL side) and the bare
+        API title (Python side). Parity itself is locked upstream in
+        wxyc-etl — this just makes a break surface here. The "(N)"-title
+        axis lives in TestArtistResolveQualifierSemantics (a suffixed
+        singleton answering a bare input is ambiguous by design)."""
         resp = await app_client.post(
             "/api/v1/artists/resolve/bulk", json={"names": ["Nilüfer Yanya"]}
         )
@@ -338,39 +378,6 @@ class TestArtistResolveBulkEndpoint:
         assert resp.status_code == 413
 
 
-@pytest_asyncio.fixture
-async def app_client_authed(monkeypatch, mock_discogs_service):
-    """Same wiring as ``app_client`` but with bearer enforcement ON."""
-    from httpx import ASGITransport, AsyncClient
-
-    import core.dependencies as core_deps
-    import identity.dependencies as deps
-    from config.settings import get_settings
-    from core.dependencies import get_discogs_service
-    from main import app
-
-    monkeypatch.setenv("DATABASE_URL_DISCOGS", DATABASE_URL)
-    monkeypatch.setenv("LML_REQUIRE_AUTH", "true")
-    monkeypatch.setenv("LML_API_KEY", "test-artist-resolve-key")
-    get_settings.cache_clear()
-    deps._entity_store = None
-    deps._entity_probe_failed = False
-    await core_deps.close_discogs_pool()
-    await core_deps.close_discogs_service()
-
-    app.dependency_overrides[get_discogs_service] = lambda: mock_discogs_service
-    try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-            yield ac
-    finally:
-        app.dependency_overrides.pop(get_discogs_service, None)
-        deps._entity_store = None
-        deps._entity_probe_failed = False
-        await core_deps.close_discogs_pool()
-        await core_deps.close_discogs_service()
-        get_settings.cache_clear()
-
-
 @pytest.mark.pg
 class TestArtistResolveBulkAuth:
     @pytest.mark.asyncio
@@ -379,6 +386,17 @@ class TestArtistResolveBulkAuth:
             "/api/v1/artists/resolve/bulk", json={"names": ["Juana Molina"]}
         )
         assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_403_with_wrong_bearer(self, app_client_authed):
+        """A present-but-wrong token is 403 (missing header is the 401):
+        the split BS#1614's credential-rotation alerting keys on."""
+        resp = await app_client_authed.post(
+            "/api/v1/artists/resolve/bulk",
+            json={"names": ["Juana Molina"]},
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert resp.status_code == 403
 
     @pytest.mark.asyncio
     async def test_200_with_bearer(self, app_client_authed):
@@ -426,7 +444,7 @@ class TestArtistResolveQualifierSemantics:
         assert read.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_semantically_invalid_name_returns_422(self, app_client, pg_pool):
+    async def test_semantically_invalid_name_returns_422(self, app_client):
         """One garbage name 422s the batch before any tier runs — no
         mints, no in-band verdict a consumer could negative-cache."""
         resp = await app_client.post(
