@@ -5,6 +5,7 @@ seeded with representative catalog items.
 """
 
 import os
+from collections.abc import Iterable
 from unittest.mock import AsyncMock
 
 import aiosqlite
@@ -91,8 +92,9 @@ RECONCILER_TABLE_DDL: dict[str, str] = {
 # ``entity.identity`` stub DDL — mirrors discogs-cache alembic (the schema's
 # owner; see CLAUDE.md "PostgreSQL schema ownership": LML never CREATEs in
 # ``entity.*`` outside tests). One shared literal so per-file copies can't
-# silently diverge; when discogs-cache adds an identity column, this is the
-# single test-side mirror to update.
+# silently diverge. Five older files still carry inline copies pending
+# LML#768; until that lands, a discogs-cache identity-column change must
+# update this constant AND those copies.
 ENTITY_IDENTITY_DDL = """
     CREATE TABLE entity.identity (
         id SERIAL PRIMARY KEY,
@@ -110,7 +112,7 @@ ENTITY_IDENTITY_DDL = """
 """
 
 
-async def skip_if_drop_targets_populated(conn, public_tables) -> None:
+async def skip_if_drop_targets_populated(conn, public_tables: "Iterable[str]") -> None:
     """``pytest.skip`` when anything a schema-dropping fixture would destroy holds rows.
 
     The default ``DATABASE_URL_TEST`` may point at a real discogs-cache whose
@@ -150,19 +152,32 @@ async def skip_if_drop_targets_populated(conn, public_tables) -> None:
             targets.append(("public", table))
 
     populated: list[str] = []
+    unprobeable: list[str] = []
     for schema, table in targets:
         try:
             has_rows = await conn.fetchval(f'SELECT EXISTS(SELECT 1 FROM "{schema}"."{table}")')
         except Exception:
-            has_rows = True
+            # Fail toward veto, but say so — a mid-sweep connection loss (or
+            # a never-refreshed matview) must not be reported as "holds
+            # data", or the operator repoints DATABASE_URL_TEST instead of
+            # looking at the actual infra failure.
+            unprobeable.append(f"{schema}.{table}")
+            continue
         if has_rows:
             populated.append(f"{schema}.{table}")
 
-    if populated:
+    if populated or unprobeable:
+        parts = []
+        if populated:
+            parts.append(f"tables that hold data ({', '.join(populated)})")
+        if unprobeable:
+            parts.append(
+                f"tables whose row-probe FAILED ({', '.join(unprobeable)}) — "
+                "possible connection loss; vetoing because their contents are unknown"
+            )
         pytest.skip(
-            "DATABASE_URL_TEST points at a populated DB; refusing to DROP "
-            f"tables that hold data ({', '.join(populated)}). Point "
-            "DATABASE_URL_TEST at a clean PG before running this suite."
+            f"Refusing to DROP: {'; '.join(parts)}. Point DATABASE_URL_TEST "
+            "at a clean, reachable PG before running this suite."
         )
 
 

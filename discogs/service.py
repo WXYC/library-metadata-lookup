@@ -900,8 +900,20 @@ class DiscogsService:
         try:
             response.raise_for_status()
             data = response.json()
-            results: list[DiscogsArtistSearchResult] = []
-            for item in data.get("results", []):
+            raw_items = data.get("results", [])
+            if not isinstance(raw_items, list):
+                raise TypeError(f"'results' is {type(raw_items).__name__}, not a list")
+        except Exception as e:
+            # Couldn't obtain a contract-shaped envelope: non-2xx, JSON decode
+            # failure, or a body that isn't the results-object shape at all.
+            # An intermediary (CDN error page, proxy) can 200 with anything,
+            # so this class is "couldn't ask", not evidence of Discogs drift.
+            logger.warning(f"search_artists failed for '{name}': {e}")
+            return None
+
+        results: list[DiscogsArtistSearchResult] = []
+        try:
+            for item in raw_items:
                 artist_id = item.get("id")
                 title = item.get("title")
                 if artist_id is None or not title:
@@ -916,7 +928,14 @@ class DiscogsService:
                     return None
                 results.append(DiscogsArtistSearchResult(artist_id=artist_id, title=title))
         except Exception as e:
-            logger.warning(f"search_artists failed for '{name}': {e}")
+            # A proper `results` list whose ITEMS defeat parsing (non-dict
+            # item, model validation failure on id/title types) is the same
+            # distrust semantic as the None-id guard: Discogs answered, the
+            # item contract moved. Carries the distrust fingerprint so the
+            # live smoke fails red on this drift class instead of skipping.
+            logger.warning(
+                f"{SEARCH_ARTISTS_DISTRUST_LOG_PREFIX} for '{name}': item parse failed: {e}"
+            )
             return None
 
         return results

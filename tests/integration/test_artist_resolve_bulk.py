@@ -85,7 +85,7 @@ async def set_up_schemas(pg_pool):
         except Exception as e:  # locked-down Postgres without contrib
             pytest.skip(f"pg_trgm/unaccent extensions unavailable: {e}")
 
-        await skip_if_drop_targets_populated(conn, RECONCILER_TABLE_DDL)
+        await skip_if_drop_targets_populated(conn, tuple(RECONCILER_TABLE_DDL))
 
     # Creation and seeding inside the try: a mid-seed failure must still
     # drop whatever was created (see test_artist_candidate_sets.py).
