@@ -56,6 +56,15 @@ from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
 
+# NOTE(LML#759): ``discogs/cache_service.py`` carries a candidate-SET rewrite
+# of these same legs (``_ARTIST_EQUALITY_CANDIDATES_SQL`` /
+# ``_ARTIST_TRIGRAM_CANDIDATES_SQL``) for the bare-name artist resolver. The
+# divergence is intentional, not drift: this cascade's first-match-wins
+# collapse (SELECT DISTINCT + dict comprehension) is correct for its
+# library-name inputs — the discogs-cache corpus was pair-filtered around
+# exactly those artists — but the resolver's inputs void that warranty, so it
+# must see every id an overloaded form points at. Keep the per-leg predicates
+# here and there byte-compatible when editing either side.
 _EXACT_MATCH_SQL = """\
 SELECT DISTINCT wxyc_identity_match_artist(ra.artist_name) AS artist_name, ra.artist_id
 FROM release_artist ra

@@ -8,7 +8,9 @@ import httpx
 import pytest
 
 import discogs.service as discogs_service_module
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import (
+    DiscogsArtistSearchResult,
     DiscogsSearchRequest,
     DiscogsSearchResponse,
     ReleaseMetadataResponse,
@@ -3053,3 +3055,168 @@ class TestGetMaster:
         ):
             result = await service.get_master(456)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# search_artists (LML#759)
+# ---------------------------------------------------------------------------
+
+
+def make_artist_search_response(results: list[dict]) -> MagicMock:
+    """Build a mock 200 response for ``/database/search?type=artist``."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {
+        "pagination": {"page": 1, "pages": 3, "per_page": 100},
+        "results": results,
+    }
+    return mock_resp
+
+
+class TestSearchArtists:
+    """LML#759 tier-3 primitive: single-page ``type=artist`` search.
+
+    The ``[]``-vs-``None`` return distinction is load-bearing: ``[]`` means
+    "asked Discogs, zero candidates" (→ ``not_found``, ``candidate_count=0``)
+    while ``None`` means "couldn't ask" (→ ``escalation_unavailable``,
+    ``candidate_count=null``). Null never means zero.
+    """
+
+    @pytest.mark.asyncio
+    async def test_builds_single_page_artist_search(self, service):
+        """One GET /database/search with type=artist, q, per_page=100 — and
+        never a second page, even when pagination advertises more."""
+        mock_resp = make_artist_search_response([{"id": 123, "title": "Wishy", "type": "artist"}])
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ) as mock_req:
+            results = await service.search_artists("Wishy")
+
+        mock_req.assert_awaited_once_with(
+            "GET",
+            "/database/search",
+            params={"type": "artist", "q": "Wishy", "per_page": 100},
+        )
+        assert results == [DiscogsArtistSearchResult(artist_id=123, title="Wishy")]
+
+    @pytest.mark.asyncio
+    async def test_preserves_raw_discogs_title(self, service):
+        """The "(N)" disambiguator must survive — stripping it here would blind
+        the resolver's exact-form overload detection (LML#759)."""
+        mock_resp = make_artist_search_response(
+            [
+                {"id": 111, "title": "Popsicle", "type": "artist"},
+                {"id": 222, "title": "Popsicle (2)", "type": "artist"},
+            ]
+        )
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            results = await service.search_artists("Popsicle")
+
+        assert [r.title for r in results] == ["Popsicle", "Popsicle (2)"]
+        assert [r.artist_id for r in results] == [111, 222]
+
+    @pytest.mark.asyncio
+    async def test_zero_results_returns_empty_list_not_none(self, service):
+        mock_resp = make_artist_search_response([])
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            results = await service.search_artists("Csillagrablók")
+        assert results == []
+        assert results is not None
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retries_returns_none(self, service):
+        """``_request_with_retry`` → ``None`` (429-exhausted / network error)
+        maps to ``None``: couldn't ask, not measured."""
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=None
+        ):
+            results = await service.search_artists("REZN")
+        assert results is None
+
+    @pytest.mark.asyncio
+    async def test_server_error_returns_none(self, service):
+        """A 5xx terminal response is "couldn't ask" — never an empty
+        measurement."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 502
+        mock_resp.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "502", request=MagicMock(), response=MagicMock(status_code=502)
+            )
+        )
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            results = await service.search_artists("SiM")
+        assert results is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_returns_none(self, service):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.side_effect = ValueError("bad json")
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            results = await service.search_artists("glaive")
+        assert results is None
+
+    @pytest.mark.asyncio
+    async def test_breaker_open_propagates(self, service):
+        """A breaker shed must propagate as ``DiscogsBreakerOpenError`` so the
+        resolver can short-circuit the rest of the batch to
+        ``escalation_unavailable`` — swallowing it into ``None`` would cost
+        one shed round-trip per remaining name."""
+        with (
+            patch.object(
+                service,
+                "_request_with_retry",
+                new_callable=AsyncMock,
+                side_effect=DiscogsBreakerOpenError("open"),
+            ),
+            pytest.raises(DiscogsBreakerOpenError),
+        ):
+            await service.search_artists("The Tubs")
+
+    @pytest.mark.asyncio
+    async def test_skips_malformed_result_items(self, service):
+        mock_resp = make_artist_search_response(
+            [
+                {"title": "No Id", "type": "artist"},
+                {"id": None, "title": "Null Id", "type": "artist"},
+                {"id": 5, "type": "artist"},  # no title
+                {"id": 7, "title": "", "type": "artist"},  # empty title
+                {"id": 9, "title": "L'Rain", "type": "artist"},
+            ]
+        )
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            results = await service.search_artists("L'Rain")
+        assert results == [DiscogsArtistSearchResult(artist_id=9, title="L'Rain")]
+
+    @pytest.mark.asyncio
+    async def test_blank_name_short_circuits_without_api_call(self, service):
+        with patch.object(service, "_request_with_retry", new_callable=AsyncMock) as mock_req:
+            assert await service.search_artists("") == []
+            assert await service.search_artists("   ") == []
+        mock_req.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_records_api_call_stat(self, service):
+        mock_resp = make_artist_search_response([{"id": 1, "title": "Sessa", "type": "artist"}])
+        recorder = MagicMock()
+        with (
+            patch.object(
+                service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+            ),
+            patch.object(discogs_service_module, "get_cache_stats_recorder", return_value=recorder),
+        ):
+            await service.search_artists("Sessa")
+        recorder.record_api_call.assert_called_once()

@@ -38,6 +38,7 @@ from discogs.models import (
     ArtistCredit,
     ArtistDetails,
     ArtistRef,
+    DiscogsArtistSearchResult,
     DiscogsSearchRequest,
     DiscogsSearchResponse,
     DiscogsSearchResult,
@@ -832,6 +833,68 @@ class DiscogsService:
             total=len(releases[:limit]),
             cached=False,
         )
+
+    async def search_artists(self, name: str) -> list[DiscogsArtistSearchResult] | None:
+        """Search Discogs artists by name — one ``type=artist`` page (LML#759).
+
+        The tier-3 exact-form uniqueness probe for the bare-name artist
+        resolver: ``/database/search?type=artist&per_page=100``, single page
+        by design. The resolver treats page 1 as the observation universe —
+        a name whose exact-form family doesn't fit on one page is ambiguous
+        long before page 2 — so no pagination crawl, ever.
+
+        API-only — no cache leg. The discogs-cache is a pair-wise-filtered
+        ~50K biased sample, so for bare touring names it can corroborate but
+        never decide (the whole point of #759's verify-before-mint model);
+        the cache evidence legs live in
+        ``cache_service.artist_equality_candidates`` /
+        ``artist_trigram_candidates``.
+
+        The return distinction is load-bearing for ``candidate_count``
+        (null never means zero):
+
+        - ``list`` (possibly empty): Discogs answered; the list is the
+          measured single-page observation. Titles are raw Discogs strings,
+          "(N)" disambiguator intact (see ``DiscogsArtistSearchResult``).
+        - ``None``: couldn't ask — 429-exhausted, network error, non-2xx,
+          or unparseable body. Callers must treat it as *unknown*, never
+          as a confirmed-empty verdict.
+
+        Raises:
+            DiscogsBreakerOpenError: propagated from ``_request_with_retry``
+                when the LML#755 saturation breaker sheds the call, so the
+                resolver can short-circuit the rest of its batch to
+                ``escalation_unavailable`` instead of paying one shed per
+                remaining name.
+        """
+        if not name or not name.strip():
+            return []
+
+        params: dict[str, Any] = {"type": "artist", "q": name, "per_page": 100}
+
+        with request_context("search_artists"):
+            async with timed_api():
+                response = await self._request_with_retry("GET", "/database/search", params=params)
+
+        if response is None:
+            return None
+        get_cache_stats_recorder().record_api_call()
+
+        try:
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            logger.warning(f"search_artists failed for '{name}': {e}")
+            return None
+
+        results: list[DiscogsArtistSearchResult] = []
+        for item in data.get("results", []):
+            artist_id = item.get("id")
+            title = item.get("title")
+            if artist_id is None or not title:
+                continue
+            results.append(DiscogsArtistSearchResult(artist_id=artist_id, title=title))
+        return results
 
     def _process_search_result(self, result: dict, seen_albums: set) -> ReleaseInfo | None:
         """Process a single search result into a ReleaseInfo.

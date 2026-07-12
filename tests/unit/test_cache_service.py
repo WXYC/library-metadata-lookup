@@ -2234,3 +2234,131 @@ class TestRecordLookupNegative:
         mock_asyncpg_pool.execute = AsyncMock(side_effect=RuntimeError("conn lost"))
         # Should not raise.
         await cache_service.record_lookup_negative("anything", "anywhere", False)
+
+
+# ---------------------------------------------------------------------------
+# artist_equality_candidates (LML#759)
+# ---------------------------------------------------------------------------
+
+
+class TestArtistEqualityCandidates:
+    """LML#759 tier-2 evidence legs, rewritten as candidate SETS.
+
+    The reconciler's ``SELECT DISTINCT`` + dict-comprehension collapse
+    silently picks one arbitrary candidate when a form is overloaded — it
+    cannot honor "ambiguous names must not mint." These queries must return
+    the full per-form id set for each equality leg instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_input_short_circuits_without_query(self, cache_service, mock_asyncpg_pool):
+        assert await cache_service.artist_equality_candidates([]) == {}
+        mock_asyncpg_pool.fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_single_round_trip_with_forms_array(self, cache_service, mock_asyncpg_pool):
+        """All four legs for the whole batch ride one query — the batched
+        PG pre-pass budget in #759 is 1-3 round-trips for the request."""
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        await cache_service.artist_equality_candidates(["popsicle", "wishy"])
+        mock_asyncpg_pool.fetch.assert_awaited_once()
+        args = mock_asyncpg_pool.fetch.await_args.args
+        assert args[1] == ["popsicle", "wishy"]
+
+    @pytest.mark.asyncio
+    async def test_overloaded_form_keeps_full_candidate_set(self, cache_service, mock_asyncpg_pool):
+        """Two exact-leg ids for one form must BOTH come back — the
+        anti-collapse property this method exists for."""
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[{"leg": "exact", "form": "popsicle", "artist_ids": [111, 222]}]
+        )
+        result = await cache_service.artist_equality_candidates(["popsicle"])
+        assert result["popsicle"].exact == {111, 222}
+
+    @pytest.mark.asyncio
+    async def test_legs_route_to_their_own_sets(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[
+                {"leg": "exact", "form": "stereolab", "artist_ids": [4242]},
+                {"leg": "member", "form": "laetitia sadier", "artist_ids": [200]},
+                {"leg": "alias", "form": "stereolab", "artist_ids": [300]},
+                {"leg": "name_variation", "form": "stereolab", "artist_ids": [400]},
+            ]
+        )
+        result = await cache_service.artist_equality_candidates(["stereolab", "laetitia sadier"])
+        assert result["stereolab"].exact == {4242}
+        assert result["stereolab"].alias == {300}
+        assert result["stereolab"].name_variation == {400}
+        assert result["stereolab"].member == set()
+        assert result["laetitia sadier"].member == {200}
+        assert result["laetitia sadier"].exact == set()
+
+    @pytest.mark.asyncio
+    async def test_forms_without_rows_get_empty_sets(self, cache_service, mock_asyncpg_pool):
+        """A miss is a measured zero on every leg — the key must exist so
+        the resolver never confuses "no candidates" with "not queried"."""
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[{"leg": "exact", "form": "sessa", "artist_ids": [7]}]
+        )
+        result = await cache_service.artist_equality_candidates(["sessa", "wishy"])
+        assert set(result.keys()) == {"sessa", "wishy"}
+        assert result["wishy"].exact == set()
+        assert result["wishy"].member == set()
+        assert result["wishy"].alias == set()
+        assert result["wishy"].name_variation == set()
+
+    @pytest.mark.asyncio
+    async def test_db_error_wrapped_as_cache_unavailable(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn refused"))
+        with pytest.raises(CacheUnavailableError):
+            await cache_service.artist_equality_candidates(["stereolab"])
+
+
+# ---------------------------------------------------------------------------
+# artist_trigram_candidates (LML#759)
+# ---------------------------------------------------------------------------
+
+
+class TestArtistTrigramCandidates:
+    @pytest.mark.asyncio
+    async def test_empty_input_short_circuits_without_query(self, cache_service, mock_asyncpg_pool):
+        assert await cache_service.artist_trigram_candidates([]) == {}
+        mock_asyncpg_pool.fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_batched_single_round_trip_keyed_by_input(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[{"input": "Nilüfer Yanya", "artist_ids": [5499521]}]
+        )
+        result = await cache_service.artist_trigram_candidates(["Nilüfer Yanya", "Hot 8"])
+        mock_asyncpg_pool.fetch.assert_awaited_once()
+        assert result == {"Nilüfer Yanya": {5499521}, "Hot 8": set()}
+
+    @pytest.mark.asyncio
+    async def test_default_threshold_bound_in_query(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        await cache_service.artist_trigram_candidates(["Stereolab"])
+        args = mock_asyncpg_pool.fetch.await_args.args
+        assert args[1] == ["Stereolab"]
+        assert args[2] == pytest.approx(0.85)
+
+    @pytest.mark.asyncio
+    async def test_threshold_override_passed_through(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        await cache_service.artist_trigram_candidates(["Stereolab"], threshold=0.4)
+        args = mock_asyncpg_pool.fetch.await_args.args
+        assert args[2] == pytest.approx(0.4)
+
+    @pytest.mark.asyncio
+    async def test_multi_id_candidate_set_not_collapsed(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[{"input": "Popsicle", "artist_ids": [5001, 5002]}]
+        )
+        result = await cache_service.artist_trigram_candidates(["Popsicle"])
+        assert result["Popsicle"] == {5001, 5002}
+
+    @pytest.mark.asyncio
+    async def test_db_error_wrapped_as_cache_unavailable(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn refused"))
+        with pytest.raises(CacheUnavailableError):
+            await cache_service.artist_trigram_candidates(["Stereolab"])
