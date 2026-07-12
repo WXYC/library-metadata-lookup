@@ -21,13 +21,16 @@ Data safety: both fixtures **skip** when the tables they seed already exist
 posture as ``TestTrigramFallbackSQLIntegration``.
 """
 
-from typing import ClassVar
-
 import pytest
 import pytest_asyncio
 from wxyc_etl.text import to_identity_match_form
 
 from discogs.cache_service import DiscogsCacheService
+from tests.integration.conftest import (
+    F_UNACCENT_WRAPPER_SQL,
+    RECONCILER_TABLE_DDL,
+    skip_unless_wxyc_identity_match_artist,
+)
 
 
 @pytest.mark.pg
@@ -42,28 +45,11 @@ class TestArtistEqualityCandidatesPG:
     surface in LML's own suite.
     """
 
-    _TABLES: ClassVar[dict[str, str]] = {
-        "release_artist": (
-            "release_id INTEGER, artist_id INTEGER, artist_name TEXT, extra INTEGER DEFAULT 0"
-        ),
-        "artist_member": "artist_id INTEGER, member_id INTEGER, member_name TEXT",
-        "artist_alias": "artist_id INTEGER, alias_name TEXT",
-        "artist_name_variation": "artist_id INTEGER, name TEXT",
-    }
-
     @pytest_asyncio.fixture(autouse=True)
     async def seed_equality_tables(self, pg_pool):
         async with pg_pool.acquire() as conn:
-            fn_exists = await conn.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = $1)",
-                "wxyc_identity_match_artist",
-            )
-            if not fn_exists:
-                pytest.skip(
-                    "wxyc_identity_match_artist not deployed -- needs alembic 0004 "
-                    "from WXYC/discogs-etl (see TestDiscogsReconciliationSQLSmoke)"
-                )
-            for table_name in self._TABLES:
+            await skip_unless_wxyc_identity_match_artist(conn)
+            for table_name in RECONCILER_TABLE_DDL:
                 pre_existing = await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
                     "WHERE table_schema = current_schema() AND table_name = $1)",
@@ -74,40 +60,48 @@ class TestArtistEqualityCandidatesPG:
                         f"{table_name} already present -- refusing to seed into a real "
                         "discogs-cache (data-safety posture)"
                     )
-            for table_name, columns in self._TABLES.items():
-                await conn.execute(f"CREATE TABLE {table_name} ({columns})")
-            await conn.executemany(
-                "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "
-                "VALUES ($1, $2, $3, $4)",
-                [
-                    # Overload family: the "(N)" suffix collapses under the
-                    # identity-match form, so both must land in ONE form's set.
-                    (1, 111, "Popsicle", 0),
-                    (2, 222, "Popsicle (2)", 0),
-                    # Leading-article collapse.
-                    (3, 333, "The Tubs", 0),
-                    (4, 4242, "Stereolab", 0),
-                    # ``extra = 1`` credit: invisible to the exact leg.
-                    (5, 9999, "Stereolab", 1),
-                ],
-            )
-            await conn.execute(
-                "INSERT INTO artist_member (artist_id, member_id, member_name) "
-                "VALUES (4242, 200, 'Laetitia Sadier')"
-            )
-            await conn.execute(
-                "INSERT INTO artist_alias (artist_id, alias_name) "
-                "VALUES (555, 'Chuquimamani-Condori')"
-            )
-            # Diacritic-free cache form; queried below with the umlaut input.
-            await conn.execute(
-                "INSERT INTO artist_name_variation (artist_id, name) VALUES (666, 'Nilufer Yanya')"
-            )
+        # Creation and seeding happen inside the try: a mid-seed failure must
+        # still drop whatever was created, or the leaked tables trip the
+        # data-safety skip above and silently disable this class on every
+        # subsequent run against a persistent test PG.
+        created: list[str] = []
         try:
+            async with pg_pool.acquire() as conn:
+                for table_name, columns in RECONCILER_TABLE_DDL.items():
+                    await conn.execute(f"CREATE TABLE {table_name} ({columns})")
+                    created.append(table_name)
+                await conn.executemany(
+                    "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "
+                    "VALUES ($1, $2, $3, $4)",
+                    [
+                        # Overload family: the "(N)" suffix collapses under the
+                        # identity-match form, so both must land in ONE form's set.
+                        (1, 111, "Popsicle", 0),
+                        (2, 222, "Popsicle (2)", 0),
+                        # Leading-article collapse.
+                        (3, 333, "The Tubs", 0),
+                        (4, 4242, "Stereolab", 0),
+                        # ``extra = 1`` credit: invisible to the exact leg.
+                        (5, 9999, "Stereolab", 1),
+                    ],
+                )
+                await conn.execute(
+                    "INSERT INTO artist_member (artist_id, member_id, member_name) "
+                    "VALUES (4242, 200, 'Laetitia Sadier')"
+                )
+                await conn.execute(
+                    "INSERT INTO artist_alias (artist_id, alias_name) "
+                    "VALUES (555, 'Chuquimamani-Condori')"
+                )
+                # Diacritic-free cache form; queried below with the umlaut input.
+                await conn.execute(
+                    "INSERT INTO artist_name_variation (artist_id, name) "
+                    "VALUES (666, 'Nilufer Yanya')"
+                )
             yield
         finally:
             async with pg_pool.acquire() as conn:
-                for table_name in self._TABLES:
+                for table_name in created:
                     await conn.execute(f"DROP TABLE IF EXISTS {table_name}")
 
     @pytest.mark.asyncio
@@ -200,32 +194,29 @@ class TestArtistTrigramCandidatesPG:
                     "discogs-cache (data-safety posture)"
                 )
 
-            # IMMUTABLE f_unaccent wrapper mirroring discogs-cache. Idempotent.
-            await conn.execute(
-                "CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text "
-                "AS $$ SELECT unaccent('unaccent', $1) $$ "
-                "LANGUAGE sql IMMUTABLE PARALLEL SAFE"
-            )
-            await conn.execute(
-                "CREATE TABLE release_artist ("
-                "release_id INTEGER, artist_id INTEGER, artist_name TEXT, extra INTEGER DEFAULT 0)"
-            )
-            await conn.executemany(
-                "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "
-                "VALUES ($1, $2, $3, $4)",
-                [
-                    (1, 4242, "Stereolab", 0),
-                    # Two distinct artists with the identical name: the
-                    # candidate set must carry both (the reconciler's top-1
-                    # would pick one arbitrarily).
-                    (2, 5001, "Popsicle", 0),
-                    (3, 5002, "Popsicle", 0),
-                    (4, 5499521, "Nilufer Yanya", 0),  # diacritic-free cache form
-                    (5, 7777, "Hot 8 Brass Band", 0),
-                    (6, 9999, "Stereolab", 1),  # extra credit: excluded
-                ],
-            )
+        # Creation and seeding inside the try — see seed_equality_tables for
+        # why a mid-seed failure must still drop the table.
         try:
+            async with pg_pool.acquire() as conn:
+                await conn.execute(F_UNACCENT_WRAPPER_SQL)
+                await conn.execute(
+                    f"CREATE TABLE release_artist ({RECONCILER_TABLE_DDL['release_artist']})"
+                )
+                await conn.executemany(
+                    "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "
+                    "VALUES ($1, $2, $3, $4)",
+                    [
+                        (1, 4242, "Stereolab", 0),
+                        # Two distinct artists with the identical name: the
+                        # candidate set must carry both (the reconciler's top-1
+                        # would pick one arbitrarily).
+                        (2, 5001, "Popsicle", 0),
+                        (3, 5002, "Popsicle", 0),
+                        (4, 5499521, "Nilufer Yanya", 0),  # diacritic-free cache form
+                        (5, 7777, "Hot 8 Brass Band", 0),
+                        (6, 9999, "Stereolab", 1),  # extra credit: excluded
+                    ],
+                )
             yield
         finally:
             async with pg_pool.acquire() as conn:

@@ -118,9 +118,10 @@ _request_context_var: ContextVar[dict[str, str] | None] = ContextVar(
 def request_context(method: str, cache_state: str = "no_pg") -> Iterator[None]:
     """Tag downstream ``_request_with_retry`` spans for the duration of the block.
 
-    Used by ``fallthrough`` itself and by the three production methods that
+    Used by ``fallthrough`` itself and by the four production methods that
     bypass the seam (``search_releases_by_album_title``, ``get_label_image``,
-    ``get_master`` — all API-only with no L2 cache leg) plus the four
+    ``get_master``, ``search_artists`` — all API-only with no L2 cache
+    leg) plus the four
     seam methods that have a ``cache is None`` fallback branch
     (``search_releases_by_track``, ``get_release``, ``get_artist_details``,
     ``search``). ``validate_track_on_release`` also has a ``cache is None``
