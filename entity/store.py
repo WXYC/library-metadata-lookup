@@ -72,6 +72,43 @@ RETURNING id, library_name, discogs_artist_id, wikidata_qid,
           apple_music_artist_id, bandcamp_id, reconciliation_status\
 """
 
+# --- fill-if-null mint primitive (LML#766) ----------------------------------
+#
+# Unlike `_UPSERT_IDENTITY_SQL`'s COALESCE-new-wins arm, this arm sets
+# `discogs_artist_id` ONLY when the stored value is NULL (the
+# `WHERE ... IS NULL` guard on the DO UPDATE). A concurrent writer that has
+# already set a non-null id in the tier-1 read-to-mint window (up to ~30s
+# stale under the resolver's 50/min serial API pacing) is therefore never
+# silently overwritten — the guard makes the DO UPDATE a no-op, RETURNING
+# comes back empty, and the caller detects the lost race.
+#
+# Row-status decision (LML#766): minted / filled rows are stamped
+# `reconciliation_status = 'reconciled'`, NOT the table default
+# `'unreconciled'`. `scripts/entity_resolution/__main__.py:run_discogs_stage`
+# reprocesses `'unreconciled'` rows through the first-match-wins Discogs
+# cascade and unconditionally `upsert_identity(discogs_artist_id=...)` — i.e.
+# COALESCE-new-wins would clobber this API-verified id with a cascade guess.
+# 'reconciled' excludes the row from that stage's `get_identities_by_status
+# ('unreconciled')` scan. The Wikidata/MusicBrainz enrichment stages DO read
+# 'reconciled' rows, but they only fill `wikidata_qid` / streaming ids and
+# never touch `discogs_artist_id`, so picking the API-verified row up for
+# QID bridging is desirable, not a clobber. `reconciliation_status` is a
+# free-text `TEXT NOT NULL DEFAULT 'unreconciled'` column (no CHECK / enum
+# in the discogs-cache alembic schema), so 'reconciled' — already written by
+# the reconciler — needs no cross-repo enum change.
+_FILL_IDENTITY_DISCOGS_ID_SQL = """\
+INSERT INTO entity.identity (library_name, discogs_artist_id, reconciliation_status)
+VALUES ($1, $2, 'reconciled')
+ON CONFLICT (library_name) DO UPDATE SET
+    discogs_artist_id = EXCLUDED.discogs_artist_id,
+    reconciliation_status = 'reconciled',
+    updated_at = now()
+WHERE entity.identity.discogs_artist_id IS NULL
+RETURNING id, library_name, discogs_artist_id, wikidata_qid,
+          musicbrainz_artist_id, spotify_artist_id,
+          apple_music_artist_id, bandcamp_id, reconciliation_status\
+"""
+
 _GET_IDENTITY_SQL = """\
 SELECT id, library_name, discogs_artist_id, wikidata_qid,
        musicbrainz_artist_id, spotify_artist_id,
@@ -283,6 +320,31 @@ class ProvenanceRow:
     method: str
 
 
+@dataclass
+class FillOutcome:
+    """Result of a fill-if-null ``discogs_artist_id`` mint (LML#766).
+
+    Attributes:
+        identity: The row after the attempt (the winner's state on a lost
+            race), or ``None`` only if the store swallowed a failure.
+        filled: True iff THIS call wrote the ``discogs_artist_id`` — either
+            by inserting a new row or by filling a previously-NULL column.
+        lost_race: True iff the row already held a non-null id DIFFERENT from
+            the one we tried to write. The stored id is preserved; our value
+            was rejected by the ``IS NULL`` guard. Callers should treat this
+            as a real (if benign) conflict worth counting, not an error.
+        previous_discogs_artist_id: The id already stored before our attempt
+            (``None`` when we minted a fresh row or filled a NULL column).
+            Equals ``identity.discogs_artist_id`` on both the idempotent
+            same-id re-fill and the lost race.
+    """
+
+    identity: Identity | None
+    filled: bool
+    lost_race: bool
+    previous_discogs_artist_id: int | None
+
+
 class EntityStore:
     """CRUD interface for the entity identity store.
 
@@ -305,10 +367,18 @@ class EntityStore:
         apple_music_artist_id: str | None = None,
         bandcamp_id: str | None = None,
     ) -> Identity | None:
-        """Insert or update an identity row.
+        """Insert or update an identity row (NEW-WINS-when-non-null).
 
         Uses ``ON CONFLICT ... DO UPDATE`` with ``COALESCE`` so that populated
-        fields are never overwritten with NULL.
+        fields are never overwritten with NULL. **But a non-null EXCLUDED
+        value overwrites a non-null stored value** — this is the new-wins
+        arm, correct for flows that legitimately UPDATE an id (the reconciler
+        campaigns, the streaming/QID enrichment stages). It is NOT safe as a
+        first-write-wins mint: two writers racing to set ``discogs_artist_id``
+        for the same ``library_name`` will clobber each other. Mint call
+        sites that must never overwrite an existing id use
+        ``fill_identity_discogs_id`` (LML#766) instead, whose ON CONFLICT arm
+        is guarded ``WHERE discogs_artist_id IS NULL``.
 
         Every TEXT-bound argument is passed through
         ``wxyc_etl.pg.to_pg_text_form`` before the query — same WX-3.B
@@ -341,6 +411,133 @@ class EntityStore:
         if record is None:
             return None
         return _record_to_identity(record)
+
+    async def fill_identity_discogs_id(
+        self, library_name: str, discogs_artist_id: int
+    ) -> FillOutcome:
+        """Fill ``discogs_artist_id`` only when the stored value is NULL.
+
+        The concurrency-safe mint primitive (LML#766). Unlike
+        ``upsert_identity``'s new-wins arm, this can never silently overwrite
+        a non-null ``discogs_artist_id`` set by a concurrent writer — the ON
+        CONFLICT arm is guarded ``WHERE entity.identity.discogs_artist_id IS
+        NULL``, so a row that already carries an id makes the DO UPDATE a
+        no-op and RETURNING comes back empty. The loser then reads the
+        winner's row back and reports ``lost_race=True`` with a loud WARNING,
+        so a clobbered write leaves a trail rather than vanishing.
+
+        Case-sibling awareness (LML#766 point 4): before the atomic fill, the
+        existing case-insensitive read leg (``_GET_IDENTITY_LOWER_SQL``) is
+        consulted. When an id-bearing row exists under a different casing
+        (e.g. a ``WISHY`` sibling for a ``wishy`` fill), that row answers
+        directly — the fill is short-circuited so the store does not accrete
+        a conflicting case-variant row. A sibling holding a DIFFERENT id is a
+        lost race. This reuses the leg the resolver's tier-1 read already
+        runs, so it adds one sub-millisecond seq-scan on the ~24K-row table
+        and needs no schema change. A sibling with a NULL id does NOT
+        short-circuit: the verbatim key is minted/filled normally (matching
+        the resolver's in-place fill-target choice, which keys on the stored
+        ``library_name``).
+
+        Minted / filled rows are stamped ``reconciliation_status =
+        'reconciled'`` so the reconciler's first-match-wins Discogs cascade
+        (which reprocesses ``'unreconciled'`` rows) can't later clobber this
+        API-verified id. See ``_FILL_IDENTITY_DISCOGS_ID_SQL``.
+
+        Args:
+            library_name: Verbatim artist name (NUL-stripped at the boundary).
+            discogs_artist_id: The id to write if the column is NULL.
+
+        Returns:
+            A ``FillOutcome``. ``filled`` marks the writer that actually set
+            the id; ``lost_race`` marks a writer whose non-null-different
+            conflict was rejected; ``previous_discogs_artist_id`` carries the
+            value that was already stored (``None`` on a fresh mint / NULL
+            fill). ``identity`` is ``None`` only if the store swallowed a
+            failure (today's ``PgSource`` raises instead).
+        """
+        verbatim = to_pg_text_form(library_name)
+
+        # --- Case-sibling short-circuit (LML#766 point 4). ---------------
+        # An id-bearing row under a different casing already answers reads;
+        # filling a verbatim near-duplicate would accrete a conflicting
+        # case-variant. Reuse the existing LOWER leg (lowest id wins, same
+        # rule as the resolver's tier-1 read).
+        sibling_row = await self._pg.fetchone(_GET_IDENTITY_LOWER_SQL, verbatim)
+        if sibling_row is not None and sibling_row["discogs_artist_id"] is not None:
+            sibling = _record_to_identity(sibling_row)
+            existing = sibling.discogs_artist_id
+            if existing == discogs_artist_id:
+                # The sibling already holds our id — idempotent, no-op.
+                return FillOutcome(
+                    identity=sibling,
+                    filled=False,
+                    lost_race=False,
+                    previous_discogs_artist_id=existing,
+                )
+            # A DIFFERENT id under a case-variant: lost race, never mint a
+            # second row. Loud so the rejected attempt leaves a trail.
+            logger.warning(
+                "fill_identity_discogs_id lost race for %r (case sibling %r): "
+                "stored discogs_artist_id=%s, attempted=%s — attempted value NOT written",
+                library_name,
+                sibling.library_name,
+                existing,
+                discogs_artist_id,
+            )
+            return FillOutcome(
+                identity=sibling,
+                filled=False,
+                lost_race=True,
+                previous_discogs_artist_id=existing,
+            )
+
+        # --- Atomic fill-if-null. ----------------------------------------
+        record = await self._pg.fetchone(_FILL_IDENTITY_DISCOGS_ID_SQL, verbatim, discogs_artist_id)
+        if record is not None:
+            # We inserted a fresh row, or filled a previously-NULL column.
+            return FillOutcome(
+                identity=_record_to_identity(record),
+                filled=True,
+                lost_race=False,
+                previous_discogs_artist_id=None,
+            )
+
+        # RETURNING was empty: the row exists and already held a non-null id,
+        # so the `IS NULL` guard blocked the DO UPDATE. Read it back to
+        # distinguish an idempotent same-id re-fill from a genuine lost race.
+        existing_row = await self._pg.fetchone(_GET_IDENTITY_SQL, verbatim)
+        if existing_row is None:
+            # The row vanished between the blocked upsert and this read — a
+            # concurrent delete (orphan pass). Nothing to report as filled.
+            return FillOutcome(
+                identity=None,
+                filled=False,
+                lost_race=False,
+                previous_discogs_artist_id=None,
+            )
+        existing_identity = _record_to_identity(existing_row)
+        existing = existing_identity.discogs_artist_id
+        if existing == discogs_artist_id:
+            return FillOutcome(
+                identity=existing_identity,
+                filled=False,
+                lost_race=False,
+                previous_discogs_artist_id=existing,
+            )
+        logger.warning(
+            "fill_identity_discogs_id lost race for %r: stored discogs_artist_id=%s, "
+            "attempted=%s — attempted value NOT written",
+            library_name,
+            existing,
+            discogs_artist_id,
+        )
+        return FillOutcome(
+            identity=existing_identity,
+            filled=False,
+            lost_race=True,
+            previous_discogs_artist_id=existing,
+        )
 
     async def get_identity(self, library_name: str) -> Identity | None:
         """Look up an identity by library name.

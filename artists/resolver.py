@@ -86,13 +86,16 @@ Tiers, per group:
    intra-request concurrency can't beat it and only starves interleaved
    live-lookup traffic of semaphore slots (LML#370/#372).
 
-Write-back: ``upsert_identity``'s ON CONFLICT arm is
-``COALESCE(EXCLUDED.discogs_artist_id, existing)`` — **new wins when
-non-null**; COALESCE only refuses to overwrite with NULL. Not
-overwriting an existing id therefore rests on the tier-1 read gate,
-which is up to ~30s stale at mint time under the serial API pacing — a
-concurrent writer in that window is silently overwritten (LML#766
-tracks the store-level fill-if-null primitive that closes this).
+Write-back: the mint uses ``EntityStore.fill_identity_discogs_id``
+(LML#766), whose ON CONFLICT arm is guarded ``WHERE discogs_artist_id
+IS NULL`` — the id is written ONLY when the stored value is NULL. The
+tier-1 read gate is up to ~30s stale at mint time under the serial API
+pacing, so a concurrent higher-evidence writer (release-derived
+``_writeback_identity``) can set an id in that window; the fill-if-null
+guard means that id is never silently overwritten — the resolver's
+attempt is rejected and counted as ``mint_lost_race`` instead. Minted
+rows are stamped ``reconciliation_status='reconciled'`` so a later
+reconciler campaign can't reprocess (and clobber) the API-verified id.
 Qualifier-bearing groups never mint: a qualified key is unreachable via
 the bare-name reads Backend actually issues (only an exact-leg read of
 the same qualified string finds it — which is also why such a stored row
@@ -270,8 +273,16 @@ class ResolveStats:
     (an upsert that returned None — the store's swallowed-failure
     contract — is logged but not counted, so ``minted`` tracks rows
     actually persisted, not write attempts).
-    ``discogs_api_calls`` counts ``search_artists`` probes that returned
-    to the resolver — including ``None`` returns (a 429-exhausted or
+    ``mint_lost_race`` counts fill-if-null mints (LML#766) the resolver
+    LOST: the store already held a non-null ``discogs_artist_id`` different
+    from this batch's winner, so the store rejected the write and the
+    higher-evidence stored id survived. A non-zero value is not an error —
+    it is the (benign, expected-rare) concurrent-writer signal the #766
+    primitive exists to surface instead of silently clobbering — but a
+    sustained rate is worth alerting on. Only the api_search mint path can
+    lose a race; a lost race is NOT counted in ``minted`` (nothing was
+    persisted by us). ``discogs_api_calls`` counts ``search_artists`` probes
+    that returned to the resolver — including ``None`` returns (a 429-exhausted or
     distrusted probe still consumed shared-limiter budget). A probe shed
     by the breaker is not counted: usually it was refused at entry before
     any HTTP left the building, though a mid-flight open may have spent
@@ -290,6 +301,7 @@ class ResolveStats:
     escalation_unavailable: int = 0
     discogs_api_calls: int = 0
     minted: int = 0
+    mint_lost_race: int = 0
 
 
 @dataclass
@@ -689,26 +701,34 @@ class BareNameArtistResolver:
         mint_key = group.mint_key or group.probe
         if not dry_run and group.qualifier is None:
             # discogs_artist_id only — other id columns belong to their own
-            # enrichment flows. COALESCE guards NULL-overwrites only; not
-            # clobbering an EXISTING id rests on the tier-1 gate, which is
-            # a stale read by mint time (LML#766 tracks the store-level
-            # fill-if-null fix). Qualifier-bearing groups skip the mint
+            # enrichment flows. The fill-if-null primitive (LML#766) writes
+            # the id ONLY when the stored value is NULL, so a concurrent
+            # higher-evidence writer (e.g. release/orchestrator._writeback_
+            # identity) that set an id in the tier-1 read-to-mint window is
+            # never silently clobbered — that race lands as mint_lost_race,
+            # not a bad overwrite. Minted rows are stamped 'reconciled' by
+            # the store so a later reconciler campaign can't reprocess this
+            # API-verified id. Qualifier-bearing groups skip the mint
             # entirely: a qualified key is unreachable via the bare-name
             # reads Backend issues, i.e. pure pollution.
-            upserted = await self._entity_store.upsert_identity(
-                mint_key, discogs_artist_id=winner_id
-            )
-            if upserted is None:
-                # upsert_identity's contract allows a None return for a
-                # swallowed failure; today's PgSource raises instead (the
-                # route 503s), so this branch is belt-and-braces.
+            outcome = await self._entity_store.fill_identity_discogs_id(mint_key, winner_id)
+            if outcome.lost_race:
+                # A concurrent writer already set a DIFFERENT id; the store
+                # kept it (and logged loudly). Count the (benign) race, do
+                # not count a mint — nothing was persisted by us.
+                stats.mint_lost_race += 1
+            elif outcome.identity is None:
+                # Swallowed store failure (today's PgSource raises instead,
+                # so the route 503s); belt-and-braces.
                 logger.error(
-                    "entity.identity write-back failed for '%s' (discogs_artist_id=%d)",
+                    "entity.identity fill-if-null failed for '%s' (discogs_artist_id=%d)",
                     mint_key,
                     winner_id,
                 )
-            else:
+            elif outcome.filled:
                 stats.minted += 1
+            # else: a pre-existing row already held our exact id (idempotent
+            # re-fill / case sibling) — resolved, but nothing minted by us.
         return group.resolved(
             discogs_artist_id=winner_id,
             method=ArtistResolveMethod.api_search,

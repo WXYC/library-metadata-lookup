@@ -22,7 +22,7 @@ from discogs.cache_service import (
 )
 from discogs.models import DiscogsArtistSearchResult
 from discogs.service import DiscogsService
-from entity.store import EntityStore
+from entity.store import EntityStore, FillOutcome, Identity
 from generated.api_models import ArtistResolveBulkRequest
 from tests.unit.conftest import override_deps
 
@@ -37,6 +37,20 @@ def mock_entity_store():
     store = AsyncMock(spec=EntityStore)
     store.bulk_resolve_library_names = AsyncMock(return_value={})
     store.upsert_identity = AsyncMock(return_value=MagicMock())
+    # LML#766: the mint site uses the fill-if-null primitive; a clean win.
+    store.fill_identity_discogs_id = AsyncMock(
+        return_value=FillOutcome(
+            identity=Identity(
+                id=1,
+                library_name="Wishy",
+                discogs_artist_id=123,
+                reconciliation_status="reconciled",
+            ),
+            filled=True,
+            lost_race=False,
+            previous_discogs_artist_id=None,
+        )
+    )
     return store
 
 
@@ -147,7 +161,7 @@ class TestHappyPath:
         assert result["unresolved_reason"] is None
         # Always serialized — never omitted (null means "not measured").
         assert result["candidate_count"] == 1
-        mock_entity_store.upsert_identity.assert_awaited_once()
+        mock_entity_store.fill_identity_discogs_id.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_dry_run_skips_write_back(self, make_app, mock_entity_store):
@@ -157,7 +171,7 @@ class TestHappyPath:
 
         assert resp.status_code == 200
         assert resp.json()["results"][0]["discogs_artist_id"] == 123
-        mock_entity_store.upsert_identity.assert_not_awaited()
+        mock_entity_store.fill_identity_discogs_id.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_discogs_service_degrades_to_200_not_503(self, make_app):
@@ -502,7 +516,7 @@ class TestRouteEnvelopeGaps:
         with ctx:
             resp = await _post(app, {"names": ["Wishy"], "dry_run": False})
         assert resp.status_code == 200
-        mock_entity_store.upsert_identity.assert_awaited_once()
+        mock_entity_store.fill_identity_discogs_id.assert_awaited_once()
 
 
 class TestSentrySpanContract:

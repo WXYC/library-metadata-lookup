@@ -3,7 +3,8 @@
 The full verdict table from the issue's design, against mocked tiers:
 
 - tier 1: ``EntityStore.bulk_resolve_library_names`` (identity_store
-  short-circuit) + ``upsert_identity`` (write-back)
+  short-circuit) + ``fill_identity_discogs_id`` (fill-if-null write-back,
+  LML#766)
 - tier 2: ``DiscogsCacheService.artist_equality_candidates`` /
   ``artist_trigram_candidates`` (evidence, never verdicts)
 - tier 3: ``DiscogsService.search_artists`` (the full-universe
@@ -25,11 +26,21 @@ from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import ArtistEqualityCandidates, DiscogsCacheService
 from discogs.models import DiscogsArtistSearchResult
 from discogs.service import DiscogsService
-from entity.store import EntityStore, Identity
+from entity.store import EntityStore, FillOutcome, Identity
 
 
 def _identity(library_name: str, **kwargs) -> Identity:
     return Identity(id=1, library_name=library_name, reconciliation_status="reconciled", **kwargs)
+
+
+def _fill_win(name: str, discogs_artist_id: int) -> FillOutcome:
+    """Default ``fill_identity_discogs_id`` result: a fresh successful mint."""
+    return FillOutcome(
+        identity=_identity(name, discogs_artist_id=discogs_artist_id),
+        filled=True,
+        lost_race=False,
+        previous_discogs_artist_id=None,
+    )
 
 
 def _pages(mapping: dict[str, list[DiscogsArtistSearchResult] | None]):
@@ -69,6 +80,12 @@ def entity_store():
     store = AsyncMock(spec=EntityStore)
     store.bulk_resolve_library_names = AsyncMock(return_value={})
     store.upsert_identity = AsyncMock(side_effect=lambda name, **kw: _identity(name, **kw))
+    # LML#766: the mint site now uses the fill-if-null primitive. Default to a
+    # clean win (fresh mint); tests exercising a lost race / idempotent re-fill
+    # rebind this per-test.
+    store.fill_identity_discogs_id = AsyncMock(
+        side_effect=lambda name, discogs_artist_id: _fill_win(name, discogs_artist_id)
+    )
     return store
 
 
@@ -140,7 +157,7 @@ class TestInputValidation:
         discogs_cache.artist_equality_candidates.assert_not_awaited()
         discogs_cache.artist_trigram_candidates.assert_not_awaited()
         discogs_service.search_artists.assert_not_awaited()
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_punctuation_only_real_band_names_survive_validation(
@@ -180,7 +197,7 @@ class TestIdentityStoreShortCircuit:
         assert result.unresolved_reason is None
 
         discogs_service.search_artists.assert_not_awaited()
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
         assert stats.discogs_api_calls == 0
         assert stats.minted == 0
         assert stats.resolved == 1
@@ -326,7 +343,7 @@ class TestDisambiguatedInputs:
         assert results[0].discogs_artist_id == 20
         assert results[0].canonical_name == "Popsicle (2)"
         assert results[0].method == "api_search"
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
         assert stats.minted == 0
         assert stats.resolved == 1
 
@@ -351,8 +368,63 @@ class TestApiVerdicts:
         assert result.method == "api_search"
         assert result.candidate_count == 1
         assert result.unresolved_reason is None
-        entity_store.upsert_identity.assert_awaited_once_with("Wishy", discogs_artist_id=123)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("Wishy", 123)
         assert stats.minted == 1
+        assert stats.resolved == 1
+
+    @pytest.mark.asyncio
+    async def test_lost_race_counted_not_minted(self, resolver, entity_store, discogs_service):
+        """LML#766: when the store rejects the fill (a concurrent writer
+        already set a different id), the resolver counts mint_lost_race, not
+        minted, and the verdict still reports Discogs truth."""
+        entity_store.fill_identity_discogs_id = AsyncMock(
+            return_value=FillOutcome(
+                identity=_identity("Wishy", discogs_artist_id=999),
+                filled=False,
+                lost_race=True,
+                previous_discogs_artist_id=999,
+            )
+        )
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages({"Wishy": _page((123, "Wishy"))})
+        )
+
+        results, stats = await resolver.resolve(["Wishy"])
+
+        (result,) = results
+        # The API verdict is unchanged — the resolver reports what Discogs
+        # returned; the store just declined to overwrite the stored id.
+        assert result.discogs_artist_id == 123
+        assert result.method == "api_search"
+        assert result.unresolved_reason is None
+        assert stats.minted == 0
+        assert stats.mint_lost_race == 1
+        assert stats.resolved == 1
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("Wishy", 123)
+
+    @pytest.mark.asyncio
+    async def test_idempotent_refill_resolves_without_counting_mint(
+        self, resolver, entity_store, discogs_service
+    ):
+        """A pre-existing row already holding our exact id (idempotent
+        re-fill / case sibling): resolved, but nothing minted by us."""
+        entity_store.fill_identity_discogs_id = AsyncMock(
+            return_value=FillOutcome(
+                identity=_identity("Wishy", discogs_artist_id=123),
+                filled=False,
+                lost_race=False,
+                previous_discogs_artist_id=123,
+            )
+        )
+        discogs_service.search_artists = AsyncMock(
+            side_effect=_pages({"Wishy": _page((123, "Wishy"))})
+        )
+
+        results, stats = await resolver.resolve(["Wishy"])
+
+        assert results[0].discogs_artist_id == 123
+        assert stats.minted == 0
+        assert stats.mint_lost_race == 0
         assert stats.resolved == 1
 
     @pytest.mark.asyncio
@@ -372,7 +444,7 @@ class TestApiVerdicts:
         assert result.candidate_count == 2
         assert result.discogs_artist_id is None
         assert result.method is None
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
         assert stats.ambiguous == 1
         assert stats.minted == 0
 
@@ -406,7 +478,7 @@ class TestApiVerdicts:
         # (_pages also raises on unmapped probes).
         assert result.candidate_count == 0
         discogs_service.search_artists.assert_awaited_once_with("REZN")
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
         assert stats.not_found == 1
 
     @pytest.mark.asyncio
@@ -427,7 +499,7 @@ class TestApiVerdicts:
         assert result.unresolved_reason == "not_found"
         assert result.cache_corroboration == ["cache_alias"]
         assert result.candidate_count == 0
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unencodable_api_title_distrusts_whole_page(
@@ -445,7 +517,7 @@ class TestApiVerdicts:
         (result,) = results
         assert result.unresolved_reason == "escalation_unavailable"
         assert result.candidate_count is None
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
         # The probe itself was placed and consumed limiter budget.
         assert stats.discogs_api_calls == 1
 
@@ -495,7 +567,7 @@ class TestCacheConflictRule:
         # ambiguity is the cache conflict, not an overload family.
         assert result.candidate_count == 1
         assert result.cache_corroboration == ["cache_exact"]
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_equality_agreement_resolves_with_corroboration(
@@ -549,7 +621,7 @@ class TestEscalationUnavailable:
         assert discogs_service.search_artists.await_count == 1
         assert stats.discogs_api_calls == 0
         assert stats.escalation_unavailable == 3
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_mid_batch_breaker_preserves_earlier_verdicts_and_mints(
@@ -573,7 +645,7 @@ class TestEscalationUnavailable:
         # Two probes placed (one measured, one shed), third short-circuited.
         assert discogs_service.search_artists.await_count == 2
         assert stats.discogs_api_calls == 1
-        entity_store.upsert_identity.assert_awaited_once_with("Wishy", discogs_artist_id=123)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("Wishy", 123)
         assert stats.minted == 1
         assert stats.resolved == 1
         assert stats.escalation_unavailable == 2
@@ -660,7 +732,7 @@ class TestDedupe:
         # store accretes near-duplicate keys, and the read legs are
         # case-insensitive so any spelling stays findable).
         discogs_service.search_artists.assert_awaited_once_with("WISHY")
-        entity_store.upsert_identity.assert_awaited_once_with("WISHY", discogs_artist_id=123)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("WISHY", 123)
         assert stats.names == 3
         assert stats.deduped == 1
         assert stats.resolved == 3
@@ -688,7 +760,7 @@ class TestWriteBack:
         assert result.candidate_count == 1
         assert stats.discogs_api_calls == 1
         # ...except the persistence.
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
         assert stats.minted == 0
 
     @pytest.mark.asyncio
@@ -709,7 +781,7 @@ class TestWriteBack:
         results, _ = await resolver.resolve(["wishy"])
 
         assert results[0].discogs_artist_id == 123
-        entity_store.upsert_identity.assert_awaited_once_with("Wishy", discogs_artist_id=123)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("Wishy", 123)
 
     @pytest.mark.asyncio
     async def test_fillable_row_found_via_group_mate_verbatim(
@@ -727,20 +799,24 @@ class TestWriteBack:
         results, _ = await resolver.resolve(["The Tubs", "Tubs"])
 
         assert all(r.discogs_artist_id == 333 for r in results)
-        entity_store.upsert_identity.assert_awaited_once_with("Tubs", discogs_artist_id=333)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("Tubs", 333)
 
     @pytest.mark.asyncio
     async def test_upsert_returning_none_logs_and_keeps_verdict(
         self, resolver, entity_store, discogs_service, caplog
     ):
-        """Pins the DEFENSIVE branch for upsert_identity's declared
-        Optional return (today's PgSource raises instead of returning
-        None — that path is pinned separately below): a swallowed
+        """Pins the DEFENSIVE branch for fill_identity_discogs_id's
+        swallowed-failure contract (``identity=None``; today's PgSource
+        raises instead — that path is pinned separately below): a swallowed
         persistence failure must be loud in logs, and the verdict stands
         (it reports Discogs truth; dry_run already decouples the two)."""
         import logging
 
-        entity_store.upsert_identity = AsyncMock(return_value=None)
+        entity_store.fill_identity_discogs_id = AsyncMock(
+            return_value=FillOutcome(
+                identity=None, filled=False, lost_race=False, previous_discogs_artist_id=None
+            )
+        )
         discogs_service.search_artists = AsyncMock(
             side_effect=_pages({"Wishy": _page((123, "Wishy"))})
         )
@@ -750,7 +826,7 @@ class TestWriteBack:
 
         assert results[0].discogs_artist_id == 123
         assert stats.minted == 0
-        assert any("write-back failed" in r.getMessage() for r in caplog.records)
+        assert any("fill-if-null failed" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_write_back_pg_exception_propagates(
@@ -761,7 +837,9 @@ class TestWriteBack:
         mistakes the Optional-return branch above for this path."""
         from asyncpg.exceptions import PostgresError
 
-        entity_store.upsert_identity = AsyncMock(side_effect=PostgresError("connection reset"))
+        entity_store.fill_identity_discogs_id = AsyncMock(
+            side_effect=PostgresError("connection reset")
+        )
         discogs_service.search_artists = AsyncMock(
             side_effect=_pages({"Wishy": _page((123, "Wishy"))})
         )
@@ -796,7 +874,7 @@ class TestQualifierGeneralization:
         assert results[0].method == "identity_store"
         assert results[1].unresolved_reason == "ambiguous"
         assert results[1].discogs_artist_id is None
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -861,7 +939,7 @@ class TestQualifierGeneralization:
 
         assert results[0].unresolved_reason == "ambiguous"
         assert results[0].candidate_count == 1
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
 
 
 class TestWinnerQualifierRule:
@@ -895,7 +973,7 @@ class TestWinnerQualifierRule:
         assert result.candidate_count == 1
         assert result.discogs_artist_id is None
         assert result.method is None
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
         assert stats.minted == 0
         assert stats.ambiguous == 1
 
@@ -942,7 +1020,7 @@ class TestStoreConflict:
         discogs_service.search_artists.assert_not_awaited()
         assert stats.discogs_api_calls == 0
         assert stats.ambiguous == 2
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
 
 
 class TestInputHygiene:
@@ -963,7 +1041,7 @@ class TestInputHygiene:
         assert results[0].discogs_artist_id == 123
         (queried,) = entity_store.bulk_resolve_library_names.await_args[0]
         assert queried == ["Wishy"]
-        entity_store.upsert_identity.assert_awaited_once_with("Wishy", discogs_artist_id=123)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("Wishy", 123)
 
     @pytest.mark.asyncio
     async def test_padded_and_clean_spellings_share_one_group(self, resolver, discogs_service):
@@ -1063,7 +1141,7 @@ class TestQualifierNormalizerParity:
         assert results[0].method == "identity_store"
         # The nested-qualified position saw a bare-titled winner: mismatch.
         assert results[1].unresolved_reason == "ambiguous"
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_multi_qualifier_input_sees_family_not_false_zero(
@@ -1081,7 +1159,7 @@ class TestQualifierNormalizerParity:
         (result,) = results
         assert result.unresolved_reason == "ambiguous"
         assert result.candidate_count == 2
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_qualifier_key_is_case_insensitive(self, resolver, discogs_service):
@@ -1109,7 +1187,7 @@ class TestQualifierNormalizerParity:
 
         assert results[0].discogs_artist_id == 50
         assert results[0].method == "api_search"
-        entity_store.upsert_identity.assert_awaited_once_with("(Smog)", discogs_artist_id=50)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("(Smog)", 50)
         assert stats.minted == 1
 
     @pytest.mark.asyncio
@@ -1128,7 +1206,7 @@ class TestQualifierNormalizerParity:
         assert results[0].name == "Wishy​"
         (queried,) = entity_store.bulk_resolve_library_names.await_args[0]
         assert queried == ["Wishy"]
-        entity_store.upsert_identity.assert_awaited_once_with("Wishy", discogs_artist_id=123)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("Wishy", 123)
 
     @pytest.mark.asyncio
     async def test_cf_padded_bare_number_still_rejected(
@@ -1166,7 +1244,7 @@ class TestTierOneRowSelection:
         assert [r.discogs_artist_id for r in results] == [999, 999]
         assert all(r.method == "identity_store" for r in results)
         discogs_service.search_artists.assert_not_awaited()
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
         assert stats.discogs_api_calls == 0
 
     @pytest.mark.asyncio
@@ -1189,7 +1267,7 @@ class TestTierOneRowSelection:
         results, _ = await resolver.resolve(batch)
 
         assert all(r.discogs_artist_id == 333 for r in results)
-        entity_store.upsert_identity.assert_awaited_once_with("The Tubs", discogs_artist_id=333)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("The Tubs", 333)
 
     @pytest.mark.asyncio
     async def test_qualified_store_row_neither_decides_nor_fills_bare_group(
@@ -1209,7 +1287,7 @@ class TestTierOneRowSelection:
 
         assert results[0].discogs_artist_id == 10
         assert results[0].method == "api_search"
-        entity_store.upsert_identity.assert_awaited_once_with("Popsicle", discogs_artist_id=10)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("Popsicle", 10)
 
 
 class TestPgFailurePropagation:
@@ -1264,7 +1342,7 @@ class TestRoundFourPins:
         assert result.discogs_artist_id == 42
         assert result.canonical_name == "Sault (2) (UK)"
         assert result.method == "api_search"
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
         assert stats.minted == 0
 
     @pytest.mark.asyncio
@@ -1283,7 +1361,7 @@ class TestRoundFourPins:
         (result,) = results
         assert result.unresolved_reason == "ambiguous"
         assert result.candidate_count == 2
-        entity_store.upsert_identity.assert_not_awaited()
+        entity_store.fill_identity_discogs_id.assert_not_awaited()
         assert stats.minted == 0
 
     @pytest.mark.asyncio
@@ -1346,7 +1424,7 @@ class TestRoundFourPins:
         results, _ = await resolver.resolve(batch)
 
         assert all(r.discogs_artist_id == 333 for r in results)
-        entity_store.upsert_identity.assert_awaited_once_with("The Tubs", discogs_artist_id=333)
+        entity_store.fill_identity_discogs_id.assert_awaited_once_with("The Tubs", 333)
 
     @pytest.mark.asyncio
     async def test_zero_padded_qualifier_stays_distinct(self, resolver, discogs_service):

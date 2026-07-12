@@ -894,6 +894,52 @@ class TestDiscogsStageConfidencePersisted:
 
 
 @pytest.mark.pg
+class TestMintedRowExcludedFromReconciler:
+    """LML#766: a fill-if-null mint carries an API-verified ``discogs_artist_id``
+    and is stamped ``reconciliation_status = 'reconciled'``, so the Discogs
+    reconciliation stage never reprocesses it through the first-match-wins
+    cascade (which would clobber the verified id with a guess)."""
+
+    @pytest.mark.asyncio
+    async def test_fill_minted_row_not_reprocessed_by_discogs_stage(self, pg_source):
+        store = EntityStore(pg_source)
+        # The resolver mints an API-verified id via the fill primitive.
+        outcome = await store.fill_identity_discogs_id("Wishy", 123)
+        assert outcome.filled is True
+        assert outcome.identity.reconciliation_status == "reconciled"
+
+        # A reconciler campaign runs. Its cascade would (wrongly) credit a
+        # DIFFERENT id to "Wishy" if it saw the row — but it must not see it.
+        reconciler = AsyncMock()
+        reconciler.reconcile_batch = AsyncMock(
+            return_value={"Wishy": ReconciliationMatch(discogs_artist_id=999, method="exact_match")}
+        )
+        matched, no_match = await run_discogs_stage(store, reconciler, batch_size=1000)
+
+        # The stage scans only 'unreconciled' rows; the minted row is absent.
+        reconciler.reconcile_batch.assert_not_awaited()
+        assert (matched, no_match) == (0, 0)
+        identity = await store.get_identity("Wishy")
+        assert identity is not None
+        # The API-verified id survives untouched.
+        assert identity.discogs_artist_id == 123
+
+    @pytest.mark.asyncio
+    async def test_reseed_preserves_minted_reconciled_status(self, pg_source):
+        """``seed_identities`` re-upserting a library artist must not reset a
+        minted row's 'reconciled' status back to 'unreconciled' (which would
+        re-expose it to the cascade)."""
+        store = EntityStore(pg_source)
+        await store.fill_identity_discogs_id("Wishy", 123)
+        # Re-seed (no id) — COALESCE preserves the id AND leaves status alone.
+        await store.upsert_identity(library_name="Wishy")
+        identity = await store.get_identity("Wishy")
+        assert identity is not None
+        assert identity.discogs_artist_id == 123
+        assert identity.reconciliation_status == "reconciled"
+
+
+@pytest.mark.pg
 class TestLatestProvenanceTiebreak:
     """LML#233: identical `created_at` rows resolve deterministically by id."""
 
