@@ -36,6 +36,13 @@ from tests.unit.conftest import CREDENTIAL_ENV_VARS
 #: case-insensitively, so the pairing is just a lower-casing away).
 CREDENTIAL_SETTINGS_FIELDS = tuple(var.lower() for var in CREDENTIAL_ENV_VARS)
 
+#: ``str | None`` Settings fields that are deliberately NOT scrubbed because
+#: they carry no secret or live-connection material — a positive allowlist so
+#: the reverse-direction guard below forces a conscious credential/non-credential
+#: decision on every new optional-string field. Empty today: every current
+#: ``str | None`` field is a credential or connection target and is scrubbed.
+NON_CREDENTIAL_OPTIONAL_STR_FIELDS: frozenset[str] = frozenset()
+
 
 def test_credential_env_vars_cover_all_credential_settings_fields():
     """Every credential-bearing Settings field must be in the scrub list.
@@ -49,6 +56,33 @@ def test_credential_env_vars_cover_all_credential_settings_fields():
             f"Settings field {field!r} — fix the scrub list in "
             "tests/unit/conftest.py."
         )
+
+
+def test_every_optional_str_setting_is_scrubbed_or_allowlisted():
+    """Reverse direction: no ``str | None`` Settings field escapes the scrub.
+
+    ``test_credential_env_vars_cover_all_credential_settings_fields`` only
+    checks list -> field, so a NEW optional-string field carrying a secret or a
+    live-connection target (e.g. the ``streaming_webhook_urls`` outbound webhook
+    list) could be added to ``Settings`` and silently re-open the LML#769 leak
+    without any test noticing. This closes that gap: every ``str | None`` field
+    must be either in ``CREDENTIAL_ENV_VARS`` (scrubbed) or explicitly declared
+    non-secret in ``NON_CREDENTIAL_OPTIONAL_STR_FIELDS`` — a conscious choice,
+    never a silent omission.
+    """
+    optional_str_fields = {
+        name for name, info in Settings.model_fields.items() if info.annotation == (str | None)
+    }
+    unaccounted = (
+        optional_str_fields - set(CREDENTIAL_SETTINGS_FIELDS) - NON_CREDENTIAL_OPTIONAL_STR_FIELDS
+    )
+    assert not unaccounted, (
+        f"Optional-string Settings field(s) {sorted(unaccounted)} are neither "
+        "scrubbed nor allowlisted. If a field carries a credential or a live "
+        "connection target, add its upper-cased name to CREDENTIAL_ENV_VARS in "
+        "tests/unit/conftest.py; if it is genuinely non-secret, add it to "
+        "NON_CREDENTIAL_OPTIONAL_STR_FIELDS. See WXYC/library-metadata-lookup#769."
+    )
 
 
 def test_unit_run_sees_no_real_credentials():
