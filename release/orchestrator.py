@@ -277,7 +277,22 @@ async def _writeback_identity(
         # discogs_artist_id: fill-if-null so we never clobber a concurrent
         # writer's id (LML#766). Only write when we actually learned one.
         if identifiers.discogs_artist_id is not None:
-            await store.fill_identity_discogs_id(canonical.artist, identifiers.discogs_artist_id)
+            outcome = await store.fill_identity_discogs_id(
+                canonical.artist, identifiers.discogs_artist_id
+            )
+            # identity=None means the row vanished between the blocked upsert
+            # and the read-back — a concurrent orphan-pass delete (or a
+            # swallowed store failure). The learned id is not re-stamped (and
+            # re-creating a row the orphan pass just deleted would only
+            # re-orphan it), but the drop must not be silent.
+            if outcome.identity is None:
+                logger.warning(
+                    "entity.identity fill-if-null found no row to stamp for "
+                    "'%s' (discogs_artist_id=%d) — concurrent delete or "
+                    "swallowed store failure; id not recorded",
+                    canonical.artist,
+                    identifiers.discogs_artist_id,
+                )
         # bandcamp_id (and the first-sight row creation when no Discogs id was
         # learned): COALESCE-additive upsert. Skipping this entirely when both
         # ids are absent avoids an empty no-op write.
