@@ -192,6 +192,14 @@ GROUP BY q.input\
 # the resolver should count either.
 _ARTIST_TRIGRAM_CANDIDATE_THRESHOLD = 0.85
 
+# The ``%`` pre-filter floor: ``artist_trigram_candidates`` pins the
+# ``pg_trgm.similarity_threshold`` GUC to this value with ``SET LOCAL`` and
+# rejects caller thresholds below it. Guard and pin MUST move together —
+# single-sourced here so they can't drift (a guard lowered without the pin
+# reintroduces the silent [threshold, floor) candidate drop).
+_PG_TRGM_FLOOR = 0.3
+_SET_PG_TRGM_FLOOR_SQL = f"SET LOCAL pg_trgm.similarity_threshold = {_PG_TRGM_FLOOR}"
+
 
 def _negative_cache_key_hash(artist: str | None, track: str, artist_as_keyword: bool) -> bytes:
     """Hash the (artist, track, artist_as_keyword) tuple into a stable 32-byte key.
@@ -553,17 +561,18 @@ class DiscogsCacheService:
                 constant fails a dry run, not the first real batch.
             CacheUnavailableError: If the database is unreachable.
         """
-        if threshold < 0.3:
+        if threshold < _PG_TRGM_FLOOR:
             raise ValueError(
-                f"threshold {threshold} is below pg_trgm's similarity_threshold floor (0.3); "
-                "candidates in the gap would be silently dropped by the % pre-filter"
+                f"threshold {threshold} is below pg_trgm's similarity_threshold floor "
+                f"({_PG_TRGM_FLOOR}); candidates in the gap would be silently dropped "
+                "by the % pre-filter"
             )
         if not names:
             return {}
         try:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    await conn.execute("SET LOCAL pg_trgm.similarity_threshold = 0.3")
+                    await conn.execute(_SET_PG_TRGM_FLOOR_SQL)
                     rows = await conn.fetch(_ARTIST_TRIGRAM_CANDIDATES_SQL, names, threshold)
             results: dict[str, set[int]] = {name: set() for name in names}
             for row in rows:

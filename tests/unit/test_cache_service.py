@@ -2313,6 +2313,28 @@ class TestArtistEqualityCandidates:
         with pytest.raises(CacheUnavailableError):
             await cache_service.artist_equality_candidates(["stereolab"])
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_row",
+        [
+            # A form the batch never asked for (= ANY invariant violated).
+            {"leg": "exact", "form": "not in batch", "artist_ids": [1]},
+            # A leg label with no dataclass field (SQL/dataclass drift).
+            {"leg": "group", "form": "stereolab", "artist_ids": [1]},
+        ],
+    )
+    async def test_invariant_violation_fails_loudly(
+        self, cache_service, mock_asyncpg_pool, bad_row
+    ):
+        """A row violating the SQL↔dataclass invariants must raise (wrapped
+        as CacheUnavailableError), never be silently skipped — a silent
+        drop is how an ambiguous name reads as unique and mints wrong.
+        Pins the direct-access contract so a future editor can't quietly
+        restore ``.get(...) + continue`` defensiveness."""
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[bad_row])
+        with pytest.raises(CacheUnavailableError):
+            await cache_service.artist_equality_candidates(["stereolab"])
+
 
 # ---------------------------------------------------------------------------
 # artist_trigram_candidates (LML#759)
@@ -2361,16 +2383,32 @@ class TestArtistTrigramCandidates:
         """``pg_trgm.similarity_threshold`` is a GUC settable at server/
         database/role scope, so the module's 0.3-floor assumption is
         falsifiable by a DBA tuning the shared cache — the query must pin
-        it with ``SET LOCAL`` inside its own transaction."""
+        it with ``SET LOCAL`` inside its own transaction, BEFORE the fetch.
+
+        The ordering is the contract: ``SET LOCAL`` outside a transaction
+        is a WARNING no-op on real PostgreSQL, and the pg integration
+        tests can't catch a hoist because the server default equals the
+        pin — so this test records the event sequence explicitly.
+        """
         conn = mock_asyncpg_pool._mock_conn
-        conn.fetch = AsyncMock(return_value=[])
+        events: list[str] = []
+        tx_ctx = conn._mock_tx_ctx
+        tx_ctx.__aenter__ = AsyncMock(side_effect=lambda: events.append("tx_enter") or tx_ctx)
+        tx_ctx.__aexit__ = AsyncMock(side_effect=lambda *a: events.append("tx_exit") or False)
+
+        async def record_execute(sql, *args):
+            if "similarity_threshold" in sql:
+                assert "SET LOCAL" in sql
+                events.append("set_local")
+
+        async def record_fetch(*args):
+            events.append("fetch")
+            return []
+
+        conn.execute = AsyncMock(side_effect=record_execute)
+        conn.fetch = AsyncMock(side_effect=record_fetch)
         await cache_service.artist_trigram_candidates(["Stereolab"])
-        set_calls = [
-            c.args[0] for c in conn.execute.await_args_list if "similarity_threshold" in c.args[0]
-        ]
-        assert set_calls, "expected SET LOCAL pg_trgm.similarity_threshold before the query"
-        assert "SET LOCAL" in set_calls[0]
-        conn.transaction.assert_called_once()
+        assert events == ["tx_enter", "set_local", "fetch", "tx_exit"]
 
     @pytest.mark.asyncio
     async def test_multi_id_candidate_set_not_collapsed(self, cache_service, mock_asyncpg_pool):
@@ -2401,5 +2439,15 @@ class TestArtistTrigramCandidates:
     async def test_db_error_wrapped_as_cache_unavailable(self, cache_service, mock_asyncpg_pool):
         conn = mock_asyncpg_pool._mock_conn
         conn.fetch = AsyncMock(side_effect=RuntimeError("conn refused"))
+        with pytest.raises(CacheUnavailableError):
+            await cache_service.artist_trigram_candidates(["Stereolab"])
+
+    @pytest.mark.asyncio
+    async def test_unknown_input_row_fails_loudly(self, cache_service, mock_asyncpg_pool):
+        """A row keyed by an input the batch never sent (unnest invariant
+        violated) must raise, not be silently skipped — same loud-failure
+        contract as the equality legs."""
+        conn = mock_asyncpg_pool._mock_conn
+        conn.fetch = AsyncMock(return_value=[{"input": "not in batch", "artist_ids": [1]}])
         with pytest.raises(CacheUnavailableError):
             await cache_service.artist_trigram_candidates(["Stereolab"])

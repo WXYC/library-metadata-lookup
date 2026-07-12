@@ -108,10 +108,16 @@ WHERE wxyc_identity_match_artist(nv.name) = ANY($1)\
 # trivially tunable (and so the score is available to record as confidence).
 # Note: the ``%`` operator pre-filters to rows above pg_trgm's session
 # ``similarity_threshold`` (``show_limit()``, default 0.3) before the Python
-# ``trigram_threshold`` is applied, so configuring a ``trigram_threshold`` below
-# that floor would silently drop candidates in the gap. The shipped default
-# (0.85) and the issue's tuning band sit well above 0.3, so this never bites in
-# practice.
+# ``trigram_threshold`` is applied. Two hazards: a ``trigram_threshold``
+# configured below the floor silently drops candidates in the gap (the shipped
+# 0.85 default and the issue's tuning band sit well above 0.3, so that
+# direction never bites in practice), and — unguarded here — a GUC raised
+# ABOVE ``trigram_threshold`` at server/database/role scope would silently
+# drop candidates in [``trigram_threshold``, GUC) with no error. The #759
+# sibling (``discogs/cache_service.py:artist_trigram_candidates``) pins the
+# floor with ``SET LOCAL`` in its own transaction; pinning this leg the same
+# way is deliberately deferred (this script is behavior-frozen under #759) —
+# tracked in WXYC/library-metadata-lookup#763.
 _TRIGRAM_FALLBACK_SQL = """\
 SELECT ra.artist_id, ra.artist_name,
        similarity(lower(f_unaccent(ra.artist_name)), lower(f_unaccent($1))) AS score
