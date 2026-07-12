@@ -28,8 +28,9 @@ from tests.integration.conftest import (
     skip_unless_wxyc_identity_match_artist,
 )
 
-# Canned single-page observations per input name (the resolver probes with
-# the first occurrence's verbatim). Raw Discogs titles, "(N)" intact.
+# Canned single-page observations per probe string (the resolver probes
+# with the group's lexicographically-least sanitized spelling). Raw
+# Discogs titles, "(N)" intact.
 _CANNED_PAGES: dict[str, list[DiscogsArtistSearchResult]] = {
     # Exact-form unique, nothing cached: the plain mint path.
     "Wishy": [DiscogsArtistSearchResult(artist_id=123, title="Wishy")],
@@ -44,9 +45,15 @@ _CANNED_PAGES: dict[str, list[DiscogsArtistSearchResult]] = {
     "The Tubs": [DiscogsArtistSearchResult(artist_id=999, title="The Tubs")],
     # Pre-existing identity row holds spotify only: the non-clobber fill.
     "Cat Power": [DiscogsArtistSearchResult(artist_id=3081, title="Cat Power")],
-    # Parity canary: umlaut input, diacritic-free cache row, "(N)"-suffixed
-    # raw API title — all three collapse to one identity-match form.
-    "Nilüfer Yanya": [DiscogsArtistSearchResult(artist_id=666, title="Nilüfer Yanya (2)")],
+    # Parity canary: umlaut input vs diacritic-free cache row — both
+    # collapse to one identity-match form through the two normalizers.
+    "Nilüfer Yanya": [DiscogsArtistSearchResult(artist_id=666, title="Nilüfer Yanya")],
+    # Winner-qualifier mismatch: a "(2)"-titled singleton answering a bare
+    # input is family evidence, not a resolution.
+    "Wand": [DiscogsArtistSearchResult(artist_id=77, title="Wand (2)")],
+    # Qualified input: own group, resolves via the qualifier-matched
+    # singleton, never mints, skips the cache-evidence tier.
+    "Popsicle (2)": [DiscogsArtistSearchResult(artist_id=222, title="Popsicle (2)")],
 }
 
 
@@ -316,8 +323,7 @@ class TestArtistResolveBulkEndpoint:
         assert resp.status_code == 200
         (result,) = resp.json()["results"]
         assert result["discogs_artist_id"] == 666
-        # The raw Discogs title, suffix intact — provenance wants it.
-        assert result["canonical_name"] == "Nilüfer Yanya (2)"
+        assert result["canonical_name"] == "Nilüfer Yanya"
         # cache_trigram rides along: f_unaccent collapses the umlaut, so
         # the seeded row scores 1.0 on the trigram leg too.
         assert result["cache_corroboration"] == ["cache_exact", "cache_trigram"]
@@ -383,3 +389,51 @@ class TestArtistResolveBulkAuth:
         )
         assert resp.status_code == 200
         assert resp.json()["results"][0]["discogs_artist_id"] == 187553
+
+
+@pytest.mark.pg
+class TestArtistResolveQualifierSemantics:
+    """Endpoint-level pins for the qualifier rules the resolver's unit
+    suite covers in depth: winner-title mismatch, qualified-never-mint,
+    and the 422 input contract."""
+
+    @pytest.mark.asyncio
+    async def test_qualifier_titled_singleton_is_ambiguous_for_bare_input(self, app_client):
+        resp = await app_client.post("/api/v1/artists/resolve/bulk", json={"names": ["Wand"]})
+        assert resp.status_code == 200
+        (result,) = resp.json()["results"]
+        assert result["unresolved_reason"] == "ambiguous"
+        assert result["candidate_count"] == 1
+        assert result["discogs_artist_id"] is None
+
+        read = await app_client.get("/identity/resolve", params={"name": "Wand"})
+        assert read.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_qualified_input_resolves_without_minting(self, app_client):
+        resp = await app_client.post(
+            "/api/v1/artists/resolve/bulk", json={"names": ["Popsicle (2)"]}
+        )
+        assert resp.status_code == 200
+        (result,) = resp.json()["results"]
+        assert result["discogs_artist_id"] == 222
+        assert result["canonical_name"] == "Popsicle (2)"
+        assert result["method"] == "api_search"
+        # Qualified groups skip the cache-evidence tier entirely.
+        assert result["cache_corroboration"] == []
+
+        read = await app_client.get("/identity/resolve", params={"name": "Popsicle (2)"})
+        assert read.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_semantically_invalid_name_returns_422(self, app_client, pg_pool):
+        """One garbage name 422s the batch before any tier runs — no
+        mints, no in-band verdict a consumer could negative-cache."""
+        resp = await app_client.post(
+            "/api/v1/artists/resolve/bulk", json={"names": ["Wishy", "   "]}
+        )
+        assert resp.status_code == 422
+        assert "names[1]" in resp.json()["detail"]
+
+        read = await app_client.get("/identity/resolve", params={"name": "Wishy"})
+        assert read.status_code == 404
