@@ -2345,6 +2345,80 @@ class TestArtistEqualityCandidates:
 # ---------------------------------------------------------------------------
 
 
+class TestArtistEqualityCandidatesLegIteration:
+    """The dataclass owns its leg enumeration (LML#759 review round 1):
+    consumers derive corroboration and the conflict-rule union from ONE
+    field list, so a leg added to the dataclass cannot be silently absent
+    from either — a missing leg in the union weakens the veto and lets an
+    ambiguous name mint."""
+
+    def test_nonempty_legs_in_field_declaration_order(self):
+        candidates = ArtistEqualityCandidates(
+            exact={1},
+            alias={3},
+            name_variation={4},
+        )
+        assert candidates.nonempty_legs() == ["exact", "alias", "name_variation"]
+
+    def test_nonempty_legs_empty_when_all_legs_measured_zero(self):
+        assert ArtistEqualityCandidates().nonempty_legs() == []
+
+    def test_leg_names_match_wire_enum_values(self):
+        """Field names are contractually tied to ArtistResolveCacheLeg
+        (each wire value is "cache_" + field name); a rename on either
+        side must fail here, not silently desynchronize telemetry."""
+        from dataclasses import fields
+
+        from generated.api_models import ArtistResolveCacheLeg
+
+        wire_values = {leg.value for leg in ArtistResolveCacheLeg}
+        for f in fields(ArtistEqualityCandidates):
+            assert f"cache_{f.name}" in wire_values
+
+    def test_all_candidate_ids_unions_every_leg(self):
+        candidates = ArtistEqualityCandidates(
+            exact={1, 2},
+            member={2, 3},
+            alias={4},
+            name_variation={5},
+        )
+        assert candidates.all_candidate_ids() == {1, 2, 3, 4, 5}
+
+    def test_all_candidate_ids_empty_on_measured_zero(self):
+        assert ArtistEqualityCandidates().all_candidate_ids() == set()
+
+    def test_field_order_matches_wire_enum_declaration_order(self):
+        """nonempty_legs() promises field order == wire enum order — a
+        reorder on either side silently changes cache_corroboration
+        ordering that downstream consumers treat as deterministic."""
+        from dataclasses import fields
+
+        from generated.api_models import ArtistResolveCacheLeg
+
+        equality_enum_values = [
+            leg.value
+            for leg in ArtistResolveCacheLeg
+            if leg is not ArtistResolveCacheLeg.cache_trigram
+        ]
+        assert [f"cache_{f.name}" for f in fields(ArtistEqualityCandidates)] == (
+            equality_enum_values
+        )
+
+    def test_every_equality_enum_value_has_a_dataclass_field(self):
+        """Reverse parity: a wire enum leg added without its dataclass
+        field would silently never corroborate NOR veto — the exact
+        missing-leg failure the leg-iteration methods exist to prevent."""
+        from dataclasses import fields
+
+        from generated.api_models import ArtistResolveCacheLeg
+
+        field_names = {f.name for f in fields(ArtistEqualityCandidates)}
+        for leg in ArtistResolveCacheLeg:
+            if leg is ArtistResolveCacheLeg.cache_trigram:
+                continue
+            assert leg.value.removeprefix("cache_") in field_names
+
+
 class TestArtistTrigramCandidates:
     """The trigram query runs on an acquired connection inside a transaction
     so ``SET LOCAL pg_trgm.similarity_threshold`` can pin the ``%``
@@ -2455,46 +2529,3 @@ class TestArtistTrigramCandidates:
         conn.fetch = AsyncMock(return_value=[{"input": "not in batch", "artist_ids": [1]}])
         with pytest.raises(CacheUnavailableError):
             await cache_service.artist_trigram_candidates(["Stereolab"])
-
-
-class TestArtistEqualityCandidatesLegIteration:
-    """The dataclass owns its leg enumeration (LML#759 review round 1):
-    consumers derive corroboration and the conflict-rule union from ONE
-    field list, so a leg added to the dataclass cannot be silently absent
-    from either — a missing leg in the union weakens the veto and lets an
-    ambiguous name mint."""
-
-    def test_nonempty_legs_in_field_declaration_order(self):
-        candidates = ArtistEqualityCandidates(
-            exact={1},
-            alias={3},
-            name_variation={4},
-        )
-        assert candidates.nonempty_legs() == ["exact", "alias", "name_variation"]
-
-    def test_nonempty_legs_empty_when_all_legs_measured_zero(self):
-        assert ArtistEqualityCandidates().nonempty_legs() == []
-
-    def test_leg_names_match_wire_enum_values(self):
-        """Field names are contractually tied to ArtistResolveCacheLeg
-        (each wire value is "cache_" + field name); a rename on either
-        side must fail here, not silently desynchronize telemetry."""
-        from dataclasses import fields
-
-        from generated.api_models import ArtistResolveCacheLeg
-
-        wire_values = {leg.value for leg in ArtistResolveCacheLeg}
-        for f in fields(ArtistEqualityCandidates):
-            assert f"cache_{f.name}" in wire_values
-
-    def test_all_candidate_ids_unions_every_leg(self):
-        candidates = ArtistEqualityCandidates(
-            exact={1, 2},
-            member={2, 3},
-            alias={4},
-            name_variation={5},
-        )
-        assert candidates.all_candidate_ids() == {1, 2, 3, 4, 5}
-
-    def test_all_candidate_ids_empty_on_measured_zero(self):
-        assert ArtistEqualityCandidates().all_candidate_ids() == set()
