@@ -31,7 +31,15 @@ from routers.health import router as health_router
 from streaming.dependencies import close_streaming_clients
 from streaming.router import router as streaming_router
 
-load_dotenv()
+# Load ONLY this checkout's .env — never an ancestor's. A bare load_dotenv()
+# does python-dotenv's upward directory search, so a process started from a
+# git worktree nested under the main checkout (.worktrees/<name>/,
+# .claude/worktrees/<name>/) would climb out of the worktree and load the
+# PARENT checkout's .env, leaking its real DISCOGS_TOKEN and live
+# DATABASE_URL_DISCOGS into what should be a hermetic run (LML#769).
+# Path(__file__) resolves inside the worktree, so every checkout gets exactly
+# its own .env; `uvicorn main:app --reload` from the repo root is unchanged.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 settings = get_settings()
 
