@@ -334,7 +334,7 @@ class TestApiVerdicts:
     """Tier 3: the exact-form uniqueness table."""
 
     @pytest.mark.asyncio
-    async def test_unique_exact_form_resolves_and_mints_verbatim(
+    async def test_unique_exact_form_resolves_and_mints(
         self, resolver, entity_store, discogs_service
     ):
         # Page noise whose identity-match form differs must not count.
@@ -666,7 +666,9 @@ class TestDedupe:
 
 
 class TestWriteBack:
-    """Mint rules: verbatim key, discogs_artist_id only, dry_run inverse."""
+    """Mint rules: content-deterministic key (the group's min() spelling,
+    or a fillable stored row's key), discogs_artist_id only, dry_run
+    inverse."""
 
     @pytest.mark.asyncio
     async def test_dry_run_returns_full_verdicts_but_never_upserts(
@@ -1194,7 +1196,7 @@ class TestTierOneRowSelection:
     ):
         """Symmetric guard: a qualified-keyed row handed back for a BARE
         read must not decide the group nor become its fill target — the
-        mint keys on the trimmed verbatim instead."""
+        mint keys on the group's min() spelling instead."""
         entity_store.bulk_resolve_library_names = AsyncMock(
             return_value={"Popsicle": _identity("Popsicle (2)", spotify_artist_id="9dEf")}
         )
