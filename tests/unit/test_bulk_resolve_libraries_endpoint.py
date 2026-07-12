@@ -1079,3 +1079,90 @@ class TestBulkResolveDefaultConcurrencyTracksPool:
 
         monkeypatch.setenv("LML_DISCOGS_POOL_MAX_SIZE", "8")
         assert _bulk_resolve_default_concurrency() == 8
+
+
+class TestBulkResolveFamilyAlignment:
+    """LML#767: the manual-parse route joins the shared envelope + transient
+    tuple. InterfaceError -> 503, ClientDisconnect -> 400, and an absent
+    batch field -> Pydantic's structured 422 (not the old bare-string)."""
+
+    @pytest.mark.asyncio
+    async def test_interface_error_mid_batch_returns_503(self, app_client, mock_entity_store):
+        """asyncpg's client-side InterfaceError (pool teardown) fails the
+        whole batch closed with 503, same as PostgresError/OSError."""
+        from asyncpg.exceptions import InterfaceError
+
+        async def maybe_fail(name: str):
+            if name == "Boom":
+                raise InterfaceError("pool is closing")
+            return None
+
+        mock_entity_store.resolve_library_name.side_effect = maybe_fail
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/identity/bulk-resolve-libraries",
+                json={
+                    "inputs": [
+                        {"library_id": 1, "artist_name": "Fine One", "album_title": "x"},
+                        {"library_id": 2, "artist_name": "Boom", "album_title": "x"},
+                    ]
+                },
+            )
+
+        assert resp.status_code == 503
+        assert "results" not in resp.json()
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_during_body_read_returns_400(
+        self, app_client, mock_entity_store, monkeypatch
+    ):
+        """A mid-body client abort maps to 400, not an unhandled 500 — the
+        arm keeps error-class accounting clean."""
+        from starlette.requests import ClientDisconnect, Request
+
+        async def _gone(self):
+            raise ClientDisconnect()
+
+        monkeypatch.setattr(Request, "json", _gone)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/identity/bulk-resolve-libraries",
+                json={"inputs": [{"library_id": 1, "artist_name": "x", "album_title": "y"}]},
+            )
+
+        assert resp.status_code == 400
+        assert "disconnected" in resp.json()["detail"].lower()
+        mock_entity_store.resolve_library_name.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_absent_inputs_field_returns_structured_422(self, app_client, mock_entity_store):
+        """A missing `inputs` field falls through to model_validate, so the
+        detail is Pydantic's structured errors() list (missing/list_type),
+        not a bare "`inputs` must be a JSON array" string."""
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/api/v1/identity/bulk-resolve-libraries", json={})
+
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert isinstance(detail, list)
+        assert detail[0]["loc"] == ["inputs"]
+        assert detail[0]["type"] == "missing"
+        mock_entity_store.resolve_library_name.assert_not_awaited()
+
+    def test_input_cap_reads_from_generated_model_schema(self):
+        """Item 5: the 413 gate cap is schema-derived, not a hardcoded 1000
+        — a regenerated model with a different maxItems moves the gate."""
+        from generated.api_models import BulkResolveLibrariesRequest
+        from identity.router import _BULK_RESOLVE_INPUT_CAP
+
+        schema = BulkResolveLibrariesRequest.model_json_schema()
+        assert schema["properties"]["inputs"]["maxItems"] == _BULK_RESOLVE_INPUT_CAP
+        assert _BULK_RESOLVE_INPUT_CAP == 1000

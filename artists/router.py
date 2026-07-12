@@ -23,14 +23,12 @@ import logging
 from typing import TYPE_CHECKING
 
 import sentry_sdk
-from asyncpg.exceptions import InterfaceError, PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ValidationError
-from starlette.requests import ClientDisconnect
 from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
 
 from artists.composer import ArtistSearchAliasesComposer
 from artists.resolver import BareNameArtistResolver, InvalidNameError
+from core.bulk_body import TRANSIENT_PG_ERRORS, parse_bulk_body, resolve_input_cap
 from core.dependencies import (
     get_artist_resolve_posthog_client,
     get_discogs_cache_service_from_pool,
@@ -53,43 +51,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _resolve_input_cap(request_model: type[BaseModel]) -> int:
-    """Read the names array `maxItems` from a generated model's JSON schema.
-
-    Drift guard: api.yaml's `maxItems` for `names` drives the generated
-    request model's constraint. The routes enforce the cap as 413 before
-    Pydantic validation; sourcing the literal from the model means a
-    future api.yaml change that regenerates the model automatically
-    updates the manual 413 gate.
-
-    Uses `model_json_schema()` rather than the lower-level
-    `model_fields[...].metadata` introspection because the JSON-schema
-    export is Pydantic's documented public API (it's tied to OpenAPI
-    generation and unlikely to drift across minor versions), whereas the
-    metadata shape is implementation detail that has changed before.
-    `pydantic` is pinned only as a lower bound (`>=2.0.0`) so this
-    distinction matters across deploys.
-
-    Raises at module import time if `maxItems` is missing — fail loud, so
-    a regenerated model that drops the constraint can't silently widen
-    the 413 gate and produce 422 responses for cap-exceeded requests.
-    """
-    schema = request_model.model_json_schema()
-    names_schema = schema.get("properties", {}).get("names", {})
-    max_items = names_schema.get("maxItems")
-    if isinstance(max_items, int) and max_items > 0:
-        return max_items
-    raise RuntimeError(
-        f"Cannot resolve `maxItems` for {request_model.__name__}.names "
-        "from its JSON schema. The route's 413 gate must agree with the "
-        "generated model; fix or regenerate the model before this module "
-        f"can import (schema fragment: {names_schema!r})."
-    )
-
-
 # Per api.yaml: max names per request; over-cap returns 413.
-_BULK_INPUT_CAP = _resolve_input_cap(ArtistSearchAliasesBulkRequest)
-_RESOLVE_INPUT_CAP = _resolve_input_cap(ArtistResolveBulkRequest)
+_BULK_INPUT_CAP = resolve_input_cap(ArtistSearchAliasesBulkRequest, "names")
+_RESOLVE_INPUT_CAP = resolve_input_cap(ArtistResolveBulkRequest, "names")
 
 _ROUTE_PATH = "/api/v1/artists/search-aliases/bulk"
 _RESOLVE_ROUTE_PATH = "/api/v1/artists/resolve/bulk"
@@ -113,48 +77,6 @@ _ENTITY_STORE_QUERY_FAILED_DETAIL = (
 _DISCOGS_CACHE_QUERY_FAILED_DETAIL = (
     "Discogs cache query failed — likely a transient connection loss; retrying may succeed."
 )
-
-
-async def _parse_bulk_names_body[RequestT: BaseModel](
-    http_request: Request,
-    model: type[RequestT],
-    cap: int,
-) -> RequestT:
-    """Shared request envelope for the bulk `names` routes in this router.
-
-    Manual 413 check before Pydantic validation (mirrors `bulk-resolve-
-    libraries`): the generated request models carry api.yaml's `maxItems`,
-    but Pydantic's enforcement is 422. The api.yaml contract documents 413
-    for cap exceedance, so the raw count is read first and 413 raised;
-    only then does the model validate.
-    """
-    try:
-        body = await http_request.json()
-    except (ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=f"Malformed JSON body: {e}") from None
-    except ClientDisconnect:
-        # Client closed the connection before the body completed. There is
-        # no point sending a 5xx — the client is gone — but we want this to
-        # land as a 4xx in logs (the route did its job; the failure is the
-        # client's). Treat as 400 to keep error-class accounting clean.
-        raise HTTPException(
-            status_code=400,
-            detail="Client disconnected before request body completed.",
-        ) from None
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
-    names_raw = body.get("names")
-    if not isinstance(names_raw, list):
-        raise HTTPException(status_code=422, detail="`names` must be a JSON array.")
-    if len(names_raw) > cap:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Batch exceeded the {cap}-name cap (received {len(names_raw)}).",
-        )
-    try:
-        return model.model_validate(body)
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors()) from None
 
 
 router = APIRouter(tags=["artists"])
@@ -187,8 +109,8 @@ async def search_aliases_bulk(
     `asyncio.gather` over per-name leaves (LML#370/#372 cascade-cascade
     avoidance).
     """
-    request = await _parse_bulk_names_body(
-        http_request, ArtistSearchAliasesBulkRequest, _BULK_INPUT_CAP
+    request = await parse_bulk_body(
+        http_request, ArtistSearchAliasesBulkRequest, _BULK_INPUT_CAP, field="names"
     )
 
     if entity_store is None:
@@ -245,7 +167,7 @@ async def search_aliases_bulk(
             raise HTTPException(
                 status_code=503, detail=_DISCOGS_CACHE_QUERY_FAILED_DETAIL
             ) from None
-        except (PostgresError, InterfaceError, OSError):
+        except TRANSIENT_PG_ERRORS:
             # Phase 1: entity-store PG failure (raw asyncpg error — not
             # wrapped). Phase 2 errors are wrapped above; if a PostgresError
             # reaches here, it came from `bulk_resolve_library_names`.
@@ -342,8 +264,8 @@ async def resolve_bulk(
     LML#755 breaker shed degrades per-name to `escalation_unavailable` —
     the PG tiers keep answering, never a batch-level 503.
     """
-    request = await _parse_bulk_names_body(
-        http_request, ArtistResolveBulkRequest, _RESOLVE_INPUT_CAP
+    request = await parse_bulk_body(
+        http_request, ArtistResolveBulkRequest, _RESOLVE_INPUT_CAP, field="names"
     )
 
     if entity_store is None:
@@ -410,7 +332,7 @@ async def resolve_bulk(
             raise HTTPException(
                 status_code=503, detail=_DISCOGS_CACHE_QUERY_FAILED_DETAIL
             ) from None
-        except (PostgresError, InterfaceError, OSError):
+        except TRANSIENT_PG_ERRORS:
             # Tier-1 read or write-back: raw entity-store PG failure.
             # InterfaceError (asyncpg's client-side pool/connection
             # lifecycle errors) subclasses neither PostgresError nor

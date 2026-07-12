@@ -3,10 +3,10 @@
 import asyncio
 import logging
 
-from asyncpg.exceptions import PostgresError
 from fastapi import Depends
 
 from config.settings import Settings, get_settings
+from core.bulk_body import TRANSIENT_PG_ERRORS
 from core.dependencies import get_discogs_pool
 from entity.sources import PgSource
 from entity.store import EntityStore
@@ -78,7 +78,7 @@ async def get_entity_store(
         pg = PgSource(pool=pool)
         try:
             await pg.fetchone(_PROBE_SQL)
-        except (PostgresError, OSError) as e:
+        except TRANSIENT_PG_ERRORS as e:
             logger.warning(
                 "Entity store probe failed; disabling identity routes: %s: %s",
                 type(e).__name__,

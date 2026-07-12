@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any
 
 import sentry_sdk
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from pydantic import ValidationError
 from wxyc_fastapi.observability import (
     RequestTelemetry,
     get_cache_stats,
@@ -22,6 +21,7 @@ from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
 from config.settings import get_settings
+from core.bulk_body import parse_bulk_body
 from core.bulk_concurrency import (
     acquire_bulk_global_permit,
     cancel_and_drain,
@@ -480,28 +480,14 @@ async def handle_bulk_lookup(
     ),
 ) -> BulkLookupResponse:
     """Bulk lookup. See route docstring for protocol."""
-    # Manual cap-check: 400 (not Pydantic's 422) for oversize batches.
-    try:
-        body = await http_request.json()
-    except (ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=f"Malformed JSON body: {e}") from None
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
-    items_raw = body.get("items")
-    if not isinstance(items_raw, list):
-        raise HTTPException(status_code=422, detail="`items` must be a JSON array.")
-    if len(items_raw) > _BULK_LOOKUP_INPUT_CAP:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Batch exceeded the {_BULK_LOOKUP_INPUT_CAP}-item cap (received {len(items_raw)})."
-            ),
-        )
-
-    try:
-        request = BulkLookupRequest.model_validate(body)
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors()) from None
+    # Shared bulk envelope (LML#767): raw-JSON parse, ClientDisconnect -> 400,
+    # non-object -> 400, manual over-cap before Pydantic, then model_validate.
+    # `cap_status=400` preserves this route's LML#368 over-cap contract (400,
+    # not the family's default 413). An absent/wrong-type `items` field falls
+    # through to Pydantic's structured errors() rather than a bare 422.
+    request = await parse_bulk_body(
+        http_request, BulkLookupRequest, _BULK_LOOKUP_INPUT_CAP, field="items", cap_status=400
+    )
 
     # Entry signal (LML#371). Fires synchronously before any awaits, so a
     # handler that later hangs past the caller's AbortController still leaves

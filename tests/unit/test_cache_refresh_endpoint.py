@@ -91,3 +91,86 @@ class TestCacheRefreshGlobalBound:
         assert peak <= 2, (
             f"Peak cross-request concurrency was {peak}; global permit did not bound it"
         )
+
+
+class TestCacheRefreshFamilyAlignment:
+    """LML#767: the cache-refresh route joins the shared envelope + transient
+    tuple. InterfaceError -> 503, ClientDisconnect -> 400, absent batch field
+    -> Pydantic's structured 422. The 400 over-cap contract is preserved."""
+
+    @pytest.mark.asyncio
+    async def test_interface_error_on_provenance_read_returns_503(
+        self, app_client, mock_entity_store
+    ):
+        """asyncpg's client-side InterfaceError on the batch provenance read
+        maps to 503, same transient class as PostgresError/OSError."""
+        from asyncpg.exceptions import InterfaceError
+
+        mock_entity_store.get_release_identity_provenance_bulk.side_effect = InterfaceError(
+            "pool is closing"
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/cache/refresh-for-identities", json={"identity_ids": [42]}
+            )
+
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_during_body_read_returns_400(
+        self, app_client, mock_entity_store, monkeypatch
+    ):
+        """A mid-body client abort maps to 400, not an unhandled 500."""
+        from starlette.requests import ClientDisconnect, Request
+
+        async def _gone(self):
+            raise ClientDisconnect()
+
+        monkeypatch.setattr(Request, "json", _gone)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/cache/refresh-for-identities", json={"identity_ids": [42]}
+            )
+
+        assert resp.status_code == 400
+        assert "disconnected" in resp.json()["detail"].lower()
+        mock_entity_store.get_release_identity_provenance_bulk.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_absent_identity_ids_field_returns_structured_422(
+        self, app_client, mock_entity_store
+    ):
+        """A missing `identity_ids` field falls through to model_validate, so
+        the detail is Pydantic's structured errors() list, not a bare
+        "`identity_ids` must be a JSON array" string."""
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/api/v1/cache/refresh-for-identities", json={})
+
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert isinstance(detail, list)
+        assert detail[0]["loc"] == ["identity_ids"]
+        assert detail[0]["type"] == "missing"
+
+    @pytest.mark.asyncio
+    async def test_over_cap_still_returns_400(self, app_client, mock_entity_store):
+        """The 400 over-cap contract (LML#525, not 413) survives adoption of
+        the shared envelope."""
+        oversized = list(range(51))
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/cache/refresh-for-identities", json={"identity_ids": oversized}
+            )
+
+        assert resp.status_code == 400
+        mock_entity_store.get_release_identity_provenance_bulk.assert_not_awaited()
