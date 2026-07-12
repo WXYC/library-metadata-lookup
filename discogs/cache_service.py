@@ -12,7 +12,7 @@ The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 import asyncio
 import hashlib
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison
@@ -50,12 +50,36 @@ class ArtistEqualityCandidates:
     single id — because the bare-name resolver's conflict rule needs every
     candidate an overloaded form points at; collapsing to one would let an
     ambiguous name mint.
+
+    Field names are contractually tied to the wire enum
+    ``ArtistResolveCacheLeg`` (each value is ``cache_`` + the field name)
+    and to the SQL's ``leg`` labels in ``_ARTIST_EQUALITY_CANDIDATES_SQL``.
+    The two methods below exist so consumers iterate the legs through ONE
+    enumeration — a leg added here automatically joins both the
+    corroboration telemetry and the resolver's conflict-rule union, where
+    a hand-maintained second list could silently omit it (and a silently
+    missing leg lets an ambiguous name mint).
     """
 
     exact: set[int] = field(default_factory=set)
     member: set[int] = field(default_factory=set)
     alias: set[int] = field(default_factory=set)
     name_variation: set[int] = field(default_factory=set)
+
+    def nonempty_legs(self) -> list[str]:
+        """Names of legs holding at least one candidate, in field order.
+
+        Field order matches the wire enum's declaration order, so
+        corroboration lists built from this are deterministic.
+        """
+        return [f.name for f in fields(self) if getattr(self, f.name)]
+
+    def all_candidate_ids(self) -> set[int]:
+        """Union across every equality leg — the conflict rule's input."""
+        ids: set[int] = set()
+        for f in fields(self):
+            ids |= getattr(self, f.name)
+        return ids
 
 
 # Mirrors ``_ARTIST_FUZZY_MATCH_THRESHOLD`` in ``discogs/service.py`` — the
@@ -544,8 +568,9 @@ class DiscogsCacheService:
         scripts' explicit ``SET``.)
 
         Args:
-            names: Raw artist names as received (first-occurrence verbatim
-                per deduped form, by the resolver's convention).
+            names: Raw artist names as received (one deterministic
+                representative verbatim per deduped group, by the
+                resolver's convention).
             threshold: Minimum pg_trgm similarity [0, 1] for a candidate to
                 count. Must be >= 0.3 (the pinned ``%`` pre-filter floor);
                 lower values raise ``ValueError`` because candidates in the
