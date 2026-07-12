@@ -65,9 +65,12 @@ logger = logging.getLogger(__name__)
 # exactly those artists — but the resolver's inputs void that warranty, so it
 # must see every id an overloaded form points at. When editing either side,
 # keep the *matching* predicates (``extra = 0``, the
-# ``wxyc_identity_match_artist(col) = ANY($1)`` comparison) byte-compatible;
-# NULL-id filtering intentionally differs in mechanism (Python-side ``is not
-# None`` comprehensions here, SQL ``IS NOT NULL`` there) — same universe.
+# ``wxyc_identity_match_artist(col) = ANY($1)`` comparison) byte-compatible.
+# NULL-id filtering differs by leg: ``_EXACT_MATCH_SQL``'s ``artist_id IS
+# NOT NULL`` matches the resolver's exact leg byte-for-byte, while the
+# member/alias/name_variation legs filter NULL ids Python-side here (the
+# ``is not None`` comprehensions below) and in SQL there — same universe
+# either way; don't "fix" either side to match the other.
 _EXACT_MATCH_SQL = """\
 SELECT DISTINCT wxyc_identity_match_artist(ra.artist_name) AS artist_name, ra.artist_id
 FROM release_artist ra

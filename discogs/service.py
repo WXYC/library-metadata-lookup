@@ -857,13 +857,13 @@ class DiscogsService:
           measured single-page observation. Titles are raw Discogs strings,
           "(N)" disambiguator intact (see ``DiscogsArtistSearchResult``).
         - ``None``: couldn't ask — 429-exhausted, network error, non-2xx,
-          or a body whose shape defeats parsing (a partially-understood
-          page could yield a false-unique ``candidate_count``, so the
-          whole observation is untrusted). Callers must treat ``None`` as
-          *unknown*, never as a confirmed-empty verdict — in particular,
-          never coalesce it away with ``results or []`` / ``if not
-          results``, which silently turns "couldn't ask" into "measured
-          zero".
+          or a body containing anything unparseable, including a single
+          malformed result item (a partially-understood page could yield
+          a false-unique ``candidate_count``, so the whole observation is
+          untrusted). Callers must treat ``None`` as *unknown*, never as
+          a confirmed-empty verdict — in particular, never coalesce it
+          away with ``results or []`` / ``if not results``, which
+          silently turns "couldn't ask" into "measured zero".
 
         Raises:
             ValueError: on blank/whitespace-only ``name`` — a caller error,
@@ -899,7 +899,14 @@ class DiscogsService:
                 artist_id = item.get("id")
                 title = item.get("title")
                 if artist_id is None or not title:
-                    continue
+                    # Any malformed item distrusts the WHOLE page: silently
+                    # skipping it would return a truncated page as a trusted
+                    # measurement — dropping a null-id "Popsicle (2)" leaves
+                    # candidate_count=1, a false-unique that mints wrong.
+                    logger.warning(
+                        f"search_artists distrusting page for '{name}': malformed item {item!r}"
+                    )
+                    return None
                 results.append(DiscogsArtistSearchResult(artist_id=artist_id, title=title))
         except Exception as e:
             logger.warning(f"search_artists failed for '{name}': {e}")

@@ -2320,55 +2320,86 @@ class TestArtistEqualityCandidates:
 
 
 class TestArtistTrigramCandidates:
+    """The trigram query runs on an acquired connection inside a transaction
+    so ``SET LOCAL pg_trgm.similarity_threshold`` can pin the ``%``
+    pre-filter floor — assertions target ``pool._mock_conn``."""
+
     @pytest.mark.asyncio
     async def test_empty_input_short_circuits_without_query(self, cache_service, mock_asyncpg_pool):
         assert await cache_service.artist_trigram_candidates([]) == {}
-        mock_asyncpg_pool.fetch.assert_not_awaited()
+        mock_asyncpg_pool._mock_conn.fetch.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_batched_single_round_trip_keyed_by_input(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
-            return_value=[{"input": "Nilüfer Yanya", "artist_ids": [5499521]}]
-        )
+        conn = mock_asyncpg_pool._mock_conn
+        conn.fetch = AsyncMock(return_value=[{"input": "Nilüfer Yanya", "artist_ids": [5499521]}])
         result = await cache_service.artist_trigram_candidates(["Nilüfer Yanya", "Hot 8"])
-        mock_asyncpg_pool.fetch.assert_awaited_once()
+        conn.fetch.assert_awaited_once()
         assert result == {"Nilüfer Yanya": {5499521}, "Hot 8": set()}
 
     @pytest.mark.asyncio
     async def test_default_threshold_bound_in_query(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        conn = mock_asyncpg_pool._mock_conn
+        conn.fetch = AsyncMock(return_value=[])
         await cache_service.artist_trigram_candidates(["Stereolab"])
-        args = mock_asyncpg_pool.fetch.await_args.args
+        args = conn.fetch.await_args.args
         assert args[1] == ["Stereolab"]
         assert args[2] == pytest.approx(0.85)
 
     @pytest.mark.asyncio
     async def test_threshold_override_passed_through(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        conn = mock_asyncpg_pool._mock_conn
+        conn.fetch = AsyncMock(return_value=[])
         await cache_service.artist_trigram_candidates(["Stereolab"], threshold=0.4)
-        args = mock_asyncpg_pool.fetch.await_args.args
+        args = conn.fetch.await_args.args
         assert args[2] == pytest.approx(0.4)
 
     @pytest.mark.asyncio
+    async def test_pins_session_similarity_floor_in_transaction(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """``pg_trgm.similarity_threshold`` is a GUC settable at server/
+        database/role scope, so the module's 0.3-floor assumption is
+        falsifiable by a DBA tuning the shared cache — the query must pin
+        it with ``SET LOCAL`` inside its own transaction."""
+        conn = mock_asyncpg_pool._mock_conn
+        conn.fetch = AsyncMock(return_value=[])
+        await cache_service.artist_trigram_candidates(["Stereolab"])
+        set_calls = [
+            c.args[0] for c in conn.execute.await_args_list if "similarity_threshold" in c.args[0]
+        ]
+        assert set_calls, "expected SET LOCAL pg_trgm.similarity_threshold before the query"
+        assert "SET LOCAL" in set_calls[0]
+        conn.transaction.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_multi_id_candidate_set_not_collapsed(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
-            return_value=[{"input": "Popsicle", "artist_ids": [5001, 5002]}]
-        )
+        conn = mock_asyncpg_pool._mock_conn
+        conn.fetch = AsyncMock(return_value=[{"input": "Popsicle", "artist_ids": [5001, 5002]}])
         result = await cache_service.artist_trigram_candidates(["Popsicle"])
         assert result["Popsicle"] == {5001, 5002}
 
     @pytest.mark.asyncio
     async def test_threshold_below_pg_trgm_floor_raises(self, cache_service, mock_asyncpg_pool):
-        """A threshold under pg_trgm's session ``similarity_threshold`` floor
-        (default 0.3) would silently drop candidates in the gap — the ``%``
+        """A threshold under pg_trgm's pinned ``similarity_threshold`` floor
+        (0.3) would silently drop candidates in the gap — the ``%``
         operator pre-filters at the floor before ``similarity() >= $2`` runs.
         Reject loudly instead of under-returning."""
         with pytest.raises(ValueError, match="0.3"):
             await cache_service.artist_trigram_candidates(["Stereolab"], threshold=0.2)
-        mock_asyncpg_pool.fetch.assert_not_awaited()
+        mock_asyncpg_pool._mock_conn.fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bad_threshold_raises_even_on_empty_batch(self, cache_service, mock_asyncpg_pool):
+        """The guard must fire before the empty-batch short-circuit: a
+        misconfigured threshold constant should fail a dry-run whose batch
+        happens to be empty, not surface mid-way through the first real one."""
+        with pytest.raises(ValueError, match="0.3"):
+            await cache_service.artist_trigram_candidates([], threshold=0.2)
 
     @pytest.mark.asyncio
     async def test_db_error_wrapped_as_cache_unavailable(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn refused"))
+        conn = mock_asyncpg_pool._mock_conn
+        conn.fetch = AsyncMock(side_effect=RuntimeError("conn refused"))
         with pytest.raises(CacheUnavailableError):
             await cache_service.artist_trigram_candidates(["Stereolab"])
