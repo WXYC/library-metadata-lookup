@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
+from discogs.cache_service import (
+    ArtistEqualityCandidates,
+    CacheUnavailableError,
+    DiscogsCacheService,
+)
 from discogs.models import (
     ArtistCredit,
     ArtistDetails,
@@ -2451,3 +2455,46 @@ class TestArtistTrigramCandidates:
         conn.fetch = AsyncMock(return_value=[{"input": "not in batch", "artist_ids": [1]}])
         with pytest.raises(CacheUnavailableError):
             await cache_service.artist_trigram_candidates(["Stereolab"])
+
+
+class TestArtistEqualityCandidatesLegIteration:
+    """The dataclass owns its leg enumeration (LML#759 review round 1):
+    consumers derive corroboration and the conflict-rule union from ONE
+    field list, so a leg added to the dataclass cannot be silently absent
+    from either — a missing leg in the union weakens the veto and lets an
+    ambiguous name mint."""
+
+    def test_nonempty_legs_in_field_declaration_order(self):
+        candidates = ArtistEqualityCandidates(
+            exact={1},
+            alias={3},
+            name_variation={4},
+        )
+        assert candidates.nonempty_legs() == ["exact", "alias", "name_variation"]
+
+    def test_nonempty_legs_empty_when_all_legs_measured_zero(self):
+        assert ArtistEqualityCandidates().nonempty_legs() == []
+
+    def test_leg_names_match_wire_enum_values(self):
+        """Field names are contractually tied to ArtistResolveCacheLeg
+        (each wire value is "cache_" + field name); a rename on either
+        side must fail here, not silently desynchronize telemetry."""
+        from dataclasses import fields
+
+        from generated.api_models import ArtistResolveCacheLeg
+
+        wire_values = {leg.value for leg in ArtistResolveCacheLeg}
+        for f in fields(ArtistEqualityCandidates):
+            assert f"cache_{f.name}" in wire_values
+
+    def test_all_candidate_ids_unions_every_leg(self):
+        candidates = ArtistEqualityCandidates(
+            exact={1, 2},
+            member={2, 3},
+            alias={4},
+            name_variation={5},
+        )
+        assert candidates.all_candidate_ids() == {1, 2, 3, 4, 5}
+
+    def test_all_candidate_ids_empty_on_measured_zero(self):
+        assert ArtistEqualityCandidates().all_candidate_ids() == set()
