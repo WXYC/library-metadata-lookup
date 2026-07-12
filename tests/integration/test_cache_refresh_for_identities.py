@@ -368,7 +368,9 @@ class TestCacheRefreshInputValidation:
         ids = list(range(1, 52))  # 51 ids > 50 cap
         resp = await app_client.post(_ROUTE, json={"identity_ids": ids})
         assert resp.status_code == 400
-        assert "50-id cap" in resp.text
+        # Shared bulk envelope (LML#767) emits a generic "{cap}-item cap"
+        # message; the 400 status is the load-bearing contract, not the noun.
+        assert "50-item cap" in resp.text
 
     @pytest.mark.asyncio
     async def test_empty_identity_ids_returns_422(self, app_client):
