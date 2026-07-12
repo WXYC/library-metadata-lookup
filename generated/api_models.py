@@ -1385,25 +1385,28 @@ class ArtistResolveUnresolvedReason(StrEnum):
 class ArtistResolveResult(BaseModel):
     name: str = Field(..., description="Verbatim echo of the input name at this index.")
     discogs_artist_id: int | None = Field(
-        None, description="The resolved Discogs artist id. Present iff resolved."
+        None,
+        description="The resolved Discogs artist id. Non-null iff resolved (serialized as an explicit null on unresolved verdicts — the response never omits fields).\n",
     )
     canonical_name: str | None = Field(
         None,
         description="The raw Discogs artist title, disambiguation suffix included (e.g. `Popsicle (2)`) — the true Discogs string, kept for provenance; callers render their own input name. Present iff resolved via `api_search`: `entity.identity` rows store no Discogs title, so `identity_store` resolutions omit it.\n",
     )
     method: ArtistResolveMethod | None = Field(
-        None, description="What decided the resolution. Present iff resolved.\n"
+        None,
+        description="What decided the resolution. Non-null iff resolved (serialized as an explicit null on unresolved verdicts).\n",
     )
     cache_corroboration: list[ArtistResolveCacheLeg] = Field(
         ...,
-        description="Cache legs that produced at least one candidate for this name's identity-match form, on BOTH verdict kinds — the per-leg yield telemetry sizing a possible v2 alias arm. On resolved verdicts, listed equality legs necessarily agreed with the deciding tier (a disagreeing equality leg forces `ambiguous`), while `cache_trigram` entries are fuzzy near-misses that never veto. Empty when no leg produced candidates, and always empty on `identity_store` short-circuits — the store decides before cache evidence is consulted, and implementations report an empty array there.\n",
+        description="Cache legs that produced at least one candidate for this name's identity-match form, on BOTH verdict kinds — the per-leg yield telemetry sizing a possible v2 alias arm. On resolved verdicts, listed equality legs necessarily agreed with the deciding tier (a disagreeing equality leg forces `ambiguous`), while `cache_trigram` entries are fuzzy near-misses that never veto (`cache_trigram` is measured against the group's probe string — its lexicographically least sanitized spelling — where the equality legs bind the identity-match form). Empty when no leg produced candidates, and ALWAYS empty — the cache was never consulted, which is not a measured zero-yield — on (a) `identity_store` short-circuits (the store decides before cache evidence is consulted), (b) qualifier-bearing inputs (stripped-form evidence cannot distinguish family members, so the cache tier is skipped), and (c) store-conflict `ambiguous` verdicts.\n",
     )
     unresolved_reason: ArtistResolveUnresolvedReason | None = Field(
-        None, description="Why the name did not resolve. Present iff unresolved.\n"
+        None,
+        description='Why the name did not resolve. Non-null iff unresolved (serialized as an explicit null on resolved verdicts). The response carries every field explicitly — consumers must treat null, not absence, as the "other kind" marker.\n',
     )
     candidate_count: int | None = Field(
         None,
-        description='Exact-form candidates the API tier observed: 1 on resolved via `api_search`, 0 on not_found; on ambiguous, >= 2 for an overloaded family, or exactly 1 when the ambiguity is an equality-leg cache conflict. Always serialized — never omitted; null when the API tier did not run (identity_store short-circuit, escalation_unavailable) — null means "not measured," never zero.\n',
+        description='Exact-form candidates the API tier observed: 1 on resolved via `api_search`, 0 on not_found; on ambiguous, >= 2 for an overloaded family, or exactly 1 when the ambiguity is an equality-leg cache conflict or a qualifier mismatch between the lone candidate\'s own title and the input (a "(N)"-titled singleton answering a bare input, or vice versa, is family evidence — never a resolution). Always serialized — never omitted; null when the API tier did not run: identity_store short-circuit, escalation_unavailable, or an `ambiguous` verdict from conflicting identity-store rows within one deduplicated group (the store contradicting itself is doubt without a measurement; such verdicts also carry an empty `cache_corroboration` — the cache tier was never consulted) — null means "not measured," never zero.\n',
     )
 
 
@@ -1414,7 +1417,7 @@ class Name(RootModel[constr(min_length=1, max_length=255)]):
 class ArtistResolveBulkRequest(BaseModel):
     names: list[Name] = Field(
         ...,
-        description="Bare artist names to resolve, verbatim. Inputs are deduplicated internally on their normalized identity-match form: duplicate positions receive the shared verdict, and only the first occurrence's verbatim string mints.\n",
+        description='Bare artist names to resolve, verbatim (Unicode format characters are dropped and whitespace trimmed for all internal work; responses echo the raw string). Inputs are deduplicated internally on their fixed-point identity-match form PLUS any trailing parenthesized/bracketed qualifier. Qualifier detection mirrors the normalizer: every balanced trailing ()/[] group peels off the NFKC-folded lowercase name (nested tails included), bare-number groups canonicalize across bracket/width/spacing spellings ("[2]", "( 2 )", "（２）" all key as "(2)"; zero-padded "(02)" stays distinct), and multi-group tails concatenate ("(2)(uk)"); non-numeric groups drop internal whitespace, so "(Chk Chk Chk)" and "(ChkChkChk)" share a key. Duplicate positions receive the shared verdict, but a qualified name is its own work unit — a Discogs-style disambiguator denotes a different artist than the bare name, so it never inherits (or supplies) the bare form\'s verdict, and it resolves only when the API candidate\'s own title carries the same qualifier. A name whose only content IS a bracketed group ("(Smog)") is a bare name, not a qualifier — the normalizer makes the same refusal. A verified mint is keyed on the group\'s lexicographically-least sanitized spelling (deterministic in batch content — the same representative the API probe uses; the store\'s read legs are case-insensitive, so any spelling stays findable), EXCEPT when the identity read found an existing row for the name that lacks `discogs_artist_id` — the mint then fills that row\'s stored key in place rather than inserting a near-duplicate key (deterministically, the lexicographically-least stored key when several id-less rows match); qualified names never mint. Names that are blank, contain U+0000 or unencodable code points, normalize to an empty identity-match form, or whose entire identity content is a bare parenthesized ASCII number ("(2)", "[2]", "(2)(3)" — a Discogs disambiguator whose artist name was lost upstream; a fully-bracketed NON-numeric name like "(Smog)" stays resolvable) are rejected with 422 — never given an in-band verdict (`not_found` means the API tier ran and measured zero).\n',
         max_length=25,
         min_length=1,
     )
