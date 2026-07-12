@@ -1,10 +1,15 @@
-"""Artist-search-alias REST API router.
+"""Artist REST API router.
 
 `POST /api/v1/artists/search-aliases/bulk` — composes per-source artist-
 name variants for a batch of WXYC canonical artist names. Backend-
 Service's artist-search-alias-consumer ETL (BS PR 4 of the artist-search-
 alias plan) is the consumer; the response shape is the input substrate
 for the alias-aware catalog search LATERAL JOIN (BS PR 5).
+
+`POST /api/v1/artists/resolve/bulk` — bulk bare-name artist resolution
+under the LML#759 verify-before-mint model (tier orchestration in
+`artists/resolver.py`). Backend-Service's concerts pipeline (BS#1614) is
+the consumer.
 
 Auth: bearer `LML_API_KEY`. Mounted under the same `Depends(require_lml_key)`
 posture as `bulk-resolve-libraries`.
@@ -14,34 +19,47 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 import sentry_sdk
 from asyncpg.exceptions import PostgresError
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from starlette.requests import ClientDisconnect
+from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
 
 from artists.composer import ArtistSearchAliasesComposer
-from core.dependencies import get_discogs_cache_service_from_pool
+from artists.resolver import BareNameArtistResolver
+from core.dependencies import (
+    get_artist_resolve_posthog_client,
+    get_discogs_cache_service_from_pool,
+    get_discogs_service,
+)
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
+from discogs.service import DiscogsService
 from entity.store import EntityStore
 from generated.api_models import (
+    ArtistResolveBulkRequest,
+    ArtistResolveBulkResponse,
     ArtistSearchAliasesBulkRequest,
     ArtistSearchAliasesBulkResponse,
 )
 from identity.dependencies import get_entity_store
 
+if TYPE_CHECKING:
+    from posthog import Posthog
+
 logger = logging.getLogger(__name__)
 
 
-def _resolve_input_cap() -> int:
-    """Read the names array `maxItems` from the generated model's JSON schema.
+def _resolve_input_cap(request_model: type[BaseModel]) -> int:
+    """Read the names array `maxItems` from a generated model's JSON schema.
 
     Drift guard: api.yaml's `maxItems` for `names` drives the generated
-    `ArtistSearchAliasesBulkRequest.names` constraint. The route enforces
-    the cap as 413 before Pydantic validation; sourcing the literal from
-    the model means a future api.yaml change that regenerates the model
-    automatically updates the manual 413 gate.
+    request model's constraint. The routes enforce the cap as 413 before
+    Pydantic validation; sourcing the literal from the model means a
+    future api.yaml change that regenerates the model automatically
+    updates the manual 413 gate.
 
     Uses `model_json_schema()` rather than the lower-level
     `model_fields[...].metadata` introspection because the JSON-schema
@@ -55,13 +73,13 @@ def _resolve_input_cap() -> int:
     a regenerated model that drops the constraint can't silently widen
     the 413 gate and produce 422 responses for cap-exceeded requests.
     """
-    schema = ArtistSearchAliasesBulkRequest.model_json_schema()
+    schema = request_model.model_json_schema()
     names_schema = schema.get("properties", {}).get("names", {})
     max_items = names_schema.get("maxItems")
     if isinstance(max_items, int) and max_items > 0:
         return max_items
     raise RuntimeError(
-        "Cannot resolve `maxItems` for ArtistSearchAliasesBulkRequest.names "
+        f"Cannot resolve `maxItems` for {request_model.__name__}.names "
         "from its JSON schema. The route's 413 gate must agree with the "
         "generated model; fix or regenerate the model before this module "
         f"can import (schema fragment: {names_schema!r})."
@@ -69,9 +87,11 @@ def _resolve_input_cap() -> int:
 
 
 # Per api.yaml: max names per request; over-cap returns 413.
-_BULK_INPUT_CAP = _resolve_input_cap()
+_BULK_INPUT_CAP = _resolve_input_cap(ArtistSearchAliasesBulkRequest)
+_RESOLVE_INPUT_CAP = _resolve_input_cap(ArtistResolveBulkRequest)
 
 _ROUTE_PATH = "/api/v1/artists/search-aliases/bulk"
+_RESOLVE_ROUTE_PATH = "/api/v1/artists/resolve/bulk"
 
 _ENTITY_STORE_UNAVAILABLE_DETAIL = (
     "Entity store is not available. Ensure DATABASE_URL_DISCOGS is configured "
@@ -232,3 +252,174 @@ async def search_aliases_bulk(
         len(response.missing),
     )
     return response
+
+
+def _emit_resolve_summary(
+    posthog_client: Posthog | None,
+    telemetry: RequestTelemetry,
+    properties: dict,
+) -> None:
+    """Best-effort aggregate emit — one `artist_resolve_completed` event per
+    request, no per-name events. The whole telemetry step is swallowed so it
+    can never change the handler's outcome (same posture as streaming-check,
+    LML#639)."""
+    if not posthog_client:
+        return
+    try:
+        telemetry.send_to_posthog(posthog_client, properties)
+    except Exception:
+        logger.warning("artist-resolve telemetry emit failed", exc_info=True)
+
+
+@router.post(
+    "/artists/resolve/bulk",
+    response_model=ArtistResolveBulkResponse,
+    summary="Bulk bare-name artist resolution",
+    responses={
+        200: {"description": "Per-name verdicts, index-aligned with the request."},
+        400: {"description": "Malformed JSON body."},
+        401: {"description": "Missing or invalid `LML_API_KEY` bearer token."},
+        413: {"description": "Batch exceeded the per-request name cap."},
+        422: {"description": "Request body failed Pydantic validation."},
+        503: {"description": "Entity store or Discogs cache not available."},
+    },
+)
+async def resolve_bulk(
+    http_request: Request,
+    entity_store: EntityStore | None = Depends(get_entity_store),
+    discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service_from_pool),
+    discogs_service: DiscogsService | None = Depends(get_discogs_service),
+    posthog_client: Posthog | None = Depends(get_artist_resolve_posthog_client),
+) -> ArtistResolveBulkResponse:
+    """Resolve bare artist names to Discogs artist identities (LML#759).
+
+    Verify-before-mint: verdict semantics and tier orchestration live in
+    `artists/resolver.py`. A missing Discogs service (no token) or an
+    LML#755 breaker shed degrades per-name to `escalation_unavailable` —
+    the PG tiers keep answering, never a batch-level 503.
+    """
+    # Manual 413 check before Pydantic validation (mirrors the sibling
+    # bulk routes): Pydantic enforces api.yaml's `maxItems` as 422, but
+    # the contract documents 413 for cap exceedance.
+    try:
+        body = await http_request.json()
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=f"Malformed JSON body: {e}") from None
+    except ClientDisconnect:
+        # Client closed the connection before the body completed — see the
+        # sibling route for why this is a 4xx, not a 5xx.
+        raise HTTPException(
+            status_code=400,
+            detail="Client disconnected before request body completed.",
+        ) from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+    names_raw = body.get("names")
+    if not isinstance(names_raw, list):
+        raise HTTPException(status_code=422, detail="`names` must be a JSON array.")
+    if len(names_raw) > _RESOLVE_INPUT_CAP:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Batch exceeded the {_RESOLVE_INPUT_CAP}-name cap (received {len(names_raw)})."
+            ),
+        )
+
+    try:
+        request = ArtistResolveBulkRequest.model_validate(body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors()) from None
+
+    if entity_store is None:
+        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL)
+    if discogs_cache is None:
+        raise HTTPException(status_code=503, detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL)
+
+    resolver = BareNameArtistResolver(
+        entity_store=entity_store,
+        discogs_cache=discogs_cache,
+        discogs_service=discogs_service,
+    )
+
+    names = [n.root for n in request.names]
+    dry_run = bool(request.dry_run)
+    logger.info("artist-resolve bulk start: names=%d dry_run=%s", len(names), dry_run)
+
+    # Per-request telemetry bracket: `search_artists` records API calls into
+    # the cache-stats context, and RequestTelemetry carries the aggregate
+    # event. Explicit `http.server` span mirrors the siblings — query with
+    # `op:http.server span.description:*artists/resolve/bulk*`.
+    init_cache_stats()
+    telemetry = RequestTelemetry(
+        api_call_keys=[],
+        distinct_id="library-metadata-lookup-service",
+        event_prefix="artist_resolve",
+    )
+    with sentry_sdk.start_span(
+        op="http.server",
+        name=f"POST {_RESOLVE_ROUTE_PATH}",
+    ) as http_span:
+        http_span.set_data("http.method", "POST")
+        http_span.set_data("http.target", _RESOLVE_ROUTE_PATH)
+        http_span.set_data("lml.artist_resolve.names", len(names))
+        http_span.set_data("lml.artist_resolve.dry_run", dry_run)
+
+        try:
+            results, stats = await resolver.resolve(names, dry_run=dry_run)
+        except asyncio.CancelledError:
+            # Client aborted mid-resolve. Pin 499 for the trace explorer,
+            # re-raise per the asyncio cancellation contract (see sibling).
+            http_span.set_data("http.status_code", 499)
+            logger.warning("artist-resolve bulk aborted by client: names=%d", len(names))
+            raise
+        except CacheUnavailableError:
+            # Tier-2 candidate queries: discogs-cache pool/PG failure.
+            logger.exception(
+                "Discogs cache unavailable during artist-resolve (names=%d)", len(names)
+            )
+            http_span.set_data("http.status_code", 503)
+            raise HTTPException(status_code=503, detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL) from None
+        except (PostgresError, OSError):
+            # Tier-1 read or write-back: raw entity-store PG failure.
+            logger.exception(
+                "Entity store query failed during artist-resolve (names=%d)", len(names)
+            )
+            http_span.set_data("http.status_code", 503)
+            raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
+        except HTTPException:
+            # Carries its own status code — don't blanket-stamp 500.
+            raise
+        except Exception:
+            http_span.set_data("http.status_code", 500)
+            raise
+
+        summary = {
+            "names": stats.names,
+            "deduped": stats.deduped,
+            "resolved": stats.resolved,
+            "not_found": stats.not_found,
+            "ambiguous": stats.ambiguous,
+            "escalation_unavailable": stats.escalation_unavailable,
+            "api_calls": stats.api_calls,
+            "minted": stats.minted,
+            "dry_run": dry_run,
+        }
+        for key, value in summary.items():
+            http_span.set_data(f"lml.artist_resolve.{key}", value)
+        http_span.set_data("http.status_code", 200)
+
+    _emit_resolve_summary(posthog_client, telemetry, summary)
+    logger.info(
+        "artist-resolve bulk complete: names=%d deduped=%d resolved=%d not_found=%d "
+        "ambiguous=%d escalation_unavailable=%d api_calls=%d minted=%d dry_run=%s",
+        stats.names,
+        stats.deduped,
+        stats.resolved,
+        stats.not_found,
+        stats.ambiguous,
+        stats.escalation_unavailable,
+        stats.api_calls,
+        stats.minted,
+        dry_run,
+    )
+    return ArtistResolveBulkResponse(results=results)

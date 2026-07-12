@@ -13,6 +13,27 @@ The service exposes REST endpoints for querying the `entity.identity` table in t
 
 These endpoints return 503 when `DATABASE_URL_DISCOGS` is not set or the entity schema is not applied.
 
+## Artist Resolve Endpoint (bulk bare-name)
+
+`POST /api/v1/artists/resolve/bulk` resolves clean bare artist names — typically touring artists WXYC has never cataloged — to Discogs artist identities, minting `entity.identity` rows for unambiguous resolutions (LML#759). Backend-Service's concerts pipeline (BS#1614) is the consumer. Bearer `LML_API_KEY` auth; max 25 names per request (over-cap returns 413; a fully-escalating batch ≈ 25 Discogs API calls ≈ 30s at the shared 50/min budget, so callers page).
+
+Request: `{"names": ["Wishy", "REZN"], "dry_run": false}`. `dry_run: true` runs every tier identically — including live Discogs API verification — but skips the write-back. Inputs are deduplicated on their identity-match form (`wxyc_etl.text.to_identity_match_form`): duplicate positions receive the shared verdict and only the first occurrence's verbatim string mints.
+
+**Verify-before-mint** (the LML#759 design): the discogs-cache is a pair-wise-filtered ~50K *biased sample* of Discogs, so for bare names it can corroborate but never decide. Per unique name:
+
+1. `entity.identity` three-leg read — true short-circuit (`method: identity_store`) when the row carries a `discogs_artist_id`.
+2. Cache candidate-set queries (exact / member / alias / name_variation equality legs + trigram) — evidence only, reported in `cache_corroboration` on **both** resolved and unresolved verdicts (the per-leg yield telemetry sizing a possible v2 alias arm).
+3. Discogs API exact-form uniqueness check (`method: api_search`) — one `type=artist` search page, results filtered to titles whose identity-match form equals the input's. The form strips the "(N)" disambiguator, so "Popsicle (2)" collides with "Popsicle" — that strip *is* the overload detection.
+
+Verdicts per name (index-aligned with the request; `candidate_count` is null — "not measured", never zero — when the API tier didn't run):
+
+- **resolved** — exactly 1 exact-form API candidate with no disagreeing equality-leg cache candidate, or an identity-store hit. Unambiguous `api_search` resolutions upsert `entity.identity` keyed on the verbatim input (or the found Discogs-id-less row's stored key), populating `discogs_artist_id` only (COALESCE never-clobber). `canonical_name` carries the raw Discogs title, "(N)" suffix included — `identity_store` resolutions omit it (the store keeps no Discogs title).
+- **`unresolved_reason: ambiguous`** — ≥2 exact-form candidates (an overload family), or 1 candidate that an equality-leg cache candidate disagrees with (conflict means doubt, doubt means NULL). Never a guess; nothing mints.
+- **`unresolved_reason: not_found`** — 0 exact-form candidates, even when cache alias/member legs had matches (alias-shaped evidence can't be globally uniqueness-checked in v1; it's counted in `cache_corroboration` instead).
+- **`unresolved_reason: escalation_unavailable`** — the **retryable** verdict: the PG tiers missed and the API tier couldn't ask (LML#755 breaker open, outage cool-down, 429, 5xx-after-retries, or no `DISCOGS_TOKEN`). A mid-batch breaker trip short-circuits the remaining names to this verdict immediately. There is no batch-level 503 for Discogs outages — the PG tiers keep answering. Consumers must not apply a no-match TTL here: it means "couldn't ask," not "asked and missed."
+
+The API-verification leg runs serially (the shared limiter paces globally at 50/min; intra-request concurrency would only starve interleaved live-lookup traffic — the LML#370/#372 lesson). Tier orchestration lives in `artists/resolver.py`, the route in `artists/router.py`, the candidate-set queries in `discogs/cache_service.py`, and the `type=artist` search in `discogs/service.py:search_artists`. Observability: an explicit `http.server` Sentry span with `lml.artist_resolve.*` counters and one aggregate `artist_resolve_completed` PostHog event per request (no per-name events).
+
 ## Cache Refresh Endpoint
 
 `POST /api/v1/cache/refresh-for-identities` warms LML's Discogs cache for a batch of `entity.release_identity.id` values. Source-agnostic by design (LML#525) — Backend hands LML the canonical identity IDs and lets LML do the source-to-external-id mapping. Used by Backend-Service's rotation-artist-backfill cron (WXYC/Backend-Service#1381) so BS no longer needs to hold Discogs IDs directly (those are unstable across Discogs reshuffles).

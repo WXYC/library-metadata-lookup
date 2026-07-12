@@ -343,3 +343,4 @@ def _make_posthog_client_dep(event_prefix: str) -> Callable[..., Posthog | None]
 # on it are undisturbed; streaming-check gets its own prefix (LML#659).
 get_posthog_client = _make_posthog_client_dep("lookup")
 get_streaming_posthog_client = _make_posthog_client_dep("streaming_check")
+get_artist_resolve_posthog_client = _make_posthog_client_dep("artist_resolve")
