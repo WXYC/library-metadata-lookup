@@ -24,7 +24,11 @@ from tests.charset_torture import CharsetTortureEntry, entry_id, iter_entries
 
 # ``pg_pool`` (max_size=3) lives in conftest; ``DATABASE_URL`` is imported from
 # there for the ``source._dsn`` wiring below.
-from tests.integration.conftest import DATABASE_URL
+from tests.integration.conftest import (
+    DATABASE_URL,
+    ENTITY_IDENTITY_DDL,
+    skip_if_drop_targets_populated,
+)
 
 CORPUS_ENTRIES = list(iter_entries())
 
@@ -43,31 +47,33 @@ PG_TEXT_STRIP_OVERRIDES: dict[tuple[str, str], str] = {
 
 @pytest_asyncio.fixture
 async def entity_store(pg_pool):
-    """EntityStore over a freshly-created entity schema."""
+    """EntityStore over a freshly-created entity schema.
+
+    SAFETY: refuses to run when anything this fixture would drop already
+    holds rows — the default ``DATABASE_URL_TEST`` may point at a real
+    discogs-cache whose ``entity.*`` took hours of rate-limited
+    reconciliation to build. The guard sweeps the entity schema dynamically
+    from ``pg_class`` (see ``skip_if_drop_targets_populated``); this fixture
+    drops no public tables, so its public-table list is empty.
+    """
     async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
-        await conn.execute("CREATE SCHEMA entity")
-        await conn.execute("""
-            CREATE TABLE entity.identity (
-                id SERIAL PRIMARY KEY,
-                library_name TEXT NOT NULL UNIQUE,
-                discogs_artist_id INTEGER,
-                wikidata_qid TEXT,
-                musicbrainz_artist_id TEXT,
-                spotify_artist_id TEXT,
-                apple_music_artist_id TEXT,
-                bandcamp_id TEXT,
-                reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-    source = PgSource.__new__(PgSource)
-    source._dsn = DATABASE_URL
-    source._pool = pg_pool
-    yield EntityStore(source)
-    async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+        await skip_if_drop_targets_populated(conn, ())
+
+    # Creation inside the try: a mid-setup failure must still drop whatever
+    # was created instead of stranding rows that veto the next run (same
+    # posture as the artists-route siblings).
+    try:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+            await conn.execute("CREATE SCHEMA entity")
+            await conn.execute(ENTITY_IDENTITY_DDL)
+        source = PgSource.__new__(PgSource)
+        source._dsn = DATABASE_URL
+        source._pool = pg_pool
+        yield EntityStore(source)
+    finally:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
 
 
 @pytest.mark.pg

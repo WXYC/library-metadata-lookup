@@ -15,57 +15,63 @@ import pytest_asyncio
 
 # ``pg_pool`` (max_size=3) lives in conftest; ``DATABASE_URL`` is imported from
 # there for the ``monkeypatch.setenv("DATABASE_URL_DISCOGS", ...)`` wiring below.
-from tests.integration.conftest import DATABASE_URL
+from tests.integration.conftest import (
+    DATABASE_URL,
+    ENTITY_IDENTITY_DDL,
+    skip_if_drop_targets_populated,
+)
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def set_up_entity_schema(pg_pool):
-    """Create + seed a fresh `entity` schema for each test."""
+    """Create + seed a fresh `entity` schema for each test.
+
+    SAFETY: refuses to run when anything this fixture would drop already
+    holds rows — the default ``DATABASE_URL_TEST`` may point at a real
+    discogs-cache whose ``entity.*`` took hours of rate-limited
+    reconciliation to build. The guard sweeps the entity schema dynamically
+    from ``pg_class`` (see ``skip_if_drop_targets_populated``); this fixture
+    drops no public tables, so its public-table list is empty.
+    """
     async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
-        await conn.execute("CREATE SCHEMA entity")
-        await conn.execute("""
-            CREATE TABLE entity.identity (
-                id SERIAL PRIMARY KEY,
-                library_name TEXT NOT NULL UNIQUE,
-                discogs_artist_id INTEGER,
-                wikidata_qid TEXT,
-                musicbrainz_artist_id TEXT,
-                spotify_artist_id TEXT,
-                apple_music_artist_id TEXT,
-                bandcamp_id TEXT,
-                reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        await skip_if_drop_targets_populated(conn, ())
+
+    # Creation and seeding inside the try: a mid-seed failure must still
+    # drop whatever was created instead of stranding rows that veto the
+    # next run (same posture as the artists-route siblings).
+    try:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+            await conn.execute("CREATE SCHEMA entity")
+            await conn.execute(ENTITY_IDENTITY_DDL)
+            await conn.execute("""
+                CREATE TABLE entity.reconciliation_log (
+                    id SERIAL PRIMARY KEY,
+                    identity_id INTEGER NOT NULL REFERENCES entity.identity(id),
+                    source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    confidence REAL,
+                    method TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            # Seed in verbatim Backend casing — matches the production shape
+            # surfaced by the #276 audit (99.8% of entity.identity rows are
+            # mixed-case verbatim, not canonical). The handler's three-leg
+            # fall-through (#276) handles both verbatim hits and canonical-form
+            # divergence on top of this shape.
+            await conn.execute(
+                """
+                INSERT INTO entity.identity (library_name, discogs_artist_id, wikidata_qid)
+                VALUES
+                    ('Stereolab', 2154, 'Q484464'),
+                    ('Juana Molina', 305253, 'Q272615')
+                """
             )
-        """)
-        await conn.execute("""
-            CREATE TABLE entity.reconciliation_log (
-                id SERIAL PRIMARY KEY,
-                identity_id INTEGER NOT NULL REFERENCES entity.identity(id),
-                source TEXT NOT NULL,
-                external_id TEXT NOT NULL,
-                confidence REAL,
-                method TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-        # Seed in verbatim Backend casing — matches the production shape
-        # surfaced by the #276 audit (99.8% of entity.identity rows are
-        # mixed-case verbatim, not canonical). The handler's three-leg
-        # fall-through (#276) handles both verbatim hits and canonical-form
-        # divergence on top of this shape.
-        await conn.execute(
-            """
-            INSERT INTO entity.identity (library_name, discogs_artist_id, wikidata_qid)
-            VALUES
-                ('Stereolab', 2154, 'Q484464'),
-                ('Juana Molina', 305253, 'Q272615')
-            """
-        )
-    yield
-    async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+        yield
+    finally:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
 
 
 @pytest_asyncio.fixture

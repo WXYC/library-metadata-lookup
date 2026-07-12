@@ -31,8 +31,10 @@ from scripts.entity_resolution.discogs import DiscogsReconciler, ReconciliationM
 # the discogs-cache mirrors can't drift per-file.
 from tests.integration.conftest import (
     DATABASE_URL,
+    ENTITY_IDENTITY_DDL,
     F_UNACCENT_WRAPPER_SQL,
     RECONCILER_TABLE_DDL,
+    skip_if_drop_targets_populated,
     skip_unless_wxyc_identity_match_artist,
 )
 
@@ -48,42 +50,44 @@ async def pg_source(pg_pool):
 
 @pytest_asyncio.fixture(autouse=True)
 async def set_up_entity_schema(pg_pool):
-    """Create (or re-create) the entity schema for each test."""
+    """Create (or re-create) the entity schema for each test.
+
+    SAFETY: refuses to run when anything this fixture would drop already
+    holds rows — the default ``DATABASE_URL_TEST`` may point at a real
+    discogs-cache whose ``entity.*`` took hours of rate-limited
+    reconciliation to build. The guard sweeps the entity schema dynamically
+    from ``pg_class`` (see ``skip_if_drop_targets_populated``); this fixture
+    drops no public tables, so its public-table list is empty.
+    """
     async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
-        await conn.execute("CREATE SCHEMA entity")
-        await conn.execute("""
-            CREATE TABLE entity.identity (
-                id SERIAL PRIMARY KEY,
-                library_name TEXT NOT NULL UNIQUE,
-                discogs_artist_id INTEGER,
-                wikidata_qid TEXT,
-                musicbrainz_artist_id TEXT,
-                spotify_artist_id TEXT,
-                apple_music_artist_id TEXT,
-                bandcamp_id TEXT,
-                reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        await skip_if_drop_targets_populated(conn, ())
+
+    # Creation inside the try: a mid-setup failure must still drop whatever
+    # was created instead of stranding rows that veto the next run (same
+    # posture as the artists-route siblings).
+    try:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+            await conn.execute("CREATE SCHEMA entity")
+            await conn.execute(ENTITY_IDENTITY_DDL)
+            await conn.execute(
+                "CREATE INDEX idx_entity_identity_status ON entity.identity(reconciliation_status)"
             )
-        """)
-        await conn.execute(
-            "CREATE INDEX idx_entity_identity_status ON entity.identity(reconciliation_status)"
-        )
-        await conn.execute("""
-            CREATE TABLE entity.reconciliation_log (
-                id SERIAL PRIMARY KEY,
-                identity_id INTEGER NOT NULL REFERENCES entity.identity(id),
-                source TEXT NOT NULL,
-                external_id TEXT NOT NULL,
-                confidence REAL,
-                method TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-    yield
-    async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+            await conn.execute("""
+                CREATE TABLE entity.reconciliation_log (
+                    id SERIAL PRIMARY KEY,
+                    identity_id INTEGER NOT NULL REFERENCES entity.identity(id),
+                    source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    confidence REAL,
+                    method TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+        yield
+    finally:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
 
 
 @pytest.mark.pg
@@ -358,15 +362,13 @@ class TestTrigramFallbackSQLIntegration:
             except Exception as e:  # locked-down Postgres without contrib
                 pytest.skip(f"pg_trgm/unaccent extensions unavailable: {e}")
 
-            release_artist_exists = await conn.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema = current_schema() AND table_name = 'release_artist')"
-            )
-            if release_artist_exists:
-                pytest.skip(
-                    "release_artist already present -- refusing to stub over real "
-                    "discogs-cache data (run the cascade test against a live cache instead)"
-                )
+            # Reconciled onto the shared data-safety guard (LML#768): the
+            # bespoke "release_artist already present" check this fixture
+            # carried was a per-file variant of the same veto. Route it
+            # through ``skip_if_drop_targets_populated`` so a populated
+            # ``release_artist`` (a real discogs-cache) skips rather than
+            # gets stubbed over — and the entity sweep rides along for free.
+            await skip_if_drop_targets_populated(conn, ("release_artist",))
 
             # IMMUTABLE f_unaccent wrapper mirroring discogs-cache, so the
             # trigram operator can ride a functional GIN index. Idempotent.
@@ -458,12 +460,22 @@ class TestIdentityRouterEntityStoreUnavailable:
 
     @pytest_asyncio.fixture(autouse=True)
     async def set_up_entity_schema(self, pg_pool):
-        """Override the module-level autouse fixture: keep the schema *missing*."""
+        """Override the module-level autouse fixture: keep the schema *missing*.
+
+        SAFETY: still guards the drop even though it creates nothing — a
+        mispointed ``DATABASE_URL_TEST`` -> a real discogs-cache must veto
+        here too, never wipe ``entity.*`` (see
+        ``skip_if_drop_targets_populated``). No public tables dropped.
+        """
         async with pg_pool.acquire() as conn:
-            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
-        yield
-        async with pg_pool.acquire() as conn:
-            await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+            await skip_if_drop_targets_populated(conn, ())
+        try:
+            async with pg_pool.acquire() as conn:
+                await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
+            yield
+        finally:
+            async with pg_pool.acquire() as conn:
+                await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
 
     @pytest_asyncio.fixture
     async def app_with_pg_dsn(self, monkeypatch):
