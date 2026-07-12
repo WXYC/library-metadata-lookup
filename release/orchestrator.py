@@ -128,7 +128,9 @@ async def resolve_release(
     identifiers = _merge_streaming_identifiers(identifiers, streaming)
 
     # Identity write-back: any newly-discovered IDs land in entity.identity
-    # for the artist. Idempotent + COALESCE-based — never clobbers existing data.
+    # for the artist. The discogs_artist_id write is fill-if-null (LML#766) so
+    # a concurrent writer's id is never clobbered; bandcamp_id is COALESCE-
+    # additive. Idempotent.
     # Require a non-empty, non-compilation artist name so we never insert
     # library_name="" or pollute the matcher's lookup space with V/A rows
     # (read-side handlers like identity/router.py already skip these, but the
@@ -249,9 +251,19 @@ async def _writeback_identity(
 ) -> None:
     """Push newly-learned IDs into ``entity.identity`` keyed on the artist name.
 
-    Reuses the existing ``upsert_identity`` SQL pattern (``ON CONFLICT ... DO
-    UPDATE`` with ``COALESCE``) so populated fields are never clobbered. The
-    artist row is created on first sight.
+    The ``discogs_artist_id`` is written via ``EntityStore.
+    fill_identity_discogs_id`` (LML#766): fill-if-null, so a non-null id set
+    by a concurrent writer — the bare-name resolver's ``artists/resolver.py``
+    mint is the realistic contender, and this release-derived id is the
+    HIGHER-evidence of the two — is never silently clobbered. A lost race is
+    logged by the store; there is nothing to surface to the DJ (either id is
+    a valid Discogs artist for this release), so no warning is appended.
+
+    ``bandcamp_id`` is written separately via ``upsert_identity`` (COALESCE-
+    additive: it only fills a NULL, never overwrites). It is not the
+    TOCTOU-contested column, so new-wins-when-non-null is not a hazard for it;
+    the resolver never writes it. The artist row is created on first sight by
+    whichever write runs first.
     """
     # Bandcamp doesn't expose an integer artist ID, so we use the album URL's
     # subdomain as the bandcamp_id placeholder. This matches existing
@@ -262,11 +274,18 @@ async def _writeback_identity(
     )
 
     try:
-        await store.upsert_identity(
-            canonical.artist,
-            discogs_artist_id=identifiers.discogs_artist_id,
-            bandcamp_id=bandcamp_id,
-        )
+        # discogs_artist_id: fill-if-null so we never clobber a concurrent
+        # writer's id (LML#766). Only write when we actually learned one.
+        if identifiers.discogs_artist_id is not None:
+            await store.fill_identity_discogs_id(canonical.artist, identifiers.discogs_artist_id)
+        # bandcamp_id (and the first-sight row creation when no Discogs id was
+        # learned): COALESCE-additive upsert. Skipping this entirely when both
+        # ids are absent avoids an empty no-op write.
+        if bandcamp_id is not None or identifiers.discogs_artist_id is None:
+            await store.upsert_identity(
+                canonical.artist,
+                bandcamp_id=bandcamp_id,
+            )
     except Exception:
         logger.exception("Identity write-back failed for %s", canonical.artist)
         warnings.append(

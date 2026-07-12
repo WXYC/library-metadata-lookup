@@ -365,10 +365,49 @@ class TestIdentityWriteBack:
                 ReleaseResolveRequest(url="https://www.discogs.com/release/12345"), deps
             )
 
-        store.upsert_identity.assert_awaited_once()
-        args, kwargs = store.upsert_identity.call_args
-        assert args[0] == "Juana Molina"
-        assert kwargs["discogs_artist_id"] == 999
+        # LML#766: the discogs_artist_id write is fill-if-null so a concurrent
+        # (bare-name resolver) id is never clobbered. No bandcamp id + a
+        # discogs id present means the COALESCE-additive upsert is skipped.
+        store.fill_identity_discogs_id.assert_awaited_once_with("Juana Molina", 999)
+        store.upsert_identity.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lost_race_does_not_surface_a_warning(self):
+        """LML#766: the release-derived write is higher-evidence than a
+        bare-name search win, but if a concurrent writer already set a
+        different id the fill primitive keeps the stored value. The store
+        logs it; the DJ sees no warning (either id is a valid Discogs artist
+        for the release), and the response is unaffected."""
+        from entity.store import FillOutcome, Identity
+
+        discogs = AsyncMock()
+        discogs.get_release.return_value = _make_release()
+        store = AsyncMock()
+        store.fill_identity_discogs_id.return_value = FillOutcome(
+            identity=Identity(
+                id=1,
+                library_name="Juana Molina",
+                discogs_artist_id=42,
+                reconciliation_status="reconciled",
+            ),
+            filled=False,
+            lost_race=True,
+            previous_discogs_artist_id=42,
+        )
+        deps = _deps(discogs=discogs, entity_store=store)
+
+        with patch(
+            "release.orchestrator.check_streaming_availability",
+            new=AsyncMock(return_value=_stream()),
+        ):
+            response = await resolve_release(
+                ReleaseResolveRequest(url="https://www.discogs.com/release/12345"), deps
+            )
+
+        store.fill_identity_discogs_id.assert_awaited_once_with("Juana Molina", 999)
+        assert response.canonical.artist == "Juana Molina"
+        # A lost race is not an error condition — no warning to the caller.
+        assert not any("identifiers" in w.lower() for w in response.warnings)
 
     @pytest.mark.asyncio
     async def test_skips_when_store_unavailable(self):
@@ -392,7 +431,7 @@ class TestIdentityWriteBack:
         discogs = AsyncMock()
         discogs.get_release.return_value = _make_release()
         store = AsyncMock()
-        store.upsert_identity.side_effect = RuntimeError("PG down")
+        store.fill_identity_discogs_id.side_effect = RuntimeError("PG down")
         deps = _deps(discogs=discogs, entity_store=store)
 
         with patch(
@@ -425,6 +464,7 @@ class TestIdentityWriteBack:
             )
 
         store.upsert_identity.assert_not_called()
+        store.fill_identity_discogs_id.assert_not_called()
 
     @pytest.mark.parametrize(
         "va_artist",
@@ -457,3 +497,4 @@ class TestIdentityWriteBack:
             )
 
         store.upsert_identity.assert_not_called()
+        store.fill_identity_discogs_id.assert_not_called()

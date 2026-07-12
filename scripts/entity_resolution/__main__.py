@@ -294,7 +294,18 @@ async def run_discogs_stage(
     reconciler: DiscogsReconciler,
     batch_size: int,
 ) -> tuple[int, int]:
-    """Run Discogs reconciliation for unreconciled identities. Returns (matched, no_match)."""
+    """Run Discogs reconciliation for unreconciled identities. Returns (matched, no_match).
+
+    Scans ONLY ``reconciliation_status = 'unreconciled'`` rows, then runs each
+    through the first-match-wins Discogs cascade and ``upsert_identity
+    (discogs_artist_id=...)`` (new-wins-when-non-null). That is exactly the
+    clobber LML#766 guards against: a resolver / release-writeback mint carries
+    an API-VERIFIED ``discogs_artist_id``, so those mints are stamped
+    ``reconciliation_status = 'reconciled'`` by ``fill_identity_discogs_id`` and
+    are therefore EXCLUDED from this scan. Do not widen this to reprocess
+    'reconciled' rows through the cascade, or the campaign will overwrite
+    API-verified ids with first-match-wins guesses.
+    """
     identities = await store.get_identities_by_status("unreconciled")
     if not identities:
         logger.info("No unreconciled identities for Discogs stage")
