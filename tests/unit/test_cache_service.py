@@ -1,6 +1,7 @@
 """Unit tests for discogs/cache_service.py."""
 
 import asyncio
+from dataclasses import fields
 from datetime import UTC
 from unittest.mock import AsyncMock
 
@@ -21,6 +22,7 @@ from discogs.models import (
     ReleaseVideo,
     TrackItem,
 )
+from generated.api_models import ArtistResolveCacheLeg
 
 
 def make_fetch_router(**table_results):
@@ -2367,10 +2369,6 @@ class TestArtistEqualityCandidatesLegIteration:
         """Field names are contractually tied to ArtistResolveCacheLeg
         (each wire value is "cache_" + field name); a rename on either
         side must fail here, not silently desynchronize telemetry."""
-        from dataclasses import fields
-
-        from generated.api_models import ArtistResolveCacheLeg
-
         wire_values = {leg.value for leg in ArtistResolveCacheLeg}
         for f in fields(ArtistEqualityCandidates):
             assert f"cache_{f.name}" in wire_values
@@ -2391,10 +2389,6 @@ class TestArtistEqualityCandidatesLegIteration:
         """nonempty_legs() promises field order == wire enum order — a
         reorder on either side silently changes cache_corroboration
         ordering that downstream consumers treat as deterministic."""
-        from dataclasses import fields
-
-        from generated.api_models import ArtistResolveCacheLeg
-
         equality_enum_values = [
             leg.value
             for leg in ArtistResolveCacheLeg
@@ -2408,10 +2402,6 @@ class TestArtistEqualityCandidatesLegIteration:
         """Reverse parity: a wire enum leg added without its dataclass
         field would silently never corroborate NOR veto — the exact
         missing-leg failure the leg-iteration methods exist to prevent."""
-        from dataclasses import fields
-
-        from generated.api_models import ArtistResolveCacheLeg
-
         field_names = {f.name for f in fields(ArtistEqualityCandidates)}
         for leg in ArtistResolveCacheLeg:
             if leg is ArtistResolveCacheLeg.cache_trigram:

@@ -60,7 +60,11 @@ Tiers, per group:
    deterministic in batch content where first-wins would flip with input
    order). A Discogs-id-less row does not decide, but for unqualified
    groups its stored key becomes the mint target so the upsert fills
-   that row in place instead of accreting a near-duplicate key.
+   that row in place instead of accreting a near-duplicate key; with no
+   such row the mint keys on the group's min() spelling — deterministic
+   in content, like the probe, so the minted key can't flip with input
+   order (the store's read legs are case-insensitive, so any spelling
+   stays findable).
 2. ``DiscogsCacheService.artist_equality_candidates`` +
    ``artist_trigram_candidates`` — candidate SETS (an equality-leg
    candidate that disagrees with the API winner forces ``ambiguous``;
@@ -133,12 +137,15 @@ logger = logging.getLogger(__name__)
 # the normalizer and stay content here.
 _QUALIFIER_OPENERS = {")": "(", "]": "["}
 
-# The exact garbage shape rejected at validation: a name that IS a bare
-# parenthesized/bracketed number ("(2)", "[2]", "（２）" after folding) —
-# a disambiguator with the artist name lost upstream. Deliberately narrow:
-# a fully-parenthesized NON-numeric name ("(Smog)") is a real artist name
-# the normalizer also refuses to strip, and stays resolvable.
-_BARE_NUMBER_GROUP_RE = re.compile(r"[(\[]\s*(\d+)\s*[)\]]")
+# The exact garbage shape rejected at validation: a name whose identity
+# content IS a bare parenthesized/bracketed ASCII number ("(2)", "[2]",
+# "（２）" after folding, "(2)(3)" after qualifier peeling) — a Discogs
+# disambiguator with the artist name lost upstream. Deliberately narrow:
+# ASCII digits in MATCHED bracket pairs only, because a Discogs
+# disambiguator can never spell any other way (NFKC leaves e.g.
+# Arabic-Indic "٢" unfolded), so a fully-bracketed non-ASCII-digit name
+# is a real artist name under the same doctrine as "(Smog)".
+_BARE_NUMBER_GROUP_RE = re.compile(r"\(\s*([0-9]+)\s*\)|\[\s*([0-9]+)\s*\]")
 
 
 def _peel_trailing_group(text: str) -> tuple[str | None, str]:
@@ -176,7 +183,7 @@ def _canonical_qualifier_group(group: str) -> str:
     """
     match = _BARE_NUMBER_GROUP_RE.fullmatch(group.strip())
     if match:
-        return f"({match.group(1)})"
+        return f"({match.group(1) or match.group(2)})"
     return re.sub(r"\s+", "", group)
 
 
@@ -191,7 +198,13 @@ def _split_trailing_qualifiers(name: str) -> tuple[str | None, str]:
     normalizer makes the same refusal — so "(Smog)" returns
     ``(None, "(smog)")`` and stays a resolvable bare name.
     """
-    folded = unicodedata.normalize("NFKC", name).lower()
+    # Cf-strip here too: the store-row and winner-title callers feed
+    # UNSANITIZED text, and a trailing ZWSP would hide a real qualifier
+    # from the peel (the normalizer strips Cf everywhere, so a stored
+    # "Popsicle (2)\u200b" row is still handed back by the read legs).
+    folded = unicodedata.normalize(
+        "NFKC", "".join(ch for ch in name if unicodedata.category(ch) != "Cf")
+    ).lower()
     remainder = folded
     groups: list[str] = []
     while True:
@@ -269,11 +282,13 @@ class _FormGroup:
 
     form: str
     qualifier: str | None
-    # Key the mint targets: the first occurrence's trimmed verbatim, or
-    # the stored ``library_name`` when tier 1 found a Discogs-id-less row
-    # to fill (unqualified groups only — qualified groups never mint).
-    mint_key: str
-    # Distinct trimmed spellings in position order; tier 1 reads all of
+    # Retargeted mint key: the stored ``library_name`` when tier 1 found
+    # a Discogs-id-less row to fill in place (unqualified groups only —
+    # qualified groups never mint). None means no retarget; the mint then
+    # keys on ``probe``, the same content-deterministic min() spelling,
+    # so the minted library_name cannot flip with caller input order.
+    mint_key: str | None = None
+    # Distinct sanitized spellings in position order; tier 1 reads all of
     # them, tier 3 probes with min() so the observation universe can't
     # depend on input order.
     verbatims: list[str] = field(default_factory=list)
@@ -350,14 +365,15 @@ def _validate_name(index: int, name: str) -> tuple[str, str | None]:
         raise ValueError(f"names[{index}] is not encodable Unicode (lone surrogate?)") from e
     if not form:
         raise ValueError(f"names[{index}] normalizes to an empty identity-match form")
-    qualifier, _ = _split_trailing_qualifiers(name)
-    if qualifier is None and _BARE_NUMBER_GROUP_RE.fullmatch(
-        unicodedata.normalize("NFKC", name).strip()
-    ):
+    # Gate on the FIXED-POINT form so a bare-number base wearing a
+    # qualifier tail ("(2)(3)") is caught too — after peeling, "(2)" is
+    # the group's entire identity content, the exact shape this rejects.
+    if _BARE_NUMBER_GROUP_RE.fullmatch(form):
         raise ValueError(
             f"names[{index}] is only a bare parenthesized number — a Discogs "
             "disambiguator with no artist name before it"
         )
+    qualifier, _ = _split_trailing_qualifiers(name)
     return form, qualifier
 
 
@@ -418,7 +434,7 @@ class BareNameArtistResolver:
             key = (form, qualifier)
             group = groups.get(key)
             if group is None:
-                group = _FormGroup(form=form, qualifier=qualifier, mint_key=trimmed)
+                group = _FormGroup(form=form, qualifier=qualifier)
                 groups[key] = group
             if trimmed not in group.verbatims:
                 group.verbatims.append(trimmed)
@@ -601,7 +617,7 @@ class BareNameArtistResolver:
         candidates: dict[int, str] = {}
         try:
             for item in page:
-                if to_identity_match_form(item.title) == group.form:
+                if _fixed_point_form(item.title) == group.form:
                     candidates.setdefault(item.artist_id, item.title)
         except UnicodeEncodeError:
             # A title the normalizer cannot encode distrusts the WHOLE
@@ -654,6 +670,7 @@ class BareNameArtistResolver:
                 candidate_count=1,
             )
 
+        mint_key = group.mint_key or group.probe
         if not dry_run and group.qualifier is None:
             # discogs_artist_id only — other id columns belong to their own
             # enrichment flows. COALESCE guards NULL-overwrites only; not
@@ -663,7 +680,7 @@ class BareNameArtistResolver:
             # entirely: a qualified key is unreachable via the bare-name
             # reads Backend issues, i.e. pure pollution.
             upserted = await self._entity_store.upsert_identity(
-                group.mint_key, discogs_artist_id=winner_id
+                mint_key, discogs_artist_id=winner_id
             )
             if upserted is None:
                 # upsert_identity's contract allows a None return for a
@@ -671,7 +688,7 @@ class BareNameArtistResolver:
                 # route 503s), so this branch is belt-and-braces.
                 logger.error(
                     "entity.identity write-back failed for '%s' (discogs_artist_id=%d)",
-                    group.mint_key,
+                    mint_key,
                     winner_id,
                 )
             else:
