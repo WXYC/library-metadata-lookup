@@ -7,9 +7,58 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from config.settings import Settings
+from config.settings import Settings, get_settings
 from discogs.memory_cache import clear_all_caches, set_skip_cache
 from discogs.ratelimit import reset_rate_limiting
+
+#: Environment variables that carry credentials or live connection strings
+#: (LML#769). One entry per credential-bearing ``Settings`` field —
+#: ``tests/unit/test_env_hermeticity.py`` pins the pairing. These are blanked
+#: session-wide so unit runs are hermetic regardless of what a ``.env`` file
+#: or the invoking shell carries.
+CREDENTIAL_ENV_VARS = (
+    "DISCOGS_TOKEN",
+    "DISCOGS_API_KEY",
+    "DISCOGS_API_SECRET",
+    "DATABASE_URL_DISCOGS",
+    "DATABASE_URL_MUSICBRAINZ",
+    "SPOTIFY_CLIENT_ID",
+    "SPOTIFY_CLIENT_SECRET",
+    "APPLE_MUSIC_TEAM_ID",
+    "APPLE_MUSIC_KEY_ID",
+    "APPLE_MUSIC_PRIVATE_KEY",
+    "POSTHOG_API_KEY",
+    "SENTRY_DSN",
+    "ADMIN_TOKEN",
+    "LML_API_KEY",
+    "ETL_NOTIFY_KEY",
+)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def scrub_credential_env():
+    """Blank every credential-bearing env var for the whole unit session (LML#769).
+
+    Belt-and-suspenders behind the pinned ``load_dotenv`` in ``main.py``: even
+    if a credential reaches the process some other way (the invoking shell, a
+    module-level ``load_dotenv()`` in a lazily imported script, the checkout's
+    own populated ``.env``), unit tests never see it. Setting ``""`` rather
+    than deleting matters twice over: env vars outrank pydantic-settings'
+    CWD-relative ``env_file`` source, so a populated ``./.env`` can't feed a
+    fresh ``Settings()`` either; and ``load_dotenv``'s default
+    ``override=False`` won't replace an existing (blank) value mid-session.
+    Empty strings behave like unset throughout the codebase (all credential
+    checks are falsy-based), and per-test ``monkeypatch.setenv`` still
+    overrides as usual. The trailing ``cache_clear`` drops any Settings built
+    from a pre-scrub environment during collection-time imports.
+    """
+    mp = pytest.MonkeyPatch()
+    for var in CREDENTIAL_ENV_VARS:
+        mp.setenv(var, "")
+    get_settings.cache_clear()
+    yield
+    mp.undo()
+    get_settings.cache_clear()
 
 
 @contextmanager
