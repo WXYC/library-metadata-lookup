@@ -198,6 +198,8 @@ class TestFormatReportMarkdown:
         md = format_report_markdown(rep, rows, dry_run=True)
         row_line = next(line for line in md.splitlines() if "discogs" in line)
         assert "None" not in row_line
+        # The trailing candidate cell positively carries the dash, not a blank.
+        assert row_line.rstrip().endswith("| — |")
 
     def test_max_attempts_surfaced_in_report(self):
         # The escalation-retry budget the operator ran under is the context needed
@@ -205,5 +207,5 @@ class TestFormatReportMarkdown:
         recs = [_rec(_resolved("Juana Molina", 5, method="api_search"))]
         rep = build_report(recs, ["Juana Molina"], max_attempts=3)
         md = format_report_markdown(rep, [], dry_run=True)
-        assert "attempt" in md.lower()
-        assert "3" in md
+        # Pin the digit to the retry-cap row so an unrelated 3 can't keep it green.
+        assert "attempts per name) | 3 |" in md

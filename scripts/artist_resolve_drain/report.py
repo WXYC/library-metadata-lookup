@@ -193,7 +193,7 @@ def format_report_markdown(
     lines.append(f"| Ambiguous | {report['ambiguous']} |")
     lines.append(f"| Ambiguity rate (of measured) | {report['ambiguity_rate']:.1%} |")
     lines.append(f"| Residual (`escalation_unavailable`) | {report['escalation_residual']} |")
-    lines.append(f"| &nbsp;&nbsp;retry cap (max attempts) | {report['max_attempts']} |")
+    lines.append(f"| Retry cap (max attempts per name) | {report['max_attempts']} |")
     lines.append(f"| Alias-leg-only not_found (v2 sizing) | {report['alias_only_not_found']} |")
     lines.append(f"| Trigram near-miss not_found | {report['trigram_near_miss']} |")
     lines.append("")
