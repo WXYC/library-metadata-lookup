@@ -496,6 +496,119 @@ class TestRunDrain:
         )
         assert post.batches == []
 
+    # --------------------------------------------------------------------- #
+    # LML#778 — a persistent HTTP error out of `post_batch` (after it has
+    # exhausted its own transport/5xx retries) must degrade the whole page to
+    # `escalation_unavailable` and let the round loop re-page it, NOT crash the
+    # drain and skip its report. Surfaced by the 2026-07-13 live drain, which
+    # aborted twice on `httpx.ReadTimeout` (slow-minting pages + LML#755 shed).
+    # --------------------------------------------------------------------- #
+    async def test_http_error_page_degrades_to_escalation_then_completes(self, tmp_path):
+        out = tmp_path / "d.jsonl"
+        calls = {"n": 0}
+
+        async def flaky_post(names, dry_run):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # post_batch gave up after its retries and raised (the #778 case).
+                raise httpx.ReadTimeout("timed out")
+            return [_resolved(name, 100 + i) for i, name in enumerate(names)]
+
+        records = await run_drain(
+            all_names=["Wishy", "REZN"],
+            dry_run=False,
+            out_path=out,
+            post_batch=flaky_post,
+            page_size=25,
+            max_retries=2,
+            cooldown=0,
+            sleep=_noop_sleep,
+            clock=lambda: "T",
+        )
+
+        loaded = load_records(out)
+        # First attempt: the timed-out page is recorded as escalation_unavailable
+        # for every name, shaped like a 200-level escalation verdict — no crash.
+        first = [r for r in loaded if r["attempt"] == 1]
+        assert {r["name"] for r in first} == {"Wishy", "REZN"}
+        assert all(r["unresolved_reason"] == "escalation_unavailable" for r in first)
+        assert all(r["discogs_artist_id"] is None for r in first)
+        assert all(r["method"] is None for r in first)
+        assert all(r["candidate_count"] is None for r in first)
+        assert all(r["cache_corroboration"] == [] for r in first)
+        # The run reached completion: the retry round minted both.
+        latest = latest_by_name(loaded)
+        assert latest["Wishy"]["discogs_artist_id"] == 100
+        assert latest["REZN"]["discogs_artist_id"] == 101
+        assert records is not None  # returned normally; no exception escaped run_drain
+
+    async def test_persistent_http_error_settles_as_residual_without_crashing(self, tmp_path):
+        out = tmp_path / "d.jsonl"
+
+        async def always_timeout(names, dry_run):
+            raise httpx.ReadTimeout("still timing out")
+
+        records = await run_drain(
+            all_names=["Wishy"],
+            dry_run=False,
+            out_path=out,
+            post_batch=always_timeout,
+            page_size=25,
+            max_retries=2,  # 3 attempts total
+            cooldown=7,
+            sleep=_noop_sleep,
+            clock=lambda: "T",
+        )
+
+        loaded = load_records(out)
+        # Paged the full retry budget, every attempt an escalation, then settled
+        # as residual — and the run still returned instead of crashing.
+        assert attempt_counts(loaded)["Wishy"] == 3
+        assert latest_by_name(loaded)["Wishy"]["unresolved_reason"] == "escalation_unavailable"
+        assert records is not None
+
+    async def test_drain_error_still_propagates_not_degraded(self, tmp_path):
+        # A contract break (bad length / index misalignment) is not a transient
+        # "couldn't ask" — it must fail loudly, never degrade to a verdict.
+        async def contract_break(names, dry_run):
+            raise DrainError("index misalignment")
+
+        with pytest.raises(DrainError):
+            await run_drain(
+                all_names=["Wishy"],
+                dry_run=False,
+                out_path=tmp_path / "d.jsonl",
+                post_batch=contract_break,
+                page_size=25,
+                max_retries=2,
+                cooldown=0,
+                sleep=_noop_sleep,
+                clock=lambda: "T",
+            )
+
+    async def test_client_error_4xx_propagates_not_degraded(self, tmp_path):
+        # A 4xx is a misconfig (bad key / oversized page), not "couldn't ask" —
+        # surfacing it beats silently degrading every page to escalation residual,
+        # which would mask e.g. a wrong API key as a transient breaker shed.
+        request = httpx.Request("POST", "https://lml.example/api/v1/artists/resolve/bulk")
+        response = httpx.Response(401, request=request)
+
+        async def unauthorized(names, dry_run):
+            raise httpx.HTTPStatusError("401 Unauthorized", request=request, response=response)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await run_drain(
+                all_names=["Wishy"],
+                dry_run=False,
+                out_path=tmp_path / "d.jsonl",
+                post_batch=unauthorized,
+                page_size=25,
+                max_retries=2,
+                cooldown=0,
+                sleep=_noop_sleep,
+                clock=lambda: "T",
+            )
+
 
 async def _noop_sleep(seconds):
     return None
