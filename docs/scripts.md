@@ -157,3 +157,31 @@ uv run python -m scripts.variation_audit \
 ```
 
 Discogs CSVs and MusicBrainz TSVs are optional; the script gracefully degrades using only the semantic-index entity resolution and member-of data when external files are missing.
+
+## Bulk Artist-Resolve Drain (`scripts/artist_resolve_drain/`)
+
+Drains a bare-name set — clean touring-artist names Backend-Service exports for its concerts pipeline (WXYC/Backend-Service#1614) — through the prod `POST /api/v1/artists/resolve/bulk` endpoint (LML#759), minting `entity.identity` rows for the exact-form-unique names and producing a yield report + a wrong-mint spot-check table. Backend-Service owns the name-set export (the clean-name predicate is the same code as its `extractHeadliner` gate); the handoff is a names file (JSON array or newline-delimited).
+
+The drain **always runs against production**, not staging: prod is the only place all Discogs traffic coordinates through one 50/min limiter + the LML#755 saturation breaker, so a drain there cannot 429 live lookups the way a staging drain (shared token, uncoordinated limiter) would. Run it off-peak, outside the 06:00 UTC flowsheet-backfill window.
+
+It pages 25 names at a time (the endpoint cap), appends every verdict to a JSONL log, and resumes from that log on restart — a crash at batch 8 re-pays nothing already settled. The one retryable verdict, `escalation_unavailable` (breaker open / Discogs outage / 429 / 5xx-after-retries), is re-paged after a cool-down with bounded retries (default 2), then reported as residual. Dry and live records may share one JSONL file; resume and reporting are mode-scoped, so a prior dry drain never makes a `--live` run skip the mint.
+
+**Runbook** (dry drain → human spot-check → live drain → BS writer unblocks):
+```bash
+# 1. dry drain (default; no write-back)
+LML_API_KEY=... LML_BASE_URL=https://<prod-lml> \
+  uv run python -m scripts.artist_resolve_drain names.txt \
+    --out drain.jsonl --report report.md
+
+# 2. a human eyeballs report.md's spot-check table (discogs.com/artist/<id> links)
+#    for wrong mints — the only defense against a bare name colliding with a
+#    single obscure Discogs artist. THEN authorize the live run:
+
+# 3. live drain — mints DURABLE entity.identity rows (COALESCE never-clobber,
+#    so a wrong mint is un-self-correcting)
+LML_API_KEY=... LML_BASE_URL=https://<prod-lml> \
+  uv run python -m scripts.artist_resolve_drain names.txt \
+    --live --out drain.jsonl --report report-live.md
+```
+
+`--base-url` defaults to `$LML_BASE_URL` then `$PRODUCTION_URL`; `--api-key` to `$LML_API_KEY`. Other flags: `--page-size` (default/cap 25), `--max-retries` (default 2), `--cooldown` (seconds between retry rounds, default 60), `--spot-check` (sample size, default 20), `--seed` (spot-check RNG seed — the sample is reproducible from the JSONL), `--timeout` (per-request seconds, default 120; a fully-escalating page can take ~30s). The report is printed to stdout and, with `--report`, written to a markdown file for pasting into WXYC/Backend-Service#1614.
