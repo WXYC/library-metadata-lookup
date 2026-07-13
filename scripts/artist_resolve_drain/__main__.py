@@ -1,21 +1,16 @@
 """CLI entrypoint for the bulk artist-resolve drain (LML#759 PR D).
 
-Drains a bare-name set — clean touring-artist names Backend-Service exports for
-its concerts pipeline (WXYC/Backend-Service#1614) — through the prod
-`POST /api/v1/artists/resolve/bulk` endpoint, paging 25 at a time and appending
-every verdict to a JSONL log with crash-safe, mode-scoped resume. This module is
-the drain engine's entrypoint; the yield report + wrong-mint spot-check that gate
-the `--live` mint are layered on separately (see
-:mod:`scripts.artist_resolve_drain.report`).
+Runbook (LML#759 design; BS#1614 gate):
 
-    # dry drain against prod off-peak (outside the 06:00 UTC backfill window)
+    # 1. dry drain against prod off-peak (outside the 06:00 UTC backfill window)
     LML_API_KEY=... LML_BASE_URL=https://<prod-lml> \
-        uv run python -m scripts.artist_resolve_drain names.txt --out drain.jsonl
+        uv run python -m scripts.artist_resolve_drain names.txt \
+        --out drain.jsonl --report report.md
 
-    # after the spot-check review, authorize the live drain (mints
-    # entity.identity — durable, COALESCE never-clobber, so a wrong mint is
-    # un-self-correcting)
-    ... --live --out drain.jsonl
+    # 2. a human eyeballs report.md's spot-check table for wrong mints, THEN
+    # 3. authorize the live drain (mints entity.identity — durable, COALESCE
+    #    never-clobber, so a wrong mint is un-self-correcting)
+    ... --live --out drain.jsonl --report report-live.md
 
 The drain always runs against the **prod** endpoint: it is the only place all
 Discogs traffic coordinates through a single 50/min limiter + LML#755 breaker, so
@@ -45,6 +40,11 @@ from scripts.artist_resolve_drain.drain import (
     parse_names_file,
     run_drain,
 )
+from scripts.artist_resolve_drain.report import (
+    build_report,
+    format_report_markdown,
+    sample_spot_check,
+)
 
 logger = logging.getLogger("artist_resolve_drain")
 
@@ -60,6 +60,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="artist_resolve_drain.jsonl",
         help="JSONL verdict log (append + resume). Default: artist_resolve_drain.jsonl",
     )
+    parser.add_argument("--report", help="Write the markdown report to this path.")
     parser.add_argument(
         "--base-url",
         default=None,
@@ -93,6 +94,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=float(DEFAULT_COOLDOWN_SECONDS),
         help=f"Seconds between retry rounds. Default: {DEFAULT_COOLDOWN_SECONDS}",
     )
+    parser.add_argument("--spot-check", type=int, default=20, help="Spot-check sample size.")
+    parser.add_argument("--seed", type=int, default=0, help="Spot-check RNG seed (reproducible).")
     parser.add_argument(
         "--timeout",
         type=float,
@@ -129,13 +132,13 @@ async def _run(
             shutdown=shutdown,
         )
 
-    logger.info(
-        "drain complete: %d verdict record(s) for %d name(s) → %s",
-        len(records),
-        len(names),
-        args.out,
-    )
-    print(f"Drain complete: {len(records)} verdict record(s) written to {args.out}")
+    report = build_report(records, names, max_attempts=args.max_retries + 1)
+    rows = sample_spot_check(records, seed=args.seed, k=args.spot_check)
+    markdown = format_report_markdown(report, rows, dry_run=dry_run)
+    if args.report:
+        Path(args.report).write_text(markdown + "\n", encoding="utf-8")
+        logger.info("wrote report to %s", args.report)
+    print("\n" + markdown)
 
 
 def main(argv: list[str] | None = None) -> None:
