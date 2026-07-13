@@ -132,6 +132,12 @@ async def _run(
             shutdown=shutdown,
         )
 
+    logger.info(
+        "drain complete: %d verdict record(s) for %d name(s) → %s",
+        len(records),
+        len(names),
+        args.out,
+    )
     report = build_report(records, names, max_attempts=args.max_retries + 1)
     rows = sample_spot_check(records, seed=args.seed, k=args.spot_check)
     markdown = format_report_markdown(report, rows, dry_run=dry_run)

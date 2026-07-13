@@ -156,6 +156,18 @@ def _fmt_counter(counter: dict[str, Any]) -> str:
     return ", ".join(f"`{k}`: {v}" for k, v in sorted(counter.items()))
 
 
+def _cell(value: Any) -> str:
+    """Escape a free-text value for a markdown table cell.
+
+    A raw ``|`` or newline in an endpoint-provided name would split the row into
+    extra cells and misalign the Discogs id against the wrong name — the exact
+    failure the human spot-check gate exists to prevent.
+    """
+    if value is None:
+        return "—"
+    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
 def format_report_markdown(
     report: dict[str, Any],
     spot_check_rows: Sequence[dict[str, Any]],
@@ -181,6 +193,7 @@ def format_report_markdown(
     lines.append(f"| Ambiguous | {report['ambiguous']} |")
     lines.append(f"| Ambiguity rate (of measured) | {report['ambiguity_rate']:.1%} |")
     lines.append(f"| Residual (`escalation_unavailable`) | {report['escalation_residual']} |")
+    lines.append(f"| &nbsp;&nbsp;retry cap (max attempts) | {report['max_attempts']} |")
     lines.append(f"| Alias-leg-only not_found (v2 sizing) | {report['alias_only_not_found']} |")
     lines.append(f"| Trigram near-miss not_found | {report['trigram_near_miss']} |")
     lines.append("")
@@ -200,10 +213,11 @@ def format_report_markdown(
     lines.append("| Input name | Discogs title | Artist | Corroboration | Cand. |")
     lines.append("| --- | --- | --- | --- | --- |")
     for row in spot_check_rows:
-        corr = ", ".join(row["cache_corroboration"]) or "—"
+        corr = _cell(", ".join(row["cache_corroboration"])) if row["cache_corroboration"] else "—"
+        cand = "—" if row["candidate_count"] is None else row["candidate_count"]
         lines.append(
-            f"| {row['name']} | {row['canonical_name'] or '—'} "
-            f"| [{row['discogs_artist_id']}]({row['url']}) | {corr} | {row['candidate_count']} |"
+            f"| {_cell(row['name'])} | {_cell(row['canonical_name'])} "
+            f"| [{row['discogs_artist_id']}]({row['url']}) | {corr} | {cand} |"
         )
     lines.append("")
     return "\n".join(lines)

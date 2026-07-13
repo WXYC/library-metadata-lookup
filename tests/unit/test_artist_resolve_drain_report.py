@@ -172,3 +172,38 @@ class TestFormatReportMarkdown:
         rep = build_report([], [], max_attempts=3)
         md = format_report_markdown(rep, [], dry_run=False)
         assert "LIVE" in md
+
+    def test_pipe_in_name_is_escaped_in_spot_check_row(self):
+        # A `|` in an artist name would split the markdown row into extra cells,
+        # shifting the Discogs id against the wrong name — the exact failure the
+        # human spot-check gate exists to prevent. Free-text cells must be escaped
+        # so every row keeps the header's column count.
+        name = "Sonic Youth | Ciccone Youth"
+        recs = [_rec(_resolved(name, 5, method="api_search"))]
+        rep = build_report(recs, [name], max_attempts=3)
+        rows = sample_spot_check(recs, seed=0, k=20)
+        md = format_report_markdown(rep, rows, dry_run=True)
+        row_line = next(line for line in md.splitlines() if "discogs" in line)
+        # The name's own pipe is escaped, so it no longer opens a real cell
+        # boundary: the row has exactly the 5-column header's 6 unescaped pipes.
+        assert row_line.replace("\\|", "").count("|") == 6
+        assert "Sonic Youth \\| Ciccone Youth" in row_line
+
+    def test_none_candidate_count_renders_as_dash(self):
+        # A guarded edge — an api_search row with a null candidate_count must show
+        # a dash, matching the `canonical_name or '—'` treatment, not literal None.
+        recs = [_rec(_resolved("Stereolab", 5, method="api_search", candidate_count=None))]
+        rep = build_report(recs, ["Stereolab"], max_attempts=3)
+        rows = sample_spot_check(recs, seed=0, k=20)
+        md = format_report_markdown(rep, rows, dry_run=True)
+        row_line = next(line for line in md.splitlines() if "discogs" in line)
+        assert "None" not in row_line
+
+    def test_max_attempts_surfaced_in_report(self):
+        # The escalation-retry budget the operator ran under is the context needed
+        # to read the residual (0 retries vs 2?); it must reach the report reader.
+        recs = [_rec(_resolved("Juana Molina", 5, method="api_search"))]
+        rep = build_report(recs, ["Juana Molina"], max_attempts=3)
+        md = format_report_markdown(rep, [], dry_run=True)
+        assert "attempt" in md.lower()
+        assert "3" in md
