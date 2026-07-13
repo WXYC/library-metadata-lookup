@@ -132,6 +132,25 @@ def record_from_verdict(
     }
 
 
+def _escalation_unavailable_verdict(name: str) -> dict[str, Any]:
+    """Synthesize the verdict for a page whose HTTP call failed after retries.
+
+    A persistent transport/5xx failure — "couldn't ask" — is the design's one
+    retryable verdict. Shaped exactly like a 200-level ``escalation_unavailable``
+    result so it flows through :func:`record_from_verdict` and is re-paged by the
+    round loop like any other escalation (see :func:`run_drain`).
+    """
+    return {
+        "name": name,
+        "discogs_artist_id": None,
+        "canonical_name": None,
+        "method": None,
+        "cache_corroboration": [],
+        "unresolved_reason": "escalation_unavailable",
+        "candidate_count": None,
+    }
+
+
 def is_terminal(rec: dict[str, Any]) -> bool:
     """Whether a verdict will not change on a re-page (resolved / not_found / ambiguous)."""
     if rec.get("discogs_artist_id") is not None:
@@ -342,7 +361,26 @@ async def run_drain(
             if shutdown is not None and shutdown.requested:
                 logger.info("shutdown requested; stopping mid-round")
                 return records
-            verdicts = await post_batch(batch, dry_run)
+            try:
+                verdicts = await post_batch(batch, dry_run)
+            except httpx.HTTPError as exc:
+                # `post_batch` exhausted its transport/5xx retries and raised. A
+                # persistent HTTP-layer failure is "couldn't ask" — degrade the
+                # whole page to escalation_unavailable and let the round loop
+                # re-page it (up to max_retries), rather than crash the drain and
+                # skip its report (LML#778). A 4xx is a misconfig (bad key /
+                # oversized page), not a transient fault, so it still surfaces —
+                # mirroring make_post_batch's own 4xx policy.
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+                    raise
+                logger.warning(
+                    "batch HTTP error after retries [round %d]; degrading %d name(s) "
+                    "to escalation_unavailable: %s",
+                    round_idx,
+                    len(batch),
+                    exc,
+                )
+                verdicts = [_escalation_unavailable_verdict(name) for name in batch]
             ts = clock()
             for name, verdict in zip(batch, verdicts, strict=True):
                 attempt = counts.get(name, 0) + 1
