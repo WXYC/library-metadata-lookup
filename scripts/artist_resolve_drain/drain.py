@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -45,6 +45,11 @@ DEFAULT_COOLDOWN_SECONDS = 60
 # `escalation_unavailable` is deliberately excluded: it is the one retryable
 # verdict (re-paged after a cool-down, up to max_retries).
 _TERMINAL_REASONS = frozenset({"not_found", "ambiguous"})
+
+# Injected clock/sleep seams (the testable core): `clock` returns the ISO-8601
+# `ts` written to each JSONL record; `sleep` awaits the cool-down between rounds.
+_Clock = Callable[[], str]
+_Sleep = Callable[[float], Awaitable[None]]
 
 
 class DrainError(RuntimeError):
@@ -252,7 +257,7 @@ def make_post_batch(
     *,
     max_http_retries: int = 3,
     backoff: float = 2.0,
-    sleep=asyncio.sleep,
+    sleep: _Sleep = asyncio.sleep,
 ) -> _PostBatch:
     """Build a `post_batch` coroutine that retries transient transport/5xx errors.
 
@@ -302,8 +307,8 @@ async def run_drain(
     max_retries: int = DEFAULT_MAX_RETRIES,
     cooldown: float = DEFAULT_COOLDOWN_SECONDS,
     shutdown: _ShutdownFlag | None = None,
-    sleep=asyncio.sleep,
-    clock=_utc_now_iso,
+    sleep: _Sleep = asyncio.sleep,
+    clock: _Clock = _utc_now_iso,
 ) -> list[dict[str, Any]]:
     """Drive the drain to completion (or shutdown), returning the mode's records.
 

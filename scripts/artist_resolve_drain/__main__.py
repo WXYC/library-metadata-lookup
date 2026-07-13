@@ -20,6 +20,7 @@ uncoordinated limiter) would.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
@@ -30,7 +31,10 @@ from pathlib import Path
 import httpx
 
 from scripts._lib.runtime import set_up_script_runtime
+from scripts._lib.signals import ShutdownFlag
 from scripts.artist_resolve_drain.drain import (
+    DEFAULT_COOLDOWN_SECONDS,
+    DEFAULT_MAX_RETRIES,
     PAGE_SIZE,
     make_post_batch,
     parse_names_file,
@@ -45,7 +49,7 @@ from scripts.artist_resolve_drain.report import (
 logger = logging.getLogger("artist_resolve_drain")
 
 
-def _parse_args(argv: list[str] | None = None):
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = ArgumentParser(
         prog="python -m scripts.artist_resolve_drain",
         description="Drain a bare-name set through prod POST /api/v1/artists/resolve/bulk.",
@@ -78,9 +82,17 @@ def _parse_args(argv: list[str] | None = None):
         default=PAGE_SIZE,
         help=f"Names per request (endpoint cap {PAGE_SIZE}). Default: {PAGE_SIZE}",
     )
-    parser.add_argument("--max-retries", type=int, default=2, help="escalation retries. Default: 2")
     parser.add_argument(
-        "--cooldown", type=float, default=60.0, help="Seconds between retry rounds. Default: 60"
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help=f"escalation retries. Default: {DEFAULT_MAX_RETRIES}",
+    )
+    parser.add_argument(
+        "--cooldown",
+        type=float,
+        default=float(DEFAULT_COOLDOWN_SECONDS),
+        help=f"Seconds between retry rounds. Default: {DEFAULT_COOLDOWN_SECONDS}",
     )
     parser.add_argument("--spot-check", type=int, default=20, help="Spot-check sample size.")
     parser.add_argument("--seed", type=int, default=0, help="Spot-check RNG seed (reproducible).")
@@ -94,7 +106,13 @@ def _parse_args(argv: list[str] | None = None):
     return parser.parse_args(argv)
 
 
-async def _run(args, base_url: str, api_key: str, dry_run: bool, shutdown) -> None:
+async def _run(
+    args: argparse.Namespace,
+    base_url: str,
+    api_key: str,
+    dry_run: bool,
+    shutdown: ShutdownFlag,
+) -> None:
     names = parse_names_file(Path(args.names_file).read_text(encoding="utf-8"))
     logger.info("loaded %d unique name(s) from %s", len(names), args.names_file)
     if not names:

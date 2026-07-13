@@ -478,6 +478,26 @@ class TestBuildReport:
         assert rep["alias_only_not_found"] == 1  # nf1
         assert rep["trigram_near_miss"] == 1  # nf2
 
+    def test_alias_only_excludes_mixed_corroboration_not_found(self):
+        # A not_found corroborated by an equality leg (cache_exact) *and* an alias
+        # leg is NOT alias-leg-*only*: it would size the v2 alias arm only if the
+        # alias family were its sole corroboration. `any(...)` over-counts it.
+        recs = [_rec(_unresolved("nf", "not_found", corr=["cache_exact", "cache_alias"]))]
+        rep = build_report(recs, ["nf"], max_attempts=3)
+        assert rep["alias_only_not_found"] == 0
+
+    def test_ambiguity_rate_excludes_unmeasured_store_conflict(self):
+        # A store-conflict ambiguous verdict carries candidate_count=None ("doubt
+        # without a measurement"); it must not inflate the rate over `measured`.
+        recs = [
+            _rec(_resolved("api1", 1, candidate_count=1)),
+            _rec(_unresolved("amb_unmeasured", "ambiguous", candidate_count=None)),
+        ]
+        rep = build_report(recs, ["api1", "amb_unmeasured"], max_attempts=3)
+        # Only api1 is measured; the unmeasured ambiguous verdict is out of the base.
+        assert rep["measured"] == 1
+        assert rep["ambiguity_rate"] == pytest.approx(0.0)
+
     def test_not_processed_counts_names_without_a_verdict(self):
         rep = build_report([_rec(_resolved("a", 1))], ["a", "b"], max_attempts=3)
         assert rep["not_processed"] == 1

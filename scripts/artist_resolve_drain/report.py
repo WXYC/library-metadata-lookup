@@ -59,6 +59,7 @@ def build_report(
     candidate_dist: Counter[str] = Counter()
 
     resolved = not_found = ambiguous = escalation = not_processed = measured = 0
+    ambiguous_measured = 0
     alias_only = trigram_near = 0
 
     for name in unique_names:
@@ -66,7 +67,8 @@ def build_report(
         if rec is None:
             not_processed += 1
             continue
-        if rec.get("candidate_count") is not None:
+        is_measured = rec.get("candidate_count") is not None
+        if is_measured:
             measured += 1
         candidate_dist[_candidate_bucket(rec.get("candidate_count"))] += 1
         corr = rec.get("cache_corroboration") or []
@@ -83,12 +85,19 @@ def build_report(
             not_found += 1
             for leg in corr:
                 corr_not_found[leg] += 1
-            if any(leg in ALIAS_FAMILY_LEGS for leg in corr):
+            # Alias-leg-*only*: the alias family is the sole corroboration, so
+            # this name would be recoverable only via a v2 alias arm. A not_found
+            # that also carries an equality/trigram leg is not alias-only.
+            if corr and all(leg in ALIAS_FAMILY_LEGS for leg in corr):
                 alias_only += 1
             if "cache_trigram" in corr:
                 trigram_near += 1
         elif reason == "ambiguous":
             ambiguous += 1
+            # Store-conflict ambiguity carries candidate_count=None (doubt without
+            # a measurement); only measured ambiguity belongs in the rate's base.
+            if is_measured:
+                ambiguous_measured += 1
         elif reason == "escalation_unavailable":
             escalation += 1
 
@@ -102,7 +111,7 @@ def build_report(
         "ambiguous": ambiguous,
         "escalation_residual": escalation,
         "measured": measured,
-        "ambiguity_rate": (ambiguous / measured) if measured else 0.0,
+        "ambiguity_rate": (ambiguous_measured / measured) if measured else 0.0,
         "corroboration_resolved": dict(corr_resolved),
         "corroboration_not_found": dict(corr_not_found),
         "candidate_count_dist": dict(candidate_dist),
