@@ -609,6 +609,42 @@ class TestRunDrain:
                 clock=lambda: "T",
             )
 
+    async def test_server_error_5xx_degrades_to_escalation_not_propagated(self, tmp_path):
+        out = tmp_path / "d.jsonl"
+        # A 5xx `HTTPStatusError` is "couldn't ask" — repeated 5xx is the issue's
+        # canonical degradable case, so it must degrade like a transport timeout,
+        # not re-raise like a 4xx. Guards the `< 500` boundary's false branch.
+        request = httpx.Request("POST", "https://lml.example/api/v1/artists/resolve/bulk")
+        calls = {"n": 0}
+
+        async def flaky_5xx(names, dry_run):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                response = httpx.Response(503, request=request)
+                raise httpx.HTTPStatusError(
+                    "503 Service Unavailable", request=request, response=response
+                )
+            return [_resolved(name, 100 + i) for i, name in enumerate(names)]
+
+        records = await run_drain(
+            all_names=["Wishy"],
+            dry_run=False,
+            out_path=out,
+            post_batch=flaky_5xx,
+            page_size=25,
+            max_retries=2,
+            cooldown=0,
+            sleep=_noop_sleep,
+            clock=lambda: "T",
+        )
+
+        loaded = load_records(out)
+        first = [r for r in loaded if r["attempt"] == 1]
+        assert first and all(r["unresolved_reason"] == "escalation_unavailable" for r in first)
+        # The run completed instead of crashing; the retry round minted the name.
+        assert latest_by_name(loaded)["Wishy"]["discogs_artist_id"] == 100
+        assert records is not None
+
 
 async def _noop_sleep(seconds):
     return None
