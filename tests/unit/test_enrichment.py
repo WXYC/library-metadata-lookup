@@ -3596,16 +3596,18 @@ class TestSiblingOverrideProbeDivergence:
     synthesized result and the user lands on the wrong release in their
     streaming app.
 
-    ``find_track_metadata`` enforces ``album_score >= 80`` against the
-    *requested* album (``clients/streaming/apple_music.py:407-412``), so
-    a probe match on the synthesis branch is, by construction, for the
-    requested album whenever ``album`` was supplied. When both ``album``
-    and ``item.title`` carry signal, the override URLs must therefore
-    have come from a wrong-sibling row — clear them. The artist-only
-    path (``album=None``) and the title-less row path (``item.title is
-    None``) intentionally retain the override: in those branches the
-    probe's album-score filter never ran, so a probe match does not
-    imply the override is wrong.
+    ``find_track_metadata`` sets ``AppleMusicTrackMatch.album_verified``
+    only when the winner cleared the ``album_score >= 80`` floor against
+    the *requested* album, so an ``album_verified`` probe match on the
+    synthesis branch is, by construction, for the requested album. When
+    that flag and ``item.title`` both carry signal, the override URLs
+    must therefore have come from a wrong-sibling row — clear them. The
+    artist-only path (``album=None``), the LML#782 album-fallback path
+    (album axis FAILED — Apple merely titles the album differently), and
+    the title-less row path (``item.title is None``) intentionally
+    retain the override: in those branches the probe's album-score
+    filter never passed, so a probe match does not imply the override
+    is wrong.
     """
 
     @pytest.mark.asyncio
@@ -3683,6 +3685,69 @@ class TestSiblingOverrideProbeDivergence:
         # Spotify's templated fallback is gone (LML#573); nothing fills the
         # slot in this no-Spotify-client / flag-off setup.
         assert enriched.spotify_url is None
+
+    @pytest.mark.asyncio
+    async def test_fallback_probe_match_retains_curated_overrides(self):
+        """LML#782 seam guard: an album-UNVERIFIED probe match must NOT
+        trigger the LML#505 invalidation.
+
+        The #782 album-less fallback makes ``find_track_metadata`` return a
+        match even when the album axis FAILED (Apple titles the album
+        differently than the catalog — Friko's "Get Numb To It!" sits on an
+        Apple album "Get Numb to It!", not the catalog's "RED XEROX"). Such
+        a match proves nothing about the library row's curated URLs: here
+        the row IS the requested album (exact title match), its five
+        curated links are correct, and Apple merely disagrees about album
+        naming. Clearing them would downgrade correct librarian-curated
+        links to search placeholders in exactly the divergence shape the
+        fallback exists to fix. ``AppleMusicTrackMatch.album_verified``
+        carries the distinction; only a verified match may clear."""
+        item = make_library_item(id=77, artist="Friko", title="RED XEROX")
+
+        curated_spotify = "https://open.spotify.com/album/red-xerox-id"
+        curated_apple = "https://music.apple.com/us/album/red-xerox/222"
+        curated_ytm = "https://music.youtube.com/playlist?list=red-xerox"
+        curated_bandcamp = "https://friko.bandcamp.com/album/red-xerox"
+        curated_soundcloud = "https://soundcloud.com/friko/sets/red-xerox"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": curated_spotify,
+                "apple_music_url": curated_apple,
+                "youtube_music_url": curated_ytm,
+                "bandcamp_url": curated_bandcamp,
+                "soundcloud_url": curated_soundcloud,
+            }
+        )
+
+        probe_match = AppleMusicTrackMatch(
+            url="https://music.apple.com/us/song/get-numb-to-it/1713114815",
+            artwork_url=None,
+            release_year=None,
+            album_verified=False,
+        )
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+
+        results = await enrich_artwork_results(
+            [(item, None)],  # synthesis branch — no Discogs hit
+            AsyncMock(),
+            song="Get Numb To It!",
+            album="RED XEROX",
+            apple_music=apple_music,
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # All five curated overrides survive the unverified probe match.
+        assert enriched.spotify_url == curated_spotify
+        assert enriched.apple_music_url == curated_apple
+        assert enriched.youtube_music_url == curated_ytm
+        assert enriched.bandcamp_url == curated_bandcamp
+        assert enriched.soundcloud_url == curated_soundcloud
 
     @pytest.mark.asyncio
     async def test_probe_url_wins_precedence_over_override_on_synthesis_branch(self):

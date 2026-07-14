@@ -242,25 +242,39 @@ async def enrich_one(
     # So a library row for the sibling original propagates its five
     # curated streaming URLs through the override block above when
     # the request is for the Deluxe. When Discogs lacks the Deluxe
-    # (synthesis branch, ``not library_row_acceptable``) the Apple
-    # probe fetches the *requested* album — ``find_track_metadata``
-    # enforces ``album_score >= 80`` at
-    # ``clients/streaming/apple_music.py:407-412`` — proving the
-    # row's URLs are for a sibling, not the request. Clear them so
-    # the precedence at the final ``update`` assignment lets the
-    # probe URL win the Apple slot and the other four services
-    # downgrade to ``_build_streaming_search_url`` placeholders
-    # instead of leaking the wrong release to iOS / dj-site.
+    # (synthesis branch, ``not library_row_acceptable``) an
+    # ``album_verified`` Apple probe match proves the *requested*
+    # album exists on Apple — ``find_track_metadata`` sets the flag
+    # only when the winner cleared the ``album_score >= 80`` floor
+    # against the supplied album — so the row's URLs must be for a
+    # sibling, not the request. Clear them so the precedence at the
+    # final ``update`` assignment lets the probe URL win the Apple
+    # slot and the other four services downgrade to
+    # ``_build_streaming_search_url`` placeholders instead of
+    # leaking the wrong release to iOS / dj-site.
     #
-    # The ``album`` and ``item.title`` guards exclude two paths the
-    # collapse-to-``probe_match is not None`` rule mishandles:
-    # artist-only lookups (``album=None`` → probe ran without the
-    # ``album_score`` floor, so a probe match does not imply
-    # override is wrong) and title-less rows (no row title to be
-    # 'wrong' against). Both retain the override; the title-less
-    # branch is a latent leak tracked as an open question on LML#505
-    # and explicitly out of scope here.
-    if not library_row_acceptable and probe_match is not None and ctx.album and item.title:
+    # ``album_verified`` is the load-bearing guard: it excludes the
+    # paths a collapse-to-``probe_match is not None`` rule
+    # mishandles. Artist-only lookups (``album=None``) never ran the
+    # ``album_score`` floor, and LML#782 album-fallback winners
+    # FAILED it — Apple simply titles the album differently than the
+    # catalog (Friko "RED XEROX" vs Apple "Get Numb to It!"), so the
+    # row may well be the requested album and its curated URLs
+    # correct. Both carry ``album_verified=False`` and retain the
+    # override. ``ctx.album`` stays as defense-in-depth for the
+    # artist-only path (a verified match implies an album was
+    # supplied, so the conjunct is redundant when the flag honors
+    # its contract). ``item.title`` excludes title-less rows (no row
+    # title to be 'wrong' against); that branch is a latent leak
+    # tracked as an open question on LML#505 and explicitly out of
+    # scope here.
+    if (
+        not library_row_acceptable
+        and probe_match is not None
+        and probe_match.album_verified
+        and ctx.album
+        and item.title
+    ):
         apple_music_override = None
         spotify_url = None
         youtube_music_url = None

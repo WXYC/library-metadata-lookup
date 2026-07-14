@@ -641,6 +641,60 @@ class TestFindTrackMetadata:
         assert match.release_year is None
 
     @pytest.mark.asyncio
+    async def test_constrained_winner_is_album_verified(self, es256_keypair):
+        """A winner from the album-constrained pass carries
+        ``album_verified=True`` — it cleared the ``album_score >= 80``
+        floor against the requested album, so downstream consumers
+        (the LML#505 override invalidation in ``lookup/enrichment/item.py``)
+        may treat the match as proof the requested album exists on Apple."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([_make_song_data_full()]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+        assert match is not None
+        assert match.album_verified is True
+
+    @pytest.mark.asyncio
+    async def test_fallback_winner_is_not_album_verified(self, es256_keypair):
+        """An LML#782 fallback winner carries ``album_verified=False``: its
+        album axis FAILED the floor against the requested album, so the
+        match proves nothing about the requested album's presence on
+        Apple. The LML#505 invalidation in ``lookup/enrichment/item.py``
+        keys off this flag — without it, a fallback match would nuke a
+        correct row's curated streaming overrides in exactly the
+        album-title-divergence shape this fallback exists to fix."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response([_make_song_data_full(album_name="Tzenni")])
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+        assert match is not None
+        assert match.album_verified is False
+
+    @pytest.mark.asyncio
+    async def test_album_none_winner_is_not_album_verified(self, es256_keypair):
+        """With ``album=None`` the album floor never ran, so the match
+        cannot claim album verification (same reason its album-derived
+        fields are stripped)."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([_make_song_data_full()]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata("Noura Mint Seymali", "Hebebeb (Zrag)", album=None)
+        assert match is not None
+        assert match.album_verified is False
+
+    @pytest.mark.asyncio
     async def test_album_fallback_does_not_rescue_artist_below_floor(self, es256_keypair):
         """The LML#782 fallback relaxes ONLY the album axis. A candidate
         that also fails the artist floor stays rejected in the re-score —
@@ -803,6 +857,26 @@ class TestFindTrackMetadata:
         # Album-derived fields stripped when album is None.
         assert match.artwork_url is None
         assert match.release_year is None
+
+    @pytest.mark.asyncio
+    async def test_empty_album_treated_as_unconstrained(self, es256_keypair):
+        """``album=""`` normalizes to no constraint (the constrained pass
+        never runs), so the winner must take the same URL-only,
+        unverified contract as ``album=None``. Previously the URL-only
+        gate tested ``album is None`` literally, letting an empty-string
+        album surface full artwork/release-year that no album floor ever
+        checked — the LML#487 wrong-album leak through a falsy edge."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([_make_song_data_full()]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata("Noura Mint Seymali", "Hebebeb (Zrag)", album="")
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/hebebeb-zrag/9"
+        assert match.artwork_url is None
+        assert match.release_year is None
+        assert match.album_verified is False
 
     @pytest.mark.asyncio
     async def test_prefers_match_with_artwork_over_higher_scoring_without(self, es256_keypair):
