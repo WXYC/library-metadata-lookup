@@ -4,6 +4,17 @@ from discogs.models import DiscogsSearchResult
 from generated.api_models import DiscogsMatchResult, LibraryCatalogItem
 from library.models import LibraryItem
 from lookup.release_resolution import ResolvedRelease
+from services.parser import MessageType, ParsedRequest
+
+
+def make_parsed_request(artist: str, album: str) -> ParsedRequest:
+    """Build the (artist, album) request shape the library-miss probe takes."""
+    return ParsedRequest(
+        artist=artist,
+        album=album,
+        message_type=MessageType.REQUEST,
+        is_request=True,
+    )
 
 
 def make_library_item(id=1, artist="Stereolab", title="Aluminum Tunes", **kwargs):
