@@ -27,7 +27,10 @@ Public surface:
   with the URL plus `attributes.artwork.url` (artwork) and
   `attributes.releaseDate` (year) so the synthesized
   `DiscogsSearchResult` surfaces the correct album's cover art instead
-  of leaking a sibling-album library row's Discogs image.
+  of leaking a sibling-album library row's Discogs image. When every
+  candidate fails only the album axis, re-scores the same response
+  without it (LML#782 album-title divergence) and returns a URL-only,
+  `album_verified=False` match.
 """
 
 from __future__ import annotations
@@ -66,11 +69,21 @@ class AppleMusicTrackMatch:
     ``search_song`` response payload — no extra Apple Music API rounds
     over the existing ``find_track_url`` quota. ``url`` is the Apple Music
     song deep-link (same value ``find_track_url`` returns).
+
+    ``album_verified`` is True only when the winner cleared the
+    ``album_score >= 80`` floor against a supplied album — the evidence
+    the LML#505 override invalidation in ``lookup/enrichment/item.py``
+    needs before clearing a library row's curated streaming URLs. Album-
+    less winners and LML#782 album-fallback winners carry False: their
+    album axis never passed, so they prove nothing about the requested
+    album. Defaults True because every pre-#782 match was constrained by
+    construction; ``find_track_metadata`` always sets it explicitly.
     """
 
     url: str
     artwork_url: str | None
     release_year: int | None
+    album_verified: bool = True
 
 
 logger = logging.getLogger(__name__)
@@ -452,23 +465,34 @@ class AppleMusicClient(BaseStreamingClient):
             matched_title=_extract_name(best),
         )
 
-        # When ``album`` was not supplied the 80/80(/80) floor collapses to
-        # 80/80 — any artist+song match clears regardless of album, and
-        # Apple typically returns the most popular album containing this
-        # song title. The match's URL is per-track so it stays, but the
-        # album-derived fields (``artwork_url``, ``release_year``) describe
-        # whatever album Apple ranked highest; surfacing them on the
-        # synthesized result would be a wrong-album leak. ~40% of
-        # request-o-matic traffic is artist+song-only. The LML#782 fallback
-        # winner is the same trade with sharper evidence — its album just
-        # FAILED the floor against the requested one — so it is URL-only too.
-        if album is None or album_fallback:
-            return AppleMusicTrackMatch(url=_extract_url(best), artwork_url=None, release_year=None)
+        # When no album constrained the scoring (``norm_album is None``
+        # covers both ``album=None`` and a falsy/empty album string) the
+        # 80/80(/80) floor collapses to 80/80 — any artist+song match
+        # clears regardless of album, and Apple typically returns the most
+        # popular album containing this song title. The match's URL is
+        # per-track so it stays, but the album-derived fields
+        # (``artwork_url``, ``release_year``) describe whatever album Apple
+        # ranked highest; surfacing them on the synthesized result would be
+        # a wrong-album leak. ~40% of request-o-matic traffic is
+        # artist+song-only. The LML#782 fallback winner is the same trade
+        # with sharper evidence — its album just FAILED the floor against
+        # the requested one — so it is URL-only too. Either way the album
+        # axis never passed, so the match is ``album_verified=False`` and
+        # the LML#505 invalidation downstream must not treat it as proof
+        # the requested album exists on Apple.
+        if norm_album is None or album_fallback:
+            return AppleMusicTrackMatch(
+                url=_extract_url(best),
+                artwork_url=None,
+                release_year=None,
+                album_verified=False,
+            )
 
         return AppleMusicTrackMatch(
             url=_extract_url(best),
             artwork_url=_extract_artwork_url(best),
             release_year=_extract_release_year(best),
+            album_verified=True,
         )
 
 
