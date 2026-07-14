@@ -372,6 +372,55 @@ class TestHalfOpenWatchdog:
         breaker.record_success(remaining=50, epoch=epoch)
         assert breaker.state is BreakerState.OPEN
 
+    def test_watchdog_floor_applies_when_cooldown_is_zero(self, clock):
+        """LML#787 review R1: ``cooldown_seconds=0`` is a permitted config
+        (settings ``ge=0.0``), and ``cooldown × multiplier = 0`` must not
+        disable the watchdog — a 5xx-resolved trial (neutral: slot stays
+        occupied, LML#791) would then latch HALF_OPEN *forever*, the exact
+        #787 failure mode. The threshold is floored at 60s instead."""
+        breaker = _breaker(clock, cooldown_seconds=0.0, trial_watchdog_multiplier=20.0)
+        breaker.force_open()
+        epoch = breaker.allow_request()  # zero cool-down: immediate promotion
+        assert epoch is not None
+        assert breaker.state is BreakerState.HALF_OPEN
+        # The trial resolves in a neutral 5xx: state no-op, slot still occupied.
+        breaker.record_server_error(epoch=epoch)
+        assert breaker.state is BreakerState.HALF_OPEN
+        # Under the 60s floor the trial is not presumed lost early...
+        clock.advance(59.0)
+        assert breaker.allow_request() is None
+        assert breaker.state is BreakerState.HALF_OPEN
+        # ...but past it the watchdog still fires despite threshold 0 × 20 = 0.
+        clock.advance(2.0)
+        assert breaker.allow_request() is None  # this call re-OPENs
+        assert breaker.state is BreakerState.OPEN
+        # Zero cool-down: the next call promotes a fresh trial (new epoch).
+        fresh_epoch = breaker.allow_request()
+        assert fresh_epoch is not None
+        assert fresh_epoch != epoch
+        assert breaker.state is BreakerState.HALF_OPEN
+
+    def test_5xx_resolved_trial_stall_is_bounded_by_the_watchdog(self, clock):
+        """Pin the LML#791 stall bound: a trial resolving in a neutral 5xx
+        leaves HALF_OPEN with no in-flight trial and no admission path
+        (``record_server_error`` deliberately doesn't move the state — FIX 5),
+        so live calls shed until the watchdog presumes the slot stranded.
+        Prompt re-arm is LML#791; this pins that the stall is *bounded*."""
+        breaker, epoch = self._to_half_open(clock, trial_watchdog_multiplier=20.0)
+        breaker.record_server_error(epoch=epoch)
+        assert breaker.state is BreakerState.HALF_OPEN
+        # Stalled: nothing is admitted while the slot is stranded...
+        clock.advance(599.0)
+        assert breaker.allow_request() is None
+        assert breaker.state is BreakerState.HALF_OPEN
+        # ...until the watchdog window (30s cooldown × 20 = 600s) elapses.
+        clock.advance(2.0)
+        assert breaker.allow_request() is None  # re-OPENs
+        assert breaker.state is BreakerState.OPEN
+        clock.advance(31.0)
+        assert breaker.allow_request() is not None
+        assert breaker.state is BreakerState.HALF_OPEN
+
 
 class TestShouldShedInflight:
     """R2-1: the READ-ONLY, epoch-aware in-flight predicate.

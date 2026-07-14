@@ -40,7 +40,9 @@ State machine
   decides. A trial that dies without any terminal outcome — request-layer
   ``RequestError``, cancellation, an unexpected raise — is **inconclusive**:
   the caller reports it via :meth:`record_aborted`, which re-OPENs for another
-  cool-down (LML#787; never CLOSE on a lost trial, never stay latched).
+  cool-down (LML#787; never CLOSE on a lost trial). Note that after a
+  5xx-resolved trial the slot stays occupied until the watchdog below fires —
+  prompt re-arm is tracked in LML#791.
 
 Aborted trials & the HALF_OPEN watchdog (LML#787)
 -------------------------------------------------
@@ -48,25 +50,35 @@ The 2026-07-13 prod incident: the HALF_OPEN trial exited
 ``_request_with_retry`` through a path that recorded nothing, and because
 HALF_OPEN sheds every other caller unconditionally — and no stale-epoch
 ``record_*`` can move the state — the breaker shed 100% of live Discogs calls
-for ~8 hours until a process restart. Two guards make that latch impossible by
-construction:
+for ~8 hours until a process restart. Two guards bound how long HALF_OPEN can
+persist:
 
 - :meth:`record_aborted` — the request path guarantees (via ``try/finally``)
   that an admitted request which exits without a terminal ``record_*`` reports
   the abort. If the aborter was the current trial, re-OPEN (fresh cool-down →
   fresh trial). Anything else (CLOSED-era caller, stale epoch, OPEN) is a
   no-op — an aborted request is not a saturation signal.
-- A **watchdog** in :meth:`allow_request` — belt-and-suspenders for exit paths
-  nobody has thought of yet (a trial coroutine lost without its ``finally``
-  running). If HALF_OPEN persists past ``cooldown_seconds ×
-  trial_watchdog_multiplier``, the trial is presumed lost and the breaker
-  re-OPENs. The default multiplier (20 → 400s at the default 20s cool-down) is
-  sized to exceed the worst-case *legitimate* trial — ``discogs_max_retries``
-  (5) sleeps capped at 60s plus 6 attempts against the 10s client timeout ≈
-  360s — so a live trial riding its full backoff is never killed early, while
-  a genuinely lost trial self-heals in minutes instead of hours. A zombie
-  trial that later records anyway epoch-mismatches (the watchdog's ``_open``
-  bumped the epoch) and cannot decide the fresh trial.
+- A **watchdog** in :meth:`allow_request` — belt-and-suspenders for slot
+  strandings ``record_aborted`` can't see: a trial coroutine lost without its
+  ``finally`` running, and the LML#791 shape (a trial *resolving* in a neutral
+  5xx leaves the slot occupied with nothing in flight). If HALF_OPEN persists
+  past ``max(cooldown_seconds × trial_watchdog_multiplier, 60s)``, the slot is
+  presumed stranded and the breaker re-OPENs; the 60s floor keeps the watchdog
+  alive under degenerate configs (zero cool-down, zero/negative multiplier)
+  that would otherwise zero the threshold and re-admit the forever-latch. The
+  default multiplier (20 → 400s at the default 20s cool-down) is sized above
+  the worst-case *legitimate* trial — ``discogs_max_retries`` (5) sleeps
+  capped at 60s plus 6 attempts against the 10s client timeout ≈ 360s, though
+  semaphore/rate-limiter queue waits can stretch a real trial further — so an
+  early kill is unlikely, and when one happens it is benign: the zombie
+  trial's late record epoch-mismatches (the watchdog's ``_open`` bumped the
+  epoch), costing one discarded probe and one extra cool-down.
+
+So HALF_OPEN is bounded at ``max(cooldown × multiplier, 60s)`` in the worst
+case, and the known unrecorded-exit paths resolve immediately via
+``record_aborted``. The residual stall — a 5xx-resolved trial shedding until
+the watchdog fires instead of re-arming after one cool-down — is tracked in
+LML#791.
 
 Epoch guard
 -----------
@@ -112,6 +124,12 @@ from collections.abc import Callable
 from enum import StrEnum
 
 logger = logging.getLogger(__name__)
+
+# LML#787: minimum HALF_OPEN watchdog threshold. ``cooldown ×
+# trial_watchdog_multiplier`` is floored here so degenerate configs (zero
+# cool-down, zero/negative multiplier) can't disable the watchdog and re-admit
+# the forever-latch the watchdog exists to prevent.
+_WATCHDOG_FLOOR_SECONDS = 60.0
 
 
 class BreakerState(StrEnum):
@@ -165,11 +183,12 @@ class DiscogsCircuitBreaker:
             cooldown_seconds: How long the breaker stays OPEN before admitting a
                 half-open trial request.
             trial_watchdog_multiplier: A HALF_OPEN trial unresolved after
-                ``cooldown_seconds × trial_watchdog_multiplier`` is presumed
-                lost and the breaker re-OPENs (LML#787). Must comfortably
-                exceed the worst-case legitimate trial (~360s with the default
-                retry/backoff settings); the default (20) gives 400s at the
-                default 20s cool-down.
+                ``max(cooldown_seconds × trial_watchdog_multiplier, 60s)`` is
+                presumed lost and the breaker re-OPENs (LML#787; the 60s floor
+                keeps the watchdog alive when the product is zero or
+                negative). Must comfortably exceed the worst-case legitimate
+                trial (~360s with the default retry/backoff settings); the
+                default (20) gives 400s at the default 20s cool-down.
             now: Monotonic clock source (injectable for deterministic tests).
         """
         self._failure_threshold = failure_threshold
@@ -205,10 +224,11 @@ class DiscogsCircuitBreaker:
         - CLOSED → admit (returns the current epoch).
         - OPEN → admit exactly once after the cool-down elapses (promoting to
           HALF_OPEN for that single trial); shed (``None``) otherwise.
-        - HALF_OPEN → shed: a trial is already in flight; concurrent callers are
-          shed until it resolves. If the trial has been unresolved past the
-          LML#787 watchdog window (``cooldown × trial_watchdog_multiplier``),
-          presume it lost and re-OPEN (this caller is still shed; the fresh
+        - HALF_OPEN → shed: the trial slot is occupied; concurrent callers are
+          shed until it resolves. If the slot has been occupied past the
+          LML#787 watchdog window (``max(cooldown ×
+          trial_watchdog_multiplier, 60s)``), presume the trial lost or the
+          slot stranded and re-OPEN (this caller is still shed; the fresh
           cool-down promotes a fresh trial).
         """
         if self._state is BreakerState.CLOSED:
@@ -224,19 +244,25 @@ class DiscogsCircuitBreaker:
                 return self._epoch
             return None
 
-        # HALF_OPEN: a trial is in flight; shed everyone else — unless the
-        # trial has been unresolved so long it must be lost (LML#787 watchdog;
-        # ``record_aborted`` covers the known unrecorded-exit paths, this
-        # covers the unknown ones). ``threshold > 0`` keeps a zero cool-down
-        # config from flapping the trial on every call.
-        threshold = self._cooldown_seconds * self._trial_watchdog_multiplier
-        if threshold > 0 and self._now() - self._half_open_at >= threshold:
+        # HALF_OPEN: a trial slot is occupied; shed everyone else — unless the
+        # slot has been occupied so long the trial must be lost or stranded
+        # (LML#787 watchdog; ``record_aborted`` covers the known
+        # unrecorded-exit paths, this covers the unknown ones — plus the
+        # LML#791 stranded slot after a neutral 5xx-resolved trial). The 60s
+        # floor keeps the watchdog alive under degenerate configs — a zero
+        # cool-down (settings permit ``ge=0.0``) or a zero/negative multiplier
+        # would otherwise yield threshold 0 and re-latch HALF_OPEN forever —
+        # while never presuming a live trial lost faster than a minute.
+        threshold = max(
+            self._cooldown_seconds * self._trial_watchdog_multiplier,
+            _WATCHDOG_FLOOR_SECONDS,
+        )
+        if self._now() - self._half_open_at >= threshold:
             logger.warning(
-                "Discogs saturation breaker HALF_OPEN trial unresolved after %.0fs "
-                "(> cooldown %.0fs x %.0f); presuming it lost and re-opening (LML#787)",
+                "Discogs saturation breaker stuck HALF_OPEN for %.0fs (>= watchdog %.0fs); "
+                "presuming the trial lost or its slot stranded, re-opening (LML#787)",
                 self._now() - self._half_open_at,
-                self._cooldown_seconds,
-                self._trial_watchdog_multiplier,
+                threshold,
             )
             self._open()
         return None
