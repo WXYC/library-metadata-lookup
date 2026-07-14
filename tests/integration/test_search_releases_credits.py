@@ -32,7 +32,7 @@ pytestmark = pytest.mark.pg
 
 @pytest_asyncio.fixture
 async def seeded_cache(pg_pool):
-    """Fresh ``release`` + ``release_artist`` with three seed releases."""
+    """Fresh ``release`` + ``release_artist`` with four seed releases."""
     async with pg_pool.acquire() as conn:
         await skip_if_drop_targets_populated(conn, ("release", "release_artist"))
         try:
@@ -67,6 +67,10 @@ async def seeded_cache(pg_pool):
                 (36830641, "Cup Of Loneliness / Choices"),
                 (1489958, "DOGA"),
                 (11144750, "Best Of Horace Andy"),
+                # Ranking decoy: its single credit scores 0.786 against
+                # "merce lemon" — above the joined credit's 0.706, below the
+                # per-credit 1.0. Only per-credit ranking sorts it second.
+                (77001, "Peel Sessions"),
             ],
         )
         await conn.executemany(
@@ -77,6 +81,7 @@ async def seeded_cache(pg_pool):
                 (36830641, "Alex Farrar", 1),  # producer credit — must stay out
                 (1489958, "Juana Molina", 0),
                 (11144750, "Horace Andy", 0),
+                (77001, "Merce Lemons", 0),
             ],
         )
 
@@ -122,6 +127,15 @@ class TestSearchReleasesCreditAggregation:
         )
         assert [r["release_id"] for r in rows] == [36830641]
         assert rows[0]["artist_name"] == "Fust, Merce Lemon"
+
+    @pytest.mark.asyncio
+    async def test_ranking_stays_per_credit(self, seeded_cache):
+        """The DISTINCT ON score ranks by the matched credit's similarity —
+        'Merce Lemon' scores 1.0 per-credit, so 36830641 sorts above the
+        'Merce Lemons' decoy (0.786). Ranking on the aggregated presentation
+        ('Fust, Merce Lemon' → 0.706) would flip this order."""
+        rows = await seeded_cache.search_releases(artist="Merce Lemon")
+        assert [r["release_id"] for r in rows] == [36830641, 77001]
 
     @pytest.mark.asyncio
     async def test_artist_only_branch_aggregates(self, seeded_cache):

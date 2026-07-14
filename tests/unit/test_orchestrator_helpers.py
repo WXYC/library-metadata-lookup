@@ -1057,6 +1057,31 @@ class TestFilterResultsByTrackValidation:
         assert validated[0].title == "A Night at the Opera"
 
     @pytest.mark.asyncio
+    async def test_joined_cache_credit_result_still_validates(self, mock_discogs_service):
+        """LML#784 A2 non-regression: the PG arm now presents a multi-artist
+        release as its aggregated credit ("Fust, Merce Lemon"). ``validate_one``
+        reads only the result's album title and release_id, so a joined-credit
+        candidate must validate exactly like the single-credit shape did."""
+        items = [make_library_item(id=1, artist="Fust", title="Cup Of Loneliness / Choices")]
+        search_result = make_discogs_result(
+            release_id=36830641,
+            album="Cup Of Loneliness / Choices",
+            artist="Fust, Merce Lemon",
+            artist_credits=["Fust", "Merce Lemon"],
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[search_result], cached=True, pg_served=True
+        )
+        mock_discogs_service.validate_track_on_release.return_value = True
+
+        validated = await filter_results_by_track_validation(
+            items, "Spangled", "Fust", mock_discogs_service
+        )
+        assert validated is not None
+        assert len(validated) == 1
+        assert validated[0].title == "Cup Of Loneliness / Choices"
+
+    @pytest.mark.asyncio
     async def test_returns_none_without_discogs(self):
         items = [make_library_item(id=1, artist="Queen", title="A Night at the Opera")]
         result = await filter_results_by_track_validation(items, "Song", "Artist", None)
