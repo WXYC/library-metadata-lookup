@@ -14,7 +14,7 @@ Strategy-adjacent, so it lives in this package (LML#727).
 import logging
 
 from clients.streaming.matching import find_best_typed_match
-from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
+from discogs.models import DiscogsSearchRequest, DiscogsSearchResponse, DiscogsSearchResult
 from discogs.service import DiscogsService
 from library.models import LibraryItem
 from lookup.matching import is_self_titled
@@ -40,14 +40,15 @@ async def _library_miss_discogs_search(
     shape is near-miss typed albums (typed "Anthology" → "Anthology, Vol. 1");
     see regression tests for pinned cases.
 
-    When every candidate from a cache-served response floor-fails, the search
+    When every candidate from a PG-served response floor-fails, the search
     is re-issued once with ``skip_pg=True`` (LML#784 category 1): the PG arm
     joins ``release_artist`` one credit per row, so a multi-artist release
     surfaces as single credits that floor-fail singly, while the API arm's
     joined credit would pass — and the fallthrough seam treats any non-empty
-    ``pg_read`` as terminal, masking that working arm. ``response.cached`` is
-    the retry gate: the seam sets it only on PG-served responses, so an
-    API-served first pass is never re-searched.
+    ``pg_read`` as terminal, masking that working arm. ``response.pg_served``
+    is the retry gate: only the PG arm sets it, so an API-served first pass —
+    including a memory-cache replay of one, which arrives ``cached=True`` —
+    is never re-searched.
 
     Returns ``None`` when:
     - ``discogs_service`` is not available
@@ -74,18 +75,14 @@ async def _library_miss_discogs_search(
 
     request = DiscogsSearchRequest(album=album, artist=artist)
 
-    def _floor_best(response) -> DiscogsSearchResult | None:
+    def _floor_best(response: DiscogsSearchResponse | None) -> DiscogsSearchResult | None:
         if not response or not response.results:
             return None
         return find_best_typed_match(
             response.results,
             query_artist=artist,
             query_title=album,
-            # Joined credit plus the PG arm's per-credit variants (LML#784):
-            # a single-credit query clears via its credit, a joined-credit
-            # query clears via the aggregate. API-arm results carry no
-            # artist_credits and score exactly as before.
-            artist_fn=lambda r: [r.artist, *(r.artist_credits or [])],
+            artist_fn=lambda r: r.artist_variants(),
             title_fn=lambda r: r.album,
         )
 
@@ -97,7 +94,7 @@ async def _library_miss_discogs_search(
 
     best = _floor_best(response)
 
-    if best is None and response is not None and response.cached:
+    if best is None and response is not None and response.pg_served:
         logger.info(
             "library-miss cache candidates all floor-failed for artist=%r album=%r; "
             "retrying API-only (LML#784)",
