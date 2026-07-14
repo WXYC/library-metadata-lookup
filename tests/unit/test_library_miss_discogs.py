@@ -33,7 +33,7 @@ from lookup.orchestrator import perform_lookup
 from lookup.strategies.library_miss import _library_miss_discogs_search
 from services.parser import MessageType, ParsedRequest
 from tests.conftest import make_lml_telemetry
-from tests.factories import make_discogs_result, make_library_item
+from tests.factories import make_discogs_result, make_library_item, make_parsed_request
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -824,13 +824,7 @@ class TestNearMissAlbumRegression:
 # ---------------------------------------------------------------------------
 
 
-def _parsed(artist: str, album: str) -> ParsedRequest:
-    return ParsedRequest(
-        artist=artist,
-        album=album,
-        message_type=MessageType.REQUEST,
-        is_request=True,
-    )
+_parsed = make_parsed_request
 
 
 class TestCacheArmFloorRejectFallthrough:
@@ -910,7 +904,8 @@ class TestCacheArmFloorRejectFallthrough:
 
     @pytest.mark.asyncio
     async def test_no_retry_when_first_response_is_api_served(self, mock_discogs_service):
-        """cached=False means the API arm was already consulted — never retry."""
+        """pg_served=False (the default) means the candidates were not
+        PG-served — the API arm was already consulted, never retry."""
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
             cached=False,
             results=[

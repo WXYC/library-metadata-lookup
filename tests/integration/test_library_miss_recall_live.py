@@ -26,7 +26,7 @@ import pytest
 
 from discogs.service import DiscogsService
 from lookup.strategies.library_miss import _library_miss_discogs_search
-from services.parser import MessageType, ParsedRequest
+from tests.factories import make_parsed_request as _parsed
 
 DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN")
 
@@ -34,15 +34,6 @@ pytestmark = [
     pytest.mark.external_api,
     pytest.mark.skipif(not DISCOGS_TOKEN, reason="DISCOGS_TOKEN not set"),
 ]
-
-
-def _parsed(artist: str, album: str) -> ParsedRequest:
-    return ParsedRequest(
-        artist=artist,
-        album=album,
-        message_type=MessageType.REQUEST,
-        is_request=True,
-    )
 
 
 @pytest.fixture
