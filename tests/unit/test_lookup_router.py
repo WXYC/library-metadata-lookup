@@ -8,7 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from discogs.service import DiscogsService
 from library.db import LibraryDB
 from lookup.models import LookupResponse, LookupResultItem
-from tests.factories import LOOKUP_BODY, make_catalog_item, make_match_result
+from tests.factories import LOOKUP_BODY, make_catalog_item, make_library_item, make_match_result
 from tests.unit.conftest import override_deps
 
 
@@ -120,6 +120,61 @@ class TestHandleLookup:
                 resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
 
         assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_structured_body_without_raw_message_returns_200(
+        self, mock_library_db, mock_settings
+    ):
+        """Regression (WXYC/library-metadata-lookup#783): a structured-only POST
+        (artist/album/song, no ``raw_message``) must return 200, not 500.
+
+        ``LookupRequest.raw_message`` is ``str | None`` and defaults to None; the
+        internal ``ParsedRequest.raw_message`` is a non-optional ``str``. Copying
+        None across in ``_step_prepare`` raised a Pydantic ValidationError that
+        ``handle_lookup`` wrapped as HTTP 500. This drives the REAL orchestrator
+        (``perform_lookup`` is not patched) so the router→pipeline seam is covered
+        end-to-end. Discogs is None so the pipeline resolves purely from the
+        library hit, isolating the raw_message coercion under test.
+        """
+        from config.settings import get_settings
+        from core.dependencies import (
+            get_discogs_service,
+            get_library_db,
+            get_posthog_client,
+        )
+        from main import app
+
+        mock_library_db.search.return_value = [
+            make_library_item(
+                id=42,
+                artist="Stereolab",
+                title="Aluminum Tunes",
+                call_letters="RO",
+                genre="Rock",
+            )
+        ]
+
+        body = {"artist": "Stereolab", "album": "Aluminum Tunes", "song": "Pop Quiz"}
+        assert "raw_message" not in body
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_library_db,
+                get_discogs_service: None,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=body)
+
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert len(results) == 1
+        assert results[0]["library_item"]["artist"] == "Stereolab"
 
     @pytest.mark.asyncio
     async def test_http_exception_passthrough(self, app_client):

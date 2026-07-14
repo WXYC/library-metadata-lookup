@@ -369,7 +369,13 @@ async def _step_prepare_request(
         artist=request.artist,
         is_request=True,
         message_type=MessageType.REQUEST,
-        raw_message=request.raw_message,
+        # LookupRequest.raw_message is str | None (optional when structured
+        # fields are supplied), but ParsedRequest.raw_message is a non-optional
+        # str whose "no raw text" sentinel is "". Coerce None here so a
+        # structured-only request doesn't fail Pydantic validation and surface
+        # as a 500 (WXYC/library-metadata-lookup#783). The pipeline drives off
+        # artist/album/song regardless; "" is inert for the free-text legs.
+        raw_message=request.raw_message or "",
     )
 
     if parsed.artist:
