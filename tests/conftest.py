@@ -187,6 +187,10 @@ def mock_discogs_service():
     service.search = AsyncMock()
     service.validate_track_on_release = AsyncMock()
     service.check_api = AsyncMock(return_value=DiscogsApiCheckResult.OK)
+    # Explicit None (not an auto-AsyncMock): consumers treat "no release" as
+    # a normal outcome, and an awaited auto-mock would leak a truthy Mock
+    # into e.g. the V/A rescue's tracklist walk.
+    service.get_release = AsyncMock(return_value=None)
     service.cache_service = None
     return service
 

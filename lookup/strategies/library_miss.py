@@ -18,6 +18,7 @@ from discogs.models import DiscogsSearchRequest, DiscogsSearchResponse, DiscogsS
 from discogs.service import DiscogsService
 from library.models import LibraryItem
 from lookup.matching import is_self_titled
+from lookup.strategies.va_rescue import find_va_comp_match
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -50,12 +51,19 @@ async def _library_miss_discogs_search(
     including a memory-cache replay of one, which arrives ``cached=True`` —
     is never re-searched.
 
+    When the floor still cleared nothing, compilation-credited candidates get
+    one more look via :func:`find_va_comp_match` (LML#784 category 2) —
+    embedded-title-segment and tracklist-credit evidence, since a V/A
+    release's "Various" credit can never clear the artist axis.
+
     Returns ``None`` when:
     - ``discogs_service`` is not available
     - ``parsed.artist`` or ``parsed.album`` is empty / whitespace-only
     - Discogs returns no candidates
-    - No candidate clears the 80/80 floor (on either arm)
-    - Discogs raises (outage, rate-limit exhaustion) — logged and swallowed
+    - No candidate clears the 80/80 floor (on either arm) nor the V/A rescue
+    - The first Discogs search raises (outage, rate-limit exhaustion) —
+      logged and swallowed; a raised API *retry* instead degrades to the
+      rescue over the cache-served candidates
     """
     if discogs_service is None:
         return None
@@ -102,13 +110,36 @@ async def _library_miss_discogs_search(
             album,
         )
         try:
-            response = await discogs_service.search(request, skip_pg=True)
+            retry = await discogs_service.search(request, skip_pg=True)
         except Exception:
+            # A raised (or, below, empty) retry keeps the PG-served
+            # candidates: the rescue works during an API outage (segments
+            # are pure CPU; the tracklist fetch reads the PG tier first).
             logger.warning(
                 "library-miss Discogs API retry failed for artist=%r album=%r", artist, album
             )
-            return None
-        best = _floor_best(response)
+        else:
+            best = _floor_best(retry)
+            if retry.results:
+                # A non-empty retry supersedes even when it floor-fails: the
+                # fuzzy API arm's retrieval is category 2's own premise. Only
+                # an empty retry keeps the PG-served candidates.
+                response = retry
+
+    if best is None and response is not None and response.results:
+        # LML#784 category 2: compilation-credited candidates structurally
+        # cannot clear the release-level floor ("Various" on the artist axis,
+        # subtitled comp titles on the album axis). Give them one more look
+        # against embedded-title-segment and tracklist-credit evidence.
+        # Applies to whichever arm's candidate set we ended with. The rescue
+        # self-guards against degenerate axes (artist ≈ album, incl. the
+        # category-4 swap above) and compilation-artist queries.
+        best = await find_va_comp_match(
+            response.results,
+            query_artist=artist,
+            query_album=album,
+            discogs_service=discogs_service,
+        )
 
     if best is None:
         return None
