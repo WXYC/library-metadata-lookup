@@ -240,6 +240,139 @@ class TestHalfOpenTransitions:
         assert breaker.state is BreakerState.HALF_OPEN
 
 
+class TestAbortedTrial:
+    """LML#787: an admitted request that dies without a terminal ``record_*``.
+
+    The 2026-07-13 prod incident: the HALF_OPEN trial exited
+    ``_request_with_retry`` through an unrecorded path (``httpx.RequestError``
+    → ``return None``, or cancellation mid-request / mid-retry-sleep), so
+    ``allow_request`` shed every caller unconditionally for ~8 hours — no new
+    trial is promoted in HALF_OPEN, and no stale-epoch ``record_*`` can move
+    the state. ``record_aborted`` is the terminal outcome for that exit shape:
+    a lost trial is *inconclusive*, so the breaker re-OPENs (fresh cool-down →
+    a fresh trial), never CLOSES, and never latches.
+    """
+
+    def _to_half_open(self, clock):
+        breaker = _breaker(clock, cooldown_seconds=30.0)
+        for _ in range(3):
+            breaker.record_failure()
+        clock.advance(31.0)
+        epoch = breaker.allow_request()
+        assert epoch is not None
+        assert breaker.state is BreakerState.HALF_OPEN
+        return breaker, epoch
+
+    def test_aborted_trial_reopens_and_a_fresh_trial_is_promoted(self, clock):
+        breaker, epoch = self._to_half_open(clock)
+        breaker.record_aborted(epoch=epoch)
+        # A lost trial is inconclusive: re-OPEN (not latched, not closed).
+        assert breaker.state is BreakerState.OPEN
+        # The next cool-down expiry promotes a FRESH trial under a new epoch.
+        clock.advance(31.0)
+        fresh_epoch = breaker.allow_request()
+        assert fresh_epoch is not None
+        assert fresh_epoch != epoch
+        assert breaker.state is BreakerState.HALF_OPEN
+
+    def test_closed_state_abort_is_a_noop(self, clock):
+        breaker = _breaker(clock)
+        epoch = breaker.allow_request()
+        breaker.record_aborted(epoch=epoch)
+        # A cancelled request while CLOSED is not a saturation signal.
+        assert breaker.state is BreakerState.CLOSED
+        assert breaker.allow_request() is not None
+
+    def test_stale_epoch_abort_does_not_disturb_the_current_trial(self, clock):
+        breaker = _breaker(clock, cooldown_seconds=30.0)
+        # A CLOSED-era request captures its epoch, then the breaker trips and
+        # half-opens for a new trial.
+        stale_epoch = breaker.allow_request()
+        for _ in range(3):
+            breaker.record_failure()
+        clock.advance(31.0)
+        trial_epoch = breaker.allow_request()
+        assert breaker.state is BreakerState.HALF_OPEN
+        # The stale CLOSED-era request now aborts (e.g. caller disconnect) —
+        # it must NOT re-open on the live trial's behalf.
+        breaker.record_aborted(epoch=stale_epoch)
+        assert breaker.state is BreakerState.HALF_OPEN
+        # The genuine trial still decides the transition.
+        breaker.record_success(remaining=50, epoch=trial_epoch)
+        assert breaker.state is BreakerState.CLOSED
+
+    def test_open_state_abort_does_not_extend_the_cooldown(self, clock):
+        breaker = _breaker(clock, cooldown_seconds=30.0)
+        stale_epoch = breaker.allow_request()
+        for _ in range(3):
+            breaker.record_failure()
+        assert breaker.state is BreakerState.OPEN
+        # A stale abort lands mid-cool-down: it must not reset ``opened_at``.
+        clock.advance(15.0)
+        breaker.record_aborted(epoch=stale_epoch)
+        clock.advance(16.0)  # 31s past the ORIGINAL open
+        assert breaker.allow_request() is not None
+        assert breaker.state is BreakerState.HALF_OPEN
+
+
+class TestHalfOpenWatchdog:
+    """LML#787 belt-and-suspenders: HALF_OPEN must be self-expiring.
+
+    ``record_aborted`` guards the *known* unrecorded-exit paths; the watchdog
+    guards the unknown ones (a trial coroutine lost without any exit running).
+    If HALF_OPEN persists past ``cooldown_seconds × trial_watchdog_multiplier``
+    the trial is presumed lost and the next ``allow_request`` re-OPENs (fresh
+    cool-down → fresh trial). The default multiplier must comfortably exceed
+    the worst-case *legitimate* trial (max_retries × 60s-capped backoff plus
+    per-attempt timeouts ≈ 6 min) so a live trial riding its retries is never
+    killed early.
+    """
+
+    def _to_half_open(self, clock, **kwargs):
+        breaker = _breaker(clock, cooldown_seconds=30.0, **kwargs)
+        for _ in range(3):
+            breaker.record_failure()
+        clock.advance(31.0)
+        epoch = breaker.allow_request()
+        assert epoch is not None
+        assert breaker.state is BreakerState.HALF_OPEN
+        return breaker, epoch
+
+    def test_unresolved_trial_past_the_watchdog_reopens_then_promotes_fresh(self, clock):
+        breaker, epoch = self._to_half_open(clock, trial_watchdog_multiplier=20.0)
+        # 30s cooldown × 20 = 600s watchdog. Past it, the next allow_request
+        # presumes the trial lost: re-OPEN (this call is still shed).
+        clock.advance(601.0)
+        assert breaker.allow_request() is None
+        assert breaker.state is BreakerState.OPEN
+        # ...and the fresh cool-down promotes a brand-new trial.
+        clock.advance(31.0)
+        fresh_epoch = breaker.allow_request()
+        assert fresh_epoch is not None
+        assert fresh_epoch != epoch
+        assert breaker.state is BreakerState.HALF_OPEN
+
+    def test_watchdog_does_not_kill_a_live_trial_early(self, clock):
+        breaker, epoch = self._to_half_open(clock, trial_watchdog_multiplier=20.0)
+        # Just under the 600s watchdog: still HALF_OPEN, callers still shed.
+        clock.advance(599.0)
+        assert breaker.allow_request() is None
+        assert breaker.state is BreakerState.HALF_OPEN
+        # The live trial (legitimately riding a long backoff) can still CLOSE.
+        breaker.record_success(remaining=50, epoch=epoch)
+        assert breaker.state is BreakerState.CLOSED
+
+    def test_zombie_trial_landing_after_the_watchdog_cannot_close(self, clock):
+        breaker, epoch = self._to_half_open(clock, trial_watchdog_multiplier=20.0)
+        clock.advance(601.0)
+        breaker.allow_request()  # watchdog fires: presumed-lost trial, re-OPEN
+        assert breaker.state is BreakerState.OPEN
+        # The presumed-lost trial turns out alive and records late: its epoch
+        # is stale (the watchdog's _open bumped it), so it must NOT close.
+        breaker.record_success(remaining=50, epoch=epoch)
+        assert breaker.state is BreakerState.OPEN
+
+
 class TestShouldShedInflight:
     """R2-1: the READ-ONLY, epoch-aware in-flight predicate.
 
