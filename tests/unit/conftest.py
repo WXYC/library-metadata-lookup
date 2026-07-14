@@ -237,6 +237,31 @@ def mock_posthog_client():
     return client
 
 
+class MonotonicClock:
+    """Deterministic monotonic clock for cool-down/watchdog tests.
+
+    Injected via the breaker's ``now=`` seam so time-driven transitions
+    (OPEN → HALF_OPEN promotion, the LML#787 watchdog) are exact and fast —
+    no real sleeping. Shared by the breaker state-machine tests and the
+    ``_request_with_retry`` breaker-integration tests.
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+@pytest.fixture
+def clock() -> MonotonicClock:
+    """A fresh :class:`MonotonicClock` per test."""
+    return MonotonicClock()
+
+
 @pytest.fixture(autouse=True)
 def reset_caches():
     """Clear all in-memory caches, rate limiting state, and ContextVars between tests."""
