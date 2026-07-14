@@ -121,6 +121,13 @@ async def enrich_artwork_results(
     None on the synthesized result because they require a verified
     Discogs identity link (no equivalent surfaces from Apple).
 
+    **Behavior change (LML#782):** when Apple titles the album differently
+    than the catalog (album-title divergence), the probe's album-less
+    fallback still supplies the per-track URL, so the synthesized result
+    can also be URL-only — ``artwork_url`` and ``release_year`` stay None
+    because the fallback winner's album axis failed the floor
+    (``AppleMusicTrackMatch.album_verified=False``).
+
     ``extended=True`` additionally populates the new DiscogsMatchResult
     fields LML already loaded during the release+artist fetches:
     ``discogs_artist_id``, ``tracklist``, ``genres``, ``styles``, ``label``,

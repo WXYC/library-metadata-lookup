@@ -68,7 +68,9 @@ class TestStreamingOnDiscogsMiss:
         # find_track_url — AsyncMock(spec=...) would otherwise auto-generate
         # a Mock-returning stub and silently keep the test green.
         apple_music.find_track_metadata = AsyncMock(
-            return_value=AppleMusicTrackMatch(url=apple_url, artwork_url=None, release_year=None)
+            return_value=AppleMusicTrackMatch(
+                url=apple_url, artwork_url=None, release_year=None, album_verified=True
+            )
         )
         apple_music.find_track_url = AsyncMock()
 
@@ -173,4 +175,65 @@ class TestStreamingOnDiscogsMiss:
         assert top.artwork.soundcloud_url is not None
         # Pin the synthesis path — the no-match shape still routes through
         # find_track_metadata, not find_track_url.
+        apple_music.find_track_url.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fallback_shape_apple_url_survives_route(self, library_db):
+        """LML#782 end-to-end: when the probe's winner came from the
+        album-less fallback (``album_verified=False``, URL-only — Apple
+        titles the album differently than the catalog), the synthesized
+        streaming-only result still carries the per-track Apple URL
+        through ``perform_lookup``. This is the whole point of the
+        fallback: divergence rows previously froze as permanent nulls
+        once Backend-Service persisted the miss (BS#1192)."""
+        from wxyc_fastapi.observability import init_cache_stats
+
+        init_cache_stats()
+
+        mock_service = AsyncMock(
+            spec_set=[
+                "search",
+                "search_releases_by_track",
+                "validate_track_on_release",
+                "get_release",
+                "cache_service",
+            ]
+        )
+        mock_service.cache_service = None
+        mock_service.search = AsyncMock(return_value=DiscogsSearchResponse(results=[]))
+        mock_service.get_release = AsyncMock(return_value=None)
+        mock_service.validate_track_on_release = AsyncMock(return_value=False)
+
+        fallback_url = "https://music.apple.com/us/song/cybeles-reverie/999"
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(
+            return_value=AppleMusicTrackMatch(
+                url=fallback_url, artwork_url=None, release_year=None, album_verified=False
+            )
+        )
+        apple_music.find_track_url = AsyncMock()
+
+        request = LookupRequest(
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            song="Cybele's Reverie",
+            raw_message="Stereolab - Aluminum Tunes - Cybele's Reverie",
+        )
+        response = await perform_lookup(
+            request,
+            library_db,
+            mock_service,
+            make_lml_telemetry(),
+            apple_music=apple_music,
+        )
+
+        assert len(response.results) >= 1
+        top = response.results[0]
+        assert top.artwork is not None
+        assert top.artwork.release_id == 0
+        # The fallback URL survives the route — no more permanent null.
+        assert top.artwork.apple_music_url == fallback_url
+        # URL-only contract: the fallback winner's album-derived fields
+        # never surface (its album axis failed the floor).
+        assert top.artwork.release_year is None
         apple_music.find_track_url.assert_not_called()

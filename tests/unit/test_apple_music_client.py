@@ -695,6 +695,31 @@ class TestFindTrackMetadata:
         assert match.album_verified is False
 
     @pytest.mark.asyncio
+    async def test_album_fallback_does_not_rescue_track_below_floor(self, es256_keypair):
+        """The LML#782 fallback relaxes ONLY the album axis. A candidate
+        whose track title fails the 80 floor (a genuinely different,
+        non-subset title) stays rejected in the re-score — dropping the
+        album constraint must not admit wrong-track matches."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response(
+                [
+                    _make_song_data_full(
+                        name="Completely Unrelated Title",
+                        album_name="Tzenni",
+                    )
+                ]
+            )
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+        assert match is None
+
+    @pytest.mark.asyncio
     async def test_album_fallback_does_not_rescue_artist_below_floor(self, es256_keypair):
         """The LML#782 fallback relaxes ONLY the album axis. A candidate
         that also fails the artist floor stays rejected in the re-score —

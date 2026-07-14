@@ -151,7 +151,9 @@ class TestEnrichArtworkResults:
         apple_url = "https://music.apple.com/us/album/tragic-magic/1843854211"
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(
-            return_value=AppleMusicTrackMatch(url=apple_url, artwork_url=None, release_year=None)
+            return_value=AppleMusicTrackMatch(
+                url=apple_url, artwork_url=None, release_year=None, album_verified=True
+            )
         )
 
         results = await enrich_artwork_results(
@@ -1568,7 +1570,9 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
 
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(
-            return_value=AppleMusicTrackMatch(url=apple_url, artwork_url=None, release_year=None)
+            return_value=AppleMusicTrackMatch(
+                url=apple_url, artwork_url=None, release_year=None, album_verified=True
+            )
         )
 
         results = await enrich_artwork_results(
@@ -1661,7 +1665,9 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         apple_music.find_track_metadata = AsyncMock(
             side_effect=[
                 AttributeError("Apple returned a non-dict item"),
-                AppleMusicTrackMatch(url=item2_url, artwork_url=None, release_year=None),
+                AppleMusicTrackMatch(
+                    url=item2_url, artwork_url=None, release_year=None, album_verified=True
+                ),
             ]
         )
 
@@ -1712,6 +1718,7 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
                 url="https://music.apple.com/should-never-resolve",
                 artwork_url=None,
                 release_year=None,
+                album_verified=True,
             )
 
         apple_music.find_track_metadata = AsyncMock(side_effect=slow_find)
@@ -1764,6 +1771,7 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
                 url="https://music.apple.com/should-never-resolve",
                 artwork_url=None,
                 release_year=None,
+                album_verified=True,
             )
 
         apple_music.find_track_metadata = AsyncMock(side_effect=slow_find)
@@ -1817,6 +1825,7 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
                 url="https://music.apple.com/should-never-resolve",
                 artwork_url=None,
                 release_year=None,
+                album_verified=True,
             )
 
         apple_music.find_track_metadata = AsyncMock(side_effect=slow_find)
@@ -2080,6 +2089,7 @@ class TestExternalArtworkProbe:
             url="https://music.apple.com/us/song/hebebeb-zrag/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/abc/600x600bb.jpg",
             release_year=2025,
+            album_verified=True,
         )
 
         apple_music = AsyncMock(spec=AppleMusicClient)
@@ -2132,6 +2142,7 @@ class TestExternalArtworkProbe:
             url="https://music.apple.com/us/song/hebebeb-zrag/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/abc/600x600bb.jpg",
             release_year=2025,
+            album_verified=True,
         )
 
         apple_music = AsyncMock(spec=AppleMusicClient)
@@ -2398,6 +2409,7 @@ class TestArtistIdentitySplitGate:
             url="https://music.apple.com/us/song/hebebeb-zrag/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/abc/600x600bb.jpg",
             release_year=2025,
+            album_verified=True,
         )
 
         apple_music = AsyncMock(spec=AppleMusicClient)
@@ -2480,6 +2492,7 @@ class TestArtistIdentitySplitGate:
             url="https://music.apple.com/us/song/x/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/yenbett.jpg",
             release_year=2025,
+            album_verified=True,
         )
 
         apple_music = AsyncMock(spec=AppleMusicClient)
@@ -2744,6 +2757,7 @@ class TestArtistIdentitySplitGate:
             url="https://music.apple.com/us/song/x/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/right.jpg",
             release_year=1979,
+            album_verified=True,
         )
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
@@ -2800,6 +2814,7 @@ class TestArtistIdentitySplitGate:
             url="https://music.apple.com/us/song/x/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/right.jpg",
             release_year=2010,
+            album_verified=True,
         )
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
@@ -2861,6 +2876,7 @@ class TestArtistIdentitySplitGate:
             url="https://music.apple.com/us/song/x/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/yenbett.jpg",
             release_year=2025,
+            album_verified=True,
         )
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
@@ -2916,6 +2932,7 @@ class TestArtistIdentitySplitGate:
             url="https://music.apple.com/us/song/x/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/yenbett.jpg",
             release_year=2025,
+            album_verified=True,
         )
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
@@ -3192,6 +3209,7 @@ class TestArtistIdentitySplitGate:
             url="https://music.apple.com/us/song/wrong-artwork/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/WRONG/600x600bb.jpg",
             release_year=2025,
+            album_verified=True,
         )
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
@@ -3233,6 +3251,7 @@ class TestArtistIdentitySplitGate:
             url="https://music.apple.com/us/song/wrong-artwork/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/WRONG/600x600bb.jpg",
             release_year=2025,
+            album_verified=True,
         )
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
@@ -3331,6 +3350,7 @@ class TestArtistIdentitySplitGate:
             url="https://music.apple.com/us/song/x/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/yenbett.jpg",
             release_year=2025,
+            album_verified=True,
         )
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
@@ -3404,6 +3424,7 @@ class TestArtistIdentitySplitGate:
             url="https://music.apple.com/us/song/non-top1-track/9",
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/dots-and-loops.jpg",
             release_year=1997,
+            album_verified=True,
         )
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
@@ -3647,6 +3668,7 @@ class TestSiblingOverrideProbeDivergence:
             url=probe_url,
             artwork_url="https://is1-ssl.mzstatic.com/image/thumb/deluxe/600x600bb.jpg",
             release_year=2015,
+            album_verified=True,
         )
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
@@ -3771,7 +3793,9 @@ class TestSiblingOverrideProbeDivergence:
 
         apple_music = AsyncMock(spec=AppleMusicClient)
         apple_music.find_track_metadata = AsyncMock(
-            return_value=AppleMusicTrackMatch(url=probe_url, artwork_url=None, release_year=None)
+            return_value=AppleMusicTrackMatch(
+                url=probe_url, artwork_url=None, release_year=None, album_verified=True
+            )
         )
         apple_music.find_track_url = AsyncMock(return_value=probe_url)
 
@@ -3898,6 +3922,7 @@ class TestSiblingOverrideProbeDivergence:
                 url="https://music.apple.com/us/song/doga/888",
                 artwork_url=None,
                 release_year=None,
+                album_verified=False,
             )
         )
         apple_music.find_track_url = AsyncMock(
@@ -3957,6 +3982,7 @@ class TestSiblingOverrideProbeDivergence:
                 url="https://music.apple.com/us/album/aluminum-tunes/999",
                 artwork_url="https://example.com/aluminum-tunes.jpg",
                 release_year=1998,
+                album_verified=True,
             )
         )
         apple_music.find_track_url = AsyncMock(return_value=None)
