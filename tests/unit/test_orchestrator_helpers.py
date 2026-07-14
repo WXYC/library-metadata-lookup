@@ -1534,6 +1534,30 @@ class TestFetchArtworkForItems:
         assert results[1][1].release_id == 67890
 
     @pytest.mark.asyncio
+    async def test_single_credit_artist_matches_joined_cache_credit(self, mock_discogs_service):
+        """LML#784 A2 non-regression: the PG cache arm now presents a
+        multi-artist release as its aggregated credit ("Fust, Merce Lemon").
+        A library item credited to just one of those artists must keep
+        matching via the per-credit ``artist_credits`` variants."""
+        item = make_library_item(id=1, artist="Fust", title="Cup Of Loneliness / Choices")
+        joined = make_discogs_result(
+            release_id=36830641,
+            album="Cup Of Loneliness / Choices",
+            artist="Fust, Merce Lemon",
+            artist_credits=["Fust", "Merce Lemon"],
+            artwork_url="https://example.com/cup.jpg",
+        )
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=True, results=[joined]
+        )
+
+        results = await fetch_artwork_for_items([item], mock_discogs_service)
+
+        assert len(results) == 1
+        assert results[0][1] is not None
+        assert results[0][1].release_id == 36830641
+
+    @pytest.mark.asyncio
     async def test_returns_none_artwork_without_discogs(self):
         items = [make_library_item(id=1, artist="Queen", title="A Night at the Opera")]
 

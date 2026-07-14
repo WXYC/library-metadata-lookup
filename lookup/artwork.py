@@ -268,7 +268,12 @@ async def fetch_artwork_for_items(
                 response.results,
                 query_artist=artist_variants,
                 query_title=album_variants,
-                artist_fn=lambda r: r.artist,
+                # Candidate-side variants (LML#784): the PG cache arm now
+                # presents a multi-artist release as its aggregated credit;
+                # the per-credit artist_credits keep a single-credit library
+                # artist ("Fust") clearing against it. API-arm results carry
+                # no artist_credits and score exactly as before.
+                artist_fn=lambda r: [r.artist, *(r.artist_credits or [])],
                 title_fn=lambda r: r.album,
             )
             if result is None:

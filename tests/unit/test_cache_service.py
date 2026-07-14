@@ -1195,6 +1195,7 @@ class TestSearchReleases:
                     "release_id": 1,
                     "title": "Album",
                     "artist_name": "Artist",
+                    "artist_credits": ["Artist"],
                     "artwork_url": None,
                     "score": 0.8,
                 }
@@ -1202,6 +1203,28 @@ class TestSearchReleases:
         )
         result = await cache_service.search_releases(artist="Artist", album="Album")
         assert len(result) == 1
+        assert result[0]["artist_credits"] == ["Artist"]
+
+    @pytest.mark.asyncio
+    async def test_aggregated_credit_passes_through(self, cache_service, mock_asyncpg_pool):
+        """LML#784: the row carries the joined credit plus the per-credit list."""
+        mock_asyncpg_pool.fetch = AsyncMock(
+            return_value=[
+                {
+                    "release_id": 36830641,
+                    "title": "Cup Of Loneliness / Choices",
+                    "artist_name": "Fust, Merce Lemon",
+                    "artist_credits": ["Fust", "Merce Lemon"],
+                    "artwork_url": None,
+                    "score": 0.9,
+                }
+            ]
+        )
+        result = await cache_service.search_releases(
+            artist="Merce Lemon & Fust", album="Cup of Loneliness / Choices"
+        )
+        assert result[0]["artist_name"] == "Fust, Merce Lemon"
+        assert result[0]["artist_credits"] == ["Fust", "Merce Lemon"]
 
     @pytest.mark.asyncio
     async def test_artist_only(self, cache_service, mock_asyncpg_pool):
@@ -1211,6 +1234,7 @@ class TestSearchReleases:
                     "release_id": 1,
                     "title": "Album",
                     "artist_name": "Artist",
+                    "artist_credits": ["Artist"],
                     "artwork_url": None,
                     "score": 0.8,
                 }
@@ -1227,6 +1251,7 @@ class TestSearchReleases:
                     "release_id": 1,
                     "title": "Album",
                     "artist_name": "Artist",
+                    "artist_credits": ["Artist"],
                     "artwork_url": None,
                     "score": 0.8,
                 }
@@ -1243,6 +1268,7 @@ class TestSearchReleases:
                     "release_id": 1,
                     "title": "Album",
                     "artist_name": "A1",
+                    "artist_credits": ["A1"],
                     "artwork_url": None,
                     "score": 0.8,
                 },
@@ -1250,6 +1276,7 @@ class TestSearchReleases:
                     "release_id": 2,
                     "title": "Album",
                     "artist_name": "A2",
+                    "artist_credits": ["A2"],
                     "artwork_url": None,
                     "score": 0.7,
                 },
