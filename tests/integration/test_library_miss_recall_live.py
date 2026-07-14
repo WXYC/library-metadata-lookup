@@ -1,13 +1,14 @@
-"""Live-API replay of the LML#784 PR-A acceptance pairs (Bug Fix Protocol).
+"""Live-API replay of the LML#784 acceptance pairs (Bug Fix Protocol).
 
 ``docs/testing.md`` requires every lookup-recall bug to carry an integration
 test against the real APIs alongside its mocked unit tests. These replay the
-category-1 (multi-artist "A & B") and category-4 (query-side "S/T") pairs
-through ``_library_miss_discogs_search`` with a real ``DiscogsService`` and
-no PG cache attached — the API arm the floor-reject fall-through retries
-into. The exact release-id pins assert both protocol halves at once: the
-correct release is included, and any floor-clearing false positive would
-surface as a different id.
+category-1 (multi-artist "A & B"), category-4 (query-side "S/T"), and
+category-2 (V/A-compilation rescue) pairs through
+``_library_miss_discogs_search`` with a real ``DiscogsService`` and no PG
+cache attached — the API arm the floor-reject fall-through retries into.
+The exact release-id pins assert both protocol halves at once: the correct
+release is included, and any floor-clearing false positive would surface as
+a different id.
 
 Category 3 (typo) deliberately has no live test: the Discogs API returns
 zero results for the typo'd title on both the strict and fuzzy arms
@@ -81,3 +82,32 @@ async def test_matmos_self_titled_placeholder_resolves(service):
     assert (best.album or "").strip().upper() != "S/T", (
         "a candidate literally titled 'S/T' must never clear via the placeholder"
     )
+
+
+@pytest.mark.asyncio
+async def test_perry_comp_resolves_direct_or_va_substitute(service):
+    """Category 2 (PR B): 'Born in the Sky' resolves either the directly
+    credited release (316672) via the standard floor or the V/A comp
+    632150 via the rescue's embedded-title-segment evidence — the ticket
+    sanctions both."""
+    result = await _library_miss_discogs_search(
+        _parsed("lee scratch perry", "Born in the Sky"),
+        discogs_service=service,
+    )
+    assert result is not None, "expected 316672 or 632150; got no candidate past floor or rescue"
+    _, best = result
+    assert best.release_id in {316672, 632150}, f"resolved wrong release {best.release_id}"
+
+
+@pytest.mark.asyncio
+async def test_tasquier_comp_resolves_via_tracklist_credit(service):
+    """Category 2 (PR B): Lionel Tasquier appears only in the comp's
+    per-track credits — the rescue's live ``get_release`` tracklist fetch
+    is the evidence path."""
+    result = await _library_miss_discogs_search(
+        _parsed("Lionel Tasquier", "Prends Le Temps D'écouter"),
+        discogs_service=service,
+    )
+    assert result is not None, "expected release 27518829; got no candidate past floor or rescue"
+    _, best = result
+    assert best.release_id == 27518829, f"resolved wrong release {best.release_id}"

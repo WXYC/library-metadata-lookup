@@ -1213,3 +1213,167 @@ class TestSelfTitledQuerySwap:
         assert result is not None
         request = mock_discogs_service.search.call_args_list[0].args[0]
         assert request.album == "Muito Sol"
+
+
+# ---------------------------------------------------------------------------
+# LML#784 category 2 — V/A-comp rescue wiring
+# ---------------------------------------------------------------------------
+
+
+class TestVaRescueWiring:
+    """When the standard floor (and the category-1 API retry) found nothing,
+    compilation-credited candidates get one more look against embedded-title
+    and tracklist evidence via ``find_va_comp_match``."""
+
+    PERRY_TITLE = "Lee Scratch Perry - Born In The Sky (Upsetter At The Controls 1969-1975)"
+
+    @pytest.mark.asyncio
+    async def test_va_rescue_resolves_perry_comp(self, mock_discogs_service):
+        """lee scratch perry — Born in the Sky resolves the valid comp 632150
+        via its embedded title segments (no tracklist fetch needed)."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=False,
+            results=[
+                make_discogs_result(release_id=632150, artist="Various", album=self.PERRY_TITLE)
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("lee scratch perry", "Born in the Sky"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is not None
+        lib_item, discogs_result = result
+        assert discogs_result.release_id == 632150
+        assert lib_item.id == 0
+        mock_discogs_service.get_release.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_va_rescue_not_attempted_when_floor_passes(self, mock_discogs_service):
+        """A standard floor pass short-circuits — the rescue never runs."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=False,
+            results=[make_discogs_result(release_id=1489958, artist="Juana Molina", album="DOGA")],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Juana Molina", "DOGA"), discogs_service=mock_discogs_service
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == 1489958
+        mock_discogs_service.get_release.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_va_rescue_runs_on_retry_results(self, mock_discogs_service):
+        """After a cache-served floor-reject triggers the API retry, the rescue
+        applies to the retry's candidate set."""
+        mock_discogs_service.search.side_effect = [
+            DiscogsSearchResponse(
+                cached=True,
+                pg_served=True,
+                results=[
+                    make_discogs_result(
+                        release_id=1, artist="The Upsetters", album="Blackboard Jungle Dub"
+                    )
+                ],
+            ),
+            DiscogsSearchResponse(
+                cached=False,
+                results=[
+                    make_discogs_result(release_id=632150, artist="Various", album=self.PERRY_TITLE)
+                ],
+            ),
+        ]
+        result = await _library_miss_discogs_search(
+            _parsed("lee scratch perry", "Born in the Sky"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == 632150
+        assert mock_discogs_service.search.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_retry_exception_still_runs_rescue_on_cached_candidates(
+        self, mock_discogs_service
+    ):
+        """A raised category-1 API retry (outage, breaker shed) must not
+        swallow the PG-served candidates the rescue could still work with —
+        segment evidence is pure CPU and the tracklist fetch reads the PG
+        tier first, both available during an API outage."""
+        mock_discogs_service.search.side_effect = [
+            DiscogsSearchResponse(
+                cached=True,
+                pg_served=True,
+                results=[
+                    make_discogs_result(release_id=632150, artist="Various", album=self.PERRY_TITLE)
+                ],
+            ),
+            Exception("Discogs API unavailable"),
+        ]
+        result = await _library_miss_discogs_search(
+            _parsed("lee scratch perry", "Born in the Sky"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == 632150
+
+    @pytest.mark.asyncio
+    async def test_self_titled_query_never_enters_va_rescue(self, mock_discogs_service):
+        """After the category-4 swap ``query_album == query_artist``, so one
+        embedded title segment would satisfy BOTH rescue axes — and a V/A
+        compilation is by definition never anyone's self-titled album. The
+        rescue's degenerate-axes self-guard must refuse the query, or
+        'X — S/T' resolves any comp titled 'X - …'."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=False,
+            results=[
+                make_discogs_result(
+                    release_id=999,
+                    artist="Various",
+                    album="Lee Scratch Perry - Presents The Full Experience",
+                )
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Lee Scratch Perry", "S/T"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is None
+        mock_discogs_service.get_release.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_retry_keeps_pg_candidates_for_rescue(self, mock_discogs_service):
+        """A retry that succeeds with zero results must degrade like a raised
+        one: the PG-served V/A candidates that triggered the retry stay
+        available to the rescue instead of being replaced by nothing."""
+        mock_discogs_service.search.side_effect = [
+            DiscogsSearchResponse(
+                cached=True,
+                pg_served=True,
+                results=[
+                    make_discogs_result(release_id=632150, artist="Various", album=self.PERRY_TITLE)
+                ],
+            ),
+            DiscogsSearchResponse(cached=False, results=[]),
+        ]
+        result = await _library_miss_discogs_search(
+            _parsed("lee scratch perry", "Born in the Sky"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == 632150
+
+    @pytest.mark.asyncio
+    async def test_no_va_candidates_still_none(self, mock_discogs_service):
+        """Floor-failing non-compilation candidates stay a clean no-match."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=False,
+            results=[make_discogs_result(release_id=2, artist="The Upsetters", album="Super Ape")],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("lee scratch perry", "Born in the Sky"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is None
