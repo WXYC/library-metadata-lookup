@@ -76,14 +76,16 @@ class AppleMusicTrackMatch:
     needs before clearing a library row's curated streaming URLs. Album-
     less winners and LML#782 album-fallback winners carry False: their
     album axis never passed, so they prove nothing about the requested
-    album. Defaults True because every pre-#782 match was constrained by
-    construction; ``find_track_metadata`` always sets it explicitly.
+    album. Deliberately no default: a silent True would fail open
+    (authorizing the destructive #505 clear), a silent False would fail
+    open the other way (re-admitting the sibling-override leak #505
+    fixed) — every construction site must state its evidence.
     """
 
     url: str
     artwork_url: str | None
     release_year: int | None
-    album_verified: bool = True
+    album_verified: bool
 
 
 logger = logging.getLogger(__name__)
@@ -93,8 +95,10 @@ logger = logging.getLogger(__name__)
 # provider uses inside `clients/streaming/matching.is_acceptable_match` — not a
 # re-declared literal, so the two can't drift (LML#592). Stops the wrong link
 # from freezing onto a flowsheet row when Apple's search ranking is unstable for
-# obscure artists (LML#389) or returns a same-titled track from the wrong
-# album (LML#396).
+# obscure artists (LML#389). On the album axis the floor now gates metadata
+# rather than the link: a same-titled track from the wrong album (LML#396)
+# loses its album-derived fields and `album_verified` status via the LML#782
+# album-less fallback instead of being dropped outright.
 _APPLE_MUSIC_MATCH_FLOOR = SCORE_MATCH_ACCEPTANCE_FLOOR
 
 # Apple Music developer-token lifetime. Apple permits `exp` up to ~6 months;
