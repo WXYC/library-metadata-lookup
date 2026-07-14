@@ -177,34 +177,113 @@ class TestInFlightCapBehavior:
 
 
 class TestInFlightCapConfiguration:
-    def test_env_var_name_and_default(self):
+    def test_env_var_name_and_ceiling(self):
         assert router_mod._LOOKUP_MAX_CONCURRENT_ENV_VAR == "LML_LOOKUP_MAX_CONCURRENT"
-        assert router_mod._LOOKUP_DEFAULT_MAX_CONCURRENT == 8
+        # The ceiling is the historical default; the *effective* default is now
+        # this clamped to the PG pools (see TestInFlightCapPoolClamp).
+        assert router_mod._LOOKUP_MAX_CONCURRENT_CEILING == 8
 
     def test_semaphore_uses_env_override(self, monkeypatch):
         monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "3")
         sem = router_mod._get_lookup_semaphore()
         assert sem._value == 3
 
-    def test_semaphore_falls_back_to_default_when_unset(self, monkeypatch):
+    def test_semaphore_falls_back_to_pool_clamped_default_when_unset(self, monkeypatch):
+        # With the cap unset and the discogs-cache pool at its default of 5, the
+        # effective default is min(ceiling=8, discogs=5) = 5 — the cap can never
+        # silently exceed the pool it contends for (LML#706).
         monkeypatch.delenv("LML_LOOKUP_MAX_CONCURRENT", raising=False)
+        monkeypatch.delenv("LML_DISCOGS_POOL_MAX_SIZE", raising=False)
         sem = router_mod._get_lookup_semaphore()
-        assert sem._value == router_mod._LOOKUP_DEFAULT_MAX_CONCURRENT
+        assert sem._value == router_mod._lookup_default_max_concurrent()
+        assert sem._value == 5
 
     @pytest.mark.parametrize("bad", ["0", "-4", "banana"])
-    def test_invalid_env_falls_back_to_default(self, monkeypatch, bad):
+    def test_invalid_env_falls_back_to_pool_clamped_default(self, monkeypatch, bad):
         # resolve_positive_int_env semantics: operator typos must not change
         # the cap to something surprising — unparseable/zero/negative all WARN
-        # and fall back (a 0 cap would deadlock every request forever).
+        # and fall back (a 0 cap would deadlock every request forever). The
+        # fallback is now the pool-clamped default, not a bare 8.
         monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", bad)
+        monkeypatch.delenv("LML_DISCOGS_POOL_MAX_SIZE", raising=False)
         sem = router_mod._get_lookup_semaphore()
-        assert sem._value == router_mod._LOOKUP_DEFAULT_MAX_CONCURRENT
+        assert sem._value == router_mod._lookup_default_max_concurrent()
+        assert sem._value == 5
 
     def test_semaphore_is_process_global_across_calls(self, monkeypatch):
         # One cap per worker process, spanning requests — NOT per-request like
         # the bulk handler's batch-internal semaphore.
         monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "2")
         assert router_mod._get_lookup_semaphore() is router_mod._get_lookup_semaphore()
+
+
+class TestInFlightCapPoolClamp:
+    """The default cap must never exceed the discogs-cache pool (LML#706).
+
+    Every `/lookup` borrows the discogs-cache asyncpg pool for its cache reads,
+    trigram match, and identity mint (WXYC#395 — the entity store reuses that
+    one pool; `LML_PG_POOL_MAX_SIZE` sizes only the off-hot-path musicbrainz
+    pool). A lookup semaphore wider than that pool doesn't add throughput — it
+    just relocates the queue from the semaphore (where waits are measured and
+    bounded) onto ``pool.acquire()``, where the wait attaches to whatever PG
+    span is open. That is the mechanism behind the reopen's "1.4 ms
+    entity.identity SELECT that took 5,070 ms". So the *default* cap is
+    ``min(ceiling, discogs_pool)``; an explicit env override may still exceed
+    it, but emits a guard warning.
+    """
+
+    def test_default_is_ceiling_when_pool_is_large(self, monkeypatch):
+        monkeypatch.delenv("LML_LOOKUP_MAX_CONCURRENT", raising=False)
+        monkeypatch.setenv("LML_DISCOGS_POOL_MAX_SIZE", "20")
+        sem = router_mod._get_lookup_semaphore()
+        assert sem._value == router_mod._LOOKUP_MAX_CONCURRENT_CEILING == 8
+
+    def test_default_clamps_to_pool_below_ceiling(self, monkeypatch):
+        monkeypatch.delenv("LML_LOOKUP_MAX_CONCURRENT", raising=False)
+        monkeypatch.setenv("LML_DISCOGS_POOL_MAX_SIZE", "3")
+        sem = router_mod._get_lookup_semaphore()
+        assert sem._value == 3
+
+    def test_raising_pool_lifts_the_default_up_to_the_ceiling(self, monkeypatch):
+        monkeypatch.delenv("LML_LOOKUP_MAX_CONCURRENT", raising=False)
+        monkeypatch.setenv("LML_DISCOGS_POOL_MAX_SIZE", "7")
+        sem = router_mod._get_lookup_semaphore()
+        assert sem._value == 7
+
+    def test_musicbrainz_pool_does_not_couple_the_cap(self, monkeypatch):
+        # LML_PG_POOL_MAX_SIZE sizes the owned musicbrainz pool, which a
+        # `/lookup` does not borrow on the hot path — it must NOT drag the cap
+        # down. Discogs pool at 5, musicbrainz at 1 => cap stays 5.
+        monkeypatch.delenv("LML_LOOKUP_MAX_CONCURRENT", raising=False)
+        monkeypatch.setenv("LML_DISCOGS_POOL_MAX_SIZE", "5")
+        monkeypatch.setenv("LML_PG_POOL_MAX_SIZE", "1")
+        sem = router_mod._get_lookup_semaphore()
+        assert sem._value == 5
+
+    def test_explicit_override_above_pool_still_wins_but_warns(self, monkeypatch, caplog):
+        # Operators keep the no-redeploy Railway lever: an explicit cap over the
+        # pool is honoured (they may be about to raise the pool too), but the
+        # guard makes the hazardous mismatch loud instead of silent — AC#4.
+        monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "8")
+        monkeypatch.setenv("LML_DISCOGS_POOL_MAX_SIZE", "5")
+        with caplog.at_level("WARNING", logger=router_mod.logger.name):
+            sem = router_mod._get_lookup_semaphore()
+        assert sem._value == 8
+        assert any(
+            "LML_LOOKUP_MAX_CONCURRENT" in r.message and "pool" in r.message.lower()
+            for r in caplog.records
+        ), "expected a guard warning when the cap exceeds the discogs-cache pool"
+
+    def test_default_within_pool_does_not_warn(self, monkeypatch, caplog):
+        monkeypatch.delenv("LML_LOOKUP_MAX_CONCURRENT", raising=False)
+        monkeypatch.setenv("LML_DISCOGS_POOL_MAX_SIZE", "5")
+        with caplog.at_level("WARNING", logger=router_mod.logger.name):
+            sem = router_mod._get_lookup_semaphore()
+        assert sem._value == 5
+        assert not any(
+            "LML_LOOKUP_MAX_CONCURRENT" in r.message and "exceeds" in r.message.lower()
+            for r in caplog.records
+        )
 
 
 class TestCallerBudgetDeduction:
