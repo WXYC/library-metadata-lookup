@@ -222,8 +222,8 @@ class TestFindTrackUrl:
         release beats the permanent null BS persistence froze these into
         (BS#1192). The wrong-album *metadata* leak LML#396/#487 guarded
         against cannot recur — the fallback strips the album-derived
-        fields (pinned by TestFindTrackMetadata.
-        test_album_below_floor_falls_back_to_url_only)."""
+        fields, pinned by the metadata-path twin
+        ``test_album_below_floor_falls_back_to_url_only``."""
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(
@@ -242,6 +242,9 @@ class TestFindTrackUrl:
 
         url = await client.find_track_url("Friko", "Get Numb To It!", album="RED XEROX")
         assert url == "https://music.apple.com/us/song/get-numb-to-it/1713114815"
+        # The fallback is a re-score of the SAME response — never a second
+        # Apple API round (the documented quota invariant).
+        assert mock_http.get.call_count == 1
 
     @pytest.mark.asyncio
     async def test_picks_best_scoring_when_multiple_clear_floor(self, es256_keypair):
@@ -639,6 +642,9 @@ class TestFindTrackMetadata:
         assert match.url == "https://music.apple.com/us/song/hebebeb-zrag/9"
         assert match.artwork_url is None
         assert match.release_year is None
+        # The fallback is a re-score of the SAME response — never a second
+        # Apple API round (the documented quota invariant).
+        assert mock_http.get.call_count == 1
 
     @pytest.mark.asyncio
     async def test_constrained_winner_is_album_verified(self, es256_keypair):
@@ -1139,6 +1145,31 @@ class TestFindTrackMetadataEmits:
         assert kwargs["matched_artist"] == "Wanda"
         assert kwargs["query_title"] == "la paradoja"
         assert kwargs["matched_title"] == "la paradoja"
+
+    @pytest.mark.asyncio
+    async def test_whitespace_album_emits_plain_track_surface(self, es256_keypair):
+        """A whitespace-only album normalizes to ``""`` — no scoreable
+        constraint. It must take the album-less path directly (one scoring
+        pass, ``surface="track"``), not run a guaranteed-miss constrained
+        pass and mislabel the winner ``"track_album_fallback"`` — that
+        would inflate the LML#592 fallback-rate dashboard with requests
+        that were never album-constrained to begin with."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([_make_song_data_full()]))
+        client._http = mock_http
+
+        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
+            match = await client.find_track_metadata(
+                "Noura Mint Seymali", "Hebebeb (Zrag)", album="   "
+            )
+
+        assert match is not None
+        assert match.artwork_url is None
+        assert match.release_year is None
+        assert match.album_verified is False
+        rec.assert_called_once()
+        assert rec.call_args.kwargs["surface"] == "track"
 
     @pytest.mark.asyncio
     async def test_emits_scores_of_chosen_winner_not_top_fuzz(self, es256_keypair):
