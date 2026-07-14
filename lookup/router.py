@@ -29,6 +29,7 @@ from core.bulk_concurrency import (
     watch_disconnect,
 )
 from core.dependencies import (
+    discogs_pool_max_size,
     get_discogs_cache_pg,
     get_discogs_cache_service,
     get_discogs_service,
@@ -95,11 +96,42 @@ _BULK_LOOKUP_DEFAULT_CONCURRENCY = 10
 # LML_LOOKUP_MAX_CONCURRENT + LML_BULK_GLOBAL_MAX_CONCURRENT, so size the
 # pool against that SUM. `/streaming-check` sits under neither cap (it
 # borrows no pool connection); its loop-time residual is LML#753.
-# Default 8: above the warm path's needs (~5 ms hits never stack
-# that deep at production arrival rates) and low enough that a single-lookup
-# cold storm can't re-enter the pool-starvation regime.
+# Ceiling 8: above the warm path's needs (~5 ms hits never stack that deep at
+# production arrival rates) and low enough that a single-lookup cold storm
+# can't re-enter the pool-starvation regime.
+#
+# But 8 is only the CEILING, not the effective default. The reopen (LML#706)
+# showed the residual cold tail is a cap-wider-than-pool hazard: the cap
+# defaulted to 8 while the discogs-cache pool defaults to 5, so up to 3
+# admitted lookups sat on ``pool.acquire()`` at once — moving the queue off the
+# (measured, bounded) semaphore onto acquire, where the wait attaches to
+# whatever PG span is open (a 1.4 ms ``entity.identity`` SELECT measured at
+# 5 s). The discogs-cache pool is THE binding constraint for a `/lookup`: the
+# trigram release match, the streaming-URL cache read, AND every identity
+# mint/lookup borrow that one pool (the WXYC#395 shared seam — the entity store
+# reuses the discogs pool, it is not an owned `LML_PG_POOL_MAX_SIZE` pool;
+# that knob sizes only the off-hot-path musicbrainz pool). Profiling ruled out
+# ``library/db.py`` as the loop-blocker (fallback paths are 5-9 ms, off-loop,
+# <2 ms loop lag at ×8), leaving this config incoherence as the fitting
+# mechanism. So the effective default is the ceiling CLAMPED to the discogs
+# pool — the cap can never *silently* exceed the pool it contends for. An
+# explicit ``LML_LOOKUP_MAX_CONCURRENT`` still overrides upward (the
+# no-redeploy Railway lever), but emits a guard warning.
 _LOOKUP_MAX_CONCURRENT_ENV_VAR = "LML_LOOKUP_MAX_CONCURRENT"
-_LOOKUP_DEFAULT_MAX_CONCURRENT = 8
+_LOOKUP_MAX_CONCURRENT_CEILING = 8
+
+
+def _lookup_default_max_concurrent() -> int:
+    """Effective default ``/lookup`` in-flight cap: the ceiling, clamped to the pool.
+
+    ``min(_LOOKUP_MAX_CONCURRENT_CEILING, discogs_pool_max_size())`` — read at
+    semaphore-construction time so ``LML_DISCOGS_POOL_MAX_SIZE`` is honoured
+    without a redeploy, mirroring the cap's own env read. Every `/lookup`
+    borrows the discogs-cache pool for its cache reads, trigram match, and
+    identity mint (WXYC#395), so that pool is the binding constraint (LML#706).
+    """
+    return min(_LOOKUP_MAX_CONCURRENT_CEILING, discogs_pool_max_size())
+
 
 _lookup_semaphore: asyncio.Semaphore | None = None
 """Lazily constructed on the first request — NOT because a semaphore needs a
@@ -114,13 +146,32 @@ def _get_lookup_semaphore() -> asyncio.Semaphore:
 
     Sized from ``LML_LOOKUP_MAX_CONCURRENT`` (read once, at first
     construction; unparseable/zero/negative values WARN and fall back — a 0
-    cap would deadlock every request forever).
+    cap would deadlock every request forever). The fallback is the pool-clamped
+    default (:func:`_lookup_default_max_concurrent`), not a bare 8, so an unset
+    cap can never exceed the pool it contends for (LML#706). An explicit
+    override *may* exceed the pool; the guard below makes that mismatch loud
+    rather than silent (LML#706 AC#4).
     """
     global _lookup_semaphore
     if _lookup_semaphore is None:
-        _lookup_semaphore = asyncio.Semaphore(
-            resolve_positive_int_env(_LOOKUP_MAX_CONCURRENT_ENV_VAR, _LOOKUP_DEFAULT_MAX_CONCURRENT)
+        # One read of the pool size backs both the clamped default and the
+        # guard, so they can't disagree about which pool the cap is measured
+        # against (the clamp keeps the default within it; the guard flags an
+        # explicit override that escapes it).
+        pool_max = discogs_pool_max_size()
+        cap = resolve_positive_int_env(
+            _LOOKUP_MAX_CONCURRENT_ENV_VAR, min(_LOOKUP_MAX_CONCURRENT_CEILING, pool_max)
         )
+        if cap > pool_max:
+            logger.warning(
+                "LML_LOOKUP_MAX_CONCURRENT=%d exceeds the discogs-cache pool (%d): "
+                "excess in-flight lookups will queue on pool.acquire() and inflate "
+                "trivial PG spans (LML#706). Raise LML_DISCOGS_POOL_MAX_SIZE to "
+                "match, or lower the cap.",
+                cap,
+                pool_max,
+            )
+        _lookup_semaphore = asyncio.Semaphore(cap)
     return _lookup_semaphore
 
 
