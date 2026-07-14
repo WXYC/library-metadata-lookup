@@ -121,7 +121,7 @@ _LOOKUP_MAX_CONCURRENT_ENV_VAR = "LML_LOOKUP_MAX_CONCURRENT"
 _LOOKUP_MAX_CONCURRENT_CEILING = 8
 
 
-def _lookup_default_max_concurrent() -> int:
+def _lookup_default_max_concurrent(pool_max: int | None = None) -> int:
     """Effective default ``/lookup`` in-flight cap: the ceiling, clamped to the pool.
 
     ``min(_LOOKUP_MAX_CONCURRENT_CEILING, discogs_pool_max_size())`` — read at
@@ -129,8 +129,15 @@ def _lookup_default_max_concurrent() -> int:
     without a redeploy, mirroring the cap's own env read. Every `/lookup`
     borrows the discogs-cache pool for its cache reads, trigram match, and
     identity mint (WXYC#395), so that pool is the binding constraint (LML#706).
+
+    ``pool_max`` lets the caller pass a pool size it already read, so the
+    semaphore builder can size both the clamp and its guard from one env read
+    without this helper reading it a second time. Left ``None`` (the test/probe
+    path), it reads the env itself.
     """
-    return min(_LOOKUP_MAX_CONCURRENT_CEILING, discogs_pool_max_size())
+    if pool_max is None:
+        pool_max = discogs_pool_max_size()
+    return min(_LOOKUP_MAX_CONCURRENT_CEILING, pool_max)
 
 
 _lookup_semaphore: asyncio.Semaphore | None = None
@@ -157,10 +164,12 @@ def _get_lookup_semaphore() -> asyncio.Semaphore:
         # One read of the pool size backs both the clamped default and the
         # guard, so they can't disagree about which pool the cap is measured
         # against (the clamp keeps the default within it; the guard flags an
-        # explicit override that escapes it).
+        # explicit override that escapes it). ``_lookup_default_max_concurrent``
+        # stays the single definition of the clamp — passed the pool we already
+        # read so it doesn't read the env a second time.
         pool_max = discogs_pool_max_size()
         cap = resolve_positive_int_env(
-            _LOOKUP_MAX_CONCURRENT_ENV_VAR, min(_LOOKUP_MAX_CONCURRENT_CEILING, pool_max)
+            _LOOKUP_MAX_CONCURRENT_ENV_VAR, _lookup_default_max_concurrent(pool_max)
         )
         if cap > pool_max:
             logger.warning(
@@ -189,7 +198,7 @@ def _project_inflight_capped(wait_ms: float) -> None:
       untagged.
     * ``set_measurement("lml.lookup.inflight_wait_ms", ...)`` — the
       quantitative series (p95 queue wait) that decides whether the default
-      cap of 8 is tuned right.
+      cap (``min(8, LML_DISCOGS_POOL_MAX_SIZE)``) is tuned right.
 
     Observability must not break the request path; failures log and continue.
     """
