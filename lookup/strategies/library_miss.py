@@ -17,6 +17,7 @@ from clients.streaming.matching import find_best_typed_match
 from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
 from discogs.service import DiscogsService
 from library.models import LibraryItem
+from lookup.matching import is_self_titled
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,15 @@ async def _library_miss_discogs_search(
     album = (parsed.album or "").strip()
     if not artist or not album:
         return None
+
+    # LML#784 category 4: a query-side self-titled placeholder ("S/T",
+    # "s.t.", "self-titled") can never match a real Discogs title — swap in
+    # the artist name for both the search and the title-axis scoring,
+    # mirroring the library-side swap in ``lookup/artwork.py``. The trigger
+    # string is NOT kept as a scoring variant: a wrong-release candidate
+    # literally titled "S/T" would clear the floor trivially.
+    if is_self_titled(album):
+        album = artist
 
     request = DiscogsSearchRequest(album=album, artist=artist)
 
