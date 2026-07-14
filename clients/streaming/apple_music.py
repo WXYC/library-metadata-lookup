@@ -339,7 +339,9 @@ class AppleMusicClient(BaseStreamingClient):
 
     async def find_track_url(self, artist: str, song: str, album: str | None = None) -> str | None:
         """Search for `(artist, song[, album])` and return the Apple Music track
-        URL of the best floor-clearing match, else `None`.
+        URL of the best floor-clearing match, else `None`. The album axis is
+        soft (LML#782): an album-constrained miss re-scores without it, so a
+        supplied album narrows the choice but no longer vetoes the URL.
 
         Thin wrapper around ``find_track_metadata`` (LML#500): both methods
         score against the same ``search_song`` response with the same
@@ -415,7 +417,11 @@ class AppleMusicClient(BaseStreamingClient):
 
         norm_artist = normalize_for_comparison(artist)
         norm_song = normalize_for_comparison(song)
-        norm_album = normalize_for_comparison(album) if album else None
+        # ``or None``: a whitespace-only album normalizes to "" — no
+        # scoreable constraint, so treat it as album-less rather than
+        # running a guaranteed-miss constrained pass whose winner would
+        # be mislabeled ``track_album_fallback`` in LML#592 telemetry.
+        norm_album = (normalize_for_comparison(album) or None) if album else None
 
         best, (artist_axis, track_axis) = _select_best_track_candidate(
             results,
@@ -440,6 +446,13 @@ class AppleMusicClient(BaseStreamingClient):
         # winner is surfaced URL-only (below): its album-derived fields
         # describe an album that just FAILED the floor against the request,
         # so carrying them would be the LML#396/#487 wrong-album leak.
+        # Known recall trade: the fallback URL fills the Apple slot, which
+        # preempts the album-keyed post-process leg (it fires only on a
+        # null slot). For genuine divergence rows that leg could never
+        # succeed anyway; when the requested album DOES exist on Apple but
+        # its track version fell outside this search's top results, the
+        # track deep-link wins over the eventually-warmed album-canonical
+        # URL — the issue's "URL beats null" call, accepted knowingly.
         album_fallback = False
         if best is None and norm_album is not None:
             best, (artist_axis, track_axis) = _select_best_track_candidate(
