@@ -208,19 +208,40 @@ class TestFindTrackUrl:
         assert url is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_album_below_floor(self, es256_keypair):
-        """LML#396: same artist + same track title on the wrong album."""
+    async def test_album_below_floor_falls_back_to_url(self, es256_keypair):
+        """LML#782: album-title divergence. The WXYC catalog album and
+        Apple's album for the same track can legitimately differ (Friko's
+        "Get Numb To It!" lives on an Apple album titled "Get Numb to
+        It!", not the catalog's "RED XEROX"), so an album-constrained
+        miss re-scores the same response with the album axis dropped
+        (artist+track 80/80 still enforced) and surfaces the per-track
+        URL instead of returning None.
+
+        This deliberately inverts the LML#396 expectation (album below
+        floor -> None): a link to the verified track on a different
+        release beats the permanent null BS persistence froze these into
+        (BS#1192). The wrong-album *metadata* leak LML#396/#487 guarded
+        against cannot recur — the fallback strips the album-derived
+        fields (pinned by TestFindTrackMetadata.
+        test_album_below_floor_falls_back_to_url_only)."""
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(
-            return_value=_songs_response([_make_song_data(album_name="Some Unrelated Compilation")])
+            return_value=_songs_response(
+                [
+                    _make_song_data(
+                        name="Get Numb to It!",
+                        artist_name="Friko",
+                        album_name="Get Numb to It!",
+                        url="https://music.apple.com/us/song/get-numb-to-it/1713114815",
+                    )
+                ]
+            )
         )
         client._http = mock_http
 
-        url = await client.find_track_url(
-            "Jessica Pratt", "Back, Baby", album="On Your Own Love Again"
-        )
-        assert url is None
+        url = await client.find_track_url("Friko", "Get Numb To It!", album="RED XEROX")
+        assert url == "https://music.apple.com/us/song/get-numb-to-it/1713114815"
 
     @pytest.mark.asyncio
     async def test_picks_best_scoring_when_multiple_clear_floor(self, es256_keypair):
@@ -594,12 +615,16 @@ class TestFindTrackMetadata:
         assert match is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_album_below_floor(self, es256_keypair):
-        """LML#487 Tzenni-vs-Yenbett shape: when the song appears on the
-        wrong album in Apple's catalog (a compilation, a single-track
-        sampler) the 3-way 80/80/80 floor must reject. Otherwise the
-        synthesized result would carry wrong-album artwork, regressing
-        on the very bug this ticket fixes."""
+    async def test_album_below_floor_falls_back_to_url_only(self, es256_keypair):
+        """LML#782 album-less fallback on the metadata path: when every
+        candidate fails the album axis (Tzenni-vs-Yenbett shape — the
+        song sits on a different Apple album than the one requested),
+        re-score without the album constraint and surface the per-track
+        URL — but STRIP ``artwork_url`` and ``release_year``. The
+        candidate's album-derived fields describe an album that failed
+        the 80 floor against the requested one, so surfacing them would
+        be exactly the wrong-album leak LML#487 fixed. Same contract as
+        ``album=None`` (``test_album_none_strips_album_derived_fields``)."""
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(
@@ -610,6 +635,56 @@ class TestFindTrackMetadata:
         match = await client.find_track_metadata(
             "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
         )
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/hebebeb-zrag/9"
+        assert match.artwork_url is None
+        assert match.release_year is None
+
+    @pytest.mark.asyncio
+    async def test_album_fallback_does_not_rescue_artist_below_floor(self, es256_keypair):
+        """The LML#782 fallback relaxes ONLY the album axis. A candidate
+        that also fails the artist floor stays rejected in the re-score —
+        the LML#389 wrong-artist guard is untouched by the fallback."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response(
+                [
+                    _make_song_data_full(
+                        artist_name="Completely Different Artist",
+                        album_name="Some Unrelated Compilation",
+                    )
+                ]
+            )
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Yenbett"
+        )
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_album_fallback_does_not_rescue_degenerate_title_subset(self, es256_keypair):
+        """The LML#719 degenerate-subset guard applies inside the LML#782
+        fallback re-score too: a buried token-subset title (``Hound Dog``
+        inside ``Black leather (The hound dog mix)``) must stay rejected
+        even with the album axis dropped."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response(
+                [
+                    _make_song_data_full(
+                        name="Black leather (The hound dog mix)",
+                        album_name="Some Unrelated Compilation",
+                    )
+                ]
+            )
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata("Noura Mint Seymali", "Hound Dog", album="Yenbett")
         assert match is None
 
     @pytest.mark.asyncio
@@ -1003,6 +1078,29 @@ class TestFindTrackMetadataEmits:
         # Emitted title score is B's track axis (la paradoja == 100), NOT B's
         # album axis (DOGA vs DOGAS == 88.89) — pins (artist, track) lockstep.
         assert rec.call_args.kwargs["title_score"] >= 95.0
+
+    @pytest.mark.asyncio
+    async def test_fallback_winner_emits_distinct_surface(self, es256_keypair):
+        """LML#782: a winner selected by the album-less fallback re-score
+        emits ``surface="track_album_fallback"`` — exactly one call,
+        because the album-constrained pass chose no winner and so emitted
+        nothing. The distinct surface lets LML#592 dashboards track the
+        fallback rate separately from ordinary track wins."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response([_make_song_data(album_name="Some Unrelated Compilation")])
+        )
+        client._http = mock_http
+
+        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
+            match = await client.find_track_metadata(
+                "Jessica Pratt", "Back, Baby", album="On Your Own Love Again"
+            )
+
+        assert match is not None
+        rec.assert_called_once()
+        assert rec.call_args.kwargs["surface"] == "track_album_fallback"
 
 
 class TestRetryBehavior:

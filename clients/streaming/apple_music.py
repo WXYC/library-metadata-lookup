@@ -385,6 +385,12 @@ class AppleMusicClient(BaseStreamingClient):
         carries over to ``find_track_url`` (post-collapse): the happy
         path doesn't consume artwork, but the URL it returns now comes
         from a likely-more-canonical record.
+
+        When the album-constrained pass clears nobody, RE-SCORES the same
+        response with the album axis dropped and returns the winner's URL
+        only (LML#782 album-title divergence — see the fallback comment
+        inline). Still a single Apple Music API call: the album constraint
+        was never part of the ``search_song`` query, only of the scoring.
         """
         results = await self.search_song(artist, song)
         if not results:
@@ -394,82 +400,50 @@ class AppleMusicClient(BaseStreamingClient):
         norm_song = normalize_for_comparison(song)
         norm_album = normalize_for_comparison(album) if album else None
 
-        best_overall: dict | None = None
-        best_overall_score = 0.0
-        best_overall_axes: tuple[float, float] = (0.0, 0.0)
-        best_with_artwork: dict | None = None
-        best_with_artwork_score = 0.0
-        best_with_artwork_axes: tuple[float, float] = (0.0, 0.0)
+        best, (artist_axis, track_axis) = _select_best_track_candidate(
+            results,
+            norm_artist=norm_artist,
+            norm_song=norm_song,
+            norm_album=norm_album,
+            raw_song=song,
+        )
 
-        for item in results:
-            attrs = item.get("attributes") or {}
-            url = attrs.get("url")
-            if not url:
-                continue
-            artist_score = fuzz.token_set_ratio(
-                norm_artist, normalize_for_comparison(attrs.get("artistName") or "")
+        # LML#782: album-title divergence. The WXYC catalog album and
+        # Apple's album for the same track can legitimately differ (Friko's
+        # "Get Numb To It!" sits on an Apple album titled "Get Numb to
+        # It!", not the catalog's "RED XEROX"), and the album-keyed
+        # streaming-URL post-process can never rescue such rows — it
+        # searches Apple by the request album, which doesn't exist there.
+        # Returning None here therefore froze these tracks as permanent
+        # nulls once Backend-Service persisted the miss (BS#1192). Re-score
+        # the SAME response with the album axis dropped: the artist/track
+        # 80/80 floors (LML#389) and the LML#719 degenerate-subset guard
+        # still apply, so only the album constraint is relaxed. Zero extra
+        # API calls — the album was only ever a scoring-time filter. The
+        # winner is surfaced URL-only (below): its album-derived fields
+        # describe an album that just FAILED the floor against the request,
+        # so carrying them would be the LML#396/#487 wrong-album leak.
+        album_fallback = False
+        if best is None and norm_album is not None:
+            best, (artist_axis, track_axis) = _select_best_track_candidate(
+                results,
+                norm_artist=norm_artist,
+                norm_song=norm_song,
+                norm_album=None,
+                raw_song=song,
             )
-            track_score = fuzz.token_set_ratio(
-                norm_song, normalize_for_comparison(attrs.get("name") or "")
-            )
-            if artist_score < _APPLE_MUSIC_MATCH_FLOOR or track_score < _APPLE_MUSIC_MATCH_FLOOR:
-                continue
-            # LML#719: token_set_ratio returns 100 for any token-subset, so a
-            # short generic query title buried in a long unrelated candidate
-            # clears the floor with no real signal — fatal on Various-Artists
-            # requests where the artist axis can't disambiguate (a `Various
-            # Artists` request shares the `various artists` token cluster with
-            # any VA-credited catalog spam). Reject the title axis's degenerate
-            # subsets while keeping the legitimate variant subsets the
-            # token_set path exists to admit. Title axis only — the artist axis
-            # keeps token_set for leader->ensemble subsets (Yves -> Yves Tumor).
-            #
-            # Recall cost (accepted): the guard is unconditional, so a genuine
-            # partial/truncated query title that is a NON-suffix token-subset
-            # (`Fade` -> `Fade Into You`, `Motion` -> `Motion Sickness`) now
-            # drops even when the artist axis is an exact match — these scored
-            # token_set 100 pre-LML#719. This is the fail-safe trade: dropping
-            # Apple enrichment (URL/artwork/year) beats caching a wrong one, and
-            # the loss only bites when the track is ALSO absent from the WXYC
-            # library (the synthesis path is the sole find_track_metadata
-            # caller; in-catalog rows source artwork from the library row, not
-            # this probe). Never alters the DJ's typed artist/song text.
-            if title_subset_is_degenerate(song, attrs.get("name") or ""):
-                continue
-            if norm_album is not None:
-                album_score = fuzz.token_set_ratio(
-                    norm_album, normalize_for_comparison(attrs.get("albumName") or "")
-                )
-                if album_score < _APPLE_MUSIC_MATCH_FLOOR:
-                    continue
-                combined = (artist_score + track_score + album_score) / 3
-            else:
-                combined = (artist_score + track_score) / 2
-            if combined > best_overall_score:
-                best_overall_score = combined
-                best_overall = item
-                best_overall_axes = (artist_score, track_score)
-            if (attrs.get("artwork") or {}).get("url") and combined > best_with_artwork_score:
-                best_with_artwork_score = combined
-                best_with_artwork = item
-                best_with_artwork_axes = (artist_score, track_score)
+            album_fallback = True
 
-        best = best_with_artwork or best_overall
         if best is None:
             return None
 
-        # LML#592: emit the CHOSEN winner's axis scores (track surface). Scores
-        # are stashed in lockstep with each candidate so they describe whichever
-        # record `best_with_artwork or best_overall` actually selected — not the
-        # higher-fuzz record that artwork preference may have passed over.
-        artist_axis, track_axis = (
-            best_with_artwork_axes if best is best_with_artwork else best_overall_axes
-        )
         record_match_telemetry(
             artist_score=artist_axis,
             title_score=track_axis,
             service="apple_music",
-            surface="track",
+            # The fallback winner gets its own surface so LML#592 dashboards
+            # can watch the fallback rate separately from ordinary track wins.
+            surface="track_album_fallback" if album_fallback else "track",
             # LML#592 labeling: request values vs the CHOSEN winner's strings
             # (same record the axes were stashed from), for the marginal sample.
             query_artist=artist,
@@ -485,8 +459,10 @@ class AppleMusicClient(BaseStreamingClient):
         # album-derived fields (``artwork_url``, ``release_year``) describe
         # whatever album Apple ranked highest; surfacing them on the
         # synthesized result would be a wrong-album leak. ~40% of
-        # request-o-matic traffic is artist+song-only.
-        if album is None:
+        # request-o-matic traffic is artist+song-only. The LML#782 fallback
+        # winner is the same trade with sharper evidence — its album just
+        # FAILED the floor against the requested one — so it is URL-only too.
+        if album is None or album_fallback:
             return AppleMusicTrackMatch(url=_extract_url(best), artwork_url=None, release_year=None)
 
         return AppleMusicTrackMatch(
@@ -494,6 +470,100 @@ class AppleMusicClient(BaseStreamingClient):
             artwork_url=_extract_artwork_url(best),
             release_year=_extract_release_year(best),
         )
+
+
+def _select_best_track_candidate(
+    results: list[dict],
+    *,
+    norm_artist: str,
+    norm_song: str,
+    norm_album: str | None,
+    raw_song: str,
+) -> tuple[dict | None, tuple[float, float]]:
+    """One scoring pass over a ``search_song`` response.
+
+    Applies the 80/80(/80) ``token_set_ratio`` floor per axis plus the
+    LML#719 degenerate-subset guard on the title axis, and picks the
+    highest-combined-score candidate — PREFERRING floor-clearers that
+    carry ``attributes.artwork`` over higher-scoring ones that lack it
+    (see ``find_track_metadata``'s docstring for why).
+
+    Extracted from ``find_track_metadata`` so the LML#782 album-less
+    fallback can re-score the same in-memory response with
+    ``norm_album=None`` instead of paying a second Apple Music call.
+    ``raw_song`` is the un-normalized request title — the LML#719 guard
+    does its own normalization internally.
+
+    Returns ``(best, (artist_score, track_score))`` — the chosen record
+    (or ``None`` when nothing clears) plus its per-axis scores, stashed
+    in lockstep with the candidate so they describe whichever record
+    ``best_with_artwork or best_overall`` actually selected, not the
+    higher-fuzz record that artwork preference may have passed over
+    (LML#592).
+    """
+    best_overall: dict | None = None
+    best_overall_score = 0.0
+    best_overall_axes: tuple[float, float] = (0.0, 0.0)
+    best_with_artwork: dict | None = None
+    best_with_artwork_score = 0.0
+    best_with_artwork_axes: tuple[float, float] = (0.0, 0.0)
+
+    for item in results:
+        attrs = item.get("attributes") or {}
+        url = attrs.get("url")
+        if not url:
+            continue
+        artist_score = fuzz.token_set_ratio(
+            norm_artist, normalize_for_comparison(attrs.get("artistName") or "")
+        )
+        track_score = fuzz.token_set_ratio(
+            norm_song, normalize_for_comparison(attrs.get("name") or "")
+        )
+        if artist_score < _APPLE_MUSIC_MATCH_FLOOR or track_score < _APPLE_MUSIC_MATCH_FLOOR:
+            continue
+        # LML#719: token_set_ratio returns 100 for any token-subset, so a
+        # short generic query title buried in a long unrelated candidate
+        # clears the floor with no real signal — fatal on Various-Artists
+        # requests where the artist axis can't disambiguate (a `Various
+        # Artists` request shares the `various artists` token cluster with
+        # any VA-credited catalog spam). Reject the title axis's degenerate
+        # subsets while keeping the legitimate variant subsets the
+        # token_set path exists to admit. Title axis only — the artist axis
+        # keeps token_set for leader->ensemble subsets (Yves -> Yves Tumor).
+        #
+        # Recall cost (accepted): the guard is unconditional, so a genuine
+        # partial/truncated query title that is a NON-suffix token-subset
+        # (`Fade` -> `Fade Into You`, `Motion` -> `Motion Sickness`) now
+        # drops even when the artist axis is an exact match — these scored
+        # token_set 100 pre-LML#719. This is the fail-safe trade: dropping
+        # Apple enrichment (URL/artwork/year) beats caching a wrong one, and
+        # the loss only bites when the track is ALSO absent from the WXYC
+        # library (the synthesis path is the sole find_track_metadata
+        # caller; in-catalog rows source artwork from the library row, not
+        # this probe). Never alters the DJ's typed artist/song text.
+        if title_subset_is_degenerate(raw_song, attrs.get("name") or ""):
+            continue
+        if norm_album is not None:
+            album_score = fuzz.token_set_ratio(
+                norm_album, normalize_for_comparison(attrs.get("albumName") or "")
+            )
+            if album_score < _APPLE_MUSIC_MATCH_FLOOR:
+                continue
+            combined = (artist_score + track_score + album_score) / 3
+        else:
+            combined = (artist_score + track_score) / 2
+        if combined > best_overall_score:
+            best_overall_score = combined
+            best_overall = item
+            best_overall_axes = (artist_score, track_score)
+        if (attrs.get("artwork") or {}).get("url") and combined > best_with_artwork_score:
+            best_with_artwork_score = combined
+            best_with_artwork = item
+            best_with_artwork_axes = (artist_score, track_score)
+
+    best = best_with_artwork or best_overall
+    axes = best_with_artwork_axes if best is best_with_artwork else best_overall_axes
+    return best, axes
 
 
 def _extract_artist_name(item: dict) -> str:

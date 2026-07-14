@@ -393,7 +393,8 @@ def record_match_telemetry(
         artist_score: Fuzzy score of the request artist vs the matched artist.
         title_score: Fuzzy score of the request title vs the matched title.
         service: Streaming service that produced the match ("apple_music", ...).
-        surface: Match surface — "album" or "track".
+        surface: Match surface — "album", "track", or "track_album_fallback"
+            (a track winner selected by the LML#782 album-less re-score).
         query_artist: Request artist string (labeling; marginal clears only).
         matched_artist: Matched-candidate artist string (labeling).
         query_title: Request title string (labeling).
