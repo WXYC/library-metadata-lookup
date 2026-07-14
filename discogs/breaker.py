@@ -37,7 +37,36 @@ State machine
   still-exhausted remaining) re-OPENS it for another cool-down. A 5xx trial is
   **neutral** — it neither closes nor reopens (a Discogs upstream error is not a
   rate-limit signal), so the breaker stays HALF_OPEN and the next admitted trial
-  decides.
+  decides. A trial that dies without any terminal outcome — request-layer
+  ``RequestError``, cancellation, an unexpected raise — is **inconclusive**:
+  the caller reports it via :meth:`record_aborted`, which re-OPENs for another
+  cool-down (LML#787; never CLOSE on a lost trial, never stay latched).
+
+Aborted trials & the HALF_OPEN watchdog (LML#787)
+-------------------------------------------------
+The 2026-07-13 prod incident: the HALF_OPEN trial exited
+``_request_with_retry`` through a path that recorded nothing, and because
+HALF_OPEN sheds every other caller unconditionally — and no stale-epoch
+``record_*`` can move the state — the breaker shed 100% of live Discogs calls
+for ~8 hours until a process restart. Two guards make that latch impossible by
+construction:
+
+- :meth:`record_aborted` — the request path guarantees (via ``try/finally``)
+  that an admitted request which exits without a terminal ``record_*`` reports
+  the abort. If the aborter was the current trial, re-OPEN (fresh cool-down →
+  fresh trial). Anything else (CLOSED-era caller, stale epoch, OPEN) is a
+  no-op — an aborted request is not a saturation signal.
+- A **watchdog** in :meth:`allow_request` — belt-and-suspenders for exit paths
+  nobody has thought of yet (a trial coroutine lost without its ``finally``
+  running). If HALF_OPEN persists past ``cooldown_seconds ×
+  trial_watchdog_multiplier``, the trial is presumed lost and the breaker
+  re-OPENs. The default multiplier (20 → 400s at the default 20s cool-down) is
+  sized to exceed the worst-case *legitimate* trial — ``discogs_max_retries``
+  (5) sleeps capped at 60s plus 6 attempts against the 10s client timeout ≈
+  360s — so a live trial riding its full backoff is never killed early, while
+  a genuinely lost trial self-heals in minutes instead of hours. A zombie
+  trial that later records anyway epoch-mismatches (the watchdog's ``_open``
+  bumped the epoch) and cannot decide the fresh trial.
 
 Epoch guard
 -----------
@@ -121,6 +150,7 @@ class DiscogsCircuitBreaker:
         failure_threshold: int,
         remaining_floor: int,
         cooldown_seconds: float,
+        trial_watchdog_multiplier: float = 20.0,
         now: Callable[[], float] = time.monotonic,
     ) -> None:
         """Construct a breaker.
@@ -134,16 +164,26 @@ class DiscogsCircuitBreaker:
                 the proactive floor.
             cooldown_seconds: How long the breaker stays OPEN before admitting a
                 half-open trial request.
+            trial_watchdog_multiplier: A HALF_OPEN trial unresolved after
+                ``cooldown_seconds × trial_watchdog_multiplier`` is presumed
+                lost and the breaker re-OPENs (LML#787). Must comfortably
+                exceed the worst-case legitimate trial (~360s with the default
+                retry/backoff settings); the default (20) gives 400s at the
+                default 20s cool-down.
             now: Monotonic clock source (injectable for deterministic tests).
         """
         self._failure_threshold = failure_threshold
         self._remaining_floor = remaining_floor
         self._cooldown_seconds = cooldown_seconds
+        self._trial_watchdog_multiplier = trial_watchdog_multiplier
         self._now = now
 
         self._state = BreakerState.CLOSED
         self._consecutive_failures = 0
         self._opened_at = 0.0
+        # When the current half-open trial was promoted — read by the LML#787
+        # watchdog to presume a never-resolving trial lost.
+        self._half_open_at = 0.0
         # Monotonic epoch, bumped on every ``_open()``. A caller admitted by
         # ``allow_request`` captures the current epoch and passes it back; the
         # half-open transition only fires on an epoch match.
@@ -166,7 +206,10 @@ class DiscogsCircuitBreaker:
         - OPEN → admit exactly once after the cool-down elapses (promoting to
           HALF_OPEN for that single trial); shed (``None``) otherwise.
         - HALF_OPEN → shed: a trial is already in flight; concurrent callers are
-          shed until it resolves.
+          shed until it resolves. If the trial has been unresolved past the
+          LML#787 watchdog window (``cooldown × trial_watchdog_multiplier``),
+          presume it lost and re-OPEN (this caller is still shed; the fresh
+          cool-down promotes a fresh trial).
         """
         if self._state is BreakerState.CLOSED:
             return self._epoch
@@ -177,10 +220,25 @@ class DiscogsCircuitBreaker:
                 # stale CLOSED-era or superseded-trial response can't decide it.
                 self._epoch += 1
                 self._state = BreakerState.HALF_OPEN
+                self._half_open_at = self._now()
                 return self._epoch
             return None
 
-        # HALF_OPEN: a trial is in flight; shed everyone else.
+        # HALF_OPEN: a trial is in flight; shed everyone else — unless the
+        # trial has been unresolved so long it must be lost (LML#787 watchdog;
+        # ``record_aborted`` covers the known unrecorded-exit paths, this
+        # covers the unknown ones). ``threshold > 0`` keeps a zero cool-down
+        # config from flapping the trial on every call.
+        threshold = self._cooldown_seconds * self._trial_watchdog_multiplier
+        if threshold > 0 and self._now() - self._half_open_at >= threshold:
+            logger.warning(
+                "Discogs saturation breaker HALF_OPEN trial unresolved after %.0fs "
+                "(> cooldown %.0fs x %.0f); presuming it lost and re-opening (LML#787)",
+                self._now() - self._half_open_at,
+                self._cooldown_seconds,
+                self._trial_watchdog_multiplier,
+            )
+            self._open()
         return None
 
     def should_shed_inflight(self, epoch: int | None) -> bool:
@@ -261,6 +319,27 @@ class DiscogsCircuitBreaker:
         opens if the 5xx also reports an at/below-floor ``remaining``.
         """
         if self._at_or_below_floor(remaining):
+            self._open()
+
+    def record_aborted(self, *, epoch: int | None = None) -> None:
+        """Record an admitted request that exited without a terminal outcome
+        (LML#787): request-layer ``RequestError``, cancellation mid-request or
+        mid-retry-sleep, or an unexpected raise.
+
+        If the aborter was the current HALF_OPEN trial (epoch match), the trial
+        is **inconclusive** — re-OPEN for another cool-down so a fresh trial is
+        promoted, instead of latching HALF_OPEN forever (the 2026-07-13 prod
+        incident: ~8h shedding 100% of live Discogs calls until a restart).
+        Every other case is a no-op: an aborted request is not a saturation
+        signal, so a CLOSED-state abort must not trip the breaker, and a stale
+        epoch (CLOSED-era caller, superseded trial) must not disturb the
+        current state or extend an OPEN cool-down.
+        """
+        if self._state is BreakerState.HALF_OPEN and epoch == self._epoch:
+            logger.warning(
+                "Discogs saturation breaker HALF_OPEN trial aborted without a terminal "
+                "outcome; re-opening (LML#787)"
+            )
             self._open()
 
     def force_open(self) -> None:

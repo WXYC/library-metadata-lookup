@@ -466,98 +466,130 @@ class DiscogsService:
         # ``lml.discogs.rate_limiter`` spans now fire once per attempt rather
         # than once per request — a span-count schema change documented in the
         # #569 PR (no current dashboard/alert aggregates on that count).
-        for attempt in range(max_retries + 1):
-            # LML#755 in-flight shed (FIX 3 / R2-1): re-check the breaker at the
-            # top of each attempt via the READ-ONLY ``should_shed_inflight`` —
-            # NOT the state-mutating ``allow_request``. A request already past
-            # the entry gate must not ride its full ~62s backoff after the
-            # breaker opens mid-flight, but it must also not promote itself to
-            # the half-open trial (it holds its stale entry ``epoch``, so its
-            # terminal ``record_*`` would epoch-mismatch and latch the breaker
-            # HALF_OPEN forever — R2-1). The predicate lets the genuine trial
-            # (matching epoch) finish and sheds everyone else. The first attempt
-            # (attempt 0) was just admitted above, so only re-check on retries.
-            if attempt > 0 and breaker.should_shed_inflight(epoch):
-                self._record_breaker_shed(method, path)
-                raise DiscogsBreakerOpenError(
-                    f"Discogs saturation breaker opened mid-flight: {method} {path}"
-                )
+        #
+        # LML#787: an ADMITTED request must always resolve its breaker
+        # bookkeeping. The terminal ``record_*`` sites below set ``recorded``;
+        # any exit that reaches the outer ``finally`` without one — the
+        # ``httpx.RequestError`` → ``return None`` path, cancellation during
+        # the request / limiter acquire / retry sleep, or an unexpected raise —
+        # reports ``record_aborted``. If the victim was the HALF_OPEN trial,
+        # that re-OPENs the breaker (fresh cool-down → fresh trial) instead of
+        # latching it shedding forever (the 2026-07-13 incident); in every
+        # other state/epoch it is a no-op. The mid-flight shed raise inside the
+        # loop also lands here: its entry epoch is stale by construction
+        # (``_open`` bumped it), so the abort is a guaranteed no-op.
+        recorded = False
+        try:
+            for attempt in range(max_retries + 1):
+                # LML#755 in-flight shed (FIX 3 / R2-1): re-check the breaker at
+                # the top of each attempt via the READ-ONLY
+                # ``should_shed_inflight`` — NOT the state-mutating
+                # ``allow_request``. A request already past the entry gate must
+                # not ride its full ~62s backoff after the breaker opens
+                # mid-flight, but it must also not promote itself to the
+                # half-open trial (it holds its stale entry ``epoch``, so its
+                # terminal ``record_*`` would epoch-mismatch and latch the
+                # breaker HALF_OPEN forever — R2-1). The predicate lets the
+                # genuine trial (matching epoch) finish and sheds everyone else.
+                # The first attempt (attempt 0) was just admitted above, so only
+                # re-check on retries.
+                if attempt > 0 and breaker.should_shed_inflight(epoch):
+                    self._record_breaker_shed(method, path)
+                    raise DiscogsBreakerOpenError(
+                        f"Discogs saturation breaker opened mid-flight: {method} {path}"
+                    )
 
-            # Explicit acquire/release (not `async with semaphore:`) so the wait
-            # is wrapped in a Sentry span. The 5-permit semaphore is the dominant
-            # source of pre-request dark time on backfill cascades — sampling the
-            # queue depth right before the await gives the trace explorer a
-            # relative-load signal per call. See WXYC/library-metadata-lookup#358.
-            with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
-                span.set_data("lml.semaphore.queue_depth", _approx_semaphore_queue_depth(semaphore))
-                apply_request_ctx_tags(span)
-                await semaphore.acquire()
-
-            try:
-                with sentry_sdk.start_span(
-                    op="lock.acquire", name="lml.discogs.rate_limiter"
-                ) as span:
+                # Explicit acquire/release (not `async with semaphore:`) so the
+                # wait is wrapped in a Sentry span. The 5-permit semaphore is the
+                # dominant source of pre-request dark time on backfill cascades —
+                # sampling the queue depth right before the await gives the trace
+                # explorer a relative-load signal per call. See
+                # WXYC/library-metadata-lookup#358.
+                with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
+                    span.set_data(
+                        "lml.semaphore.queue_depth", _approx_semaphore_queue_depth(semaphore)
+                    )
                     apply_request_ctx_tags(span)
-                    await rate_limiter.acquire()
+                    await semaphore.acquire()
 
-                response = await client.request(method, path, params=params)
+                try:
+                    with sentry_sdk.start_span(
+                        op="lock.acquire", name="lml.discogs.rate_limiter"
+                    ) as span:
+                        apply_request_ctx_tags(span)
+                        await rate_limiter.acquire()
 
-                # Log rate limit remaining for observability.
-                remaining = response.headers.get("X-Discogs-Ratelimit-Remaining")
-                if remaining:
-                    logger.debug(f"Discogs rate limit remaining: {remaining}")
-            except httpx.RequestError as e:
-                logger.error(
-                    "Discogs request failed: %s %s -> %s: %r",
-                    method,
-                    path,
-                    type(e).__name__,
-                    e,
-                    exc_info=True,
-                )
+                    response = await client.request(method, path, params=params)
+
+                    # Log rate limit remaining for observability.
+                    remaining = response.headers.get("X-Discogs-Ratelimit-Remaining")
+                    if remaining:
+                        logger.debug(f"Discogs rate limit remaining: {remaining}")
+                except httpx.RequestError as e:
+                    logger.error(
+                        "Discogs request failed: %s %s -> %s: %r",
+                        method,
+                        path,
+                        type(e).__name__,
+                        e,
+                        exc_info=True,
+                    )
+                    # No terminal ``record_*`` here on purpose: a network-layer
+                    # failure is not a rate-limit signal, so it neither feeds
+                    # the failure run nor closes a trial. The outer ``finally``
+                    # reports ``record_aborted`` (LML#787) so a dying trial
+                    # re-OPENs instead of latching.
+                    return None
+                finally:
+                    # Released before the retry sleep below, on success, and on
+                    # any error/cancellation in this attempt — one release per
+                    # acquire.
+                    semaphore.release()
+
+                # LML#755: feed the breaker **once per request, on the terminal
+                # outcome** (FIX 2/5), not per attempt — the counting unit is
+                # failed *requests*, not failed attempts. A non-429 terminal
+                # response ends the loop, so we record here and return; a 429
+                # that still has retries left loops WITHOUT recording (the
+                # failure is only terminal once retries are exhausted).
+                remaining_value = _parse_ratelimit_remaining(remaining)
+                if response.status_code != 429:
+                    recorded = True
+                    if response.status_code >= 500:
+                        # 5xx is neutral: don't reset the failure run, don't
+                        # close a half-open trial (FIX 5). Only opens on an
+                        # exhausted floor.
+                        breaker.record_server_error(remaining=remaining_value, epoch=epoch)
+                    else:
+                        breaker.record_success(remaining=remaining_value, epoch=epoch)
+                    return response
+
+                if attempt < max_retries:
+                    retry_after = response.headers.get("Retry-After")
+                    delay = _compute_retry_delay(attempt, retry_after)
+                    logger.warning(
+                        f"Discogs rate limit hit, retrying in {delay:.2f}s "
+                        f"(attempt {attempt + 1}/{max_retries + 1}, "
+                        f"Retry-After={retry_after})"
+                    )
+                    # Sleep WITHOUT holding the permit; re-acquire on the next
+                    # pass.
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Retries exhausted: this request definitively 429'd. Record
+                # exactly one failure (per-request unit) carrying the last-seen
+                # remaining so an at/below-floor bucket opens proactively even
+                # before the reactive threshold (FIX 2).
+                logger.error("Discogs rate limit hit, max retries exhausted")
+                recorded = True
+                breaker.record_failure(remaining=remaining_value, epoch=epoch)
                 return None
-            finally:
-                # Released before the retry sleep below, on success, and on any
-                # error/cancellation in this attempt — one release per acquire.
-                semaphore.release()
 
-            # LML#755: feed the breaker **once per request, on the terminal
-            # outcome** (FIX 2/5), not per attempt — the counting unit is failed
-            # *requests*, not failed attempts. A non-429 terminal response ends
-            # the loop, so we record here and return; a 429 that still has
-            # retries left loops WITHOUT recording (the failure is only terminal
-            # once retries are exhausted).
-            remaining_value = _parse_ratelimit_remaining(remaining)
-            if response.status_code != 429:
-                if response.status_code >= 500:
-                    # 5xx is neutral: don't reset the failure run, don't close a
-                    # half-open trial (FIX 5). Only opens on an exhausted floor.
-                    breaker.record_server_error(remaining=remaining_value, epoch=epoch)
-                else:
-                    breaker.record_success(remaining=remaining_value, epoch=epoch)
-                return response
-
-            if attempt < max_retries:
-                retry_after = response.headers.get("Retry-After")
-                delay = _compute_retry_delay(attempt, retry_after)
-                logger.warning(
-                    f"Discogs rate limit hit, retrying in {delay:.2f}s "
-                    f"(attempt {attempt + 1}/{max_retries + 1}, "
-                    f"Retry-After={retry_after})"
-                )
-                # Sleep WITHOUT holding the permit; re-acquire on the next pass.
-                await asyncio.sleep(delay)
-                continue
-
-            # Retries exhausted: this request definitively 429'd. Record exactly
-            # one failure (per-request unit) carrying the last-seen remaining so
-            # an at/below-floor bucket opens proactively even before the reactive
-            # threshold (FIX 2).
-            logger.error("Discogs rate limit hit, max retries exhausted")
-            breaker.record_failure(remaining=remaining_value, epoch=epoch)
             return None
-
-        return None
+        finally:
+            if not recorded:
+                breaker.record_aborted(epoch=epoch)
 
     def _parse_title(self, title: str) -> tuple[str, str]:
         """Parse Discogs title format 'Artist - Album' into components."""

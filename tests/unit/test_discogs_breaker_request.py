@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from discogs.breaker import DiscogsBreakerOpenError, DiscogsCircuitBreaker
@@ -365,3 +366,147 @@ async def test_inflight_shed_during_cooldown_does_not_latch_the_breaker():
 
     assert result is not None
     assert breaker.state.value == "closed"
+
+
+class _Clock:
+    """Mutable monotonic clock for deterministic cool-down transitions."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def _half_open_ready_breaker(clock: _Clock) -> DiscogsCircuitBreaker:
+    """A breaker whose cool-down has elapsed: the NEXT admitted request becomes
+    the half-open trial."""
+    breaker = DiscogsCircuitBreaker(
+        failure_threshold=1, remaining_floor=0, cooldown_seconds=30.0, now=clock
+    )
+    breaker.force_open()
+    clock.t += 31.0
+    return breaker
+
+
+async def _assert_recovery_possible(breaker: DiscogsCircuitBreaker, clock: _Clock) -> None:
+    """After the cool-down, a fresh healthy request must be admitted as a new
+    trial and CLOSE the breaker — the anti-latch invariant."""
+    clock.t += 31.0
+    healthy_client = MagicMock()
+    healthy_client.request = AsyncMock(
+        return_value=_response(200, {"X-Discogs-Ratelimit-Remaining": "50"})
+    )
+    healthy_service = _make_service(healthy_client)
+    fake_limiter = MagicMock()
+    fake_limiter.acquire = AsyncMock()
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+    ):
+        result = await healthy_service._request_with_retry("GET", "/database/search")
+    assert result is not None
+    assert breaker.state.value == "closed"
+
+
+@pytest.mark.asyncio
+async def test_trial_killed_by_request_error_does_not_latch(fake_limiter):
+    """LML#787 exit path 1: the HALF_OPEN trial hits ``httpx.RequestError``
+    (connect/read failure) and ``_request_with_retry`` returns ``None``. The
+    2026-07-13 latch: nothing recorded a terminal outcome, so the breaker sat
+    HALF_OPEN shedding 100% of live calls until a process restart. The trial's
+    death must instead re-OPEN the breaker so the next cool-down promotes a
+    fresh trial."""
+    clock = _Clock()
+    breaker = _half_open_ready_breaker(clock)
+
+    client = MagicMock()
+    client.request = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+    service = _make_service(client)
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+    ):
+        # This request is admitted as the half-open trial, then dies.
+        result = await service._request_with_retry("GET", "/database/search")
+
+    assert result is None
+    # NOT latched HALF_OPEN: the aborted trial re-OPENed the breaker.
+    assert breaker.state.value == "open"
+    await _assert_recovery_possible(breaker, clock)
+
+
+@pytest.mark.asyncio
+async def test_trial_cancelled_mid_request_does_not_latch(fake_limiter):
+    """LML#787 exit path 2a: the HALF_OPEN trial is cancelled while awaiting
+    ``client.request`` (per-strategy ``wait_for`` ceiling / caller disconnect).
+    Cancellation must propagate — but the breaker must re-OPEN, not latch."""
+    clock = _Clock()
+    breaker = _half_open_ready_breaker(clock)
+
+    client = MagicMock()
+    client.request = AsyncMock(side_effect=asyncio.CancelledError())
+    service = _make_service(client)
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await service._request_with_retry("GET", "/database/search")
+
+    assert breaker.state.value == "open"
+    await _assert_recovery_possible(breaker, clock)
+
+
+@pytest.mark.asyncio
+async def test_trial_cancelled_during_retry_sleep_does_not_latch(fake_limiter):
+    """LML#787 exit path 2b: the HALF_OPEN trial 429s, enters its inter-attempt
+    backoff sleep, and is cancelled mid-sleep — the hot path during floods (the
+    LML#758 sleep ignores ``caller_budget_ms``, so ``wait_for`` routinely fires
+    mid-backoff). The breaker must re-OPEN, not latch."""
+    clock = _Clock()
+    breaker = _half_open_ready_breaker(clock)
+
+    client = MagicMock()
+    client.request = AsyncMock(return_value=_response(429, {"Retry-After": "30"}))
+    service = _make_service(client)
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+        patch("discogs.service.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError())),
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await service._request_with_retry("GET", "/database/search", max_retries=3)
+
+    assert breaker.state.value == "open"
+    await _assert_recovery_possible(breaker, clock)
+
+
+@pytest.mark.asyncio
+async def test_closed_request_error_leaves_the_breaker_closed(fake_limiter):
+    """LML#787 no-spurious-open guard: an aborted request while CLOSED (network
+    blip, caller disconnect) is not a saturation signal — the abort bookkeeping
+    must be a no-op, not a trip."""
+    breaker = DiscogsCircuitBreaker(failure_threshold=3, remaining_floor=0, cooldown_seconds=30.0)
+
+    client = MagicMock()
+    client.request = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+    service = _make_service(client)
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+    ):
+        result = await service._request_with_retry("GET", "/database/search")
+
+    assert result is None
+    assert breaker.state.value == "closed"
+    assert breaker.allow_request() is not None
