@@ -10,8 +10,9 @@ breaks the pileup feedback loop and shields the background warmers +
 upstream APIs from burst.
 
 Shape: a process-global semaphore around ``perform_lookup`` in
-``handle_lookup``, sized by ``LML_LOOKUP_MAX_CONCURRENT`` (default 8), built
-lazily on the first request. Laziness is NOT a loop constraint (Python 3.10+
+``handle_lookup``, sized by ``LML_LOOKUP_MAX_CONCURRENT`` (default
+``min(8, LML_DISCOGS_POOL_MAX_SIZE)`` — the ceiling clamped to the pool it
+contends for, LML#706), built lazily on the first request. Laziness is NOT a loop constraint (Python 3.10+
 semaphores bind a loop only at the first contended acquire) — it exists so
 the env is read at request time (the no-redeploy Railway lever) and so tests
 can reset the global between event loops (the suite-wide autouse fixture in
@@ -434,7 +435,8 @@ class TestInFlightCapObservability:
         ``set_data`` span attributes read back as "Unknown attribute" in the
         spans dataset — unqueryable. The tag mirrors ``lml.client_aborted``;
         the wait-ms measurement is the quantitative series that decides
-        whether the default cap of 8 is tuned right.
+        whether the default cap (``min(8, LML_DISCOGS_POOL_MAX_SIZE)``) is
+        tuned right.
         """
         monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "1")
 
