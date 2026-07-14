@@ -1084,3 +1084,102 @@ class TestCacheArmFloorRejectFallthrough:
         _, discogs_result = result
         assert discogs_result.release_id == 36830641
         assert mock_discogs_service.search.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# LML#784 category 4 — query-side "S/T" swaps to the artist name
+# ---------------------------------------------------------------------------
+
+
+class TestSelfTitledQuerySwap:
+    """A query-side self-titled placeholder ("S/T", "s.t.", "self-titled")
+    can never match a real Discogs title — the probe searched
+    ``release_title=S/T`` and scored "S/T" vs "Matmos" at 22.2 (deterministic
+    no-match on every arm). Mirror the library-side swap the artwork path
+    already does: search and score with the artist name as the album, and do
+    NOT keep the trigger string as a scoring variant (a wrong-release
+    candidate literally titled "S/T" would clear trivially).
+    """
+
+    @pytest.mark.asyncio
+    async def test_self_titled_album_searches_and_scores_artist_name(self, mock_discogs_service):
+        """Matmos — S/T resolves the self-titled release (63794)."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=False,
+            results=[
+                make_discogs_result(release_id=63794, artist="Matmos", album="Matmos"),
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Matmos", "S/T"), discogs_service=mock_discogs_service
+        )
+        assert result is not None
+        lib_item, discogs_result = result
+        assert discogs_result.release_id == 63794
+        assert lib_item.title == "Matmos"
+        request = mock_discogs_service.search.call_args_list[0].args[0]
+        assert request.album == "Matmos"
+        assert request.artist == "Matmos"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("placeholder", ["S/T", "s/t", "S.T.", "self-titled", "Self Titled"])
+    async def test_all_self_titled_spellings_swap(self, mock_discogs_service, placeholder):
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=False,
+            results=[
+                make_discogs_result(release_id=63794, artist="Matmos", album="Matmos"),
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Matmos", placeholder), discogs_service=mock_discogs_service
+        )
+        assert result is not None
+        request = mock_discogs_service.search.call_args_list[0].args[0]
+        assert request.album == "Matmos"
+
+    @pytest.mark.asyncio
+    async def test_self_titled_trigger_not_readmitted_as_title_variant(self, mock_discogs_service):
+        """A candidate literally titled "S/T" must not clear the title floor —
+        the trigger string is swapped out, not kept as a variant."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=False,
+            results=[
+                make_discogs_result(release_id=999, artist="Matmos", album="S/T"),
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Matmos", "S/T"), discogs_service=mock_discogs_service
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_wrong_album_still_rejected_after_swap(self, mock_discogs_service):
+        """The swap doesn't loosen the floor — a different Matmos album stays out."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=False,
+            results=[
+                make_discogs_result(release_id=888, artist="Matmos", album="Supreme Balloon"),
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Matmos", "S/T"), discogs_service=mock_discogs_service
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_non_self_titled_album_unchanged(self, mock_discogs_service):
+        """A regular album title searches and scores exactly as before."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=False,
+            results=[
+                make_discogs_result(
+                    release_id=27474075, artist="Ricardo Dias Gomes", album="Muito Sol"
+                ),
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Ricardo Dias Gomes", "Muito Sol"), discogs_service=mock_discogs_service
+        )
+        assert result is not None
+        request = mock_discogs_service.search.call_args_list[0].args[0]
+        assert request.album == "Muito Sol"
