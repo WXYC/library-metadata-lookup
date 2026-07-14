@@ -1449,7 +1449,9 @@ class DiscogsService:
             return None
 
     @async_cached(SEARCH_CACHE)
-    async def search(self, request: DiscogsSearchRequest, limit: int = 5) -> DiscogsSearchResponse:
+    async def search(
+        self, request: DiscogsSearchRequest, limit: int = 5, skip_pg: bool = False
+    ) -> DiscogsSearchResponse:
         """General release search for artwork discovery.
 
         Read-through via :func:`fallthrough` with ``pg_write=None`` — the PG
@@ -1462,6 +1464,11 @@ class DiscogsService:
         Args:
             request: Search parameters (artist, album, track)
             limit: Maximum number of results to return
+            skip_pg: Bypass the PG cache leg and go straight to the API.
+                The library-miss probe sets this on its floor-reject retry
+                (LML#784): a non-empty ``pg_read`` is terminal at the seam,
+                so a cache candidate set that all floor-fails must be
+                re-searched API-only or the working API arm stays masked.
 
         Returns:
             DiscogsSearchResponse with ranked results
@@ -1596,8 +1603,11 @@ class DiscogsService:
                 return DiscogsSearchResponse(cached=False)
 
         cache = self.cache_service
-        if cache is None:
-            with request_context("search"):
+        if cache is None or skip_pg:
+            # ``skip`` is the seam's existing cache-bypass state (LML#537
+            # taxonomy), so the #784 floor-reject retry is distinguishable
+            # from ``no_pg`` in the wait-time histograms.
+            with request_context("search", "skip" if skip_pg else "no_pg"):
                 result = await _api_fetch()
         else:
             result = await fallthrough(

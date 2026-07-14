@@ -817,3 +817,222 @@ class TestNearMissAlbumRegression:
         assert result is not None
         lib_item, discogs_result = result
         assert discogs_result.release_id == 37008771
+
+
+# ---------------------------------------------------------------------------
+# LML#784 category 1 — cache-arm floor-reject falls through to the API arm
+# ---------------------------------------------------------------------------
+
+
+def _parsed(artist: str, album: str) -> ParsedRequest:
+    return ParsedRequest(
+        artist=artist,
+        album=album,
+        message_type=MessageType.REQUEST,
+        is_request=True,
+    )
+
+
+class TestCacheArmFloorRejectFallthrough:
+    """Floor-rejected PG-cache candidates must fall through to the API arm.
+
+    The PG cache's ``search_releases`` joins ``release_artist`` one credit per
+    row, so a multi-artist release surfaces as "Merce Lemon" (75.9) or "Fust"
+    (36.4) singly and floor-fails, while the API arm's joined credit
+    ("Fust, Merce Lemon") clears at 91.4. The ``fallthrough`` seam treats any
+    non-empty ``pg_read`` as terminal, so ``_library_miss_discogs_search``
+    re-issues the search with ``skip_pg=True`` when a cache-served
+    (``response.cached``) candidate set clears nothing (LML#784 category 1).
+    """
+
+    @pytest.mark.asyncio
+    async def test_cache_floor_reject_retries_api_and_resolves(self, mock_discogs_service):
+        """Merce Lemon & Fust — per-credit cache rows floor-fail, joined API credit passes."""
+        cache_response = DiscogsSearchResponse(
+            cached=True,
+            results=[
+                make_discogs_result(
+                    release_id=36830641,
+                    artist="Merce Lemon",
+                    album="Cup Of Loneliness / Choices",
+                ),
+                make_discogs_result(
+                    release_id=36830641,
+                    artist="Fust",
+                    album="Cup Of Loneliness / Choices",
+                ),
+            ],
+        )
+        api_response = DiscogsSearchResponse(
+            cached=False,
+            results=[
+                make_discogs_result(
+                    release_id=36830641,
+                    artist="Fust, Merce Lemon",
+                    album="Cup Of Loneliness / Choices",
+                )
+            ],
+        )
+        mock_discogs_service.search.side_effect = [cache_response, api_response]
+        result = await _library_miss_discogs_search(
+            _parsed("Merce Lemon & Fust", "Cup of Loneliness / Choices"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == 36830641
+        assert mock_discogs_service.search.call_count == 2
+        retry_call = mock_discogs_service.search.call_args_list[1]
+        assert retry_call.kwargs.get("skip_pg") is True
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_cache_candidate_clears_floor(self, mock_discogs_service):
+        """A floor-passing cache candidate is terminal — no second search."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=True,
+            results=[
+                make_discogs_result(
+                    release_id=1489958,
+                    artist="Juana Molina",
+                    album="DOGA",
+                )
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Juana Molina", "DOGA"), discogs_service=mock_discogs_service
+        )
+        assert result is not None
+        assert mock_discogs_service.search.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_first_response_is_api_served(self, mock_discogs_service):
+        """cached=False means the API arm was already consulted — never retry."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=False,
+            results=[
+                make_discogs_result(
+                    release_id=999,
+                    artist="Merce Lemon",
+                    album="Cup Of Loneliness / Choices",
+                )
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Merce Lemon & Fust", "Cup of Loneliness / Choices"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is None
+        assert mock_discogs_service.search.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_floor_reject_returns_none(self, mock_discogs_service):
+        """Both arms floor-failing degrades to a clean no-match."""
+        mock_discogs_service.search.side_effect = [
+            DiscogsSearchResponse(
+                cached=True,
+                results=[make_discogs_result(release_id=1, artist="Fust", album="Genevieve")],
+            ),
+            DiscogsSearchResponse(
+                cached=False,
+                results=[make_discogs_result(release_id=2, artist="Fust", album="Big Ugly")],
+            ),
+        ]
+        result = await _library_miss_discogs_search(
+            _parsed("Merce Lemon & Fust", "Cup of Loneliness / Choices"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is None
+        assert mock_discogs_service.search.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_retry_empty_response_returns_none(self, mock_discogs_service):
+        """An empty API retry degrades to a clean no-match."""
+        mock_discogs_service.search.side_effect = [
+            DiscogsSearchResponse(
+                cached=True,
+                results=[make_discogs_result(release_id=1, artist="Fust", album="Genevieve")],
+            ),
+            DiscogsSearchResponse(cached=False, results=[]),
+        ]
+        result = await _library_miss_discogs_search(
+            _parsed("Merce Lemon & Fust", "Cup of Loneliness / Choices"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_retry_exception_returns_none(self, mock_discogs_service):
+        """A Discogs failure on the retry is logged and swallowed, like the first call."""
+        mock_discogs_service.search.side_effect = [
+            DiscogsSearchResponse(
+                cached=True,
+                results=[make_discogs_result(release_id=1, artist="Fust", album="Genevieve")],
+            ),
+            Exception("rate limited"),
+        ]
+        result = await _library_miss_discogs_search(
+            _parsed("Merce Lemon & Fust", "Cup of Loneliness / Choices"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_anadol_marie_klock_resolves_via_api_arm(self, mock_discogs_service):
+        """Anadol & Marie Klock — the API arm prefers the "&"-credited pressing (37483479).
+
+        The ticket pins either 37483479 (the "&" credit, artist 100) or
+        37552383 (comma credit, 92.3) as acceptable; the mock carries both in
+        API-arm order and the "&" pressing must win on score.
+        """
+        mock_discogs_service.search.side_effect = [
+            DiscogsSearchResponse(
+                cached=True,
+                results=[
+                    make_discogs_result(release_id=37552383, artist="Anadol", album="Manivelles")
+                ],
+            ),
+            DiscogsSearchResponse(
+                cached=False,
+                results=[
+                    make_discogs_result(
+                        release_id=37552383, artist="Anadol, Marie Klock", album="Manivelles"
+                    ),
+                    make_discogs_result(
+                        release_id=37483479, artist="Anadol & Marie Klock", album="Manivelles"
+                    ),
+                ],
+            ),
+        ]
+        result = await _library_miss_discogs_search(
+            _parsed("Anadol & Marie Klock", "Manivelles"), discogs_service=mock_discogs_service
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == 37483479
+
+    @pytest.mark.asyncio
+    async def test_masked_cache_rescued_by_exact_api_match(self, mock_discogs_service):
+        """Ricardo Dias Gomes — Muito Sol (Population B): unrelated cache rows
+        must not mask the exact 100/100 API-arm match."""
+        mock_discogs_service.search.side_effect = [
+            DiscogsSearchResponse(
+                cached=True,
+                results=[
+                    make_discogs_result(release_id=1, artist="Ricardo Villalobos", album="Sol"),
+                ],
+            ),
+            DiscogsSearchResponse(
+                cached=False,
+                results=[
+                    make_discogs_result(
+                        release_id=27474075, artist="Ricardo Dias Gomes", album="Muito Sol"
+                    )
+                ],
+            ),
+        ]
+        result = await _library_miss_discogs_search(
+            _parsed("Ricardo Dias Gomes", "Muito Sol"), discogs_service=mock_discogs_service
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == 27474075

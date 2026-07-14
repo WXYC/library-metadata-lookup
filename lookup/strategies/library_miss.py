@@ -39,11 +39,20 @@ async def _library_miss_discogs_search(
     shape is near-miss typed albums (typed "Anthology" → "Anthology, Vol. 1");
     see regression tests for pinned cases.
 
+    When every candidate from a cache-served response floor-fails, the search
+    is re-issued once with ``skip_pg=True`` (LML#784 category 1): the PG arm
+    joins ``release_artist`` one credit per row, so a multi-artist release
+    surfaces as single credits that floor-fail singly, while the API arm's
+    joined credit would pass — and the fallthrough seam treats any non-empty
+    ``pg_read`` as terminal, masking that working arm. ``response.cached`` is
+    the retry gate: the seam sets it only on PG-served responses, so an
+    API-served first pass is never re-searched.
+
     Returns ``None`` when:
     - ``discogs_service`` is not available
     - ``parsed.artist`` or ``parsed.album`` is empty / whitespace-only
     - Discogs returns no candidates
-    - No candidate clears the 80/80 floor
+    - No candidate clears the 80/80 floor (on either arm)
     - Discogs raises (outage, rate-limit exhaustion) — logged and swallowed
     """
     if discogs_service is None:
@@ -53,22 +62,43 @@ async def _library_miss_discogs_search(
     if not artist or not album:
         return None
 
+    request = DiscogsSearchRequest(album=album, artist=artist)
+
+    def _floor_best(response) -> DiscogsSearchResult | None:
+        if not response or not response.results:
+            return None
+        return find_best_typed_match(
+            response.results,
+            query_artist=artist,
+            query_title=album,
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+
     try:
-        response = await discogs_service.search(DiscogsSearchRequest(album=album, artist=artist))
+        response = await discogs_service.search(request)
     except Exception:
         logger.warning("library-miss Discogs search failed for artist=%r album=%r", artist, album)
         return None
 
-    if not response or not response.results:
-        return None
+    best = _floor_best(response)
 
-    best = find_best_typed_match(
-        response.results,
-        query_artist=artist,
-        query_title=album,
-        artist_fn=lambda r: r.artist,
-        title_fn=lambda r: r.album,
-    )
+    if best is None and response is not None and response.cached:
+        logger.info(
+            "library-miss cache candidates all floor-failed for artist=%r album=%r; "
+            "retrying API-only (LML#784)",
+            artist,
+            album,
+        )
+        try:
+            response = await discogs_service.search(request, skip_pg=True)
+        except Exception:
+            logger.warning(
+                "library-miss Discogs API retry failed for artist=%r album=%r", artist, album
+            )
+            return None
+        best = _floor_best(response)
+
     if best is None:
         return None
 

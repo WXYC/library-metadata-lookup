@@ -1635,6 +1635,64 @@ class TestSearch:
         assert isinstance(result, DiscogsSearchResponse)
 
     @pytest.mark.asyncio
+    async def test_skip_pg_bypasses_cache_read(self, service_with_cache):
+        """skip_pg=True goes straight to the API arm — the PG read never runs.
+
+        LML#784 category 1: the library-miss probe re-issues a search whose
+        cache-served candidates all floor-failed, so the retry must not
+        consult the same cache again.
+        """
+        service_with_cache.cache_service.search_releases = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "results": [
+                {
+                    "title": "Fust, Merce Lemon - Cup Of Loneliness / Choices",
+                    "id": 36830641,
+                    "thumb": "",
+                }
+            ]
+        }
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ):
+            result = await service_with_cache.search(
+                DiscogsSearchRequest(
+                    artist="Merce Lemon & Fust", album="Cup of Loneliness / Choices"
+                ),
+                skip_pg=True,
+            )
+
+        service_with_cache.cache_service.search_releases.assert_not_called()
+        assert result.cached is False
+        assert result.results[0].release_id == 36830641
+
+    @pytest.mark.asyncio
+    async def test_skip_pg_without_cache_service(self, service):
+        """skip_pg is a no-op difference when there is no cache leg at all."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "results": [{"title": "Juana Molina - DOGA", "id": 1489958, "thumb": ""}]
+        }
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.search(
+                DiscogsSearchRequest(artist="Juana Molina", album="DOGA"), skip_pg=True
+            )
+
+        assert len(result.results) == 1
+
+    @pytest.mark.asyncio
     async def test_spacer_gif_filtered(self, service):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
