@@ -65,6 +65,19 @@ class TestResolveNonlibraryReleaseFlag:
         assert Settings().lml_resolve_nonlibrary_release is True
 
 
+class TestDiscogsBreakerTrialWatchdogMultiplier:
+    """LML#787 review: the HALF_OPEN watchdog multiplier follows the three
+    sibling breaker knobs into pydantic-settings, so operators can retune the
+    watchdog window during an incident without a code deploy."""
+
+    def test_defaults_to_20(self):
+        assert Settings().discogs_breaker_trial_watchdog_multiplier == 20.0
+
+    def test_reads_env(self, monkeypatch):
+        monkeypatch.setenv("DISCOGS_BREAKER_TRIAL_WATCHDOG_MULTIPLIER", "10.5")
+        assert Settings().discogs_breaker_trial_watchdog_multiplier == 10.5
+
+
 class TestGetSettings:
     def test_returns_settings_instance(self):
         get_settings.cache_clear()

@@ -169,6 +169,18 @@ class Settings(BaseSettings):
             "Must be >= 0."
         ),
     )
+    discogs_breaker_trial_watchdog_multiplier: float = Field(
+        default=20.0,
+        ge=0.0,
+        description=(
+            "LML#787 HALF_OPEN watchdog: a trial unresolved after "
+            "`max(cooldown_seconds × this, 60s)` is presumed lost and the breaker re-OPENs "
+            "(fresh cool-down → fresh trial) instead of latching. Size it above the worst-case "
+            "legitimate trial (~360s with the default retry/backoff settings); the default "
+            "(20 → 400s at the 20s cool-down) leaves headroom. The 60s floor keeps the watchdog "
+            "alive even at 0. Must be >= 0."
+        ),
+    )
 
     # Admin Configuration
     admin_token: str | None = Field(

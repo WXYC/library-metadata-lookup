@@ -30,6 +30,7 @@ import pytest
 
 from discogs.breaker import DiscogsBreakerOpenError, DiscogsCircuitBreaker
 from discogs.service import BREAKER_OPEN_STAT_KEY, DiscogsService
+from tests.unit.conftest import MonotonicClock
 
 
 def _make_service(client: MagicMock) -> DiscogsService:
@@ -308,14 +309,7 @@ async def test_inflight_shed_during_cooldown_does_not_latch_the_breaker():
     → the breaker sheds all live traffic until restart.
     """
 
-    class Clock:
-        def __init__(self) -> None:
-            self.t = 1000.0
-
-        def __call__(self) -> float:
-            return self.t
-
-    clock = Clock()
+    clock = MonotonicClock()
     breaker = DiscogsCircuitBreaker(
         failure_threshold=1, remaining_floor=0, cooldown_seconds=30.0, now=clock
     )
@@ -329,7 +323,7 @@ async def test_inflight_shed_during_cooldown_does_not_latch_the_breaker():
 
     async def open_and_elapse_cooldown(_delay: float) -> None:
         breaker.force_open()
-        clock.t += 31.0  # push past the cool-down while this request sleeps
+        clock.advance(31.0)  # push past the cool-down while this request sleeps
 
     fake_limiter = MagicMock()
     fake_limiter.acquire = AsyncMock()
@@ -368,31 +362,21 @@ async def test_inflight_shed_during_cooldown_does_not_latch_the_breaker():
     assert breaker.state.value == "closed"
 
 
-class _Clock:
-    """Mutable monotonic clock for deterministic cool-down transitions."""
-
-    def __init__(self) -> None:
-        self.t = 1000.0
-
-    def __call__(self) -> float:
-        return self.t
-
-
-def _half_open_ready_breaker(clock: _Clock) -> DiscogsCircuitBreaker:
+def _half_open_ready_breaker(clock: MonotonicClock) -> DiscogsCircuitBreaker:
     """A breaker whose cool-down has elapsed: the NEXT admitted request becomes
     the half-open trial."""
     breaker = DiscogsCircuitBreaker(
         failure_threshold=1, remaining_floor=0, cooldown_seconds=30.0, now=clock
     )
     breaker.force_open()
-    clock.t += 31.0
+    clock.advance(31.0)
     return breaker
 
 
-async def _assert_recovery_possible(breaker: DiscogsCircuitBreaker, clock: _Clock) -> None:
+async def _assert_recovery_possible(breaker: DiscogsCircuitBreaker, clock: MonotonicClock) -> None:
     """After the cool-down, a fresh healthy request must be admitted as a new
     trial and CLOSE the breaker — the anti-latch invariant."""
-    clock.t += 31.0
+    clock.advance(31.0)
     healthy_client = MagicMock()
     healthy_client.request = AsyncMock(
         return_value=_response(200, {"X-Discogs-Ratelimit-Remaining": "50"})
@@ -418,7 +402,7 @@ async def test_trial_killed_by_request_error_does_not_latch(fake_limiter):
     HALF_OPEN shedding 100% of live calls until a process restart. The trial's
     death must instead re-OPEN the breaker so the next cool-down promotes a
     fresh trial."""
-    clock = _Clock()
+    clock = MonotonicClock()
     breaker = _half_open_ready_breaker(clock)
 
     client = MagicMock()
@@ -444,7 +428,7 @@ async def test_trial_cancelled_mid_request_does_not_latch(fake_limiter):
     """LML#787 exit path 2a: the HALF_OPEN trial is cancelled while awaiting
     ``client.request`` (per-strategy ``wait_for`` ceiling / caller disconnect).
     Cancellation must propagate — but the breaker must re-OPEN, not latch."""
-    clock = _Clock()
+    clock = MonotonicClock()
     breaker = _half_open_ready_breaker(clock)
 
     client = MagicMock()
@@ -469,7 +453,7 @@ async def test_trial_cancelled_during_retry_sleep_does_not_latch(fake_limiter):
     backoff sleep, and is cancelled mid-sleep — the hot path during floods (the
     LML#758 sleep ignores ``caller_budget_ms``, so ``wait_for`` routinely fires
     mid-backoff). The breaker must re-OPEN, not latch."""
-    clock = _Clock()
+    clock = MonotonicClock()
     breaker = _half_open_ready_breaker(clock)
 
     client = MagicMock()
@@ -485,6 +469,35 @@ async def test_trial_cancelled_during_retry_sleep_does_not_latch(fake_limiter):
         with pytest.raises(asyncio.CancelledError):
             await service._request_with_retry("GET", "/database/search", max_retries=3)
 
+    assert breaker.state.value == "open"
+    await _assert_recovery_possible(breaker, clock)
+
+
+@pytest.mark.asyncio
+async def test_trial_cancelled_during_limiter_acquire_does_not_latch():
+    """LML#787 exit path 2c: the HALF_OPEN trial is cancelled while awaiting
+    ``rate_limiter.acquire()`` — admitted, but cancelled before any attempt is
+    dispatched. The admitted-body ``try/finally`` must still report the abort
+    so the breaker re-OPENs rather than latching."""
+    clock = MonotonicClock()
+    breaker = _half_open_ready_breaker(clock)
+
+    cancelling_limiter = MagicMock()
+    cancelling_limiter.acquire = AsyncMock(side_effect=asyncio.CancelledError())
+
+    client = MagicMock()
+    client.request = AsyncMock()  # must never be reached
+    service = _make_service(client)
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_rate_limiter", return_value=cancelling_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await service._request_with_retry("GET", "/database/search")
+
+    client.request.assert_not_called()
     assert breaker.state.value == "open"
     await _assert_recovery_possible(breaker, clock)
 

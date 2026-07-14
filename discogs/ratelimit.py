@@ -31,6 +31,7 @@ def _build_breaker() -> DiscogsCircuitBreaker:
         failure_threshold=settings.discogs_breaker_failure_threshold,
         remaining_floor=settings.discogs_breaker_remaining_floor,
         cooldown_seconds=settings.discogs_breaker_cooldown_seconds,
+        trial_watchdog_multiplier=settings.discogs_breaker_trial_watchdog_multiplier,
     )
 
 

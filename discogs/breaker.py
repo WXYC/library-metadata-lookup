@@ -74,11 +74,12 @@ persist:
   trial's late record epoch-mismatches (the watchdog's ``_open`` bumped the
   epoch), costing one discarded probe and one extra cool-down.
 
-So HALF_OPEN is bounded at ``max(cooldown × multiplier, 60s)`` in the worst
-case, and the known unrecorded-exit paths resolve immediately via
-``record_aborted``. The residual stall — a 5xx-resolved trial shedding until
-the watchdog fires instead of re-arming after one cool-down — is tracked in
-LML#791.
+So — given traffic (the watchdog runs inside ``allow_request``, so an idle
+service can sit HALF_OPEN longer, harmlessly: no callers, nothing shed) —
+HALF_OPEN is bounded at ``max(cooldown × multiplier, 60s)``, and the known
+unrecorded-exit paths resolve immediately via ``record_aborted``. The residual
+stall — a 5xx-resolved trial shedding until the watchdog fires instead of
+re-arming after one cool-down — is tracked in LML#791.
 
 Epoch guard
 -----------
@@ -184,11 +185,9 @@ class DiscogsCircuitBreaker:
                 half-open trial request.
             trial_watchdog_multiplier: A HALF_OPEN trial unresolved after
                 ``max(cooldown_seconds × trial_watchdog_multiplier, 60s)`` is
-                presumed lost and the breaker re-OPENs (LML#787; the 60s floor
-                keeps the watchdog alive when the product is zero or
-                negative). Must comfortably exceed the worst-case legitimate
-                trial (~360s with the default retry/backoff settings); the
-                default (20) gives 400s at the default 20s cool-down.
+                presumed lost and the breaker re-OPENs (LML#787). Sizing and
+                floor rationale live in the module docstring and on
+                ``_WATCHDOG_FLOOR_SECONDS``.
             now: Monotonic clock source (injectable for deterministic tests).
         """
         self._failure_threshold = failure_threshold
@@ -248,11 +247,9 @@ class DiscogsCircuitBreaker:
         # slot has been occupied so long the trial must be lost or stranded
         # (LML#787 watchdog; ``record_aborted`` covers the known
         # unrecorded-exit paths, this covers the unknown ones — plus the
-        # LML#791 stranded slot after a neutral 5xx-resolved trial). The 60s
-        # floor keeps the watchdog alive under degenerate configs — a zero
-        # cool-down (settings permit ``ge=0.0``) or a zero/negative multiplier
-        # would otherwise yield threshold 0 and re-latch HALF_OPEN forever —
-        # while never presuming a live trial lost faster than a minute.
+        # LML#791 stranded slot after a neutral 5xx-resolved trial). The
+        # threshold is floored so a degenerate config can't zero it and
+        # re-admit the forever-latch (see ``_WATCHDOG_FLOOR_SECONDS``).
         threshold = max(
             self._cooldown_seconds * self._trial_watchdog_multiplier,
             _WATCHDOG_FLOOR_SECONDS,
