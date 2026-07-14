@@ -229,6 +229,41 @@ class TestPerformLookupBasic:
         assert response.results[0].artwork is None
 
     @pytest.mark.asyncio
+    async def test_structured_fields_without_raw_message_resolves(self, mock_library_db, telemetry):
+        """Regression (WXYC/library-metadata-lookup#783): a structured-only request
+        (artist/album/song set, ``raw_message`` omitted → None on the public
+        ``LookupRequest``) must resolve normally, not blow up.
+
+        ``ParsedRequest.raw_message`` is a non-optional ``str``; ``_step_prepare``
+        copied the request value straight across, so a ``None`` raw_message raised a
+        Pydantic ValidationError that ``handle_lookup`` surfaced as HTTP 500. The
+        structured path drives the pipeline from artist/album/song regardless of
+        raw_message, so this must return the library hit."""
+        stereolab_aluminum = make_library_item(
+            id=42,
+            artist="Stereolab",
+            title="Aluminum Tunes",
+            call_letters="RO",
+            genre="Rock",
+        )
+        mock_library_db.search.return_value = [stereolab_aluminum]
+
+        request = LookupRequest(
+            artist="Stereolab",
+            album="Aluminum Tunes",
+            song="Pop Quiz",
+            # raw_message intentionally omitted → None
+        )
+        assert request.raw_message is None
+
+        response = await perform_lookup(request, mock_library_db, None, telemetry)
+
+        assert isinstance(response, LookupResponse)
+        assert len(response.results) == 1
+        assert response.results[0].library_item.artist == "Stereolab"
+        assert response.results[0].library_item.title == "Aluminum Tunes"
+
+    @pytest.mark.asyncio
     async def test_song_as_track_emits_matched_via_on_result_item(
         self, mock_library_db, mock_discogs_service, telemetry
     ):
