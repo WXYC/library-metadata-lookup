@@ -1503,6 +1503,7 @@ class DiscogsService:
                     DiscogsSearchResult(
                         album=row["title"],
                         artist=row["artist_name"],
+                        artist_credits=row.get("artist_credits") or None,
                         release_id=row["release_id"],
                         release_url=f"https://www.discogs.com/release/{row['release_id']}",
                         artwork_url=row.get("artwork_url"),

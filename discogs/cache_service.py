@@ -1281,12 +1281,33 @@ class DiscogsCacheService:
             logger.error(f"Cache write_release failed: {e}")
             raise CacheUnavailableError(f"Cache write_release failed: {e}") from e
 
+    # LML#784: retrieval and ranking stay per-credit (the trigram WHERE and the
+    # similarity score both look at the single ``ra.artist_name`` that matched),
+    # but presentation is the aggregated release credit — the shape the API
+    # arm's "Artist A, Artist B - Title" results already carry, so both arms
+    # feed the same artist string to the 80/80 floor. ``artist_credits`` keeps
+    # the per-credit names so single-credit queries still clear via the
+    # candidate-side variants in ``find_best_typed_match``. Alphabetical
+    # ordering is for determinism only — ``token_sort_ratio`` is
+    # order-insensitive, so scoring is unaffected.
+    _CREDIT_AGG_LATERAL = """
+        CROSS JOIN LATERAL (
+            SELECT string_agg(ra2.artist_name, ', ' ORDER BY ra2.artist_name) AS artist_name,
+                   array_agg(ra2.artist_name ORDER BY ra2.artist_name) AS artist_credits
+            FROM release_artist ra2
+            WHERE ra2.release_id = r.id AND ra2.extra = 0
+        ) agg
+    """
+
     async def search_releases(
         self, artist: str | None = None, album: str | None = None, limit: int = 5
     ) -> list[dict]:
         """Search for releases by artist and/or album title.
 
-        Uses trigram similarity for fuzzy matching.
+        Uses trigram similarity for fuzzy matching. Matching runs per credit;
+        the returned ``artist_name`` is the release's aggregated ``extra = 0``
+        credit ("Fust, Merce Lemon") with the individual names in
+        ``artist_credits`` (LML#784 — see ``_CREDIT_AGG_LATERAL``).
 
         Args:
             artist: Artist name to search for
@@ -1294,7 +1315,8 @@ class DiscogsCacheService:
             limit: Maximum number of results to return
 
         Returns:
-            List of dicts with keys: release_id, title, artist_name, artwork_url
+            List of dicts with keys: release_id, title, artist_name,
+            artist_credits, artwork_url
 
         Raises:
             CacheUnavailableError: If database is unreachable
@@ -1304,13 +1326,15 @@ class DiscogsCacheService:
 
         try:
             if artist and album:
-                query = """
+                query = f"""
                     SELECT DISTINCT ON (r.id)
-                        r.id as release_id, r.title, ra.artist_name, r.artwork_url,
+                        r.id as release_id, r.title, agg.artist_name, agg.artist_credits,
+                        r.artwork_url,
                         (similarity(lower(f_unaccent(r.title)), lower(f_unaccent($1)))
                          + similarity(lower(f_unaccent(ra.artist_name)), lower(f_unaccent($2)))) / 2.0 as score
                     FROM release r
                     JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
+                    {self._CREDIT_AGG_LATERAL}
                     WHERE lower(f_unaccent(r.title)) % lower(f_unaccent($1))
                       AND lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($2))
                     ORDER BY r.id, score DESC
@@ -1322,12 +1346,14 @@ class DiscogsCacheService:
                 """
                 rows = await self.pool.fetch(query, album, artist, limit * 2)
             elif artist:
-                query = """
+                query = f"""
                     SELECT DISTINCT ON (r.id)
-                        r.id as release_id, r.title, ra.artist_name, r.artwork_url,
+                        r.id as release_id, r.title, agg.artist_name, agg.artist_credits,
+                        r.artwork_url,
                         similarity(lower(f_unaccent(ra.artist_name)), lower(f_unaccent($1))) as score
                     FROM release r
                     JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
+                    {self._CREDIT_AGG_LATERAL}
                     WHERE lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($1))
                     ORDER BY r.id, score DESC
                 """
@@ -1338,12 +1364,14 @@ class DiscogsCacheService:
                 """
                 rows = await self.pool.fetch(query, artist, limit * 2)
             else:  # album only
-                query = """
+                query = f"""
                     SELECT DISTINCT ON (r.id)
-                        r.id as release_id, r.title, ra.artist_name, r.artwork_url,
+                        r.id as release_id, r.title, agg.artist_name, agg.artist_credits,
+                        r.artwork_url,
                         similarity(lower(f_unaccent(r.title)), lower(f_unaccent($1))) as score
                     FROM release r
                     JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
+                    {self._CREDIT_AGG_LATERAL}
                     WHERE lower(f_unaccent(r.title)) % lower(f_unaccent($1))
                     ORDER BY r.id, score DESC
                 """
@@ -1367,6 +1395,7 @@ class DiscogsCacheService:
                         "release_id": row["release_id"],
                         "title": row["title"],
                         "artist_name": row["artist_name"],
+                        "artist_credits": list(row["artist_credits"] or []),
                         "artwork_url": row["artwork_url"],
                     }
                 )

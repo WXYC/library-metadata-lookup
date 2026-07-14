@@ -1505,6 +1505,131 @@ class TestFindBestTypedMatch:
         assert best is candidate
 
 
+class TestFindBestTypedMatchCandidateVariants:
+    """Candidate-side artist variants (LML#784 A2).
+
+    The PG cache arm presents the aggregated release credit ("Fust, Merce
+    Lemon") plus the per-credit list (``artist_credits``). ``artist_fn`` may
+    return an iterable of variants; the artist axis scores as the max across
+    them — mirroring the query-side variant support. This is what lets a
+    single-credit query (library item artist "Fust") keep matching a
+    multi-artist release after the aggregation, without loosening any floor:
+    a variant passes only when the queried artist is genuinely one of the
+    release's credits.
+    """
+
+    def test_single_credit_query_passes_via_per_credit_variant(self):
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        joined = make_discogs_result(
+            release_id=36830641,
+            album="Cup Of Loneliness / Choices",
+            artist="Fust, Merce Lemon",
+        )
+        best = find_best_typed_match(
+            [joined],
+            query_artist="Fust",
+            query_title="Cup Of Loneliness / Choices",
+            artist_fn=lambda r: [r.artist, "Fust", "Merce Lemon"],
+            title_fn=lambda r: r.album,
+        )
+        assert best is joined
+
+    def test_joined_credit_query_passes_via_joined_variant(self):
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        joined = make_discogs_result(
+            release_id=36830641,
+            album="Cup Of Loneliness / Choices",
+            artist="Fust, Merce Lemon",
+        )
+        best = find_best_typed_match(
+            [joined],
+            query_artist="Merce Lemon & Fust",
+            query_title="Cup of Loneliness / Choices",
+            artist_fn=lambda r: [r.artist, "Fust", "Merce Lemon"],
+            title_fn=lambda r: r.album,
+        )
+        assert best is joined
+
+    def test_unrelated_query_still_rejected_with_variants(self):
+        """Variants only admit genuine credits — an unrelated artist still fails."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        joined = make_discogs_result(
+            release_id=36830641,
+            album="Cup Of Loneliness / Choices",
+            artist="Fust, Merce Lemon",
+        )
+        best = find_best_typed_match(
+            [joined],
+            query_artist="Jessica Pratt",
+            query_title="Cup Of Loneliness / Choices",
+            artist_fn=lambda r: [r.artist, "Fust", "Merce Lemon"],
+            title_fn=lambda r: r.album,
+        )
+        assert best is None
+
+    def test_empty_variant_iterable_scores_zero(self):
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        candidate = make_discogs_result(release_id=1, album="Aluminum Tunes", artist="Stereolab")
+        best = find_best_typed_match(
+            [candidate],
+            query_artist="Stereolab",
+            query_title="Aluminum Tunes",
+            artist_fn=lambda r: [],
+            title_fn=lambda r: r.album,
+        )
+        assert best is None
+
+    def test_none_and_empty_variants_are_filtered(self):
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        candidate = make_discogs_result(release_id=1, album="Aluminum Tunes", artist="Stereolab")
+        best = find_best_typed_match(
+            [candidate],
+            query_artist="Stereolab",
+            query_title="Aluminum Tunes",
+            artist_fn=lambda r: [None, "", "  ", r.artist],
+            title_fn=lambda r: r.album,
+        )
+        assert best is candidate
+
+    def test_plain_str_extractor_behavior_unchanged(self):
+        """Non-regression pin: a plain-`str` extractor scores exactly as before —
+        floor-pass and floor-fail cases both preserved."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        passing = make_discogs_result(release_id=1, album="DOGA", artist="Juana Molina")
+        best = find_best_typed_match(
+            [passing],
+            query_artist="Juana Molina",
+            query_title="DOGA",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is passing
+
+        failing = make_discogs_result(
+            release_id=2, album="Cup Of Loneliness / Choices", artist="Merce Lemon"
+        )
+        best = find_best_typed_match(
+            [failing],
+            query_artist="Merce Lemon & Fust",
+            query_title="Cup Of Loneliness / Choices",
+            artist_fn=lambda r: r.artist,
+            title_fn=lambda r: r.album,
+        )
+        assert best is None
+
+
 class TestStripThePrefix:
     @pytest.mark.parametrize(
         "name, expected",

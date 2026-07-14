@@ -71,7 +71,11 @@ async def _library_miss_discogs_search(
             response.results,
             query_artist=artist,
             query_title=album,
-            artist_fn=lambda r: r.artist,
+            # Joined credit plus the PG arm's per-credit variants (LML#784):
+            # a single-credit query clears via its credit, a joined-credit
+            # query clears via the aggregate. API-arm results carry no
+            # artist_credits and score exactly as before.
+            artist_fn=lambda r: [r.artist, *(r.artist_credits or [])],
             title_fn=lambda r: r.album,
         )
 

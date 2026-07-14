@@ -232,6 +232,14 @@ class DiscogsSearchResult(BaseModel):
 
     album: str | None = None
     artist: str | None = None
+    # LML#784: the release's individual `extra = 0` credits, populated only by
+    # the PG cache arm of `DiscogsService.search()` (whose `search_releases`
+    # aggregates them alongside the joined `artist` presentation). The API arm
+    # leaves this None — Discogs search results carry only the joined display
+    # title. Floor consumers score the artist axis against `artist` plus these
+    # variants, so single-credit and joined-credit queries both clear on a
+    # multi-artist release.
+    artist_credits: list[str] | None = None
     release_id: int
     release_url: str
     artwork_url: str | None = None

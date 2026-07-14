@@ -1036,3 +1036,51 @@ class TestCacheArmFloorRejectFallthrough:
         assert result is not None
         _, discogs_result = result
         assert discogs_result.release_id == 27474075
+
+    @pytest.mark.asyncio
+    async def test_joined_cache_credit_resolves_without_retry(self, mock_discogs_service):
+        """A2: once the PG arm presents the aggregated credit, the in-cache
+        multi-artist release resolves on the first pass — no API retry."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=True,
+            results=[
+                make_discogs_result(
+                    release_id=36830641,
+                    artist="Fust, Merce Lemon",
+                    artist_credits=["Fust", "Merce Lemon"],
+                    album="Cup Of Loneliness / Choices",
+                )
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Merce Lemon & Fust", "Cup of Loneliness / Choices"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == 36830641
+        assert mock_discogs_service.search.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_single_credit_query_matches_joined_cache_credit(self, mock_discogs_service):
+        """A2: a single-credit query keeps matching a multi-artist release via
+        the per-credit ``artist_credits`` variants."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=True,
+            results=[
+                make_discogs_result(
+                    release_id=36830641,
+                    artist="Fust, Merce Lemon",
+                    artist_credits=["Fust", "Merce Lemon"],
+                    album="Cup Of Loneliness / Choices",
+                )
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Fust", "Cup of Loneliness / Choices"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is not None
+        _, discogs_result = result
+        assert discogs_result.release_id == 36830641
+        assert mock_discogs_service.search.call_count == 1

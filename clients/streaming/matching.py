@@ -570,7 +570,7 @@ def find_best_typed_match[T](
     *,
     query_artist: str | Iterable[str],
     query_title: str | Iterable[str],
-    artist_fn: Callable[[T], str | None],
+    artist_fn: Callable[[T], str | None | Iterable[str | None]],
     title_fn: Callable[[T], str | None],
 ) -> T | None:
     """Return the highest-scoring result that clears the 80/80 floor, or None.
@@ -587,6 +587,17 @@ def find_best_typed_match[T](
     surfaces with are known to differ (e.g. "Various" search query vs.
     "Various Artists" canonical artist; a ``discogs_titles`` long-canonical
     override paired against the raw library title).
+
+    ``artist_fn`` may symmetrically return an iterable of **candidate-side**
+    variants (LML#784): the PG cache arm presents a multi-artist release as
+    the aggregated credit plus its per-credit names (``artist_credits``), so
+    a single-credit query ("Fust") and a joined-credit query ("Merce Lemon &
+    Fust") both score against the shape they can actually clear. The artist
+    axis takes the max across the variant cross-product; a variant passes
+    only when the queried artist genuinely is (or contains) one of the
+    release's credits, so this admits no cross-artist collisions (#592) and
+    leaves the title axis untouched (#719). None/empty variants are dropped;
+    an all-empty variant set scores 0 (rejected).
 
     Empty or whitespace-only query strings short-circuit to no-match —
     ``score_match("", "")`` returns 100 by ``rapidfuzz`` convention (and
@@ -629,12 +640,20 @@ def find_best_typed_match[T](
         # skipped, not fatal (LML#640). No total-failure re-raise here — the
         # lookup pipeline wants a graceful ``None`` (see docstring).
         try:
-            r_artist = artist_fn(item) or ""
+            r_artist_raw = artist_fn(item)
             r_title = title_fn(item) or ""
         except _EXTRACTION_ERRORS as exc:
             logger.warning("Skipping malformed result row in find_best_typed_match: %s", exc)
             continue
-        artist_score = max(score_match(q, r_artist) for q in artist_variants)
+        # Candidate-side variants (LML#784): a str extractor keeps the exact
+        # pre-variant scoring; an iterable is filtered like the query side
+        # and scored max-over. An all-empty set degrades to "" (scores 0
+        # against any non-empty query variant — rejected, not raised).
+        if r_artist_raw is None or isinstance(r_artist_raw, str):
+            r_artist_variants = [r_artist_raw or ""]
+        else:
+            r_artist_variants = [v for v in r_artist_raw if v and v.strip()] or [""]
+        artist_score = max(score_match(q, v) for q in artist_variants for v in r_artist_variants)
         title_score = max(score_match(q, r_title) for q in title_variants)
         if not is_acceptable_match(artist_score, title_score):
             continue

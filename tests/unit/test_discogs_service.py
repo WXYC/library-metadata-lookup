@@ -1616,6 +1616,31 @@ class TestSearch:
         assert len(result.results) == 1
 
     @pytest.mark.asyncio
+    async def test_cache_hit_maps_artist_credits(self, service_with_cache):
+        """The PG arm's aggregated credit + per-credit list both reach the
+        result model (LML#784 A2): ``artist`` carries the joined credit the
+        floor scores against, ``artist_credits`` carries the per-credit
+        variants the candidate-side scoring falls back to."""
+        service_with_cache.cache_service.search_releases = AsyncMock(
+            return_value=[
+                {
+                    "release_id": 36830641,
+                    "title": "Cup Of Loneliness / Choices",
+                    "artist_name": "Fust, Merce Lemon",
+                    "artist_credits": ["Fust", "Merce Lemon"],
+                    "artwork_url": None,
+                }
+            ]
+        )
+
+        result = await service_with_cache.search(
+            DiscogsSearchRequest(artist="Merce Lemon & Fust", album="Cup of Loneliness / Choices")
+        )
+        assert result.cached is True
+        assert result.results[0].artist == "Fust, Merce Lemon"
+        assert result.results[0].artist_credits == ["Fust", "Merce Lemon"]
+
+    @pytest.mark.asyncio
     async def test_cache_error_falls_back_to_api(self, service_with_cache):
         service_with_cache.cache_service.search_releases = AsyncMock(
             side_effect=Exception("cache error")
