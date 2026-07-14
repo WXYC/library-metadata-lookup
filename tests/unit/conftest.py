@@ -246,8 +246,8 @@ class MonotonicClock:
     ``_request_with_retry`` breaker-integration tests.
     """
 
-    def __init__(self, start: float = 1000.0) -> None:
-        self.t = start
+    def __init__(self) -> None:
+        self.t = 1000.0
 
     def __call__(self) -> float:
         return self.t

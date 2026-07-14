@@ -129,7 +129,8 @@ logger = logging.getLogger(__name__)
 # LML#787: minimum HALF_OPEN watchdog threshold. ``cooldown ×
 # trial_watchdog_multiplier`` is floored here so degenerate configs (zero
 # cool-down, zero/negative multiplier) can't disable the watchdog and re-admit
-# the forever-latch the watchdog exists to prevent.
+# the forever-latch the watchdog exists to prevent — while never presuming a
+# live trial lost faster than a minute.
 _WATCHDOG_FLOOR_SECONDS = 60.0
 
 

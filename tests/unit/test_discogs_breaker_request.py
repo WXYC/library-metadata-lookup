@@ -296,7 +296,7 @@ async def test_closed_breaker_actually_rides_the_backoff_when_not_shed():
 
 
 @pytest.mark.asyncio
-async def test_inflight_shed_during_cooldown_does_not_latch_the_breaker():
+async def test_inflight_shed_during_cooldown_does_not_latch_the_breaker(clock):
     """R2-1 regression: a request that is mid-retry when the cool-down elapses
     must shed WITHOUT consuming the trial slot, so the breaker is not stuck
     HALF_OPEN. A subsequent fresh request must still be admitted as the trial and
@@ -309,7 +309,6 @@ async def test_inflight_shed_during_cooldown_does_not_latch_the_breaker():
     → the breaker sheds all live traffic until restart.
     """
 
-    clock = MonotonicClock()
     breaker = DiscogsCircuitBreaker(
         failure_threshold=1, remaining_floor=0, cooldown_seconds=30.0, now=clock
     )
@@ -395,14 +394,13 @@ async def _assert_recovery_possible(breaker: DiscogsCircuitBreaker, clock: Monot
 
 
 @pytest.mark.asyncio
-async def test_trial_killed_by_request_error_does_not_latch(fake_limiter):
+async def test_trial_killed_by_request_error_does_not_latch(fake_limiter, clock):
     """LML#787 exit path 1: the HALF_OPEN trial hits ``httpx.RequestError``
     (connect/read failure) and ``_request_with_retry`` returns ``None``. The
     2026-07-13 latch: nothing recorded a terminal outcome, so the breaker sat
     HALF_OPEN shedding 100% of live calls until a process restart. The trial's
     death must instead re-OPEN the breaker so the next cool-down promotes a
     fresh trial."""
-    clock = MonotonicClock()
     breaker = _half_open_ready_breaker(clock)
 
     client = MagicMock()
@@ -424,11 +422,10 @@ async def test_trial_killed_by_request_error_does_not_latch(fake_limiter):
 
 
 @pytest.mark.asyncio
-async def test_trial_cancelled_mid_request_does_not_latch(fake_limiter):
+async def test_trial_cancelled_mid_request_does_not_latch(fake_limiter, clock):
     """LML#787 exit path 2a: the HALF_OPEN trial is cancelled while awaiting
     ``client.request`` (per-strategy ``wait_for`` ceiling / caller disconnect).
     Cancellation must propagate — but the breaker must re-OPEN, not latch."""
-    clock = MonotonicClock()
     breaker = _half_open_ready_breaker(clock)
 
     client = MagicMock()
@@ -448,12 +445,11 @@ async def test_trial_cancelled_mid_request_does_not_latch(fake_limiter):
 
 
 @pytest.mark.asyncio
-async def test_trial_cancelled_during_retry_sleep_does_not_latch(fake_limiter):
+async def test_trial_cancelled_during_retry_sleep_does_not_latch(fake_limiter, clock):
     """LML#787 exit path 2b: the HALF_OPEN trial 429s, enters its inter-attempt
     backoff sleep, and is cancelled mid-sleep — the hot path during floods (the
     LML#758 sleep ignores ``caller_budget_ms``, so ``wait_for`` routinely fires
     mid-backoff). The breaker must re-OPEN, not latch."""
-    clock = MonotonicClock()
     breaker = _half_open_ready_breaker(clock)
 
     client = MagicMock()
@@ -474,12 +470,11 @@ async def test_trial_cancelled_during_retry_sleep_does_not_latch(fake_limiter):
 
 
 @pytest.mark.asyncio
-async def test_trial_cancelled_during_limiter_acquire_does_not_latch():
+async def test_trial_cancelled_during_limiter_acquire_does_not_latch(clock):
     """LML#787 exit path 2c: the HALF_OPEN trial is cancelled while awaiting
     ``rate_limiter.acquire()`` — admitted, but cancelled before any attempt is
     dispatched. The admitted-body ``try/finally`` must still report the abort
     so the breaker re-OPENs rather than latching."""
-    clock = MonotonicClock()
     breaker = _half_open_ready_breaker(clock)
 
     cancelling_limiter = MagicMock()
