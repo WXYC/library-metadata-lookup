@@ -276,6 +276,15 @@ class DiscogsSearchResult(BaseModel):
     # writer-role credits. Rides the same extended gate as the other enriched fields.
     writer_credits: WriterCredits | None = None
 
+    def artist_variants(self) -> list[str | None]:
+        """Artist-axis scoring variants: the joined credit plus the PG arm's
+        per-credit entries (LML#784). Max-over these lets a single-credit
+        query clear via its credit and a joined-credit query clear via the
+        aggregate; API-arm results carry no ``artist_credits`` and score
+        exactly as before.
+        """
+        return [self.artist, *(self.artist_credits or [])]
+
     def to_match_result(self) -> EnrichedDiscogsMatchResult:
         """Convert to the enriched API contract model."""
         return EnrichedDiscogsMatchResult(
@@ -312,6 +321,12 @@ class DiscogsSearchResponse(BaseModel):
     results: list[DiscogsSearchResult] = []
     total: int = 0
     cached: bool = False
+    # LML#784: arm provenance. True only when the PG cache arm built
+    # ``results``. Distinct from ``cached``, which the in-memory memoization
+    # layer (``@async_cached``) flips to True on every replay regardless of
+    # which arm originally served — the library-miss floor-reject retry must
+    # gate on this, or a memory-replayed API pass burns a duplicate API call.
+    pg_served: bool = False
 
 
 class DiscogsArtistSearchResult(BaseModel):

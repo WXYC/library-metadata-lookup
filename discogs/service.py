@@ -1511,7 +1511,9 @@ class DiscogsService:
                     )
                 )
             results.sort(key=lambda r: r.confidence, reverse=True)
-            return DiscogsSearchResponse(results=results, total=len(results), cached=True)
+            return DiscogsSearchResponse(
+                results=results, total=len(results), cached=True, pg_served=True
+            )
 
         async def _api_fetch() -> DiscogsSearchResponse | None:
             logger.info(f"Searching Discogs with params: {params}")

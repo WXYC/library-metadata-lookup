@@ -841,8 +841,10 @@ class TestCacheArmFloorRejectFallthrough:
     (36.4) singly and floor-fails, while the API arm's joined credit
     ("Fust, Merce Lemon") clears at 91.4. The ``fallthrough`` seam treats any
     non-empty ``pg_read`` as terminal, so ``_library_miss_discogs_search``
-    re-issues the search with ``skip_pg=True`` when a cache-served
-    (``response.cached``) candidate set clears nothing (LML#784 category 1).
+    re-issues the search with ``skip_pg=True`` when a PG-served
+    (``response.pg_served``) candidate set clears nothing (LML#784 category 1).
+    ``response.cached`` is NOT the gate: the in-memory memoization layer
+    flips it to True on every replay, including replays of API-served passes.
     """
 
     @pytest.mark.asyncio
@@ -850,6 +852,7 @@ class TestCacheArmFloorRejectFallthrough:
         """Merce Lemon & Fust — per-credit cache rows floor-fail, joined API credit passes."""
         cache_response = DiscogsSearchResponse(
             cached=True,
+            pg_served=True,
             results=[
                 make_discogs_result(
                     release_id=36830641,
@@ -890,6 +893,7 @@ class TestCacheArmFloorRejectFallthrough:
         """A floor-passing cache candidate is terminal — no second search."""
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
             cached=True,
+            pg_served=True,
             results=[
                 make_discogs_result(
                     release_id=1489958,
@@ -925,11 +929,36 @@ class TestCacheArmFloorRejectFallthrough:
         assert mock_discogs_service.search.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_no_retry_on_memory_replayed_api_response(self, mock_discogs_service):
+        """``@async_cached`` flips ``cached=True`` on every in-memory replay —
+        including one whose underlying response was API-served. Only
+        ``pg_served`` carries arm provenance, so a floor-failing memory replay
+        of an API pass must not burn a second, identical API call."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            cached=True,  # memory-cache replay...
+            pg_served=False,  # ...of an API-served response
+            results=[
+                make_discogs_result(
+                    release_id=999,
+                    artist="Merce Lemon",
+                    album="Cup Of Loneliness / Choices",
+                )
+            ],
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("Merce Lemon & Fust", "Cup of Loneliness / Choices"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is None
+        assert mock_discogs_service.search.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_retry_floor_reject_returns_none(self, mock_discogs_service):
         """Both arms floor-failing degrades to a clean no-match."""
         mock_discogs_service.search.side_effect = [
             DiscogsSearchResponse(
                 cached=True,
+                pg_served=True,
                 results=[make_discogs_result(release_id=1, artist="Fust", album="Genevieve")],
             ),
             DiscogsSearchResponse(
@@ -950,6 +979,7 @@ class TestCacheArmFloorRejectFallthrough:
         mock_discogs_service.search.side_effect = [
             DiscogsSearchResponse(
                 cached=True,
+                pg_served=True,
                 results=[make_discogs_result(release_id=1, artist="Fust", album="Genevieve")],
             ),
             DiscogsSearchResponse(cached=False, results=[]),
@@ -966,6 +996,7 @@ class TestCacheArmFloorRejectFallthrough:
         mock_discogs_service.search.side_effect = [
             DiscogsSearchResponse(
                 cached=True,
+                pg_served=True,
                 results=[make_discogs_result(release_id=1, artist="Fust", album="Genevieve")],
             ),
             Exception("rate limited"),
@@ -987,6 +1018,7 @@ class TestCacheArmFloorRejectFallthrough:
         mock_discogs_service.search.side_effect = [
             DiscogsSearchResponse(
                 cached=True,
+                pg_served=True,
                 results=[
                     make_discogs_result(release_id=37552383, artist="Anadol", album="Manivelles")
                 ],
@@ -1017,6 +1049,7 @@ class TestCacheArmFloorRejectFallthrough:
         mock_discogs_service.search.side_effect = [
             DiscogsSearchResponse(
                 cached=True,
+                pg_served=True,
                 results=[
                     make_discogs_result(release_id=1, artist="Ricardo Villalobos", album="Sol"),
                 ],
@@ -1043,6 +1076,7 @@ class TestCacheArmFloorRejectFallthrough:
         multi-artist release resolves on the first pass — no API retry."""
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
             cached=True,
+            pg_served=True,
             results=[
                 make_discogs_result(
                     release_id=36830641,
@@ -1067,6 +1101,7 @@ class TestCacheArmFloorRejectFallthrough:
         the per-credit ``artist_credits`` variants."""
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
             cached=True,
+            pg_served=True,
             results=[
                 make_discogs_result(
                     release_id=36830641,

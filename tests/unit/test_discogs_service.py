@@ -1637,6 +1637,7 @@ class TestSearch:
             DiscogsSearchRequest(artist="Merce Lemon & Fust", album="Cup of Loneliness / Choices")
         )
         assert result.cached is True
+        assert result.pg_served is True
         assert result.results[0].artist == "Fust, Merce Lemon"
         assert result.results[0].artist_credits == ["Fust", "Merce Lemon"]
 
@@ -1696,6 +1697,7 @@ class TestSearch:
 
         service_with_cache.cache_service.search_releases.assert_not_called()
         assert result.cached is False
+        assert result.pg_served is False
         assert result.results[0].release_id == 36830641
 
     @pytest.mark.asyncio
@@ -3379,3 +3381,19 @@ class TestSearchArtists:
         ):
             await service.search_artists("Sessa")
         recorder.record_api_call.assert_called_once()
+
+
+class TestDiscogsSearchResultArtistVariants:
+    """The candidate-side scoring variants live on the model (LML#784 A2)."""
+
+    def test_joined_credit_plus_per_credit_variants(self):
+        from tests.factories import make_discogs_result
+
+        r = make_discogs_result(artist="Fust, Merce Lemon", artist_credits=["Fust", "Merce Lemon"])
+        assert r.artist_variants() == ["Fust, Merce Lemon", "Fust", "Merce Lemon"]
+
+    def test_api_arm_result_without_credits_yields_just_artist(self):
+        from tests.factories import make_discogs_result
+
+        r = make_discogs_result(artist="Juana Molina")
+        assert r.artist_variants() == ["Juana Molina"]
