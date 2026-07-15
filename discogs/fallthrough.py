@@ -310,7 +310,7 @@ async def fallthrough[T](
             if is_pg_hit(cached):
                 _add_discogs_breadcrumb("cache_hit", bc_data)
                 get_cache_stats_recorder().record_pg_cache_hit()
-                logger.info("Cache hit (%s)", label)
+                logger.debug("Cache hit (%s)", label)
                 # ``cached`` may be ``T`` (single-value) or ``False`` (tri-state).
                 # Either way ``is_pg_hit`` said it's a hit, so return it.
                 return cached  # type: ignore[return-value]

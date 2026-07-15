@@ -21,6 +21,7 @@ Tests cover, in order:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock
 
 import asyncpg.exceptions
@@ -69,6 +70,27 @@ class TestBasicReadThrough:
         assert result == "cached-value"
         pg_read.assert_awaited_once()
         api_fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pg_hit_logs_at_debug_not_info(self, caplog):
+        """#798: the per-call ``Cache hit`` breadcrumb fires once per Discogs
+        fallthrough on the lookup hot path, so it logs at DEBUG (matching the
+        sibling ``Cache miss`` line) rather than flooding INFO under a
+        saturation storm."""
+        pg_read = AsyncMock(return_value="cached-value")
+
+        with caplog.at_level(logging.DEBUG, logger="discogs.fallthrough"):
+            await fallthrough(
+                label="get_thing",
+                pg_read=pg_read,
+                api_fetch=AsyncMock(),
+            )
+
+        hits = [r for r in caplog.records if "Cache hit" in r.getMessage()]
+        assert hits, "expected a cache-hit breadcrumb"
+        assert all(r.levelno == logging.DEBUG for r in hits), [
+            (r.levelname, r.getMessage()) for r in hits
+        ]
 
     @pytest.mark.asyncio
     async def test_pg_miss_calls_api_returns_api_result(self):
