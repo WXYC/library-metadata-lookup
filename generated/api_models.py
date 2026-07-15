@@ -752,6 +752,17 @@ class ConcertStatus(StrEnum):
     rescheduled = "rescheduled"
 
 
+class SimilarArtist(BaseModel):
+    artist_id: int = Field(
+        ...,
+        description="WXYC catalog artist id, same keyspace as `Concert.headlining_artist_id`.",
+    )
+    weight: float = Field(
+        ...,
+        description="semantic-index affinity score, used for client-side ranking and the similar-tier noise cap. Higher is closer.",
+    )
+
+
 class Concert(BaseModel):
     id: int
     venue: Venue
@@ -790,6 +801,14 @@ class Concert(BaseModel):
         ..., description='Source-displayed age restriction (e.g. "18+", "All Ages").'
     )
     status: ConcertStatus
+    genres: list[str] | None = Field(
+        None,
+        description="Discogs genre tags for the resolved headlining artist, aggregated across their releases (LML discogs-cache, majority-take). Null when the headliner is unresolved or enrichment has not run. Optional (not in `required`) so the field can land ahead of the Backend-Service emitter and older clients decode forward-compatibly — same discipline as `FlowsheetV2TrackEntry.upcoming_show`. Same taxonomy as `FlowsheetV2TrackEntry.genres`.",
+    )
+    similar_artists: list[SimilarArtist] | None = Field(
+        None,
+        description="Top-K affinity neighbors of the resolved headliner, computed nightly from the semantic-index graph and ordered by `weight` descending. Null when the headliner is unresolved or enrichment has not run. Powers on-device For You matching (set intersection against liked-artist ids). Optional (not in `required`) so it can land ahead of the Backend-Service emitter and older clients decode forward-compatibly — same discipline as `Concert.genres`.",
+    )
 
 
 class ConcertsResponse(BaseModel):
@@ -2135,7 +2154,7 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
     )
     upcoming_show: Concert | None = Field(
         None,
-        description="An optional embedded upcoming Triangle-area concert whose headliner is this track's resolved catalog artist, attached server-side at feed-assembly time so the iOS \"Touring Soon\" Box Office CTA renders inline with no second round-trip.\n\nMatch rule (mirrors `GET /concerts?curated=true`): the track's resolved artist — `flowsheet.album_id → library.artist_id` — is matched against `concerts.headlining_artist_id` on curated, non-tombstoned, upcoming rows (`headlining_artist_id IS NOT NULL`, `removed_at IS NULL`, `starts_on >= today` America/New_York). When an artist has several upcoming dates the **soonest** wins (`ORDER BY starts_on ASC LIMIT 1`), so at most one concert rides each playcut.\n\nAbsent/null when the track has no resolved artist (free-form entries with no `album_id`, or an `album_id` whose library row has no matched artist) or when that artist has no curated upcoming date. The field is additive and optional — older app builds that don't decode it are unaffected. Reuses the `Concert` schema verbatim so iOS decodes one type across the Touring Soon tab and the playcut CTA; the `BoxOfficeTicketPresenter` reads `id`, `title` / `headlining_artist_raw`, `venue` (name + city), `starts_on`, `doors_at`, `status`, `price_min` / `price_max`, `ticket_url`, and `image_url` off it.\n",
+        description="An optional embedded upcoming Triangle-area concert whose headliner is this track's resolved catalog artist, attached server-side at feed-assembly time so the iOS \"On Tour\" Box Office CTA renders inline with no second round-trip.\n\nMatch rule (mirrors `GET /concerts?curated=true`): the track's resolved artist — `flowsheet.album_id → library.artist_id` — is matched against `concerts.headlining_artist_id` on curated, non-tombstoned, upcoming rows (`headlining_artist_id IS NOT NULL`, `removed_at IS NULL`, `starts_on >= today` America/New_York). When an artist has several upcoming dates the **soonest** wins (`ORDER BY starts_on ASC LIMIT 1`), so at most one concert rides each playcut.\n\nAbsent/null when the track has no resolved artist (free-form entries with no `album_id`, or an `album_id` whose library row has no matched artist) or when that artist has no curated upcoming date. The field is additive and optional — older app builds that don't decode it are unaffected. Reuses the `Concert` schema verbatim so iOS decodes one type across the On Tour tab and the playcut CTA; the `BoxOfficeTicketPresenter` reads `id`, `title` / `headlining_artist_raw`, `venue` (name + city), `starts_on`, `doors_at`, `status`, `price_min` / `price_max`, `ticket_url`, and `image_url` off it.\n",
     )
 
 
