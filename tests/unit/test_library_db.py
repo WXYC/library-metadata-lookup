@@ -1,5 +1,6 @@
 """Unit tests for library/db.py."""
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -363,6 +364,70 @@ class TestLibraryDBSearch:
 
         results = await db.search(query="nothing", fallback_to_like=False, fallback_to_fuzzy=False)
         assert results == []
+
+
+class TestSearchFallbackLogLevels:
+    """#798: the per-candidate search-fallback breadcrumbs log at DEBUG, not
+    INFO, so a single VA-compilation ``/lookup`` doesn't emit one INFO line per
+    token and flood Railway's 500/sec replica cap during saturation storms.
+
+    Capture at DEBUG and assert every fallback breadcrumb is recorded there and
+    none at INFO.
+    """
+
+    @staticmethod
+    def _fallback_records(caplog):
+        markers = ("LIKE fallback", "fuzzy fallback", "Fuzzy search for")
+        return [
+            r
+            for r in caplog.records
+            if r.name == "library.db" and any(m in r.getMessage() for m in markers)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_fts_fallback_chain_logs_at_debug(self, caplog):
+        db = LibraryDB()
+        fts_cursor = AsyncMock()
+        fts_cursor.fetchall = AsyncMock(return_value=[])  # FTS empty
+        like_cursor = AsyncMock()
+        like_cursor.fetchall = AsyncMock(return_value=[])  # LIKE empty
+        row = _make_row(id=1, artist="Stereolab", title="Aluminum Tunes")
+        fuzzy_cursor = AsyncMock()
+        fuzzy_cursor.fetchall = AsyncMock(return_value=[row])
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(side_effect=[fts_cursor, like_cursor, fuzzy_cursor])
+
+        with caplog.at_level(logging.DEBUG, logger="library.db"):
+            await db.search(query="Stereolab Aluminum")
+
+        records = self._fallback_records(caplog)
+        assert records, "expected FTS/LIKE/fuzzy fallback breadcrumbs to be emitted"
+        assert all(r.levelno == logging.DEBUG for r in records), [
+            (r.levelname, r.getMessage()) for r in records
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fts_error_fallback_chain_logs_at_debug(self, caplog):
+        db = LibraryDB()
+        like_cursor = AsyncMock()
+        like_cursor.fetchall = AsyncMock(return_value=[])  # LIKE empty
+        row = _make_row(id=1, artist="Juana Molina", title="DOGA")
+        fuzzy_cursor = AsyncMock()
+        fuzzy_cursor.fetchall = AsyncMock(return_value=[row])
+        db._conn = AsyncMock()
+        # First call (FTS) raises, then LIKE (empty), then fuzzy (row).
+        db._conn.execute = AsyncMock(
+            side_effect=[Exception("FTS syntax error"), like_cursor, fuzzy_cursor]
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="library.db"):
+            await db.search(query="Juana Molina DOGA")
+
+        records = self._fallback_records(caplog)
+        assert records, "expected error-path FTS/LIKE/fuzzy fallback breadcrumbs to be emitted"
+        assert all(r.levelno == logging.DEBUG for r in records), [
+            (r.levelname, r.getMessage()) for r in records
+        ]
 
 
 # ---------------------------------------------------------------------------

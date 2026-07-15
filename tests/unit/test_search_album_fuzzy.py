@@ -21,6 +21,7 @@ real fixture library so the actual SQLite/FTS5 ordering quirk participates in
 the trace.
 """
 
+import logging
 import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -424,3 +425,29 @@ class TestPerformLookupRecoversTenantOnKaleidoscope:
         assert response.song_not_found is False, (
             "A confirmed track-bearing album should clear song_not_found"
         )
+
+
+class TestSearchAlbumFuzzyLogLevel:
+    """#798: the progressive-shorter-query breadcrumb in ``search_album_fuzzy``
+    fires once per word-length attempt inside the fuzzy loop — a real per-lookup
+    multiplier on the hot path. It must log at DEBUG, not INFO, so a VA
+    compilation doesn't flood Railway's 500/sec replica cap during a storm.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_query_breadcrumb_logs_at_debug(self, tmp_path, caplog):
+        # A title with no exact/LIKE match in the library forces the
+        # significant-words fuzzy loop, which emits the "trying fuzzy" line.
+        db = LibraryDB(db_path=_create_kaleidoscope_library(tmp_path))
+        await db.connect()
+        try:
+            with caplog.at_level(logging.DEBUG, logger="lookup.strategies.track_release_matching"):
+                await search_album_fuzzy(db, "Nonexistent Compilation Zither")
+        finally:
+            await db.close()
+
+        breadcrumbs = [r for r in caplog.records if "trying fuzzy" in r.getMessage()]
+        assert breadcrumbs, "expected the progressive-fuzzy breadcrumb to be emitted"
+        assert all(r.levelno == logging.DEBUG for r in breadcrumbs), [
+            (r.levelname, r.getMessage()) for r in breadcrumbs
+        ]

@@ -357,7 +357,7 @@ async def search_album_fuzzy(db: LibraryDB, album_title: str) -> list[LibraryIte
             max_words = min(4, len(significant_words))
             for n_words in range(max_words, 1, -1):
                 fuzzy_query = " ".join(significant_words[:n_words])
-                logger.info(
+                logger.debug(
                     f"Exact match failed for '{album_title}', trying fuzzy: '{fuzzy_query}'"
                 )
                 raw_results = await db.search(query=fuzzy_query, limit=MAX_SEARCH_RESULTS)

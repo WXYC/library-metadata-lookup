@@ -251,26 +251,26 @@ class LibraryDB:
 
                 # If no results and fallback enabled, try LIKE search
                 if not rows and fallback_to_like:
-                    logger.info(
+                    logger.debug(
                         f"FTS search for '{query}' returned no results, trying LIKE fallback"
                     )
                     rows = await self._fallback_like_search(query, limit)
 
                 # If still no results, try fuzzy search
                 if not rows and fallback_to_fuzzy:
-                    logger.info(
+                    logger.debug(
                         f"LIKE search for '{query}' returned no results, trying fuzzy fallback"
                     )
                     return await self._fuzzy_search(query, limit)
             except Exception as e:
                 # FTS syntax errors (e.g., special characters) - fall back to LIKE
                 if fallback_to_like:
-                    logger.info(f"FTS search for '{query}' failed ({e}), trying LIKE fallback")
+                    logger.debug(f"FTS search for '{query}' failed ({e}), trying LIKE fallback")
                     rows = await self._fallback_like_search(query, limit)
 
                     # If still no results, try fuzzy search
                     if not rows and fallback_to_fuzzy:
-                        logger.info(
+                        logger.debug(
                             f"LIKE search for '{query}' returned no results, trying fuzzy fallback"
                         )
                         return await self._fuzzy_search(query, limit)
@@ -495,7 +495,7 @@ class LibraryDB:
         results = [item for _, item in scored_results[:limit]]
 
         if results:
-            logger.info(f"Fuzzy search for '{query}' found {len(results)} results")
+            logger.debug(f"Fuzzy search for '{query}' found {len(results)} results")
 
         return results
 
