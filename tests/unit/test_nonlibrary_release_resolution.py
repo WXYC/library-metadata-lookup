@@ -19,6 +19,7 @@ cache and does NOT re-probe Discogs.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -79,31 +80,69 @@ def _resolving_service() -> AsyncMock:
 class _RecordingPg:
     """A minimal PgSource stand-in backed by a dict, recording read/write calls.
 
-    Stores by ``(artist_normalized, title_normalized, is_track)``. Mirrors the
-    SELECT/UPSERT shape ``release_resolution_cache`` uses closely enough that
+    Stores by ``(artist_normalized, title_normalized, is_track)`` a dict of
+    ``{"release_id", "crowd_out", "resolved_at"}`` and mirrors the SELECT/UPSERT
+    shape ``release_resolution_cache`` uses closely enough that
     ``get_cached_release_id`` / ``set_cached_release_id`` exercise their real
     normalization + three-valued logic against it.
+
+    ``fetchone`` faithfully re-implements the triple-TTL WHERE clause (positive
+    90d / normal-miss 7d / crowd-out 1h) using the cutoffs the reader passes as
+    ``$4``/``$5``/``$6``, so a test can age a stored row (:meth:`age`) to drive a
+    real staleness transition — the LML#824 self-heal. The authoritative SQL
+    version of the same math lives in the ``-m pg`` integration suite.
     """
 
     def __init__(self):
-        self.store: dict[tuple[str, str, bool], int | None] = {}
+        self.store: dict[tuple[str, str, bool], dict] = {}
         self.fetchone_calls = 0
         self.execute_calls = 0
+
+    def seed(self, key: tuple[str, str, bool], release_id: int | None, *, crowd_out: bool = False):
+        """Pre-place a fresh row (resolved_at = now)."""
+        self.store[key] = {
+            "release_id": release_id,
+            "crowd_out": crowd_out,
+            "resolved_at": datetime.now(UTC),
+        }
+
+    def age(self, key: tuple[str, str, bool], delta: timedelta):
+        """Back-date a stored row's ``resolved_at`` to simulate elapsed time."""
+        self.store[key]["resolved_at"] -= delta
 
     async def fetchone(self, query: str, *args):
         self.fetchone_calls += 1
         artist_key, title_key, is_track = args[0], args[1], args[2]
-        key = (artist_key, title_key, is_track)
-        if key not in self.store:
+        positive_cutoff, miss_cutoff, crowd_out_cutoff = args[3], args[4], args[5]
+        row = self.store.get((artist_key, title_key, is_track))
+        if row is None:
             return None
-        # Present rows are always "fresh" in this stand-in (the staleness
-        # cutoffs are real cutoffs but the row's resolved_at is now()).
-        return {"release_id": self.store[key]}
+        resolved_at = row["resolved_at"]
+        release_id = row["release_id"]
+        # Mirror the three-branch WHERE of _SELECT_SQL: a positive uses the 90d
+        # cutoff, a normal miss the 7d cutoff, a crowd-out miss the 1h cutoff.
+        if release_id is not None:
+            fresh = resolved_at > positive_cutoff
+        elif row["crowd_out"]:
+            fresh = resolved_at > crowd_out_cutoff
+        else:
+            fresh = resolved_at > miss_cutoff
+        return {"release_id": release_id} if fresh else None
 
     async def execute(self, query: str, *args):
         self.execute_calls += 1
-        artist_key, title_key, is_track, release_id = args[0], args[1], args[2], args[3]
-        self.store[(artist_key, title_key, is_track)] = release_id
+        artist_key, title_key, is_track, release_id, crowd_out = (
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+        )
+        self.store[(artist_key, title_key, is_track)] = {
+            "release_id": release_id,
+            "crowd_out": crowd_out,
+            "resolved_at": datetime.now(UTC),
+        }
         return "INSERT 0 1"
 
 
@@ -122,9 +161,11 @@ async def test_cold_resolve_then_cache_hit_skips_second_probe():
     assert first.release_url == RELEASE_URL
     assert svc.search_releases_by_track.await_count >= 1
     probes_after_first = svc.search_releases_by_track.await_count
-    # A positive resolution was written to the #632 cache.
+    # A positive resolution was written to the #632 cache, never crowd-out marked.
     assert pg.execute_calls == 1
-    assert pg.store[(ARTIST.lower(), TRACK.lower(), True)] == RELEASE_ID
+    row = pg.store[(ARTIST.lower(), TRACK.lower(), True)]
+    assert row["release_id"] == RELEASE_ID
+    assert row["crowd_out"] is False
 
     second = await _resolve_nonlibrary_release(
         svc, pg, song=TRACK, artist=ARTIST, album=ALBUM, is_track=True
@@ -150,7 +191,7 @@ async def test_transient_rehydrate_failure_does_not_demote_positive_to_miss():
 
     pg = _RecordingPg()
     # Pre-seed a known-good positive entry (a prior successful resolve).
-    pg.store[(ARTIST.lower(), TRACK.lower(), True)] = RELEASE_ID
+    pg.seed((ARTIST.lower(), TRACK.lower(), True), RELEASE_ID)
 
     result = await _resolve_nonlibrary_release(
         svc, pg, song=TRACK, artist=ARTIST, album=ALBUM, is_track=True
@@ -159,7 +200,7 @@ async def test_transient_rehydrate_failure_does_not_demote_positive_to_miss():
     # Nothing surfaces this add, but the cache is NOT demoted to a miss.
     assert result is None
     assert pg.execute_calls == 0
-    assert pg.store[(ARTIST.lower(), TRACK.lower(), True)] == RELEASE_ID
+    assert pg.store[(ARTIST.lower(), TRACK.lower(), True)]["release_id"] == RELEASE_ID
 
 
 @pytest.mark.asyncio
@@ -181,7 +222,7 @@ async def test_empty_title_rehydrate_falls_through_to_live_resolve():
         )
     )
     pg = _RecordingPg()
-    pg.store[(ARTIST.lower(), TRACK.lower(), True)] = RELEASE_ID  # known-good positive
+    pg.seed((ARTIST.lower(), TRACK.lower(), True), RELEASE_ID)  # known-good positive
 
     result = await _resolve_nonlibrary_release(
         svc, pg, song=TRACK, artist=ARTIST, album=ALBUM, is_track=True
@@ -229,14 +270,20 @@ async def test_cold_miss_writes_known_miss_to_cache(monkeypatch):
     )
 
     assert result is None
-    # Known miss recorded (release_id None).
+    # Known miss recorded (release_id None). The candidate set fit inside the cap
+    # (empty is exhaustive, not truncated), so it is a normal 7-day miss.
     assert pg.execute_calls == 1
-    assert pg.store[(ARTIST.lower(), TRACK.lower(), True)] is None
+    row = pg.store[(ARTIST.lower(), TRACK.lower(), True)]
+    assert row["release_id"] is None
+    assert row["crowd_out"] is False
 
 
 # ---------------------------------------------------------------------------
-# LML#816: a bounded-resolve empty that is a crowd-out (candidate set truncated
-# at the max_validations cap) must NOT pin a durable 7-day known-miss.
+# LML#816 / LML#824: a bounded-resolve empty that is a crowd-out (candidate set
+# truncated at the max_validations cap) must NOT pin a durable 7-day known-miss.
+# #816 skipped the write entirely; #824 pins a *short-TTL* crowd-out miss instead
+# — honored long enough to absorb one backfill flood pass, stale within the hour
+# so a transient crowd-out self-heals.
 # ---------------------------------------------------------------------------
 
 # A resolvable non-library release whose Discogs id sorts *after* the crowd-out
@@ -307,17 +354,20 @@ def _crowdout_service() -> AsyncMock:
 
 
 @pytest.mark.asyncio
-async def test_crowdout_empty_does_not_durably_suppress_resolvable_release():
+async def test_crowdout_empty_pins_short_ttl_miss_and_self_heals():
     """A bounded-resolve empty produced by a *transient* crowd-out (more true
     candidates surfaced than the max_validations=5 window validates, per #802's
-    improved recall) must NOT be pinned as a 7-day known-miss.
+    improved recall) pins a SHORT-TTL crowd-out miss, not a durable 7-day one.
 
-    Otherwise the durable negative short-circuits the very next add — turning a
-    one-off truncation into a week-long suppression of a release that is actually
-    resolvable once the crowd-out clears. This is finding C1 of the #807 review.
+    The short TTL absorbs a burst (a re-add inside the hour short-circuits without
+    re-probing) yet still self-heals: once the crowd-out clears AND the short TTL
+    lapses, the next add re-probes and surfaces the now-resolvable release. #816
+    got the non-suppression by skipping the write; #824 bounds the re-probe cost
+    while keeping it.
     """
     svc = _crowdout_service()
     pg = _RecordingPg()
+    key = (ARTIST.lower(), TRACK.lower(), True)
 
     # First add: six distractors sort ahead of the correct release (id 36907527)
     # and all fail per-track validation, so the bounded resolve exhausts its
@@ -326,23 +376,34 @@ async def test_crowdout_empty_does_not_durably_suppress_resolvable_release():
         svc, pg, song=TRACK, artist=ARTIST, album=None, is_track=True
     )
     assert first is None
-    # The empty came from a TRUNCATED candidate set (7 surfaced > cap 5), so it
-    # must NOT be pinned as a durable known-miss.
-    assert (ARTIST.lower(), TRACK.lower(), True) not in pg.store
+    # The empty came from a TRUNCATED candidate set (7 surfaced > cap 5): it is
+    # pinned as a crowd-out miss (short TTL), NOT a durable 7-day known-miss.
+    assert pg.store[key]["release_id"] is None
+    assert pg.store[key]["crowd_out"] is True
 
-    # The transient clears: the distractors are gone and the correct release is
-    # now the sole, resolvable candidate.
+    # Within the short TTL, a re-add short-circuits on the crowd-out miss — no
+    # re-probe (this is the flood-absorbing property #816's no-pin lacked).
+    probes = svc.search_releases_by_track.await_count
+    short_circuit = await _resolve_nonlibrary_release(
+        svc, pg, song=TRACK, artist=ARTIST, album=None, is_track=True
+    )
+    assert short_circuit is None
+    assert svc.search_releases_by_track.await_count == probes
+
+    # The transient clears AND the short TTL lapses (age the crowd-out row past 1h).
     svc._crowdout_state["cleared"] = True
+    pg.age(key, timedelta(hours=2))
 
-    # A second identical add must surface the correct release — not be suppressed
-    # by a negative pinned on the first (crowd-out) attempt.
+    # A second identical add now re-probes and surfaces the correct release — the
+    # crowd-out miss self-healed rather than suppressing it for a week.
     second = await _resolve_nonlibrary_release(
         svc, pg, song=TRACK, artist=ARTIST, album=None, is_track=True
     )
     assert second is not None
     assert second.release_id == CROWDOUT_CORRECT_ID
-    # And now that it genuinely resolved, a POSITIVE is cached.
-    assert pg.store[(ARTIST.lower(), TRACK.lower(), True)] == CROWDOUT_CORRECT_ID
+    # And now that it genuinely resolved, a POSITIVE is cached (marker cleared).
+    assert pg.store[key]["release_id"] == CROWDOUT_CORRECT_ID
+    assert pg.store[key]["crowd_out"] is False
 
 
 @pytest.mark.asyncio
@@ -368,9 +429,12 @@ async def test_exhausted_empty_within_cap_still_pins_known_miss():
     )
 
     assert result is None
-    # 3 candidates ≤ cap 5 → exhaustive, not truncated → known-miss pinned.
+    # 3 candidates ≤ cap 5 → exhaustive, not truncated → full 7-day known-miss
+    # pinned (crowd_out=False), distinct from the short-TTL crowd-out miss above.
     assert pg.execute_calls == 1
-    assert pg.store[(ARTIST.lower(), TRACK.lower(), True)] is None
+    row = pg.store[(ARTIST.lower(), TRACK.lower(), True)]
+    assert row["release_id"] is None
+    assert row["crowd_out"] is False
 
 
 @pytest.mark.asyncio

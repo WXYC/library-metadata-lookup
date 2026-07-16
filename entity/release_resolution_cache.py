@@ -47,6 +47,14 @@ template's eternal-hit policy:
   Filtered out; the caller falls through to a live probe. The stale row stays
   and the next probe's UPSERT refreshes it in place.
 
+LML#824 adds a third miss flavor via the ``crowd_out`` marker column. A miss
+written with ``crowd_out = true`` (the bounded resolve truncated its candidate
+set, so the release that would resolve may just have sorted past the window) is
+honored on a much shorter ``crowd_out_miss_ttl`` (~1h) instead of the 7-day
+``miss_ttl`` — long enough to absorb a re-add burst, short enough to self-heal a
+transient crowd-out. Normal exhausted misses (``crowd_out = false``, the default)
+and every positive keep their existing TTLs.
+
 ``get_cached_release_id`` therefore returns a three-valued ``ReleaseResolution``:
 ``was_present=True, release_id=<int>`` (fresh hit), ``was_present=True,
 release_id=None`` (fresh known miss — skip the probe), or ``was_present=False,
@@ -97,6 +105,17 @@ DEFAULT_POSITIVE_TTL = timedelta(days=90)
 # enough that a newly-cataloged release becomes resolvable within a week.
 DEFAULT_MISS_TTL = timedelta(days=7)
 
+# LML#824: how long a *crowd-out* miss stays authoritative. A crowd-out empty
+# (the bounded resolve truncated its candidate set at ``max_validations`` — the
+# release that would resolve may simply have sorted past the window, an effect
+# #802's recall amplifies) is neither a confirmed miss (don't pin the full 7d,
+# which would suppress a resolvable release) nor safe to leave unpinned (that
+# re-probes on *every* subsequent add — the daily flowsheet-backfill flood
+# re-adds the same tracks, LML#706 / BS#1591). A short TTL splits the
+# difference: long enough to absorb one flood pass, short enough that a
+# transient crowd-out self-heals within the hour.
+DEFAULT_CROWD_OUT_MISS_TTL = timedelta(hours=1)
+
 _DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
 # Named CHECK constraint (``release_id_validity``) avoids reliance on PG
@@ -109,36 +128,54 @@ CREATE TABLE IF NOT EXISTS lml_cache.release_resolution_cache (
     title_normalized TEXT NOT NULL,
     is_track BOOLEAN NOT NULL,
     release_id INTEGER,
+    crowd_out BOOLEAN NOT NULL DEFAULT false,
     resolved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (artist_normalized, title_normalized, is_track),
     CONSTRAINT release_id_validity CHECK (release_id IS NULL OR release_id > 0)
 )\
 """
 
+# LML#824 additive upgrade for a table that predates the crowd_out column (prod,
+# where the CREATE TABLE IF NOT EXISTS above is a no-op). ADD COLUMN with a
+# constant DEFAULT is a metadata-only, fast operation in modern PostgreSQL, so
+# it's safe to re-issue on every boot even against a populated table. Existing
+# rows backfill to false, keeping their normal 7-day miss TTL.
+_DDL_ADD_CROWD_OUT_COLUMN = (
+    "ALTER TABLE lml_cache.release_resolution_cache "
+    "ADD COLUMN IF NOT EXISTS crowd_out BOOLEAN NOT NULL DEFAULT false"
+)
+
 # Staleness lives in the WHERE clause. ``$1``/``$2`` are the normalized keys,
 # ``$3`` the ``is_track`` discriminator, ``$4`` the positive-hit cutoff
-# (``now - positive_ttl``) and ``$5`` the miss cutoff (``now - miss_ttl``). A
-# fresh positive hit passes the first OR branch; a fresh known miss passes the
-# second. A stale hit, a stale miss, and an absent row all return no row.
+# (``now - positive_ttl``), ``$5`` the normal-miss cutoff (``now - miss_ttl``)
+# and ``$6`` the crowd-out-miss cutoff (``now - crowd_out_miss_ttl``, LML#824). A
+# fresh positive hit passes the first OR branch; a fresh normal known miss
+# (``crowd_out = false``) the second; a fresh crowd-out miss (``crowd_out =
+# true``) the third, on its own shorter TTL. A stale row of any kind and an
+# absent row all return no row.
 _SELECT_SQL = """\
 SELECT release_id
 FROM lml_cache.release_resolution_cache
 WHERE artist_normalized = $1 AND title_normalized = $2 AND is_track = $3
   AND (
     (release_id IS NOT NULL AND resolved_at > $4)
-    OR (release_id IS NULL AND resolved_at > $5)
+    OR (release_id IS NULL AND crowd_out = false AND resolved_at > $5)
+    OR (release_id IS NULL AND crowd_out = true AND resolved_at > $6)
   )\
 """
 
 # UPSERT: keep the latest resolution and refresh ``resolved_at`` on conflict.
 # The ``release_id=None`` write path records "resolved to a miss at time T" so
-# subsequent adds inside the miss TTL short-circuit the probe.
+# subsequent adds inside the miss TTL short-circuit the probe. ``$5`` is the
+# ``crowd_out`` marker (LML#824); a later positive or normal-miss write clears it
+# via ``EXCLUDED.crowd_out``, so a self-healed row ages on the right TTL.
 _UPSERT_SQL = """\
 INSERT INTO lml_cache.release_resolution_cache
-    (artist_normalized, title_normalized, is_track, release_id, resolved_at)
-VALUES ($1, $2, $3, $4, now())
+    (artist_normalized, title_normalized, is_track, release_id, crowd_out, resolved_at)
+VALUES ($1, $2, $3, $4, $5, now())
 ON CONFLICT (artist_normalized, title_normalized, is_track) DO UPDATE
 SET release_id = EXCLUDED.release_id,
+    crowd_out = EXCLUDED.crowd_out,
     resolved_at = EXCLUDED.resolved_at\
 """
 
@@ -175,9 +212,15 @@ async def set_up_release_resolution_cache_schema(pg: PgSource) -> None:
     fixtures, future docker-compose stacks) boot LML cleanly. If the
     discogs-cache PG is unreachable at startup, the caller logs and continues;
     the cache layer degrades to a no-op until the next deploy.
+
+    The trailing ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS crowd_out`` (LML#824)
+    upgrades a table created before that column existed: ``CREATE TABLE IF NOT
+    EXISTS`` cannot add a column to an already-present table, so prod needs the
+    idempotent ALTER to gain the marker. It's a no-op once the column exists.
     """
     await pg.execute(_DDL_SCHEMA)
     await pg.execute(_DDL_TABLE)
+    await pg.execute(_DDL_ADD_CROWD_OUT_COLUMN)
 
 
 async def get_cached_release_id(
@@ -188,6 +231,7 @@ async def get_cached_release_id(
     is_track: bool,
     positive_ttl: timedelta = DEFAULT_POSITIVE_TTL,
     miss_ttl: timedelta = DEFAULT_MISS_TTL,
+    crowd_out_miss_ttl: timedelta = DEFAULT_CROWD_OUT_MISS_TTL,
     now: datetime | None = None,
 ) -> ReleaseResolution:
     """Look up a cached resolution for ``(artist, title, is_track)``.
@@ -207,9 +251,16 @@ async def get_cached_release_id(
     reference_now = now or datetime.now(UTC)
     positive_cutoff = reference_now - positive_ttl
     miss_cutoff = reference_now - miss_ttl
+    crowd_out_cutoff = reference_now - crowd_out_miss_ttl
     try:
         row = await pg.fetchone(
-            _SELECT_SQL, artist_key, title_key, is_track, positive_cutoff, miss_cutoff
+            _SELECT_SQL,
+            artist_key,
+            title_key,
+            is_track,
+            positive_cutoff,
+            miss_cutoff,
+            crowd_out_cutoff,
         )
     except Exception:
         logger.exception(
@@ -246,6 +297,7 @@ async def set_cached_release_id(
     title: str,
     is_track: bool,
     release_id: int | None,
+    crowd_out: bool = False,
 ) -> None:
     """UPSERT a cache row for ``(artist, title, is_track)``.
 
@@ -253,14 +305,21 @@ async def set_cached_release_id(
     known miss. ``resolved_at`` is set to ``now()`` server-side on both insert
     and conflict-update.
 
+    ``crowd_out`` (LML#824) marks a *miss* as a short-TTL crowd-out (the bounded
+    resolve truncated its candidate set) rather than a full-7-day exhausted miss.
+    It is a miss-only marker: it is coerced to false alongside a real
+    ``release_id`` so a positive is never mis-marked. A later positive or
+    normal-miss write clears the marker via the UPSERT.
+
     Write failures are logged and swallowed: cache writes are best-effort. A
     request that produced a real resolution still uses it even if the write
     fails.
     """
     artist_key = to_match_form(artist)
     title_key = to_match_form(title)
+    crowd_out_flag = crowd_out and release_id is None
     try:
-        await pg.execute(_UPSERT_SQL, artist_key, title_key, is_track, release_id)
+        await pg.execute(_UPSERT_SQL, artist_key, title_key, is_track, release_id, crowd_out_flag)
     except Exception:
         logger.exception(
             "release_resolution_cache set failed for %s / %s / is_track=%s",

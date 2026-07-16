@@ -54,6 +54,13 @@ class TestCanonicalDDLReference:
         ddl = _SQL_REFERENCE.read_text()
         assert "PRIMARY KEY (artist_normalized, title_normalized, is_track)" in ddl
 
+    def test_has_crowd_out_marker_column(self):
+        # LML#824: the crowd-out marker distinguishes a short-TTL crowd-out miss
+        # from a full-7-day exhausted miss. NOT NULL DEFAULT false so a
+        # pre-existing row (and every positive) reads as a normal miss.
+        ddl = _SQL_REFERENCE.read_text()
+        assert "crowd_out BOOLEAN NOT NULL DEFAULT false" in ddl
+
     def test_module_create_table_matches_sql_reference(self):
         # The .sql file is the hand-maintained mirror of the runtime DDL. Pin
         # the module's ``CREATE TABLE ...`` statement (modulo SQL comments and
@@ -94,23 +101,29 @@ def _extract_create_table(ddl: str) -> str:
 class TestSetUpReleaseResolutionCacheSchema:
     """``set_up_release_resolution_cache_schema`` runs exactly the idempotent DDL."""
 
-    async def test_creates_schema_then_table(self):
+    async def test_creates_schema_then_table_then_alters(self):
         pg = AsyncMock(spec=PgSource)
         pg.execute = AsyncMock(return_value="CREATE")
 
         await set_up_release_resolution_cache_schema(pg)
 
-        # Exactly two executes — schema, then table. No backfill.
-        assert pg.execute.await_count == 2
+        # Three executes — schema, then table, then the additive crowd_out column
+        # ALTER (LML#824) that upgrades a pre-existing prod table in place (the
+        # CREATE TABLE IF NOT EXISTS above is a no-op there). All idempotent.
+        assert pg.execute.await_count == 3
         schema_sql = pg.execute.await_args_list[0].args[0]
         table_sql = pg.execute.await_args_list[1].args[0]
+        alter_sql = pg.execute.await_args_list[2].args[0]
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in schema_sql
         assert "CREATE TABLE IF NOT EXISTS lml_cache.release_resolution_cache" in table_sql
         assert "CONSTRAINT release_id_validity CHECK" in table_sql
         assert "PRIMARY KEY (artist_normalized, title_normalized, is_track)" in table_sql
+        assert "ALTER TABLE lml_cache.release_resolution_cache" in alter_sql
+        assert "ADD COLUMN IF NOT EXISTS crowd_out BOOLEAN NOT NULL DEFAULT false" in alter_sql
 
     async def test_does_not_read_or_backfill(self):
-        # The bootstrap is pure DDL: no probe, no INSERT.
+        # The bootstrap is pure DDL: no probe, no data INSERT. The crowd_out
+        # ALTER (LML#824) is an idempotent DDL column add, not a row backfill.
         pg = AsyncMock(spec=PgSource)
         pg.execute = AsyncMock(return_value="CREATE")
 

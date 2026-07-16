@@ -28,7 +28,17 @@ CREATE TABLE IF NOT EXISTS lml_cache.release_resolution_cache (
     title_normalized TEXT NOT NULL,
     is_track BOOLEAN NOT NULL,
     release_id INTEGER,
+    crowd_out BOOLEAN NOT NULL DEFAULT false,
     resolved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (artist_normalized, title_normalized, is_track),
     CONSTRAINT release_id_validity CHECK (release_id IS NULL OR release_id > 0)
 );
+
+-- LML#824: `crowd_out` marks a short-TTL crowd-out miss (bounded resolve
+-- truncated its candidate set) apart from a full-7-day exhausted miss. The
+-- runtime bootstrap additionally issues this idempotent ALTER so a table that
+-- predates the column gains it in place (a fresh install already has it from the
+-- CREATE TABLE above, making the ALTER a no-op):
+--
+--   ALTER TABLE lml_cache.release_resolution_cache
+--       ADD COLUMN IF NOT EXISTS crowd_out BOOLEAN NOT NULL DEFAULT false;
