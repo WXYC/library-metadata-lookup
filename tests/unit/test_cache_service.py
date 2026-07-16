@@ -1535,6 +1535,21 @@ class TestSearchArmBoundsBuilder:
         assert s.discogs_search_statement_timeout_ms == 10000
         assert s.discogs_search_work_mem == "128MB"
 
+    def test_settings_reject_invalid_work_mem_at_load(self):
+        """A bad ``DISCOGS_SEARCH_WORK_MEM`` fails at Settings load (loud, at
+        boot) — not lazily at first ``DiscogsCacheService`` construction. Keeps
+        the field symmetric with ``discogs_search_statement_timeout_ms``' ``ge=1``.
+        """
+        from pydantic import ValidationError
+
+        from config.settings import Settings
+
+        for bad in ("garbage", "128mb", "256 MB", "128MB\n", ""):
+            with pytest.raises(ValidationError, match="Postgres memory value"):
+                Settings(discogs_search_work_mem=bad)
+        # A valid non-default value still loads.
+        assert Settings(discogs_search_work_mem="256MB").discogs_search_work_mem == "256MB"
+
     def test_rejects_non_positive_timeout(self):
         from discogs.cache_service import _build_search_bounds_sql
 
@@ -1543,10 +1558,21 @@ class TestSearchArmBoundsBuilder:
 
     def test_rejects_injecting_work_mem(self):
         """work_mem is interpolated (SET LOCAL takes no bind params), so a value
-        that isn't a bare Postgres memory literal is rejected up front."""
+        that isn't a bare Postgres memory literal is rejected up front.
+
+        The ``"128MB\\n..."`` cases pin the ``\\Z`` (not ``$``) anchor: Python's
+        ``$`` matches just before a trailing newline, so ``"128MB\\n"`` would slip
+        past a ``$``-anchored regex and reach Postgres as an invalid value."""
         from discogs.cache_service import _build_search_bounds_sql
 
-        for bad in ("128 MB", "128MB'; DROP TABLE release; --", "lots", ""):
+        for bad in (
+            "128 MB",
+            "128MB'; DROP TABLE release; --",
+            "lots",
+            "",
+            "128MB\n",
+            "128MB\nDROP TABLE release",
+        ):
             with pytest.raises(ValueError, match="Postgres memory value"):
                 _build_search_bounds_sql(10000, bad)
 

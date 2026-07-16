@@ -1,10 +1,20 @@
 """Application configuration using Pydantic Settings."""
 
+import re
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Postgres memory-value grammar (digits + optional unit) for ``work_mem`` (LML#804).
+# ``discogs_search_work_mem`` is interpolated into a ``SET LOCAL`` string (Postgres
+# ``SET`` takes no bind params), so it is validated against this at BOTH ends: the
+# ``_validate_work_mem`` field validator below (fail loudly at Settings load) and
+# ``discogs.cache_service._build_search_bounds_sql`` (defense in depth at the
+# interpolation point). ``\Z`` — not ``$`` — so a stray trailing newline can't slip
+# through (``$`` matches just before a final ``\n``).
+_WORK_MEM_RE = re.compile(r"^\d+(kB|MB|GB|TB)?\Z")
 
 
 class Settings(BaseSettings):
@@ -139,6 +149,23 @@ class Settings(BaseSettings):
             "WXYC/library-metadata-lookup#804."
         ),
     )
+
+    @field_validator("discogs_search_work_mem")
+    @classmethod
+    def _validate_work_mem(cls, v: str) -> str:
+        """Reject a non-Postgres-memory-value ``work_mem`` at Settings load (LML#804).
+
+        The value is interpolated into a ``SET LOCAL`` string, so an invalid one
+        (e.g. ``"128mb"`` lowercase, ``"256 MB"`` with a space, ``"garbage"``)
+        would otherwise fail lazily at first ``DiscogsCacheService`` construction —
+        a first-request 500 that also takes down the whole Discogs service —
+        rather than loudly at boot. This makes it symmetric with the ``ge=1`` on
+        ``discogs_search_statement_timeout_ms`` and mirrors the interpolation-time
+        guard in ``discogs.cache_service._build_search_bounds_sql``.
+        """
+        if not _WORK_MEM_RE.match(v):
+            raise ValueError(f"work_mem {v!r} is not a valid Postgres memory value (e.g. '128MB')")
+        return v
 
     # Library Cache Configuration
     library_cache_ttl: int = Field(
