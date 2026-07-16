@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.service import DiscogsService
 from release.models import CanonicalRelease, ReleaseIdentifiers, ResolveResult
 
@@ -58,6 +59,27 @@ async def resolve_discogs_release(service: DiscogsService, release_id: str) -> R
 
     try:
         release = await service.get_release(rid)
+    except DiscogsBreakerOpenError:
+        # LML#814: ``get_release`` re-raises a saturation-breaker shed (the
+        # LML#755 FIX-1 guard). The generic ``except`` below would log it at
+        # ERROR via ``logger.exception`` — and the Sentry LoggingIntegration
+        # (event_level=ERROR) turns each such record into a discrete event,
+        # reproducing the #755 flood on this release-resolve path. A shed is
+        # expected degrade: log at DEBUG and return ``canonical=None`` with a
+        # *transient*, retriable warning (matching the ``release is None``
+        # rate-limited phrasing below), not the hard "lookup failed" message.
+        # Nothing negative is persisted: ``get_release`` re-raised before any
+        # tombstone, and the orchestrator's identity write-back is gated on
+        # ``canonical is not None`` so a None result writes nothing.
+        logger.debug("Discogs release fetch shed by saturation breaker for %s (retriable)", rid)
+        return ResolveResult(
+            canonical=None,
+            identifiers=ReleaseIdentifiers(discogs_release_id=rid),
+            warnings=[
+                f"Discogs is temporarily rate-limited; release {rid} could not be "
+                "fetched right now — try again shortly."
+            ],
+        )
     except Exception:
         logger.exception("Discogs release fetch failed for %s", rid)
         return ResolveResult(

@@ -3,6 +3,7 @@ output to CanonicalRelease + ReleaseIdentifiers, with warnings on failure."""
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -102,6 +103,43 @@ class TestResolveDiscogsRelease:
         assert result.canonical is None
         assert result.identifiers.discogs_release_id == 12345
         assert any("failed" in w.lower() for w in result.warnings)
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_returns_retriable_warning_without_error_log(
+        self, mock_service, caplog
+    ):
+        """LML#814: ``get_release`` re-raises a saturation-breaker shed (LML#755
+        FIX-1). The resolver must treat that shed as expected degrade rather than
+        route it through the generic ``except`` that logs at ERROR via
+        ``logger.exception`` — under the Sentry LoggingIntegration
+        (event_level=ERROR) each such record becomes a discrete event,
+        reproducing the #755 flood on the release-resolve path.
+
+        The shed must: emit no ERROR-level record; return ``canonical=None`` (so
+        the orchestrator's ``canonical is not None``-gated identity write-back is
+        skipped — nothing negative is persisted); and carry a *transient*,
+        retriable warning rather than the hard "lookup failed" phrasing.
+        """
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        mock_service.get_release.side_effect = DiscogsBreakerOpenError(
+            "Discogs saturation breaker open"
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            result = await resolve_discogs_release(mock_service, "12345")
+
+        assert result.canonical is None
+        assert result.identifiers.discogs_release_id == 12345
+        # A transient/retriable warning, not the hard "lookup failed" phrasing.
+        assert len(result.warnings) == 1
+        warning = result.warnings[0].lower()
+        assert "12345" in result.warnings[0]
+        assert any(hint in warning for hint in ("rate-limit", "temporarily", "try again"))
+        # The heart of #814: no ERROR-level records (each would be a Sentry event
+        # under event_level=ERROR).
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records == [], f"breaker shed emitted ERROR record(s): {error_records}"
 
     @pytest.mark.asyncio
     async def test_rejects_non_numeric_id(self, mock_service):

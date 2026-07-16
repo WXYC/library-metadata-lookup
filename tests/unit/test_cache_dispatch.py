@@ -11,6 +11,7 @@ The router-level tests (batching, semaphore, client-disconnect) live in
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -25,6 +26,7 @@ from cache.models import (
     CacheRefreshResultItem,
     SourceRefreshOutcome,
 )
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import ArtistCredit, ArtistDetails, ReleaseMetadataResponse
 
 # ---------------------------------------------------------------------------
@@ -190,6 +192,18 @@ class TestComputePerIdStatus:
         Treating it as not_implemented matches the "no leg ran" semantics."""
         assert compute_per_id_status({}) == "not_implemented"
 
+    def test_breaker_shed_error_rolls_up_to_retriable_error(self):
+        """LML#814: a saturation-breaker shed is recorded as the ``error``
+        outcome (tagged ``message="DiscogsBreakerOpenError"``), so with no warmed
+        leg it rolls up to the retriable ``error`` bucket — the cron retries the
+        identity on its next pass rather than treating it as done."""
+        sources = {
+            "discogs_release": SourceRefreshOutcome(
+                release_outcome="error", message="DiscogsBreakerOpenError"
+            ),
+        }
+        assert compute_per_id_status(sources) == "error"
+
 
 # ---------------------------------------------------------------------------
 # refresh_identity — orchestration; AsyncMock-driven DiscogsService
@@ -327,6 +341,54 @@ class TestRefreshIdentity:
         assert result.sources["discogs_release"].message == "RuntimeError"
         # No artists walked when release leg errored.
         discogs.get_artist_details.assert_not_awaited()
+
+    async def test_release_leg_breaker_shed_records_error_without_error_log(self, caplog):
+        """LML#814: ``get_release`` re-raises a saturation-breaker shed (LML#755
+        FIX-1). The cache-warmer must treat that shed as expected degrade — NOT
+        route it through the generic ``except`` that logs at ERROR via
+        ``logger.exception`` (the Sentry LoggingIntegration promotes each such
+        record to a discrete event, reproducing the #755 flood on the
+        backfill-cron-driven refresh path).
+
+        The shed must: emit no ERROR-level record; record the retriable ``error``
+        outcome (not a tombstone-as-``success`` — the cache is not warm), tagged
+        ``message="DiscogsBreakerOpenError"`` so a dashboard can tell it apart
+        from a hard leg failure; and walk no artists. ``error`` (rather than a
+        new ``skipped`` value) keeps ``release_outcome`` in lockstep with the
+        api.yaml ``CacheRefreshSourceOutcome`` wire enum BS also generates from.
+        """
+        discogs = AsyncMock()
+        discogs.get_release = AsyncMock(
+            side_effect=DiscogsBreakerOpenError("Discogs saturation breaker open")
+        )
+        discogs.get_artist_details = AsyncMock()
+
+        with caplog.at_level(logging.DEBUG):
+            result = await refresh_identity(
+                identity_id=1,
+                source_pairs=[("discogs_release", "12345")],
+                discogs_service=discogs,
+            )
+
+        # A shed rolls up to the retriable ``error`` bucket so the cron retries.
+        assert result.status == "error"
+        assert result.sources["discogs_release"].release_outcome == "error"
+        # The breaker exception name distinguishes a shed from a hard leg failure
+        # (e.g. the generic path's "RuntimeError") without a new wire value.
+        assert result.sources["discogs_release"].message == "DiscogsBreakerOpenError"
+        # Not a tombstone-as-success: the cache is NOT warm after a shed.
+        assert result.sources["discogs_release"].release_outcome != "success"
+        # No artists walked — the shed returned no release record.
+        discogs.get_artist_details.assert_not_awaited()
+        # The heart of #814: the shed produced zero ERROR-level records (which
+        # would each become a Sentry event under event_level=ERROR).
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records == [], f"breaker shed emitted ERROR record(s): {error_records}"
+        # It IS logged, at DEBUG, so the shed is still observable in local logs.
+        assert any(
+            r.levelno == logging.DEBUG and "breaker" in r.getMessage().lower()
+            for r in caplog.records
+        )
 
     async def test_artist_leg_exception_does_not_demote_release_warmed(self):
         """Issue rule: artist 404 inside a release walk does NOT promote per-id to error."""
