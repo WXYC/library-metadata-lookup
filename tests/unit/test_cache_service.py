@@ -2291,7 +2291,7 @@ class TestSearchArtistsByName:
     @pytest.mark.asyncio
     async def test_returns_canonical_artist(self, cache_service, mock_asyncpg_pool):
         """Trigram hit returns the canonical artist row."""
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {"id": 9001, "name": "Stereolab", "score": 0.93},
             ]
@@ -2302,9 +2302,9 @@ class TestSearchArtistsByName:
     @pytest.mark.asyncio
     async def test_query_unions_artist_and_variation_tables(self, cache_service, mock_asyncpg_pool):
         """The SQL must use the trigram operator and union the variation table."""
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
         await cache_service.search_artists_by_name("Juana Molina", limit=3)
-        call = mock_asyncpg_pool.fetch.call_args
+        call = mock_asyncpg_pool._mock_conn.fetch.call_args
         sql = call.args[0]
         assert "artist" in sql
         assert "artist_name_variation" in sql
@@ -2315,9 +2315,22 @@ class TestSearchArtistsByName:
 
     @pytest.mark.asyncio
     async def test_raises_cache_unavailable_on_pool_error(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn lost"))
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(side_effect=RuntimeError("conn lost"))
         with pytest.raises(CacheUnavailableError):
             await cache_service.search_artists_by_name("anything")
+
+    @pytest.mark.asyncio
+    async def test_query_canceled_maps_to_cache_unavailable(self, cache_service, mock_asyncpg_pool):
+        """LML#815: this arm now runs inside the SET LOCAL statement_timeout
+        bound, so a runaway trigram scan is cancelled server-side as
+        ``asyncpg.QueryCanceledError`` and degrades to ``CacheUnavailableError``
+        (cache-only, never a 500), preserving the cancel as ``__cause__``."""
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
+            side_effect=asyncpg.QueryCanceledError("canceling statement due to statement timeout")
+        )
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await cache_service.search_artists_by_name("ArtistTimeoutA")
+        assert isinstance(exc_info.value.__cause__, asyncpg.QueryCanceledError)
 
     @pytest.mark.asyncio
     async def test_cache_hit_skips_db(self, cache_service, mock_asyncpg_pool):
@@ -2327,7 +2340,7 @@ class TestSearchArtistsByName:
         dominant DB chokepoint (p50 = 303ms × ~1k calls/day). A per-process
         TTL cache keyed by (name, limit) collapses repeat lookups to a hash.
         """
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[{"id": 1, "name": "Stereolab", "score": 0.91}]
         )
 
@@ -2335,12 +2348,12 @@ class TestSearchArtistsByName:
         second = await cache_service.search_artists_by_name("Stereolab")
 
         assert first == second == [{"id": 1, "name": "Stereolab", "score": 0.91}]
-        assert mock_asyncpg_pool.fetch.await_count == 1
+        assert mock_asyncpg_pool._mock_conn.fetch.await_count == 1
 
     @pytest.mark.asyncio
     async def test_cache_miss_different_name_hits_db(self, cache_service, mock_asyncpg_pool):
         """Different names produce different cache entries — each hits PG once."""
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             side_effect=[
                 [{"id": 1, "name": "Stereolab", "score": 0.91}],
                 [{"id": 2, "name": "Cat Power", "score": 0.88}],
@@ -2350,39 +2363,39 @@ class TestSearchArtistsByName:
         await cache_service.search_artists_by_name("Stereolab")
         await cache_service.search_artists_by_name("Cat Power")
 
-        assert mock_asyncpg_pool.fetch.await_count == 2
+        assert mock_asyncpg_pool._mock_conn.fetch.await_count == 2
 
     @pytest.mark.asyncio
     async def test_cache_miss_different_limit_hits_db(self, cache_service, mock_asyncpg_pool):
         """The cache key includes ``limit``: same name + different limit is a miss."""
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[{"id": 1, "name": "Stereolab", "score": 0.91}]
         )
 
         await cache_service.search_artists_by_name("Stereolab", limit=5)
         await cache_service.search_artists_by_name("Stereolab", limit=10)
 
-        assert mock_asyncpg_pool.fetch.await_count == 2
+        assert mock_asyncpg_pool._mock_conn.fetch.await_count == 2
 
     @pytest.mark.asyncio
     async def test_empty_result_not_cached(self, cache_service, mock_asyncpg_pool):
         """An empty list is falsy but distinct from None — keep the behaviour with
         ``async_cached``: only ``None`` is uncacheable, ``[]`` is a real answer that
         should be cached to avoid re-running the trigram scan."""
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
 
         await cache_service.search_artists_by_name("Nonexistent")
         await cache_service.search_artists_by_name("Nonexistent")
 
         # Empty list is a legitimate result — cache it so the next call is free.
-        assert mock_asyncpg_pool.fetch.await_count == 1
+        assert mock_asyncpg_pool._mock_conn.fetch.await_count == 1
 
 
 class TestSearchReleasesByTitle:
     @pytest.mark.asyncio
     async def test_returns_release_with_canonical_artist(self, cache_service, mock_asyncpg_pool):
         """Phase 1.7: fuzzy release-title hit returns canonical title + primary artist."""
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {"id": 12345, "title": "DOGA", "artist": "Juana Molina", "score": 0.81},
             ]
@@ -2397,9 +2410,9 @@ class TestSearchReleasesByTitle:
         self, cache_service, mock_asyncpg_pool
     ):
         """The SQL must use the trigram operator on release.title and pin extra=0."""
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
         await cache_service.search_releases_by_title("Aluminum Tunes", limit=3)
-        call = mock_asyncpg_pool.fetch.call_args
+        call = mock_asyncpg_pool._mock_conn.fetch.call_args
         sql = call.args[0]
         assert "release_artist" in sql
         assert "extra = 0" in sql
@@ -2410,16 +2423,28 @@ class TestSearchReleasesByTitle:
 
     @pytest.mark.asyncio
     async def test_raises_cache_unavailable_on_pool_error(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn lost"))
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(side_effect=RuntimeError("conn lost"))
         with pytest.raises(CacheUnavailableError):
             await cache_service.search_releases_by_title("anything")
+
+    @pytest.mark.asyncio
+    async def test_query_canceled_maps_to_cache_unavailable(self, cache_service, mock_asyncpg_pool):
+        """LML#815: bounded by the SET LOCAL statement_timeout — a runaway scan
+        cancels as ``QueryCanceledError`` and degrades to ``CacheUnavailableError``
+        (cache-only, never a 500), preserving the cancel as ``__cause__``."""
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
+            side_effect=asyncpg.QueryCanceledError("canceling statement due to statement timeout")
+        )
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await cache_service.search_releases_by_title("anything")
+        assert isinstance(exc_info.value.__cause__, asyncpg.QueryCanceledError)
 
 
 class TestSearchTracksByTitle:
     @pytest.mark.asyncio
     async def test_returns_track_with_release_artist(self, cache_service, mock_asyncpg_pool):
         """Phase 1.7: fuzzy track-title hit returns canonical title + parent release artist."""
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {"id": 555, "title": "Back, Baby", "artist": "Jessica Pratt", "score": 0.92},
             ]
@@ -2433,9 +2458,9 @@ class TestSearchTracksByTitle:
     async def test_query_targets_release_track_title_trigram(
         self, cache_service, mock_asyncpg_pool
     ):
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
         await cache_service.search_tracks_by_title("la paradoja", limit=2)
-        call = mock_asyncpg_pool.fetch.call_args
+        call = mock_asyncpg_pool._mock_conn.fetch.call_args
         sql = call.args[0]
         assert "release_track" in sql
         assert "release_artist" in sql
@@ -2446,9 +2471,21 @@ class TestSearchTracksByTitle:
 
     @pytest.mark.asyncio
     async def test_raises_cache_unavailable_on_pool_error(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(side_effect=RuntimeError("conn lost"))
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(side_effect=RuntimeError("conn lost"))
         with pytest.raises(CacheUnavailableError):
             await cache_service.search_tracks_by_title("anything")
+
+    @pytest.mark.asyncio
+    async def test_query_canceled_maps_to_cache_unavailable(self, cache_service, mock_asyncpg_pool):
+        """LML#815: bounded by the SET LOCAL statement_timeout — a runaway scan
+        cancels as ``QueryCanceledError`` and degrades to ``CacheUnavailableError``
+        (cache-only, never a 500), preserving the cancel as ``__cause__``."""
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
+            side_effect=asyncpg.QueryCanceledError("canceling statement due to statement timeout")
+        )
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await cache_service.search_tracks_by_title("anything")
+        assert isinstance(exc_info.value.__cause__, asyncpg.QueryCanceledError)
 
 
 # ---------------------------------------------------------------------------

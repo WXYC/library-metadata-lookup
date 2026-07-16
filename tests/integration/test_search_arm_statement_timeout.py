@@ -1,9 +1,14 @@
-"""pg integration tests for the LML#804 search-arm statement_timeout bound.
+"""pg integration tests for the LML#804/#815 search-arm statement_timeout bound.
 
-The two trigram search arms on the discogs-cache pool (``search_releases`` /
-``search_releases_by_track``) each run their query inside a ``SET LOCAL``
-transaction pinning ``statement_timeout`` + ``work_mem``. This suite pins the
-load-bearing behaviors against real PostgreSQL:
+Every trigram search arm on the discogs-cache pool runs its query inside a
+``SET LOCAL`` transaction pinning ``statement_timeout`` + ``work_mem``, via the
+shared ``DiscogsCacheService._bounded_fetch`` helper (LML#815). LML#804 bounded
+the two incident arms (``search_releases`` / ``search_releases_by_track``);
+LML#815 extends the bound to ``search_artists_by_name``,
+``search_releases_by_title``, ``search_tracks_by_title``, ``autocomplete_tracks``,
+and ``artist_trigram_candidates`` (whose ``SET LOCAL`` previously pinned only the
+pg_trgm floor). This suite pins the load-bearing behaviors against real
+PostgreSQL:
 
 * A query that overruns ``statement_timeout`` is cancelled by the server as
   ``asyncpg.QueryCanceledError`` and the search arm maps it into
@@ -55,14 +60,23 @@ _SLOW_F_UNACCENT_SQL = (
 async def slow_cache(pg_pool):
     """A ``DiscogsCacheService`` whose search arms always overrun a tiny timeout.
 
-    Seeds the four tables the two search arms touch, installs the slow
+    Seeds the tables every trigram arm touches (release / release_artist /
+    release_track / release_track_artist for the release + track arms; artist /
+    artist_name_variation for ``search_artists_by_name``), installs the slow
     ``f_unaccent``, and yields a service pinned to a 100ms ``statement_timeout``.
     Restores the standard ``f_unaccent`` wrapper and drops the tables on teardown.
     """
     async with pg_pool.acquire() as conn:
         await skip_if_drop_targets_populated(
             conn,
-            ("release", "release_artist", "release_track", "release_track_artist"),
+            (
+                "release",
+                "release_artist",
+                "release_track",
+                "release_track_artist",
+                "artist",
+                "artist_name_variation",
+            ),
         )
         try:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
@@ -70,7 +84,14 @@ async def slow_cache(pg_pool):
         except Exception as e:
             pytest.skip(f"pg_trgm/unaccent extensions unavailable: {e}")
 
-        for table in ("release_track_artist", "release_track", "release_artist", "release"):
+        for table in (
+            "release_track_artist",
+            "release_track",
+            "release_artist",
+            "release",
+            "artist_name_variation",
+            "artist",
+        ):
             await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
         await conn.execute(
             "CREATE TABLE release (id integer PRIMARY KEY, title text NOT NULL, artwork_url text)"
@@ -91,11 +112,26 @@ async def slow_cache(pg_pool):
             "track_sequence integer, artist_name text, extra integer DEFAULT 0)"
         )
         await conn.execute("INSERT INTO release (id, title) VALUES (1, 'Dots and Loops')")
+        # artist_id must be non-NULL: artist_trigram_candidates filters
+        # ``ra.artist_id IS NOT NULL`` first, and PG would short-circuit the row
+        # out before the slow f_unaccent runs (masking the timeout) if it were
+        # NULL. 1 matches the seeded ``artist`` row.
         await conn.execute(
-            "INSERT INTO release_artist (release_id, artist_name, extra) VALUES (1, 'Stereolab', 0)"
+            "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "
+            "VALUES (1, 1, 'Stereolab', 0)"
         )
         await conn.execute(
             "INSERT INTO release_track (release_id, sequence, title) VALUES (1, 1, 'Brakhage')"
+        )
+        # Artist tables for search_artists_by_name (LML#815).
+        await conn.execute("CREATE TABLE artist (id integer PRIMARY KEY, name text NOT NULL)")
+        await conn.execute(
+            "CREATE TABLE artist_name_variation ("
+            "artist_id integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE, name text NOT NULL)"
+        )
+        await conn.execute("INSERT INTO artist (id, name) VALUES (1, 'Stereolab')")
+        await conn.execute(
+            "INSERT INTO artist_name_variation (artist_id, name) VALUES (1, 'Stereolab')"
         )
         # Install the slow wrapper LAST so setup DDL/seeding isn't slowed.
         await conn.execute(_SLOW_F_UNACCENT_SQL)
@@ -111,7 +147,14 @@ async def slow_cache(pg_pool):
             await conn.execute(F_UNACCENT_WRAPPER_SQL)
         except Exception:
             pass
-        for table in ("release_track_artist", "release_track", "release_artist", "release"):
+        for table in (
+            "release_track_artist",
+            "release_track",
+            "release_artist",
+            "release",
+            "artist_name_variation",
+            "artist",
+        ):
             await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
 
 
@@ -129,6 +172,39 @@ class TestSearchArmStatementTimeout:
     async def test_search_releases_by_track_timeout_degrades(self, slow_cache):
         with pytest.raises(CacheUnavailableError) as exc_info:
             await slow_cache.search_releases_by_track("Brakhage", "Stereolab")
+        assert isinstance(exc_info.value.__cause__, asyncpg.exceptions.QueryCanceledError)
+
+    @pytest.mark.asyncio
+    async def test_search_artists_by_name_timeout_degrades(self, slow_cache):
+        """LML#815: the #359 dominant chokepoint now degrades on timeout too."""
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await slow_cache.search_artists_by_name("Stereolab")
+        assert isinstance(exc_info.value.__cause__, asyncpg.exceptions.QueryCanceledError)
+
+    @pytest.mark.asyncio
+    async def test_search_releases_by_title_timeout_degrades(self, slow_cache):
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await slow_cache.search_releases_by_title("Dots and Loops")
+        assert isinstance(exc_info.value.__cause__, asyncpg.exceptions.QueryCanceledError)
+
+    @pytest.mark.asyncio
+    async def test_search_tracks_by_title_timeout_degrades(self, slow_cache):
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await slow_cache.search_tracks_by_title("Brakhage")
+        assert isinstance(exc_info.value.__cause__, asyncpg.exceptions.QueryCanceledError)
+
+    @pytest.mark.asyncio
+    async def test_autocomplete_tracks_timeout_degrades(self, slow_cache):
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await slow_cache.autocomplete_tracks("Stereolab", "Bra")
+        assert isinstance(exc_info.value.__cause__, asyncpg.exceptions.QueryCanceledError)
+
+    @pytest.mark.asyncio
+    async def test_artist_trigram_candidates_timeout_degrades(self, slow_cache):
+        """LML#815: reconciled — its SET LOCAL now carries statement_timeout +
+        work_mem (not just the pg_trgm floor), so it degrades like the rest."""
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await slow_cache.artist_trigram_candidates(["Stereolab"])
         assert isinstance(exc_info.value.__cause__, asyncpg.exceptions.QueryCanceledError)
 
     @pytest.mark.asyncio
