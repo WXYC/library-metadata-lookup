@@ -11,9 +11,9 @@ that would have returned the correct/complete set.
 The seam mechanism is real and by design: a non-empty PG hit IS terminal (it
 is the whole point of the L2 tier — no Discogs quota on a cache hit, per the
 #818 "do not add an API call to the happy PG-hit path" constraint). What these
-tests establish is that the mechanism is **harmless at every real consumer**:
-both ``search_releases_by_track`` consumers (``track_on_compilation`` and the
-row-less ``resolve_release_for_track``) probe in TWO independent waves —
+tests establish is that the mechanism is **harmless at every real consumer**.
+The two *two-wave* ``search_releases_by_track`` consumers (``track_on_compilation``
+and the row-less ``resolve_release_for_track``) probe in TWO independent waves —
 
 * **Wave A** (``artist_as_keyword=False``): the artist-field probe, PG-read
   enabled. This is the only wave the C3 masking can touch.
@@ -27,9 +27,16 @@ arm can miss while still returning non-empty are exactly the track-level /
 compilation credits the ``rta.extra = 0`` guard prunes — and those are exactly
 what Wave B's keyword/``Compilation`` API probe is built to surface. So a
 C2-pruned comp that Wave A masks falls squarely into Wave B's domain and is
-recovered by the merge (``merge_wave_b_compilations``). Verdict: **REFUTED** —
-no seam change; these tests pin the recovery so a future wave-swap or
-PG-hit-predicate change can't silently reopen the hole.
+recovered by the merge (``merge_wave_b_compilations``).
+
+The third seam consumer, ``_match_track_releases_to_library`` (SONG_AS_TRACK /
+SWAPPED), is single-wave and has no Wave B, but the masking still can't harm it:
+SONG_AS_TRACK passes ``artist=None`` (so ``_SEARCH_BY_TRACK_SQL`` never
+artist-prunes — the comp is already in its Wave-A read) and SWAPPED excludes V/A
+comps by design. So it is covered by construction, not by a recovery wave.
+
+Verdict: **REFUTED** — no seam change; these tests pin the recovery so a future
+wave-swap or PG-hit-predicate change can't silently reopen the hole.
 
 Spine case (mirrors ``tests/unit/test_release_resolution.py``): A Guy Called
 Gerald — "Message to Black Youth" on the Various-Artists compilation "When
@@ -196,6 +203,34 @@ class TestSeamTerminalPgHit:
         assert [r.release_id for r in result.releases] == [_COMP_ID]
         assert result.cached is False
         # No durable negative was pinned — the API said "found", not "absent".
+        fake_cache.record_lookup_negative.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pruned_empty_pg_read_with_unreachable_api_pins_no_negative(self):
+        """C3 secondary shape, the harder vector: an empty (PG-pruned) read falls
+        through to the API leg, but the API is UNREACHABLE — ``_request_with_retry``
+        returns ``None`` (the httpx-error / retry-exhaustion / breaker-shed
+        "couldn't ask" laundering, service.py FIX 1). ``_api_fetch`` sets
+        ``any_call_absent`` and returns ``None`` rather than an empty response, so
+        the seam's ``api_result is not None`` gate skips the durable negative-cache
+        write. Without this, a transient Discogs outage striking during a PG-pruned
+        read would durably suppress a later API-findable comp for the negative TTL.
+        This locally pins the vector that otherwise only rides on the #755 suite."""
+        fake_cache = AsyncMock()
+        # PG-pruned empty: the ``rta.extra = 0`` guard dropped the only matching
+        # credit, so the PG arm returns nothing and the seam falls through.
+        fake_cache.search_releases_by_track = AsyncMock(return_value=[])
+        fake_cache.lookup_negative_hit = AsyncMock(return_value=False)
+        fake_cache.record_lookup_negative = AsyncMock()
+        svc = DiscogsService(token="test-token", cache_service=fake_cache)
+        # "Couldn't ask": every live leg returns ``None`` (NOT an empty 200 body).
+        svc._request_with_retry = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        result = await svc.search_releases_by_track(_TRACK, _ARTIST)
+
+        # Nothing surfaced, and crucially NO durable negative was pinned: an
+        # "unknown" (couldn't ask) must never masquerade as a confirmed absence.
+        assert [r.release_id for r in result.releases] == []
         fake_cache.record_lookup_negative.assert_not_called()
 
 
