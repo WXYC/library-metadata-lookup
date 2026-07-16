@@ -12,14 +12,13 @@ The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 import asyncio
 import hashlib
 import logging
-import re
 from dataclasses import dataclass, field, fields
 
 import asyncpg
 from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
-from config.settings import get_settings
+from config.settings import _WORK_MEM_RE, get_settings
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import async_cached, create_ttl_cache
 from discogs.models import (
@@ -352,11 +351,11 @@ ORDER BY mt.sim DESC\
 # Both knobs are settings-wired (``config/settings.py``) with the documented
 # defaults; see ``docs/env-vars.md``.
 
-# Postgres memory-value grammar (digits + optional unit). ``work_mem`` is
-# interpolated into the ``SET LOCAL`` string (Postgres ``SET`` takes no bind
-# params), so the operator-supplied value is validated against this before
-# interpolation — defense in depth against an injected ``SET LOCAL`` fragment.
-_WORK_MEM_RE = re.compile(r"^\d+(kB|MB|GB|TB)?$")
+# ``work_mem`` is interpolated into the ``SET LOCAL`` string (Postgres ``SET`` takes
+# no bind params), so ``_build_search_bounds_sql`` re-validates it against
+# ``_WORK_MEM_RE`` (imported from ``config.settings``, the single source of the
+# grammar) before interpolation — defense in depth at the interpolation point,
+# complementing the ``Settings._validate_work_mem`` boot-time gate.
 
 
 def _build_search_bounds_sql(statement_timeout_ms: int, work_mem: str) -> str:
