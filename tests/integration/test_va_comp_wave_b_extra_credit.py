@@ -431,13 +431,28 @@ class TestWaveBDegradeGapRefuted:
     async def test_surface_able_extra_one_comp_routes_validation_to_the_api(self, cache):
         """Why a degrade-time PG *read* cannot recover the surface-able population.
         An extra=1 comp that is NOT in the PG cache reads as ``None`` from
-        ``validate_track_on_release`` (not cached) — a fallthrough miss that routes
-        to the API ``get_release``, which reads the real tracklist regardless of
-        ``extra``. That API route is exactly what the breaker sheds during a
-        degrade; a PG read cannot substitute for a comp that is not in PG. So the
-        only extra=1 comps that ever surface are the non-PG ones a PG read can't
-        reach."""
-        # No comp seeded for id 5999: an uncached release.
-        cache_verdict = await cache.validate_track_on_release(5999, FUZZY_TITLE, PERFORMER)
+        ``DiscogsCacheService.validate_track_on_release`` (not cached) — a
+        fallthrough miss. At the *service* layer that miss routes to the API
+        ``get_release``, which reads the real tracklist regardless of ``extra``.
+        That API route is exactly what the breaker sheds during a degrade, so the
+        surface-able (non-PG) population is unreachable cache-only; a PG read
+        cannot substitute for a comp that is not in PG.
 
+        Pins both halves so the "routes to the API" claim in the name is actually
+        exercised: (a) the cache genuinely can't answer for an uncached release
+        (``None``), and (b) the *service* therefore drives the shed API —
+        ``get_release`` re-raises ``DiscogsBreakerOpenError`` (the LML#755 FIX-1
+        propagation) straight through ``validate_track_on_release``, and the shed
+        seam is awaited. Contrast the load-bearing test above, where a PG-cached
+        extra=1 comp answers ``False`` cache-only and never awaits the API."""
+        # No comp seeded for id 5999: an uncached release, so PG can't answer.
+        cache_verdict = await cache.validate_track_on_release(5999, FUZZY_TITLE, PERFORMER)
         assert cache_verdict is None
+
+        # At the service layer the ``None`` cache miss falls through to the API
+        # ``get_release`` -- which the breaker sheds during a degrade. This is the
+        # route a PG read cannot replace for the non-PG surface-able population.
+        service = _shed_service(cache)
+        with pytest.raises(DiscogsBreakerOpenError):
+            await service.validate_track_on_release(5999, FUZZY_TITLE, PERFORMER)
+        service._request_with_retry.assert_awaited()
