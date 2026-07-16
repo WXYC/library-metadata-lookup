@@ -243,6 +243,7 @@ async def resolve_release_for_track(
     *,
     also_probe_album_title: bool = False,
     max_validations: int | None = None,
+    truncated_out: list[bool] | None = None,
 ) -> list[ResolvedRelease]:
     """Find and validate the Discogs release(s) a track sits on.
 
@@ -268,6 +269,17 @@ async def resolve_release_for_track(
       case. Sequential (not concurrent) to minimize Discogs quota — the binding
       constraint — and degrade gently under the fallthrough seam's rate-limit
       cool-down. (See the #625 decision record.)
+
+    ``truncated_out`` is an optional out-parameter for the bounded path (LML#816).
+    When a list is passed, the resolver appends a single ``bool`` recording whether
+    the id-having candidate set exceeded ``max_validations`` — i.e. whether some
+    surfaced candidates were never validated. An empty result with ``truncated_out
+    == [True]`` may be a *crowd-out* (a resolvable release sorted outside the
+    window) rather than a true exhaustion; the row-less kernel reads this to avoid
+    pinning a durable known-miss over a release it never actually ruled out. It is
+    only populated in bounded mode (``max_validations is not None``); the default
+    validate-all path leaves it untouched, since it validates every candidate and
+    can never truncate.
 
     When ``also_probe_album_title`` is set and ``album`` is non-empty, a third
     album-title probe (``search_releases_by_album_title``) joins the Wave A/B
@@ -376,6 +388,12 @@ async def resolve_release_for_track(
         # Falsy-id rows can never be validated, so drop them before counting the
         # budget — they must not consume an attempt slot.
         ranked = prerank_candidates_for_validation([r for r in candidates if r.release_id], album)
+        if truncated_out is not None:
+            # LML#816: record whether the window was smaller than the candidate
+            # set — an empty result under truncation is a possible crowd-out, not
+            # a confirmed exhaustion. Recorded before the loop so it is set on
+            # every bounded outcome (empty or hit), keeping the sink single-valued.
+            truncated_out.append(len(ranked) > max_validations)
         for release in ranked[:max_validations]:
             resolved = await _validate_one(release)
             if resolved is not None:

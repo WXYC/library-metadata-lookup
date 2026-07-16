@@ -222,7 +222,11 @@ async def _resolve_nonlibrary_release(
        coalesce with a default ``[]`` (the #633 landmine). Cold-cache
        durability comes from the #632 PG cache here instead.
     3. **#632 cache write-back** — the resolved id, or ``None`` to record a known
-       miss so the next identical add short-circuits.
+       miss so the next identical add short-circuits. A known miss is pinned only
+       when the empty resolve was *exhaustive*; an empty from a candidate set
+       truncated at the ``max_validations`` cap (a possible #802-amplified
+       crowd-out) is left unpinned so a resolvable release is not durably
+       suppressed for the miss TTL (LML#816).
 
     ``pg`` is best-effort: ``None`` (or a PG failure, swallowed inside the cache
     helpers) degrades to an uncached bounded resolve. ``album`` (often absent on
@@ -250,6 +254,12 @@ async def _resolve_nonlibrary_release(
             # demote it on a transient outage.
             cached_positive_unhydrated = True
 
+    # LML#816: ``truncated_out`` reports whether the bounded resolve validated
+    # fewer candidates than it surfaced (the id-having set exceeded the cap). An
+    # empty result under truncation may be a *crowd-out* — a resolvable release
+    # sorted outside the 5-candidate window, an effect #802's improved recall
+    # amplifies — rather than a confirmed miss.
+    truncated_out: list[bool] = []
     candidates = await resolve_release_for_track(
         song,
         artist,
@@ -257,15 +267,34 @@ async def _resolve_nonlibrary_release(
         discogs_service,
         also_probe_album_title=bool(album),
         max_validations=5,
+        truncated_out=truncated_out,
     )
     best = candidates[0] if candidates else None
+    # Default to "not truncated" when the sink was left unpopulated (a monkeypatched
+    # resolver in tests, or any non-bounded path), so the pin policy is unchanged
+    # for every case that can't be a crowd-out.
+    bounded_resolve_truncated = bool(truncated_out and truncated_out[0])
 
-    # Never overwrite a known-good cached id with a miss: if we already held a
-    # positive entry that merely failed to re-hydrate (transient get_release /
-    # validate outage) and the live resolve also came up empty, leave the
-    # positive entry intact so it self-heals once the outage clears — rather
-    # than pinning a 7-day miss over good data.
-    if pg is not None and not (cached_positive_unhydrated and best is None):
+    # Two guards protect against pinning a durable known-miss over a release that
+    # is actually resolvable:
+    #
+    # * self-heal (LML#628): if we already held a positive entry that merely
+    #   failed to re-hydrate (transient get_release / validate outage) and the
+    #   live resolve also came up empty, leave the positive intact so it heals
+    #   once the outage clears — never demote good data to a 7-day miss.
+    # * crowd-out (LML#816): if the empty came from a *truncated* candidate set,
+    #   the correct release may simply have sorted past the validation window;
+    #   pinning here would durably suppress it for the miss TTL. Skip the write so
+    #   the next add re-probes; a genuine exhaustion (candidate set NOT truncated,
+    #   so every candidate was tried and failed) still pins below. A positive
+    #   (``best is not None``) is always written — both guards gate on
+    #   ``best is None`` and so never suppress a real resolution.
+    suppress_crowd_out_miss = best is None and bounded_resolve_truncated
+    if (
+        pg is not None
+        and not (cached_positive_unhydrated and best is None)
+        and not suppress_crowd_out_miss
+    ):
         await set_cached_release_id(
             pg,
             artist=artist,
