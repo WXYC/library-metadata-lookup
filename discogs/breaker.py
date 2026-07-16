@@ -393,13 +393,17 @@ class DiscogsCircuitBreaker:
     def _open(self) -> None:
         # Log once on the transition INTO open (FIX 7 / LML#805) — not per shed,
         # which would flood the log through an 8h flood (per-shed logging is
-        # DEBUG in ``DiscogsService._record_breaker_shed``). A breaker already
-        # OPEN that re-opens (e.g. a failed half-open trial) logs again because
-        # the state meaningfully changed (HALF_OPEN → OPEN); a no-op re-entry
-        # from OPEN is impossible (OPEN never calls ``_open``). The trip context
-        # — the prior state, the consecutive-failure run that tripped it, and
-        # the new epoch — is what an operator alerts on (LML#805), so it rides
-        # the transition line rather than being reconstructed from per-shed noise.
+        # DEBUG in ``DiscogsService._record_breaker_shed``). A transition from a
+        # DIFFERENT state (HALF_OPEN → OPEN on a failed trial, CLOSED → OPEN on
+        # the reactive/proactive trip) logs because the state meaningfully
+        # changed. A re-entry while ALREADY OPEN — a late at/below-floor
+        # ``record_success`` / ``record_failure`` / ``record_server_error``
+        # landing after the breaker has tripped — is a no-op for the *log*:
+        # ``was_open`` suppresses the duplicate line (though the cool-down clock
+        # and epoch below still advance). The trip context — the prior state,
+        # the consecutive-failure run that tripped it, and the new epoch — is
+        # what an operator alerts on (LML#805), so it rides the transition line
+        # rather than being reconstructed from per-shed noise.
         was_open = self._state is BreakerState.OPEN
         prior_state = self._state
         consecutive_failures = self._consecutive_failures
@@ -411,7 +415,7 @@ class DiscogsCircuitBreaker:
             logger.warning(
                 "Discogs saturation breaker %s->OPEN, shedding live Discogs requests "
                 "(consecutive_failures=%d, epoch=%d, cooldown=%.0fs)",
-                prior_state.value,
+                prior_state.name,
                 consecutive_failures,
                 self._epoch,
                 self._cooldown_seconds,
