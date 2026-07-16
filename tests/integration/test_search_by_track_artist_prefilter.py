@@ -43,6 +43,15 @@ N_DISTRACTORS = 42
 COMMON_TITLE = "Common Track"
 FUZZY_TITLE = "Common Track (Reprise)"  # measured similarity vs COMMON_TITLE = 0.619
 
+# The #801 concrete pin (``TestIssue801ConcretePin``) reuses the same
+# fuzzier-than-1.0 mechanism with the real "Milkman" / "Milkman (Reprise)" pair.
+# Pin its similarity in the floor test too, so a cluster whose
+# ``pg_trgm.similarity_threshold`` was raised above this pair's score fails
+# loudly at the boundary instead of silently returning ``[]`` from the #801
+# reproduction (LML#802 review).
+ISSUE_801_QUERY_TITLE = "Milkman"
+ISSUE_801_TARGET_TITLE = "Milkman (Reprise)"
+
 
 async def _create_schema(conn) -> None:
     """DROP/CREATE the four discogs-cache tables ``search_releases_by_track`` reads."""
@@ -136,22 +145,32 @@ class TestTrigramFloorPin:
     """Pin the boundary the RED reproductions depend on, so it fails loudly."""
 
     @pytest.mark.asyncio
-    async def test_fuzzy_title_similarity_in_range(self, cache):
+    @pytest.mark.parametrize(
+        ("target_title", "query_title"),
+        [
+            (FUZZY_TITLE, COMMON_TITLE),
+            (ISSUE_801_TARGET_TITLE, ISSUE_801_QUERY_TITLE),
+        ],
+    )
+    async def test_fuzzy_title_similarity_in_range(self, cache, target_title, query_title):
         async with cache.pool.acquire() as conn:
             sim = await conn.fetchval(
                 "SELECT similarity(lower(f_unaccent($1)), lower(f_unaccent($2)))",
-                FUZZY_TITLE,
-                COMMON_TITLE,
+                target_title,
+                query_title,
             )
             matches = await conn.fetchval(
                 "SELECT lower(f_unaccent($1)) % lower(f_unaccent($2))",
-                FUZZY_TITLE,
-                COMMON_TITLE,
+                target_title,
+                query_title,
             )
         # Below 1.0 -> the target sorts under the exact-title distractors (RED
         # prune is deterministic). Above the 0.3 default threshold -> it still
         # passes the `%` track filter, so the fix can surface it (GREEN).
-        assert 0.3 < sim < 1.0, f"target sim {sim} out of the (0.3, 1.0) window the RED test needs"
+        assert 0.3 < sim < 1.0, (
+            f"target sim {sim} for {target_title!r} vs {query_title!r} "
+            "out of the (0.3, 1.0) window the RED test needs"
+        )
         assert matches is True
 
 
@@ -279,20 +298,20 @@ class TestIssue801ConcretePin:
     @pytest.mark.asyncio
     async def test_rdj_album_returned_for_milkman_aphex_twin(self, cache):
         async with cache.pool.acquire() as conn:
-            await _seed_distractors(conn, track_title="Milkman")
+            await _seed_distractors(conn, track_title=ISSUE_801_QUERY_TITLE)
             await conn.execute(
                 "INSERT INTO release (id, title) VALUES (972, 'Richard D. James Album')"
             )
             await conn.execute(
-                "INSERT INTO release_track (release_id, sequence, title) "
-                "VALUES (972, 10, 'Milkman (Reprise)')"
+                "INSERT INTO release_track (release_id, sequence, title) VALUES (972, 10, $1)",
+                ISSUE_801_TARGET_TITLE,
             )
             await conn.execute(
                 "INSERT INTO release_artist (release_id, artist_name, extra) "
                 "VALUES (972, 'Aphex Twin', 0)"
             )
 
-        results = await cache.search_releases_by_track("Milkman", "Aphex Twin", 20)
+        results = await cache.search_releases_by_track(ISSUE_801_QUERY_TITLE, "Aphex Twin", 20)
 
         assert [r.release_id for r in results] == [972]
         assert results[0].album == "Richard D. James Album"

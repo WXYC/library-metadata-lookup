@@ -167,7 +167,7 @@ class TestSearchReleasesByTrack:
 
     @pytest.mark.asyncio
     async def test_query_filters_rta_to_extra_zero(self, cache_service, mock_asyncpg_pool):
-        """The rta join must restrict to main-artist credits.
+        """The CTE ``rta`` credit prefilter must restrict to main-artist credits.
 
         Mirrors the per-track filter in ``validate_track_on_release``: the
         candidate-release ranking should not surface a release just because
@@ -175,14 +175,25 @@ class TestSearchReleasesByTrack:
         requested artist. ``release_track_artist`` rows with ``extra = 1``
         are extra credits (writer / producer / performer) and must not
         participate in the candidate-artist match. See #333.
+
+        The guard is pinned on the ``rta`` EXISTS leg *inside the CTE* (before
+        ``LIMIT $2``) -- the leg that governs which releases survive truncation.
+        A bare ``"rta.extra = 0" in sql`` check would be satisfied by the outer
+        LEFT JOIN's copy of the same clause and pass even if the CTE leg's guard
+        were deleted, which is the failure the prefilter exists to prevent
+        (LML#802 review).
         """
         mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
 
         await cache_service.search_releases_by_track("Song", "Artist")
 
         sql = mock_asyncpg_pool.fetch.call_args[0][0]
-        assert "rta.extra = 0" in sql, (
-            f"Expected `rta.extra = 0` constraint in rta join; got: {sql!r}"
+        cte = sql[: sql.index("LIMIT $2")]
+        rta_leg = "EXISTS (SELECT 1 FROM release_track_artist rta"
+        assert rta_leg in cte, f"Expected the rta EXISTS leg inside the CTE; got: {cte!r}"
+        assert "rta.extra = 0" in cte[cte.index(rta_leg) :], (
+            "The CTE rta EXISTS leg must carry `rta.extra = 0`; the outer LEFT "
+            f"JOIN copy does not protect the truncation set. Got: {cte!r}"
         )
 
     @pytest.mark.asyncio
@@ -286,6 +297,32 @@ class TestSearchReleasesByTrack:
             "artist EXISTS leg must appear inside the CTE, before LIMIT $2"
         )
         assert "lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3))" in sql[:limit_at]
+        # Companion to the rta.extra = 0 pin: the release-level leg is also
+        # precision-guarded to main-artist credits inside the CTE.
+        assert "ra.extra = 0" in sql[:limit_at], (
+            "the release-level EXISTS leg must carry `ra.extra = 0` before LIMIT $2"
+        )
+
+    def test_artist_variant_outer_block_identical_to_hot_path(self):
+        """The two search strings must share a byte-identical outer block.
+
+        ``_SEARCH_BY_TRACK_ARTIST_SQL`` only adds the artist prefilter inside
+        the CTE; everything from the outer ``SELECT`` onward is copied verbatim
+        from ``_SEARCH_BY_TRACK_SQL`` as a pure subtractive backstop (the
+        display-artist / ``is_compilation`` selection). Nothing else pins them
+        equal -- the snapshot test covers only the None branch -- so if the two
+        outer blocks drift, the artist branch could select or classify a release
+        differently from the hot path with no test noticing (LML#802 review).
+        """
+        anchor = "SELECT r.id as release_id"
+        assert _SEARCH_BY_TRACK_SQL.count(anchor) == 1
+        assert _SEARCH_BY_TRACK_ARTIST_SQL.count(anchor) == 1
+        hot_outer = _SEARCH_BY_TRACK_SQL[_SEARCH_BY_TRACK_SQL.index(anchor) :]
+        artist_outer = _SEARCH_BY_TRACK_ARTIST_SQL[_SEARCH_BY_TRACK_ARTIST_SQL.index(anchor) :]
+        assert hot_outer == artist_outer, (
+            "the artist variant's outer block drifted from the hot path; mirror "
+            "any edit across both SQL strings"
+        )
 
 
 # ---------------------------------------------------------------------------
