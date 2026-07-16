@@ -35,6 +35,8 @@ sleeping). No Postgres, no network — pure unit, default (no-marker) suite.
 
 from __future__ import annotations
 
+import logging
+
 from discogs.breaker import BreakerState, DiscogsCircuitBreaker
 
 
@@ -439,3 +441,82 @@ class TestShouldShedInflight:
         # consume the single trial slot.
         assert breaker.should_shed_inflight(trial_epoch - 1) is True
         assert breaker.state is BreakerState.HALF_OPEN
+
+
+class TestTransitionLogging:
+    """LML#805: the breaker logs each STATE TRANSITION once, at
+    warning/info, carrying trip context (consecutive-failure count, epoch).
+
+    The per-request shed is DEBUG (``_record_breaker_shed`` in
+    ``discogs/service.py``) so a sustained OPEN episode logs a handful of
+    transition lines instead of tens of thousands of per-request error events
+    (the 32.5K-event Jul 11-14 flood). These tests pin the transition lines so
+    an operator can alert on them (or on the ``lml.cache.discogs_breaker_open_shed``
+    counter) rather than on a per-request error group that no longer exists.
+
+    Transition logs live on the ``discogs.breaker`` logger; the shed DEBUG on
+    ``discogs.service``. Neither is ERROR-level, so none becomes a Sentry error
+    event under the SDK's default ``event_level=ERROR`` LoggingIntegration.
+    """
+
+    def test_closed_to_open_logs_once_with_trip_context(self, clock, caplog):
+        breaker = _breaker(clock, failure_threshold=3)
+        with caplog.at_level(logging.DEBUG, logger="discogs.breaker"):
+            breaker.record_failure()
+            breaker.record_failure()
+            # Below threshold: no transition, so nothing logged yet.
+            assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+            breaker.record_failure()
+
+        open_logs = [
+            r for r in caplog.records if r.levelno == logging.WARNING and "OPEN" in r.getMessage()
+        ]
+        assert len(open_logs) == 1, "CLOSED->OPEN must log exactly once"
+        msg = open_logs[0].getMessage()
+        # Trip context: the consecutive-failure count that tripped it + the epoch.
+        assert "consecutive_failures=3" in msg
+        assert "epoch=1" in msg
+        # No ERROR-level record on a plain state transition.
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+    def test_open_to_half_open_promotion_is_logged(self, clock, caplog):
+        breaker = _breaker(clock, failure_threshold=3, cooldown_seconds=30.0)
+        for _ in range(3):
+            breaker.record_failure()
+        assert breaker.state is BreakerState.OPEN
+        clock.advance(31.0)
+        caplog.clear()  # drop the CLOSED->OPEN warning from the setup above.
+        with caplog.at_level(logging.INFO, logger="discogs.breaker"):
+            epoch = breaker.allow_request()
+        assert breaker.state is BreakerState.HALF_OPEN
+        promotion_logs = [
+            r
+            for r in caplog.records
+            if "HALF_OPEN" in r.getMessage() and "OPEN->" in r.getMessage()
+        ]
+        assert len(promotion_logs) == 1, "OPEN->HALF_OPEN promotion must log once"
+        assert f"epoch={epoch}" in promotion_logs[0].getMessage()
+
+    def test_half_open_to_closed_recovery_is_logged(self, clock, caplog):
+        breaker, epoch = _to_half_open(clock)
+        caplog.clear()  # drop the OPEN + promotion lines from _to_half_open.
+        with caplog.at_level(logging.INFO, logger="discogs.breaker"):
+            breaker.record_success(remaining=50, epoch=epoch)
+        assert breaker.state is BreakerState.CLOSED
+        closed_logs = [
+            r for r in caplog.records if r.levelno == logging.WARNING and "CLOSED" in r.getMessage()
+        ]
+        assert len(closed_logs) == 1, "OPEN->CLOSED recovery must log once"
+
+    def test_half_open_trial_failure_reopens_and_logs(self, clock, caplog):
+        breaker, epoch = _to_half_open(clock)
+        caplog.clear()  # drop the OPEN + promotion lines from _to_half_open.
+        with caplog.at_level(logging.INFO, logger="discogs.breaker"):
+            breaker.record_failure(epoch=epoch)
+        assert breaker.state is BreakerState.OPEN
+        reopen_logs = [
+            r for r in caplog.records if r.levelno == logging.WARNING and "OPEN" in r.getMessage()
+        ]
+        assert len(reopen_logs) == 1, "HALF_OPEN->OPEN re-open must log once"
+        # No ERROR-level record for a trial-failure re-open either.
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
