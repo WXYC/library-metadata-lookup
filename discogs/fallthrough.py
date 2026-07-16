@@ -319,11 +319,23 @@ async def fallthrough[T](
                 # releases while the ``rta.extra = 0`` guard pruned the actual
                 # track-bearing comp) masks the API leg for THIS call. That is
                 # intentional — the whole L2 point is spending no Discogs quota on
-                # a hit — and it is harmless: both consumers probe in two waves,
-                # and Wave B (``artist_as_keyword=True`` → ``pg_read=None``) always
-                # reaches the API's keyword/``Compilation`` leg, which recovers
-                # exactly the credits this arm prunes. #818 was refuted (no seam
-                # change); recovery pinned by
+                # a hit — and it is harmless across all three seam consumers:
+                #   * ``resolve_release_for_track`` (row-less kernel) and
+                #     ``search_compilations_for_track`` (TRACK_ON_COMPILATION) probe
+                #     in two waves; Wave B (``artist_as_keyword=True`` →
+                #     ``pg_read=None``) bypasses this PG read, hits the API
+                #     keyword/``Compilation`` leg, and ``merge_wave_b_compilations``
+                #     (V/A-gated) folds the recovered comp back in.
+                #   * ``_match_track_releases_to_library`` (SONG_AS_TRACK / SWAPPED)
+                #     is single-wave, but is not exposed: SONG_AS_TRACK passes
+                #     ``artist=None`` so ``_SEARCH_BY_TRACK_SQL`` takes its
+                #     ``$3 IS NULL`` branch and never artist-prunes (the comp is
+                #     already in this Wave-A read), and SWAPPED excludes V/A comps
+                #     by design.
+                # Wave B recovers the V/A-compilation subset only: a featured
+                # (``extra = 1``) credit on a NON-comp release stays pruned, but
+                # that is the pre-existing #333 recall trade-off, not new C3 harm.
+                # #818 was refuted (no seam change); recovery pinned by
                 # ``tests/unit/test_fallthrough_masked_api_leg_818.py``.
                 return cached  # type: ignore[return-value]
             _add_discogs_breadcrumb("cache_miss", bc_data)
