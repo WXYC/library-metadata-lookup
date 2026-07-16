@@ -224,6 +224,101 @@ _ARTIST_TRIGRAM_CANDIDATE_THRESHOLD = 0.85
 _PG_TRGM_FLOOR = 0.3
 _SET_PG_TRGM_FLOOR_SQL = f"SET LOCAL pg_trgm.similarity_threshold = {_PG_TRGM_FLOOR}"
 
+# ``search_releases_by_track`` picks one of these two strings on whether an
+# artist was supplied. Two strings, not one ``$3 IS NULL OR ...`` guard, so the
+# artist=None path (the VA / SONG_AS_TRACK hot path, under #706 perf scrutiny)
+# keeps the exact parse tree it runs today — same pg_stat_statements entry, same
+# generic plan. A single guarded string would force the planner to build one
+# generic plan spanning both branches (it can't constant-fold the unknown ``$3``
+# bind at plan time), so the common None path could inherit a worse plan than
+# today's. See LML#802.
+#
+# ``rta.extra = 0`` constrains the credit legs to main-artist credits (mirrors
+# validate_track_on_release after #333). Neither string has a Python-side
+# release-level fuzz fallback: a release whose only matching credit is
+# ``extra = 1`` (featuring guest, composer, remixer) drops from the candidate
+# ranking; the fallthrough seam's API leg surfaces it at the cost of Discogs
+# quota. See #333 for the recall trade-off; #472-#475 track the parallel filters
+# in sibling read sites. Keep this rationale here (not in ``--`` comments inside
+# the SQL) so it stays out of pg_stat_statements and PG logs.
+_SEARCH_BY_TRACK_SQL = """\
+WITH matching_tracks AS (
+    SELECT DISTINCT rt.release_id, rt.sequence,
+           rt.title as track_title,
+           similarity(lower(f_unaccent(rt.title)), lower(f_unaccent($1))) as sim
+    FROM release_track rt
+    WHERE lower(f_unaccent(rt.title)) % lower(f_unaccent($1))
+    ORDER BY sim DESC
+    LIMIT $2
+)
+SELECT r.id as release_id, r.title, ra.artist_name,
+       mt.track_title,
+       CASE WHEN lower(ra.artist_name) LIKE '%various%' THEN true ELSE false END as is_compilation
+FROM matching_tracks mt
+JOIN release r ON r.id = mt.release_id
+JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
+LEFT JOIN release_track_artist rta
+    ON rta.release_id = mt.release_id
+    AND rta.track_sequence = mt.sequence
+    AND rta.extra = 0
+WHERE (
+    $3::text IS NULL
+    OR lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3))
+    OR lower(f_unaccent(rta.artist_name)) % lower(f_unaccent($3))
+)
+ORDER BY mt.sim DESC\
+"""
+
+# Artist-supplied variant: the artist predicate is pushed INTO the CTE ``WHERE``
+# (before the ``LIMIT``), via two correlated ``EXISTS`` legs, so the sim-ordered
+# ``LIMIT`` truncates the already-artist-filtered set instead of pruning the
+# artist's own release out from under it (LML#802 / #801). ``EXISTS`` not
+# ``JOIN`` so the CTE can't multiply ``release_track`` rows -- the ``SELECT
+# DISTINCT`` / ``LIMIT`` still counts distinct candidate tracks. The ``rta`` leg
+# is correlated to ``rt.sequence`` so a release credited to the artist only as a
+# track-level featured credit still matches on its matching track. The outer
+# ``SELECT`` / JOIN / ``WHERE`` are kept identical to ``_SEARCH_BY_TRACK_SQL``:
+# redundant with the CTE here (a pure subtractive backstop that can only remove
+# rows the CTE kept, never admit a wrong one) but it preserves the existing
+# display-artist / is_compilation selection for multi-credit releases.
+_SEARCH_BY_TRACK_ARTIST_SQL = """\
+WITH matching_tracks AS (
+    SELECT DISTINCT rt.release_id, rt.sequence,
+           rt.title as track_title,
+           similarity(lower(f_unaccent(rt.title)), lower(f_unaccent($1))) as sim
+    FROM release_track rt
+    WHERE lower(f_unaccent(rt.title)) % lower(f_unaccent($1))
+      AND (
+          EXISTS (SELECT 1 FROM release_artist ra
+                  WHERE ra.release_id = rt.release_id AND ra.extra = 0
+                    AND lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3)))
+          OR
+          EXISTS (SELECT 1 FROM release_track_artist rta
+                  WHERE rta.release_id = rt.release_id
+                    AND rta.track_sequence = rt.sequence AND rta.extra = 0
+                    AND lower(f_unaccent(rta.artist_name)) % lower(f_unaccent($3)))
+      )
+    ORDER BY sim DESC
+    LIMIT $2
+)
+SELECT r.id as release_id, r.title, ra.artist_name,
+       mt.track_title,
+       CASE WHEN lower(ra.artist_name) LIKE '%various%' THEN true ELSE false END as is_compilation
+FROM matching_tracks mt
+JOIN release r ON r.id = mt.release_id
+JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
+LEFT JOIN release_track_artist rta
+    ON rta.release_id = mt.release_id
+    AND rta.track_sequence = mt.sequence
+    AND rta.extra = 0
+WHERE (
+    $3::text IS NULL
+    OR lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3))
+    OR lower(f_unaccent(rta.artist_name)) % lower(f_unaccent($3))
+)
+ORDER BY mt.sim DESC\
+"""
+
 
 def _negative_cache_key_hash(artist: str | None, track: str, artist_as_keyword: bool) -> bytes:
     """Hash the (artist, track, artist_as_keyword) tuple into a stable 32-byte key.
@@ -372,48 +467,17 @@ class DiscogsCacheService:
         Raises:
             CacheUnavailableError: If database is unreachable
         """
-        # `rta.extra = 0` constrains the LEFT JOIN to main-artist credits
-        # (mirrors validate_track_on_release after #333). Unlike
-        # validate_track_on_release, this query has no Python-side release-
-        # level fuzz fallback — a release where the only matching credit is
-        # `extra = 1` (featuring guest, composer, remixer) drops from the
-        # candidate ranking. The fallthrough seam's API leg will surface it
-        # at the cost of Discogs quota. See #333 for the documented recall
-        # trade-off; #472-#475 track the parallel filters in sibling read
-        # sites (get_release_metadata, va_disambiguate, match_compilations,
-        # track_streaming). Keep the rationale here (not in `--` comments
-        # inside the SQL) so it stays out of pg_stat_statements and PG
-        # logs.
+        # Two query strings selected on whether an artist was supplied: the
+        # artist=None path runs `_SEARCH_BY_TRACK_SQL` unchanged (the VA /
+        # SONG_AS_TRACK hot path — its plan must stay frozen, #706); an artist
+        # runs `_SEARCH_BY_TRACK_ARTIST_SQL`, which pushes the predicate into
+        # the CTE so the LIMIT can't prune the artist's own release (#802). Full
+        # rationale (the split, the #333 extra=0 trade-off) sits above the two
+        # module-level constants.
         try:
-            query = """
-                WITH matching_tracks AS (
-                    SELECT DISTINCT rt.release_id, rt.sequence,
-                           rt.title as track_title,
-                           similarity(lower(f_unaccent(rt.title)), lower(f_unaccent($1))) as sim
-                    FROM release_track rt
-                    WHERE lower(f_unaccent(rt.title)) % lower(f_unaccent($1))
-                    ORDER BY sim DESC
-                    LIMIT $2
-                )
-                SELECT r.id as release_id, r.title, ra.artist_name,
-                       mt.track_title,
-                       CASE WHEN lower(ra.artist_name) LIKE '%various%' THEN true ELSE false END as is_compilation
-                FROM matching_tracks mt
-                JOIN release r ON r.id = mt.release_id
-                JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0
-                LEFT JOIN release_track_artist rta
-                    ON rta.release_id = mt.release_id
-                    AND rta.track_sequence = mt.sequence
-                    AND rta.extra = 0
-                WHERE (
-                    $3::text IS NULL
-                    OR lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3))
-                    OR lower(f_unaccent(rta.artist_name)) % lower(f_unaccent($3))
-                )
-                ORDER BY mt.sim DESC
-            """
+            sql = _SEARCH_BY_TRACK_SQL if artist is None else _SEARCH_BY_TRACK_ARTIST_SQL
 
-            rows = await self.pool.fetch(query, track, limit * 2, artist)
+            rows = await self.pool.fetch(sql, track, limit * 2, artist)
 
             results = []
             seen_albums = set()
