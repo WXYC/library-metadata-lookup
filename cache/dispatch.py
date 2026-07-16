@@ -40,6 +40,7 @@ from cache.models import (
     CacheRefreshResultItem,
     SourceRefreshOutcome,
 )
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import ReleaseMetadataResponse
 
 if TYPE_CHECKING:
@@ -90,6 +91,11 @@ def compute_per_id_status(
        was ``success`` → ``not_implemented``.
     3. All dispatched sources errored → ``error``.
 
+    A LML#755 saturation-breaker shed on the release leg is recorded as
+    ``error`` (see ``_refresh_discogs_release``), so it rolls up here through
+    branch 3 to the retriable ``error`` bucket — the cron retries the identity
+    on its next pass, which is the intended "couldn't ask, try later" behavior.
+
     Empty ``sources`` (a row whose per-source columns are all NULL — legal
     but never produced by the v1 mint protocol) rolls up to
     ``not_implemented``: nothing was dispatched, so there is no error to
@@ -129,6 +135,35 @@ async def _refresh_discogs_release(
         release = await discogs_service.get_release(release_id)
     except asyncio.CancelledError:
         raise
+    except DiscogsBreakerOpenError:
+        # LML#814: ``get_release`` re-raises a saturation-breaker shed (the
+        # LML#755 FIX-1 guard, so ``validate_track_on_release`` can't turn
+        # "couldn't ask" into a definitive False). Here in the cache-warmer that
+        # shed would otherwise fall into the generic ``except Exception`` below
+        # and log at ERROR via ``logger.exception`` — and the Sentry
+        # LoggingIntegration (event_level=ERROR) promotes each such record to a
+        # discrete event, reproducing the #755 flood (32.5K events, Jul 11-14)
+        # on this backfill-cron-driven refresh path #805 didn't touch.
+        #
+        # A shed is expected degrade: log at DEBUG (mirroring #805 and the
+        # breaker's own ``_record_breaker_shed``) and return the retriable
+        # ``error`` outcome, tagging ``message`` with the breaker exception name
+        # so a dashboard can tell a shed apart from a hard leg failure. We keep
+        # the shed on the existing ``error`` value (rather than a new
+        # ``skipped``) because ``release_outcome`` mirrors the api.yaml
+        # ``CacheRefreshSourceOutcome`` wire enum BS also generates from — a new
+        # value would need a coordinated wxyc-shared + BS change out of #814's
+        # scope. ``error`` rolls up to the retriable per-id ``error`` so the
+        # cron retries. Nothing negative is persisted: ``get_release`` re-raised
+        # before any tombstone/write-back, and the dispatcher only reports.
+        logger.debug(
+            "cache refresh: discogs release leg shed by saturation breaker "
+            "external_id=%r; recording retriable error (cache-only)",
+            external_id,
+        )
+        return None, SourceRefreshOutcome(
+            release_outcome="error", message="DiscogsBreakerOpenError"
+        )
     except Exception as exc:
         logger.exception("cache refresh: discogs release leg failed external_id=%r", external_id)
         return None, SourceRefreshOutcome(release_outcome="error", message=type(exc).__name__)

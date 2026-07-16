@@ -17,6 +17,16 @@ The models live here (not in ``generated/api_models.py``) because:
 Per-source ``release_outcome`` and per-artist ``outcome`` are a coarse
 three-value enum (``success | error | not_implemented``). Tombstones count
 as ``success`` — see ``cache/dispatch.py`` for the public-boundary translation.
+
+These three values mirror the api.yaml wire contract's
+``CacheRefreshSourceOutcome`` enum (``generated/api_models.py``) 1:1 — the
+endpoint serializes this internal model, and BS generates its own types from
+the same ``api.yaml``, so the two enums must stay structurally identical. A
+LML#755 saturation-breaker shed on the release leg is recorded as ``error``
+(with ``message="DiscogsBreakerOpenError"`` to distinguish it from a hard leg
+failure for dashboards); it is not given a distinct ``skipped`` value because
+that would be a wire-contract change requiring a coordinated wxyc-shared +
+BS regeneration (LML#814 keeps the shed on the existing retriable ``error``).
 """
 
 from __future__ import annotations
