@@ -29,11 +29,15 @@ what Wave B's keyword/``Compilation`` API probe is built to surface. So a
 C2-pruned comp that Wave A masks falls squarely into Wave B's domain and is
 recovered by the merge (``merge_wave_b_compilations``).
 
-The third seam consumer, ``_match_track_releases_to_library`` (SONG_AS_TRACK /
-SWAPPED), is single-wave and has no Wave B, but the masking still can't harm it:
+The single-wave lookup-strategy consumer ``_match_track_releases_to_library``
+(SONG_AS_TRACK / SWAPPED) has no Wave B, but the masking still can't harm it:
 SONG_AS_TRACK passes ``artist=None`` (so ``_SEARCH_BY_TRACK_SQL`` never
-artist-prunes — the comp is already in its Wave-A read) and SWAPPED excludes V/A
-comps by design. So it is covered by construction, not by a recovery wave.
+artist-prunes — the comp is already in its Wave-A read) and SWAPPED re-filters to
+the queried artist, dropping V/A comps. The two remaining direct seam callers
+(``lookup_releases_by_track``'s album path, artist-filtered; and the
+``get_track_releases`` diagnostic endpoint, off the ``/lookup`` correctness path)
+are covered by the same reasoning. So these paths are safe by construction, not
+by a recovery wave.
 
 Verdict: **REFUTED** — no seam change; these tests pin the recovery so a future
 wave-swap or PG-hit-predicate change can't silently reopen the hole.

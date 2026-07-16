@@ -319,7 +319,8 @@ async def fallthrough[T](
                 # releases while the ``rta.extra = 0`` guard pruned the actual
                 # track-bearing comp) masks the API leg for THIS call. That is
                 # intentional — the whole L2 point is spending no Discogs quota on
-                # a hit — and it is harmless across all three seam consumers:
+                # a hit — and it is harmless on every ``/lookup`` path. The three
+                # lookup-strategy seam consumers:
                 #   * ``resolve_release_for_track`` (row-less kernel) and
                 #     ``search_compilations_for_track`` (TRACK_ON_COMPILATION) probe
                 #     in two waves; Wave B (``artist_as_keyword=True`` →
@@ -327,11 +328,15 @@ async def fallthrough[T](
                 #     keyword/``Compilation`` leg, and ``merge_wave_b_compilations``
                 #     (V/A-gated) folds the recovered comp back in.
                 #   * ``_match_track_releases_to_library`` (SONG_AS_TRACK / SWAPPED)
-                #     is single-wave, but is not exposed: SONG_AS_TRACK passes
-                #     ``artist=None`` so ``_SEARCH_BY_TRACK_SQL`` takes its
-                #     ``$3 IS NULL`` branch and never artist-prunes (the comp is
-                #     already in this Wave-A read), and SWAPPED excludes V/A comps
-                #     by design.
+                #     is single-wave but unexposed: SONG_AS_TRACK passes ``artist=None``
+                #     so ``_SEARCH_BY_TRACK_SQL`` takes its ``$3 IS NULL`` branch and
+                #     never artist-prunes (the comp is already in this Wave-A read),
+                #     and SWAPPED re-filters to the queried artist, dropping V/A comps.
+                # The two remaining direct seam callers are covered by the same
+                # reasoning: ``lookup_releases_by_track`` (album path) filters to
+                # ``release_artist`` matching the artist, so a masked "Various" comp
+                # is dropped regardless, and the ``get_track_releases`` diagnostic
+                # endpoint is off the ``/lookup`` correctness path.
                 # Wave B recovers the V/A-compilation subset only: a featured
                 # (``extra = 1``) credit on a NON-comp release stays pruned, but
                 # that is the pre-existing #333 recall trade-off, not new C3 harm.
