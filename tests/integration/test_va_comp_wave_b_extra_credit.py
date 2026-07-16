@@ -164,6 +164,17 @@ async def cache(pg_pool):
             await _create_schema(conn)
         except Exception as e:
             pytest.skip(f"pg_trgm/unaccent extensions unavailable: {e}")
+        # The full ``search_releases_by_track`` seam writes a durable negative on
+        # an empty API result. All three Wave-B probes here share one negative key
+        # -- ``(PERFORMER, COMMON_TITLE, artist_as_keyword=True)`` -- so an earlier
+        # test's empty-API write would short-circuit a later same-key call via the
+        # negative cache *before* its API arm, masking a real Wave-B routing
+        # regression as a green run (or a spurious red). Own the "no negative
+        # cache" precondition explicitly instead of relying on the table being
+        # ambiently absent (it exists in the real discogs-cache schema, and
+        # ``test_lookup_negative_cache`` creates it). This runs only past the
+        # drop-target guard above, so a populated shared cache DB is never touched.
+        await conn.execute("DROP TABLE IF EXISTS lookup_negative CASCADE")
 
     # The service method under test is wrapped in an L1 @async_cached(TRACK_CACHE);
     # clear it around each test so a prior test's (track, artist, artist_as_keyword)
@@ -177,6 +188,7 @@ async def cache(pg_pool):
         await conn.execute("DROP TABLE IF EXISTS release_track CASCADE")
         await conn.execute("DROP TABLE IF EXISTS release_artist CASCADE")
         await conn.execute("DROP TABLE IF EXISTS release CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS lookup_negative CASCADE")
 
 
 def _make_service(cache: DiscogsCacheService, *, api_results: list[dict]) -> tuple:
