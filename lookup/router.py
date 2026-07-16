@@ -9,7 +9,7 @@ from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 import sentry_sdk
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from wxyc_fastapi.observability import (
     RequestTelemetry,
     get_cache_stats,
@@ -322,6 +322,34 @@ def _project_cache_stats_to_transaction(stats: dict | None) -> None:
         logger.warning("Failed to project cache_stats onto Sentry transaction: %s", e)
 
 
+def _emit_server_timing_header(
+    http_response: Response,
+    telemetry: RequestTelemetry,
+    extra: dict[str, float] | None = None,
+) -> None:
+    """Surface the per-stage RequestTelemetry timings as a ``Server-Timing`` header.
+
+    Out-of-band instrumentation — the LML half of the cross-repo Server-Timing
+    trace (Backend-Service#881, Epic G: enrichment-pipeline observability). The
+    durations ``track_step`` already captured — plus any derived ``extra`` legs
+    (on ``/lookup`` the ``discogs`` = ``pg_time_ms + api_time_ms`` split) and one
+    live ``total`` — are serialized onto the HTTP response so a caller
+    (request-o-matic's ``lookup`` CLI) can attribute a slow lookup to a named
+    server stage. No ``api.yaml`` / ``CacheStats`` change: the JSON body is
+    byte-identical whether or not this header is set.
+
+    Gated on ``LML_EMIT_SERVER_TIMING`` (default on; the Railway kill switch).
+    Observability must not break the request path — any failure (a settings read
+    or the serialize) logs at WARNING and the response ships without the header.
+    """
+    try:
+        if not get_settings().lml_emit_server_timing:
+            return
+        http_response.headers["Server-Timing"] = telemetry.as_server_timing(extra=extra)
+    except Exception as e:
+        logger.warning("Failed to emit Server-Timing header: %s", e)
+
+
 @router.post(
     "/lookup",
     response_model=LookupResponse,
@@ -347,6 +375,7 @@ def _project_cache_stats_to_transaction(stats: dict | None) -> None:
 )
 async def handle_lookup(
     request: LookupRequest,
+    http_response: Response,
     db: LibraryDB = Depends(get_library_db),
     discogs_service: DiscogsService | None = Depends(get_discogs_service),
     discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service),
@@ -442,6 +471,14 @@ async def handle_lookup(
         # SENTRY_DSN configured, or running outside a request span).
         _project_cache_stats_to_transaction(stats)
 
+        # Surface the per-stage telemetry as a Server-Timing header (BS#881).
+        # The derived `discogs` leg is `pg_time_ms + api_time_ms`; guard the
+        # None-context case (get_cache_stats() can return None) so it degrades
+        # to 0 rather than TypeError, mirroring the CacheStats guard above.
+        pg_ms = stats.get("pg_time_ms", 0) if stats else 0
+        api_ms = stats.get("api_time_ms", 0) if stats else 0
+        _emit_server_timing_header(http_response, telemetry, extra={"discogs": pg_ms + api_ms})
+
         # Send telemetry
         if posthog_client:
             results = response.results or []
@@ -515,6 +552,7 @@ async def handle_lookup(
 )
 async def handle_bulk_lookup(
     http_request: Request,
+    http_response: Response,
     db: LibraryDB = Depends(get_library_db),
     discogs_service: DiscogsService | None = Depends(get_discogs_service),
     discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service),
@@ -772,5 +810,11 @@ async def handle_bulk_lookup(
             counts["error"],
         )
         http_span.set_data("http.status_code", 200)
+
+    # Batch-level Server-Timing (BS#881): one `total` for the whole request,
+    # no per-item step timings or derived `discogs` leg — per-item stages aren't
+    # meaningful in a single per-HTTP-request header. `batch_telemetry` tracks no
+    # steps, so with no `extra` this is total-only. Degrade-safe by construction.
+    _emit_server_timing_header(http_response, batch_telemetry)
 
     return BulkLookupResponse(results=results)

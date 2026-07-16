@@ -136,6 +136,34 @@ class TestBulkLookupEndpoint:
         assert mock_lookup.await_args.kwargs.get("allow_release_resolution_fallback") is False
 
     @pytest.mark.asyncio
+    async def test_bulk_emits_total_only_server_timing(self, app_client):
+        """BS#881 (Epic G) observability: /lookup/bulk carries a Server-Timing header
+        with a single batch-level ``total`` and no per-item step timings or the
+        derived ``discogs`` leg — per-item stages aren't meaningful in one
+        per-HTTP-request header. Degrade-safe: presence, never a crash.
+        """
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_no_match_response(),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={
+                        "items": [{"artist": "Jessica Pratt", "album": "On Your Own Love Again"}]
+                    },
+                )
+
+        assert resp.status_code == 200
+        assert "Server-Timing" in resp.headers
+        header = resp.headers["Server-Timing"]
+        names = {entry.split(";")[0].strip() for entry in header.split(",")}
+        assert names == {"total"}
+
+    @pytest.mark.asyncio
     async def test_bulk_hard_pins_warm_cache_off(self, app_client, caplog):
         """A bulk item that sets ``warm_cache: true`` reaches perform_lookup with
         ``request.warm_cache`` falsy (LML#742). ``warm_cache`` gates the
