@@ -476,6 +476,10 @@ class TestTransitionLogging:
         # Trip context: the consecutive-failure count that tripped it + the epoch.
         assert "consecutive_failures=3" in msg
         assert "epoch=1" in msg
+        # Prior state renders as the uppercase enum NAME ("CLOSED"), matching the
+        # sibling transition logs and the operator-facing alert convention — NOT
+        # the lowercase StrEnum value ("closed"). LML#805.
+        assert "CLOSED->OPEN" in msg
         # No ERROR-level record on a plain state transition.
         assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
 
@@ -518,5 +522,8 @@ class TestTransitionLogging:
             r for r in caplog.records if r.levelno == logging.WARNING and "OPEN" in r.getMessage()
         ]
         assert len(reopen_logs) == 1, "HALF_OPEN->OPEN re-open must log once"
+        # Prior state renders as the uppercase enum NAME ("HALF_OPEN"), not the
+        # lowercase StrEnum value ("half-open"). LML#805.
+        assert "HALF_OPEN->OPEN" in reopen_logs[0].getMessage()
         # No ERROR-level record for a trial-failure re-open either.
         assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
