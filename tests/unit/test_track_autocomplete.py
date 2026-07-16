@@ -2,10 +2,11 @@
 
 from unittest.mock import AsyncMock
 
+import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from discogs.cache_service import DiscogsCacheService
+from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from tests.unit.conftest import override_deps
 
 # ---------------------------------------------------------------------------
@@ -16,7 +17,7 @@ from tests.unit.conftest import override_deps
 class TestAutocompleteTracksCache:
     @pytest.mark.asyncio
     async def test_returns_distinct_track_titles(self, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {"title": "Percolator"},
                 {"title": "Per Clansen"},
@@ -27,11 +28,11 @@ class TestAutocompleteTracksCache:
         result = await svc.autocomplete_tracks("Stereolab", "per", limit=20)
 
         assert result == ["Per Clansen", "Percolator"]
-        mock_asyncpg_pool.fetch.assert_called_once()
+        mock_asyncpg_pool._mock_conn.fetch.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_deduplicates_case_insensitive(self, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {"title": "Percolator"},
                 {"title": "percolator"},
@@ -47,7 +48,7 @@ class TestAutocompleteTracksCache:
 
     @pytest.mark.asyncio
     async def test_respects_limit(self, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[{"title": f"Track {i}"} for i in range(10)]
         )
 
@@ -58,29 +59,43 @@ class TestAutocompleteTracksCache:
 
     @pytest.mark.asyncio
     async def test_with_release_filter(self, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[{"title": "Song"}])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[{"title": "Song"}])
 
         svc = DiscogsCacheService(mock_asyncpg_pool)
         result = await svc.autocomplete_tracks("Artist", "so", release="Album", limit=20)
 
         assert result == ["Song"]
         # Verify the release parameter was passed: fetch(query, artist, q, release, limit)
-        call_args = mock_asyncpg_pool.fetch.call_args
+        call_args = mock_asyncpg_pool._mock_conn.fetch.call_args
         assert call_args[0][3] == "Album"  # release param at index 3
 
     @pytest.mark.asyncio
     async def test_returns_empty_on_cache_error(self, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(side_effect=Exception("connection lost"))
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(side_effect=Exception("connection lost"))
 
         svc = DiscogsCacheService(mock_asyncpg_pool)
-        from discogs.cache_service import CacheUnavailableError
 
         with pytest.raises(CacheUnavailableError):
             await svc.autocomplete_tracks("Artist", "per", limit=20)
 
     @pytest.mark.asyncio
+    async def test_query_canceled_maps_to_cache_unavailable(self, mock_asyncpg_pool):
+        """LML#815: bounded by the SET LOCAL statement_timeout — a runaway scan
+        cancels as ``QueryCanceledError`` and degrades to ``CacheUnavailableError``
+        (the discogs/router autocomplete seam returns an empty list, never a 500),
+        preserving the cancel as ``__cause__``."""
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
+            side_effect=asyncpg.QueryCanceledError("canceling statement due to statement timeout")
+        )
+        svc = DiscogsCacheService(mock_asyncpg_pool)
+
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await svc.autocomplete_tracks("Artist", "per", limit=20)
+        assert isinstance(exc_info.value.__cause__, asyncpg.QueryCanceledError)
+
+    @pytest.mark.asyncio
     async def test_returns_sorted_titles(self, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {"title": "Zebra"},
                 {"title": "Alpha"},
@@ -95,7 +110,7 @@ class TestAutocompleteTracksCache:
 
     @pytest.mark.asyncio
     async def test_empty_results(self, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
 
         svc = DiscogsCacheService(mock_asyncpg_pool)
         result = await svc.autocomplete_tracks("Unknown", "xyz", limit=20)

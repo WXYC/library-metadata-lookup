@@ -540,6 +540,61 @@ class DiscogsCacheService:
         except Exception as e:
             logger.warning(f"record_lookup_negative failed (best-effort write): {e}")
 
+    async def _bounded_fetch(
+        self,
+        query: str,
+        *params,
+        op: str,
+        extra_set_local: str | None = None,
+    ) -> list[asyncpg.Record]:
+        """Run a trigram SELECT inside the LML#804 ``SET LOCAL`` bound.
+
+        Acquires a pooled connection, opens a transaction, applies the
+        per-transaction ``statement_timeout`` + ``work_mem`` ceiling
+        (``self._search_bounds_sql``) — plus any ``extra_set_local`` preamble
+        (e.g. ``artist_trigram_candidates``' pg_trgm similarity floor) — then
+        fetches. ``SET LOCAL`` reverts at transaction end, so the write-serving
+        pool session is never touched (api_fetch writes, entity.identity
+        write-backs, bulk-drain write-backs).
+
+        A ``statement_timeout`` trip surfaces as ``asyncpg.QueryCanceledError``,
+        mapped here to ``CacheUnavailableError`` (in the fallthrough seam's
+        ``_ARMING_EXCEPTIONS``) so a runaway trigram scan degrades to cache-only
+        — the LML#755 "couldn't ask" boundary — freeing the pool slot and the
+        /lookup in-flight cap slot instead of 500ing. ``op`` names the calling
+        arm in the log + error for diagnosis; non-timeout failures propagate to
+        the caller, whose own ``except Exception`` wraps them as
+        ``CacheUnavailableError`` with its method-specific message (so each arm
+        must re-raise a ``CacheUnavailableError`` unchanged, not double-wrap it).
+
+        LML#815's single bounding seam: the six trigram arms (``search_releases``,
+        ``search_releases_by_track``, ``search_artists_by_name``,
+        ``search_releases_by_title``, ``search_tracks_by_title``,
+        ``autocomplete_tracks``) plus ``artist_trigram_candidates`` all inherit
+        the ceiling from here instead of hand-copying the acquire / SET LOCAL /
+        degrade prologue.
+
+        Args:
+            query: The SQL to fetch.
+            *params: Positional bind params for ``query``.
+            op: Calling-arm name for the timeout log + error message.
+            extra_set_local: An optional additional ``SET LOCAL`` statement run
+                inside the same transaction after the bounds (e.g. the pg_trgm
+                similarity floor). ``None`` for the plain search arms.
+
+        Raises:
+            CacheUnavailableError: If the ``statement_timeout`` cancels the query.
+        """
+        try:
+            async with self.pool.acquire() as conn, conn.transaction():
+                await conn.execute(self._search_bounds_sql)
+                if extra_set_local is not None:
+                    await conn.execute(extra_set_local)
+                return await conn.fetch(query, *params)
+        except asyncpg.QueryCanceledError as e:
+            logger.warning("%s exceeded statement_timeout (degrading to cache-only): %s", op, e)
+            raise CacheUnavailableError(f"Cache {op} timed out: {e}") from e
+
     async def search_releases_by_track(
         self, track: str, artist: str | None = None, limit: int = 20
     ) -> list[ReleaseInfo]:
@@ -568,12 +623,12 @@ class DiscogsCacheService:
         try:
             sql = _SEARCH_BY_TRACK_SQL if artist is None else _SEARCH_BY_TRACK_ARTIST_SQL
 
-            # LML#804: bound the trigram scan with a per-transaction SET LOCAL
-            # (statement_timeout + work_mem). SET LOCAL reverts at transaction
-            # end, so the write-serving pool session is untouched.
-            async with self.pool.acquire() as conn, conn.transaction():
-                await conn.execute(self._search_bounds_sql)
-                rows = await conn.fetch(sql, track, limit * 2, artist)
+            # LML#804/#815: run the trigram scan inside the shared statement_timeout
+            # + work_mem bound (see ``_bounded_fetch``). A timeout degrades to
+            # CacheUnavailableError there; other failures fall through below.
+            rows = await self._bounded_fetch(
+                sql, track, limit * 2, artist, op="search_releases_by_track"
+            )
 
             results = []
             seen_albums = set()
@@ -601,18 +656,10 @@ class DiscogsCacheService:
 
             return results
 
-        except asyncpg.QueryCanceledError as e:
-            # LML#804: statement_timeout tripped. Degrade to cache-only —
-            # CacheUnavailableError is in the fallthrough seam's
-            # _ARMING_EXCEPTIONS, so "couldn't ask" reads as unknown, never a
-            # confirmed-empty verdict (LML#755). The pool slot and the /lookup
-            # in-flight cap slot are already freed by the acquire/transaction
-            # exit above; do NOT let this escape to the router → 500.
-            logger.warning(
-                "search_releases_by_track exceeded statement_timeout (degrading to cache-only): %s",
-                e,
-            )
-            raise CacheUnavailableError(f"Cache search timed out: {e}") from e
+        except CacheUnavailableError:
+            # Timeout already degraded by ``_bounded_fetch`` — re-raise unchanged
+            # (don't re-wrap into the generic message below).
+            raise
         except Exception as e:
             logger.error(f"Cache search failed: {e}")
             raise CacheUnavailableError(f"Cache search failed: {e}") from e
@@ -661,8 +708,11 @@ class DiscogsCacheService:
                 ORDER BY score DESC
                 LIMIT $2
             """
-            rows = await self.pool.fetch(query, name, limit)
+            # LML#815: the #359 dominant chokepoint — bound it too.
+            rows = await self._bounded_fetch(query, name, limit, op="search_artists_by_name")
             return [{"id": r["id"], "name": r["name"], "score": float(r["score"])} for r in rows]
+        except CacheUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Cache search_artists_by_name failed: {e}")
             raise CacheUnavailableError(f"Cache search_artists_by_name failed: {e}") from e
@@ -767,10 +817,17 @@ class DiscogsCacheService:
         if not names:
             return {}
         try:
-            async with self.pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.execute(_SET_PG_TRGM_FLOOR_SQL)
-                    rows = await conn.fetch(_ARTIST_TRIGRAM_CANDIDATES_SQL, names, threshold)
+            # LML#815: reconcile the partial third case — this arm already ran a
+            # SET LOCAL transaction, but only for the pg_trgm floor. Route it
+            # through ``_bounded_fetch`` so it ALSO inherits the statement_timeout
+            # + work_mem ceiling, passing the floor pin as ``extra_set_local``.
+            rows = await self._bounded_fetch(
+                _ARTIST_TRIGRAM_CANDIDATES_SQL,
+                names,
+                threshold,
+                op="artist_trigram_candidates",
+                extra_set_local=_SET_PG_TRGM_FLOOR_SQL,
+            )
             results: dict[str, set[int]] = {name: set() for name in names}
             for row in rows:
                 # ``unnest($1)`` guarantees every returned input is an input
@@ -778,6 +835,8 @@ class DiscogsCacheService:
                 # below) rather than silently dropping a candidate set.
                 results[row["input"]].update(row["artist_ids"])
             return results
+        except CacheUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Cache artist_trigram_candidates failed: {e}")
             raise CacheUnavailableError(f"Cache artist_trigram_candidates failed: {e}") from e
@@ -814,7 +873,7 @@ class DiscogsCacheService:
                 ORDER BY score DESC
                 LIMIT $2
             """
-            rows = await self.pool.fetch(query, title, limit)
+            rows = await self._bounded_fetch(query, title, limit, op="search_releases_by_title")
             return [
                 {
                     "id": r["id"],
@@ -824,6 +883,8 @@ class DiscogsCacheService:
                 }
                 for r in rows
             ]
+        except CacheUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Cache search_releases_by_title failed: {e}")
             raise CacheUnavailableError(f"Cache search_releases_by_title failed: {e}") from e
@@ -861,7 +922,7 @@ class DiscogsCacheService:
                 ORDER BY score DESC
                 LIMIT $2
             """
-            rows = await self.pool.fetch(query, title, limit)
+            rows = await self._bounded_fetch(query, title, limit, op="search_tracks_by_title")
             return [
                 {
                     "id": r["id"],
@@ -871,6 +932,8 @@ class DiscogsCacheService:
                 }
                 for r in rows
             ]
+        except CacheUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Cache search_tracks_by_title failed: {e}")
             raise CacheUnavailableError(f"Cache search_tracks_by_title failed: {e}") from e
@@ -908,7 +971,9 @@ class DiscogsCacheService:
             """
 
             # Overfetch to allow for dedup
-            rows = await self.pool.fetch(query, artist, q, release, limit * 5)
+            rows = await self._bounded_fetch(
+                query, artist, q, release, limit * 5, op="autocomplete_tracks"
+            )
 
             # Case-insensitive dedup (first occurrence wins), then sort
             seen: set[str] = set()
@@ -923,6 +988,8 @@ class DiscogsCacheService:
             titles.sort(key=str.lower)
             return titles[:limit]
 
+        except CacheUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Cache autocomplete_tracks failed: {e}")
             raise CacheUnavailableError(f"Cache autocomplete_tracks failed: {e}") from e
@@ -1554,12 +1621,10 @@ class DiscogsCacheService:
                 """
                 params = (album, limit * 2)
 
-            # LML#804: bound the trigram scan with a per-transaction SET LOCAL
-            # (statement_timeout + work_mem). SET LOCAL reverts at transaction
-            # end, so the write-serving pool session is untouched.
-            async with self.pool.acquire() as conn, conn.transaction():
-                await conn.execute(self._search_bounds_sql)
-                rows = await conn.fetch(query, *params)
+            # LML#804/#815: run the trigram scan inside the shared statement_timeout
+            # + work_mem bound (see ``_bounded_fetch``). A timeout degrades to
+            # CacheUnavailableError there; other failures fall through below.
+            rows = await self._bounded_fetch(query, *params, op="search_releases")
 
             results = []
             seen_titles = set()
@@ -1584,18 +1649,9 @@ class DiscogsCacheService:
 
             return results
 
-        except asyncpg.QueryCanceledError as e:
-            # LML#804: statement_timeout tripped. Degrade to cache-only —
-            # CacheUnavailableError is in the fallthrough seam's
-            # _ARMING_EXCEPTIONS, so "couldn't ask" reads as unknown, never a
-            # confirmed-empty verdict (LML#755). The pool slot and the /lookup
-            # in-flight cap slot are already freed by the acquire/transaction
-            # exit above; do NOT let this escape to the router → 500.
-            logger.warning(
-                "search_releases exceeded statement_timeout (degrading to cache-only): %s",
-                e,
-            )
-            raise CacheUnavailableError(f"Cache search_releases timed out: {e}") from e
+        except CacheUnavailableError:
+            # Timeout already degraded by ``_bounded_fetch`` — re-raise unchanged.
+            raise
         except Exception as e:
             logger.error(f"Cache search_releases failed: {e}")
             raise CacheUnavailableError(f"Cache search_releases failed: {e}") from e
