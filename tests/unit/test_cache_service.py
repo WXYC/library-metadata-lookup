@@ -5,6 +5,7 @@ from dataclasses import fields
 from datetime import UTC
 from unittest.mock import AsyncMock
 
+import asyncpg
 import pytest
 
 from discogs.cache_service import (
@@ -75,9 +76,13 @@ class TestIsAvailable:
 
 
 class TestSearchReleasesByTrack:
+    # LML#804: the trigram query now runs on an acquired connection inside a
+    # transaction (SET LOCAL statement_timeout + work_mem), so assertions
+    # target ``mock_asyncpg_pool._mock_conn.fetch`` — same convention as
+    # ``TestArtistTrigramCandidates`` / ``TestWriteRelease``.
     @pytest.mark.asyncio
     async def test_returns_results(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {
                     "release_id": 1,
@@ -95,7 +100,7 @@ class TestSearchReleasesByTrack:
 
     @pytest.mark.asyncio
     async def test_deduplicates(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {
                     "release_id": 1,
@@ -129,7 +134,7 @@ class TestSearchReleasesByTrack:
             }
             for i in range(10)
         ]
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=rows)
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=rows)
 
         results = await cache_service.search_releases_by_track("S", limit=3)
         assert len(results) == 3
@@ -137,7 +142,7 @@ class TestSearchReleasesByTrack:
     @pytest.mark.asyncio
     async def test_returns_va_compilation_via_track_artist(self, cache_service, mock_asyncpg_pool):
         """VA compilation is returned when the track-level artist matches."""
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {
                     "release_id": 99,
@@ -157,11 +162,11 @@ class TestSearchReleasesByTrack:
     @pytest.mark.asyncio
     async def test_query_includes_track_artist_join(self, cache_service, mock_asyncpg_pool):
         """SQL query joins release_track_artist for track-level artist matching."""
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
 
         await cache_service.search_releases_by_track("Song", "Artist")
 
-        sql = mock_asyncpg_pool.fetch.call_args[0][0]
+        sql = mock_asyncpg_pool._mock_conn.fetch.call_args[0][0]
         assert "release_track_artist" in sql
         assert "rta.artist_name" in sql
 
@@ -183,11 +188,11 @@ class TestSearchReleasesByTrack:
         were deleted, which is the failure the prefilter exists to prevent
         (LML#802 review).
         """
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
 
         await cache_service.search_releases_by_track("Song", "Artist")
 
-        sql = mock_asyncpg_pool.fetch.call_args[0][0]
+        sql = mock_asyncpg_pool._mock_conn.fetch.call_args[0][0]
         cte = sql[: sql.index("LIMIT $2")]
         rta_leg = "EXISTS (SELECT 1 FROM release_track_artist rta"
         assert rta_leg in cte, f"Expected the rta EXISTS leg inside the CTE; got: {cte!r}"
@@ -199,7 +204,7 @@ class TestSearchReleasesByTrack:
     @pytest.mark.asyncio
     async def test_deduplicates_multiple_track_artists(self, cache_service, mock_asyncpg_pool):
         """Multiple rows from LEFT JOIN (different track artists) are deduplicated."""
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {
                     "release_id": 99,
@@ -223,7 +228,7 @@ class TestSearchReleasesByTrack:
 
     @pytest.mark.asyncio
     async def test_error_raises_cache_unavailable(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(side_effect=Exception("db error"))
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(side_effect=Exception("db error"))
 
         with pytest.raises(CacheUnavailableError):
             await cache_service.search_releases_by_track("S")
@@ -236,11 +241,11 @@ class TestSearchReleasesByTrack:
         pg_stat_statements entry must stay frozen, so the None branch must
         dispatch to the unchanged string, never the artist variant.
         """
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
 
         await cache_service.search_releases_by_track("Song", None)
 
-        sql = mock_asyncpg_pool.fetch.call_args[0][0]
+        sql = mock_asyncpg_pool._mock_conn.fetch.call_args[0][0]
         assert sql is _SEARCH_BY_TRACK_SQL
 
     def test_hot_path_sql_matches_snapshot(self):
@@ -284,11 +289,11 @@ class TestSearchReleasesByTrack:
         `LIMIT $2` truncates -- otherwise the LIMIT can prune the artist's own
         release out again.
         """
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
 
         await cache_service.search_releases_by_track("Song", "Artist")
 
-        sql = mock_asyncpg_pool.fetch.call_args[0][0]
+        sql = mock_asyncpg_pool._mock_conn.fetch.call_args[0][0]
         assert sql is _SEARCH_BY_TRACK_ARTIST_SQL
         limit_at = sql.index("LIMIT $2")
         cte_predicate = "EXISTS (SELECT 1 FROM release_artist ra"
@@ -323,6 +328,52 @@ class TestSearchReleasesByTrack:
             "the artist variant's outer block drifted from the hot path; mirror "
             "any edit across both SQL strings"
         )
+
+    @pytest.mark.asyncio
+    async def test_pins_search_bounds_before_fetch(self, mock_asyncpg_pool):
+        """LML#804: the trigram query runs inside a transaction that first
+        SET LOCALs statement_timeout + work_mem, BEFORE the fetch. Ordering is
+        the contract (SET LOCAL outside a transaction is a no-op WARNING on
+        real PostgreSQL), so the event sequence is recorded explicitly — the
+        same shape as ``TestArtistTrigramCandidates``' floor-pin test."""
+        svc = DiscogsCacheService(
+            mock_asyncpg_pool, search_statement_timeout_ms=9000, search_work_mem="128MB"
+        )
+        conn = mock_asyncpg_pool._mock_conn
+        events: list[str] = []
+        tx_ctx = conn._mock_tx_ctx
+        tx_ctx.__aenter__ = AsyncMock(side_effect=lambda: events.append("tx_enter") or tx_ctx)
+        tx_ctx.__aexit__ = AsyncMock(side_effect=lambda *a: events.append("tx_exit") or False)
+        set_local_sql: list[str] = []
+
+        async def record_execute(sql, *args):
+            set_local_sql.append(sql)
+            events.append("execute")
+
+        async def record_fetch(*args):
+            events.append("fetch")
+            return []
+
+        conn.execute = AsyncMock(side_effect=record_execute)
+        conn.fetch = AsyncMock(side_effect=record_fetch)
+
+        await svc.search_releases_by_track("Song", "Artist")
+
+        assert events == ["tx_enter", "execute", "fetch", "tx_exit"]
+        assert "SET LOCAL statement_timeout = 9000" in set_local_sql[0]
+        assert "SET LOCAL work_mem = '128MB'" in set_local_sql[0]
+
+    @pytest.mark.asyncio
+    async def test_query_canceled_maps_to_cache_unavailable(self, cache_service, mock_asyncpg_pool):
+        """LML#804: a statement_timeout (asyncpg.QueryCanceledError) degrades to
+        CacheUnavailableError — the fallthrough seam's cache-only boundary —
+        never a 500. The QueryCanceledError is preserved as ``__cause__``."""
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
+            side_effect=asyncpg.QueryCanceledError("canceling statement due to statement timeout")
+        )
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await cache_service.search_releases_by_track("Song", "Artist")
+        assert isinstance(exc_info.value.__cause__, asyncpg.QueryCanceledError)
 
 
 # ---------------------------------------------------------------------------
@@ -1291,6 +1342,9 @@ class TestGetReleaseEnriched:
 
 
 class TestSearchReleases:
+    # LML#804: the trigram query now runs on an acquired connection inside a
+    # transaction (SET LOCAL statement_timeout + work_mem), so assertions
+    # target ``mock_asyncpg_pool._mock_conn.fetch``.
     @pytest.mark.asyncio
     async def test_no_params_returns_empty(self, cache_service):
         result = await cache_service.search_releases()
@@ -1298,7 +1352,7 @@ class TestSearchReleases:
 
     @pytest.mark.asyncio
     async def test_artist_and_album(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {
                     "release_id": 1,
@@ -1317,7 +1371,7 @@ class TestSearchReleases:
     @pytest.mark.asyncio
     async def test_aggregated_credit_passes_through(self, cache_service, mock_asyncpg_pool):
         """LML#784: the row carries the joined credit plus the per-credit list."""
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {
                     "release_id": 36830641,
@@ -1337,7 +1391,7 @@ class TestSearchReleases:
 
     @pytest.mark.asyncio
     async def test_artist_only(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {
                     "release_id": 1,
@@ -1354,7 +1408,7 @@ class TestSearchReleases:
 
     @pytest.mark.asyncio
     async def test_album_only(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {
                     "release_id": 1,
@@ -1371,7 +1425,7 @@ class TestSearchReleases:
 
     @pytest.mark.asyncio
     async def test_deduplicates(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
             return_value=[
                 {
                     "release_id": 1,
@@ -1397,10 +1451,10 @@ class TestSearchReleases:
     @pytest.mark.asyncio
     async def test_artist_and_album_query_uses_and_logic(self, cache_service, mock_asyncpg_pool):
         """When both artist and album are provided, the SQL must require BOTH to match (AND)."""
-        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(return_value=[])
         await cache_service.search_releases(artist="High Rise", album="Disallow")
 
-        query_sql = mock_asyncpg_pool.fetch.call_args[0][0]
+        query_sql = mock_asyncpg_pool._mock_conn.fetch.call_args[0][0]
         # Normalize whitespace for reliable matching
         normalized = " ".join(query_sql.split())
         assert "AND lower(f_unaccent(ra.artist_name))" in normalized, (
@@ -1412,9 +1466,96 @@ class TestSearchReleases:
 
     @pytest.mark.asyncio
     async def test_error_raises(self, cache_service, mock_asyncpg_pool):
-        mock_asyncpg_pool.fetch = AsyncMock(side_effect=Exception("db error"))
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(side_effect=Exception("db error"))
         with pytest.raises(CacheUnavailableError):
             await cache_service.search_releases(artist="A")
+
+    @pytest.mark.asyncio
+    async def test_pins_search_bounds_before_fetch(self, mock_asyncpg_pool):
+        """LML#804: the trigram query runs inside a transaction that first
+        SET LOCALs statement_timeout + work_mem, BEFORE the fetch. The event
+        sequence is recorded explicitly (SET LOCAL outside a transaction is a
+        no-op WARNING on real PostgreSQL, so ordering is the contract)."""
+        svc = DiscogsCacheService(
+            mock_asyncpg_pool, search_statement_timeout_ms=9000, search_work_mem="128MB"
+        )
+        conn = mock_asyncpg_pool._mock_conn
+        events: list[str] = []
+        tx_ctx = conn._mock_tx_ctx
+        tx_ctx.__aenter__ = AsyncMock(side_effect=lambda: events.append("tx_enter") or tx_ctx)
+        tx_ctx.__aexit__ = AsyncMock(side_effect=lambda *a: events.append("tx_exit") or False)
+        set_local_sql: list[str] = []
+
+        async def record_execute(sql, *args):
+            set_local_sql.append(sql)
+            events.append("execute")
+
+        async def record_fetch(*args):
+            events.append("fetch")
+            return []
+
+        conn.execute = AsyncMock(side_effect=record_execute)
+        conn.fetch = AsyncMock(side_effect=record_fetch)
+
+        await svc.search_releases(artist="Stereolab")
+
+        assert events == ["tx_enter", "execute", "fetch", "tx_exit"]
+        assert "SET LOCAL statement_timeout = 9000" in set_local_sql[0]
+        assert "SET LOCAL work_mem = '128MB'" in set_local_sql[0]
+
+    @pytest.mark.asyncio
+    async def test_query_canceled_maps_to_cache_unavailable(self, cache_service, mock_asyncpg_pool):
+        """LML#804: a statement_timeout (asyncpg.QueryCanceledError) degrades to
+        CacheUnavailableError — the fallthrough seam's cache-only boundary —
+        never a 500. The QueryCanceledError is preserved as ``__cause__``."""
+        mock_asyncpg_pool._mock_conn.fetch = AsyncMock(
+            side_effect=asyncpg.QueryCanceledError("canceling statement due to statement timeout")
+        )
+        with pytest.raises(CacheUnavailableError) as exc_info:
+            await cache_service.search_releases(artist="Stereolab")
+        assert isinstance(exc_info.value.__cause__, asyncpg.QueryCanceledError)
+
+
+class TestSearchArmBoundsBuilder:
+    """LML#804: the settings-wired SET LOCAL preamble builder."""
+
+    def test_default_bounds_from_settings(self):
+        """A service built with no override wires the documented defaults
+        (statement_timeout 10s, work_mem 128MB) from Settings."""
+        from unittest.mock import MagicMock
+
+        svc = DiscogsCacheService(MagicMock())
+        assert "SET LOCAL statement_timeout = 10000" in svc._search_bounds_sql
+        assert "SET LOCAL work_mem = '128MB'" in svc._search_bounds_sql
+
+    def test_settings_expose_documented_defaults(self):
+        from config.settings import Settings
+
+        s = Settings()
+        assert s.discogs_search_statement_timeout_ms == 10000
+        assert s.discogs_search_work_mem == "128MB"
+
+    def test_rejects_non_positive_timeout(self):
+        from discogs.cache_service import _build_search_bounds_sql
+
+        with pytest.raises(ValueError, match=">= 1"):
+            _build_search_bounds_sql(0, "128MB")
+
+    def test_rejects_injecting_work_mem(self):
+        """work_mem is interpolated (SET LOCAL takes no bind params), so a value
+        that isn't a bare Postgres memory literal is rejected up front."""
+        from discogs.cache_service import _build_search_bounds_sql
+
+        for bad in ("128 MB", "128MB'; DROP TABLE release; --", "lots", ""):
+            with pytest.raises(ValueError, match="Postgres memory value"):
+                _build_search_bounds_sql(10000, bad)
+
+    def test_accepts_valid_work_mem_units(self):
+        from discogs.cache_service import _build_search_bounds_sql
+
+        for good in ("64MB", "128MB", "1GB", "262144kB", "4096"):
+            sql = _build_search_bounds_sql(10000, good)
+            assert f"work_mem = '{good}'" in sql
 
 
 # ---------------------------------------------------------------------------
