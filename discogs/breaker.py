@@ -241,6 +241,16 @@ class DiscogsCircuitBreaker:
                 self._epoch += 1
                 self._state = BreakerState.HALF_OPEN
                 self._half_open_at = self._now()
+                # LML#805: log the recovery-probe transition once (INFO — this
+                # is a routine "try one live probe" attempt, not a failure). It
+                # fires at most once per cool-down, so a sustained episode still
+                # logs a bounded handful of these; the shed volume stays on the
+                # ``lml.cache.discogs_breaker_open_shed`` counter, not the log.
+                logger.info(
+                    "Discogs saturation breaker OPEN->HALF_OPEN, admitting one trial "
+                    "request (epoch=%d)",
+                    self._epoch,
+                )
                 return self._epoch
             return None
 
@@ -308,7 +318,10 @@ class DiscogsCircuitBreaker:
 
         if self._state is BreakerState.HALF_OPEN and epoch == self._epoch:
             self._state = BreakerState.CLOSED
-            logger.warning("Discogs saturation breaker CLOSED (half-open trial recovered)")
+            logger.warning(
+                "Discogs saturation breaker HALF_OPEN->CLOSED (trial recovered, epoch=%d)",
+                self._epoch,
+            )
 
     def record_failure(self, remaining: int | None = None, *, epoch: int | None = None) -> None:
         """Record a 429 (rate-limited) Discogs *request* (one per call).
@@ -378,15 +391,28 @@ class DiscogsCircuitBreaker:
         )
 
     def _open(self) -> None:
-        # Log once on the transition INTO open (FIX 7) — not per shed, which
-        # would flood the log through an 8h flood. A breaker already OPEN that
-        # re-opens (e.g. a failed half-open trial) logs again because the state
-        # meaningfully changed (HALF_OPEN → OPEN); a no-op re-entry from OPEN is
-        # impossible (OPEN never calls ``_open``).
+        # Log once on the transition INTO open (FIX 7 / LML#805) — not per shed,
+        # which would flood the log through an 8h flood (per-shed logging is
+        # DEBUG in ``DiscogsService._record_breaker_shed``). A breaker already
+        # OPEN that re-opens (e.g. a failed half-open trial) logs again because
+        # the state meaningfully changed (HALF_OPEN → OPEN); a no-op re-entry
+        # from OPEN is impossible (OPEN never calls ``_open``). The trip context
+        # — the prior state, the consecutive-failure run that tripped it, and
+        # the new epoch — is what an operator alerts on (LML#805), so it rides
+        # the transition line rather than being reconstructed from per-shed noise.
         was_open = self._state is BreakerState.OPEN
+        prior_state = self._state
+        consecutive_failures = self._consecutive_failures
         self._state = BreakerState.OPEN
         self._opened_at = self._now()
         self._consecutive_failures = 0
         self._epoch += 1
         if not was_open:
-            logger.warning("Discogs saturation breaker OPEN, shedding live Discogs requests")
+            logger.warning(
+                "Discogs saturation breaker %s->OPEN, shedding live Discogs requests "
+                "(consecutive_failures=%d, epoch=%d, cooldown=%.0fs)",
+                prior_state.value,
+                consecutive_failures,
+                self._epoch,
+                self._cooldown_seconds,
+            )

@@ -745,14 +745,27 @@ class DiscogsService:
                     cached=False,
                 )
 
+            except DiscogsBreakerOpenError:
+                # LML#805: a saturation-breaker shed is expected degrade
+                # ("couldn't ask, try later"), NOT a search failure — log it at
+                # DEBUG so a sustained OPEN episode doesn't flood Sentry with a
+                # per-request error event (the #755 flood: 32.5K events in 4
+                # days). The OPEN/CLOSED transitions are logged once each by the
+                # breaker, and ``lml.cache.discogs_breaker_open_shed`` carries the
+                # volume. Return ``None`` (same as the generic path) so the seam
+                # still skips both the write-back and negative-record paths.
+                logger.debug(
+                    "Discogs saturation breaker shed search_releases_by_track; "
+                    "returning None (cache-only)"
+                )
+                return None
             except Exception as e:
                 logger.error(f"Discogs search failed: {e}")
                 # An exception-path empty is NOT a "we asked, nothing" verdict
-                # — it's "we couldn't ask, try later" (a breaker shed raises
-                # ``DiscogsBreakerOpenError`` here; 5xx via ``raise_for_status``
-                # lands here too). Return ``None`` so the seam skips both the
-                # write-back and negative-record paths. The caller wraps
-                # ``None`` into an empty ``TrackReleasesResponse``.
+                # — it's "we couldn't ask, try later" (5xx via
+                # ``raise_for_status`` lands here). Return ``None`` so the seam
+                # skips both the write-back and negative-record paths. The caller
+                # wraps ``None`` into an empty ``TrackReleasesResponse``.
                 return None
 
         cache = self.cache_service
@@ -1336,6 +1349,17 @@ class DiscogsService:
                     cached=False,
                 )
 
+            except DiscogsBreakerOpenError:
+                # LML#805: a saturation-breaker shed is expected degrade, not an
+                # artist-fetch failure — DEBUG, not ERROR, so a sustained OPEN
+                # episode doesn't flood Sentry (#755). Return ``None`` (same as
+                # the generic path). The LML#510 ERROR path below is reserved for
+                # genuine fetch failures / artist 404s, which stay alertable.
+                logger.debug(
+                    "Discogs saturation breaker shed get_artist_details for %s; returning None",
+                    artist_id,
+                )
+                return None
             except Exception as e:
                 # LML#510: promoted from warning → error so Sentry's default
                 # `error+` filter captures artist 404s post-deploy. The
@@ -1601,6 +1625,15 @@ class DiscogsService:
                     cached=False,
                 )
 
+            except DiscogsBreakerOpenError:
+                # LML#805: a saturation-breaker shed is expected degrade, not a
+                # search failure — DEBUG, not ERROR, so a sustained OPEN episode
+                # doesn't flood Sentry with per-request error events (#755). The
+                # breaker logs the OPEN/CLOSED transitions; the shed counter
+                # carries the volume. Return the same empty response as the
+                # generic path (this seam is read-only, no negative cache write).
+                logger.debug("Discogs saturation breaker shed search; returning empty (cache-only)")
+                return DiscogsSearchResponse(cached=False)
             except Exception as e:
                 logger.error(f"Discogs search failed: {e}")
                 return DiscogsSearchResponse(cached=False)

@@ -1,5 +1,6 @@
 """Integration tests for the lookup pipeline with real LibraryDB."""
 
+import logging
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -1097,3 +1098,48 @@ class TestBreakerShedDegradesTo200:
         data = resp.json()
         # The item did not error out — it degraded to a (cache-only) lookup.
         assert data["results"][0]["status"] != "error"
+
+    @pytest.mark.asyncio
+    async def test_shed_lookup_emits_no_error_level_logs(self, open_breaker_client, caplog):
+        """LML#805: a ``/lookup`` shed by the OPEN breaker must NOT emit any
+        ERROR-level log record — the shed is expected degrade, not a failure.
+
+        Before #805 the two ``logger.error("Discogs search failed: ...")``
+        catch-alls in ``discogs/service.py`` swallowed the propagated
+        ``DiscogsBreakerOpenError`` at ERROR, so a sustained OPEN episode turned
+        one state into tens of thousands of Sentry error events (the SDK
+        LoggingIntegration promotes ERROR logs to events). The shed must instead
+        surface at DEBUG (``lml.cache.discogs_breaker_open_shed`` counter carries
+        the volume). This test is non-vacuous: it asserts the shed path actually
+        fired (a DEBUG shed record is present) AND that no ERROR record was
+        emitted.
+        """
+        # The Discogs in-memory caches are module-global and NOT reset between
+        # integration tests, so a sibling test's identical lookup could serve
+        # this one from cache and never reach the breaker shed. Clear them so
+        # the live-probe path is actually exercised.
+        from discogs.memory_cache import clear_all_caches
+
+        clear_all_caches()
+        client = await open_breaker_client()
+        with caplog.at_level(logging.DEBUG, logger="discogs.service"):
+            async with client:
+                resp = await client.post(
+                    "/api/v1/lookup",
+                    json={
+                        "artist": "Stereolab",
+                        "song": "Fuses",
+                        "raw_message": "Stereolab - Fuses",
+                    },
+                )
+        assert resp.status_code == 200
+
+        # Non-vacuous: the OPEN breaker actually shed at least one live probe.
+        shed_debug = [r for r in caplog.records if "breaker shed live request" in r.getMessage()]
+        assert shed_debug, "expected the breaker to shed a live probe (DEBUG)"
+
+        # The point of #805: no ERROR-level record from the shed swallow sites.
+        error_records = [
+            (r.name, r.getMessage()) for r in caplog.records if r.levelno >= logging.ERROR
+        ]
+        assert error_records == [], f"breaker shed must not log at ERROR: {error_records}"
