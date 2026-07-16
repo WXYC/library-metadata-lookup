@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from discogs.cache_service import (
+    _SEARCH_BY_TRACK_ARTIST_SQL,
+    _SEARCH_BY_TRACK_SQL,
     ArtistEqualityCandidates,
     CacheUnavailableError,
     DiscogsCacheService,
@@ -214,6 +216,76 @@ class TestSearchReleasesByTrack:
 
         with pytest.raises(CacheUnavailableError):
             await cache_service.search_releases_by_track("S")
+
+    @pytest.mark.asyncio
+    async def test_none_artist_uses_frozen_hot_path_sql(self, cache_service, mock_asyncpg_pool):
+        """The artist=None branch runs `_SEARCH_BY_TRACK_SQL` verbatim.
+
+        This is the VA / SONG_AS_TRACK hot path (#706): its plan and
+        pg_stat_statements entry must stay frozen, so the None branch must
+        dispatch to the unchanged string, never the artist variant.
+        """
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+
+        await cache_service.search_releases_by_track("Song", None)
+
+        sql = mock_asyncpg_pool.fetch.call_args[0][0]
+        assert sql is _SEARCH_BY_TRACK_SQL
+
+    def test_hot_path_sql_matches_snapshot(self):
+        """Change-detector for the frozen artist=None SQL (LML#802 AC#2).
+
+        Whitespace-normalized, not byte-for-byte: hoisting the string to a
+        module constant de-indents it and pg_stat_statements normalizes
+        whitespace away regardless. What must not drift is the *structure* --
+        any semantic edit to the hot-path query trips this and forces a
+        deliberate re-freeze (and a fresh EXPLAIN).
+        """
+        snapshot = (
+            "WITH matching_tracks AS ( SELECT DISTINCT rt.release_id, rt.sequence, "
+            "rt.title as track_title, "
+            "similarity(lower(f_unaccent(rt.title)), lower(f_unaccent($1))) as sim "
+            "FROM release_track rt WHERE lower(f_unaccent(rt.title)) % lower(f_unaccent($1)) "
+            "ORDER BY sim DESC LIMIT $2 ) "
+            "SELECT r.id as release_id, r.title, ra.artist_name, mt.track_title, "
+            "CASE WHEN lower(ra.artist_name) LIKE '%various%' THEN true ELSE false END "
+            "as is_compilation FROM matching_tracks mt JOIN release r ON r.id = mt.release_id "
+            "JOIN release_artist ra ON ra.release_id = r.id AND ra.extra = 0 "
+            "LEFT JOIN release_track_artist rta ON rta.release_id = mt.release_id "
+            "AND rta.track_sequence = mt.sequence AND rta.extra = 0 "
+            "WHERE ( $3::text IS NULL "
+            "OR lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3)) "
+            "OR lower(f_unaccent(rta.artist_name)) % lower(f_unaccent($3)) ) "
+            "ORDER BY mt.sim DESC"
+        )
+        assert " ".join(_SEARCH_BY_TRACK_SQL.split()) == snapshot
+
+    @pytest.mark.asyncio
+    async def test_artist_predicate_pushed_into_cte_before_limit(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """Bug-fix-protocol structural analog (LML#802 AC#1).
+
+        The prune is a SQL-execution artifact -- it can't be reproduced against
+        a mock pool (no SQL runs; behavioural repro lives in the `pg` suite).
+        This pins the *mechanism*: with an artist supplied, the emitted SQL must
+        evaluate an artist EXISTS predicate on `$3` INSIDE the CTE, before the
+        `LIMIT $2` truncates -- otherwise the LIMIT can prune the artist's own
+        release out again.
+        """
+        mock_asyncpg_pool.fetch = AsyncMock(return_value=[])
+
+        await cache_service.search_releases_by_track("Song", "Artist")
+
+        sql = mock_asyncpg_pool.fetch.call_args[0][0]
+        assert sql is _SEARCH_BY_TRACK_ARTIST_SQL
+        limit_at = sql.index("LIMIT $2")
+        cte_predicate = "EXISTS (SELECT 1 FROM release_artist ra"
+        assert cte_predicate in sql
+        assert sql.index(cte_predicate) < limit_at, (
+            "artist EXISTS leg must appear inside the CTE, before LIMIT $2"
+        )
+        assert "lower(f_unaccent(ra.artist_name)) % lower(f_unaccent($3))" in sql[:limit_at]
 
 
 # ---------------------------------------------------------------------------
