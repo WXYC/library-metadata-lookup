@@ -1,4 +1,4 @@
-"""Reproduce-or-refute for LML#817 (finding C2 from the #807 max-effort review).
+"""Reproduce-or-refute for LML#817 (finding C2, #807 review) and its LML#825 follow-up.
 
 #817 posits that the TRACK_ON_COMPILATION Wave-B V/A-compilation probe
 (``DiscogsService.search_releases_by_track(..., artist_as_keyword=True)``) runs
@@ -33,6 +33,35 @@ through the cache CTE (which would re-open the #817 mechanism) fails loudly:
   keyword search returning the comp, Wave B surfaces it despite an extra=1 cached
   credit, and the API was queried with ``q=<artist>`` + ``format=Compilation``.
 
+LML#825 (follow-up, same mechanism): #817/#818 both noted a residual — in a
+*cache-only degrade* (LML#755 saturation breaker OPEN, every live Discogs call
+shed) Wave B's API arm returns empty, so a PG-cached extra=1 V/A comp is
+unreachable through Wave B. The proposed fix was to give Wave B a degrade-time PG
+read scoped to extra=1 V/A comps.
+
+VERDICT: **REFUTED — the fix would recover nothing.** ``TestWaveBDegradeGapRefuted``
+pins the two independent facts that rule it out:
+
+1. Even if Wave B surfaced the PG-cached extra=1 comp during a degrade, it dies at
+   the *validation* choke. ``DiscogsCacheService.validate_track_on_release`` reads
+   ``release_track_artist WHERE extra = 0`` (the same #333 guard as the search
+   CTE), so an extra=1-only credit is a definitive ``False`` — and ``False`` is a
+   fallthrough *hit* (``_default_is_pg_hit(False)`` is ``True``), so
+   ``DiscogsService.validate_track_on_release`` returns ``False`` **without ever
+   reaching the (shed) API**. So a PG-cached extra=1 comp is dropped at validation
+   whether the breaker is open or closed; the degrade adds no new loss for it. The
+   only change that would let it through relaxes the extra=0 validation guard —
+   exactly the #333/#719 precision trade-off #825 forbids relaxing (a writer /
+   producer / featured credit is not a performance).
+2. The extra=1 comps that *do* surface in normal operation are precisely those
+   NOT in the PG cache: their validation misses the cache (``None`` → not cached)
+   and falls to the API ``get_release``, which reads the real tracklist regardless
+   of ``extra``. A degrade-time PG *read* cannot recover a comp that is not in PG.
+
+So the current degrade behavior — drop the extra=1 comp — is the correct
+conservative outcome, and a degrade-time PG read would only add L2 load in the
+exact flood window (LML#706 discogs-cache buffer-thrash) for zero recovery.
+
 Run with:
     pytest -m pg -v tests/integration/test_va_comp_wave_b_extra_credit.py
 """
@@ -44,6 +73,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import clear_all_caches
 from discogs.service import DiscogsService
@@ -217,6 +247,23 @@ def _make_service(cache: DiscogsCacheService, *, api_results: list[dict]) -> tup
     return service, calls
 
 
+def _shed_service(cache: DiscogsCacheService) -> DiscogsService:
+    """A DiscogsService over the real cache whose every live Discogs call is shed.
+
+    ``_request_with_retry`` raises :class:`DiscogsBreakerOpenError` — exactly what
+    the LML#755 saturation breaker does when OPEN — so this faithfully simulates a
+    cache-only degrade without driving real per-loop breaker state (the same
+    stub-to-raise technique the row-less shed test uses). The ``AsyncMock`` also
+    lets a test assert the API was never consulted (``assert_not_awaited``)."""
+    service = DiscogsService(token="test-token", cache_service=cache)
+
+    async def _shed(method, path, params=None, max_retries=None):
+        raise DiscogsBreakerOpenError("shed")
+
+    service._request_with_retry = AsyncMock(side_effect=_shed)  # type: ignore[method-assign]
+    return service
+
+
 class TestCacheCteExtraGuard:
     """The ``rta.extra = 0`` prune is real at the cache layer -- but only on the
     artist-scoped read the Wave-A probe uses. This is the #333 precision guard."""
@@ -306,3 +353,91 @@ class TestWaveBApiArmRescue:
         # Proof it came from the API keyword arm, not the cache CTE.
         assert calls[0].get("q") == PERFORMER
         assert calls[0].get("format") == "Compilation"
+
+
+class TestWaveBDegradeGapRefuted:
+    """LML#825: during a cache-only degrade (LML#755 breaker OPEN, every live
+    Discogs call shed) Wave B's API arm is empty, so a PG-cached extra=1 V/A comp
+    is unreachable through Wave B. The proposed degrade-time Wave-B PG read is
+    REFUTED here: the comp dies at validation regardless, and the surface-able
+    extra=1 population is not in PG. See the module docstring for the full argument."""
+
+    @pytest.mark.asyncio
+    async def test_wave_b_empty_during_degrade(self, cache):
+        """Ticket premise, reproduced: breaker OPEN -> Wave B
+        (``artist_as_keyword=True``) returns empty even with the extra=1 V/A comp
+        sitting in the PG cache (the API arm is shed; Wave B never reads PG)."""
+        async with cache.pool.acquire() as conn:
+            await _seed_distractors(conn)
+            await _seed_va_comp(conn, release_id=5001, performer_extra=1)
+
+        service = _shed_service(cache)
+
+        response = await service.search_releases_by_track(
+            COMMON_TITLE, PERFORMER, artist_as_keyword=True
+        )
+
+        assert response.releases == []
+        # It really did try (and shed) the live API — the empty is a degrade, not
+        # a PG read: Wave B has ``pg_read_hook=None``.
+        service._request_with_retry.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_extra_one_comp_fails_validation_from_pg_without_touching_api(self, cache):
+        """The choke that refutes the fix. Even if a degrade-time Wave-B PG read
+        surfaced the PG-cached extra=1 comp, ``validate_release_for_track`` drops
+        it: ``DiscogsCacheService.validate_track_on_release`` reads
+        ``release_track_artist WHERE extra = 0`` (the #333 guard), so the extra=1
+        credit yields a definitive ``False`` — and ``False`` is a fallthrough hit
+        (``_default_is_pg_hit(False)`` is ``True``), so
+        ``DiscogsService.validate_track_on_release`` returns ``False`` WITHOUT ever
+        reaching the (shed) API. Dropped identically whether the breaker is open or
+        closed. The teeth: relaxing the extra=0 validation guard to close #825
+        (the only change that makes the fix recover anything) flips this to
+        ``True`` and fails here — reintroducing the #333/#719 imprecision."""
+        async with cache.pool.acquire() as conn:
+            await _seed_distractors(conn)
+            await _seed_va_comp(conn, release_id=5002, performer_extra=1)
+
+        service = _shed_service(cache)
+
+        verdict = await service.validate_track_on_release(5002, FUZZY_TITLE, PERFORMER)
+
+        assert verdict is False
+        # It answered from PG and never consulted the shed API — else get_release
+        # would have raised DiscogsBreakerOpenError through this call.
+        service._request_with_retry.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_extra_zero_comp_validates_from_pg_during_degrade(self, cache):
+        """Discriminator + coverage of the extra=0 population Wave A already
+        surfaces during a degrade: the same comp with an extra=0 track credit
+        validates ``True`` from the PG cache under the identical shed, no API. So
+        the ``extra`` axis is the discriminator (not a blanket degrade miss), and
+        the extra=0 path — the one the ticket notes Wave A's ``rta`` leg already
+        covers — validates fine cache-only."""
+        async with cache.pool.acquire() as conn:
+            await _seed_distractors(conn)
+            await _seed_va_comp(conn, release_id=5003, performer_extra=0)
+
+        service = _shed_service(cache)
+
+        verdict = await service.validate_track_on_release(5003, FUZZY_TITLE, PERFORMER)
+
+        assert verdict is True
+        service._request_with_retry.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_surface_able_extra_one_comp_routes_validation_to_the_api(self, cache):
+        """Why a degrade-time PG *read* cannot recover the surface-able population.
+        An extra=1 comp that is NOT in the PG cache reads as ``None`` from
+        ``validate_track_on_release`` (not cached) — a fallthrough miss that routes
+        to the API ``get_release``, which reads the real tracklist regardless of
+        ``extra``. That API route is exactly what the breaker sheds during a
+        degrade; a PG read cannot substitute for a comp that is not in PG. So the
+        only extra=1 comps that ever surface are the non-PG ones a PG read can't
+        reach."""
+        # No comp seeded for id 5999: an uncached release.
+        cache_verdict = await cache.validate_track_on_release(5999, FUZZY_TITLE, PERFORMER)
+
+        assert cache_verdict is None
