@@ -29,7 +29,8 @@ two-channel decision). ``is_track`` discriminates the two channels: ``True`` for
 a ``(artist, track)`` resolution, ``False`` for ``(artist, album)``.
 
 Staleness is a SQL-side filter (mirroring ``discogs/cache_service.py`` and the
-streaming cache), but with a **dual TTL** that diverges from the streaming
+streaming cache), but with a **tiered TTL** — a positive TTL, a known-miss TTL,
+and (LML#824) a short crowd-out-miss TTL — that diverges from the streaming
 template's eternal-hit policy:
 
 * ``release_id IS NOT NULL`` AND ``resolved_at > now() - positive_ttl`` —
@@ -190,12 +191,14 @@ class ReleaseResolution:
     * ``was_present=True`` and ``release_id`` is an ``int`` — a fresh resolution
       inside ``positive_ttl``. Short-circuit with this ``release_id``.
     * ``was_present=True`` and ``release_id is None`` — a fresh **known miss**
-      inside ``miss_ttl``. Short-circuit: the live probe already came up empty
-      recently, so skip it.
+      inside its TTL (``miss_ttl`` for an exhausted miss, or the shorter
+      ``crowd_out_miss_ttl`` for a LML#824 crowd-out miss). Short-circuit: the
+      live probe already came up empty recently, so skip it.
     * ``was_present=False`` (``release_id`` always ``None``) — no fresh row: the
       entry is absent, the positive hit aged past ``positive_ttl``, or the miss
-      aged past ``miss_ttl``. Run the live probe. The SQL WHERE collapses all
-      three into this shape, so the caller can't (and needn't) tell them apart.
+      aged past its TTL (``miss_ttl``, or ``crowd_out_miss_ttl`` for a crowd-out
+      miss). Run the live probe. The SQL WHERE collapses all these into this
+      shape, so the caller can't (and needn't) tell them apart.
     """
 
     release_id: int | None

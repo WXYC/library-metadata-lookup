@@ -7,8 +7,9 @@ Mirrors ``tests/unit/test_streaming_url_cache_schema.py``. Two surfaces:
   ``lml_cache.release_resolution_cache`` table with the named CHECK constraint
   and composite PK, so a reviewer / operator has the DDL inline.
 * ``set_up_release_resolution_cache_schema`` — the lifespan bootstrap helper.
-  It must issue ``CREATE SCHEMA`` then ``CREATE TABLE`` (named CHECK) and
-  nothing else.
+  It must issue ``CREATE SCHEMA`` then ``CREATE TABLE`` (named CHECK) then the
+  idempotent ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS crowd_out`` (LML#824)
+  and nothing else.
 
 The parity assertion pins the module's runtime ``CREATE TABLE`` text to the
 ``.sql`` reference so the two cannot silently drift. PG is mocked; the
