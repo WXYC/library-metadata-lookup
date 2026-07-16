@@ -4,7 +4,7 @@ Mirrors ``tests/integration/test_streaming_url_persistent_lookup.py``. LML#632
 adds the LML-owned ``lml_cache.release_resolution_cache`` table plus the cache
 module ``entity/release_resolution_cache.py`` (read/write helpers). All unit
 coverage mocks ``PgSource``; this file is the matching ``@pytest.mark.pg`` layer
-driving the real schema, the real UPSERT, and the real dual-TTL math against an
+driving the real schema, the real UPSERT, and the real triple-TTL math against an
 actual PostgreSQL connection.
 
 Concrete production risks the unit tests cannot catch:
@@ -14,8 +14,10 @@ Concrete production risks the unit tests cannot catch:
   would break the ``resolved_at`` cutoff comparison.
 * UPSERT semantics — the composite-PK ``ON CONFLICT`` updates in place.
 * ``to_match_form`` normalization parity between SELECT and UPSERT.
-* The dual TTL: a positive hit reads stale after 90 days; a miss reads fresh
-  inside 7 days and stale after.
+* The triple TTL (LML#824): a positive hit reads stale after 90 days; a normal
+  miss reads fresh inside 7 days and stale after; a crowd-out miss reads fresh
+  inside 1 hour and stale after, on its own shorter cutoff.
+* The additive ``crowd_out`` column ALTER backfills a pre-#824 table in place.
 
 Run with: pytest -m pg -v tests/integration/test_release_resolution_cache.py
 """
@@ -233,3 +235,161 @@ class TestDualTTL:
         )
         assert result.was_present is False
         assert result.release_id is None
+
+
+@pytest.mark.pg
+class TestCrowdOutMissTTL:
+    """LML#824: a crowd-out empty pins a short-TTL miss (``crowd_out=true``), so it
+    self-heals within the hour instead of being suppressed for the full 7 days —
+    while a genuine exhausted miss (``crowd_out=false``) keeps the 7-day TTL."""
+
+    @pytest.mark.asyncio
+    async def test_crowd_out_miss_within_1h_is_returned(self, pg_source):
+        await set_cached_release_id(
+            pg_source,
+            artist="Juana Molina",
+            title="Paraguaya",
+            is_track=True,
+            release_id=None,
+            crowd_out=True,
+        )
+        # A fresh crowd-out miss is honored exactly like any known miss inside its
+        # TTL: present row, null release_id — the caller skips the live probe.
+        result = await get_cached_release_id(
+            pg_source, artist="Juana Molina", title="Paraguaya", is_track=True
+        )
+        assert result.was_present is True
+        assert result.release_id is None
+
+    @pytest.mark.asyncio
+    async def test_crowd_out_miss_past_1h_reads_stale(self, pg_source, pg_pool):
+        await set_cached_release_id(
+            pg_source,
+            artist="Juana Molina",
+            title="Paraguaya",
+            is_track=True,
+            release_id=None,
+            crowd_out=True,
+        )
+        now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
+        past = now - timedelta(hours=2)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.release_resolution_cache SET resolved_at = $1 "
+                "WHERE artist_normalized = 'juana molina' AND title_normalized = 'paraguaya' "
+                "AND is_track = true",
+                past,
+            )
+        # 2h old crowd-out miss is past the 1h crowd-out TTL: filtered by the SQL,
+        # reads as absent so the caller re-probes (the self-heal).
+        result = await get_cached_release_id(
+            pg_source, artist="Juana Molina", title="Paraguaya", is_track=True, now=now
+        )
+        assert result.was_present is False
+        assert result.release_id is None
+
+    @pytest.mark.asyncio
+    async def test_normal_miss_same_age_as_a_stale_crowd_out_is_still_fresh(
+        self, pg_source, pg_pool
+    ):
+        # The discriminating case: at exactly the same 2h age, a crowd-out miss
+        # (short TTL) is stale but a normal exhausted miss (7-day TTL) is fresh.
+        # Proves the marker column selects a distinct cutoff, not just a shared one.
+        await set_cached_release_id(
+            pg_source,
+            artist="Sessa",
+            title="Sonho Da Maçã",
+            is_track=True,
+            release_id=None,
+            crowd_out=False,
+        )
+        now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
+        past = now - timedelta(hours=2)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.release_resolution_cache SET resolved_at = $1 "
+                "WHERE artist_normalized = 'sessa' AND title_normalized = 'sonho da maca' "
+                "AND is_track = true",
+                past,
+            )
+        result = await get_cached_release_id(
+            pg_source, artist="Sessa", title="Sonho Da Maçã", is_track=True, now=now
+        )
+        assert result.was_present is True
+        assert result.release_id is None
+
+    @pytest.mark.asyncio
+    async def test_positive_reresolve_clears_the_crowd_out_marker(self, pg_source, pg_pool):
+        # A crowd-out miss that later resolves must have its marker cleared, so it
+        # ages on the 90-day positive TTL, not the 1h crowd-out TTL.
+        key = ("chuquimamani-condori", "call your name", True)
+        await set_cached_release_id(
+            pg_source,
+            artist="Chuquimamani-Condori",
+            title="Call Your Name",
+            is_track=True,
+            release_id=None,
+            crowd_out=True,
+        )
+        await set_cached_release_id(
+            pg_source,
+            artist="Chuquimamani-Condori",
+            title="Call Your Name",
+            is_track=True,
+            release_id=555,
+        )
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT release_id, crowd_out FROM lml_cache.release_resolution_cache "
+                "WHERE artist_normalized = $1 AND title_normalized = $2 AND is_track = $3",
+                *key,
+            )
+        assert row["release_id"] == 555
+        assert row["crowd_out"] is False
+
+    @pytest.mark.asyncio
+    async def test_positive_write_is_never_marked_crowd_out(self, pg_source, pg_pool):
+        # crowd_out is a miss-only marker: passing crowd_out=True alongside a real
+        # release_id must be coerced to false (a positive is never a crowd-out).
+        await set_cached_release_id(
+            pg_source,
+            artist="Duke Ellington & John Coltrane",
+            title="In a Sentimental Mood",
+            is_track=True,
+            release_id=777,
+            crowd_out=True,
+        )
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT release_id, crowd_out FROM lml_cache.release_resolution_cache "
+                "WHERE artist_normalized = 'duke ellington & john coltrane' "
+                "AND title_normalized = 'in a sentimental mood' AND is_track = true"
+            )
+        assert row["release_id"] == 777
+        assert row["crowd_out"] is False
+
+    @pytest.mark.asyncio
+    async def test_alter_backfills_pre_existing_rows_to_false(self, pg_source, pg_pool):
+        # The prod-upgrade path: an existing table (rows written before #824) gets
+        # the crowd_out column added in place with DEFAULT false, so legacy misses
+        # keep the 7-day TTL rather than being reclassified as short-lived.
+        await set_cached_release_id(
+            pg_source,
+            artist="Stereolab",
+            title="Metronomic Underground",
+            is_track=True,
+            release_id=None,
+        )
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE lml_cache.release_resolution_cache DROP COLUMN crowd_out"
+            )
+        # Re-running the bootstrap issues the idempotent ALTER that re-adds it.
+        await set_up_release_resolution_cache_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT crowd_out FROM lml_cache.release_resolution_cache "
+                "WHERE artist_normalized = 'stereolab' "
+                "AND title_normalized = 'metronomic underground' AND is_track = true"
+            )
+        assert row["crowd_out"] is False
