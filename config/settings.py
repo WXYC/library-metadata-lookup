@@ -324,6 +324,25 @@ class Settings(BaseSettings):
             "See WXYC/library-metadata-lookup#628."
         ),
     )
+    lml_emit_server_timing: bool = Field(
+        default=True,
+        description=(
+            "When True, /lookup and /lookup/bulk surface the "
+            "RequestTelemetry timings that track_step already captures as a "
+            "Server-Timing response header (name;dur=<ms> entries). On /lookup: "
+            "one entry per tracked step, a derived `discogs` leg from the "
+            "cache_stats pg/api split, then one live `total`; /lookup/bulk emits "
+            "a batch-level `total` only (per-item stages aren't meaningful in one "
+            "per-HTTP-request header). Out-of-band instrumentation only — the "
+            "cache_stats JSON body is byte-identical either way — so a caller "
+            "(request-o-matic's `lookup` CLI) can attribute a slow lookup to a "
+            "named server stage without any api.yaml / CacheStats change. Default "
+            "True; flip False in Railway to withhold internal stage latencies "
+            "without a redeploy. The LML half of the cross-repo Server-Timing "
+            "trace; part of the enrichment-observability hardening epic "
+            "WXYC/Backend-Service#881 (Epic G)."
+        ),
+    )
     # Persistent streaming-URL cache flags (LML#573). A service is persisted
     # only when BOTH the master kill switch AND its per-service flag are true
     # (AND-gate). The master defaults True and the per-service flags default

@@ -160,6 +160,10 @@ Wiring:
 - `DATABASE_URL_MUSICBRAINZ` is new — when unset the MB leg is skipped silently.
 - Existing callers (no flag) see no behavior change and no extra queries.
 
+## Server-Timing response header (Backend-Service#881, Epic G)
+
+`/api/v1/lookup` and `/api/v1/lookup/bulk` surface the per-stage `RequestTelemetry.track_step` timings — already captured for PostHog — as an out-of-band [`Server-Timing`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Server-Timing) header, so a caller can attribute a slow lookup to a named server stage without any `api.yaml` / `CacheStats` change (the JSON body is byte-identical with or without it). The formatter is `RequestTelemetry.as_server_timing(extra=…)` in `wxyc-fastapi` (`>=1.1.0`); the router wires it via `_emit_server_timing_header` on an injected FastAPI `Response`. Grammar: one `name;dur=<ms>` entry per tracked stage (insertion order), then a derived `discogs` leg (`cache_stats` `pg_time_ms + api_time_ms`, guarded when the context is None → 0), then exactly one live `total`; `/lookup/bulk` emits a batch-level `total` only. Gated on `LML_EMIT_SERVER_TIMING` (default on); a build failure logs at WARNING and ships the response without the header (observability never breaks the request path). Because `metadata_enrichment` is wall-clock over concurrent probes, `Σ steps + discogs ≠ total`, and the header `total` is sampled a few ms before the PostHog `total_duration_ms` — two independent measurements. This is the LML half of a cross-repo trace (request-o-matic forwards + merges the header on `/request` and prints it in the `lookup` CLI). Env-var reference in [`env-vars.md`](env-vars.md).
+
 ## Streaming-match telemetry (LML#592)
 
 Every winning streaming match emits a lightweight `matcher.match` Sentry span (via `record_match_telemetry` in `clients/streaming/matching.py`) carrying the per-axis fuzzy scores. It is emitted once per resolved match on both surfaces: the album path (`find_best_source_match`, all adapters) and the Apple track path (`find_track_metadata`, which inlines its own `token_set_ratio` floor). Span data keys:

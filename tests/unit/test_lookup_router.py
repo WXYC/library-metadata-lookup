@@ -29,6 +29,28 @@ def _full_cache_stats() -> dict:
     }
 
 
+def _parse_server_timing(value: str) -> dict[str, float | None]:
+    """Parse a ``Server-Timing`` header value into ``{name: dur_ms}``.
+
+    Mirrors the ``name;dur=<ms>`` grammar ``RequestTelemetry.as_server_timing``
+    emits (comma-joined). Tolerant of a missing ``dur`` (maps to None) so a test
+    asserting on presence doesn't trip over a malformed entry.
+    """
+    parsed: dict[str, float | None] = {}
+    for entry in value.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, _, params = entry.partition(";")
+        dur: float | None = None
+        for param in params.split(";"):
+            param = param.strip()
+            if param.startswith("dur="):
+                dur = float(param[len("dur=") :])
+        parsed[name.strip()] = dur
+    return parsed
+
+
 @pytest.fixture
 def mock_db():
     return AsyncMock(spec=LibraryDB)
@@ -607,6 +629,252 @@ class TestHandleLookup:
 
         projected = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
         assert projected["lml.cache.memory_cache_inflight_join"] == 2
+
+    @pytest.mark.asyncio
+    async def test_server_timing_header_present_by_default(self, app_client):
+        """BS#881 (Epic G) observability: /lookup surfaces the RequestTelemetry stage
+        timings as a Server-Timing response header. Default-on, so an existing
+        caller sees it without opting in. The derived ``discogs`` leg and the
+        live ``total`` are always present even when perform_lookup is mocked
+        (no tracked steps), so a caller can always read at least those two.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        assert "Server-Timing" in resp.headers
+        parsed = _parse_server_timing(resp.headers["Server-Timing"])
+        assert "total" in parsed
+        assert "discogs" in parsed
+        # Every emitted dur must parse as a float.
+        assert all(v is not None for v in parsed.values())
+
+    @pytest.mark.asyncio
+    async def test_server_timing_header_absent_when_flag_off(self, app_client, mock_settings):
+        """With LML_EMIT_SERVER_TIMING off, no header is emitted — the kill
+        switch is honored and the response is otherwise unchanged.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+        flag_off = mock_settings.model_copy(update={"lml_emit_server_timing": False})
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_settings", return_value=flag_off),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        assert "Server-Timing" not in resp.headers
+
+    @pytest.mark.asyncio
+    async def test_server_timing_discogs_is_pg_plus_api(self, app_client):
+        """The derived ``discogs`` leg equals ``pg_time_ms + api_time_ms`` from
+        cache_stats, so the header never disagrees with the cache_stats JSON.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+        stats = {**_full_cache_stats(), "pg_time_ms": 12.5, "api_time_ms": 480.7}
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value=stats),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        parsed = _parse_server_timing(resp.headers["Server-Timing"])
+        assert parsed["discogs"] == pytest.approx(493.2)
+
+    @pytest.mark.asyncio
+    async def test_server_timing_survives_none_cache_stats(self, app_client):
+        """``get_cache_stats()`` returns None on an uninitialized context; the
+        derived discogs leg must degrade to 0, not TypeError → 500.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value=None),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        parsed = _parse_server_timing(resp.headers["Server-Timing"])
+        assert parsed["discogs"] == 0
+        assert "total" in parsed
+
+    @pytest.mark.asyncio
+    async def test_server_timing_does_not_alter_response_body(self, app_client, mock_settings):
+        """The header is out-of-band instrumentation: the JSON body (cache_stats
+        included) must be byte-identical whether the header is emitted or not.
+        Runs the same request flag-on then flag-off and compares the raw bodies.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+        stats = _full_cache_stats()
+        flag_off = mock_settings.model_copy(update={"lml_emit_server_timing": False})
+
+        async def _body(get_settings_return):
+            with (
+                patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+                patch("lookup.router.get_cache_stats", return_value=stats),
+                patch("lookup.router.get_settings", return_value=get_settings_return),
+            ):
+                mock_lookup.return_value = response
+                async with AsyncClient(
+                    transport=ASGITransport(app=app_client), base_url="http://test"
+                ) as client:
+                    resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+            return resp
+
+        on = await _body(mock_settings)
+        off = await _body(flag_off)
+
+        assert on.status_code == off.status_code == 200
+        assert "Server-Timing" in on.headers
+        assert "Server-Timing" not in off.headers
+        # The header must not perturb the body at all.
+        assert on.content == off.content
+
+    @pytest.mark.asyncio
+    async def test_server_timing_surfaces_real_orchestrator_steps(
+        self, mock_library_db, mock_settings
+    ):
+        """Drives the REAL orchestrator (perform_lookup not patched) so the header
+        carries an actual tracked step, not just the derived legs. ``library_search``
+        (orchestrator.py) runs on every lookup, so it must appear alongside the
+        derived ``discogs`` and the live ``total`` — proving the header reflects
+        genuine ``track_step`` timings, not a hardcoded shape. Discogs is None so
+        the pipeline resolves purely from the library hit.
+        """
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        mock_library_db.search.return_value = [
+            make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes", genre="Rock")
+        ]
+
+        # Pin the flag on the module global the helper actually reads —
+        # dependency_overrides never intercepts a direct get_settings() call, so
+        # this asserts on the emitted header rather than on the ambient default.
+        with (
+            override_deps(
+                app,
+                {
+                    get_library_db: mock_library_db,
+                    get_discogs_service: None,
+                    get_posthog_client: None,
+                },
+            ),
+            patch("lookup.router.get_settings", return_value=mock_settings),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        parsed = _parse_server_timing(resp.headers["Server-Timing"])
+        assert "library_search" in parsed
+        assert "discogs" in parsed
+        assert "total" in parsed
+        assert all(v is not None for v in parsed.values())
+
+    @pytest.mark.asyncio
+    async def test_server_timing_failure_does_not_break_request(self, app_client):
+        """Observability must not break the request path: if the header build
+        raises, the request still returns 200 with no header.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch(
+                "lookup.router.RequestTelemetry.as_server_timing",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        assert "Server-Timing" not in resp.headers
+
+    @pytest.mark.asyncio
+    async def test_server_timing_wire_format_is_strict_parser_safe(
+        self, mock_library_db, mock_settings
+    ):
+        """The emitted header must be consumable by a strict ``Server-Timing`` parser
+        (request-o-matic's ``lookup`` CLI, the next PR in the trace). Drives the REAL
+        orchestrator and asserts LML's own wiring end-to-end: every entry is
+        ``name;dur=<plain-decimal>`` joined by ``", "`` (never scientific notation),
+        ``total`` appears exactly once and last, and the derived ``discogs`` leg sits
+        among the entries. Parsing into an ordered LIST (not a dict/set) is deliberate
+        so a double-``total`` regression — e.g. an accidental ``extra={"total": …}`` —
+        is visible; that LML-side wiring the upstream ``as_server_timing`` unit tests
+        can't see. The flag is pinned on explicitly (``lookup.router.get_settings``, the
+        module global the helper reads) so the assertion never rides the ambient default.
+        """
+        import re
+
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        mock_library_db.search.return_value = [
+            make_library_item(id=42, artist="Stereolab", title="Aluminum Tunes", genre="Rock")
+        ]
+
+        with (
+            override_deps(
+                app,
+                {
+                    get_library_db: mock_library_db,
+                    get_discogs_service: None,
+                    get_posthog_client: None,
+                },
+            ),
+            patch("lookup.router.get_settings", return_value=mock_settings),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        header = resp.headers["Server-Timing"]
+
+        # Splitting on ", " (the as_server_timing join) and matching each entry
+        # against the grammar verifies BOTH the separator and the entry shape: a
+        # bare-comma join or a mangled dur would leave a non-conforming token.
+        entries = header.split(", ")
+        grammar = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*;dur=\d+(?:\.\d+)?$")
+        for entry in entries:
+            assert grammar.match(entry), f"non-conforming Server-Timing entry: {entry!r}"
+
+        names = [entry.split(";")[0] for entry in entries]
+        assert names.count("total") == 1  # exactly one canonical total
+        assert names[-1] == "total"  # ...and it is last
+        assert "discogs" in names  # the derived pg+api leg
+        assert "library_search" in names  # a real track_step stage
 
     @pytest.mark.asyncio
     async def test_response_includes_call_number(self, app_client):
