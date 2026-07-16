@@ -313,6 +313,18 @@ async def fallthrough[T](
                 logger.debug("Cache hit (%s)", label)
                 # ``cached`` may be ``T`` (single-value) or ``False`` (tri-state).
                 # Either way ``is_pg_hit`` said it's a hit, so return it.
+                #
+                # #818 (C3): this terminal return means a non-empty-but-incomplete
+                # ``search_releases_by_track`` PG read (e.g. the artist's other
+                # releases while the ``rta.extra = 0`` guard pruned the actual
+                # track-bearing comp) masks the API leg for THIS call. That is
+                # intentional — the whole L2 point is spending no Discogs quota on
+                # a hit — and it is harmless: both consumers probe in two waves,
+                # and Wave B (``artist_as_keyword=True`` → ``pg_read=None``) always
+                # reaches the API's keyword/``Compilation`` leg, which recovers
+                # exactly the credits this arm prunes. #818 was refuted (no seam
+                # change); recovery pinned by
+                # ``tests/unit/test_fallthrough_masked_api_leg_818.py``.
                 return cached  # type: ignore[return-value]
             _add_discogs_breadcrumb("cache_miss", bc_data)
             get_cache_stats_recorder().record_pg_cache_miss()
