@@ -548,6 +548,67 @@ class TestBoundedEarlyExit:
         assert [r.release_id for r in resolved] == [30]
         assert svc.validate_track_on_release.await_args.args[0] == 30
 
+    @pytest.mark.asyncio
+    async def test_bounded_reports_truncation_when_candidates_exceed_cap(self):
+        """LML#816: the bounded path reports (via ``truncated_out``) that its
+        candidate set was truncated at the cap — 8 id-having candidates surfaced,
+        only 5 validated — so an empty result may be a crowd-out (a resolvable
+        release sorted outside the window) rather than a true exhaustion. The
+        row-less kernel uses this to decide whether to pin a durable known-miss."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(return_value=_track_response(*_eight_candidates()))
+        svc.validate_track_on_release = AsyncMock(return_value=False)
+
+        truncated: list[bool] = []
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+            max_validations=5,
+            truncated_out=truncated,
+        )
+
+        assert resolved == []
+        assert svc.validate_track_on_release.await_count == 5
+        # 8 candidates > cap of 5 → the empty came from a truncated set.
+        assert truncated == [True]
+
+    @pytest.mark.asyncio
+    async def test_bounded_reports_no_truncation_when_within_cap(self):
+        """LML#816: when the whole candidate set fits inside the cap and still
+        validates nothing, the empty is a genuine exhaustion — every candidate was
+        tried — so ``truncated_out`` reports ``False`` and the kernel is free to
+        pin the durable known-miss."""
+        from lookup.release_resolution import resolve_release_for_track
+
+        svc = AsyncMock()
+        svc.search_releases_by_track = AsyncMock(
+            return_value=_track_response(
+                _va_comp(release_id=10, album="Comp A"),
+                _va_comp(release_id=20, album="Comp B"),
+                _va_comp(release_id=30, album="Comp C"),
+            )
+        )
+        svc.validate_track_on_release = AsyncMock(return_value=False)
+
+        truncated: list[bool] = []
+        resolved = await resolve_release_for_track(
+            song="Message to Black Youth",
+            artist="A Guy Called Gerald",
+            album="When There Is No Sun",
+            discogs_service=svc,
+            max_validations=5,
+            truncated_out=truncated,
+        )
+
+        assert resolved == []
+        assert svc.validate_track_on_release.await_count == 3
+        # 3 candidates ≤ cap of 5 → nothing was skipped → exhaustive empty.
+        assert truncated == [False]
+
 
 class TestValidateReleaseForTrack:
     """The shared validate+telemetry primitive both strategies delegate to."""

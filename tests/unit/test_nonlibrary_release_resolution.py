@@ -234,6 +234,145 @@ async def test_cold_miss_writes_known_miss_to_cache(monkeypatch):
     assert pg.store[(ARTIST.lower(), TRACK.lower(), True)] is None
 
 
+# ---------------------------------------------------------------------------
+# LML#816: a bounded-resolve empty that is a crowd-out (candidate set truncated
+# at the max_validations cap) must NOT pin a durable 7-day known-miss.
+# ---------------------------------------------------------------------------
+
+# A resolvable non-library release whose Discogs id sorts *after* the crowd-out
+# distractors. The bounded no-album prerank orders by ``release_id`` ascending,
+# so a large id lands last — outside the 5-candidate validation window once six
+# lower-id distractors precede it.
+CROWDOUT_CORRECT_ID = RELEASE_ID  # 36907527, far above the distractor ids
+
+
+def _crowdout_distractor(release_id: int) -> ReleaseInfo:
+    """A candidate Discogs surfaces for the artist+track query that does NOT
+    actually carry the track's per-track credit (fails validation). Non-comp so
+    the no-album prerank keys purely on ``release_id``."""
+    return ReleaseInfo(
+        album=f"Unrelated Release {release_id}",
+        artist=ARTIST,
+        release_id=release_id,
+        release_url=f"https://www.discogs.com/release/{release_id}",
+        is_compilation=False,
+    )
+
+
+def _crowdout_correct() -> ReleaseInfo:
+    return ReleaseInfo(
+        album=ALBUM,
+        artist=ARTIST,
+        release_id=CROWDOUT_CORRECT_ID,
+        release_url=RELEASE_URL,
+        is_compilation=False,
+    )
+
+
+def _crowdout_service() -> AsyncMock:
+    """A Discogs service whose track probe first returns six distractors ahead of
+    the correct release (a transient crowd-out), then — once ``cleared`` — returns
+    only the correct release. ``validate_track_on_release`` passes solely for the
+    correct id, so on the crowd-out pass the top-5 pre-ranked candidates all fail
+    and the correct release (sorted 7th by id) never enters the window."""
+    svc = AsyncMock()
+    svc.cache_service = None
+    svc.validate_track_on_release = AsyncMock(
+        side_effect=lambda rid, song, artist: rid == CROWDOUT_CORRECT_ID
+    )
+    svc.search_releases_by_album_title = AsyncMock(return_value=_empty_track_releases())
+    svc.get_release = AsyncMock(
+        return_value=ReleaseMetadataResponse(
+            release_id=CROWDOUT_CORRECT_ID,
+            title=ALBUM,
+            artist=ARTIST,
+            release_url=RELEASE_URL,
+            artwork_url="https://i.discogs.com/sun.jpg",
+        )
+    )
+
+    correct = _crowdout_correct()
+    distractors = [_crowdout_distractor(i) for i in range(1, 7)]  # ids 1..6
+    state = {"cleared": False}
+
+    def _search(track, artist, *_a, **_k):
+        releases = [correct] if state["cleared"] else [*distractors, correct]
+        return TrackReleasesResponse(
+            track=track, artist=artist, releases=list(releases), total=len(releases), cached=False
+        )
+
+    svc.search_releases_by_track = AsyncMock(side_effect=_search)
+    svc._crowdout_state = state
+    return svc
+
+
+@pytest.mark.asyncio
+async def test_crowdout_empty_does_not_durably_suppress_resolvable_release():
+    """A bounded-resolve empty produced by a *transient* crowd-out (more true
+    candidates surfaced than the max_validations=5 window validates, per #802's
+    improved recall) must NOT be pinned as a 7-day known-miss.
+
+    Otherwise the durable negative short-circuits the very next add — turning a
+    one-off truncation into a week-long suppression of a release that is actually
+    resolvable once the crowd-out clears. This is finding C1 of the #807 review.
+    """
+    svc = _crowdout_service()
+    pg = _RecordingPg()
+
+    # First add: six distractors sort ahead of the correct release (id 36907527)
+    # and all fail per-track validation, so the bounded resolve exhausts its
+    # 5-attempt budget without ever reaching the correct release → empty.
+    first = await _resolve_nonlibrary_release(
+        svc, pg, song=TRACK, artist=ARTIST, album=None, is_track=True
+    )
+    assert first is None
+    # The empty came from a TRUNCATED candidate set (7 surfaced > cap 5), so it
+    # must NOT be pinned as a durable known-miss.
+    assert (ARTIST.lower(), TRACK.lower(), True) not in pg.store
+
+    # The transient clears: the distractors are gone and the correct release is
+    # now the sole, resolvable candidate.
+    svc._crowdout_state["cleared"] = True
+
+    # A second identical add must surface the correct release — not be suppressed
+    # by a negative pinned on the first (crowd-out) attempt.
+    second = await _resolve_nonlibrary_release(
+        svc, pg, song=TRACK, artist=ARTIST, album=None, is_track=True
+    )
+    assert second is not None
+    assert second.release_id == CROWDOUT_CORRECT_ID
+    # And now that it genuinely resolved, a POSITIVE is cached.
+    assert pg.store[(ARTIST.lower(), TRACK.lower(), True)] == CROWDOUT_CORRECT_ID
+
+
+@pytest.mark.asyncio
+async def test_exhausted_empty_within_cap_still_pins_known_miss():
+    """The #816 fix is surgical: an empty whose whole candidate set fit inside the
+    cap (every candidate validated and failed) is a genuine exhaustion, so the
+    durable known-miss is still pinned — preserving the #632 amortization contract
+    for truly-unresolvable adds."""
+    svc = _crowdout_service()
+    # Only three distractors this time (≤ cap), none of which validate, and no
+    # correct release — a genuinely exhaustive empty.
+    three = [_crowdout_distractor(i) for i in range(1, 4)]
+    svc.search_releases_by_track = AsyncMock(
+        return_value=TrackReleasesResponse(
+            track=TRACK, artist=ARTIST, releases=three, total=3, cached=False
+        )
+    )
+    svc.validate_track_on_release = AsyncMock(return_value=False)
+    pg = _RecordingPg()
+
+    result = await _resolve_nonlibrary_release(
+        svc, pg, song=TRACK, artist=ARTIST, album=None, is_track=True
+    )
+
+    assert result is None
+    # 3 candidates ≤ cap 5 → exhaustive, not truncated → known-miss pinned.
+    assert pg.execute_calls == 1
+    assert pg.store[(ARTIST.lower(), TRACK.lower(), True)] is None
+
+
 @pytest.mark.asyncio
 async def test_breaker_shed_does_not_pin_a_known_miss(monkeypatch):
     """LML#755 FIX 1: when the bounded resolve is shed by an OPEN breaker
