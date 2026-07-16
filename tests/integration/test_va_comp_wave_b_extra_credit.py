@@ -1,0 +1,296 @@
+"""Reproduce-or-refute for LML#817 (finding C2 from the #807 max-effort review).
+
+#817 posits that the TRACK_ON_COMPILATION Wave-B V/A-compilation probe
+(``DiscogsService.search_releases_by_track(..., artist_as_keyword=True)``) runs
+through the #802 ``_SEARCH_BY_TRACK_ARTIST_SQL`` CTE and gets a V/A compilation
+pruned by that CTE's ``rta.extra = 0`` guard *before* ``merge_wave_b_compilations``
+sees it, when the queried performer's matching-track credit is ``extra = 1`` (a
+guest/featured credit).
+
+VERDICT: **REFUTED.** ``DiscogsService.search_releases_by_track`` sets
+``pg_read_hook = None`` whenever ``artist_as_keyword=True`` (the guard predates
+#802 — it landed in the fallthrough-seam refactor 3e95de8, not the #802 fix), so
+the Wave-B probe never reads the PG cache CTE at all. It hits the Discogs API
+keyword search (``params["q"] = artist`` + ``format=Compilation``). The
+``rta.extra = 0`` guard the ticket names governs only the *artist-scoped* Wave-A
+probe (``artist_as_keyword=False``), whose job is the non-compilation match; the
+V/A comp reaches the caller via Wave B's API arm regardless of the ``extra`` flag
+on any cached credit.
+
+This module pins that split three ways so a future change that routes Wave B back
+through the cache CTE (which would re-open the #817 mechanism) fails loudly:
+
+- ``TestCacheCteExtraGuard`` — the ``rta.extra = 0`` prune is real *at the cache
+  layer* (extra=1 dropped, extra=0 kept) but is only exercised by the artist-scoped
+  read. This is the #333 precision guard; the #817 fear is real here, on Wave A.
+- ``TestWaveBBypassesCacheCte`` — the controlled comparison that refutes the
+  ticket's causal claim: with the API empty, a V/A comp is absent from the Wave-B
+  result *whether its cached credit is extra=0 or extra=1*. If the drop were the
+  ``rta.extra = 0`` prune, the extra=0 comp would surface (the CTE keeps it) and
+  only extra=1 would drop. Both drop -> the cause is the cache being bypassed for
+  Wave B, not the extra guard.
+- ``TestWaveBApiArmRescue`` — the comp reaches the caller: with the Discogs API
+  keyword search returning the comp, Wave B surfaces it despite an extra=1 cached
+  credit, and the API was queried with ``q=<artist>`` + ``format=Compilation``.
+
+Run with:
+    pytest -m pg -v tests/integration/test_va_comp_wave_b_extra_credit.py
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+import pytest_asyncio
+
+from discogs.cache_service import DiscogsCacheService
+from discogs.memory_cache import clear_all_caches
+from discogs.service import DiscogsService
+from tests.integration.conftest import (
+    F_UNACCENT_WRAPPER_SQL,
+    skip_if_drop_targets_populated,
+)
+
+pytestmark = pytest.mark.pg
+
+# Enough same-title decoys to fill the CTE's ``ORDER BY sim DESC LIMIT limit*2``
+# ahead of the fuzzier-titled target -- the same flood mechanism the #802
+# prefilter suite uses. > limit*2 (= 40 at limit=20).
+N_DISTRACTORS = 42
+COMMON_TITLE = "Fugitive Motel"
+FUZZY_TITLE = "Fugitive Motel (Reprise)"  # sorts strictly below the exact-title decoys
+
+# A representative V/A compilation shape: release artist "Various", performer
+# credited on the matching track. WXYC-representative performer name.
+COMP_ALBUM = "Nao Wave"
+PERFORMER = "Juana Molina"
+
+
+async def _create_schema(conn) -> None:
+    """DROP/CREATE the four discogs-cache tables ``search_releases_by_track`` reads."""
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
+    await conn.execute(F_UNACCENT_WRAPPER_SQL)
+
+    await conn.execute("DROP TABLE IF EXISTS release_track_artist CASCADE")
+    await conn.execute("DROP TABLE IF EXISTS release_track CASCADE")
+    await conn.execute("DROP TABLE IF EXISTS release_artist CASCADE")
+    await conn.execute("DROP TABLE IF EXISTS release CASCADE")
+    await conn.execute("""
+        CREATE TABLE release (
+            id    integer PRIMARY KEY,
+            title text NOT NULL
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE release_track (
+            release_id integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
+            sequence   integer NOT NULL,
+            title      text NOT NULL
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE release_artist (
+            release_id  integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
+            artist_id   integer,
+            artist_name text NOT NULL,
+            extra       integer DEFAULT 0
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE release_track_artist (
+            release_id     integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
+            track_sequence integer NOT NULL,
+            artist_name    text NOT NULL,
+            extra          integer DEFAULT 0
+        )
+    """)
+
+
+async def _seed_distractors(conn) -> None:
+    """Seed ``N_DISTRACTORS`` exact-title decoy releases so the CTE ``LIMIT`` is full."""
+    await conn.executemany(
+        "INSERT INTO release (id, title) VALUES ($1, $2)",
+        [(i, f"Decoy Album {i}") for i in range(1, N_DISTRACTORS + 1)],
+    )
+    await conn.executemany(
+        "INSERT INTO release_track (release_id, sequence, title) VALUES ($1, 1, $2)",
+        [(i, COMMON_TITLE) for i in range(1, N_DISTRACTORS + 1)],
+    )
+    await conn.executemany(
+        "INSERT INTO release_artist (release_id, artist_name, extra) VALUES ($1, $2, 0)",
+        [(i, f"Decoy Artist {i}") for i in range(1, N_DISTRACTORS + 1)],
+    )
+
+
+async def _seed_va_comp(conn, *, release_id: int, performer_extra: int) -> None:
+    """Seed one V/A comp: release artist 'Various' (extra 0), performer on the track.
+
+    The performer's ``release_track_artist`` credit carries ``performer_extra``
+    (0 = main-artist track credit, 1 = guest/featured/writer credit). The
+    release-level artist is 'Various', which never matches the performer, so
+    surfacing this comp from the artist-scoped CTE depends entirely on the
+    track-level ``rta`` leg -- exactly the axis #817 is about.
+    """
+    await conn.execute("INSERT INTO release (id, title) VALUES ($1, $2)", release_id, COMP_ALBUM)
+    await conn.execute(
+        "INSERT INTO release_track (release_id, sequence, title) VALUES ($1, 7, $2)",
+        release_id,
+        FUZZY_TITLE,
+    )
+    await conn.execute(
+        "INSERT INTO release_artist (release_id, artist_name, extra) VALUES ($1, 'Various', 0)",
+        release_id,
+    )
+    await conn.execute(
+        "INSERT INTO release_track_artist "
+        "(release_id, track_sequence, artist_name, extra) VALUES ($1, 7, $2, $3)",
+        release_id,
+        PERFORMER,
+        performer_extra,
+    )
+
+
+@pytest_asyncio.fixture
+async def cache(pg_pool):
+    """Empty four-table discogs-cache schema; yields a service, drops on teardown."""
+    async with pg_pool.acquire() as conn:
+        await skip_if_drop_targets_populated(
+            conn,
+            ("release", "release_track", "release_artist", "release_track_artist"),
+        )
+        try:
+            await _create_schema(conn)
+        except Exception as e:
+            pytest.skip(f"pg_trgm/unaccent extensions unavailable: {e}")
+
+    # The service method under test is wrapped in an L1 @async_cached(TRACK_CACHE);
+    # clear it around each test so a prior test's (track, artist, artist_as_keyword)
+    # result can't leak in as a memory-cache hit.
+    clear_all_caches()
+    yield DiscogsCacheService(pg_pool)
+    clear_all_caches()
+
+    async with pg_pool.acquire() as conn:
+        await conn.execute("DROP TABLE IF EXISTS release_track_artist CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS release_track CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS release_artist CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS release CASCADE")
+
+
+def _make_service(cache: DiscogsCacheService, *, api_results: list[dict]) -> tuple:
+    """Build a DiscogsService over the real cache with ``_request_with_retry`` stubbed.
+
+    Returns ``(service, calls)`` where ``calls`` is a list the stub appends each
+    call's ``params`` dict to, so a test can assert the API arm was hit with the
+    expected keyword+format params. Every stubbed call returns the same
+    ``{"results": api_results}`` payload; ``_process_search_result`` dedups by
+    album so the supplemental keyword leg (fired when < 3 results) can't inflate.
+    """
+    service = DiscogsService(token="test-token", cache_service=cache)
+    calls: list[dict] = []
+
+    def _fake_response() -> MagicMock:
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock(return_value=None)
+        resp.json = MagicMock(return_value={"results": api_results})
+        return resp
+
+    async def _stub(method, path, params=None, max_retries=None):
+        calls.append(dict(params or {}))
+        return _fake_response()
+
+    service._request_with_retry = AsyncMock(side_effect=_stub)  # type: ignore[method-assign]
+    return service, calls
+
+
+class TestCacheCteExtraGuard:
+    """The ``rta.extra = 0`` prune is real at the cache layer -- but only on the
+    artist-scoped read the Wave-A probe uses. This is the #333 precision guard."""
+
+    @pytest.mark.asyncio
+    async def test_extra_one_track_credit_pruned_by_cte(self, cache):
+        """Performer credited only via an ``extra = 1`` track credit -> the
+        artist-scoped CTE drops the comp (``rta.extra = 0`` guard). This IS the
+        mechanism #817 fears; it lives on Wave A, not Wave B."""
+        async with cache.pool.acquire() as conn:
+            await _seed_distractors(conn)
+            await _seed_va_comp(conn, release_id=2001, performer_extra=1)
+
+        results = await cache.search_releases_by_track(COMMON_TITLE, PERFORMER, 20)
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_extra_zero_track_credit_surfaced_by_cte(self, cache):
+        """Same comp, but the performer's track credit is ``extra = 0`` -> the
+        #802 ``rta`` leg keeps it despite the distractor flood. Establishes that
+        the artist-scoped CTE *can* surface a V/A comp on a main-artist track
+        credit, so the extra=1 drop above is the discriminator, not a blanket miss."""
+        async with cache.pool.acquire() as conn:
+            await _seed_distractors(conn)
+            await _seed_va_comp(conn, release_id=2000, performer_extra=0)
+
+        results = await cache.search_releases_by_track(COMMON_TITLE, PERFORMER, 20)
+
+        assert [r.release_id for r in results] == [2000]
+        assert results[0].album == COMP_ALBUM
+        assert results[0].is_compilation is True
+
+
+class TestWaveBBypassesCacheCte:
+    """Controlled comparison refuting the #817 causal claim: with the API empty,
+    a cached V/A comp is absent from the Wave-B result whether its credit is
+    extra=0 or extra=1 -- the cache CTE (and its extra guard) is not consulted."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("performer_extra", [0, 1])
+    async def test_comp_absent_when_api_empty_regardless_of_extra(self, cache, performer_extra):
+        async with cache.pool.acquire() as conn:
+            await _seed_distractors(conn)
+            await _seed_va_comp(conn, release_id=3000, performer_extra=performer_extra)
+
+        service, calls = _make_service(cache, api_results=[])
+
+        response = await service.search_releases_by_track(
+            COMMON_TITLE, PERFORMER, artist_as_keyword=True
+        )
+
+        # If Wave B read the cache CTE, the extra=0 comp (id 3000) would surface
+        # (the CTE keeps it, per TestCacheCteExtraGuard). It does not -> the cache
+        # is bypassed for Wave B; the extra flag is not the discriminator here.
+        assert response.releases == []
+        # And Wave B did hit the Discogs API keyword arm.
+        assert calls, "Wave B must reach the API arm when the PG read is skipped"
+        assert calls[0].get("q") == PERFORMER
+        assert calls[0].get("format") == "Compilation"
+
+
+class TestWaveBApiArmRescue:
+    """The comp reaches the caller via Wave B's Discogs API keyword arm, so the
+    extra=1 credit the ticket worries about does not silently drop it."""
+
+    @pytest.mark.asyncio
+    async def test_extra_one_comp_surfaces_via_api_arm(self, cache):
+        async with cache.pool.acquire() as conn:
+            await _seed_distractors(conn)
+            await _seed_va_comp(conn, release_id=4001, performer_extra=1)
+
+        # The Discogs keyword search returns the V/A comp (Discogs title shape
+        # "Artist - Album"; "Various" -> is_compilation True downstream).
+        service, calls = _make_service(
+            cache, api_results=[{"id": 4001, "title": f"Various - {COMP_ALBUM}"}]
+        )
+
+        response = await service.search_releases_by_track(
+            COMMON_TITLE, PERFORMER, artist_as_keyword=True
+        )
+
+        albums = {r.album for r in response.releases}
+        assert COMP_ALBUM in albums, "the V/A comp must surface via the Wave-B API arm"
+        surfaced = next(r for r in response.releases if r.album == COMP_ALBUM)
+        assert surfaced.is_compilation is True
+        # Proof it came from the API keyword arm, not the cache CTE.
+        assert calls[0].get("q") == PERFORMER
+        assert calls[0].get("format") == "Compilation"

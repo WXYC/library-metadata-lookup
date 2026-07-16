@@ -299,6 +299,18 @@ async def search_compilations_for_track(
             # Two artist-scoped probes return TrackReleasesResponse; the optional
             # album-title probe returns tuple[TrackReleasesResponse | None, str | None].
             # _ProbeResult (module-scope alias) captures the heterogeneous shape.
+            #
+            # Wave A (artist-scoped) reads the PG cache CTE
+            # (``_SEARCH_BY_TRACK_ARTIST_SQL``); Wave B (``artist_as_keyword=True``)
+            # does NOT. ``DiscogsService.search_releases_by_track`` sets
+            # ``pg_read_hook=None`` for the keyword probe and hits the Discogs API
+            # ``format=Compilation`` search directly, so the #802 CTE
+            # ``rta.extra = 0`` guard governs Wave A only. A V/A comp whose
+            # performer is credited on the matching track via ``extra = 1``
+            # (guest/featured) still reaches ``merge_wave_b_compilations`` through
+            # Wave B's API arm, never pruned by that guard — LML#817 finding C2,
+            # reproduced-and-refuted and pinned by
+            # ``tests/integration/test_va_comp_wave_b_extra_credit.py``.
             probes: list[Coroutine[Any, Any, _ProbeResult]] = [
                 discogs_service.search_releases_by_track(song_search, artist_for_probes),
                 discogs_service.search_releases_by_track(
