@@ -7,11 +7,45 @@ and logs the degradation, allowing callers to fall back to the Discogs API.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
+
+
+def _wire_acquire_to_conn(pool):
+    """Wire ``pool.acquire()`` → conn transaction, delegating ``conn.fetch`` to
+    ``pool.fetch`` at call time.
+
+    The LML#804 trigram search arms run their query on an acquired connection
+    inside a transaction (``SET LOCAL`` statement_timeout + work_mem), so a
+    test that drives corruption via ``pool.fetch = AsyncMock(side_effect=...)``
+    must have that side-effect reached through ``conn.fetch`` too. Delegating
+    (rather than binding ``conn.fetch = pool.fetch`` once) means a later
+    reassignment of ``pool.fetch`` is still honored. The direct-pool read
+    methods (``get_release``, ``autocomplete_tracks``, ``validate_track_on_release``)
+    keep calling ``pool.fetch`` / ``pool.fetchrow`` / ``pool.fetchval`` unchanged.
+    """
+    conn = AsyncMock()
+    conn.execute = AsyncMock()
+
+    async def _delegating_fetch(*args, **kwargs):
+        return await pool.fetch(*args, **kwargs)
+
+    conn.fetch = AsyncMock(side_effect=_delegating_fetch)
+
+    tx_ctx = MagicMock()
+    tx_ctx.__aenter__ = AsyncMock(return_value=tx_ctx)
+    tx_ctx.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx_ctx)
+
+    acq_ctx = MagicMock()
+    acq_ctx.__aenter__ = AsyncMock(return_value=conn)
+    acq_ctx.__aexit__ = AsyncMock(return_value=False)
+    pool.acquire = MagicMock(return_value=acq_ctx)
+    pool._mock_conn = conn
+    return pool
 
 
 class TestCacheFallbackOnCorruptedData:
@@ -21,7 +55,7 @@ class TestCacheFallbackOnCorruptedData:
     def corrupt_pool(self):
         """AsyncMock pool that simulates various corrupted DB states."""
         pool = AsyncMock()
-        return pool
+        return _wire_acquire_to_conn(pool)
 
     @pytest.fixture
     def cache_service(self, corrupt_pool):
@@ -144,7 +178,7 @@ class TestCacheDegradationLogging:
     @pytest.mark.asyncio
     async def test_search_error_is_logged(self, caplog):
         """DB errors during search are logged as errors."""
-        pool = AsyncMock()
+        pool = _wire_acquire_to_conn(AsyncMock())
         pool.fetch = AsyncMock(side_effect=Exception("connection reset by peer"))
         service = DiscogsCacheService(pool)
 

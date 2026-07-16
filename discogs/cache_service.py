@@ -12,11 +12,14 @@ The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 import asyncio
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field, fields
 
+import asyncpg
 from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
+from config.settings import get_settings
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import async_cached, create_ttl_cache
 from discogs.models import (
@@ -320,6 +323,69 @@ ORDER BY mt.sim DESC\
 """
 
 
+# --- LML#804 search-arm bounds ------------------------------------------------
+#
+# The two trigram search arms on the discogs-cache pool (``search_releases`` /
+# ``search_releases_by_track``) each run their query inside a ``SET LOCAL``
+# transaction pinning BOTH ``statement_timeout`` and ``work_mem``. ``SET LOCAL``
+# reverts at transaction end, so the bounds never touch the pool session or any
+# write path sharing the pool (api_fetch cache writes, entity.identity
+# write-backs, bulk-drain write-backs). Same posture as
+# ``artist_trigram_candidates`` and its ``_SET_PG_TRGM_FLOOR_SQL`` above.
+#
+#   statement_timeout — bounds a runaway trigram scan to a hard ceiling ABOVE
+#   the largest LEGITIMATE caller budget (Backend-Service ~5s), so it catches
+#   only true runaways, not steady-state queries. A timed-out query surfaces as
+#   ``asyncpg.QueryCanceledError``, which the search arms map into
+#   ``CacheUnavailableError`` — the degrade-to-cache-only boundary the
+#   fallthrough seam already arms on (``_ARMING_EXCEPTIONS``), per LML#755's
+#   "couldn't ask" principle — freeing the pool slot and the /lookup in-flight
+#   cap slot at once instead of 500ing.
+#
+#   work_mem — 128MB keeps the trigram bitmap heap scans from going lossy and
+#   recheck-storming under degraded latency (the 2026-05-25 pg_trgm finding:
+#   ~92s at the default 4MB vs ~12.7s with a large work_mem). Bounded on
+#   purpose: per-connection allocations multiply by pool size on the shared 8GB
+#   Railway instance, so NOT 1GB. Empirical prod tuning is a separate follow-up
+#   (LML#806).
+#
+# Both knobs are settings-wired (``config/settings.py``) with the documented
+# defaults; see ``docs/env-vars.md``.
+
+# Postgres memory-value grammar (digits + optional unit). ``work_mem`` is
+# interpolated into the ``SET LOCAL`` string (Postgres ``SET`` takes no bind
+# params), so the operator-supplied value is validated against this before
+# interpolation — defense in depth against an injected ``SET LOCAL`` fragment.
+_WORK_MEM_RE = re.compile(r"^\d+(kB|MB|GB|TB)?$")
+
+
+def _build_search_bounds_sql(statement_timeout_ms: int, work_mem: str) -> str:
+    """Build the ``SET LOCAL`` preamble bounding a trigram search-arm transaction.
+
+    Returns a two-statement ``SET LOCAL`` string (``statement_timeout`` in ms,
+    then ``work_mem``) to run on the acquired connection before the trigram
+    fetch. Both values are validated because they are interpolated, not bound:
+    ``statement_timeout_ms`` is coerced through ``int`` and must be >= 1;
+    ``work_mem`` must match Postgres' ``<digits><unit>`` grammar.
+
+    Args:
+        statement_timeout_ms: Per-transaction ``statement_timeout`` in ms.
+        work_mem: Per-transaction ``work_mem`` (e.g. ``"128MB"``).
+
+    Raises:
+        ValueError: If ``statement_timeout_ms`` < 1, or ``work_mem`` is not a
+            valid Postgres memory value.
+    """
+    timeout = int(statement_timeout_ms)
+    if timeout < 1:
+        raise ValueError(f"statement_timeout_ms must be >= 1, got {statement_timeout_ms!r}")
+    if not _WORK_MEM_RE.match(work_mem):
+        raise ValueError(
+            f"work_mem {work_mem!r} is not a valid Postgres memory value (e.g. '128MB')"
+        )
+    return f"SET LOCAL statement_timeout = {timeout}; SET LOCAL work_mem = '{work_mem}'"
+
+
 def _negative_cache_key_hash(artist: str | None, track: str, artist_as_keyword: bool) -> bytes:
     """Hash the (artist, track, artist_as_keyword) tuple into a stable 32-byte key.
 
@@ -346,13 +412,39 @@ class DiscogsCacheService:
     for searching and retrieving cached Discogs data.
     """
 
-    def __init__(self, pool):
+    def __init__(
+        self,
+        pool,
+        *,
+        search_statement_timeout_ms: int | None = None,
+        search_work_mem: str | None = None,
+    ):
         """Initialize the cache service with a connection pool.
 
         Args:
-            pool: asyncpg connection pool
+            pool: asyncpg connection pool.
+            search_statement_timeout_ms: Per-transaction ``statement_timeout``
+                (ms) for the trigram search arms (LML#804). Defaults to
+                ``settings.discogs_search_statement_timeout_ms``. Injectable so
+                tests can pin a tiny ceiling.
+            search_work_mem: Per-transaction ``work_mem`` for the trigram
+                search arms (LML#804). Defaults to
+                ``settings.discogs_search_work_mem``.
         """
         self.pool = pool
+        settings = get_settings()
+        timeout_ms = (
+            search_statement_timeout_ms
+            if search_statement_timeout_ms is not None
+            else settings.discogs_search_statement_timeout_ms
+        )
+        work_mem = (
+            search_work_mem if search_work_mem is not None else settings.discogs_search_work_mem
+        )
+        # Built once at construction so the per-query hot path only executes the
+        # already-validated string (and a bad operator value fails loudly at
+        # construction, not on the first real search).
+        self._search_bounds_sql = _build_search_bounds_sql(timeout_ms, work_mem)
 
     async def is_available(self) -> bool:
         """Check if the cache database is available."""
@@ -477,7 +569,12 @@ class DiscogsCacheService:
         try:
             sql = _SEARCH_BY_TRACK_SQL if artist is None else _SEARCH_BY_TRACK_ARTIST_SQL
 
-            rows = await self.pool.fetch(sql, track, limit * 2, artist)
+            # LML#804: bound the trigram scan with a per-transaction SET LOCAL
+            # (statement_timeout + work_mem). SET LOCAL reverts at transaction
+            # end, so the write-serving pool session is untouched.
+            async with self.pool.acquire() as conn, conn.transaction():
+                await conn.execute(self._search_bounds_sql)
+                rows = await conn.fetch(sql, track, limit * 2, artist)
 
             results = []
             seen_albums = set()
@@ -505,6 +602,18 @@ class DiscogsCacheService:
 
             return results
 
+        except asyncpg.QueryCanceledError as e:
+            # LML#804: statement_timeout tripped. Degrade to cache-only —
+            # CacheUnavailableError is in the fallthrough seam's
+            # _ARMING_EXCEPTIONS, so "couldn't ask" reads as unknown, never a
+            # confirmed-empty verdict (LML#755). The pool slot and the /lookup
+            # in-flight cap slot are already freed by the acquire/transaction
+            # exit above; do NOT let this escape to the router → 500.
+            logger.warning(
+                "search_releases_by_track exceeded statement_timeout (degrading to cache-only): %s",
+                e,
+            )
+            raise CacheUnavailableError(f"Cache search timed out: {e}") from e
         except Exception as e:
             logger.error(f"Cache search failed: {e}")
             raise CacheUnavailableError(f"Cache search failed: {e}") from e
@@ -1408,7 +1517,7 @@ class DiscogsCacheService:
                     ORDER BY score DESC
                     LIMIT $3
                 """
-                rows = await self.pool.fetch(query, album, artist, limit * 2)
+                params: tuple = (album, artist, limit * 2)
             elif artist:
                 query = f"""
                     SELECT DISTINCT ON (r.id)
@@ -1426,7 +1535,7 @@ class DiscogsCacheService:
                     ORDER BY score DESC
                     LIMIT $2
                 """
-                rows = await self.pool.fetch(query, artist, limit * 2)
+                params = (artist, limit * 2)
             else:  # album only
                 query = f"""
                     SELECT DISTINCT ON (r.id)
@@ -1444,7 +1553,14 @@ class DiscogsCacheService:
                     ORDER BY score DESC
                     LIMIT $2
                 """
-                rows = await self.pool.fetch(query, album, limit * 2)
+                params = (album, limit * 2)
+
+            # LML#804: bound the trigram scan with a per-transaction SET LOCAL
+            # (statement_timeout + work_mem). SET LOCAL reverts at transaction
+            # end, so the write-serving pool session is untouched.
+            async with self.pool.acquire() as conn, conn.transaction():
+                await conn.execute(self._search_bounds_sql)
+                rows = await conn.fetch(query, *params)
 
             results = []
             seen_titles = set()
@@ -1469,6 +1585,18 @@ class DiscogsCacheService:
 
             return results
 
+        except asyncpg.QueryCanceledError as e:
+            # LML#804: statement_timeout tripped. Degrade to cache-only —
+            # CacheUnavailableError is in the fallthrough seam's
+            # _ARMING_EXCEPTIONS, so "couldn't ask" reads as unknown, never a
+            # confirmed-empty verdict (LML#755). The pool slot and the /lookup
+            # in-flight cap slot are already freed by the acquire/transaction
+            # exit above; do NOT let this escape to the router → 500.
+            logger.warning(
+                "search_releases exceeded statement_timeout (degrading to cache-only): %s",
+                e,
+            )
+            raise CacheUnavailableError(f"Cache search_releases timed out: {e}") from e
         except Exception as e:
             logger.error(f"Cache search_releases failed: {e}")
             raise CacheUnavailableError(f"Cache search_releases failed: {e}") from e

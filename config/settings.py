@@ -107,6 +107,39 @@ class Settings(BaseSettings):
         default=1000, description="Maximum entries in Discogs caches"
     )
 
+    # Discogs-cache trigram search-arm bounds (LML#804). Applied per-transaction
+    # via SET LOCAL on the two trigram search arms (`search_releases`,
+    # `search_releases_by_track`) so they revert at transaction end and never
+    # touch the write-serving pool session.
+    discogs_search_statement_timeout_ms: int = Field(
+        default=10000,
+        ge=1,
+        description=(
+            "Per-transaction statement_timeout (ms) on the discogs-cache trigram search "
+            "arms. Bounds a runaway scan to a hard ceiling ABOVE the largest legitimate "
+            "caller budget (Backend-Service ~5s), so it catches only true runaways, not "
+            "steady-state queries. A timed-out query surfaces as asyncpg.QueryCanceledError, "
+            "which the search arms map into CacheUnavailableError (degrade to cache-only, "
+            "never a 500), freeing the pool slot and the /lookup in-flight cap slot at once. "
+            "Applied via SET LOCAL, so it never touches the write-serving pool session. "
+            "Must be >= 1. See WXYC/library-metadata-lookup#804."
+        ),
+    )
+    discogs_search_work_mem: str = Field(
+        default="128MB",
+        description=(
+            "Per-transaction work_mem on the discogs-cache trigram search arms, as a "
+            "Postgres memory value (e.g. '128MB'). Default work_mem (4MB) makes the trigram "
+            "bitmap heap scans go lossy and recheck-storm under degraded latency (~92s vs "
+            "~12.7s with a large work_mem, per the 2026-05-25 pg_trgm finding). Bounded on "
+            "purpose: per-connection allocations multiply by pool size on the shared 8GB "
+            "Railway instance, so NOT 1GB — 128MB is a safe default; empirical prod tuning "
+            "is a separate follow-up (WXYC/library-metadata-lookup#806). Applied via SET "
+            "LOCAL so it never touches the write-serving pool session. See "
+            "WXYC/library-metadata-lookup#804."
+        ),
+    )
+
     # Library Cache Configuration
     library_cache_ttl: int = Field(
         default=3600,
