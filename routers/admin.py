@@ -387,10 +387,12 @@ async def upload_streaming_db(
 
     with tempfile.TemporaryDirectory(prefix="lml-streaming-upload-") as td:
         tdir = Path(td)
-        # Scratch file for the upload. A post-validation read fault on it is
-        # classified 500 (not 409) by the ``except`` around the
-        # ``_streaming_coverage(upload_tmp)`` call below, since the upload has
-        # already passed albums-count validation -- the suffix is not load-bearing.
+        # The upload scratch file MUST end in ``.tmp`` and the baseline temp below
+        # must NOT: test_unreadable_uploaded_tmp_after_validation_is_500 monkeypatches
+        # ``_streaming_coverage`` to fault only on ``.tmp`` paths, which is how it
+        # exercises a post-validation read fault on the *upload* (classified 500 by
+        # the ``except`` around ``_streaming_coverage(upload_tmp)`` below) without
+        # also faulting the *baseline* read. Don't rename these two temp files.
         upload_tmp = tdir / "upload.tmp"
 
         try:
