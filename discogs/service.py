@@ -985,6 +985,79 @@ class DiscogsService:
 
         return results
 
+    async def search_release_ids_by_artist(self, name: str, *, limit: int = 10) -> list[int] | None:
+        """Discover an artist's release IDs — one ``type=release`` page (LML#781).
+
+        The cache-miss fallback primitive for the bulk artist-genres endpoint:
+        ``/database/search?type=release&artist=<name>``, a single page. The
+        caller fans out ``get_release`` over the returned IDs (bounded by
+        ``limit``) to sample the artist's genre/style distribution while
+        persisting each release to the discogs-cache.
+
+        API-only — a cache-miss artist has no ``release_artist`` rows to read,
+        so this is the only way to locate their releases. Homonym caveat: the
+        Discogs search matches by artist *name*, not the (unknown-to-search)
+        Discogs artist ID, so callers with a ``discogs_artist_id`` should rely
+        on the cache path for homonym safety; this fallback is best-effort.
+
+        The ``list``-vs-``None`` distinction mirrors ``search_artists``:
+
+        - ``list`` (possibly empty): Discogs answered. ``[]`` means "asked, this
+          artist has no releases" — a confirmed-empty measurement.
+        - ``None``: couldn't ask — 429-exhausted, network error, non-2xx, or an
+          unparseable body. Callers must treat it as *unknown*, never as a
+          confirmed-empty verdict.
+
+        Returns release IDs in Discogs' search-relevance order, deduplicated,
+        capped at ``limit``.
+
+        Raises:
+            ValueError: on a blank/whitespace-only ``name`` — a caller error,
+                not a measurement (the endpoint short-circuits blank names
+                before reaching this tier).
+            DiscogsBreakerOpenError: propagated from ``_request_with_retry`` when
+                the LML#755 saturation breaker sheds the call, so the caller can
+                mark the artist ``unavailable`` rather than pay one shed per
+                remaining release.
+        """
+        if not name or not name.strip():
+            raise ValueError("search_release_ids_by_artist requires a non-blank name")
+
+        params: dict[str, Any] = {"type": "release", "artist": name, "per_page": limit}
+
+        add_discogs_breadcrumb("search_release_ids_by_artist", {"name": name})
+        with request_context("search_release_ids_by_artist"):
+            async with timed_api():
+                response = await self._request_with_retry("GET", "/database/search", params=params)
+
+        if response is None:
+            return None
+        get_cache_stats_recorder().record_api_call()
+
+        try:
+            response.raise_for_status()
+            data = response.json()
+            raw_items = data.get("results", [])
+            if not isinstance(raw_items, list):
+                raise TypeError(f"'results' is {type(raw_items).__name__}, not a list")
+        except Exception as e:
+            # Couldn't obtain a contract-shaped envelope: non-2xx, JSON decode
+            # failure, or a body that isn't the results-object shape. "Couldn't
+            # ask", not a confirmed-empty measurement.
+            logger.warning(f"search_release_ids_by_artist failed for '{name}': {e}")
+            return None
+
+        release_ids: list[int] = []
+        seen: set[int] = set()
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            release_id = item.get("id")
+            if isinstance(release_id, int) and release_id > 0 and release_id not in seen:
+                release_ids.append(release_id)
+                seen.add(release_id)
+        return release_ids[:limit]
+
     def _process_search_result(self, result: dict, seen_albums: set) -> ReleaseInfo | None:
         """Process a single search result into a ReleaseInfo.
 

@@ -717,6 +717,75 @@ class DiscogsCacheService:
             logger.error(f"Cache search_artists_by_name failed: {e}")
             raise CacheUnavailableError(f"Cache search_artists_by_name failed: {e}") from e
 
+    async def aggregate_artist_genre_style(
+        self,
+        *,
+        artist_id: int | None,
+        artist_name: str,
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        """Frequency-aggregate Discogs genres/styles across an artist's releases (LML#781).
+
+        Counts ``release_genre`` / ``release_style`` rows across the releases the
+        artist is a *primary* credit on (``release_artist.extra = 0``), keyed on
+        the stable ``artist_id`` when provided, else a case-insensitive exact
+        ``artist_name`` match. Each release contributes each genre/style at most
+        once (``COUNT(DISTINCT release_id)``) so a genre that recurs across an
+        artist's catalog outranks a one-off, and duplicate child rows or the
+        artist↔genre join fan-out never inflate a single release's weight.
+
+        The genre/style *ranking* + top-K truncation is deliberately NOT done
+        here — it lives in ``artists/genre_aggregation.py`` so it is unit-testable
+        without a database and shared with the Discogs-API fallback path.
+
+        Args:
+            artist_id: Discogs artist ID; preferred key (stable, homonym-safe).
+            artist_name: Artist display name; the fallback key when
+                ``artist_id`` is ``None``.
+
+        Returns:
+            ``(genre_counts, style_counts)`` — each a ``{name: count}`` dict.
+            Both empty on no match (the caller's cache-miss signal).
+
+        Raises:
+            CacheUnavailableError: If the database is unreachable. The
+                genre/style child tables not existing yet (pre-rebuild pipeline)
+                surfaces here too; the caller degrades to the API fallback.
+        """
+        if artist_id is not None:
+            predicate = "ra.artist_id = $1"
+            param: int | str = artist_id
+        else:
+            predicate = "lower(ra.artist_name) = lower($1)"
+            param = artist_name
+
+        genre_query = f"""
+            SELECT rg.genre AS name, COUNT(DISTINCT ra.release_id) AS n
+            FROM release_artist ra
+            JOIN release_genre rg ON rg.release_id = ra.release_id
+            WHERE ra.extra = 0 AND {predicate}
+            GROUP BY rg.genre
+        """
+        style_query = f"""
+            SELECT rs.style AS name, COUNT(DISTINCT ra.release_id) AS n
+            FROM release_artist ra
+            JOIN release_style rs ON rs.release_id = ra.release_id
+            WHERE ra.extra = 0 AND {predicate}
+            GROUP BY rs.style
+        """
+
+        try:
+            genre_rows, style_rows = await asyncio.gather(
+                self.pool.fetch(genre_query, param),
+                self.pool.fetch(style_query, param),
+            )
+        except Exception as e:
+            logger.error(f"Cache aggregate_artist_genre_style failed: {e}")
+            raise CacheUnavailableError(f"Cache aggregate_artist_genre_style failed: {e}") from e
+
+        genre_counts = {row["name"]: row["n"] for row in genre_rows}
+        style_counts = {row["name"]: row["n"] for row in style_rows}
+        return genre_counts, style_counts
+
     async def artist_equality_candidates(
         self, forms: list[str]
     ) -> dict[str, ArtistEqualityCandidates]:
