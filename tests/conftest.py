@@ -80,6 +80,30 @@ def _reset_bulk_global_permit():
 
 
 @pytest.fixture(autouse=True)
+def _reset_object_store_singleton():
+    """Suite-wide reset of the WXYC#835 process-global object store.
+
+    ``core.dependencies._object_store`` is a lazily built process-global
+    (:class:`LocalDirStore` or :class:`S3ObjectStore`) cached on first
+    ``get_object_store`` call. The admin streaming-DB endpoints (WXYC#836)
+    resolve it, and each of their tests roots a fresh ``LocalDirStore`` at its
+    own ``tmp_path`` (via an overridden ``get_settings``) or overrides the store
+    outright for bucket mode. Left unreset, the FIRST such test's store would be
+    reused by every later one — a stale ``tmp_path`` baseline read as another
+    test's on-disk file, or a moto-backed S3 store leaking past its
+    ``mock_aws`` context. Autouse at the root (not per-file) because both the
+    unit guard suite and the integration round-trip touch it, and the reset is
+    one attribute write. Nothing to close: neither store holds a persistent
+    connection.
+    """
+    from core import dependencies as _core_deps
+
+    _core_deps._object_store = None
+    yield
+    _core_deps._object_store = None
+
+
+@pytest.fixture(autouse=True)
 def _reset_lookup_inflight_cap():
     """Suite-wide reset of the LML#706 ``/lookup`` in-flight semaphore.
 

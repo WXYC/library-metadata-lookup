@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -11,16 +12,18 @@ from typing import Literal
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, UploadFile
 from fastapi import Path as PathParam
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from config.settings import Settings, get_settings
 from core.dependencies import (
     close_library_db,
     get_discogs_cache_service_from_pool,
+    get_object_store,
 )
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.memory_cache import evict_cached
 from discogs.service import DiscogsService
+from storage.object_store import ObjectNotFoundError, ObjectStore
 
 logger = logging.getLogger(__name__)
 
@@ -44,19 +47,14 @@ _STREAMING_COVERAGE_METRICS = ("apple_url", "spotify_url", "deezer_url", "albums
 _background_tasks: set[asyncio.Task] = set()
 
 
-def _streaming_db_path(settings: Settings) -> Path:
-    """Sibling of library.db on the Railway volume."""
-    return settings.resolved_library_db_path.parent / STREAMING_DB_FILENAME
-
-
 class StreamingCoverageUnreadableError(Exception):
-    """A streaming_availability.db file exists on disk but could not be read.
+    """A streaming_availability.db object exists but could not be read.
 
-    Distinguishes "no prior file" (a legitimate first upload) from "prior file
+    Distinguishes "no prior object" (a legitimate first upload) from "prior object
     present but unreadable" so the upload guard can fail *closed* on the latter:
     waving an upload through because the baseline read failed would re-open the
-    288-Apple-URLs -> 0 hole the guard exists to plug, precisely when the disk is
-    flaky.
+    288-Apple-URLs -> 0 hole the guard exists to plug, precisely when the stored
+    object is corrupt.
     """
 
 
@@ -347,7 +345,7 @@ async def upload_library_db(
         403: {"description": "Invalid or missing token"},
         409: {
             "description": "Refused (use force=true): either a coverage regression vs the "
-            "file on disk, or the on-disk file is present but unreadable. The JSON `detail` "
+            "stored object, or the stored object is present but unreadable. The JSON `detail` "
             "carries an `error` discriminator; the regression variant also includes a "
             "`regressions` list."
         },
@@ -358,112 +356,135 @@ async def upload_streaming_db(
     file: UploadFile,
     force: bool = False,
     settings: Settings = Depends(get_settings),
+    object_store: ObjectStore = Depends(get_object_store),
     authorization: str | None = Header(None),
 ):
-    """Store a streaming_availability.db backup on the Railway volume.
+    """Store a streaming_availability.db backup in the object store.
 
     This is the canonical copy the daily library-sync reads (LML#672), so the
-    upload is a full-file replace guarded against coverage regression. It is first
-    validated as SQLite with an 'albums' table (400 on failure), then the guard
-    runs and rejects the upload with **409** when either:
+    upload is a full-object replace guarded against coverage regression. It is
+    first validated as SQLite with an 'albums' table (400 on failure), then the
+    guard runs and rejects the upload with **409** when either:
 
     * any of {apple_url, spotify_url, deezer_url, albums, track_results} drops
-      below prior * (1 - tolerance) or goes non-zero -> zero versus the file
-      currently on disk -- ``detail`` is ``{error, regressions, hint}``; or
-    * the on-disk file exists but cannot be read, so there is no baseline to
+      below prior * (1 - tolerance) or goes non-zero -> zero versus the object
+      currently stored -- ``detail`` is ``{error, regressions, hint}``; or
+    * the stored object exists but cannot be read, so there is no baseline to
       compare against -- ``detail`` is ``{error, hint}`` (no ``regressions``).
 
     Branch on ``detail['error']``; ``regressions`` is only present for the first
     case. Pass ``?force=true`` to override either rejection (logged loudly).
+
+    The storage backend (:class:`~storage.object_store.ObjectStore`) is
+    selected once per deployment (WXYC#836): a Railway Bucket in prod, a local
+    directory in dev/tests. The coverage guard's semantics are identical in both
+    modes -- a **missing** object (S3 404 / absent file) reads as the all-zero
+    first-upload baseline and is accepted, while a present-but-**unreadable**
+    object fails closed at 409. ``put`` is atomic per object (S3 PUT; the local
+    store does tmp + ``os.replace``), so no replace dance is needed here.
     """
     _validate_auth(settings, authorization)
 
-    db_path = _streaming_db_path(settings)
-    tmp_path = db_path.with_suffix(db_path.suffix + ".tmp")
+    with tempfile.TemporaryDirectory(prefix="lml-streaming-upload-") as td:
+        tdir = Path(td)
+        # The upload scratch file keeps the ``.tmp`` suffix the coverage read is
+        # keyed on so a post-validation read fault is still classified 500.
+        upload_tmp = tdir / "upload.tmp"
 
-    try:
-        content = await file.read()
-        tmp_path.write_bytes(content)
-    except Exception as e:
-        logger.error(f"Failed to write uploaded streaming DB: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to write file: {e}") from e
+        try:
+            content = await file.read()
+            upload_tmp.write_bytes(content)
+        except Exception as e:
+            logger.error(f"Failed to write uploaded streaming DB: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to write file: {e}") from e
 
-    try:
-        conn = sqlite3.connect(str(tmp_path))
-        row_count = conn.execute("SELECT count(*) FROM albums").fetchone()[0]
-        conn.close()
-    except Exception as e:
-        tmp_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid SQLite database: {e}",
-        ) from e
+        try:
+            conn = sqlite3.connect(str(upload_tmp))
+            row_count = conn.execute("SELECT count(*) FROM albums").fetchone()[0]
+            conn.close()
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid SQLite database: {e}",
+            ) from e
 
-    # Coverage-regression guard (LML#672): compare against the live on-disk file
-    # at replace time (not an uploader-supplied baseline). A stale-content writer
-    # that genuinely lost coverage is rejected on the regression and re-applies on
-    # its next cycle. (This is eventual rejection across cycles, not a lock across
-    # concurrent uploads -- the two writers here, a weekly cron and a rare manual
-    # run, are effectively non-concurrent.)
-    try:
-        old_cov = _streaming_coverage(db_path)
-    except StreamingCoverageUnreadableError:
-        # The existing file is present but unreadable, so there is no baseline to
-        # compare against. Fail closed rather than fail open: treating it as a
-        # first upload would accept any thin replacement. force=true overrides.
-        if force:
-            logger.warning(
-                "On-disk streaming DB unreadable but force=true; "
-                "replacing without a coverage baseline."
-            )
+        # Coverage-regression guard (LML#672): compare against the object currently
+        # stored (not an uploader-supplied baseline). A stale-content writer that
+        # genuinely lost coverage is rejected on the regression and re-applies on
+        # its next cycle. (Eventual rejection across cycles, not a lock across
+        # concurrent uploads -- the two writers here, a weekly cron and a rare
+        # manual run, are effectively non-concurrent.)
+        try:
+            baseline_bytes = await object_store.get(STREAMING_DB_FILENAME)
+        except ObjectNotFoundError:
+            # No stored object -> the first-upload baseline (all-zero coverage);
+            # the regression check skips zero baselines, so the upload is accepted.
             old_cov = dict.fromkeys(_STREAMING_COVERAGE_METRICS, 0)
         else:
-            tmp_path.unlink(missing_ok=True)
-            logger.warning("Rejected streaming upload: on-disk streaming DB unreadable.")
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "existing streaming DB unreadable; refusing to replace blind",
-                    "hint": "retry once the volume is readable, or pass force=true to override",
-                },
-            ) from None
-    try:
-        new_cov = _streaming_coverage(tmp_path)
-    except StreamingCoverageUnreadableError as e:
-        # The upload already passed the albums-count validation above, so this is a
-        # server-side read fault on a file we just wrote and validated, not a bad
-        # client upload -- surface it as 500 so a retry-on-5xx caller retries.
-        tmp_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Uploaded streaming DB became unreadable after validation: {e}",
-        ) from e
-    regressions = _check_streaming_regression(old_cov, new_cov)
-    if regressions:
-        if force:
-            logger.warning(
-                "Streaming upload regresses coverage but force=true; replacing anyway. "
-                "Regressions: %s",
-                regressions,
-            )
-        else:
-            tmp_path.unlink(missing_ok=True)
-            logger.warning(
-                "Rejected streaming upload: coverage regression vs on-disk file. %s",
-                regressions,
-            )
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "streaming coverage regression",
-                    "regressions": regressions,
-                    "hint": "re-run as a round-trip (download -> modify -> upload), "
-                    "or pass force=true to override",
-                },
-            )
+            baseline_tmp = tdir / "baseline.db"
+            baseline_tmp.write_bytes(baseline_bytes)
+            try:
+                old_cov = _streaming_coverage(baseline_tmp)
+            except StreamingCoverageUnreadableError:
+                # The stored object is present but unreadable, so there is no
+                # baseline to compare against. Fail closed rather than fail open:
+                # treating it as a first upload would accept any thin replacement.
+                # force=true overrides.
+                if force:
+                    logger.warning(
+                        "Stored streaming DB unreadable but force=true; "
+                        "replacing without a coverage baseline."
+                    )
+                    old_cov = dict.fromkeys(_STREAMING_COVERAGE_METRICS, 0)
+                else:
+                    logger.warning("Rejected streaming upload: stored streaming DB unreadable.")
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "existing streaming DB unreadable; refusing to replace blind",
+                            "hint": "retry once the stored object is readable, "
+                            "or pass force=true to override",
+                        },
+                    ) from None
 
-    os.replace(str(tmp_path), str(db_path))
-    logger.info(f"Streaming database backed up: {db_path} ({row_count} albums)")
+        try:
+            new_cov = _streaming_coverage(upload_tmp)
+        except StreamingCoverageUnreadableError as e:
+            # The upload already passed the albums-count validation above, so this
+            # is a server-side read fault on a file we just wrote and validated, not
+            # a bad client upload -- surface it as 500 so a retry-on-5xx caller
+            # retries.
+            raise HTTPException(
+                status_code=500,
+                detail=f"Uploaded streaming DB became unreadable after validation: {e}",
+            ) from e
+
+        regressions = _check_streaming_regression(old_cov, new_cov)
+        if regressions:
+            if force:
+                logger.warning(
+                    "Streaming upload regresses coverage but force=true; replacing anyway. "
+                    "Regressions: %s",
+                    regressions,
+                )
+            else:
+                logger.warning(
+                    "Rejected streaming upload: coverage regression vs stored object. %s",
+                    regressions,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "streaming coverage regression",
+                        "regressions": regressions,
+                        "hint": "re-run as a round-trip (download -> modify -> upload), "
+                        "or pass force=true to override",
+                    },
+                )
+
+        await object_store.put(STREAMING_DB_FILENAME, upload_tmp)
+
+    logger.info("Streaming database backed up to the object store (%d albums)", row_count)
 
     return JSONResponse(
         content={
@@ -484,32 +505,36 @@ async def upload_streaming_db(
         },
         401: {"description": "Missing authorization"},
         403: {"description": "Invalid or missing token"},
-        404: {"description": "streaming_availability.db not present on the volume"},
+        404: {"description": "streaming_availability.db not present in the store"},
     },
 )
 async def download_streaming_db(
     settings: Settings = Depends(get_settings),
+    object_store: ObjectStore = Depends(get_object_store),
     authorization: str | None = Header(None),
 ):
-    """Stream the current streaming_availability.db from the Railway volume.
+    """Stream the current streaming_availability.db from the object store.
 
     Symmetric with `POST /admin/upload-streaming-db`. Lets the daily
     library-sync pipeline (WXYC/discogs-etl) read the file directly from the
-    volume instead of round-tripping it through a GitHub Release.
+    store instead of round-tripping it through a GitHub Release. The whole
+    object (~53MB) is buffered and returned in one response; that egress is
+    negligible at weekly cadence.
     """
     _validate_auth(settings, authorization)
 
-    db_path = _streaming_db_path(settings)
-    if not db_path.exists():
+    try:
+        data = await object_store.get(STREAMING_DB_FILENAME)
+    except ObjectNotFoundError:
         raise HTTPException(
             status_code=404,
-            detail=f"{STREAMING_DB_FILENAME} not found on volume",
-        )
+            detail=f"{STREAMING_DB_FILENAME} not found in the store",
+        ) from None
 
-    return FileResponse(
-        path=db_path,
+    return Response(
+        content=data,
         media_type="application/octet-stream",
-        filename=STREAMING_DB_FILENAME,
+        headers={"content-disposition": f'attachment; filename="{STREAMING_DB_FILENAME}"'},
     )
 
 
