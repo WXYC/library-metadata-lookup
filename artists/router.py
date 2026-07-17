@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+from collections import Counter
 from typing import TYPE_CHECKING
 
 import sentry_sdk
@@ -27,6 +28,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
 
 from artists.composer import ArtistSearchAliasesComposer
+from artists.genre_aggregation import resolve_artist_genres
+from artists.genre_models import (
+    ArtistGenresResultItem,
+    BulkArtistGenresRequest,
+    BulkArtistGenresResponse,
+)
 from artists.resolver import BareNameArtistResolver, InvalidNameError
 from core.bulk_body import TRANSIENT_PG_ERRORS, parse_bulk_body, resolve_input_cap
 from core.dependencies import (
@@ -57,6 +64,15 @@ _RESOLVE_INPUT_CAP = resolve_input_cap(ArtistResolveBulkRequest, "names")
 
 _ROUTE_PATH = "/api/v1/artists/search-aliases/bulk"
 _RESOLVE_ROUTE_PATH = "/api/v1/artists/resolve/bulk"
+_GENRES_ROUTE_PATH = "/api/v1/artists/genres/bulk"
+
+# Per-request artist cap for the bulk artist-genres endpoint (LML#781). Local
+# (not api.yaml-sourced) because the wire-contract addition is a separate
+# wxyc-shared commit — see ``artists/genre_models.py``. Aligned with the
+# resolve endpoint's 25: an all-cache-miss batch fans out ~1 +
+# FALLBACK_MAX_RELEASES Discogs calls per artist, so 25 keeps the worst case
+# inside Railway's ~5-minute request-timeout ceiling. Callers page.
+_GENRES_INPUT_CAP = 25
 
 _ENTITY_STORE_UNAVAILABLE_DETAIL = (
     "Entity store is not available. Ensure DATABASE_URL_DISCOGS is configured "
@@ -379,3 +395,133 @@ async def resolve_bulk(
         " ".join(f"{key}={value}" for key, value in summary.items()),
     )
     return ArtistResolveBulkResponse(results=results)
+
+
+@router.post(
+    "/artists/genres/bulk",
+    response_model=BulkArtistGenresResponse,
+    summary="Bulk artist-level Discogs genre/style aggregation",
+    description=(
+        "Aggregates per-artist Discogs *genres* (coarse, top 1-2) and *styles* "
+        "(fine, full ranked list) from the discogs-cache `release_genre` / "
+        "`release_style` rows, keyed on `discogs_artist_id` when supplied else a "
+        "case-insensitive `artist_name` match. On a cache miss the Discogs API "
+        "fallback discovers the artist's releases and fetches each through the "
+        "cached `get_release` write-back (persisting genre/style rows so the next "
+        "call hits the cache). Server-to-server; consumed by Backend-Service's "
+        "nightly concerts enrichment (WXYC/Backend-Service#1624). WXYC's internal "
+        "library genre taxonomy is deliberately never surfaced here."
+    ),
+    responses={
+        200: {
+            "description": "Per-artist genre/style aggregations, index-aligned with the request."
+        },
+        400: {"description": "Malformed JSON body."},
+        401: {"description": "Missing `Authorization` header."},
+        403: {"description": "Present but invalid/malformed `LML_API_KEY` bearer token."},
+        413: {"description": "Batch exceeded the per-request artist cap."},
+        422: {"description": "Request body failed Pydantic validation (e.g. empty batch)."},
+        499: {"description": "Client closed the connection before the batch finished."},
+        503: {"description": "Discogs cache not available."},
+    },
+)
+async def genres_bulk(
+    http_request: Request,
+    discogs_cache: DiscogsCacheService | None = Depends(get_discogs_cache_service_from_pool),
+    discogs_service: DiscogsService | None = Depends(get_discogs_service),
+) -> BulkArtistGenresResponse:
+    """Bulk artist genre/style aggregation (LML#781).
+
+    Cache-first: the discogs-cache aggregation always answers when the pool is
+    up. A missing Discogs service (no token) or a saturation-breaker shed
+    degrades a per-artist cache miss to `source="unavailable"` — never a
+    batch-level 503 for a Discogs outage; only a cache-pool failure 503s.
+
+    Artists are processed sequentially: the cache reads are cheap, and running
+    the (rare) API-fallback legs serially inherits the shared Discogs limiter's
+    global pacing without the intra-request fan-out that would starve
+    interleaved live-lookup traffic (the LML#370/#372 cascade-cascade lesson).
+    """
+    request = await parse_bulk_body(
+        http_request, BulkArtistGenresRequest, _GENRES_INPUT_CAP, field="artists"
+    )
+
+    if discogs_cache is None:
+        raise HTTPException(status_code=503, detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL)
+
+    artists = request.artists
+    logger.info("artist-genres bulk start: artists=%d", len(artists))
+
+    with sentry_sdk.start_span(op="http.server", name=f"POST {_GENRES_ROUTE_PATH}") as http_span:
+        http_span.set_data("http.method", "POST")
+        http_span.set_data("http.target", _GENRES_ROUTE_PATH)
+        http_span.set_data("lml.artist_genres.artists", len(artists))
+
+        try:
+            results: list[ArtistGenresResultItem] = []
+            for item in artists:
+                # Free the shared Discogs rate-limit budget promptly if the
+                # client walks away mid-batch (mirrors the bulk family's
+                # watch_disconnect 499, adapted to the sequential loop).
+                if await http_request.is_disconnected():
+                    http_span.set_data("http.status_code", 499)
+                    logger.warning("artist-genres bulk aborted by client: artists=%d", len(artists))
+                    raise HTTPException(status_code=499, detail="client disconnected")
+
+                agg = await resolve_artist_genres(
+                    artist_name=item.artist_name,
+                    discogs_artist_id=item.discogs_artist_id,
+                    discogs_cache=discogs_cache,
+                    discogs_service=discogs_service,
+                )
+                results.append(
+                    ArtistGenresResultItem(
+                        artist_name=item.artist_name,
+                        discogs_artist_id=item.discogs_artist_id,
+                        genres=agg.genres,
+                        styles=agg.styles,
+                        source=agg.source,
+                    )
+                )
+        except asyncio.CancelledError:
+            http_span.set_data("http.status_code", 499)
+            logger.warning("artist-genres bulk aborted by client: artists=%d", len(artists))
+            raise
+        except CacheUnavailableError:
+            logger.exception(
+                "Discogs cache unavailable during artist-genres (artists=%d)", len(artists)
+            )
+            http_span.set_data("http.status_code", 503)
+            raise HTTPException(
+                status_code=503, detail=_DISCOGS_CACHE_QUERY_FAILED_DETAIL
+            ) from None
+        except TRANSIENT_PG_ERRORS:
+            logger.exception(
+                "Discogs cache query failed during artist-genres (artists=%d)", len(artists)
+            )
+            http_span.set_data("http.status_code", 503)
+            raise HTTPException(
+                status_code=503, detail=_DISCOGS_CACHE_QUERY_FAILED_DETAIL
+            ) from None
+        except HTTPException:
+            # Carries its own status code (e.g. the 499 above) — re-raise unchanged.
+            raise
+        except Exception:
+            http_span.set_data("http.status_code", 500)
+            raise
+
+        counts = Counter(r.source for r in results)
+        for source in ("cache", "discogs_api", "not_found", "unavailable"):
+            http_span.set_data(f"lml.artist_genres.{source}", counts.get(source, 0))
+        http_span.set_data("http.status_code", 200)
+
+    logger.info(
+        "artist-genres bulk complete: artists=%d cache=%d discogs_api=%d not_found=%d "
+        "unavailable=%d",
+        len(artists),
+        counts.get("cache", 0),
+        counts.get("discogs_api", 0),
+        counts.get("not_found", 0),
+        counts.get("unavailable", 0),
+    )
+    return BulkArtistGenresResponse(results=results)
