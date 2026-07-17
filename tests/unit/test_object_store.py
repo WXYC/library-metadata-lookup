@@ -13,6 +13,7 @@ from pathlib import Path
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from storage.object_store import (
@@ -151,3 +152,24 @@ class TestS3ObjectStore:
     def test_exposes_bucket(self):
         store = S3ObjectStore(bucket="lml-prod", endpoint_url=ENDPOINT, region="us-east-1")
         assert store.bucket == "lml-prod"
+
+    def test_uses_path_style_addressing(self):
+        """Custom S3-compatible endpoints (Railway Bucket) need path-style; boto3's
+        ``auto`` default would try virtual-host and fail on absent wildcard DNS."""
+        store = S3ObjectStore(bucket="lml-prod", endpoint_url=ENDPOINT, region="us-east-1")
+        assert store._client.meta.config.s3["addressing_style"] == "path"
+
+    @pytest.mark.asyncio
+    async def test_get_propagates_non_404_client_error(self, s3_store, monkeypatch):
+        """A non-absence error (e.g. 403) must surface, not be masked as a miss."""
+        forbidden = ClientError(
+            {"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+            "GetObject",
+        )
+
+        def _boom(*args, **kwargs):
+            raise forbidden
+
+        monkeypatch.setattr(s3_store._client, "get_object", _boom)
+        with pytest.raises(ClientError):
+            await s3_store.get("library.db")

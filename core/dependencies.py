@@ -110,7 +110,7 @@ async def close_library_db() -> None:
 _object_store: ObjectStore | None = None
 
 
-def get_object_store(settings: Settings = Depends(get_settings)) -> ObjectStore:
+async def get_object_store(settings: Settings = Depends(get_settings)) -> ObjectStore:
     """Get the process-wide object store for the two hosted SQLite files.
 
     Bucket mode (:class:`S3ObjectStore`) when ``LML_BUCKET_NAME`` and
@@ -118,6 +118,12 @@ def get_object_store(settings: Settings = Depends(get_settings)) -> ObjectStore:
     (:class:`LocalDirStore`, rooted at ``library.db``'s parent so today's on-disk
     siblings resolve by bare filename) otherwise. Exactly one store is active per
     deployment — no dual-write, no fallback chain.
+
+    ``async`` (like :func:`get_library_db`) so the lazy check-then-build runs on
+    the event loop: there is no ``await`` between the ``is None`` test and the
+    assignment, so first-caller init is race-free. A sync ``def`` would run in
+    FastAPI's dependency threadpool, where two concurrent first callers could each
+    build a store (benign — last write wins, nothing to leak — but avoidable).
 
     Inert in PR 1: nothing depends on it yet. PR 2 (streaming endpoints) and PR 3
     (``library.db`` boot-fetch + upload) consume it. See the volume-eviction epic

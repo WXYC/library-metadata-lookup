@@ -49,9 +49,11 @@ class ObjectNotFoundError(Exception):
 class ObjectStat:
     """Metadata for a stored object.
 
-    ``etag`` is populated by S3 (a content hash, useful for the cutover
-    checksum-verify step) and ``None`` for the local store, which does not
-    compute one.
+    ``etag`` is populated by S3 (useful for the cutover checksum-verify step)
+    and ``None`` for the local store, which does not compute one. It is returned
+    verbatim from S3, i.e. wrapped in literal double-quotes and **not** an MD5 for
+    multipart uploads (``upload_file`` on a large ``put``) — a consumer comparing
+    ETags must account for both.
     """
 
     size: int
@@ -102,6 +104,13 @@ class S3ObjectStore:
     are not passed explicitly. The client is built once and reused; boto3
     low-level clients are safe to call across threads, which is what
     ``asyncio.to_thread`` does here.
+
+    Addressing is pinned to **path-style** (``endpoint/bucket/key``). boto3's
+    default ``auto`` prefers virtual-host style (``bucket.endpoint/key``), which
+    needs wildcard DNS the Railway Bucket endpoint does not serve; path-style is
+    the portable choice across S3-compatible backends and this store only ever
+    targets a custom ``endpoint_url`` (never bare AWS), so it is always correct
+    here.
     """
 
     def __init__(
@@ -120,6 +129,7 @@ class S3ObjectStore:
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
             retries={"max_attempts": max_attempts, "mode": "standard"},
+            s3={"addressing_style": "path"},
         )
         self._client = boto3.client(
             "s3",
