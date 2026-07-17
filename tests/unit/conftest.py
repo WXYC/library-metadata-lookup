@@ -33,6 +33,14 @@ CREDENTIAL_ENV_VARS = (
     "LML_API_KEY",
     "STREAMING_WEBHOOK_URLS",
     "ETL_NOTIFY_KEY",
+    # Object-storage target (WXYC/library-metadata-lookup#835). Not secret, but a
+    # live connection target: scrubbing both keeps a leaked parent-checkout .env
+    # from silently flipping `get_object_store` into bucket mode against real
+    # object storage during a unit run (bucket mode needs BOTH, so either being
+    # blank is enough — both are scrubbed for symmetry). Each maps to a real
+    # `str | None` Settings field, so the hermeticity pairing test stays green.
+    "LML_BUCKET_NAME",
+    "LML_BUCKET_ENDPOINT",
 )
 
 

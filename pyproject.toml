@@ -29,6 +29,11 @@ dependencies = [
     "python-multipart>=0.0.6",
     "wxyc-etl>=0.8.0,<0.9.0",
     "pyjwt[crypto]>=2.8.0",
+    # boto3 is a RUNTIME dep, not dev-only: the library.db boot-fetch (main.py
+    # lifespan) and the /admin upload paths both call the S3ObjectStore, and the
+    # Docker image installs runtime deps only — a dev-only boto3 would ImportError
+    # at boot. See WXYC/library-metadata-lookup#835 (volume-eviction PR 1).
+    "boto3>=1.34.0",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +50,9 @@ dev = [
     "ruff==0.15.6",
     "mypy==1.19.1",
     "datamodel-code-generator[http]==0.56.1",
+    # moto mocks S3 in-process for the object-store tests (WXYC#835). No pytest
+    # marker needed — it patches botocore's HTTP layer, so no network or service.
+    "moto[s3]>=5.0.0",
 ]
 
 [build-system]
@@ -52,7 +60,7 @@ requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["core*", "config*", "library*", "discogs*", "lookup*", "routers*", "services*", "generated*", "scripts*", "entity*", "clients*"]
+include = ["core*", "config*", "library*", "discogs*", "lookup*", "routers*", "services*", "generated*", "scripts*", "entity*", "clients*", "storage*"]
 
 [tool.ruff]
 line-length = 100

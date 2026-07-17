@@ -63,6 +63,26 @@ class Settings(BaseSettings):
             return Path("library.db")
         return self.library_db_path
 
+    # Object Storage (Railway Bucket) — WXYC/library-metadata-lookup#835.
+    # When BOTH are set, library.db and streaming_availability.db are served from
+    # an S3-compatible Railway Bucket instead of the local /data volume (the
+    # volume-eviction epic #834). Both default None -> local-directory mode, so
+    # dev and the endpoint test suite need no bucket. Credentials come from the
+    # standard AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars that boto3 reads
+    # natively (Railway's variable-reference presets provision those names).
+    lml_bucket_name: str | None = Field(
+        None, description="Railway Bucket name (the bucket's BUCKET var); enables bucket mode"
+    )
+    lml_bucket_endpoint: str | None = Field(
+        None,
+        description="Railway Bucket S3 endpoint URL (the bucket's ENDPOINT var); enables bucket mode",
+    )
+
+    @property
+    def bucket_mode(self) -> bool:
+        """Whether object storage is bucket-backed (both bucket vars set) vs local."""
+        return bool(self.lml_bucket_name and self.lml_bucket_endpoint)
+
     # Application Configuration
     host: str = Field(default="0.0.0.0", description="Host to bind the server to")
     port: int = Field(default=8000, description="Port to run the server on")

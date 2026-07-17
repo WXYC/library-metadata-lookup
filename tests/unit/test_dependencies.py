@@ -29,10 +29,12 @@ def reset_globals():
     fixtures don't work for sync tests under pytest-asyncio strict mode).
     """
     deps_module._library_db = None
+    deps_module._object_store = None
     asyncio.run(close_discogs_service())
     asyncio.run(close_musicbrainz_pg())
     yield
     deps_module._library_db = None
+    deps_module._object_store = None
     asyncio.run(close_discogs_service())
     asyncio.run(close_musicbrainz_pg())
 
@@ -179,6 +181,68 @@ class TestCloseLibraryDB:
     async def test_noop_when_none(self):
         deps_module._library_db = None
         await close_library_db()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# get_object_store (WXYC/library-metadata-lookup#835)
+# ---------------------------------------------------------------------------
+
+
+class TestGetObjectStore:
+    """Storage-backend selection: bucket mode iff BOTH bucket vars are set.
+
+    PR 1 of the volume-eviction epic wires the singleton; nothing calls it yet.
+    """
+
+    def test_local_mode_when_bucket_vars_unset(self, mock_settings):
+        from storage.object_store import LocalDirStore
+
+        mock_settings.lml_bucket_name = None
+        mock_settings.lml_bucket_endpoint = None
+        mock_settings.library_db_path = Path("/data/library.db")
+
+        store = deps_module.get_object_store(mock_settings)
+
+        assert isinstance(store, LocalDirStore)
+        # Local keys resolve next to library.db, so today's on-disk siblings are
+        # reachable by bare filename (library.db, streaming_availability.db).
+        assert store.base_dir == Path("/data")
+
+    def test_bucket_mode_when_both_vars_set(self, mock_settings):
+        from storage.object_store import S3ObjectStore
+
+        mock_settings.lml_bucket_name = "lml-prod-data"
+        mock_settings.lml_bucket_endpoint = "https://s3.example.com"
+
+        store = deps_module.get_object_store(mock_settings)
+
+        assert isinstance(store, S3ObjectStore)
+        assert store.bucket == "lml-prod-data"
+
+    def test_only_name_set_is_local_mode(self, mock_settings):
+        from storage.object_store import LocalDirStore
+
+        mock_settings.lml_bucket_name = "lml-prod-data"
+        mock_settings.lml_bucket_endpoint = None
+
+        assert isinstance(deps_module.get_object_store(mock_settings), LocalDirStore)
+
+    def test_only_endpoint_set_is_local_mode(self, mock_settings):
+        from storage.object_store import LocalDirStore
+
+        mock_settings.lml_bucket_name = None
+        mock_settings.lml_bucket_endpoint = "https://s3.example.com"
+
+        assert isinstance(deps_module.get_object_store(mock_settings), LocalDirStore)
+
+    def test_singleton_is_cached(self, mock_settings):
+        mock_settings.lml_bucket_name = None
+        mock_settings.lml_bucket_endpoint = None
+
+        first = deps_module.get_object_store(mock_settings)
+        second = deps_module.get_object_store(mock_settings)
+
+        assert first is second
 
 
 # ---------------------------------------------------------------------------

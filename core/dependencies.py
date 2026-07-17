@@ -17,6 +17,7 @@ from discogs.cache_service import DiscogsCacheService
 from discogs.service import DiscogsService
 from entity.sources import PgSource
 from library.db import LibraryDB
+from storage.object_store import LocalDirStore, ObjectStore, S3ObjectStore
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -100,6 +101,43 @@ async def close_library_db() -> None:
     if _library_db:
         await _library_db.close()
         _library_db = None
+
+
+# Object store selection (WXYC/library-metadata-lookup#835). Built once and
+# cached. Unlike the DB singletons there is no matching closer: boto3 clients
+# hold no persistent connections and LocalDirStore holds none either, so there is
+# nothing to tear down. Tests reset it via `deps_module._object_store = None`.
+_object_store: ObjectStore | None = None
+
+
+def get_object_store(settings: Settings = Depends(get_settings)) -> ObjectStore:
+    """Get the process-wide object store for the two hosted SQLite files.
+
+    Bucket mode (:class:`S3ObjectStore`) when ``LML_BUCKET_NAME`` and
+    ``LML_BUCKET_ENDPOINT`` are both set; local-directory mode
+    (:class:`LocalDirStore`, rooted at ``library.db``'s parent so today's on-disk
+    siblings resolve by bare filename) otherwise. Exactly one store is active per
+    deployment — no dual-write, no fallback chain.
+
+    Inert in PR 1: nothing depends on it yet. PR 2 (streaming endpoints) and PR 3
+    (``library.db`` boot-fetch + upload) consume it. See the volume-eviction epic
+    (WXYC/library-metadata-lookup#834).
+    """
+    global _object_store
+    if _object_store is None:
+        if settings.bucket_mode:
+            # bucket_mode is True iff both are set; assert narrows for mypy.
+            assert settings.lml_bucket_name and settings.lml_bucket_endpoint
+            _object_store = S3ObjectStore(
+                bucket=settings.lml_bucket_name,
+                endpoint_url=settings.lml_bucket_endpoint,
+            )
+            logger.info("Object store: S3 bucket mode (bucket=%s)", settings.lml_bucket_name)
+        else:
+            base_dir = settings.resolved_library_db_path.parent
+            _object_store = LocalDirStore(base_dir=base_dir)
+            logger.info("Object store: local-directory mode (dir=%s)", base_dir)
+    return _object_store
 
 
 async def _build_discogs_pool() -> asyncpg.Pool | None:
