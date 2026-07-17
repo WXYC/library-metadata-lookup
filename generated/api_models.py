@@ -816,6 +816,53 @@ class ConcertsResponse(BaseModel):
     pagination: PaginationInfo
 
 
+class AlbumReview(BaseModel):
+    id: int
+    album_id: int = Field(
+        ...,
+        description="WXYC library album id when the free-text artist/album resolved to exactly one catalog row; null otherwise.",
+    )
+    artist_name: str = Field(..., description="Artist name exactly as the reviewer entered it.")
+    album_title: str = Field(..., description="Album title exactly as the reviewer entered it.")
+    record_label: str
+    artist_blurb: str = Field(..., description="Short reviewer-written background on the artist.")
+    review: str = Field(..., description="The review body.")
+    recommended_tracks: str = Field(
+        ...,
+        description='Raw recommended-tracks text, including the form\'s `!`-rating notation (1–5 exclamation marks) and "Play All" shorthand.',
+    )
+    buzzwords: str = Field(..., description="Comma-separated reviewer-chosen descriptors.")
+    fcc_violations: str = Field(
+        ...,
+        description='Verbatim reviewer answer listing FCC-violating track numbers. Blank (unanswered) is distinct from "None"/"N/A" (affirmatively clean); values are not normalized.',
+    )
+    review_purpose: str = Field(
+        ...,
+        description='Raw multi-select of "Rotation", "New DJ Assignment", "Album in the Library"; comma-joined when multiple were selected.',
+    )
+    rotated: bool = Field(
+        ...,
+        description='Curator-maintained "was this album rotated" flag; null when the sheet cell is blank or unparseable.',
+    )
+    released_within_six_months: bool = Field(
+        ...,
+        description="Whether the album was released within 6 months of the review; null when unanswered (question added mid-2024).",
+    )
+    social_consent: bool = Field(
+        ...,
+        description="Whether the reviewer consented to the review being shared on station social media (always anonymously); null when unanswered.",
+    )
+    submitted_at: AwareDatetime = Field(
+        ...,
+        description="Form submission instant. Null only for the rare row whose sheet timestamp is missing.",
+    )
+
+
+class AlbumReviewsResponse(BaseModel):
+    album_reviews: list[AlbumReview]
+    pagination: PaginationInfo
+
+
 class DeviceAuthCodeRequest(BaseModel):
     client_id: str = Field(
         ..., description="The client ID of the application requesting authorization."
