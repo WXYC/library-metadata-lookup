@@ -387,13 +387,18 @@ async def upload_streaming_db(
 
     with tempfile.TemporaryDirectory(prefix="lml-streaming-upload-") as td:
         tdir = Path(td)
-        # The upload scratch file keeps the ``.tmp`` suffix the coverage read is
-        # keyed on so a post-validation read fault is still classified 500.
+        # Scratch file for the upload. A post-validation read fault on it is
+        # classified 500 (not 409) by the ``except`` around the
+        # ``_streaming_coverage(upload_tmp)`` call below, since the upload has
+        # already passed albums-count validation -- the suffix is not load-bearing.
         upload_tmp = tdir / "upload.tmp"
 
         try:
             content = await file.read()
             upload_tmp.write_bytes(content)
+            # Free the ~53MB upload buffer before we fetch the baseline object,
+            # which materializes another full copy in memory (LML memory pressure).
+            del content
         except Exception as e:
             logger.error(f"Failed to write uploaded streaming DB: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to write file: {e}") from e
@@ -519,7 +524,7 @@ async def download_streaming_db(
     library-sync pipeline (WXYC/discogs-etl) read the file directly from the
     store instead of round-tripping it through a GitHub Release. The whole
     object (~53MB) is buffered and returned in one response; that egress is
-    negligible at weekly cadence.
+    negligible at the daily sync cadence.
     """
     _validate_auth(settings, authorization)
 
