@@ -34,6 +34,7 @@ import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+import sentry_sdk
 from httpx import ASGITransport, AsyncClient
 
 from config.settings import get_settings
@@ -521,3 +522,275 @@ class TestInFlightCapObservability:
             c.args[0] == "lml.lookup.inflight_wait_ms"
             for c in transaction.set_measurement.call_args_list
         )
+
+
+class TestInFlightCapClientAbort:
+    """Reap disconnected callers from the ``/lookup`` in-flight queue (LML#715).
+
+    The #714 cap queues excess ``/lookup`` requests on a process-global
+    semaphore. Starlette runs a non-streaming handler to completion even after
+    the client's socket closes, so a request whose caller has already
+    disconnected (timed out and retried, in the #706 cold-storm shape) keeps
+    its FIFO slot, later acquires a permit, and runs a full cold lookup for a
+    departed client — retry-amplified zombie work that spends the 8-wide
+    capacity on results nobody receives.
+
+    The fix mirrors the ``/lookup/bulk`` disconnect race
+    (``TestBulkLookupClientAbort``): while a request WAITS for a permit, race
+    the acquire against the ``watch_disconnect`` sentinel; on disconnect,
+    cancel the acquire (freeing the queue slot, running no lookup) and
+    short-circuit with 499. This guards the QUEUED phase only — a request that
+    already holds a permit is unaffected.
+
+    Tests patch ``watch_disconnect`` directly; the receive-channel mechanism is
+    exercised in production by uvicorn.
+    """
+
+    @staticmethod
+    def _disconnect_after(delay_s: float = 0.05):
+        """Replacement sentinel that 'detects' disconnect after ``delay_s``.
+
+        A request that acquires its permit uncontended cancels this sentinel
+        before it fires, so only requests still parked on the cap at
+        ``delay_s`` observe the disconnect — which is exactly the queued-phase
+        boundary LML#715 targets.
+        """
+
+        async def fake_sentinel(_request):
+            await asyncio.sleep(delay_s)
+            return
+
+        return fake_sentinel
+
+    @pytest.mark.asyncio
+    async def test_queued_client_disconnect_returns_499_and_runs_no_lookup(
+        self, app_client, monkeypatch
+    ):
+        """A queued request whose client disconnects returns 499 and never looks up.
+
+        Cap 1: the first request holds the only permit (gated) while the second
+        parks on the cap. The patched sentinel fires the second's disconnect
+        while it is still queued, so it must short-circuit 499 and
+        ``perform_lookup`` must run exactly once (for the permit-holder only) —
+        no zombie lookup for the departed caller.
+        """
+        monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "1")
+
+        gate = asyncio.Event()
+        started = 0
+
+        async def gated_lookup(request, **kwargs):
+            nonlocal started
+            started += 1
+            if started == 1:
+                await gate.wait()
+            return _empty_response()
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock, side_effect=gated_lookup),
+            patch("lookup.router.watch_disconnect", self._disconnect_after()),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                first = asyncio.create_task(ac.post("/api/v1/lookup", json=LOOKUP_BODY))
+                await _wait_until(lambda: started >= 1, message="first lookup to hold the permit")
+                second = asyncio.create_task(ac.post("/api/v1/lookup", json=LOOKUP_BODY))
+                await _wait_until(
+                    _lookup_semaphore_has_waiters, message="second request to park on the cap"
+                )
+                second_resp = await asyncio.wait_for(second, timeout=3.0)
+                # The permit-holder is still gated; only its lookup has run.
+                assert started == 1
+                gate.set()
+                first_resp = await asyncio.wait_for(first, timeout=3.0)
+
+        assert second_resp.status_code == 499, (
+            f"Expected 499 for the disconnected queued request, got {second_resp.status_code}"
+        )
+        assert first_resp.status_code == 200
+        # Only the permit-holder's lookup ran; the departed caller's never did.
+        assert started == 1
+
+    @pytest.mark.asyncio
+    async def test_queued_client_disconnect_sets_sentry_tag(self, app_client, monkeypatch):
+        """``lml.client_aborted=true`` lands on the active scope for a queued abort.
+
+        Same filterable convention as the bulk path — the tag is what surfaces
+        the reaped requests in the Sentry trace explorer.
+        """
+        monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "1")
+
+        gate = asyncio.Event()
+        started = 0
+        captured_tags: dict[str, str] = {}
+        original_set_tag = sentry_sdk.set_tag
+
+        def capture_tag(key, value):
+            captured_tags[key] = value
+            return original_set_tag(key, value)
+
+        async def gated_lookup(request, **kwargs):
+            nonlocal started
+            started += 1
+            if started == 1:
+                await gate.wait()
+            return _empty_response()
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock, side_effect=gated_lookup),
+            patch("lookup.router.watch_disconnect", self._disconnect_after()),
+            patch("lookup.router.sentry_sdk.set_tag", side_effect=capture_tag),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                first = asyncio.create_task(ac.post("/api/v1/lookup", json=LOOKUP_BODY))
+                await _wait_until(lambda: started >= 1, message="first lookup to hold the permit")
+                second = asyncio.create_task(ac.post("/api/v1/lookup", json=LOOKUP_BODY))
+                await _wait_until(
+                    _lookup_semaphore_has_waiters, message="second request to park on the cap"
+                )
+                second_resp = await asyncio.wait_for(second, timeout=3.0)
+                gate.set()
+                await asyncio.wait_for(first, timeout=3.0)
+
+        assert second_resp.status_code == 499
+        assert captured_tags.get("lml.client_aborted") == "true", (
+            f"Expected lml.client_aborted=true tag; got {captured_tags!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_permit_holder_unaffected_by_disconnect(self, app_client, monkeypatch):
+        """A request that already holds a permit runs to completion despite a disconnect.
+
+        LML#715 guards the queued phase ONLY. An uncontended request acquires
+        immediately, cancels its disconnect sentinel, and runs the full lookup
+        even though the sentinel would have fired mid-flight — the permit-held
+        phase is deliberately not reaped.
+        """
+        monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "8")
+
+        ran = 0
+
+        async def slow_lookup(request, **kwargs):
+            nonlocal ran
+            ran += 1
+            # Outlast the sentinel's disconnect signal (0.05s) — proving the
+            # in-flight phase ignores it.
+            await asyncio.sleep(0.2)
+            return _empty_response()
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock, side_effect=slow_lookup),
+            patch("lookup.router.watch_disconnect", self._disconnect_after()),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await asyncio.wait_for(
+                    ac.post("/api/v1/lookup", json=LOOKUP_BODY), timeout=3.0
+                )
+
+        assert resp.status_code == 200
+        assert ran == 1
+
+    @pytest.mark.asyncio
+    async def test_queued_disconnect_does_not_leak_a_permit(self, app_client, monkeypatch):
+        """A reaped queued request returns its (never-taken) permit to the pool.
+
+        Cap 1: a queued request aborts on disconnect, the permit-holder then
+        completes, and a fresh request must still acquire and finish 200. If the
+        abort had stranded a permit, cap 1 would be permanently exhausted and
+        the follow-up would hang past the timeout.
+        """
+        monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "1")
+
+        gate = asyncio.Event()
+        started = 0
+
+        async def gated_lookup(request, **kwargs):
+            nonlocal started
+            started += 1
+            if started == 1:
+                await gate.wait()
+            return _empty_response()
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock, side_effect=gated_lookup),
+            patch("lookup.router.watch_disconnect", self._disconnect_after()),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                first = asyncio.create_task(ac.post("/api/v1/lookup", json=LOOKUP_BODY))
+                await _wait_until(lambda: started >= 1, message="first lookup to hold the permit")
+                second = asyncio.create_task(ac.post("/api/v1/lookup", json=LOOKUP_BODY))
+                await _wait_until(
+                    _lookup_semaphore_has_waiters, message="second request to park on the cap"
+                )
+                assert (await asyncio.wait_for(second, timeout=3.0)).status_code == 499
+                gate.set()
+                assert (await asyncio.wait_for(first, timeout=3.0)).status_code == 200
+
+                # The permit is back: a fresh uncontended request completes.
+                third = await asyncio.wait_for(
+                    ac.post("/api/v1/lookup", json=LOOKUP_BODY), timeout=3.0
+                )
+
+        assert third.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_sentinel_exception_after_acquire_does_not_leak_a_permit(
+        self, app_client, monkeypatch
+    ):
+        """A ``watch_disconnect`` error once the permit is held must still release it.
+
+        ``watch_disconnect`` awaits ``request.receive()``; if that raises (a
+        broken connection rather than a clean ``http.disconnect``), the
+        post-acquire sentinel cleanup re-raises it. The permit is already held
+        at that point, so its release must sit inside the guaranteeing
+        ``finally`` — otherwise the process-global cap silently loses a slot on
+        every such error and eventually deadlocks all ``/lookup`` traffic. The
+        error still surfaces as a 500 (the connection is gone), but the permit
+        must return to the pool.
+        """
+        monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "1")
+
+        async def boom_sentinel(_request):
+            raise RuntimeError("receive channel error")
+
+        with (
+            patch(
+                "lookup.router.perform_lookup",
+                new_callable=AsyncMock,
+                return_value=_empty_response(),
+            ),
+            patch("lookup.router.watch_disconnect", boom_sentinel),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                first = await asyncio.wait_for(
+                    ac.post("/api/v1/lookup", json=LOOKUP_BODY), timeout=3.0
+                )
+
+        assert first.status_code == 500
+        # The permit is back in the pool, not stranded.
+        assert router_mod._get_lookup_semaphore()._value == 1
+
+        # And a subsequent normal request still acquires — it would hang past
+        # the timeout if the cap-1 permit had leaked.
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_empty_response(),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                second = await asyncio.wait_for(
+                    ac.post("/api/v1/lookup", json=LOOKUP_BODY), timeout=3.0
+                )
+
+        assert second.status_code == 200

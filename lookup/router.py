@@ -375,6 +375,7 @@ def _emit_server_timing_header(
 )
 async def handle_lookup(
     request: LookupRequest,
+    http_request: Request,
     http_response: Response,
     db: LibraryDB = Depends(get_library_db),
     discogs_service: DiscogsService | None = Depends(get_discogs_service),
@@ -420,7 +421,75 @@ async def handle_lookup(
         semaphore = _get_lookup_semaphore()
         capped_on_arrival = semaphore.locked()
         wait_start = time.perf_counter()
-        async with semaphore:
+
+        # LML#715: reap callers that disconnect WHILE QUEUED. Starlette runs a
+        # non-streaming handler to completion after the client's socket closes,
+        # so a request whose caller already timed out and retried (the #706
+        # cold-storm shape) would otherwise keep its FIFO slot, later acquire a
+        # permit, and run a full cold lookup nobody receives — retry-amplified
+        # zombie work that spends the scarce cap. Race the permit acquire
+        # against the same `watch_disconnect` sentinel the /lookup/bulk and
+        # identity bulk-resolve paths use; on disconnect, cancel the acquire so
+        # the queue slot frees and no lookup runs. This guards the QUEUED phase
+        # ONLY — once the permit is held the sentinel is cancelled and
+        # perform_lookup runs to completion (a disconnect mid-lookup is not
+        # reaped; that phase already holds its resources).
+        #
+        # Cancelling `semaphore.acquire()` is permit-safe on this repo's Python
+        # (>=3.12): if the acquire is cancelled AFTER the permit was granted
+        # (the acquire/sentinel tie), Semaphore.acquire returns the permit and
+        # re-raises, so `cancel_and_drain` cannot strand a slot.
+        acquire_future = asyncio.ensure_future(semaphore.acquire())
+        sentinel_task = asyncio.create_task(
+            watch_disconnect(http_request), name="lml.lookup.disconnect_sentinel"
+        )
+        # A single guaranteed-release scope guards the permit from the moment it
+        # could be held. `cancel_and_drain` is a no-op on an already-done future,
+        # so it does NOT return a granted permit; and the sentinel cleanup on
+        # the success path can re-raise (a `receive()` error) before the lookup.
+        # Both are permit leaks on the process-global cap if release is tied to
+        # a narrower `try`. Track "did we end up holding a permit" explicitly and
+        # release it once in the outer `finally`, whatever path we leave by.
+        permit_held = False
+        try:
+            try:
+                done, _pending = await asyncio.wait(
+                    {acquire_future, sentinel_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+            except BaseException:
+                # Handler cancellation can arrive with the acquire already
+                # granted (grant + cancel in the same loop cycle). Drain the
+                # acquire, then flag the granted permit so the outer `finally`
+                # releases it — a still-pending acquire drains as CANCELLED and
+                # never took a permit, so it stays False.
+                await cancel_and_drain(acquire_future)
+                permit_held = acquire_future.done() and not acquire_future.cancelled()
+                await cancel_and_drain(sentinel_task)
+                raise
+
+            # Tie broken toward "acquired": if both completed, the acquire holds
+            # a permit, so proceed rather than reap. `acquire_future.done()` is
+            # exact here — no await separates the wait() return from this check,
+            # so the single event loop cannot flip the state underneath us.
+            if sentinel_task in done and not acquire_future.done():
+                # Client departed while queued. Free the never-taken slot and
+                # short-circuit; nobody reads the body. The tag mirrors the bulk
+                # path so `lml.client_aborted:true` surfaces reaped requests in
+                # the Sentry trace explorer.
+                await cancel_and_drain(acquire_future)
+                sentry_sdk.set_tag("lml.client_aborted", "true")
+                logger.warning(
+                    "lookup reaped: client disconnected while queued on the in-flight cap"
+                )
+                http_response.status_code = 499
+                return LookupResponse(results=[], search_type="none")
+
+            # Permit held from here — the outer `finally` owns its release, so a
+            # raising sentinel drain (below) or perform_lookup error can't strand
+            # it.
+            permit_held = True
+            # Stop watching for disconnect; the permit-held phase is not reaped.
+            await cancel_and_drain(sentinel_task)
             if capped_on_arrival:
                 wait_ms = (time.perf_counter() - wait_start) * 1000.0
                 _project_inflight_capped(wait_ms)
@@ -457,6 +526,9 @@ async def handle_lookup(
                 discogs_cache_pg=discogs_cache_pg,
                 caller_budget_ms=x_caller_budget_ms,
             )
+        finally:
+            if permit_held:
+                semaphore.release()
 
         # Attach cache stats. wxyc-shared#86 has shipped the typed CacheStats
         # Pydantic model, so the response field is no longer dict-shaped —
