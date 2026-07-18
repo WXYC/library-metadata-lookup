@@ -1497,6 +1497,46 @@ class ArtistResolveBulkResponse(BaseModel):
     results: list[ArtistResolveResult]
 
 
+class ArtistGenresSource(StrEnum):
+    cache = "cache"
+    discogs_api = "discogs_api"
+    not_found = "not_found"
+    unavailable = "unavailable"
+
+
+class ArtistGenresInput(BaseModel):
+    artist_name: constr(min_length=1) = Field(..., description="Artist display name.")
+    discogs_artist_id: int | None = Field(
+        None,
+        description="Discogs artist ID. Optional but strongly preferred: when present the cache aggregation keys on it (stable Discogs artist entity, homonym-safe); when absent it falls back to a case-insensitive exact `artist_name` match. Backend-Service resolves it via `POST /api/v1/artists/resolve/bulk` (LML#759) before calling this endpoint, so it is usually present.\n",
+    )
+
+
+class BulkArtistGenresRequest(BaseModel):
+    artists: list[ArtistGenresInput] = Field(..., max_length=25, min_length=1)
+
+
+class ArtistGenresResultItem(BaseModel):
+    artist_name: str = Field(..., description="Echoed from the request for index alignment.")
+    discogs_artist_id: int | None = Field(
+        None,
+        description="Echoed from the request (explicit null when not supplied). Kept out of `required` deliberately: datamodel-codegen (LML's generator) types a required-plus-nullable field as non-nullable and would reject the null this field must carry — the same treatment as `ArtistResolveResult.discogs_artist_id`.\n",
+    )
+    genres: list[str] = Field(
+        ...,
+        description="Top coarse Discogs genres (majority-take, frequency-ranked, truncated to the top-K). Empty when unknown. The ~15-value Discogs genre taxonomy the iOS On Tour filter chips render.\n",
+    )
+    styles: list[str] = Field(
+        ...,
+        description="Frequency-ranked Discogs styles (full list, untruncated). Empty when unknown. The finer Discogs style taxonomy; the iOS filter ignores it — it is a detail-view treatment.\n",
+    )
+    source: ArtistGenresSource
+
+
+class BulkArtistGenresResponse(BaseModel):
+    results: list[ArtistGenresResultItem]
+
+
 class CacheRefreshSourceOutcome(StrEnum):
     success = "success"
     error = "error"
