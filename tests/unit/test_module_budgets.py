@@ -38,6 +38,7 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/release_resolution.py": 550,
     "lookup/router.py": 950,
     "lookup/rowless.py": 450,
+    "lookup/spine_deadline.py": 250,
     "lookup/strategies/__init__.py": 150,
     "lookup/strategies/artist_plus_album.py": 300,
     "lookup/strategies/library_miss.py": 200,
