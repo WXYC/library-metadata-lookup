@@ -2207,6 +2207,10 @@ class FlowsheetV2TrackEntry(FlowsheetV2Base):
     entry_type: Literal["track"]
     album_id: int | None = None
     rotation_id: int | None = None
+    artist_id: int | None = Field(
+        None,
+        description="The played release's resolved WXYC catalog artist id (`flowsheet.album_id → library.artist_id`), computed server-side on the same join that powers `upcoming_show`. Shares the catalog artist-id keyspace with `Concert.headlining_artist_id` and `SimilarArtist.artist_id`, so on-device features — the On Tour likes match — can intersect a liked playcut's artist against concert headliners and their affinity neighbors in one id space.\n\nNull for free-form entries (no `album_id`) and for library rows whose album has no linked artist. Additive and optional: older app builds that don't decode it are unaffected.\n",
+    )
     artist_name: str | None = None
     album_title: str | None = None
     track_title: str | None = None
