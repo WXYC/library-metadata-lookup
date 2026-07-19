@@ -243,6 +243,20 @@ class TestRunDrain:
         assert svc.master_calls == []  # never started a worker
 
     @pytest.mark.asyncio
+    async def test_negative_limit_raises_instead_of_slicing(self, tmp_path):
+        # --limit is a smoke-test cap; a negative value slices todo[:-1] and would
+        # silently drain all-but-one of the tail against the prod token — the
+        # opposite of a small batch. Guard it symmetrically with concurrency.
+        svc = FakeService(
+            masters={n: _master(n * 10) for n in (100, 200, 300)},
+            releases={n * 10: _release(2) for n in (100, 200, 300)},
+        )
+        cards = {100: [1], 200: [2], 300: [3]}
+        with pytest.raises(ValueError):
+            await run_drain(svc, cards, tmp_path / "c.jsonl", limit=-1)
+        assert svc.master_calls == []  # never started a worker
+
+    @pytest.mark.asyncio
     async def test_limit_caps_masters_processed(self, tmp_path):
         ckpt = tmp_path / "ckpt.jsonl"
         svc = FakeService(

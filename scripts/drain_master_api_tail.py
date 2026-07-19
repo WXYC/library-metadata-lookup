@@ -241,12 +241,16 @@ async def run_drain(
     this invocation processes — use it to smoke-test a small batch before the
     full run. Returns the merged ``{master_id: outcome}`` after this pass.
 
-    Raises ``ValueError`` if ``concurrency < 1``: ``asyncio.Semaphore(0)`` can
-    never be acquired, so a ``--concurrency 0`` typo would otherwise hang the
-    drain forever holding the DB pool instead of failing fast.
+    Raises ``ValueError`` for out-of-range knobs, so a typo fails fast instead of
+    hanging or silently misbehaving: ``concurrency < 1`` would build an
+    unacquirable ``asyncio.Semaphore(0)`` and hang holding the DB pool, and a
+    negative ``limit`` would slice ``todo[:-1]`` and drain all-but-one of the
+    tail against the prod token instead of a small smoke batch.
     """
     if concurrency < 1:
         raise ValueError(f"concurrency must be >= 1, got {concurrency}")
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit must be >= 1 when set, got {limit}")
     done = load_checkpoint(checkpoint_path)
     todo = _pending_masters(cards_by_master, done)
     if limit is not None:
