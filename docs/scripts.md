@@ -185,3 +185,21 @@ LML_API_KEY=... LML_BASE_URL=https://<prod-lml> \
 ```
 
 `--base-url` defaults to `$LML_BASE_URL` then `$PRODUCTION_URL`; `--api-key` to `$LML_API_KEY`. Other flags: `--page-size` (default/cap 25), `--max-retries` (default 2), `--cooldown` (seconds between retry rounds, default 60), `--spot-check` (sample size, default 20), `--seed` (spot-check RNG seed — the sample is reproducible from the JSONL), `--timeout` (per-request seconds, default 120; a fully-escalating page can take ~30s). The report is printed to stdout and, with `--report`, written to a markdown file for pasting into WXYC/Backend-Service#1614.
+
+## Library-Release Override Seeder (`scripts/seed_library_release_overrides.py`)
+
+Seeds `lml_cache.library_release_override` from WXYC DJ Alex L.'s hand-verified `card_catalog_id -> discogs_release_id` CSV (LML#850). Each pin makes a library-album `/lookup` return the verified Discogs release (and its correct tracklist) instead of the per-request fuzzy pick — gated behind the `LML_LIBRARY_RELEASE_OVERRIDE` flag (see [`env-vars.md`](env-vars.md)). The verified CSV lives in the workspace meta-repo (`plans/alex-discogs-import/data/phase1_release_links.csv`) and is **not** committed here — pass its path via `--input`.
+
+**Safety:** dry-run by default — parses + validates the CSV and reports, making **no DB connection** (so it can't create the schema either); pass `--execute` to bootstrap the schema and write. Every row is stamped `--source` (default `alex-l-2026`) so a run is reversible by `DELETE FROM lml_cache.library_release_override WHERE source = '<source>'`. The upsert is `ON CONFLICT (library_id) DO UPDATE` guarded by `source = EXCLUDED.source`, so a re-run is idempotent **and** never clobbers a pin later hand-corrected under a different `source`. Targets the shared discogs-cache PG via `DATABASE_URL_DISCOGS`. **Prod writes require explicit authorization and run staging-first.**
+
+```bash
+# 1. dry-run (default): parse + validate + report, no DB connection
+uv run python -m scripts.seed_library_release_overrides \
+  --input ../plans/alex-discogs-import/data/phase1_release_links.csv
+
+# 2. perform the upsert (staging first)
+uv run python -m scripts.seed_library_release_overrides \
+  --input <path> --execute
+```
+
+`load_rows` opens the CSV `utf-8-sig` (BOM-tolerant), drops rows with a missing/non-integer/non-positive id, and dedupes by `library_id` (last row wins — a later hand-correction supersedes an earlier automated entry). The seeder writes the override table only; minting `entity.release_identity` for the pinned releases and warming the release cache are separate optional operational steps via the existing HTTP surfaces (`POST /api/v1/identity/resolve`, `POST /api/v1/cache/refresh-for-identities`) against a running service.
