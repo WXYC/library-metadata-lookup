@@ -24,6 +24,11 @@ exercised by ``tests/integration/test_resolve_master_overrides.py``.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import csv as _csv
+import types
+
 from scripts.resolve_master_overrides import (
     CONF_HIGH,
     CONF_LOW,
@@ -35,6 +40,8 @@ from scripts.resolve_master_overrides import (
     CandidateRelease,
     MasterLink,
     MasterResolution,
+    _run,
+    _split_by_confidence,
     load_flowsheet_titles,
     load_master_links,
     normalize_titles,
@@ -54,12 +61,17 @@ def _cand(release_id: int, titles: list[str], fmt: str | None = None) -> Candida
 
 
 class TestNormalizeTitles:
-    def test_order_insensitive_and_normalized(self):
-        a = normalize_titles(["Back, Baby", "On Your Own Love Again"])
-        b = normalize_titles(["ON YOUR OWN LOVE AGAIN", "back  baby"])
-        # comma is preserved by to_match_form, so keep the raw title stable
-        assert normalize_titles(["Back Baby"]) == b - {"on your own love again"}
-        assert isinstance(a, frozenset)
+    def test_order_insensitive(self):
+        # the same titles in a different order normalize to the same set
+        assert normalize_titles(["Back, Baby", "On Your Own Love Again"]) == normalize_titles(
+            ["On Your Own Love Again", "Back, Baby"]
+        )
+
+    def test_case_and_whitespace_normalized(self):
+        assert normalize_titles(["ON YOUR OWN LOVE AGAIN", "back  baby"]) == normalize_titles(
+            ["on your own love again", "Back Baby"]
+        )
+        assert isinstance(normalize_titles(["x"]), frozenset)
 
     def test_drops_blank_titles(self):
         assert normalize_titles(["", "  ", "Real Track"]) == frozenset({"real track"})
@@ -99,6 +111,33 @@ class TestTierA:
         )
         assert r.tier == TIER_A
         assert r.chosen_release_id == 700  # main_release wins the tie
+
+    def test_lone_empty_tracklist_is_not_pinned_as_tier_a(self):
+        # a cached release whose track titles are all blank/NULL normalizes to an
+        # empty set: it carries no tracklist, so it must not be a high-confidence
+        # Tier A pin. With no main_release it is unresolvable.
+        r = resolve_master(
+            card_catalog_id=1,
+            master_id=100,
+            candidates=[_cand(500, ["", "  "])],
+            main_release_id=None,
+            played_titles=frozenset(),
+        )
+        assert r.tier == UNRESOLVED
+        assert r.chosen_release_id is None
+
+    def test_empty_tracklist_dropped_leaving_single_real_version(self):
+        # one real version + one all-blank version -> the blank one is dropped, so
+        # the master has a single usable tracklist (Tier A) pinning the real id.
+        r = resolve_master(
+            card_catalog_id=1,
+            master_id=100,
+            candidates=[_cand(500, ["a", "b"]), _cand(700, [""])],
+            main_release_id=700,  # the empty version, must NOT be pinned
+            played_titles=frozenset(),
+        )
+        assert r.tier == TIER_A
+        assert r.chosen_release_id == 500
 
 
 class TestTierB:
@@ -173,6 +212,36 @@ class TestTierC:
         assert r.tier == TIER_C
         assert r.confidence == CONF_LOW
         assert r.chosen_release_id == 700  # cached Vinyl edition, not uncached 999
+
+    def test_multitoken_format_matches_on_token_overlap(self):
+        # a real-world multi-token CSV format ('vinyl - 7"') must still steer the
+        # pick toward the vinyl edition; a naive whole-string compare never matches.
+        r = resolve_master(
+            card_catalog_id=1,
+            master_id=100,
+            candidates=[_cand(500, ["a", "b"], "CD, Album"), _cand(700, ["a", "c"], 'Vinyl, 7"')],
+            main_release_id=None,
+            played_titles=frozenset(),
+            csv_format='vinyl - 7"',
+        )
+        assert r.tier == TIER_C
+        assert r.chosen_release_id == 700  # shares {vinyl, 7} with the CSV format
+
+    def test_format_overlap_prefers_more_specific_pressing(self):
+        # LP vs 7" both share 'vinyl'; the 7" shares an extra token with the hint,
+        # so the more specific pressing wins rather than the lowest id.
+        r = resolve_master(
+            card_catalog_id=1,
+            master_id=100,
+            candidates=[
+                _cand(500, ["a", "b"], "Vinyl, LP"),
+                _cand(700, ["a", "c"], 'Vinyl, 7"'),
+            ],
+            main_release_id=None,
+            played_titles=frozenset(),
+            csv_format='vinyl - 7"',
+        )
+        assert r.chosen_release_id == 700  # {vinyl,7} beats {vinyl} despite higher id
 
 
 class TestNoCachedAndUnresolved:
@@ -265,7 +334,100 @@ class TestResolveAllAndReport:
         assert report["total"] == 3
         assert report["seedable"] == 2
         assert report["unresolved"] == 1
-        assert report["by_tier"] == {TIER_A: 1, TIER_C: 1, UNRESOLVED: 1}
+        # every tier/confidence bucket is present (0 for the empty ones) so the
+        # report's key set is stable across runs and safe to index blindly.
+        assert report["by_tier"] == {
+            TIER_A: 1,
+            TIER_B: 0,
+            TIER_C: 1,
+            NO_CACHED: 0,
+            UNRESOLVED: 1,
+        }
+        assert report["by_confidence"] == {CONF_HIGH: 1, CONF_LOW: 2}
+
+
+class TestSplitByConfidence:
+    def test_routes_high_and_low_preserving_order(self):
+        res = [
+            MasterResolution(1, 100, 500, TIER_A, CONF_HIGH, "a"),
+            MasterResolution(2, 200, 700, TIER_C, CONF_LOW, "b"),
+            MasterResolution(3, 300, None, UNRESOLVED, CONF_LOW, "c"),
+            MasterResolution(4, 400, 800, TIER_B, CONF_HIGH, "d"),
+        ]
+        high, low = _split_by_confidence(res)
+        assert [r.card_catalog_id for r in high] == [1, 4]
+        assert [r.card_catalog_id for r in low] == [2, 3]
+
+
+class TestRunDriver:
+    """The CLI driver, with the discogs-cache boundary monkeypatched out."""
+
+    def test_run_writes_both_buckets_and_creates_report_dir(self, tmp_path, monkeypatch):
+        inp = tmp_path / "merged.csv"
+        inp.write_text(
+            "card_catalog_id,discogs_type,discogs_id,format\n"
+            "1,master,100,cd\n"  # -> Tier A high (one cached version)
+            "2,master,200,vinyl\n"  # -> unresolved (no cached version)
+        )
+
+        async def fake_candidates(conn, master_ids):
+            return {100: [CandidateRelease(500, normalize_titles(["a", "b"]), "CD, Album")]}
+
+        async def fake_mains(conn, master_ids):
+            return {}
+
+        class _FakeCM:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _FakePg:
+            def __init__(self, *, dsn=None, pool=None):
+                self.closed = False
+
+            def acquire(self):
+                return _FakeCM()
+
+            async def close(self):
+                self.closed = True
+
+        monkeypatch.setattr("scripts.resolve_master_overrides.fetch_candidates", fake_candidates)
+        monkeypatch.setattr("scripts.resolve_master_overrides.fetch_main_releases", fake_mains)
+        monkeypatch.setattr(
+            "config.settings.get_settings",
+            lambda: types.SimpleNamespace(database_url_discogs="postgresql://x/y"),
+        )
+        monkeypatch.setattr("entity.sources.PgSource", _FakePg)
+
+        out_high = tmp_path / "high.csv"
+        out_low = tmp_path / "low.csv"
+        report = tmp_path / "nested" / "report.json"  # parent dir does not exist yet
+        ns = argparse.Namespace(
+            input=str(inp),
+            flowsheet=None,
+            out_high=str(out_high),
+            out_low=str(out_low),
+            report=str(report),
+        )
+
+        asyncio.run(_run(ns))
+
+        high_rows = list(_csv.DictReader(out_high.open()))
+        assert [(r["card_catalog_id"], r["discogs_release_id"]) for r in high_rows] == [
+            ("1", "500")
+        ]
+        low_rows = list(_csv.DictReader(out_low.open()))
+        assert low_rows == []  # the unresolved card is skipped, header only
+
+        import json as _json
+
+        assert report.exists()  # the missing parent dir was created
+        payload = _json.loads(report.read_text())
+        assert payload["total"] == 2
+        assert payload["seedable"] == 1
+        assert payload["unresolved"] == 1
 
 
 class TestWriteSeedCsv:
