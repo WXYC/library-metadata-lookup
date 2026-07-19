@@ -809,6 +809,10 @@ class Concert(BaseModel):
         None,
         description="Top-K affinity neighbors of the resolved headliner, computed nightly from the semantic-index graph and ordered by `weight` descending. Null when the headliner is unresolved or enrichment has not run. Powers on-device For You matching (set intersection against liked-artist ids). Optional (not in `required`) so it can land ahead of the Backend-Service emitter and older clients decode forward-compatibly — same discipline as `Concert.genres`.",
     )
+    station_plays: int | None = Field(
+        None,
+        description='All-time WXYC flowsheet play count of the resolved (in-library) headliner, computed nightly from the semantic-index graph; null when the headliner is not in the library or has no play count. Identical for every listener — the station-affinity signal behind the On Tour "For You" shelf. Not personalized; carries no listener data. Optional (not in `required`) so it can land ahead of the Backend-Service emitter and older clients decode forward-compatibly — same discipline as `Concert.similar_artists`.',
+    )
 
 
 class ConcertsResponse(BaseModel):
