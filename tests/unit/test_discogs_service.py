@@ -3108,6 +3108,7 @@ class TestGetMaster:
             "id": 456,
             "title": "Dots and Loops",
             "year": 1997,
+            "main_release": 833601,
         }
 
         with patch.object(
@@ -3119,7 +3120,26 @@ class TestGetMaster:
         assert result.master_id == 456
         assert result.title == "Dots and Loops"
         assert result.year == 1997
+        assert result.main_release_id == 833601
         assert result.cached is False
+
+    @pytest.mark.asyncio
+    async def test_main_release_absent_is_none(self, service):
+        # A master payload without a ``main_release`` (or with the ``0`` Discogs
+        # uses for "no canonical release chosen") yields ``main_release_id=None``,
+        # so the LML#858 API-tail drain can skip it rather than pin release 0.
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"id": 456, "title": "Dots and Loops", "main_release": 0}
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
+        ):
+            result = await service.get_master(456)
+
+        assert result is not None
+        assert result.main_release_id is None
 
     @pytest.mark.asyncio
     async def test_not_found_returns_none(self, service):
