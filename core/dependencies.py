@@ -137,6 +137,7 @@ async def get_object_store(settings: Settings = Depends(get_settings)) -> Object
             _object_store = S3ObjectStore(
                 bucket=settings.lml_bucket_name,
                 endpoint_url=settings.lml_bucket_endpoint,
+                addressing_style=settings.lml_bucket_addressing_style,
             )
             logger.info("Object store: S3 bucket mode (bucket=%s)", settings.lml_bucket_name)
         else:

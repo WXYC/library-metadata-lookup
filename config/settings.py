@@ -78,10 +78,38 @@ class Settings(BaseSettings):
         description="Railway Bucket S3 endpoint URL (the bucket's ENDPOINT var); enables bucket mode",
     )
 
+    lml_bucket_addressing_style: str = Field(
+        default="virtual",
+        description=(
+            "S3 addressing style for the Railway Bucket client: 'virtual' "
+            "(virtual-hosted, <bucket>.<endpoint> — Railway's current default for "
+            "newly created buckets), 'path' (<endpoint>/<bucket> — required only by "
+            "legacy pre-change buckets, per the bucket's Credentials tab), or 'auto'. "
+            "Fed verbatim to botocore's Config(s3={'addressing_style': ...}). Default "
+            "'virtual' so a freshly created bucket works with no override. See "
+            "WXYC/library-metadata-lookup#834."
+        ),
+    )
+
     @property
     def bucket_mode(self) -> bool:
         """Whether object storage is bucket-backed (both bucket vars set) vs local."""
         return bool(self.lml_bucket_name and self.lml_bucket_endpoint)
+
+    @field_validator("lml_bucket_addressing_style")
+    @classmethod
+    def _validate_addressing_style(cls, v: str) -> str:
+        """Reject an addressing style botocore doesn't accept, at Settings load.
+
+        The value is passed straight into ``Config(s3={"addressing_style": ...})``;
+        an out-of-range value would otherwise fail lazily at first
+        ``S3ObjectStore`` construction (a boot-time / first-request fault) rather
+        than loudly here. Mirrors the ``_validate_work_mem`` posture.
+        """
+        allowed = {"virtual", "path", "auto"}
+        if v not in allowed:
+            raise ValueError(f"lml_bucket_addressing_style {v!r} must be one of {sorted(allowed)}")
+        return v
 
     # Application Configuration
     host: str = Field(default="0.0.0.0", description="Host to bind the server to")
