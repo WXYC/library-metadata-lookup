@@ -27,6 +27,7 @@ from wxyc_fastapi.observability import (
 from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
+from config.settings import get_settings
 from core.search import (
     SEARCH_TYPE_NONE,
     SearchState,
@@ -40,6 +41,7 @@ from discogs.models import (
     DiscogsSearchResult,
 )
 from discogs.service import DiscogsService
+from entity.library_release_override import get_library_release_overrides
 from entity.sources import PgSource, PgSourceProtocol
 from entity.store import EntityStore, Identity
 from generated.api_models import (
@@ -650,6 +652,40 @@ async def _step_populate_streaming_status(
             result.on_streaming = streaming_status.get(result.id, False)
 
 
+async def _prefetch_release_overrides(
+    library_results: list[LibraryItem],
+    discogs_cache_pg: PgSource | None,
+    *,
+    allow_release_resolution_fallback: bool = True,
+) -> dict[int, int]:
+    """Flag-gated prefetch of verified library-release overrides (LML#850).
+
+    Reads the ``lml_library_release_override`` flag once. When off (the default),
+    returns an empty map with **zero** PG work, so /lookup resolution is the
+    pre-override fuzzy pick byte-for-byte. When on, issues a single query for the
+    request's real (``id > 0``) library ids — a row-less synthesized id (0) is
+    never a card-catalog id and can carry no pin, so it is excluded from the id
+    list. Best-effort: ``get_library_release_overrides`` swallows PG errors and
+    returns ``{}``, so a transient outage falls through to the fuzzy pick.
+
+    ``allow_release_resolution_fallback`` is the bulk kill switch: ``/lookup/bulk``
+    passes ``False`` (like the #604/#628/#632 fallbacks and the #573 streaming
+    warm) so the 35k-album drain never fans this per-item PG query out across the
+    shared discogs-cache pool. On bulk the prefetch is skipped entirely; the flag
+    is scoped to the live ``/lookup`` path.
+    """
+    if not allow_release_resolution_fallback:
+        return {}
+    if not get_settings().lml_library_release_override:
+        return {}
+    if discogs_cache_pg is None:
+        return {}
+    library_ids = [item.id for item in library_results if item.id > 0]
+    if not library_ids:
+        return {}
+    return await get_library_release_overrides(discogs_cache_pg, library_ids)
+
+
 async def _step_fetch_artwork(
     parsed: ParsedRequest,
     state: LookupState,
@@ -659,7 +695,9 @@ async def _step_fetch_artwork(
 
     READS: ``library_results``, ``discogs_titles``, ``found_on_compilation``.
     WRITES: ``items_with_artwork`` (builds the ``(item, artwork)`` pairs every
-    later step consumes).
+    later step consumes). The flag-gated LML#850 prefetch feeds
+    ``release_overrides`` to ``fetch_artwork_for_items`` so a hand-verified pin
+    binds instead of the fuzzy pick.
 
     Ordering invariant (LML#583): the ``if library_results`` emptiness guard is
     load-bearing — when Step 3a synthesized ``items_with_artwork``,
@@ -669,6 +707,15 @@ async def _step_fetch_artwork(
     """
     with services.telemetry.track_step("artwork_fetch"):
         if state.library_results:
+            # LML#850: a hand-verified pin overrides the fuzzy release pick. The
+            # prefetch is one query (flag-gated, off by default, and skipped on
+            # the bulk drain) — an override hit then short-circuits the Discogs
+            # search in fetch_one, so a hit reduces per-request work.
+            override_map = await _prefetch_release_overrides(
+                state.library_results,
+                services.discogs_cache_pg,
+                allow_release_resolution_fallback=services.allow_release_resolution_fallback,
+            )
             for _ in state.library_results:
                 services.telemetry.record_api_call("discogs")
             state.items_with_artwork = await fetch_artwork_for_items(
@@ -679,6 +726,7 @@ async def _step_fetch_artwork(
                 album=parsed.album,
                 allow_release_resolution_fallback=services.allow_release_resolution_fallback,
                 found_on_compilation=state.found_on_compilation,
+                release_overrides=override_map,
             )
 
 
