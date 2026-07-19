@@ -173,7 +173,14 @@ class TestS3ObjectStore:
 
     @pytest.mark.asyncio
     async def test_path_style_roundtrip(self, monkeypatch):
-        """put/get works end-to-end under an explicit path-style override too."""
+        """put/get works end-to-end under an explicit path-style override too.
+
+        A functional smoke check, not an addressing-mode discriminator: moto
+        intercepts S3 regardless of addressing style, so this proves the store is
+        usable with ``addressing_style="path"`` set (no misconfiguration), not
+        that path-style requests hit the wire correctly. The client-config
+        assertion in ``test_addressing_style_is_configurable`` covers the wiring.
+        """
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
         monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
