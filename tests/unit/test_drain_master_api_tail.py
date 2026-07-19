@@ -11,9 +11,7 @@ with a fake service — no DB, no network.
 
 from __future__ import annotations
 
-import json
 import types
-from pathlib import Path
 
 import pytest
 
@@ -30,7 +28,9 @@ from scripts.drain_master_api_tail import (
     drain_master,
     group_cards_by_master,
     load_checkpoint,
+    load_unresolved,
     run_drain,
+    write_seed_csv,
 )
 
 
@@ -39,7 +39,20 @@ def _master(main_release_id):
 
 
 def _release(n_tracks):
-    return types.SimpleNamespace(tracklist=[object()] * n_tracks)
+    # Title-bearing tracks: the drain counts real (non-blank-title) tracks, so a
+    # stand-in track must carry a title to be counted (matches ``TrackItem``).
+    return types.SimpleNamespace(
+        tracklist=[types.SimpleNamespace(title=f"t{i}") for i in range(n_tracks)]
+    )
+
+
+def _release_untitled(n_tracks):
+    # A release whose rows are all blank-title heading/index markers — a
+    # non-empty tracklist that carries no real track (the Phase-2 invariant
+    # drops these), so the drain must treat it as trackless.
+    return types.SimpleNamespace(
+        tracklist=[types.SimpleNamespace(title="") for _ in range(n_tracks)]
+    )
 
 
 class FakeService:
@@ -101,6 +114,16 @@ class TestDrainMaster:
         oc = await drain_master(svc, 10)
         assert oc == MasterDrainOutcome(10, 500, None, STATUS_ERROR)
 
+    @pytest.mark.asyncio
+    async def test_blank_title_tracklist_is_trackless(self):
+        # A non-empty tracklist made only of blank-title rows (headings/index
+        # markers) is not a real tracklist and must not be pinned — matching the
+        # resolver's Phase-2 invariant that drops empty-normalized-title
+        # candidates. Counting raw ``len(tracklist)`` would wrongly resolve it.
+        svc = FakeService(masters={10: _master(500)}, releases={500: _release_untitled(3)})
+        oc = await drain_master(svc, 10)
+        assert oc == MasterDrainOutcome(10, 500, 0, STATUS_TRACKLESS)
+
 
 class TestBuildSeedRows:
     def test_expands_only_resolved_masters_per_card(self):
@@ -128,6 +151,30 @@ class TestCheckpoint:
 
     def test_missing_file_is_empty(self, tmp_path):
         assert load_checkpoint(tmp_path / "nope.jsonl") == {}
+
+    def test_corrupt_trailing_line_is_skipped(self, tmp_path):
+        # A hard kill (OOM/SIGKILL/disk-full) mid-append can leave a truncated
+        # final JSON line. Resume must skip it and still recover every complete
+        # prior outcome — a partial write must never strand the whole drain.
+        path = tmp_path / "ckpt.jsonl"
+        append_checkpoint(path, MasterDrainOutcome(10, 500, 3, STATUS_RESOLVED))
+        append_checkpoint(path, MasterDrainOutcome(20, 600, 4, STATUS_NO_MAIN))
+        with path.open("a", encoding="utf-8") as f:
+            f.write('{"master_id": 30, "main_rele')  # truncated, no newline
+        loaded = load_checkpoint(path)  # must not raise
+        assert loaded[10] == MasterDrainOutcome(10, 500, 3, STATUS_RESOLVED)
+        assert loaded[20] == MasterDrainOutcome(20, 600, 4, STATUS_NO_MAIN)
+        assert 30 not in loaded
+
+    def test_line_missing_status_is_skipped(self, tmp_path):
+        # A well-formed JSON object lacking the required ``status`` key is also
+        # malformed for our schema and must be skipped, not raise a KeyError.
+        path = tmp_path / "ckpt.jsonl"
+        append_checkpoint(path, MasterDrainOutcome(10, 500, 3, STATUS_RESOLVED))
+        with path.open("a", encoding="utf-8") as f:
+            f.write('{"master_id": 40, "main_release_id": 700}\n')
+        loaded = load_checkpoint(path)
+        assert set(loaded) == {10}
 
     def test_terminal_statuses_exclude_retryable(self):
         assert STATUS_RESOLVED in TERMINAL_STATUSES
@@ -197,5 +244,36 @@ class TestRunDrain:
         assert len(done) == 2  # only two masters drained this run
 
 
-def _load_jsonl(path: Path):
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+class TestLoadUnresolved:
+    def test_parses_pairs_and_skips_malformed(self, tmp_path):
+        # Ids are parsed with the shared parse_positive_int (as the resolver and
+        # seeder do): a blank or non-integer cell skips the row rather than
+        # aborting the whole rate-limited drain with a bare ValueError.
+        p = tmp_path / "u.csv"
+        p.write_text(
+            "card_catalog_id,master_id\n1,100\n,200\n3,notanint\n0,400\n4,400\n",
+            encoding="utf-8",
+        )
+        assert load_unresolved(p) == [(1, 100), (4, 400)]
+
+    def test_reads_utf8_sig_bom(self, tmp_path):
+        # A BOM-prefixed Excel export must still match the header (utf-8-sig).
+        p = tmp_path / "u.csv"
+        p.write_text("\ufeffcard_catalog_id,master_id\n5,500\n", encoding="utf-8")
+        assert load_unresolved(p) == [(5, 500)]
+
+
+class TestWriteSeedCsvSchema:
+    def test_header_and_column_order_match_seeder(self, tmp_path):
+        # The seeder reads card_catalog_id + discogs_release_id by NAME, so a
+        # column-order regression would silently pin the wrong release. Pin the
+        # emitted header + row layout as a guard.
+        import csv as _csv
+
+        p = tmp_path / "seed.csv"
+        written = write_seed_csv(p, [(7, 500, 100)])
+        assert written == 1
+        rows = list(_csv.DictReader(p.open()))
+        assert rows[0]["card_catalog_id"] == "7"
+        assert rows[0]["discogs_release_id"] == "500"
+        assert rows[0]["master_id"] == "100"

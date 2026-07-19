@@ -3124,14 +3124,25 @@ class TestGetMaster:
         assert result.cached is False
 
     @pytest.mark.asyncio
-    async def test_main_release_absent_is_none(self, service):
-        # A master payload without a ``main_release`` (or with the ``0`` Discogs
-        # uses for "no canonical release chosen") yields ``main_release_id=None``,
-        # so the LML#858 API-tail drain can skip it rather than pin release 0.
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"id": 456, "title": "Dots and Loops"},  # key absent entirely
+            {"id": 456, "title": "Dots and Loops", "main_release": None},  # explicit null
+            {"id": 456, "title": "Dots and Loops", "main_release": 0},  # "none chosen" sentinel
+        ],
+        ids=["absent", "null", "zero"],
+    )
+    async def test_main_release_absent_is_none(self, service, payload):
+        # A master payload with no usable ``main_release`` — key absent, an
+        # explicit null, or the ``0`` Discogs uses for "no canonical release
+        # chosen" — must yield ``main_release_id=None`` (never crash on the
+        # ``isinstance`` coercion) so the LML#858 API-tail drain skips it rather
+        # than pin release 0.
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.raise_for_status = MagicMock()
-        mock_resp.json.return_value = {"id": 456, "title": "Dots and Loops", "main_release": 0}
+        mock_resp.json.return_value = payload
 
         with patch.object(
             service, "_request_with_retry", new_callable=AsyncMock, return_value=mock_resp
