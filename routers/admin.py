@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin"])
 
 STREAMING_DB_FILENAME = "streaming_availability.db"
+LIBRARY_DB_FILENAME = "library.db"
 
 # Coverage-regression guard tolerance for /admin/upload-streaming-db (LML#672).
 # An upload is rejected if any guarded metric drops below prior * (1 - tolerance)
@@ -266,18 +267,37 @@ def _validate_auth(
 async def upload_library_db(
     file: UploadFile,
     settings: Settings = Depends(get_settings),
+    object_store: ObjectStore = Depends(get_object_store),
     authorization: str | None = Header(None),
 ):
     """Replace the library.db file with an uploaded SQLite database.
 
-    The uploaded file is validated before replacing the existing database.
-    The current database connection is closed so the next request picks up
-    the new file.
+    The uploaded file is validated, written to the durable object store (the
+    canonical copy other replicas and the next boot's lifespan fetch read —
+    WXYC#837), and then hot-swapped into the serving replica's local file: the
+    current DB connection is closed (clearing the TTL caches) and the file is
+    atomically replaced so the next request picks up the new catalog.
+
+    The storage backend (:class:`~storage.object_store.ObjectStore`) is selected
+    once per deployment: a Railway Bucket in prod, a local directory in dev/tests.
+    The endpoint is mode-agnostic — it always both ``put``s to the store and does
+    the local hot-swap. In local mode the store's directory *is* the DB's parent,
+    so the ``put`` and the ``os.replace`` land the same file (idempotent); in
+    bucket mode the ``put`` is the remote canonical write and the ``os.replace``
+    is this replica's local refresh. The N>=2 caveat (a hot-swap only refreshes
+    the replica that served the request; others refresh at next restart) is a
+    runbook note, not code (epic #834, PR 4).
     """
     _validate_auth(settings, authorization)
 
     db_path = settings.resolved_library_db_path
-    tmp_path = db_path.parent / f"{db_path.name}.tmp"
+    # ``.upload.tmp`` (not ``.tmp``) so this scratch file never collides with
+    # ``LocalDirStore.put``'s own internal ``<name>.tmp`` in local mode, where the
+    # store's directory is the DB's parent: a shared name would let the store's
+    # os.replace rename this file out from under the local hot-swap below (#837).
+    # Kept in ``db_path.parent`` so the final os.replace is a same-filesystem
+    # atomic rename.
+    tmp_path = db_path.parent / f"{db_path.name}.upload.tmp"
 
     # Write uploaded file to temp location
     try:
@@ -306,10 +326,21 @@ async def upload_library_db(
         new_ids = _get_streaming_ids(tmp_path)
         changes = _compute_streaming_diff(old_ids, new_ids)
 
-    # Close current database connection
+    # Durable canonical write first (WXYC#837). Put-first so a store failure
+    # aborts with 500 *before* we mutate the serving replica's on-disk DB — no
+    # half-applied swap that would leave this replica ahead of the bucket (and of
+    # the next boot / other replicas).
+    try:
+        await object_store.put(LIBRARY_DB_FILENAME, tmp_path)
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        logger.error(f"Failed to store library.db in the object store: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to store library.db: {e}") from e
+
+    # Close current database connection (clears the TTL caches via LibraryDB.close)
     await close_library_db()
 
-    # Atomic replace
+    # Atomic local hot-swap so this replica serves the new file immediately.
     os.replace(str(tmp_path), str(db_path))
     logger.info(f"Library database replaced: {db_path} ({row_count} rows)")
 

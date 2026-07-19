@@ -1,9 +1,12 @@
 """Main application entry point for the Library Metadata Lookup service."""
 
+import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import sentry_sdk
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,12 +14,13 @@ from wxyc_fastapi.observability import flush_posthog, init_sentry, shutdown_post
 
 from artists.router import router as artists_router
 from cache.router import router as cache_router
-from config.settings import get_settings
+from config.settings import Settings, get_settings
 from core.auth import require_lml_key
 from core.dependencies import (
     close_discogs_service,
     close_library_db,
     close_musicbrainz_pg,
+    get_object_store,
 )
 from core.logging import setup_logging
 from discogs.router import router as discogs_router
@@ -26,8 +30,10 @@ from identity.router import router as identity_router
 from library.router import router as library_router
 from lookup.router import router as lookup_router
 from release.router import router as release_router
+from routers.admin import LIBRARY_DB_FILENAME
 from routers.admin import router as admin_router
 from routers.health import router as health_router
+from storage.object_store import ObjectNotFoundError, ObjectStore
 from streaming.dependencies import close_streaming_clients
 from streaming.router import router as streaming_router
 
@@ -59,12 +65,82 @@ setup_logging(level=settings.log_level, log_file=log_file)
 logger = logging.getLogger(__name__)
 
 
+def _atomic_write_bytes(dest: Path, data: bytes) -> None:
+    """Write ``data`` to ``dest`` via a temp file + ``os.replace`` (no torn reads)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".boot.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+async def _boot_fetch_library_db(
+    settings: Settings,
+    store: ObjectStore,
+    *,
+    attempts: int = 3,
+    base_delay: float = 1.0,
+) -> bool:
+    """Fetch library.db from the object store to the local path before serving.
+
+    Bucket-mode boot step (WXYC#837): populates ``LIBRARY_DB_PATH`` from the
+    durable canonical copy so the process serves the current catalog after a
+    restart with no volume. **Non-fatal** by design (epic #834 decision 2): on a
+    missing object or an exhausted transient-error retry it logs + Sentry-captures
+    and returns ``False``, leaving the app to boot degraded (``/health`` 503 via
+    the missing-DB path) with ``POST /admin/upload-library-db`` still available as
+    the recovery path. A missing object is not retried (a 404 will not resolve on
+    retry); transient errors back off linearly. Returns ``True`` once the local
+    file is written.
+    """
+    dest = settings.resolved_library_db_path
+    for attempt in range(1, attempts + 1):
+        try:
+            data = await store.get(LIBRARY_DB_FILENAME)
+        except ObjectNotFoundError:
+            logger.error(
+                "library.db absent from the object store at boot (key=%s); serving degraded",
+                LIBRARY_DB_FILENAME,
+            )
+            sentry_sdk.capture_message(
+                "library.db missing from object store at boot", level="error"
+            )
+            return False
+        except Exception as exc:  # transient (connection / 5xx): retry then degrade
+            if attempt < attempts:
+                await asyncio.sleep(base_delay * attempt)
+                continue
+            logger.exception(
+                "Boot-fetch of library.db failed after %d attempts; serving degraded", attempts
+            )
+            sentry_sdk.capture_exception(exc)
+            return False
+        # Success: land the bytes atomically off the event loop.
+        await asyncio.to_thread(_atomic_write_bytes, dest, data)
+        logger.info(
+            "Boot-fetched library.db from the object store (%d bytes) -> %s", len(data), dest
+        )
+        return True
+    return False  # unreachable: the loop returns on success or on the final attempt
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan with proper startup and shutdown."""
     logger.info(f"Starting {settings.app_name} v{settings.app_version}")
     logger.info(f"Log level: {settings.log_level}")
     logger.info(f"Discogs cache: {'configured' if settings.database_url_discogs else 'disabled'}")
+
+    # Boot-fetch library.db from the object store before serving (WXYC#837).
+    # Bucket mode only and non-fatal — on failure the app boots degraded rather
+    # than crash-looping (see ``_boot_fetch_library_db``). Local mode reads the
+    # file already on disk, so this is skipped there (current behavior).
+    if settings.bucket_mode:
+        store = await get_object_store(settings)
+        await _boot_fetch_library_db(settings, store)
 
     # Bootstrap the persistent streaming-URL cache table directly off the
     # discogs-cache pool. Going through ``get_entity_store`` (and its
