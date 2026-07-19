@@ -1535,10 +1535,18 @@ class DiscogsService:
             response.raise_for_status()
             data = response.json()
 
+            # ``main_release`` is Discogs' canonical release for the master.
+            # Coerce to a positive int; absent or the ``0`` sentinel -> None so
+            # the LML#858 API-tail drain skips masters with no release to pin
+            # instead of leaking release 0 into ``get_release`` (LML#510/#546).
+            raw_main = data.get("main_release")
+            main_release_id = raw_main if isinstance(raw_main, int) and raw_main > 0 else None
+
             return MasterRelease(
                 master_id=master_id,
                 title=data.get("title", ""),
                 year=data.get("year"),
+                main_release_id=main_release_id,
                 cached=False,
             )
         except Exception as e:

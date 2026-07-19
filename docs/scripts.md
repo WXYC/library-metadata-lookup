@@ -226,6 +226,7 @@ uv run python -m scripts.resolve_master_overrides \
   --flowsheet ../plans/alex-discogs-import/data/flowsheet_titles_per_card.csv \
   --out-high phase2_master_links_highconf.csv \
   --out-low  phase2_master_links_lowconf.csv \
+  --out-unresolved phase2_master_unresolved.csv \
   --report   phase2_resolve_report.json
 
 # then seed each bucket with the existing seeder (staging-verify, then prod — gated)
@@ -234,3 +235,24 @@ uv run python -m scripts.seed_library_release_overrides \
 ```
 
 The flowsheet titles CSV (`card_catalog_id,title`, one raw title per row) is produced by `plans/alex-discogs-import/scripts/parse_flowsheet.py` in the workspace meta-repo; the resolver re-normalizes those titles with the same `to_match_form` it applies to candidate tracklists, so Tier-B matching compares like-for-like. Omitting `--flowsheet` disables Tier B (all divergent masters fall to Tier C).
+
+`--out-unresolved` writes the `UNRESOLVED` tail (`card_catalog_id,master_id`) — masters with no cached release and no local `main_release_id` — as the work-list for the API-tail drain below. Omitting it drops those cards silently; pass it whenever the resolver's report shows a non-zero `unresolved` count.
+
+## Master API-Tail Drain (`scripts/drain_master_api_tail.py`)
+
+Resolves the `UNRESOLVED` tail from `resolve_master_overrides --out-unresolved` against the **live Discogs API** and emits a seed CSV the [seeder](#library-release-override-seeder-scriptsseed_library_release_overridespy) consumes unchanged (source tag `alex-l-2026-masters-api`). Per distinct master: `get_master(id)` → `.main_release_id`, then `get_release(main_release_id)` — which both **confirms a non-blank tracklist** (never pin a trackless release, matching the Phase-2 invariant) and **warms the PG cache** via the fallthrough write-back, so the first user lookup is hot rather than a cold-tail API hit ([LML#706](https://github.com/WXYC/library-metadata-lookup/issues/706)). Only masters that clear both steps are pinned, one row per referencing card.
+
+**Shared-token safety.** `get_master`/`get_release` route through `DiscogsService._request_with_retry`, so every call is bounded by the shared 50/min rate limiter and shielded by the [LML#755](https://github.com/WXYC/library-metadata-lookup/issues/755) saturation breaker. Even so this shares the prod Discogs token with live traffic — run **off-peak** and **never** concurrently with a bulk backfill campaign (BS#1631-class). Progress is checkpointed per master to a JSONL file: terminal states (`resolved`, `no_main_release`, `trackless`) are never retried, while `dead`/`error` (ambiguous/transient) and un-checkpointed raises (e.g. a breaker shed) are re-attempted on the next run — so an interrupted or re-run drain never re-spends API budget on a settled master. `--limit` caps masters per run for a smoke batch; `--concurrency` bounds in-flight masters on top of the service limiter.
+
+```bash
+# resolve the API tail (writes/updates the checkpoint + a seed CSV); off-peak only
+uv run python -m scripts.drain_master_api_tail \
+  --unresolved phase2_master_unresolved.csv \
+  --checkpoint drain_checkpoint.jsonl \
+  --out-seed  phase2_master_links_api.csv \
+  --concurrency 4 --limit 200   # drop --limit for the full run
+
+# then seed the API-derived pins (staging-verify, then prod — gated)
+uv run python -m scripts.seed_library_release_overrides \
+  --input phase2_master_links_api.csv --source alex-l-2026-masters-api --execute
+```

@@ -198,6 +198,10 @@ class MasterRelease(BaseModel):
     master_id: int
     title: str
     year: int | None = None
+    # Discogs' canonical release for this master (``main_release`` in the API).
+    # ``None`` when absent or the ``0`` Discogs sends for "no release chosen";
+    # the LML#858 master→release API-tail drain pins this id. See ``get_master``.
+    main_release_id: int | None = None
     cached: bool = False
 
 

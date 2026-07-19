@@ -49,6 +49,7 @@ from scripts.resolve_master_overrides import (
     resolve_master,
     tier_report,
     write_seed_csv,
+    write_unresolved_csv,
 )
 
 
@@ -404,11 +405,13 @@ class TestRunDriver:
         out_high = tmp_path / "high.csv"
         out_low = tmp_path / "low.csv"
         report = tmp_path / "nested" / "report.json"  # parent dir does not exist yet
+        out_unresolved = tmp_path / "unresolved.csv"
         ns = argparse.Namespace(
             input=str(inp),
             flowsheet=None,
             out_high=str(out_high),
             out_low=str(out_low),
+            out_unresolved=str(out_unresolved),
             report=str(report),
         )
 
@@ -420,6 +423,8 @@ class TestRunDriver:
         ]
         low_rows = list(_csv.DictReader(out_low.open()))
         assert low_rows == []  # the unresolved card is skipped, header only
+        unresolved_rows = list(_csv.DictReader(out_unresolved.open()))
+        assert len(unresolved_rows) == 1  # the unresolved card lands on the API-tail list
 
         import json as _json
 
@@ -443,3 +448,32 @@ class TestWriteSeedCsv:
         assert len(rows) == 1
         assert rows[0]["card_catalog_id"] == "1"
         assert rows[0]["discogs_release_id"] == "500"
+
+
+class TestWriteUnresolvedCsv:
+    def test_writes_only_unresolved_card_master_pairs(self, tmp_path):
+        # The complement of write_seed_csv: emit exactly the rows with no pin so
+        # the LML#858 Discogs-API tail drain has an enumerable work-list (no
+        # silent drops per the ticket's acceptance criteria).
+        resolutions = [
+            MasterResolution(1, 100, 500, TIER_A, CONF_HIGH, "pinned"),
+            MasterResolution(2, 200, None, UNRESOLVED, CONF_LOW, "no cached/main"),
+            MasterResolution(3, 300, None, UNRESOLVED, CONF_LOW, "no cached/main"),
+        ]
+        out = tmp_path / "sub" / "unresolved.csv"
+        written = write_unresolved_csv(out, resolutions)
+        assert written == 2
+        assert out.exists()  # missing parent dir created
+        rows = list(__import__("csv").DictReader(out.open()))
+        assert [r["card_catalog_id"] for r in rows] == ["2", "3"]
+        assert [r["master_id"] for r in rows] == ["200", "300"]
+
+    def test_no_cached_tier_is_not_unresolved(self, tmp_path):
+        # A no_cached row carries a main_release_id pin, so it is seedable, not
+        # part of the API tail — only tier == UNRESOLVED belongs here.
+        resolutions = [
+            MasterResolution(4, 400, 900, NO_CACHED, CONF_LOW, "main_release only"),
+        ]
+        out = tmp_path / "unresolved.csv"
+        written = write_unresolved_csv(out, resolutions)
+        assert written == 0

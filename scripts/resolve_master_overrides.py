@@ -501,6 +501,32 @@ def write_seed_csv(path: Path, resolutions: list[MasterResolution]) -> int:
     return written
 
 
+_UNRESOLVED_HEADER = ["card_catalog_id", "master_id"]
+
+
+def write_unresolved_csv(path: Path, resolutions: list[MasterResolution]) -> int:
+    """Write the ``UNRESOLVED`` tail (no cached version, no ``main_release_id``).
+
+    The complement of :func:`write_seed_csv`: these ``(card_catalog_id,
+    master_id)`` pairs are the Discogs-API work-list for the LML#858 tail drain
+    (``scripts/drain_master_api_tail.py``) — masters that need a live
+    ``GET /masters/{id}`` to discover a ``main_release`` to pin. Emitting them
+    keeps the "no silent drops" acceptance criterion enforceable. Returns the
+    number of rows written.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(_UNRESOLVED_HEADER)
+        for r in resolutions:
+            if r.tier != UNRESOLVED:
+                continue
+            w.writerow([r.card_catalog_id, r.master_id])
+            written += 1
+    return written
+
+
 def _split_by_confidence(
     resolutions: list[MasterResolution],
 ) -> tuple[list[MasterResolution], list[MasterResolution]]:
@@ -557,6 +583,13 @@ async def _run(args: argparse.Namespace) -> None:
         args.out_low,
         SOURCE_LOW,
     )
+    if args.out_unresolved:
+        n_unresolved = write_unresolved_csv(Path(args.out_unresolved), resolutions)
+        log.info(
+            "wrote %d unresolved (card,master) rows -> %s (Discogs-API tail work-list)",
+            n_unresolved,
+            args.out_unresolved,
+        )
     if args.report:
         report_path = Path(args.report)
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -584,6 +617,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--out-low",
         default="phase2_master_links_lowconf.csv",
         help="Output CSV for Tier C / no_cached pins (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--out-unresolved",
+        help="Optional CSV of the UNRESOLVED (card_catalog_id, master_id) tail "
+        "— the Discogs-API work-list for scripts/drain_master_api_tail.py (LML#858)",
     )
     parser.add_argument(
         "--report",
