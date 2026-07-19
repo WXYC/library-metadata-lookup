@@ -233,6 +233,16 @@ class TestRunDrain:
         assert load_checkpoint(ckpt) == {}
 
     @pytest.mark.asyncio
+    async def test_zero_concurrency_raises_instead_of_hanging(self, tmp_path):
+        # argparse accepts --concurrency 0; without a guard run_drain would build
+        # asyncio.Semaphore(0), which no worker can acquire, hanging the drain
+        # forever while holding the DB pool. Fail loud and fast instead.
+        svc = FakeService(masters={100: _master(500)}, releases={500: _release(2)})
+        with pytest.raises(ValueError):
+            await run_drain(svc, {100: [1]}, tmp_path / "c.jsonl", concurrency=0)
+        assert svc.master_calls == []  # never started a worker
+
+    @pytest.mark.asyncio
     async def test_limit_caps_masters_processed(self, tmp_path):
         ckpt = tmp_path / "ckpt.jsonl"
         svc = FakeService(

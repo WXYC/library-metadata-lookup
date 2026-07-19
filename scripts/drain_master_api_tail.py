@@ -20,10 +20,12 @@ per card that referenced the master — under the ``alex-l-2026-masters-api``
 source tag.
 
 **Safety.** ``get_master`` / ``get_release`` route through
-``DiscogsService._request_with_retry``, so every call is bounded by the shared
-50/min rate limiter and shielded by the LML#755 saturation breaker. Even so this
-shares the prod Discogs token with live traffic: run **off-peak** and **never**
-concurrently with a bulk backfill campaign (BS#1631-class). Progress is
+``DiscogsService._request_with_retry``, so every call is bounded by the
+service's own (per-process) 50/min rate limiter and shielded by the LML#755
+saturation breaker. That limiter is not coordinated with the live service's, so
+this drain shares the prod Discogs token with live traffic uncoordinated: run
+**off-peak** and **never** concurrently with a bulk backfill campaign
+(BS#1631-class). Progress is
 checkpointed per master to a JSONL file, so an interrupted or re-run drain never
 re-spends API budget on a master that already reached a terminal state.
 
@@ -238,7 +240,13 @@ async def run_drain(
     service's own 50/min limiter + breaker). ``limit`` caps how many masters
     this invocation processes — use it to smoke-test a small batch before the
     full run. Returns the merged ``{master_id: outcome}`` after this pass.
+
+    Raises ``ValueError`` if ``concurrency < 1``: ``asyncio.Semaphore(0)`` can
+    never be acquired, so a ``--concurrency 0`` typo would otherwise hang the
+    drain forever holding the DB pool instead of failing fast.
     """
+    if concurrency < 1:
+        raise ValueError(f"concurrency must be >= 1, got {concurrency}")
     done = load_checkpoint(checkpoint_path)
     todo = _pending_masters(cards_by_master, done)
     if limit is not None:
