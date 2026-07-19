@@ -53,6 +53,8 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts._lib.csv_ids import parse_positive_int
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -108,8 +110,8 @@ def load_rows(path: Path) -> list[OverrideRow]:
         reader = csv.DictReader(f)
         for record in reader:
             parsed += 1
-            library_id = _parse_positive_int(record.get(_LIBRARY_ID_COL))
-            release_id = _parse_positive_int(record.get(_RELEASE_ID_COL))
+            library_id = parse_positive_int(record.get(_LIBRARY_ID_COL))
+            release_id = parse_positive_int(record.get(_RELEASE_ID_COL))
             if library_id is None or release_id is None:
                 skipped += 1
                 continue
@@ -122,19 +124,6 @@ def load_rows(path: Path) -> list[OverrideRow]:
         skipped,
     )
     return [OverrideRow(library_id=k, discogs_release_id=v) for k, v in by_library_id.items()]
-
-
-def _parse_positive_int(raw: str | None) -> int | None:
-    if raw is None:
-        return None
-    raw = raw.strip()
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    return value if value > 0 else None
 
 
 async def seed_overrides(conn, rows: list[OverrideRow], *, execute: bool, source: str) -> int:

@@ -36,6 +36,8 @@ from pathlib import Path
 
 from wxyc_etl.text import to_match_form
 
+from scripts._lib.csv_ids import parse_positive_int
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -138,11 +140,16 @@ def _choose_cached(
     ids = {c.release_id for c in candidates}
     if main_release_id is not None and main_release_id in ids:
         return main_release_id
-    wanted = to_match_form(csv_format or "")
+    # Match on token overlap, not whole-string membership: the CSV format is a
+    # free-form Discogs descriptor ('vinyl - 7"', 'cd x 2'), so tokenize both
+    # sides and prefer the candidate sharing the most tokens (a 7" pressing beats
+    # an LP when the shelf copy is a 7"), breaking ties by lowest id.
+    wanted = _format_tokens(csv_format)
     if wanted:
-        fmt_matches = [c.release_id for c in candidates if wanted in _format_tokens(c.format)]
-        if fmt_matches:
-            return min(fmt_matches)
+        scored = [(len(wanted & _format_tokens(c.format)), c.release_id) for c in candidates]
+        best = max(score for score, _ in scored)
+        if best > 0:
+            return min(release_id for score, release_id in scored if score == best)
     return min(ids)
 
 
@@ -202,6 +209,12 @@ def resolve_master(
             confidence=conf,
             reason=reason,
         )
+
+    # Drop candidates whose normalized tracklist is empty (all track titles
+    # blank/NULL): an empty tracklist can't be compared and carries no shelf
+    # value, so such a version must not win Tier A or be pinned in Tier C. If
+    # every candidate is empty the master is treated as having no cached version.
+    candidates = [c for c in candidates if c.normalized_titles]
 
     if not candidates:
         if main_release_id is not None:
@@ -281,8 +294,8 @@ def load_master_links(path: Path) -> list[MasterLink]:
             if (record.get("discogs_type") or "").strip().lower() != "master":
                 continue
             parsed += 1
-            card = _parse_positive_int(record.get("card_catalog_id"))
-            master = _parse_positive_int(record.get("discogs_id"))
+            card = parse_positive_int(record.get("card_catalog_id"))
+            master = parse_positive_int(record.get("discogs_id"))
             if card is None or master is None:
                 skipped += 1
                 continue
@@ -298,19 +311,6 @@ def load_master_links(path: Path) -> list[MasterLink]:
     return list(by_card.values())
 
 
-def _parse_positive_int(raw: str | None) -> int | None:
-    if raw is None:
-        return None
-    raw = raw.strip()
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    return value if value > 0 else None
-
-
 def load_flowsheet_titles(path: Path) -> dict[int, frozenset[str]]:
     """Load per-card played titles from ``flowsheet_titles_per_card.csv``.
 
@@ -322,7 +322,7 @@ def load_flowsheet_titles(path: Path) -> dict[int, frozenset[str]]:
     raw: dict[int, set[str]] = defaultdict(set)
     with path.open(newline="", encoding="utf-8-sig") as f:
         for record in csv.DictReader(f):
-            card = _parse_positive_int(record.get("card_catalog_id"))
+            card = parse_positive_int(record.get("card_catalog_id"))
             if card is None:
                 continue
             form = to_match_form(record.get("title") or "")
@@ -338,6 +338,12 @@ def load_flowsheet_titles(path: Path) -> dict[int, frozenset[str]]:
 # ---------------------------------------------------------------------------
 
 
+def _chunked(ids: list[int], size: int) -> Iterable[list[int]]:
+    """Yield ``ids`` in contiguous slices of at most ``size`` (bounds array size)."""
+    for start in range(0, len(ids), size):
+        yield ids[start : start + size]
+
+
 async def fetch_candidates(conn, master_ids: Iterable[int]) -> dict[int, list[CandidateRelease]]:
     """Fetch cached releases (with tracklists) grouped by master id.
 
@@ -348,8 +354,7 @@ async def fetch_candidates(conn, master_ids: Iterable[int]) -> dict[int, list[Ca
     ids = sorted({int(m) for m in master_ids})
     # release_id -> {master_id, format, titles: list[str]}
     rel: dict[int, dict] = {}
-    for start in range(0, len(ids), _QUERY_CHUNK):
-        chunk = ids[start : start + _QUERY_CHUNK]
+    for chunk in _chunked(ids, _QUERY_CHUNK):
         rows = await conn.fetch(
             """
             SELECT r.master_id AS master_id, r.id AS release_id,
@@ -380,20 +385,22 @@ async def fetch_candidates(conn, master_ids: Iterable[int]) -> dict[int, list[Ca
 
 
 async def fetch_main_releases(conn, master_ids: Iterable[int]) -> dict[int, int]:
-    """Fetch ``master.main_release_id`` for the given masters (skips NULLs).
+    """Fetch ``master.main_release_id`` for the given masters.
 
-    Returns ``{}`` while the ``master`` table is unpopulated (WXYC/discogs-etl#317
-    prerequisite) — the resolver then falls back to cached-version selection.
+    Skips NULL and non-positive (``0`` sentinel / negative) values so only a real
+    release id is ever returned — matching the positive-int rule the rest of the
+    script applies to card and Discogs ids. Returns ``{}`` while the ``master``
+    table is unpopulated (WXYC/discogs-etl#317 prerequisite) — the resolver then
+    falls back to cached-version selection.
     """
     ids = sorted({int(m) for m in master_ids})
     out: dict[int, int] = {}
-    for start in range(0, len(ids), _QUERY_CHUNK):
-        chunk = ids[start : start + _QUERY_CHUNK]
+    for chunk in _chunked(ids, _QUERY_CHUNK):
         rows = await conn.fetch(
             """
             SELECT id, main_release_id
             FROM master
-            WHERE id = ANY($1::int[]) AND main_release_id IS NOT NULL
+            WHERE id = ANY($1::int[]) AND main_release_id > 0
             """,
             chunk,
         )
@@ -430,21 +437,26 @@ def resolve_all(
 
 
 def tier_report(resolutions: list[MasterResolution]) -> dict:
-    """Per-tier + per-confidence counts, plus seedable/unresolved totals."""
-    by_tier: dict[str, int] = defaultdict(int)
-    by_conf: dict[str, int] = defaultdict(int)
+    """Per-tier + per-confidence counts, plus seedable/unresolved totals.
+
+    Every tier and confidence bucket is pre-seeded to 0 so the report's key set
+    is stable run-to-run and downstream consumers can index any bucket without a
+    ``KeyError`` when it happens to be empty.
+    """
+    by_tier: dict[str, int] = dict.fromkeys((TIER_A, TIER_B, TIER_C, NO_CACHED, UNRESOLVED), 0)
+    by_conf: dict[str, int] = dict.fromkeys((CONF_HIGH, CONF_LOW), 0)
     seedable = unresolved = 0
     for r in resolutions:
-        by_tier[r.tier] += 1
-        by_conf[r.confidence] += 1
+        by_tier[r.tier] = by_tier.get(r.tier, 0) + 1
+        by_conf[r.confidence] = by_conf.get(r.confidence, 0) + 1
         if r.chosen_release_id is None:
             unresolved += 1
         else:
             seedable += 1
     return {
         "total": len(resolutions),
-        "by_tier": dict(sorted(by_tier.items())),
-        "by_confidence": dict(sorted(by_conf.items())),
+        "by_tier": by_tier,
+        "by_confidence": by_conf,
         "seedable": seedable,
         "unresolved": unresolved,
     }
@@ -546,7 +558,9 @@ async def _run(args: argparse.Namespace) -> None:
         SOURCE_LOW,
     )
     if args.report:
-        Path(args.report).write_text(json.dumps(report, indent=2))
+        report_path = Path(args.report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2))
         log.info("wrote report -> %s", args.report)
 
 

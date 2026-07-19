@@ -63,7 +63,7 @@ async def seeded_masters(pg_pool):
         """)
         await conn.executemany(
             "INSERT INTO master (id, main_release_id) VALUES ($1, $2)",
-            [(100, 500), (200, None)],
+            [(100, 500), (200, None), (300, 0)],  # 300: sentinel main_release_id 0
         )
         await conn.executemany(
             "INSERT INTO release (id, format, master_id) VALUES ($1, $2, $3)",
@@ -112,7 +112,8 @@ async def test_fetch_candidates_groups_by_master(pg_pool, seeded_masters):
 
 
 @pytest.mark.asyncio
-async def test_fetch_main_releases_skips_null(pg_pool, seeded_masters):
+async def test_fetch_main_releases_skips_null_and_nonpositive(pg_pool, seeded_masters):
     async with pg_pool.acquire() as conn:
-        mains = await fetch_main_releases(conn, {100, 200, 999})
-    assert mains == {100: 500}  # 200 is NULL, 999 absent
+        mains = await fetch_main_releases(conn, {100, 200, 300, 999})
+    # 200 is NULL, 300 is the 0 sentinel (dropped), 999 absent
+    assert mains == {100: 500}
