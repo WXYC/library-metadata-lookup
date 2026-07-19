@@ -29,11 +29,28 @@ Progress is checkpointed per album to a JSONL file, so an interrupted or re-run
 resolve never re-spends Apple API budget on a candidate already in a terminal
 state (``matched`` / ``no_match``). ``api_error`` is transient and retried.
 
-**Safety.** The Apple JWT creds are prod's, and their per-process limiter is not
-coordinated with the live service's. Run **off-peak**, bound ``--concurrency``,
-and set ``--rate-per-min`` to stay under Apple's ceiling so the resolver never
-starves prod's own Apple enrichment. Read-only against BS (candidates are an
-exported TSV, not a live BS read); the only write is the separate fill-only apply.
+**Transient failures settle as ``no_match``, not ``api_error``.** The
+authenticated ``AppleMusicClient`` (migrated off the iTunes Search API in
+LML#443) *swallows* transient HTTP failures — an exhausted 429/5xx retry, a
+transport error, a bad-JSON body — to an empty result, so ``find_album_match``
+returns ``None`` for them, indistinguishable from a genuine "no Apple album".
+Those land as ``no_match`` (terminal). The ``api_error`` bucket therefore only
+catches a rare hard *raise*; it is **not** the 429 back-pressure path. So run
+off-peak: transient contention silently freezes candidates as ``no_match`` for
+this checkpoint, and re-probing them needs a *fresh* checkpoint (the BS
+fill-only predicate keeps them eligible, so a future full re-run is safe but
+low-yield).
+
+**Safety.** The Apple JWT creds are prod's, and ``AppleMusicClient`` already
+enforces its own internal ceiling — an ``asyncio.Semaphore(5)`` plus an
+``AsyncLimiter`` of ~60 calls/min — that is *not* coordinated with the live
+service's instance. ``--concurrency`` and ``--rate-per-min`` can only make this
+resolver **more** conservative than that built-in 5-concurrent / ~60-per-minute
+cap (they bind only when set below it); they cannot make it faster. To leave
+headroom for prod's own Apple enrichment, run **off-peak** and set
+``--concurrency`` / ``--rate-per-min`` *below* the built-in ceiling. Read-only
+against BS (candidates are an exported TSV, not a live BS read); the only write
+is the separate fill-only apply.
 
 Usage (dry-run tally first, then the real run)::
 
@@ -41,13 +58,13 @@ Usage (dry-run tally first, then the real run)::
         --candidates candidates.tsv \\
         --checkpoint apple_resolve.jsonl \\
         --out apple_urls.tsv \\
-        --concurrency 10 --rate-per-min 300 --dry-run
+        --concurrency 3 --rate-per-min 30 --dry-run
 
     python -m scripts.resolve_apple_urls \\
         --candidates candidates.tsv \\
         --checkpoint apple_resolve.jsonl \\
         --out apple_urls.tsv \\
-        --concurrency 10 --rate-per-min 300
+        --concurrency 3 --rate-per-min 30
 """
 
 from __future__ import annotations
@@ -62,6 +79,8 @@ import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 from scripts._lib.csv_ids import parse_positive_int
 
@@ -104,7 +123,9 @@ async def resolve_one(client, album_id: int, artist: str, album: str) -> AlbumRe
     ``client`` needs async ``find_album_match(artist, title) -> SourceMatch|None``
     (an ``AppleMusicClient``). A raised Apple API error is caught and reported as
     ``api_error`` so one transient failure never aborts the run — the caller
-    leaves it un-terminal for retry on the next pass.
+    leaves it un-terminal for retry on the next pass. Note the real client
+    swallows transient HTTP errors to ``None`` (recorded ``no_match``); this
+    ``api_error`` path only catches a rare hard raise (see the module docstring).
     """
     try:
         match = await client.find_album_match(artist, album)
@@ -233,17 +254,14 @@ async def run_resolve(
     if limit is not None and limit < 1:
         raise ValueError(f"limit must be >= 1 when set, got {limit}")
     done = load_checkpoint(checkpoint_path)
-    todo = _pending_candidates(candidates, done)
-    if limit is not None:
-        todo = todo[:limit]
+    pending = _pending_candidates(candidates, done)
+    todo = pending[:limit] if limit is not None else pending
     log.info(
         "resolve: %d candidates total, %d already terminal, %d to process this run",
         len(candidates),
-        len(candidates) - len(_pending_candidates(candidates, done)),
+        len(candidates) - len(pending),
         len(todo),
     )
-    if not todo:
-        return done
 
     sem = asyncio.Semaphore(concurrency)
     gate = _RateGate(min_interval_seconds(rate_per_min))
@@ -262,14 +280,22 @@ async def run_resolve(
             if processed % 250 == 0:
                 log.info("progress: %d processed — %s", processed, dict(counts))
 
-    await asyncio.gather(*(worker(aid, art, alb) for aid, art, alb in todo))
-    log.info("resolve pass complete: %s", dict(counts))
+    if todo:
+        await asyncio.gather(*(worker(aid, art, alb) for aid, art, alb in todo))
+        log.info("resolve pass complete: %s", dict(counts))
+    else:
+        log.info("resolve: nothing to process this run (all candidates already terminal)")
 
-    if out_path is not None and not dry_run:
+    # Emit the output TSV even when there was no new work: the documented
+    # workflow (a --dry-run pass, which checkpoints every candidate terminal,
+    # then a real run) leaves ``todo`` empty on the emitting pass, and a re-run
+    # to regenerate a deleted/stale TSV also has an all-terminal checkpoint.
+    # The output is always the full ``done`` set, not just this pass's work.
+    if dry_run:
+        log.info("dry-run: %d matched this pass (no TSV emitted)", counts.get(STATUS_MATCHED, 0))
+    elif out_path is not None:
         n = write_url_tsv(out_path, done)
         log.info("wrote %d matched (album_id, url) rows -> %s", n, out_path)
-    elif dry_run:
-        log.info("dry-run: %d matched (no TSV emitted)", counts.get(STATUS_MATCHED, 0))
     return done
 
 
@@ -285,10 +311,16 @@ def load_candidates(path: Path) -> list[tuple[int, str, str]]:
     non-positive id, a blank artist, or a blank album skips the row rather than
     aborting the whole rate-limited run. Opens ``utf-8-sig`` so a BOM-prefixed
     export still matches the header.
+
+    ``quoting=QUOTE_NONE`` because a BS export is genuine (unescaped) TSV: a
+    double-quote in an artist/album cell (``7" Single``, a quoted album title)
+    is a literal character. With csv's default quote processing a leading quote
+    would be stripped — silently altering the Apple query — and an unbalanced
+    quote would swallow every following line into one field, dropping candidates.
     """
     rows: list[tuple[int, str, str]] = []
     with path.open(newline="", encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f, delimiter="\t"):
+        for r in csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE):
             album_id = parse_positive_int(r.get("album_id"))
             artist = (r.get("artist") or "").strip()
             album = (r.get("album") or "").strip()
@@ -347,6 +379,10 @@ def _build_apple_client():
 
 
 async def _run(args: argparse.Namespace) -> None:
+    # Load a local ``.env`` so Apple JWT creds kept there resolve, matching the
+    # off-prod precedent ``recheck_streaming_after_mojibake.py`` and the ~10
+    # other scripts in this repo. ``os.environ`` (e.g. Railway) still wins.
+    load_dotenv()
     candidates = load_candidates(Path(args.candidates))
     log.info("loaded %d candidate albums from %s", len(candidates), args.candidates)
 
