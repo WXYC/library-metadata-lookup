@@ -256,3 +256,29 @@ uv run python -m scripts.drain_master_api_tail \
 uv run python -m scripts.seed_library_release_overrides \
   --input phase2_master_links_api.csv --source alex-l-2026-masters-api --execute
 ```
+
+## Apple-Music-URL Resolver (`scripts/resolve_apple_urls.py`)
+
+Off-prod resolver for the [BS#1631](https://github.com/WXYC/Backend-Service/issues/1631) Apple-Music-URL backfill's still-null `album_metadata` tail. The in-service backfill drives LML `/api/v1/lookup`, but almost none of a full lookup's work is needed for `apple_music_url`: the persistent album-level URL comes *solely* from the async warm calling `AppleMusicClient.find_album_match(artist, album)` (`entity/streaming_url_cache.py`). This script calls that exact method directly — **exact match parity** with the album-phase capture path — at a fraction of the cost, and, run off-prod, sidesteps both the LML health watchdog and the synchronous-enrichment latency wall ([LML#706](https://github.com/WXYC/library-metadata-lookup/issues/706)) that make the in-service backfill trip and under-capture.
+
+It is the **resolve** half of a two-phase, clean-ownership design: this script reads a read-only candidate export `(album_id, artist, album)` and emits `(album_id, apple_music_url)` for accepted matches to a TSV; the **apply** half (Backend-Service `jobs/apple-music-url-backfill/resolve.ts::applyUpdate`, fill-only `WHERE apple_music_url IS NULL`) writes it back. LML never writes BS RDS. Scope is **album-level only** — `find_album_match` is the album-phase warm path; the flowsheet phase's track-level probe is out of scope.
+
+**Shared-token safety.** The Apple JWT creds (`APPLE_MUSIC_TEAM_ID`/`KEY_ID`/`PRIVATE_KEY`, from `os.environ`) are prod's and their per-process limiter is not coordinated with the live service's. Run **off-peak**, bound `--concurrency`, and set `--rate-per-min` to stay under Apple's ceiling so the resolver never starves prod's own enrichment (a 403/429 reuses the client's backoff). Progress is checkpointed per album to a JSONL file: terminal states (`matched`, `no_match`) are never retried, while `api_error` (transient) is re-attempted on the next run — so an interrupted or re-run resolve never re-spends Apple budget on a settled candidate. `--limit` caps candidates per run for a smoke batch; `--dry-run` resolves + tallies + checkpoints but emits no output TSV.
+
+```bash
+# dry-run tally first (no TSV emitted); off-peak only
+uv run python -m scripts.resolve_apple_urls \
+  --candidates candidates.tsv \
+  --checkpoint apple_resolve.jsonl \
+  --out apple_urls.tsv \
+  --concurrency 10 --rate-per-min 300 --dry-run
+
+# then the real resolve (writes/updates the checkpoint + the (album_id, url) TSV)
+uv run python -m scripts.resolve_apple_urls \
+  --candidates candidates.tsv \
+  --checkpoint apple_resolve.jsonl \
+  --out apple_urls.tsv \
+  --concurrency 10 --rate-per-min 300
+```
+
+The emitted `apple_urls.tsv` is applied back via the Backend-Service fill-only write (SELECT-before / count-after; never overwrites a non-null URL).
