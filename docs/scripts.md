@@ -203,3 +203,34 @@ uv run python -m scripts.seed_library_release_overrides \
 ```
 
 `load_rows` opens the CSV `utf-8-sig` (BOM-tolerant), drops rows with a missing/non-integer/non-positive id, and dedupes by `library_id` (last row wins — a later hand-correction supersedes an earlier automated entry). The seeder writes the override table only; minting `entity.release_identity` for the pinned releases and warming the release cache are separate optional operational steps via the existing HTTP surfaces (`POST /api/v1/identity/resolve`, `POST /api/v1/cache/refresh-for-identities`) against a running service.
+
+## Master → Release Resolver (`scripts/resolve_master_overrides.py`)
+
+Phase 2 of the Alex L. import (LML#858). The bulk of Alex's dataset links each card to a Discogs **master** id, not a release — and a master yields no single tracklist. This read-only pre-step converts the master-typed rows of `merged_discogs_links.csv` into concrete release ids and emits CSVs the [seeder](#library-release-override-seeder-scriptsseed_library_release_overridespy) consumes **unchanged** (it reads `card_catalog_id` + `discogs_release_id` by name; the extra `master_id,tier,confidence,reason` audit columns are ignored). It only reads the shared discogs-cache (`DATABASE_URL_DISCOGS`) — it never writes.
+
+For each card the choice among the master's cached versions (grouped via `release.master_id`, each release's order-insensitive tracklist normalized with `wxyc_etl.text.to_match_form`) is **tiered**:
+
+- **Tier A** (high) — one cached version, or several with identical tracklists: the choice is forced or provably irrelevant.
+- **Tier B** (high) — versions diverge and the flowsheet's played titles pick a unique **strict-superset** winner. The signal is asymmetric — a played title present on version A and absent from B is evidence *for* A, but an unplayed title proves nothing — so a strict-superset margin is required, not raw-count scoring.
+- **Tier C** (low) — versions diverge, no distinguishing flowsheet signal: pin a **cached** version (the master's `main_release` when it is itself cached, else a format-matched / lowest-id cached edition). An uncached `main_release` is deliberately never pinned — it carries no cached tracklist, and a format-matched cached edition is the better shelf-copy approximation.
+- **no_cached** / **unresolved** — the master has no cached release: pin `main_release_id` if the `master` table supplies one (rare — the masters import is library-scoped, so a master with no cached release usually has no row either), else leave unresolved (the Discogs-API tail, reported, never silently dropped).
+
+Tier A/B land in `--out-high` (seed as `--source alex-l-2026-masters`); Tier C / no_cached land in `--out-low` (seed as `--source alex-l-2026-masters-lowconf`) so the two confidence buckets stay separable and the seeder's `source`-guarded upsert treats each as its own set. **Every seedable pin is guaranteed to resolve to a cached tracklist** — `fetch_candidates` inner-joins `release_track`, and the choosers only ever return a candidate id.
+
+The `master.main_release_id` join requires the discogs-cache `master` table, populated by [WXYC/discogs-etl#317](https://github.com/WXYC/discogs-etl/issues/317). Tier A/B resolve off `release.master_id` alone and work without it; Tier C/no_cached degrade gracefully (deterministic cached fallback) when it is empty.
+
+```bash
+# read-only: query the cache, resolve, write two seed CSVs + a per-tier report
+uv run python -m scripts.resolve_master_overrides \
+  --input ../plans/alex-discogs-import/data/merged_discogs_links.csv \
+  --flowsheet ../plans/alex-discogs-import/data/flowsheet_titles_per_card.csv \
+  --out-high phase2_master_links_highconf.csv \
+  --out-low  phase2_master_links_lowconf.csv \
+  --report   phase2_resolve_report.json
+
+# then seed each bucket with the existing seeder (staging-verify, then prod — gated)
+uv run python -m scripts.seed_library_release_overrides \
+  --input phase2_master_links_highconf.csv --source alex-l-2026-masters --execute
+```
+
+The flowsheet titles CSV (`card_catalog_id,title`, one raw title per row) is produced by `plans/alex-discogs-import/scripts/parse_flowsheet.py` in the workspace meta-repo; the resolver re-normalizes those titles with the same `to_match_form` it applies to candidate tracklists, so Tier-B matching compares like-for-like. Omitting `--flowsheet` disables Tier B (all divergent masters fall to Tier C).
