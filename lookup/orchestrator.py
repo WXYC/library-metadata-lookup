@@ -66,6 +66,12 @@ from lookup.models import LookupRequest, LookupResponse, LookupResultItem
 from lookup.release_resolution import (
     ResolvedRelease,
 )
+from lookup.spine_deadline import (
+    SpineDeadline,
+    SpineDeadlineExceededError,
+    project_spine_deadline_telemetry,
+    run_within_spine_deadline,
+)
 from lookup.strategies import build_strategies
 from lookup.strategies.artist_plus_album import search_library_with_fallback
 from lookup.strategies.library_miss import _library_miss_discogs_search
@@ -335,6 +341,13 @@ class LookupServices:
     caller_budget_ms: int | None
     """Caller-imposed search budget forwarded to the strategy pipeline (step 3)."""
 
+    spine_deadline: SpineDeadline
+    """LML#865 spine-level deadline built once at ``perform_lookup`` entry. Bounds
+    step 2's ``resolve_albums_for_track`` Discogs pass (via
+    ``run_within_spine_deadline``) and re-bases step 3's clock to the spine start
+    (via ``execute_search_pipeline(pipeline_start_offset_ms=...)``) so the hard
+    cap + caller budget cover ``step2 + step3`` together."""
+
     allow_release_resolution_fallback: bool
     """LML#652/#671 bulk kill switch: ``False`` on /lookup/bulk suppresses every
     per-row Discogs surfacing path (the row-less producers, the step-3a
@@ -401,9 +414,11 @@ async def _step_prepare_request(
             # Resolve the fuzzy library-artist correction FIRST (a cheap, cached
             # local-SQLite lookup) so album resolution can gate its Discogs
             # tracklist validation on library membership of the CORRECTED artist
-            # (LML#866). Previously these ran concurrently; serializing costs a
+            # (LML#866). Serializing (vs the former concurrent gather) costs a
             # sub-millisecond local read and is required for the gate to use the
-            # same library-artist notion step 3 does.
+            # same library-artist notion step 3 does. Because the correction now
+            # completes before step 2 begins, there is no concurrent sibling task
+            # to orphan when the LML#865 spine deadline trips.
             corrected = await services.db.find_similar_artist(parsed.artist)
             if corrected:
                 state.corrected_artist = corrected
@@ -417,13 +432,21 @@ async def _step_prepare_request(
                 # library-side legs (``db.search`` queries + ``artist_matches_item``
                 # match-backs).
                 parsed.library_artist = corrected
-            albums_for_search, song_not_found = await resolve_albums_for_track(
-                parsed, services.discogs_service, db=services.db
+            # LML#865: bound step 2's Discogs pass by the spine deadline. On a
+            # trip, run_within_spine_deadline raises SpineDeadlineExceededError,
+            # which perform_lookup catches to return the honest timed-out response.
+            albums_for_search, song_not_found = await run_within_spine_deadline(
+                resolve_albums_for_track(parsed, services.discogs_service, db=services.db),
+                services.spine_deadline,
+                step="album_lookup",
             )
     else:
         with services.telemetry.track_step("album_lookup"):
-            albums_for_search, song_not_found = await resolve_albums_for_track(
-                parsed, services.discogs_service, db=services.db
+            # LML#865: same spine-deadline bound on the artist-less branch.
+            albums_for_search, song_not_found = await run_within_spine_deadline(
+                resolve_albums_for_track(parsed, services.discogs_service, db=services.db),
+                services.spine_deadline,
+                step="album_lookup",
             )
 
     state.song_not_found = song_not_found
@@ -497,6 +520,9 @@ async def _step_search_pipeline(
             albums_for_search=albums_for_search,
             song_not_found=state.song_not_found,
             caller_budget_ms=services.caller_budget_ms,
+            # LML#865: charge step 2's already-spent spine time against step 3's
+            # hard cap + caller budget so the deadline covers the whole spine.
+            pipeline_start_offset_ms=services.spine_deadline.elapsed_ms(),
         )
 
         state.library_results = limit_results(search_state.results)
@@ -1013,6 +1039,10 @@ async def perform_lookup(
     - (response) ``_build_result_items`` — API-model conversion
     - Step 7.    ``_step_external_cache_fallback`` — external-cache fallback
     """
+    # LML#865: derive the spine deadline once at admission. It bounds step 2's
+    # Discogs pass and re-bases step 3's clock so the hard cap + caller budget
+    # cover the whole spine, not just step 3.
+    spine_deadline = SpineDeadline.from_caller_budget(caller_budget_ms)
     services = LookupServices(
         db=db,
         discogs_service=discogs_service,
@@ -1025,6 +1055,7 @@ async def perform_lookup(
         bandcamp=bandcamp,
         discogs_cache_pg=discogs_cache_pg,
         caller_budget_ms=caller_budget_ms,
+        spine_deadline=spine_deadline,
         allow_release_resolution_fallback=allow_release_resolution_fallback,
         extended=bool(request.extended),
         warm_cache=bool(request.warm_cache),
@@ -1032,7 +1063,24 @@ async def perform_lookup(
     )
     state = LookupState()
 
-    parsed, albums_for_search = await _step_prepare_request(request, state, services)
+    # LML#865: step 2's ``resolve_albums_for_track`` Discogs pass is bounded by
+    # the spine deadline inside ``_step_prepare_request``. On a trip we return the
+    # honest empty timed-out response rather than grinding step 3 (which the
+    # offset would short-circuit anyway) and the enrichment tail.
+    try:
+        parsed, albums_for_search = await _step_prepare_request(request, state, services)
+    except SpineDeadlineExceededError as exc:
+        project_spine_deadline_telemetry(exc)
+        logger.info(
+            "Spine deadline exceeded during %s (%s) after %.1fms; returning empty timed-out "
+            "response for %r",
+            exc.step,
+            exc.limit,
+            exc.elapsed_ms,
+            request.raw_message,
+        )
+        return _build_timed_out_response(state)
+
     search_state = await _step_search_pipeline(parsed, albums_for_search, state, services)
 
     # LML#755 R2-2 backstop. The runner (`core/search.py`) already catches a
@@ -1089,6 +1137,29 @@ async def perform_lookup(
         corrected_artist=state.corrected_artist,
         external_source=external_source,
         timeout=search_state.timed_out,
+    )
+
+
+def _build_timed_out_response(state: LookupState) -> LookupResponse:
+    """Build the honest empty timed-out response after a spine-deadline trip (LML#865).
+
+    Returned when step 2's Discogs pass blew the spine deadline before step 3 ran.
+    The request has spent its budget without confirming a match, so we surface the
+    determinable answer — "not found, ran out of time" — instead of grinding:
+    empty ``results``, ``song_not_found=True``, ``timeout=True``, and the
+    none/empty ``search_type`` sentinel. ``corrected_artist`` is preserved from
+    whatever the prepare step had written before it tripped (``None`` when the
+    trip preempted the artist-correction gather).
+    """
+    return LookupResponse(
+        results=[],
+        search_type=SEARCH_TYPE_NONE,
+        song_not_found=True,
+        found_on_compilation=False,
+        context_message=None,
+        corrected_artist=state.corrected_artist,
+        external_source=None,
+        timeout=True,
     )
 
 

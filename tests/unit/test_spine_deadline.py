@@ -21,14 +21,6 @@ import time
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from lookup.spine_deadline import (
-    LIMIT_CALLER_BUDGET,
-    LIMIT_HARD_CAP,
-    SpineDeadline,
-    SpineDeadlineExceeded,
-    project_spine_deadline_telemetry,
-    run_within_spine_deadline,
-)
 
 from core.search import (
     DEFAULT_SEARCH_HARD_TIMEOUT_MS,
@@ -37,6 +29,14 @@ from core.search import (
 )
 from lookup.models import LookupRequest
 from lookup.orchestrator import perform_lookup
+from lookup.spine_deadline import (
+    LIMIT_CALLER_BUDGET,
+    LIMIT_HARD_CAP,
+    SpineDeadline,
+    SpineDeadlineExceededError,
+    project_spine_deadline_telemetry,
+    run_within_spine_deadline,
+)
 from lookup.strategies import build_strategies
 from services.parser import ParsedRequest
 from tests.conftest import make_lml_telemetry
@@ -156,7 +156,7 @@ class TestRunWithinSpineDeadline:
         async def slow():
             await asyncio.sleep(5)
 
-        with pytest.raises(SpineDeadlineExceeded) as excinfo:
+        with pytest.raises(SpineDeadlineExceededError) as excinfo:
             await run_within_spine_deadline(slow(), deadline, step="album_lookup")
         assert excinfo.value.limit == LIMIT_CALLER_BUDGET
         assert excinfo.value.step == "album_lookup"
@@ -180,7 +180,7 @@ class TestRunWithinSpineDeadline:
             finally:
                 sem.release()
 
-        with pytest.raises(SpineDeadlineExceeded):
+        with pytest.raises(SpineDeadlineExceededError):
             await run_within_spine_deadline(holds_permit(), deadline, step="album_lookup")
         # give the cancellation a beat to run the finally
         await asyncio.sleep(0)
@@ -198,7 +198,9 @@ class TestSpineDeadlineTelemetry:
         transaction = Mock()
         scope = Mock()
         scope.transaction = transaction
-        exc = SpineDeadlineExceeded(limit=LIMIT_HARD_CAP, elapsed_ms=27_500.4, step="album_lookup")
+        exc = SpineDeadlineExceededError(
+            limit=LIMIT_HARD_CAP, elapsed_ms=27_500.4, step="album_lookup"
+        )
         with patch("lookup.spine_deadline.sentry_sdk.get_current_scope", return_value=scope):
             project_spine_deadline_telemetry(exc)
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
@@ -210,7 +212,7 @@ class TestSpineDeadlineTelemetry:
         transaction = Mock()
         scope = Mock()
         scope.transaction = transaction
-        exc = SpineDeadlineExceeded(
+        exc = SpineDeadlineExceededError(
             limit=LIMIT_CALLER_BUDGET, elapsed_ms=120.0, step="album_lookup"
         )
         with patch("lookup.spine_deadline.sentry_sdk.get_current_scope", return_value=scope):
@@ -222,7 +224,7 @@ class TestSpineDeadlineTelemetry:
     def test_no_transaction_is_noop(self):
         scope = Mock()
         scope.transaction = None
-        exc = SpineDeadlineExceeded(limit=LIMIT_HARD_CAP, elapsed_ms=1.0, step="album_lookup")
+        exc = SpineDeadlineExceededError(limit=LIMIT_HARD_CAP, elapsed_ms=1.0, step="album_lookup")
         with patch("lookup.spine_deadline.sentry_sdk.get_current_scope", return_value=scope):
             # Must not raise.
             project_spine_deadline_telemetry(exc)

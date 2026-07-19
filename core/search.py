@@ -730,6 +730,7 @@ async def execute_search_pipeline(
     albums_for_search: list[str] | None = None,
     song_not_found: bool = False,
     caller_budget_ms: int | None = None,
+    pipeline_start_offset_ms: float = 0.0,
 ) -> SearchState:
     """Execute strategies in array order until results found.
 
@@ -756,6 +757,12 @@ async def execute_search_pipeline(
         caller_budget_ms: Optional X-Caller-Budget-Ms header value
             (LML#345). When set, also gates the empty-results tail
             short-circuit (LML#347).
+        pipeline_start_offset_ms: Wall-clock milliseconds already spent on the
+            lookup spine *before* step 3 (i.e. step 2's
+            ``resolve_albums_for_track`` Discogs pass). The runner starts its
+            clock this far in the past so the hard cap and caller budget bound
+            ``step2 + step3`` together, not a fresh step-3 window (LML#865).
+            Defaults to ``0.0`` — direct callers get the pre-#865 behavior.
 
     Returns:
         SearchState with results and metadata about the search.
@@ -784,6 +791,7 @@ async def execute_search_pipeline(
             budget_ms,
             hard_cap_ms,
             cap_fire_counter,
+            pipeline_start_offset_ms,
         )
     finally:
         _cap_fire_count_var.reset(cap_fire_token)
@@ -798,6 +806,7 @@ async def _run_strategy_pipeline(
     budget_ms: int,
     hard_cap_ms: int,
     cap_fire_counter: list[int],
+    pipeline_start_offset_ms: float = 0.0,
 ) -> SearchState:
     """Inner loop of :func:`execute_search_pipeline`.
 
@@ -817,7 +826,12 @@ async def _run_strategy_pipeline(
                 transaction.set_data("lml.caller_budget_ms", caller_budget_ms)
         except Exception as e:
             logger.warning("Failed to project lml.caller_budget_ms onto Sentry transaction: %s", e)
-    start = time.monotonic()
+    # Re-base the clock to the lookup-spine start when a prior-work offset is
+    # supplied (LML#865): step 2's Discogs pass already spent
+    # ``pipeline_start_offset_ms`` before step 3 began, so the hard cap and
+    # caller budget below bound ``step2 + step3`` together. Offset ``0.0`` (the
+    # default) reproduces the pre-#865 step-3-entry clock exactly.
+    start = time.monotonic() - pipeline_start_offset_ms / 1000.0
 
     for idx, strategy in enumerate(strategies):
         elapsed_ms = (time.monotonic() - start) * 1000
