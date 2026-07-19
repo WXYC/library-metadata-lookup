@@ -433,6 +433,11 @@ class TestRunDriver:
         assert payload["total"] == 2
         assert payload["seedable"] == 1
         assert payload["unresolved"] == 1
+        # No silent drops: every master the report counts as unresolved is on the
+        # API-tail work-list CSV (pins the two definitions of "unresolved"
+        # together so a future tier that leaves chosen_release_id None without
+        # tier=UNRESOLVED can't slip through uncounted).
+        assert len(unresolved_rows) == payload["unresolved"]
 
 
 class TestWriteSeedCsv:

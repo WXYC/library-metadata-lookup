@@ -29,9 +29,11 @@ re-spends API budget on a master that already reached a terminal state.
 
 Terminal states (checkpointed, never retried): ``resolved``, ``no_main_release``,
 ``trackless``. Retryable states (re-attempted on the next run): ``dead`` (a
-``get_master`` ``None`` — ambiguous 404-vs-transient) and ``error`` (a
-``get_release`` ``None`` — transient). A raised exception (e.g. a breaker shed)
-is not checkpointed at all, so it is simply retried.
+``get_master`` ``None`` — ambiguous 404-vs-transient, and where a breaker shed
+that ``get_master`` swallows also lands) and ``error`` (a ``get_release``
+``None`` — transient). A raised exception (e.g. a breaker shed that
+``get_release`` re-raises) is not checkpointed at all. Either way a non-settled
+master is retried, so budget is never re-spent on one already terminal.
 
 Usage (dry-run resolve, then inspect before seeding)::
 
@@ -43,7 +45,7 @@ Usage (dry-run resolve, then inspect before seeding)::
 
 Then seed with the existing seeder::
 
-    python -m scripts.seed_library_release_overrides.py \\
+    python -m scripts.seed_library_release_overrides \\
         --input phase2_master_links_api.csv \\
         --source alex-l-2026-masters-api --execute
 """
@@ -59,6 +61,8 @@ import os
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from scripts._lib.csv_ids import parse_positive_int
 
 logging.basicConfig(
     level=logging.INFO,
@@ -139,7 +143,13 @@ async def drain_master(service, master_id: int) -> MasterDrainOutcome:
     release = await service.get_release(main_release_id)
     if release is None:
         return MasterDrainOutcome(master_id, main_release_id, None, STATUS_ERROR)
-    track_count = len(release.tracklist or [])
+    # Count only real (non-blank-title) tracks. A tracklist can carry blank-title
+    # heading/index rows; the resolver's Phase-2 invariant drops empty-normalized
+    # candidates, so counting raw ``len(tracklist)`` would pin a heading-only
+    # release the resolver would reject as trackless.
+    track_count = sum(
+        1 for t in (release.tracklist or []) if (getattr(t, "title", "") or "").strip()
+    )
     if track_count == 0:
         return MasterDrainOutcome(master_id, main_release_id, 0, STATUS_TRACKLESS)
     return MasterDrainOutcome(master_id, main_release_id, track_count, STATUS_RESOLVED)
@@ -168,7 +178,12 @@ def build_seed_rows(
 
 
 def load_checkpoint(path: Path) -> dict[int, MasterDrainOutcome]:
-    """Read the JSONL checkpoint into ``{master_id: outcome}`` (last line wins)."""
+    """Read the JSONL checkpoint into ``{master_id: outcome}`` (last line wins).
+
+    A malformed line — a truncated final record from a hard kill mid-append, or
+    a JSON object missing a required field — is skipped with a warning rather
+    than aborting the resume, so a partial write never strands the whole drain.
+    """
     out: dict[int, MasterDrainOutcome] = {}
     if not path.exists():
         return out
@@ -176,14 +191,18 @@ def load_checkpoint(path: Path) -> dict[int, MasterDrainOutcome]:
         line = line.strip()
         if not line:
             continue
-        d = json.loads(line)
-        mid = int(d["master_id"])
-        out[mid] = MasterDrainOutcome(
-            master_id=mid,
-            main_release_id=d.get("main_release_id"),
-            track_count=d.get("track_count"),
-            status=d["status"],
-        )
+        try:
+            d = json.loads(line)
+            outcome = MasterDrainOutcome(
+                master_id=int(d["master_id"]),
+                main_release_id=d.get("main_release_id"),
+                track_count=d.get("track_count"),
+                status=d["status"],
+            )
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+            log.warning("skipping malformed checkpoint line (%s): %.80s", exc, line)
+            continue
+        out[outcome.master_id] = outcome
     return out
 
 
@@ -265,11 +284,22 @@ async def run_drain(
 
 
 def load_unresolved(path: Path) -> list[tuple[int, int]]:
-    """Read the resolver's ``--out-unresolved`` CSV (``card_catalog_id,master_id``)."""
+    """Read the resolver's ``--out-unresolved`` CSV (``card_catalog_id,master_id``).
+
+    Ids go through the shared :func:`parse_positive_int` (as the resolver and
+    seeder do, to keep the seeding scripts from drifting): a blank, non-integer,
+    or non-positive cell skips the row rather than aborting the whole
+    rate-limited drain with a bare ``ValueError``. Opens ``utf-8-sig`` so a
+    BOM-prefixed export still matches the header.
+    """
     rows: list[tuple[int, int]] = []
     with path.open(newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
-            rows.append((int(r["card_catalog_id"]), int(r["master_id"])))
+            card = parse_positive_int(r.get("card_catalog_id"))
+            master = parse_positive_int(r.get("master_id"))
+            if card is None or master is None:
+                continue
+            rows.append((card, master))
     return rows
 
 
