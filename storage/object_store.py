@@ -105,12 +105,14 @@ class S3ObjectStore:
     low-level clients are safe to call across threads, which is what
     ``asyncio.to_thread`` does here.
 
-    Addressing is pinned to **path-style** (``endpoint/bucket/key``). boto3's
-    default ``auto`` prefers virtual-host style (``bucket.endpoint/key``), which
-    needs wildcard DNS the Railway Bucket endpoint does not serve; path-style is
-    the portable choice across S3-compatible backends and this store only ever
-    targets a custom ``endpoint_url`` (never bare AWS), so it is always correct
-    here.
+    Addressing style is configurable and defaults to **virtual-hosted**
+    (``bucket.endpoint/key``), which is the format Railway Buckets use — the
+    bucket name is the endpoint subdomain and Railway serves the wildcard DNS for
+    it, so providing the bare endpoint is enough. Only **legacy** (pre-change)
+    Railway buckets require path-style (``endpoint/bucket/key``); an operator
+    selects that per the bucket's Credentials tab via
+    ``LML_BUCKET_ADDRESSING_STYLE=path``. ``auto`` is also accepted. See the
+    volume-eviction epic (WXYC/library-metadata-lookup#834).
     """
 
     def __init__(
@@ -119,6 +121,7 @@ class S3ObjectStore:
         endpoint_url: str,
         *,
         region: str = "us-east-1",
+        addressing_style: str = "virtual",
         connect_timeout: float = 5.0,
         read_timeout: float = 60.0,
         max_attempts: int = 3,
@@ -129,7 +132,7 @@ class S3ObjectStore:
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
             retries={"max_attempts": max_attempts, "mode": "standard"},
-            s3={"addressing_style": "path"},
+            s3={"addressing_style": addressing_style},
         )
         self._client = boto3.client(
             "s3",

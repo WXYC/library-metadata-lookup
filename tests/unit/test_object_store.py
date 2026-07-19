@@ -153,11 +153,41 @@ class TestS3ObjectStore:
         store = S3ObjectStore(bucket="lml-prod", endpoint_url=ENDPOINT, region="us-east-1")
         assert store.bucket == "lml-prod"
 
-    def test_uses_path_style_addressing(self):
-        """Custom S3-compatible endpoints (Railway Bucket) need path-style; boto3's
-        ``auto`` default would try virtual-host and fail on absent wildcard DNS."""
+    def test_default_addressing_is_virtual(self):
+        """Railway Buckets default to virtual-hosted–style URLs (the bucket is the
+        endpoint subdomain); only legacy buckets need path-style. The store
+        defaults to virtual so a freshly created bucket works out of the box
+        (LML#834)."""
         store = S3ObjectStore(bucket="lml-prod", endpoint_url=ENDPOINT, region="us-east-1")
+        assert store._client.meta.config.s3["addressing_style"] == "virtual"
+
+    def test_addressing_style_is_configurable(self):
+        """A legacy path-style bucket is still supported via the explicit override."""
+        store = S3ObjectStore(
+            bucket="lml-prod",
+            endpoint_url=ENDPOINT,
+            region="us-east-1",
+            addressing_style="path",
+        )
         assert store._client.meta.config.s3["addressing_style"] == "path"
+
+    @pytest.mark.asyncio
+    async def test_path_style_roundtrip(self, monkeypatch):
+        """put/get works end-to-end under an explicit path-style override too."""
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+        monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+        with mock_aws():
+            boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
+            store = S3ObjectStore(
+                bucket=BUCKET,
+                endpoint_url=ENDPOINT,
+                region="us-east-1",
+                addressing_style="path",
+            )
+            await store.put("library.db", b"path-bytes")
+            assert await store.get("library.db") == b"path-bytes"
 
     @pytest.mark.asyncio
     async def test_get_propagates_non_404_client_error(self, s3_store, monkeypatch):

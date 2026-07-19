@@ -222,6 +222,28 @@ class TestGetObjectStore:
         assert store.bucket == "lml-prod-data"
 
     @pytest.mark.asyncio
+    async def test_bucket_mode_threads_addressing_style(self, mock_settings):
+        """The configured LML_BUCKET_ADDRESSING_STYLE reaches the S3 client (LML#834),
+        so an operator can select path-style for a legacy bucket from Railway."""
+        mock_settings.lml_bucket_name = "lml-prod-data"
+        mock_settings.lml_bucket_endpoint = "https://s3.example.com"
+        mock_settings.lml_bucket_addressing_style = "path"
+
+        store = await deps_module.get_object_store(mock_settings)
+
+        assert store._client.meta.config.s3["addressing_style"] == "path"
+
+    @pytest.mark.asyncio
+    async def test_bucket_mode_defaults_to_virtual_addressing(self, mock_settings):
+        """With the default setting, the built client uses virtual-hosted style."""
+        mock_settings.lml_bucket_name = "lml-prod-data"
+        mock_settings.lml_bucket_endpoint = "https://s3.example.com"
+
+        store = await deps_module.get_object_store(mock_settings)
+
+        assert store._client.meta.config.s3["addressing_style"] == "virtual"
+
+    @pytest.mark.asyncio
     async def test_only_name_set_is_local_mode(self, mock_settings):
         from storage.object_store import LocalDirStore
 

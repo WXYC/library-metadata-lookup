@@ -2,6 +2,9 @@
 
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from config.settings import Settings, get_settings
 
 
@@ -76,6 +79,28 @@ class TestDiscogsBreakerTrialWatchdogMultiplier:
     def test_reads_env(self, monkeypatch):
         monkeypatch.setenv("DISCOGS_BREAKER_TRIAL_WATCHDOG_MULTIPLIER", "10.5")
         assert Settings().discogs_breaker_trial_watchdog_multiplier == 10.5
+
+
+class TestBucketAddressingStyle:
+    """LML#834: S3 addressing is configurable and defaults to virtual-hosted
+    style — Railway Buckets' current default (only legacy buckets need
+    path-style). Operators set LML_BUCKET_ADDRESSING_STYLE=path for a legacy
+    bucket. The value is fed to botocore's ``Config(s3={"addressing_style": ...})``,
+    so it is validated at load against the three values botocore accepts."""
+
+    def test_defaults_to_virtual(self):
+        assert Settings().lml_bucket_addressing_style == "virtual"
+
+    def test_reads_env(self, monkeypatch):
+        monkeypatch.setenv("LML_BUCKET_ADDRESSING_STYLE", "path")
+        assert Settings().lml_bucket_addressing_style == "path"
+
+    def test_accepts_auto(self):
+        assert Settings(lml_bucket_addressing_style="auto").lml_bucket_addressing_style == "auto"
+
+    def test_rejects_invalid_value(self):
+        with pytest.raises(ValidationError):
+            Settings(lml_bucket_addressing_style="bogus")
 
 
 class TestGetSettings:
