@@ -82,6 +82,9 @@ async def lifespan(app: FastAPI):
     if settings.database_url_discogs:
         try:
             from core.dependencies import get_discogs_pool
+            from entity.library_release_override import (
+                set_up_library_release_override_schema,
+            )
             from entity.release_resolution_cache import (
                 set_up_release_resolution_cache_schema,
             )
@@ -98,6 +101,11 @@ async def lifespan(app: FastAPI):
                 # posture; #628 wires its read/write into the lookup path.
                 await set_up_release_resolution_cache_schema(source)
                 logger.info("Release-resolution cache schema ready")
+                # Verified library-release override (LML#850), another LML-owned
+                # ``lml_cache.*`` table. Same pool, same best-effort posture; the
+                # orchestrator prefetches it on the flag-gated lookup path.
+                await set_up_library_release_override_schema(source)
+                logger.info("Library-release override schema ready")
             else:
                 logger.info(
                     "Discogs cache pool unavailable at startup — streaming-URL cache "

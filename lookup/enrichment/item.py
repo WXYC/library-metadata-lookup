@@ -123,6 +123,17 @@ async def enrich_one(
         # was track-validated, so the leak concern doesn't apply.
         or (ctx.found_on_compilation and artwork is not None and artwork.release_id > 0)
     )
+    # LML#850: a hand-verified library-release override (bound in ``fetch_one``
+    # via ``release_overrides``) deliberately gets NO carve-out here. This gate
+    # scores the request album against the library ROW's catalog title
+    # (``item.title``), so a genuine library-album lookup — the dj-site picker
+    # and BS flowsheet-linkage both send request == row title — passes it
+    # naturally and the pinned release's tracklist surfaces. A carve-out would
+    # only change the case where the request album diverges from the surfaced
+    # row's title (the sibling-leak shape), where collapsing to the sentinel is
+    # the correct, safe behavior: trusting the pin there would leak not just the
+    # release but the row's curated ``streaming_links`` (gated on the same flag
+    # below, PR#481) onto a mismatched-album request.
 
     # LML#487: the library row is "acceptable" (a real match for the
     # requested album) only when it carries Discogs artwork AND

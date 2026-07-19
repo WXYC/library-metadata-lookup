@@ -139,6 +139,7 @@ async def fetch_artwork_for_items(
     album: str | None = None,
     allow_release_resolution_fallback: bool = True,
     found_on_compilation: bool = False,
+    release_overrides: dict[int, int] | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Fetch artwork for multiple library items in parallel.
 
@@ -165,11 +166,20 @@ async def fetch_artwork_for_items(
     trust-bound for artwork — independent of ``lml_resolve_compilation_release``,
     since binding an already-carried release costs no extra Discogs fan-out
     (unlike the flag-gated lazy ``resolve_release_for_track`` fallback below).
+
+    ``release_overrides`` (LML#850): a ``library_id -> discogs_release_id`` map of
+    **hand-verified** pins the orchestrator prefetched for this request (empty /
+    ``None`` when the ``lml_library_release_override`` flag is off, so this is a
+    no-op by default). A pinned library row binds its release BEFORE the
+    trust-bind and fuzzy paths — a human override is the most-trusted signal and
+    wins even over a carried release; it also skips the Discogs ``search``, so an
+    override hit *reduces* per-request work.
     """
     if not discogs_service:
         return [(item, None) for item in items]
 
     discogs_titles = discogs_titles or {}
+    release_overrides = release_overrides or {}
     # Bound to a distinct name: ``fetch_one`` rebinds a local ``album`` (the
     # per-item search title), which would shadow this request-level value.
     request_album = album
@@ -180,6 +190,30 @@ async def fetch_artwork_for_items(
 
     async def fetch_one(item: LibraryItem) -> DiscogsSearchResult | None:
         try:
+            # LML#850: a hand-verified library-release override is the most-
+            # trusted signal — consult it FIRST, before the LML#604 trust-bind
+            # and the LML#478 artist-floor fuzzy search. On a hit, trust-bind
+            # the pinned release (reusing ``_bind_resolved_release``: it fetches
+            # the pinned release's cover and downstream ``enrich_one`` pulls its
+            # tracklist), skipping the fuzzy ``search`` entirely — an override
+            # hit costs one cached ``get_release``, not a search + N-candidate
+            # floor. ``album_title`` stays the library row's own title so the
+            # surfaced album keeps the catalog naming; the pin only redirects the
+            # release id (and thus the tracklist). ``> 0`` mirrors the DB CHECK;
+            # a malformed 0/negative pin can never reach the ``release_id=0``
+            # sentinel path.
+            override_release_id = release_overrides.get(item.id)
+            if override_release_id is not None and override_release_id > 0:
+                override_release = ResolvedRelease(
+                    release_id=override_release_id,
+                    release_url=f"https://www.discogs.com/release/{override_release_id}",
+                    is_compilation=False,
+                    album_title=item.title or "",
+                )
+                return await _bind_resolved_release(
+                    discogs_service, override_release, item, album=request_album
+                )
+
             # The widened seam carries a ResolvedRelease; its album_title is the
             # value the seam used to carry as a bare string. Falls back to the
             # library row's own title when no release was resolved for this id.

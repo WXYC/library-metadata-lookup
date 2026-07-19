@@ -344,6 +344,28 @@ class Settings(BaseSettings):
             "See WXYC/library-metadata-lookup#628."
         ),
     )
+    lml_library_release_override: bool = Field(
+        default=False,
+        description=(
+            "When True, /lookup prefetches verified library-release -> Discogs-"
+            "release pins from lml_cache.library_release_override for the request's "
+            "library rows (one query, keyed by library_id), and fetch_one binds the "
+            "pinned release BEFORE the trust-bind and the artist-floor fuzzy search. "
+            "A hand-verified human override is the most-trusted signal, so it wins "
+            "even over a carried release; an override hit also short-circuits the "
+            "fuzzy search + its Discogs call. The pinned release then flows through "
+            "enrichment on the normal title gate: a genuine library-album lookup "
+            "(request album == the catalog row title, as the dj-site picker and BS "
+            "flowsheet-linkage send) passes it and the pin's tracklist surfaces; a "
+            "request whose album diverges from the surfaced row's title collapses "
+            "to the sentinel as before (no sibling-leak). Skipped on the "
+            "/lookup/bulk drain (allow_release_resolution_fallback=False). When "
+            "False, no prefetch runs and resolution is the pre-override fuzzy pick, "
+            "byte-for-byte. Ship dark; seed the table, then flip True in Railway "
+            "after the staging sample verifies. Fully reversible: DELETE the "
+            "source-stamped rows + flip False. See WXYC/library-metadata-lookup#850."
+        ),
+    )
     lml_emit_server_timing: bool = Field(
         default=True,
         description=(
