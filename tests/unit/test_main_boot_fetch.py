@@ -1,11 +1,12 @@
 """Boot-fetch of library.db from the object store (WXYC#837, volume-eviction PR 3).
 
 In bucket mode the FastAPI lifespan fetches ``library.db`` from the store to the
-local ``LIBRARY_DB_PATH`` before serving, with a small bounded retry. The fetch
-is **non-fatal**: on final failure (transient error exhausted, or the object
-absent) the app logs + Sentry-captures and boots degraded — ``/health`` then
-503s via the missing-DB path while the ``POST /admin/upload-library-db`` recovery
-endpoint stays available (epic #834 decision 2). Local mode never fetches.
+local ``LIBRARY_DB_PATH`` before serving, with a small bounded retry under an
+overall wall-clock deadline. The fetch is **non-fatal**: on final failure
+(transient error exhausted, the object absent, or the deadline exceeded) the app
+logs + Sentry-captures and boots degraded — ``/health`` then 503s via the
+missing-DB path while the ``POST /admin/upload-library-db`` recovery endpoint
+stays available (epic #834 decision 2). Local mode never fetches.
 
 moto (``mock_aws``) intercepts botocore in-process, so no network or real bucket
 is touched and no pytest marker is needed — the same approach the #835/#836
@@ -14,6 +15,7 @@ store tests use.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import boto3
@@ -62,6 +64,20 @@ class _RaisingStore:
         raise self._exc
 
 
+class _HangingStore:
+    """Stub store whose ``get`` blocks longer than the boot-fetch deadline.
+
+    Models a partial S3 outage where the connection is accepted but the read
+    hangs — the failure mode that, without a wall-clock bound, compounds with
+    boto3's own ``read_timeout`` x ``max_attempts`` and can stall startup for
+    minutes.
+    """
+
+    async def get(self, key: str) -> bytes:
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable: the deadline must fire first")
+
+
 class TestBootFetchHelper:
     @pytest.mark.asyncio
     async def test_success_writes_local_file(self, tmp_path, aws_creds):
@@ -78,6 +94,46 @@ class TestBootFetchHelper:
 
         assert ok is True
         assert settings.resolved_library_db_path.read_bytes() == PAYLOAD
+
+    @pytest.mark.asyncio
+    async def test_success_overwrites_existing_local_file(self, tmp_path, aws_creds):
+        """A stale local file (e.g. an old volume copy) is replaced by the bucket copy."""
+        from main import _boot_fetch_library_db
+
+        settings = _bucket_settings(tmp_path)
+        # A pre-existing local library.db — the realistic transition-window state
+        # where a volume still holds an older copy the boot-fetch must supersede.
+        settings.resolved_library_db_path.write_bytes(b"stale-local-library-db")
+
+        with mock_aws():
+            boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
+            store = S3ObjectStore(bucket=BUCKET, endpoint_url=ENDPOINT, region="us-east-1")
+            await store.put(LIBRARY_DB_FILENAME, PAYLOAD)
+
+            ok = await _boot_fetch_library_db(settings, store, base_delay=0)
+
+        assert ok is True
+        assert settings.resolved_library_db_path.read_bytes() == PAYLOAD
+
+    @pytest.mark.asyncio
+    async def test_deadline_exceeded_degrades(self, tmp_path):
+        """A hung fetch is bounded by the deadline and degrades (non-fatal)."""
+        from main import _boot_fetch_library_db
+
+        settings = _bucket_settings(tmp_path)
+        store = _HangingStore()
+
+        with pytest.MonkeyPatch.context() as mp:
+            captured = []
+            mp.setattr("sentry_sdk.capture_message", lambda *a, **k: captured.append(a))
+            ok = await asyncio.wait_for(
+                _boot_fetch_library_db(settings, store, base_delay=0, deadline=0.05),
+                timeout=5,  # test-level guard: the 0.05s deadline must fire well before this
+            )
+
+        assert ok is False
+        assert captured, "a deadline-exceeded boot-fetch must be Sentry-captured"
+        assert not settings.resolved_library_db_path.exists()
 
     @pytest.mark.asyncio
     async def test_transient_failure_retries_then_degrades(self, tmp_path):

@@ -65,6 +65,17 @@ setup_logging(level=settings.log_level, log_file=log_file)
 logger = logging.getLogger(__name__)
 
 
+# Wall-clock ceiling on the whole bucket-mode boot fetch (retries included). A
+# partial S3 outage that accepts the connection but hangs on the read would
+# otherwise compound this helper's outer retry loop with boto3's own
+# ``read_timeout`` x ``max_attempts`` and block startup for minutes — long enough
+# for Railway's deploy healthcheck to fail the release, i.e. the slow-motion
+# crash-loop the non-fatal design exists to avoid. 60s comfortably clears any
+# healthy fetch of the tens-of-MB library.db while capping the pathological case
+# well under the healthcheck window (WXYC#837 review).
+_BOOT_FETCH_DEADLINE_SECONDS = 60.0
+
+
 def _atomic_write_bytes(dest: Path, data: bytes) -> None:
     """Write ``data`` to ``dest`` via a temp file + ``os.replace`` (no torn reads)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -77,24 +88,23 @@ def _atomic_write_bytes(dest: Path, data: bytes) -> None:
         raise
 
 
-async def _boot_fetch_library_db(
+async def _fetch_library_db_with_retry(
     settings: Settings,
     store: ObjectStore,
     *,
-    attempts: int = 3,
-    base_delay: float = 1.0,
+    attempts: int,
+    base_delay: float,
 ) -> bool:
-    """Fetch library.db from the object store to the local path before serving.
+    """Fetch library.db to the local path, retrying transient errors.
 
-    Bucket-mode boot step (WXYC#837): populates ``LIBRARY_DB_PATH`` from the
-    durable canonical copy so the process serves the current catalog after a
-    restart with no volume. **Non-fatal** by design (epic #834 decision 2): on a
-    missing object or an exhausted transient-error retry it logs + Sentry-captures
-    and returns ``False``, leaving the app to boot degraded (``/health`` 503 via
-    the missing-DB path) with ``POST /admin/upload-library-db`` still available as
-    the recovery path. A missing object is not retried (a 404 will not resolve on
-    retry); transient errors back off linearly. Returns ``True`` once the local
-    file is written.
+    The retry core of :func:`_boot_fetch_library_db` (which wraps it in the
+    overall deadline). A missing object is **not** retried (a 404 will not resolve
+    on retry) and degrades immediately; transient errors (connection / 5xx) back
+    off linearly and degrade once ``attempts`` is exhausted. The fetched bytes are
+    trusted as-is — the ``POST /admin/upload-library-db`` write path validates the
+    SQLite before it ``put``s, so the store never holds an unvalidated object; no
+    second integrity check is done here. Returns ``True`` once the local file is
+    written, ``False`` on any degrade path.
     """
     dest = settings.resolved_library_db_path
     for attempt in range(1, attempts + 1):
@@ -124,7 +134,43 @@ async def _boot_fetch_library_db(
             "Boot-fetched library.db from the object store (%d bytes) -> %s", len(data), dest
         )
         return True
-    return False  # unreachable: the loop returns on success or on the final attempt
+    return False  # attempts <= 0: nothing tried, degrade by default
+
+
+async def _boot_fetch_library_db(
+    settings: Settings,
+    store: ObjectStore,
+    *,
+    attempts: int = 3,
+    base_delay: float = 1.0,
+    deadline: float = _BOOT_FETCH_DEADLINE_SECONDS,
+) -> bool:
+    """Fetch library.db from the object store to the local path before serving.
+
+    Bucket-mode boot step (WXYC#837): populates ``LIBRARY_DB_PATH`` from the
+    durable canonical copy so the process serves the current catalog after a
+    restart with no volume. **Non-fatal** by design (epic #834 decision 2): on a
+    missing object, an exhausted transient-error retry, or the overall ``deadline``
+    being exceeded, it logs + Sentry-captures and returns ``False``, leaving the
+    app to boot degraded (``/health`` 503 via the missing-DB path) with
+    ``POST /admin/upload-library-db`` still available as the recovery path.
+
+    The retry loop (:func:`_fetch_library_db_with_retry`) is bounded by ``deadline``
+    seconds of total wall-clock so a hung read cannot stall startup — see
+    ``_BOOT_FETCH_DEADLINE_SECONDS``. Returns ``True`` once the local file is
+    written.
+    """
+    try:
+        return await asyncio.wait_for(
+            _fetch_library_db_with_retry(settings, store, attempts=attempts, base_delay=base_delay),
+            timeout=deadline,
+        )
+    except TimeoutError:
+        logger.error(
+            "Boot-fetch of library.db exceeded the %.0fs deadline; serving degraded", deadline
+        )
+        sentry_sdk.capture_message("library.db boot-fetch exceeded deadline", level="error")
+        return False
 
 
 @asynccontextmanager
