@@ -117,7 +117,7 @@ async def test_permit_released_before_retry_sleep_unblocks_concurrent_caller(fak
 
     with (
         patch("discogs.service.get_semaphore", return_value=sem),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.asyncio.sleep", side_effect=fake_sleep),
     ):
         task_a = asyncio.create_task(service_a._request_with_retry("GET", "/releases/1"))
@@ -157,7 +157,7 @@ async def test_429_then_200_completes_with_balanced_permit_accounting(fake_limit
 
     with (
         patch("discogs.service.get_semaphore", return_value=sem),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.asyncio.sleep", new=AsyncMock()),
     ):
         result = await service._request_with_retry("GET", "/releases/1")
@@ -193,7 +193,7 @@ async def test_cancellation_during_retry_sleep_leaks_no_permit(fake_limiter):
 
     with (
         patch("discogs.service.get_semaphore", return_value=sem),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.asyncio.sleep", side_effect=fake_sleep),
     ):
         task = asyncio.create_task(service._request_with_retry("GET", "/releases/1"))

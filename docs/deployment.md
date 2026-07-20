@@ -148,6 +148,8 @@ After the **staging** cutover, leave staging in bucket mode through **at least o
 
 Removing the volume makes replicas *architecturally* possible (Railway won't attach a volume to replicas), but **enabling N≥2 is deliberately out of scope for the volume-eviction epic** and gated behind the flip criteria below. The blocker is the per-process Discogs limiter/semaphore/breaker (`discogs/ratelimit.py`): N replicas each running the stock limiter would drive N×50/min against the shared 60/min Discogs token. Scaling is therefore pure env-var arithmetic (divide the shared-budget knobs by N) plus awareness of the per-replica state that stops being process-global.
 
+> **LML#841 lifts the *rate* dimension out of that arithmetic.** With `DISCOGS_RATE_BUCKET_ENABLED=true`, the per-minute egress permit is drawn from a **shared PG token bucket** (one `lml_cache.discogs_rate_bucket` row), so all N replicas meter the 50/min rate against a single row — **leave `DISCOGS_RATE_LIMIT` at its stock 50 across replicas** instead of dividing. Only the rate knob comes off the divide list; the **concurrency** semaphore (`DISCOGS_MAX_CONCURRENT`) and the breaker floor stay per-process and still divide/raise, because concurrency and shed policy are local decisions the bucket doesn't touch. See the `DISCOGS_RATE_BUCKET_*` entries in [`env-vars.md`](env-vars.md).
+
 ### Flip criteria — all three must hold
 
 1. **WXYC/discogs-etl#313 landed** (discogs-cache PG `shared_buffers` tuning) **and the #706 cold-tail re-measured healthy.** Replicas double/triple connection load onto that PG; flipping before its buffers are tuned re-creates the #706 tail.
@@ -160,7 +162,7 @@ Worst-case Discogs egress and PG demand are **cluster-wide sums** across replica
 
 | Knob | At N≥2 | Why |
 |---|---|---|
-| `DISCOGS_RATE_LIMIT` | **divide** → `floor(50/N)` | Shared 60/min Discogs token. Per-process limiters must sum under 60. |
+| `DISCOGS_RATE_LIMIT` | **divide** → `floor(50/N)` — **unless `DISCOGS_RATE_BUCKET_ENABLED=true`, then leave at 50** | Shared 60/min Discogs token. Per-process limiters must sum under 60 — *but* the LML#841 shared PG token bucket meters the 50/min against one row cluster-wide, so the static division is only needed when the bucket is OFF. |
 | `DISCOGS_MAX_CONCURRENT` | **divide** → `floor(5/N)` (floor 1) | Per-process egress semaphore; cluster concurrent egress is the sum. |
 | `DISCOGS_BREAKER_REMAINING_FLOOR` | **raise** by ~`N × per-replica DISCOGS_MAX_CONCURRENT` | The floor is read off the **shared** `X-Discogs-Ratelimit-Remaining`; up to `N × per-replica concurrent` requests can be in flight cluster-wide when any one replica first observes the floor, so raise it to absorb that overshoot. |
 | `LML_DISCOGS_POOL_MAX_SIZE` | **shrink** (pre-#313) so `N × pool` stays under discogs-cache PG `max_connections` / memory budget | Shared PG connection budget (the LML#241/#357 FD-exhaustion lesson at cluster scale). Relax once #313 tunes the PG. |
@@ -171,7 +173,7 @@ Worst-case Discogs egress and PG demand are **cluster-wide sums** across replica
 
 | Knob | N=1 (today) | N=2 |
 |---|---|---|
-| `DISCOGS_RATE_LIMIT` | 50 | 25 |
+| `DISCOGS_RATE_LIMIT` | 50 | 25 (bucket OFF) / **50** (`DISCOGS_RATE_BUCKET_ENABLED=true`) |
 | `DISCOGS_MAX_CONCURRENT` | 5 | 2 |
 | `DISCOGS_BREAKER_REMAINING_FLOOR` | 3 | ~7 (`3 + 2×2`) |
 | `LML_DISCOGS_POOL_MAX_SIZE` | 5 | shrink so `2×pool` ≤ PG budget (pre-#313); revisit post-#313 |
@@ -187,7 +189,7 @@ These are inherent to per-process state going per-replica — documented, accept
 
 ### Flip procedure
 
-1. Set the divided/raised env vars from the knob table (`DISCOGS_RATE_LIMIT`, `DISCOGS_MAX_CONCURRENT`, `DISCOGS_BREAKER_REMAINING_FLOOR`, and pre-#313 `LML_DISCOGS_POOL_MAX_SIZE`).
+1. Set the divided/raised env vars from the knob table (`DISCOGS_RATE_LIMIT`, `DISCOGS_MAX_CONCURRENT`, `DISCOGS_BREAKER_REMAINING_FLOOR`, and pre-#313 `LML_DISCOGS_POOL_MAX_SIZE`). If `DISCOGS_RATE_BUCKET_ENABLED=true`, **skip the `DISCOGS_RATE_LIMIT` division** — the shared PG bucket already meters the rate cluster-wide; keep it at 50.
 2. Bump the replica count on the LML service.
 3. Add a `railway redeploy` step **after the daily library sync** so every replica boot-fetches the fresh `library.db` (closes the freshness-skew window above).
 

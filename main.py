@@ -204,6 +204,7 @@ async def lifespan(app: FastAPI):
     if settings.database_url_discogs:
         try:
             from core.dependencies import get_discogs_pool
+            from entity.discogs_rate_bucket import set_up_discogs_rate_bucket_schema
             from entity.library_release_override import (
                 set_up_library_release_override_schema,
             )
@@ -228,6 +229,19 @@ async def lifespan(app: FastAPI):
                 # orchestrator prefetches it on the flag-gated lookup path.
                 await set_up_library_release_override_schema(source)
                 logger.info("Library-release override schema ready")
+                # Shared Discogs rate token bucket (LML#841), one LML-owned
+                # ``lml_cache.*`` row seeded from the rate-limit budget. Seed is
+                # ``ON CONFLICT DO NOTHING`` so a second process/environment does
+                # not clobber the shared budget. Inert until
+                # ``DISCOGS_RATE_BUCKET_ENABLED`` is set; the gate fails open to
+                # the local limiter regardless of this bootstrap's outcome.
+                await set_up_discogs_rate_bucket_schema(
+                    source,
+                    bucket_key=settings.discogs_rate_bucket_key,
+                    capacity=settings.discogs_rate_limit,
+                    refill_per_sec=settings.discogs_rate_limit / 60,
+                )
+                logger.info("Discogs rate-bucket schema ready")
             else:
                 logger.info(
                     "Discogs cache pool unavailable at startup — streaming-URL cache "
