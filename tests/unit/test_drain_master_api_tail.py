@@ -15,6 +15,7 @@ import types
 
 import pytest
 
+from discogs.breaker import DiscogsBreakerOpenError
 from scripts.drain_master_api_tail import (
     STATUS_DEAD,
     STATUS_ERROR,
@@ -266,6 +267,196 @@ class TestRunDrain:
         cards_by_master = {100: [1], 200: [2], 300: [3]}
         done = await run_drain(svc, cards_by_master, ckpt, concurrency=1, limit=2)
         assert len(done) == 2  # only two masters drained this run
+
+
+class ShedService:
+    """Fake service that simulates the saturation breaker shedding live probes.
+
+    ``sheds`` upcoming API calls are shed the way the real path does — a
+    ``get_master`` shed is *swallowed to None* (``STATUS_DEAD``, indistinguishable
+    from a 404 at the return value), a ``get_release`` shed *raises*
+    ``DiscogsBreakerOpenError`` — and :meth:`is_breaker_open` mirrors the last
+    call so the drain can tell a swallowed shed from a genuine dead master. Once
+    the shed budget is spent, calls behave normally and the breaker reads closed
+    (a transient blip that clears). Set ``sheds`` huge for a sustained flood.
+    """
+
+    def __init__(self, masters=None, releases=None, sheds=0, shed_via="master"):
+        self.masters = masters or {}
+        self.releases = releases or {}
+        self.sheds = sheds
+        self.shed_via = shed_via  # "master" (swallow None) or "release" (raise)
+        self.master_calls: list[int] = []
+        self.release_calls: list[int] = []
+        self._open = False  # breaker predicate mirrors the most recent call
+
+    def is_breaker_open(self) -> bool:
+        return self._open
+
+    def _take_shed(self) -> bool:
+        if self.sheds > 0:
+            self.sheds -= 1
+            self._open = True
+            return True
+        self._open = False
+        return False
+
+    async def get_master(self, master_id):
+        self.master_calls.append(master_id)
+        if self.shed_via == "master" and self._take_shed():
+            return None
+        self._open = False
+        return self.masters.get(master_id)
+
+    async def get_release(self, release_id):
+        self.release_calls.append(release_id)
+        if self.shed_via == "release" and self._take_shed():
+            raise DiscogsBreakerOpenError("shed")
+        self._open = False
+        return self.releases.get(release_id)
+
+
+class TestBreakerPause:
+    """The drain must PAUSE for the breaker cool-down and resume, not shed its
+    whole backlog on a single transient trip (LML#858 drain-pause fix)."""
+
+    @pytest.mark.asyncio
+    async def test_release_shed_pauses_then_resolves(self, tmp_path):
+        # get_release raises DiscogsBreakerOpenError on the first probe, then the
+        # token recovers and it resolves. The drain must pause + retry the same
+        # master rather than dropping it.
+        ckpt = tmp_path / "ckpt.jsonl"
+        svc = ShedService(
+            masters={100: _master(500)}, releases={500: _release(3)}, sheds=1, shed_via="release"
+        )
+        done = await run_drain(
+            svc,
+            {100: [1]},
+            ckpt,
+            concurrency=1,
+            breaker_is_open=svc.is_breaker_open,
+            pause_seconds=0,
+            max_breaker_pauses=5,
+        )
+        assert done[100].status == STATUS_RESOLVED
+        assert svc.release_calls == [500, 500]  # shed once, retried, resolved
+
+    @pytest.mark.asyncio
+    async def test_swallowed_master_shed_pauses_then_resolves(self, tmp_path):
+        # get_master swallows the shed into a None (STATUS_DEAD); the breaker
+        # reads open, so the drain must recognize it as a shed (not a dead
+        # master), pause, and retry — where it now resolves.
+        ckpt = tmp_path / "ckpt.jsonl"
+        svc = ShedService(
+            masters={100: _master(500)}, releases={500: _release(3)}, sheds=1, shed_via="master"
+        )
+        done = await run_drain(
+            svc,
+            {100: [1]},
+            ckpt,
+            concurrency=1,
+            breaker_is_open=svc.is_breaker_open,
+            pause_seconds=0,
+            max_breaker_pauses=5,
+        )
+        assert done[100].status == STATUS_RESOLVED
+        assert svc.master_calls == [100, 100]  # shed once, retried, resolved
+
+    @pytest.mark.asyncio
+    async def test_genuine_dead_while_breaker_closed_is_recorded_not_paused(self, tmp_path):
+        # A real get_master None (404) while the breaker is CLOSED must settle as
+        # STATUS_DEAD with no retry — the pause path must not fire on a genuine
+        # dead master.
+        ckpt = tmp_path / "ckpt.jsonl"
+        svc = ShedService(masters={}, releases={}, sheds=0)  # None, breaker never open
+        done = await run_drain(
+            svc,
+            {100: [1]},
+            ckpt,
+            concurrency=1,
+            breaker_is_open=svc.is_breaker_open,
+            pause_seconds=0,
+            max_breaker_pauses=3,
+        )
+        assert done[100].status == STATUS_DEAD
+        assert svc.master_calls == [100]  # settled first try, never retried
+
+    @pytest.mark.asyncio
+    async def test_sustained_saturation_aborts_without_shedding_backlog(self, tmp_path):
+        # The breaker stays saturated forever. The drain must pause up to
+        # max_breaker_pauses, then STOP the run — leaving the master non-terminal
+        # (absent from the checkpoint, retried later) instead of shedding it
+        # dead. It must not spin unboundedly.
+        ckpt = tmp_path / "ckpt.jsonl"
+        svc = ShedService(masters={100: _master(500)}, releases={500: _release(3)}, sheds=10_000)
+        done = await run_drain(
+            svc,
+            {100: [1]},
+            ckpt,
+            concurrency=1,
+            breaker_is_open=svc.is_breaker_open,
+            pause_seconds=0,
+            max_breaker_pauses=3,
+        )
+        assert 100 not in done  # never settled -> retried on a later run
+        assert load_checkpoint(ckpt) == {}  # nothing checkpointed
+        # Bounded retries: one attempt per pause round + the one that trips abort.
+        assert len(svc.master_calls) == 4  # max_breaker_pauses (3) + 1
+
+    @pytest.mark.asyncio
+    async def test_zero_max_breaker_pauses_raises(self, tmp_path):
+        # A non-positive cap would abort on the first shed (0 rounds allowed) or,
+        # if mis-signed, never abort. Guard it like concurrency/limit.
+        svc = ShedService(masters={100: _master(500)}, releases={500: _release(2)})
+        with pytest.raises(ValueError):
+            await run_drain(
+                svc,
+                {100: [1]},
+                tmp_path / "c.jsonl",
+                breaker_is_open=svc.is_breaker_open,
+                max_breaker_pauses=0,
+            )
+        assert svc.master_calls == []  # never started a worker
+
+    @pytest.mark.asyncio
+    async def test_negative_pause_seconds_raises(self, tmp_path):
+        # A negative cool-down would make asyncio.sleep return immediately, so the
+        # drain would burn through every breaker-pause round with no actual pause
+        # and abort near-instantly — silently defeating the fix. Guard it like the
+        # other run_drain knobs instead of no-opping.
+        svc = ShedService(masters={100: _master(500)}, releases={500: _release(2)})
+        with pytest.raises(ValueError):
+            await run_drain(
+                svc,
+                {100: [1]},
+                tmp_path / "c.jsonl",
+                breaker_is_open=svc.is_breaker_open,
+                pause_seconds=-1.0,
+            )
+        assert svc.master_calls == []  # never started a worker
+
+    @pytest.mark.asyncio
+    async def test_sustained_saturation_does_not_mark_other_masters_dead(self, tmp_path):
+        # With a multi-master backlog and a permanent flood, the abort must leave
+        # ALL remaining masters non-terminal — the pre-fix bug shed the entire
+        # backlog to STATUS_DEAD in one burst.
+        ckpt = tmp_path / "ckpt.jsonl"
+        svc = ShedService(
+            masters={n: _master(n * 10) for n in (100, 200, 300)},
+            releases={n * 10: _release(2) for n in (100, 200, 300)},
+            sheds=10_000,
+        )
+        done = await run_drain(
+            svc,
+            {100: [1], 200: [2], 300: [3]},
+            ckpt,
+            concurrency=1,
+            breaker_is_open=svc.is_breaker_open,
+            pause_seconds=0,
+            max_breaker_pauses=2,
+        )
+        assert done == {}  # no master settled
+        assert load_checkpoint(ckpt) == {}
 
 
 class TestLoadUnresolved:
