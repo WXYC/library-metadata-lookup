@@ -374,6 +374,12 @@ async def run_drain(
                     return False
                 resume.clear()
                 drive = True
+                # Surface breaker-shed volume in the end-of-run summary — the
+                # `_` prefix keeps it out of the `processed` tally but visible in
+                # the final `dict(counts)` so an operator can see how saturated
+                # (and how costly against the shared token) the run was. Mutated
+                # only here, once per round by the single driver, synchronously.
+                counts["_paused"] = counts.get("_paused", 0) + 1
                 log.warning(
                     "Discogs breaker OPEN — pausing the drain %.0fs (pause %d/%d) to let "
                     "the shared token recover instead of shedding the backlog",

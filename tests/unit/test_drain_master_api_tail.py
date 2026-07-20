@@ -11,6 +11,7 @@ with a fake service — no DB, no network.
 
 from __future__ import annotations
 
+import logging
 import types
 
 import pytest
@@ -361,6 +362,31 @@ class TestBreakerPause:
         )
         assert done[100].status == STATUS_RESOLVED
         assert svc.master_calls == [100, 100]  # shed once, retried, resolved
+
+    @pytest.mark.asyncio
+    async def test_pause_count_surfaced_in_summary(self, tmp_path, caplog):
+        # Each breaker pause bumps a `_paused` count so the end-of-run summary
+        # records how saturated (how costly against the shared token) the run
+        # was — the signal the old `_raised` bucket carried for get_release sheds.
+        ckpt = tmp_path / "ckpt.jsonl"
+        svc = ShedService(
+            masters={100: _master(500)}, releases={500: _release(3)}, sheds=2, shed_via="release"
+        )
+        with caplog.at_level(logging.INFO, logger="drain_master_api_tail"):
+            done = await run_drain(
+                svc,
+                {100: [1]},
+                ckpt,
+                concurrency=1,
+                breaker_is_open=svc.is_breaker_open,
+                pause_seconds=0,
+                max_breaker_pauses=5,
+            )
+        assert done[100].status == STATUS_RESOLVED
+        summary = next(
+            r.getMessage() for r in caplog.records if "drain pass complete" in r.getMessage()
+        )
+        assert "'_paused': 2" in summary  # two sheds → two pauses, both tallied
 
     @pytest.mark.asyncio
     async def test_genuine_dead_while_breaker_closed_is_recorded_not_paused(self, tmp_path):
