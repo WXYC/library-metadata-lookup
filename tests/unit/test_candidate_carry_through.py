@@ -22,15 +22,18 @@ non-narrowing.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from discogs.lookup import lookup_releases_by_track
 from discogs.models import ReleaseInfo, TrackReleasesResponse
 from lookup.candidate_memo import TrackCandidateMemo
+from lookup.models import LookupRequest
+from lookup.orchestrator import perform_lookup
 from lookup.strategies.track_on_compilation import search_compilations_for_track
 from services.parser import ParsedRequest
+from tests.conftest import make_lml_telemetry
 from tests.factories import make_library_item
 
 SONG = "Sycamore Trees"
@@ -279,3 +282,53 @@ class TestWiderSearchStillFires:
         assert _artist_filtered_calls(service) == 0, "empty Wave A seed reused from memo"
         assert _keyword_calls(service) == 1, "wider probe must fire on an insufficient seed"
         assert {i.title for i in items} == {"Disco Not Disco"}
+
+
+class TestOrchestratorThreadsOneMemo:
+    """The orchestrator must create ONE request-scoped memo and thread the same
+    instance from step 2's producer to step 3's TRACK_ON_COMPILATION consumer."""
+
+    @pytest.mark.asyncio
+    async def test_single_memo_flows_from_step2_to_compilation(
+        self, mock_library_db, mock_discogs_service
+    ):
+        # No artist correction, non-two-part raw_message: only TRACK_ON_COMPILATION
+        # fires among the Discogs-aware strategies (SWAPPED needs an ambiguous
+        # two-part shape; SONG_AS_* require no artist), so the memo is threaded
+        # exactly once from producer to consumer.
+        request = LookupRequest(
+            artist=ARTIST,
+            song=SONG,
+            raw_message=f"dj played {SONG.lower()}",
+        )
+        telemetry = make_lml_telemetry()
+        captured: dict[str, object] = {}
+
+        async def _fake_producer(*_args, **kwargs):
+            captured["producer_memo"] = kwargs.get("memo")
+            return []
+
+        async def _fake_consumer(_db, _parsed, **kwargs):
+            captured["consumer_memo"] = kwargs.get("candidate_memo")
+            return [], {}
+
+        with (
+            patch(
+                "lookup.orchestrator.lookup_releases_by_track",
+                new=AsyncMock(side_effect=_fake_producer),
+            ),
+            patch(
+                "lookup.orchestrator.search_compilations_for_track",
+                new=AsyncMock(side_effect=_fake_consumer),
+            ),
+        ):
+            await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        producer_memo = captured.get("producer_memo")
+        consumer_memo = captured.get("consumer_memo")
+        assert isinstance(producer_memo, TrackCandidateMemo), (
+            "step 2 must receive a request-scoped TrackCandidateMemo"
+        )
+        assert producer_memo is consumer_memo, (
+            "the same memo instance must reach TRACK_ON_COMPILATION (one memo per request)"
+        )

@@ -51,6 +51,7 @@ from generated.api_models import (
 from library.db import LibraryDB
 from library.models import LibraryItem
 from lookup.artwork import fetch_artwork_for_items
+from lookup.candidate_memo import TrackCandidateMemo
 from lookup.enrichment import enrich_artwork_results
 from lookup.external_search import (
     search_external_albums,
@@ -92,6 +93,7 @@ async def resolve_albums_for_track(
     parsed: ParsedRequest,
     discogs_service: DiscogsService | None = None,
     db: LibraryDB | None = None,
+    memo: TrackCandidateMemo | None = None,
 ) -> tuple[list[str], bool]:
     """Resolve album names for a track if not provided.
 
@@ -103,6 +105,11 @@ async def resolve_albums_for_track(
     artist+track request does one Discogs search and zero tracklist fetches, which
     is behavior-preserving because these album names feed only ARTIST_PLUS_ALBUM,
     whose album-fed branch re-filters every hit to the query artist.
+
+    When ``memo`` is supplied (LML#867), the artist-filtered track search's raw
+    candidates (and verdicts) are recorded under ``(song, artist)`` so the
+    downstream ``TRACK_ON_COMPILATION`` strategy can reuse them as its Wave A seed
+    instead of re-issuing the same search.
 
     Returns:
         Tuple of (list of album names, song_not_found_flag)
@@ -126,6 +133,7 @@ async def resolve_albums_for_track(
                 service=discogs_service,
                 db=db,
                 library_artist=library_artist_for(parsed),
+                memo=memo,
             )
             if releases:
                 albums = []
@@ -374,7 +382,7 @@ async def _step_prepare_request(
     request: LookupRequest,
     state: LookupState,
     services: LookupServices,
-) -> tuple[ParsedRequest, list[str]]:
+) -> tuple[ParsedRequest, list[str], TrackCandidateMemo]:
     """Steps 1+2 — prepare: build the ParsedRequest, correct artist spelling, resolve albums.
 
     Artist correction (``db.find_similar_artist``) runs BEFORE album resolution
@@ -386,10 +394,17 @@ async def _step_prepare_request(
     READS: nothing from ``LookupState``.
     WRITES: ``corrected_artist``, ``song_not_found``.
 
-    Returns ``(parsed, albums_for_search)``: the ParsedRequest threads through
-    every later step; ``albums_for_search`` feeds only the search pipeline
-    (step 3), so it rides as a return value rather than state.
+    Returns ``(parsed, albums_for_search, candidate_memo)``: the ParsedRequest
+    threads through every later step; ``albums_for_search`` feeds only the search
+    pipeline (step 3); the ``candidate_memo`` (LML#867) carries step-2's
+    artist-filtered track candidates so the Discogs-aware strategies (step 3)
+    reuse them instead of re-searching. All three ride as return values rather
+    than state — each is produced once here and consumed read-mostly downstream.
     """
+    # Request-scoped candidate carry-through (LML#867). Created fresh per request;
+    # never shared across requests. Populated by ``resolve_albums_for_track`` below
+    # and read by ``TRACK_ON_COMPILATION`` in step 3.
+    candidate_memo = TrackCandidateMemo()
     # Build a ParsedRequest from the LookupRequest for compatibility with
     # search functions that expect ParsedRequest
     parsed = ParsedRequest(
@@ -435,8 +450,12 @@ async def _step_prepare_request(
             # LML#865: bound step 2's Discogs pass by the spine deadline. On a
             # trip, run_within_spine_deadline raises SpineDeadlineExceededError,
             # which perform_lookup catches to return the honest timed-out response.
+            # The LML#867 candidate memo threads in so TRACK_ON_COMPILATION can
+            # reuse step 2's artist-filtered search instead of re-issuing it.
             albums_for_search, song_not_found = await run_within_spine_deadline(
-                resolve_albums_for_track(parsed, services.discogs_service, db=services.db),
+                resolve_albums_for_track(
+                    parsed, services.discogs_service, db=services.db, memo=candidate_memo
+                ),
                 services.spine_deadline,
                 step="album_lookup",
             )
@@ -444,18 +463,21 @@ async def _step_prepare_request(
         with services.telemetry.track_step("album_lookup"):
             # LML#865: same spine-deadline bound on the artist-less branch.
             albums_for_search, song_not_found = await run_within_spine_deadline(
-                resolve_albums_for_track(parsed, services.discogs_service, db=services.db),
+                resolve_albums_for_track(
+                    parsed, services.discogs_service, db=services.db, memo=candidate_memo
+                ),
                 services.spine_deadline,
                 step="album_lookup",
             )
 
     state.song_not_found = song_not_found
-    return parsed, albums_for_search
+    return parsed, albums_for_search, candidate_memo
 
 
 async def _step_search_pipeline(
     parsed: ParsedRequest,
     albums_for_search: list[str],
+    candidate_memo: TrackCandidateMemo,
     state: LookupState,
     services: LookupServices,
 ) -> SearchState:
@@ -464,6 +486,10 @@ async def _step_search_pipeline(
     READS: ``song_not_found`` (pipeline input, seeded by steps 1+2).
     WRITES: ``library_results``, ``song_not_found``, ``found_on_compilation``,
     ``discogs_titles``, ``search_type``.
+
+    ``candidate_memo`` (LML#867) is the step-2 artist-filtered track candidate
+    carry-through; it is bound into the ``TRACK_ON_COMPILATION`` execute partial
+    so the strategy reuses step 2's Wave A search instead of re-issuing it.
 
     Returns the raw ``SearchState``: later consumers need fields that are not
     part of ``LookupState`` (``artist_fallback_results`` in step 3b,
@@ -499,6 +525,7 @@ async def _step_search_pipeline(
                 discogs_service=services.discogs_service,
                 pg=services.discogs_cache_pg,
                 allow_release_resolution_fallback=services.allow_release_resolution_fallback,
+                candidate_memo=candidate_memo,
             ),
             search_song_as_artist_func=partial(
                 search_song_as_artist,
@@ -1068,7 +1095,9 @@ async def perform_lookup(
     # honest empty timed-out response rather than grinding step 3 (which the
     # offset would short-circuit anyway) and the enrichment tail.
     try:
-        parsed, albums_for_search = await _step_prepare_request(request, state, services)
+        parsed, albums_for_search, candidate_memo = await _step_prepare_request(
+            request, state, services
+        )
     except SpineDeadlineExceededError as exc:
         project_spine_deadline_telemetry(exc)
         logger.info(
@@ -1081,7 +1110,9 @@ async def perform_lookup(
         )
         return _build_timed_out_response(state)
 
-    search_state = await _step_search_pipeline(parsed, albums_for_search, state, services)
+    search_state = await _step_search_pipeline(
+        parsed, albums_for_search, candidate_memo, state, services
+    )
 
     # LML#755 R2-2 backstop. The runner (`core/search.py`) already catches a
     # Discogs saturation-breaker shed *inside* the search pipeline and degrades
