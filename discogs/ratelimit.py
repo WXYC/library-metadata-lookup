@@ -10,6 +10,7 @@ Implements:
 
 import asyncio
 import logging
+import random
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
@@ -19,6 +20,17 @@ from aiolimiter import AsyncLimiter
 from discogs.breaker import DiscogsCircuitBreaker
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on a SINGLE queue-for-a-token sleep in the rate gate. At the
+# default 50/min this never binds (retry_after ≈ 1.2s); it only clamps a
+# degenerate ``retry_after_s`` (e.g. a tiny misconfigured refill) so the
+# queue loop can't wedge the live-probe tail on one huge sleep (LML#841 review).
+_MAX_QUEUE_SLEEP_S = 5.0
+
+# Additive jitter fraction on the queue sleep. The per-process semaphore already
+# bounds concurrent gate waiters to ``discogs_max_concurrent`` (~5), but spreading
+# their wake-ups still avoids a lock-step pile-up on the single FOR UPDATE row.
+_QUEUE_SLEEP_JITTER = 0.25
 
 # Lazily-initialized rate limiting primitives, stored per event loop
 _rate_limiters: dict[asyncio.AbstractEventLoop, AsyncLimiter] = {}
@@ -137,11 +149,21 @@ class DiscogsRateGate:
 
     * Flag OFF → delegate straight to the per-process local ``AsyncLimiter``
       (today's exact behavior; PG untouched).
-    * Flag ON, bucket healthy → spend a token from the shared PG bucket, queuing
-      on ``retry_after_s`` when momentarily empty (same "wait, don't shed"
-      contract as ``AsyncLimiter.acquire``).
-    * Flag ON, PG missing/erroring/slow → fail OPEN to the local limiter so a
-      discogs-cache hiccup can never wedge the live-probe tail.
+    * Flag ON → pace on the local ``AsyncLimiter`` FIRST (a per-process safety
+      cap under the shared global cap), then spend a token from the shared PG
+      bucket, queuing on ``retry_after_s`` when momentarily empty (same "wait,
+      don't shed" contract as ``AsyncLimiter.acquire``).
+    * Flag ON, PG missing/erroring/slow → fail OPEN. The local pace above has
+      already applied, so we just tag ``fallback`` and proceed — a discogs-cache
+      hiccup can never wedge the live-probe tail.
+
+    Local-first (LML#841 review, Finding 2): acquiring the local limiter on every
+    enabled call keeps its burst reservoir continuously DRAINED. Otherwise the
+    idle limiter refills to full (up to ``discogs_rate_limit`` permits) while PG
+    paces globally, and a mid-flood fail-open would then release that whole burst
+    past the shared budget — tripping the LML#755 breaker. Under normal operation
+    the shared PG bucket is the binding constraint, so the local acquire returns
+    essentially instantly and adds no latency.
 
     All resilience *policy* lives here; ``PgTokenBucket`` stays a pure primitive.
     The per-round-trip ``asyncio.wait_for`` bounds a SINGLE ``try_acquire`` call
@@ -157,6 +179,10 @@ class DiscogsRateGate:
     async def _resolve_bucket(self) -> "_RateBucket | None":
         # Cache the bucket once built. A ``None`` (pool not ready) is NOT cached,
         # so a pool that comes up after first use is picked up on a later call.
+        # The check-then-set is intentionally lock-free: the factory is idempotent
+        # over the shared discogs-cache pool singleton, so a rare concurrent first
+        # call just builds two cheap wrapper objects and the last write wins — both
+        # point at the same pool, so there is nothing to serialize (Finding 6).
         if self._bucket is None:
             self._bucket = await self._bucket_factory()
         return self._bucket
@@ -169,6 +195,12 @@ class DiscogsRateGate:
             await self._local.acquire()
             return
 
+        # Pace on the per-process limiter FIRST — a safety cap under the shared
+        # global cap that also keeps the local limiter's burst reservoir drained,
+        # so a later fail-open cannot release an accumulated burst (see class
+        # docstring, Finding 2).
+        await self._local.acquire()
+
         timeout_s = settings.discogs_rate_bucket_timeout_s
         try:
             bucket = await self._resolve_bucket()
@@ -178,20 +210,22 @@ class DiscogsRateGate:
                 acquisition = await asyncio.wait_for(bucket.try_acquire(), timeout_s)
                 if acquisition.allowed:
                     return
-                # Empty-but-healthy bucket: queue for the next token. Bounded by
-                # ~1/refill_per_sec (≈1.2s at 50/min), mirroring the local limiter.
-                await asyncio.sleep(acquisition.retry_after_s)
+                # Empty-but-healthy bucket: queue for the next token. Normally
+                # ~1/refill_per_sec (≈1.2s at 50/min); clamp a degenerate hint and
+                # jitter the wake-up so the (semaphore-bounded) waiters don't wake
+                # in lock-step onto the single row lock.
+                base_sleep = min(acquisition.retry_after_s, _MAX_QUEUE_SLEEP_S)
+                await asyncio.sleep(base_sleep + random.random() * base_sleep * _QUEUE_SLEEP_JITTER)
         except Exception:
-            # Any PG error, missing row, or round-trip timeout: fail OPEN. Tag the
-            # enclosing trace so the fail-open rate is queryable (a bare log line
-            # is not — LML#683). Then honor the local limiter so we still respect
-            # this process's own budget.
+            # Any PG error, missing row, or round-trip timeout: fail OPEN. We have
+            # ALREADY paced via the local limiter above, so there is nothing more
+            # to acquire — just tag the enclosing trace so the fail-open rate is
+            # queryable (a bare log line is not — LML#683).
             sentry_sdk.set_tag("lml.discogs.rate_gate", "fallback")
             logger.warning(
-                "Discogs shared rate bucket unavailable; failing open to local limiter",
+                "Discogs shared rate bucket unavailable; already paced by local limiter",
                 exc_info=True,
             )
-            await self._local.acquire()
 
 
 def _default_bucket_factory() -> BucketFactory:

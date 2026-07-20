@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS lml_cache.discogs_rate_bucket (
 -- the budget; a later boot with a different `DISCOGS_RATE_LIMIT` (e.g. staging)
 -- must NOT oscillate the shared row. Seeded full so a fresh bucket starts with a
 -- burst allowance rather than cold-starting empty.
+--
+-- The literals below spell out the DEFAULT budget (`DISCOGS_RATE_LIMIT=50` →
+-- capacity 50, refill 50/60 ≈ 0.8333/s) for a copy-paste apply. The runtime
+-- seed (`set_up_discogs_rate_bucket_schema`) instead binds these from the live
+-- `discogs_rate_limit` setting, so if an operator overrides that env var the
+-- app's seed — not this literal — is authoritative.
 INSERT INTO lml_cache.discogs_rate_bucket (bucket_key, tokens, capacity, refill_per_sec)
 VALUES ('discogs', 50, 50, 0.8333333333333334)
 ON CONFLICT (bucket_key) DO NOTHING;

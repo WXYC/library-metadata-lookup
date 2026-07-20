@@ -94,6 +94,23 @@ def rate_bucket_env(monkeypatch):
     get_settings.cache_clear()
 
 
+@pytest.fixture
+def captured_tags(monkeypatch):
+    """Capture ``sentry_sdk.set_tag`` calls made by the gate.
+
+    Local-first pacing (LML#841 review, Finding 2) means the local limiter is
+    now advanced on EVERY enabled call, so its acquire count no longer
+    distinguishes the healthy path from a fail-open. The fail-open signal is the
+    ``lml.discogs.rate_gate=fallback`` tag — the real production observable
+    (LML#683) — so the tests assert on it directly."""
+    tags: dict[str, str] = {}
+    monkeypatch.setattr(
+        "discogs.ratelimit.sentry_sdk.set_tag",
+        lambda key, value: tags.__setitem__(key, value),
+    )
+    return tags
+
+
 async def _factory_returning(bucket):
     async def factory():
         return bucket
@@ -119,7 +136,7 @@ async def test_flag_off_delegates_to_local_and_skips_pg(rate_bucket_env):
     assert built is False  # factory never invoked → PG untouched
 
 
-async def test_flag_on_healthy_bucket_spends_pg_token(rate_bucket_env):
+async def test_flag_on_healthy_bucket_spends_pg_token(rate_bucket_env, captured_tags):
     rate_bucket_env(enabled=True)
     local = _RecordingLimiter()
     bucket = _AllowingBucket()
@@ -128,10 +145,14 @@ async def test_flag_on_healthy_bucket_spends_pg_token(rate_bucket_env):
     await gate.acquire()
 
     assert bucket.calls == 1
-    assert local.acquired == 0  # PG granted; local limiter untouched
+    # Local-first (Finding 2): the local limiter is advanced on every enabled
+    # call — a per-process cap that also keeps its burst reservoir drained. The
+    # healthy path never tags fallback.
+    assert local.acquired == 1
+    assert "lml.discogs.rate_gate" not in captured_tags
 
 
-async def test_pg_error_fails_open_to_local(rate_bucket_env):
+async def test_pg_error_fails_open_to_local(rate_bucket_env, captured_tags):
     rate_bucket_env(enabled=True)
     local = _RecordingLimiter()
     bucket = _RaisingBucket()
@@ -140,10 +161,12 @@ async def test_pg_error_fails_open_to_local(rate_bucket_env):
     await gate.acquire()
 
     assert bucket.calls == 1
-    assert local.acquired == 1  # fell back to the local limiter
+    # Already paced by the local-first acquire; fail-open adds no second acquire.
+    assert local.acquired == 1
+    assert captured_tags["lml.discogs.rate_gate"] == "fallback"
 
 
-async def test_missing_pool_fails_open_to_local(rate_bucket_env):
+async def test_missing_pool_fails_open_to_local(rate_bucket_env, captured_tags):
     """A None pool (no discogs-cache configured) fails open, not hard-errors."""
     rate_bucket_env(enabled=True)
     local = _RecordingLimiter()
@@ -152,9 +175,10 @@ async def test_missing_pool_fails_open_to_local(rate_bucket_env):
     await gate.acquire()
 
     assert local.acquired == 1
+    assert captured_tags["lml.discogs.rate_gate"] == "fallback"
 
 
-async def test_empty_bucket_queues_then_succeeds_without_fallback(rate_bucket_env):
+async def test_empty_bucket_queues_then_succeeds_without_fallback(rate_bucket_env, captured_tags):
     """A saturated-but-healthy bucket makes the gate SLEEP ``retry_after_s`` and
     re-try on PG — it must NOT fail open (that would over-issue past the shared
     budget). The per-round-trip timeout bounds each call, not the queue wait."""
@@ -169,11 +193,31 @@ async def test_empty_bucket_queues_then_succeeds_without_fallback(rate_bucket_en
     elapsed = loop.time() - start
 
     assert bucket.calls == 2  # denied once, retried, granted
-    assert local.acquired == 0  # queued on PG, never fell back
+    assert local.acquired == 1  # local-first pace, then queued on PG
+    assert "lml.discogs.rate_gate" not in captured_tags  # queued, never fell back
     assert elapsed >= 0.015  # actually slept the retry hint
 
 
-async def test_slow_pg_times_out_and_fails_open(rate_bucket_env):
+async def test_degenerate_retry_after_is_capped(rate_bucket_env, captured_tags, monkeypatch):
+    """LML#841 review (Finding 3): a pathological ``retry_after_s`` hint must not
+    make the gate sleep for that whole duration. The queue sleep is clamped to
+    ``_MAX_QUEUE_SLEEP_S`` so a bad hint can't wedge the live-probe tail."""
+    rate_bucket_env(enabled=True, timeout_s=0.5)
+    monkeypatch.setattr("discogs.ratelimit._MAX_QUEUE_SLEEP_S", 0.03)
+    local = _RecordingLimiter()
+    bucket = _DeniedThenAllowedBucket(retry_after_s=999.0)
+    gate = DiscogsRateGate(local_limiter=local, bucket_factory=await _factory_returning(bucket))
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await gate.acquire()
+    elapsed = loop.time() - start
+
+    assert bucket.calls == 2  # denied (huge hint), capped-slept, retried, granted
+    assert elapsed < 0.5  # clamped to _MAX_QUEUE_SLEEP_S, NOT 999s
+
+
+async def test_slow_pg_times_out_and_fails_open(rate_bucket_env, captured_tags):
     """A single PG round-trip past ``timeout_s`` fails open — a slow/locked
     discogs-cache never wedges the live-probe tail."""
     rate_bucket_env(enabled=True, timeout_s=0.02)
@@ -188,4 +232,5 @@ async def test_slow_pg_times_out_and_fails_open(rate_bucket_env):
     elapsed = loop.time() - start
 
     assert local.acquired == 1
+    assert captured_tags["lml.discogs.rate_gate"] == "fallback"
     assert elapsed < 0.5  # bounded by timeout_s, not the 1s hang

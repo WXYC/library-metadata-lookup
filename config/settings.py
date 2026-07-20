@@ -213,7 +213,13 @@ class Settings(BaseSettings):
 
     # Discogs Rate Limiting Configuration
     discogs_rate_limit: int = Field(
-        default=50, description="Max Discogs API requests per minute (stay under 60/min limit)"
+        default=50,
+        ge=1,
+        description=(
+            "Max Discogs API requests per minute (stay under 60/min limit). Also seeds the "
+            "LML#841 shared token bucket's refill (rate / 60), so it must be >= 1 — a zero "
+            "would divide-by-zero the bucket's retry_after computation."
+        ),
     )
     discogs_max_concurrent: int = Field(
         default=5, description="Max concurrent Discogs API requests"
