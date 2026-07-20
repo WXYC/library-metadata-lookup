@@ -62,20 +62,20 @@ class TrackCandidateSet:
         validated: Whether per-candidate tracklist validation ran at all. False
             when LML#866's library-first gate skipped validation (non-library
             artist) — the candidates are still carried, just unvalidated.
-        truncated: Whether the producer's search returned a full page (its result
-            count reached the page ``limit``). A truncated seed is NOT provably the
-            complete artist-filtered result set — a fresh, wider search may surface
-            more releases — so the consumer must not reuse it as a drop-in Wave A
-            (that would narrow recall, dropping a library pressing ranked past the
-            producer's smaller page cap). ``False`` (the default) means the search
-            returned fewer rows than it asked for, i.e. the complete set, safe to
-            reuse.
+        search_limit: The Discogs ``per_page`` the producer's search used. The
+            consumer reuses this seed as its own Wave A only when this is at least
+            as large as the page a fresh Wave A would fetch
+            (``WAVE_A_SEARCH_LIMIT``) — a seed fetched at a smaller page can be a
+            strict subset of a fresh, wider search (the keyword supplement in
+            ``search_releases_by_track`` scales its page with the limit too), so
+            reusing it would drop a library pressing ranked past the smaller page.
+            ``0`` (the default) is "unknown" and never qualifies for reuse.
     """
 
     releases: list[ReleaseInfo]
     verdicts: dict[int, bool] = field(default_factory=dict)
     validated: bool = False
-    truncated: bool = False
+    search_limit: int = 0
 
 
 @dataclass
@@ -99,22 +99,22 @@ class TrackCandidateMemo:
         *,
         verdicts: dict[int, bool] | None = None,
         validated: bool = False,
-        truncated: bool = False,
+        search_limit: int = 0,
     ) -> None:
         """Record (or overwrite) the candidate set for ``(track, artist)``.
 
         The producer calls this after its ``artist=`` search: first with the raw
         candidates (``validated=False``), then again with verdicts filled in once
         validation completes. The last write wins, so the post-validation call
-        carries the richest state. ``truncated`` marks a seed whose search filled
-        its page (result count reached the ``limit``) — see
-        :attr:`TrackCandidateSet.truncated` for why the consumer must not reuse it.
+        carries the richest state. ``search_limit`` is the ``per_page`` the search
+        used — see :attr:`TrackCandidateSet.search_limit` for how the consumer
+        gates reuse on it.
         """
         self._by_key[_memo_key(track, artist)] = TrackCandidateSet(
             releases=list(releases),
             verdicts=dict(verdicts or {}),
             validated=validated,
-            truncated=truncated,
+            search_limit=search_limit,
         )
 
     def get(self, track: str, artist: str) -> TrackCandidateSet | None:

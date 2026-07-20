@@ -90,15 +90,14 @@ async def lookup_releases_by_track(
     # returned nothing (empty seed) so the consumer reuses "empty Wave A" rather
     # than re-searching; upgraded with verdicts below once validation runs.
     #
-    # ``seed_truncated`` marks a search that filled its page (result count reached
-    # ``limit``). Such a seed is NOT provably the complete artist-filtered set, so
-    # the consumer must not reuse it as a drop-in (wider) Wave A — see
-    # ``TrackCandidateSet.truncated``. A short page is the complete set (safe).
+    # The seed carries the ``limit`` (Discogs ``per_page``) it was fetched at: the
+    # consumer reuses it only when that is at least as wide as a fresh Wave A's
+    # page, since a smaller page can be a strict subset — see
+    # ``TrackCandidateSet.search_limit``.
     record_memo = memo is not None and bool(artist) and not artist_as_keyword
-    seed_truncated = len(raw_releases) >= limit
     if record_memo:
         assert memo is not None  # narrow for the type-checker
-        memo.record(track, artist or "", raw_releases, validated=False, truncated=seed_truncated)
+        memo.record(track, artist or "", raw_releases, validated=False, search_limit=limit)
 
     if not raw_releases:
         return []
@@ -167,7 +166,7 @@ async def lookup_releases_by_track(
     if record_memo:
         assert memo is not None  # narrow for the type-checker
         memo.record(
-            track, artist, raw_releases, verdicts=verdicts, validated=True, truncated=seed_truncated
+            track, artist, raw_releases, verdicts=verdicts, validated=True, search_limit=limit
         )
 
     return releases

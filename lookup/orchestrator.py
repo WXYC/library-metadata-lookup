@@ -59,6 +59,7 @@ from lookup.external_search import (
     search_external_tracks,
 )
 from lookup.matching import (
+    WAVE_A_SEARCH_LIMIT,
     _filter_results_by_song_as_album_title,
     library_artist_for,
     limit_results,
@@ -129,7 +130,12 @@ async def resolve_albums_for_track(
             releases = await lookup_releases_by_track(
                 parsed.song,
                 parsed.artist,
-                limit=10,
+                # Search at the shared Wave A page size (LML#867): the carry-through
+                # reuses this search as TRACK_ON_COMPILATION's Wave A, and reuse is
+                # only non-narrowing when step 2 searched at least as wide as a fresh
+                # Wave A would. A smaller page would make the seed a subset the
+                # consumer must re-search.
+                limit=WAVE_A_SEARCH_LIMIT,
                 service=discogs_service,
                 db=db,
                 library_artist=library_artist_for(parsed),

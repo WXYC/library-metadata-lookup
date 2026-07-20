@@ -52,6 +52,7 @@ from lookup.matching import (
     _FALLBACK_ARTIST_SIMILARITY_FLOOR,
     _FETCH_LIMIT,
     MAX_SEARCH_RESULTS,
+    WAVE_A_SEARCH_LIMIT,
     artist_matches_item,
     library_artist_for,
     limit_results,
@@ -323,23 +324,23 @@ async def search_compilations_for_track(
             if candidate_memo is not None
             else None
         )
-        # Recall guard: only reuse a seed step 2 proved complete. A seed that
-        # saturated step 2's (smaller) page limit is not provably the full
-        # artist-filtered set — a fresh, wider Wave A can surface releases ranked
-        # past that cap, one of which may be the sole library pressing (and, if not
-        # a V/A comp, one Wave B's ``format=Compilation`` arm can't rescue). Fall
-        # through to the fresh gather below; suppress the search only when the
-        # surfaced set is provably unchanged.
-        if memo_seed is not None and memo_seed.truncated:
+        # Recall guard: reuse the seed only when it was fetched at least as wide as
+        # a fresh Wave A would search (``WAVE_A_SEARCH_LIMIT``). A seed from a
+        # smaller page can be a strict subset — the keyword supplement inside
+        # ``search_releases_by_track`` scales its page with the limit, so a fresh
+        # wider Wave A can surface releases (a sole library pressing, and if not a
+        # V/A comp one Wave B's ``format=Compilation`` arm can't rescue) that a
+        # narrower seed missed. On a too-narrow seed, fall through to the fresh
+        # gather below; suppress the search only when reuse is a provable superset.
+        if memo_seed is not None and memo_seed.search_limit < WAVE_A_SEARCH_LIMIT:
             memo_seed = None
 
         if discogs_service and memo_seed is not None:
             # Wave A came free from the memo (no second ``artist=`` search). The
-            # truncated guard above ensured this seed is the *complete*
-            # artist-filtered result set (step 2's search returned a short page), so
-            # it equals what a fresh Wave A would surface — reuse is provably
-            # non-narrowing. The recall-critical wider arm is the Wave B probe,
-            # preserved below.
+            # guard above ensured the seed was fetched at least as wide as a fresh
+            # Wave A (``search_limit >= WAVE_A_SEARCH_LIMIT``), so it is a superset
+            # of what a fresh Wave A would surface — reuse is provably non-narrowing.
+            # The recall-critical wider arm is the Wave B probe, preserved below.
             wave_a_releases = list(memo_seed.releases)
             # Skip the wider Wave B probe only when the seed already holds a
             # true-V/A comp — ``merge_wave_b_compilations`` discards Wave B in
@@ -392,7 +393,9 @@ async def search_compilations_for_track(
             # reproduced-and-refuted and pinned by
             # ``tests/integration/test_va_comp_wave_b_extra_credit.py``.
             probes: list[Coroutine[Any, Any, _ProbeResult]] = [
-                discogs_service.search_releases_by_track(song_search, artist_for_probes),
+                discogs_service.search_releases_by_track(
+                    song_search, artist_for_probes, limit=WAVE_A_SEARCH_LIMIT
+                ),
                 discogs_service.search_releases_by_track(
                     song_search, artist_for_probes, artist_as_keyword=True
                 ),
