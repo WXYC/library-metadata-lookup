@@ -89,10 +89,16 @@ async def lookup_releases_by_track(
     # probe is a distinct query the consumer owns. Recorded even when the search
     # returned nothing (empty seed) so the consumer reuses "empty Wave A" rather
     # than re-searching; upgraded with verdicts below once validation runs.
+    #
+    # ``seed_truncated`` marks a search that filled its page (result count reached
+    # ``limit``). Such a seed is NOT provably the complete artist-filtered set, so
+    # the consumer must not reuse it as a drop-in (wider) Wave A — see
+    # ``TrackCandidateSet.truncated``. A short page is the complete set (safe).
     record_memo = memo is not None and bool(artist) and not artist_as_keyword
+    seed_truncated = len(raw_releases) >= limit
     if record_memo:
         assert memo is not None  # narrow for the type-checker
-        memo.record(track, artist or "", raw_releases, validated=False)
+        memo.record(track, artist or "", raw_releases, validated=False, truncated=seed_truncated)
 
     if not raw_releases:
         return []
@@ -160,7 +166,9 @@ async def lookup_releases_by_track(
     # validated candidates are collected, so unprobed ids stay verdict-unknown.
     if record_memo:
         assert memo is not None  # narrow for the type-checker
-        memo.record(track, artist, raw_releases, verdicts=verdicts, validated=True)
+        memo.record(
+            track, artist, raw_releases, verdicts=verdicts, validated=True, truncated=seed_truncated
+        )
 
     return releases
 

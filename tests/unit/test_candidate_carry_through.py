@@ -332,3 +332,91 @@ class TestOrchestratorThreadsOneMemo:
         assert producer_memo is consumer_memo, (
             "the same memo instance must reach TRACK_ON_COMPILATION (one memo per request)"
         )
+
+
+class TestTruncatedSeedNoRecallNarrowing:
+    """A seed that saturated step 2's (smaller) page limit is not provably the
+    complete artist-filtered result set: a fresh ``per_page=20`` Wave A can surface
+    releases ranked past step 2's ``per_page=10`` cap. Reusing such a seed would
+    drop a library pressing ranked 11-20 that is NOT a V/A compilation (so Wave B's
+    ``format=Compilation`` arm cannot rescue it) — the LML#267/#560/#801 high-fanout
+    artist+track rescue this strategy exists for. The memo must only suppress the
+    redundant search when the surfaced set is provably unchanged."""
+
+    STEP2_LIMIT = 10
+
+    def _limit_honoring_service(
+        self, *, all_wave_a: list[ReleaseInfo], wave_b: list[ReleaseInfo]
+    ) -> AsyncMock:
+        """A service whose ``search_releases_by_track`` honors ``limit`` (returns
+        ``all_wave_a[:limit]`` for the ``artist=`` probe), so step 2's ``limit=10``
+        yields a truncated slice and a fresh ``limit=20`` Wave A yields more."""
+        service = AsyncMock()
+        service.cache_service = None
+
+        async def _track_releases(track, artist=None, limit=20, artist_as_keyword=False, **_):
+            releases = list(wave_b) if artist_as_keyword else all_wave_a[:limit]
+            return TrackReleasesResponse(
+                track=track, artist=artist, releases=list(releases), total=len(releases)
+            )
+
+        service.search_releases_by_track = AsyncMock(side_effect=_track_releases)
+        service.validate_track_on_release = AsyncMock(return_value=True)
+        return service
+
+    @pytest.mark.asyncio
+    async def test_truncated_seed_falls_back_to_fresh_wider_wave_a(self):
+        """No recall narrowing: a truncated step-2 seed must NOT be reused; the
+        consumer re-issues a fresh ``per_page=20`` Wave A that surfaces the library
+        pressing ranked past step 2's page cap."""
+        # ranks 1-10: same-artist releases that do NOT library-match; rank 11: the
+        # sole library album — a plain reissue (not a compilation), so Wave B cannot
+        # rescue it. Step 2 (limit=10) sees only ranks 1-10 → a truncated seed.
+        filler = [
+            _release(album=f"Bootleg Vol. {i}", artist=ARTIST, release_id=i)
+            for i in range(1, self.STEP2_LIMIT + 1)
+        ]
+        target = _release(album="The Rare Reissue", artist=ARTIST, release_id=999)
+        service = self._limit_honoring_service(all_wave_a=filler + [target], wave_b=[])
+
+        target_item = make_library_item(id=999, artist=ARTIST, title="The Rare Reissue")
+        db = AsyncMock()
+
+        async def _exact_title(title, **_):
+            return [target_item] if (title or "").lower() == "the rare reissue" else []
+
+        async def _search(query, limit=None, **_):
+            # Library-membership gate (producer) + keyword leg hit on the artist.
+            if ARTIST.lower() in (query or "").lower():
+                return [target_item]
+            return []
+
+        db.exact_title = AsyncMock(side_effect=_exact_title)
+        db.search = AsyncMock(side_effect=_search)
+
+        memo = TrackCandidateMemo()
+        parsed = ParsedRequest(artist=ARTIST, song=SONG, raw_message=f"{SONG} by {ARTIST}")
+
+        # Step 2 (producer, limit=10): the search saturates → a truncated seed.
+        await lookup_releases_by_track(
+            SONG,
+            ARTIST,
+            limit=self.STEP2_LIMIT,
+            service=service,
+            db=db,
+            library_artist=ARTIST,
+            memo=memo,
+        )
+        seed = memo.get(SONG, ARTIST)
+        assert seed is not None
+        assert len(seed.releases) == self.STEP2_LIMIT, "precondition: seed saturated the page"
+
+        # Step 3 (consumer): must re-issue a fresh per_page=20 Wave A and surface the
+        # rank-11 library pressing the truncated seed lacked.
+        items, _titles = await search_compilations_for_track(
+            db, parsed, discogs_service=service, candidate_memo=memo
+        )
+        assert {i.title for i in items} == {"The Rare Reissue"}, (
+            "a truncated seed must not suppress the fresh wider Wave A that surfaces "
+            "the library album ranked past step 2's page cap"
+        )

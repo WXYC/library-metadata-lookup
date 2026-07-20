@@ -56,6 +56,22 @@ class ResolvedRelease:
     confidence: float = 1.0
 
 
+def has_va_compilation(releases: list[ReleaseInfo]) -> bool:
+    """True when ``releases`` holds a *true V/A* compilation.
+
+    A true V/A hit is a release flagged ``is_compilation`` **and** credited to a
+    compilation artist (Various-style). Gating on ``is_compilation`` alone
+    over-matches — single-artist retrospectives carry that flag too.
+
+    The single source of truth for "does this set already contain a V/A comp?".
+    :func:`merge_wave_b_compilations` uses it to decide whether to merge Wave B,
+    and ``TRACK_ON_COMPILATION`` uses the same predicate to decide whether the
+    wider Wave B search is redundant — keeping the two in lockstep so the
+    memo-reuse skip can never drift from what the merge actually discards.
+    """
+    return any(r.is_compilation and is_compilation_artist(r.artist or "") for r in releases)
+
+
 def merge_wave_b_compilations(
     wave_a: list[ReleaseInfo], wave_b: list[ReleaseInfo]
 ) -> list[ReleaseInfo]:
@@ -66,14 +82,12 @@ def merge_wave_b_compilations(
     ``format=Compilation``. Gating on ``r.is_compilation`` alone over-suppresses
     — single-artist retrospectives are flagged ``Compilation`` too — so the
     merge only fires when Wave A surfaced no *true V/A* hit (compilation AND a
-    compilation-artist credit), and only adds Wave B rows that are themselves
-    V/A compilations and not already present by album title.
+    compilation-artist credit; see :func:`has_va_compilation`), and only adds
+    Wave B rows that are themselves V/A compilations and not already present by
+    album title.
     """
     merged = list(wave_a)
-    has_va_compilation = any(
-        r.is_compilation and is_compilation_artist(r.artist or "") for r in merged
-    )
-    if not has_va_compilation:
+    if not has_va_compilation(merged):
         seen_album_keys = {r.album.lower() for r in merged}
         for r in wave_b:
             if r.is_compilation and r.album.lower() not in seen_album_keys:

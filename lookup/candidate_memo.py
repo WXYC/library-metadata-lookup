@@ -62,11 +62,20 @@ class TrackCandidateSet:
         validated: Whether per-candidate tracklist validation ran at all. False
             when LML#866's library-first gate skipped validation (non-library
             artist) — the candidates are still carried, just unvalidated.
+        truncated: Whether the producer's search returned a full page (its result
+            count reached the page ``limit``). A truncated seed is NOT provably the
+            complete artist-filtered result set — a fresh, wider search may surface
+            more releases — so the consumer must not reuse it as a drop-in Wave A
+            (that would narrow recall, dropping a library pressing ranked past the
+            producer's smaller page cap). ``False`` (the default) means the search
+            returned fewer rows than it asked for, i.e. the complete set, safe to
+            reuse.
     """
 
     releases: list[ReleaseInfo]
     verdicts: dict[int, bool] = field(default_factory=dict)
     validated: bool = False
+    truncated: bool = False
 
 
 @dataclass
@@ -90,18 +99,22 @@ class TrackCandidateMemo:
         *,
         verdicts: dict[int, bool] | None = None,
         validated: bool = False,
+        truncated: bool = False,
     ) -> None:
         """Record (or overwrite) the candidate set for ``(track, artist)``.
 
         The producer calls this after its ``artist=`` search: first with the raw
         candidates (``validated=False``), then again with verdicts filled in once
         validation completes. The last write wins, so the post-validation call
-        carries the richest state.
+        carries the richest state. ``truncated`` marks a seed whose search filled
+        its page (result count reached the ``limit``) — see
+        :attr:`TrackCandidateSet.truncated` for why the consumer must not reuse it.
         """
         self._by_key[_memo_key(track, artist)] = TrackCandidateSet(
             releases=list(releases),
             verdicts=dict(verdicts or {}),
             validated=validated,
+            truncated=truncated,
         )
 
     def get(self, track: str, artist: str) -> TrackCandidateSet | None:
