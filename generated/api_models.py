@@ -1842,6 +1842,25 @@ class TrackListItem(BaseModel):
     duration: str | None = Field(None, description='Track duration (e.g. "5:23")')
 
 
+class CriticReviewItem(BaseModel):
+    source: str = Field(..., description='Publication name (e.g. "The Quietus")')
+    url: str = Field(
+        ...,
+        description="Link to the original review on the publisher's site (mandatory link-out)",
+    )
+    snippet: str = Field(
+        ...,
+        description="Short attributed excerpt (<= ~300 chars); never the full review body",
+    )
+    author: str | None = Field(None, description="Review author, when available")
+    publishedDate: str | None = Field(
+        None, description='Review publication date when available (e.g. "2024-03-15")'
+    )
+    rating: str | None = Field(
+        None, description='Source-native rating string when available (e.g. "8.0")'
+    )
+
+
 class AlbumMetadataResponse(BaseModel):
     discogsReleaseId: int | None = Field(None, description="Discogs release ID")
     discogsUrl: str | None = Field(None, description="Discogs release page URL")
@@ -1859,6 +1878,10 @@ class AlbumMetadataResponse(BaseModel):
         None, description='Full release date when available (e.g. "2024-03-15")'
     )
     tracklist: list[TrackListItem] | None = Field(None, description="Release tracklist")
+    criticReviews: list[CriticReviewItem] | None = Field(
+        None,
+        description="Attributed external critic-review snippets, each linking out to the original",
+    )
     spotifyUrl: str | None = Field(None, description="Spotify URL for the album or track")
     appleMusicUrl: str | None = Field(None, description="Apple Music URL for the album or track")
     youtubeMusicUrl: str | None = Field(None, description="YouTube Music search URL")
