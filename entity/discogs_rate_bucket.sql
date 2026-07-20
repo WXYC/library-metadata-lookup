@@ -11,9 +11,11 @@
 -- Purpose: the per-process `AsyncLimiter` bounds each LML process to
 -- `DISCOGS_RATE_LIMIT`/min, but prod + staging share one Discogs token against
 -- one upstream 60/min bucket. This table holds ONE row per Discogs token so every
--- process draws rate permits from a single lazily-refilled token bucket — exact
--- global enforcement. Enforcement is atomic in the single `UPDATE … RETURNING`
--- with a `FOR UPDATE` CTE (see `PgTokenBucket.try_acquire` in the `.py`).
+-- process draws rate permits from a single lazily-refilled token bucket — one
+-- shared global budget instead of N uncoordinated per-process ones (same burst
+-- envelope as a single `AsyncLimiter(rate, 60)`, not a strict rate-in-any-window
+-- cap). The spend is atomic in the single `UPDATE … RETURNING` with a `FOR UPDATE`
+-- CTE (see `PgTokenBucket.try_acquire` in the `.py`).
 --
 -- This file exists so:
 --

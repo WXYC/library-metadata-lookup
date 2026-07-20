@@ -158,12 +158,25 @@ class DiscogsRateGate:
       hiccup can never wedge the live-probe tail.
 
     Local-first (LML#841 review, Finding 2): acquiring the local limiter on every
-    enabled call keeps its burst reservoir continuously DRAINED. Otherwise the
-    idle limiter refills to full (up to ``discogs_rate_limit`` permits) while PG
-    paces globally, and a mid-flood fail-open would then release that whole burst
-    past the shared budget — tripping the LML#755 breaker. Under normal operation
-    the shared PG bucket is the binding constraint, so the local acquire returns
-    essentially instantly and adds no latency.
+    enabled call keeps its burst reservoir DRAINED *for the budget-binding process*
+    — the process whose actual throughput ≈ its local refill rate, which is the sole
+    process on today's N=1 deployment. Without the local-first acquire, that process's
+    idle limiter refills to full (up to ``discogs_rate_limit`` permits) while PG paces
+    globally, and a mid-flood fail-open would release that whole burst past the shared
+    budget — tripping the LML#755 breaker. Under normal operation the shared PG bucket
+    is the binding constraint, so the local acquire returns essentially instantly and
+    adds no latency.
+
+    Caveat under N≥2 replicas (out of scope for this PR; see the horizontal-scaling
+    runbook in ``docs/deployment.md``): a replica whose share of the global budget is
+    below its local cap sees fewer acquires than its refill rate, so its local limiter
+    still drifts toward full. A simultaneous PG outage then fails all N replicas open to
+    their full local limiters — degrading to ~N×``discogs_rate_limit`` during the outage,
+    which is exactly the pre-#841 bucket-OFF behavior (fail-open reverting to the old
+    per-process limiters), NOT a new regression. Operators enabling N≥2 who want a bounded
+    fail-open should keep ``DISCOGS_RATE_LIMIT`` divided (``floor(budget/N)``) as the
+    fallback floor rather than leaving it at the stock 50; the runbook documents the
+    trade-off.
 
     All resilience *policy* lives here; ``PgTokenBucket`` stays a pure primitive.
     The per-round-trip ``asyncio.wait_for`` bounds a SINGLE ``try_acquire`` call
@@ -221,6 +234,17 @@ class DiscogsRateGate:
             # ALREADY paced via the local limiter above, so there is nothing more
             # to acquire — just tag the enclosing trace so the fail-open rate is
             # queryable (a bare log line is not — LML#683).
+            #
+            # The catch is deliberately broad (LML#841 review, round 2, Finding 3):
+            # the real PG-outage surface is wide and raw (PgSource passes asyncpg
+            # errors, OSError/connection failures, and asyncio timeouts through
+            # unwrapped), so enumerating an "expected" set is fragile — a missed type
+            # would either wedge the live-probe tail (defeating the whole fail-open
+            # contract) or, worse, mis-tag a genuine outage as a bug mid-incident.
+            # Resilience wins: fail open on everything. ``exc_info=True`` still records
+            # the exception TYPE, so a real defect (e.g. a schema-drift KeyError) is
+            # distinguishable from a PG outage in Sentry issue-grouping and the logs
+            # rather than silently masquerading as one.
             sentry_sdk.set_tag("lml.discogs.rate_gate", "fallback")
             logger.warning(
                 "Discogs shared rate bucket unavailable; already paced by local limiter",
