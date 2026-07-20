@@ -29,6 +29,7 @@ import pytest
 from discogs.lookup import lookup_releases_by_track
 from discogs.models import ReleaseInfo, TrackReleasesResponse
 from lookup.candidate_memo import TrackCandidateMemo
+from lookup.matching import WAVE_A_SEARCH_LIMIT
 from lookup.models import LookupRequest
 from lookup.orchestrator import perform_lookup
 from lookup.strategies.track_on_compilation import search_compilations_for_track
@@ -132,9 +133,16 @@ async def _run_lookup(memo: TrackCandidateMemo | None) -> AsyncMock:
         raw_message=f"{SONG} by {ARTIST}",
     )
 
-    # Step 2 (producer): populates the memo for (SONG, ARTIST).
+    # Step 2 (producer): populates the memo for (SONG, ARTIST). Searches at the
+    # shared Wave A page size (as prod's step 2 does) so the seed qualifies for reuse.
     await lookup_releases_by_track(
-        SONG, ARTIST, limit=10, service=service, db=db, library_artist=ARTIST, memo=memo
+        SONG,
+        ARTIST,
+        limit=WAVE_A_SEARCH_LIMIT,
+        service=service,
+        db=db,
+        library_artist=ARTIST,
+        memo=memo,
     )
     # Step 3 (consumer): TRACK_ON_COMPILATION reuses the memo as Wave A's seed.
     await search_compilations_for_track(db, parsed, discogs_service=service, candidate_memo=memo)
@@ -172,7 +180,13 @@ class TestCandidateCarryThrough:
         )
         db = _make_db()
         await lookup_releases_by_track(
-            SONG, ARTIST, limit=10, service=service, db=db, library_artist=ARTIST, memo=memo
+            SONG,
+            ARTIST,
+            limit=WAVE_A_SEARCH_LIMIT,
+            service=service,
+            db=db,
+            library_artist=ARTIST,
+            memo=memo,
         )
 
         entry = memo.get(SONG, ARTIST)
@@ -180,6 +194,9 @@ class TestCandidateCarryThrough:
         assert [r.release_id for r in entry.releases] == [102]
         assert entry.verdicts.get(102) is True
         assert entry.validated is True
+        # The seed records the page it was fetched at, so the consumer can gate
+        # reuse on it being at least as wide as a fresh Wave A.
+        assert entry.search_limit == WAVE_A_SEARCH_LIMIT
 
 
 class TestWiderSearchStillFires:
@@ -222,7 +239,8 @@ class TestWiderSearchStillFires:
         db = _make_db()
         parsed = ParsedRequest(artist=ARTIST, song=SONG, raw_message=f"{SONG} by {ARTIST}")
 
-        # Populate the memo directly with the V/A seed (as step 2 would carry it).
+        # Populate the memo directly with the V/A seed (as step 2 would carry it),
+        # at the shared Wave A page size so it qualifies for reuse.
         memo.record(
             SONG,
             ARTIST,
@@ -236,6 +254,7 @@ class TestWiderSearchStillFires:
             ],
             verdicts={201: True},
             validated=True,
+            search_limit=WAVE_A_SEARCH_LIMIT,
         )
 
         await search_compilations_for_track(
@@ -254,7 +273,9 @@ class TestWiderSearchStillFires:
         wider probe, which surfaces a V/A-only compilation hit."""
         va_item = make_library_item(id=58610, artist="Various Artists", title="Disco Not Disco")
         memo = TrackCandidateMemo()
-        memo.record(SONG, ARTIST, [], validated=True)  # empty seed
+        # Empty but complete seed at the shared Wave A page size: reusable (an empty
+        # Wave A), and being non-V/A it still fires the wider probe.
+        memo.record(SONG, ARTIST, [], validated=True, search_limit=WAVE_A_SEARCH_LIMIT)
 
         service = _counting_service(
             wave_a=[],
@@ -334,28 +355,37 @@ class TestOrchestratorThreadsOneMemo:
         )
 
 
-class TestTruncatedSeedNoRecallNarrowing:
-    """A seed that saturated step 2's (smaller) page limit is not provably the
-    complete artist-filtered result set: a fresh ``per_page=20`` Wave A can surface
-    releases ranked past step 2's ``per_page=10`` cap. Reusing such a seed would
-    drop a library pressing ranked 11-20 that is NOT a V/A compilation (so Wave B's
-    ``format=Compilation`` arm cannot rescue it) — the LML#267/#560/#801 high-fanout
-    artist+track rescue this strategy exists for. The memo must only suppress the
-    redundant search when the surfaced set is provably unchanged."""
+class TestNarrowerSeedNoRecallNarrowing:
+    """A seed fetched at a page narrower than the consumer's Wave A is not provably
+    the complete artist-filtered set — a fresh, wider search can surface releases the
+    narrow page missed. Crucially this holds even when the narrow seed came back
+    SHORT of its own page: ``search_releases_by_track`` runs a keyword supplement
+    (``per_page`` = the same limit) when the ``artist=`` primary finds < 3, and that
+    supplement's page scales with the limit, so a wider limit yields strictly more.
+    Reusing the narrow seed would drop a library pressing that is NOT a V/A
+    compilation (so Wave B's ``format=Compilation`` arm cannot rescue it) — the
+    LML#267/#560/#801 rescue this strategy exists for. The memo must suppress the
+    redundant search only when reuse is a provable superset."""
 
-    STEP2_LIMIT = 10
+    NARROW_LIMIT = 10  # < WAVE_A_SEARCH_LIMIT
 
-    def _limit_honoring_service(
-        self, *, all_wave_a: list[ReleaseInfo], wave_b: list[ReleaseInfo]
+    def _breadth_scaling_service(
+        self, *, narrow: list[ReleaseInfo], wide: list[ReleaseInfo], wave_b: list[ReleaseInfo]
     ) -> AsyncMock:
-        """A service whose ``search_releases_by_track`` honors ``limit`` (returns
-        ``all_wave_a[:limit]`` for the ``artist=`` probe), so step 2's ``limit=10``
-        yields a truncated slice and a fresh ``limit=20`` Wave A yields more."""
+        """A service that returns MORE for a wider ``artist=`` page (``wide`` for
+        ``limit >= WAVE_A_SEARCH_LIMIT``, else ``narrow``) — modeling the keyword
+        supplement whose page scales with the limit — and ``wave_b`` for the
+        ``q=``/``format=Compilation`` probe."""
         service = AsyncMock()
         service.cache_service = None
 
         async def _track_releases(track, artist=None, limit=20, artist_as_keyword=False, **_):
-            releases = list(wave_b) if artist_as_keyword else all_wave_a[:limit]
+            if artist_as_keyword:
+                releases = wave_b
+            elif limit >= WAVE_A_SEARCH_LIMIT:
+                releases = wide
+            else:
+                releases = narrow
             return TrackReleasesResponse(
                 track=track, artist=artist, releases=list(releases), total=len(releases)
             )
@@ -365,19 +395,21 @@ class TestTruncatedSeedNoRecallNarrowing:
         return service
 
     @pytest.mark.asyncio
-    async def test_truncated_seed_falls_back_to_fresh_wider_wave_a(self):
-        """No recall narrowing: a truncated step-2 seed must NOT be reused; the
-        consumer re-issues a fresh ``per_page=20`` Wave A that surfaces the library
-        pressing ranked past step 2's page cap."""
-        # ranks 1-10: same-artist releases that do NOT library-match; rank 11: the
-        # sole library album — a plain reissue (not a compilation), so Wave B cannot
-        # rescue it. Step 2 (limit=10) sees only ranks 1-10 → a truncated seed.
-        filler = [
-            _release(album=f"Bootleg Vol. {i}", artist=ARTIST, release_id=i)
-            for i in range(1, self.STEP2_LIMIT + 1)
+    async def test_narrower_seed_falls_back_to_fresh_wider_wave_a(self):
+        """No recall narrowing: a seed fetched at a narrower page than the consumer's
+        Wave A must NOT be reused — even when it is short of its own page — so the
+        consumer re-issues a fresh wider Wave A that surfaces the library pressing the
+        narrow page missed."""
+        # The narrow (limit=10) artist search comes back SHORT — 6 same-artist
+        # releases, none library-matching — so a len>=limit "truncated" heuristic
+        # would (wrongly) call it complete. A wider (limit=20) search returns those 6
+        # plus the sole library pressing: a plain reissue (not a compilation), so
+        # Wave B cannot rescue it.
+        narrow = [
+            _release(album=f"Bootleg Vol. {i}", artist=ARTIST, release_id=i) for i in range(1, 7)
         ]
         target = _release(album="The Rare Reissue", artist=ARTIST, release_id=999)
-        service = self._limit_honoring_service(all_wave_a=filler + [target], wave_b=[])
+        service = self._breadth_scaling_service(narrow=narrow, wide=narrow + [target], wave_b=[])
 
         target_item = make_library_item(id=999, artist=ARTIST, title="The Rare Reissue")
         db = AsyncMock()
@@ -397,11 +429,11 @@ class TestTruncatedSeedNoRecallNarrowing:
         memo = TrackCandidateMemo()
         parsed = ParsedRequest(artist=ARTIST, song=SONG, raw_message=f"{SONG} by {ARTIST}")
 
-        # Step 2 (producer, limit=10): the search saturates → a truncated seed.
+        # Step 2 (producer) at the narrow page: seed is short of its own cap.
         await lookup_releases_by_track(
             SONG,
             ARTIST,
-            limit=self.STEP2_LIMIT,
+            limit=self.NARROW_LIMIT,
             service=service,
             db=db,
             library_artist=ARTIST,
@@ -409,14 +441,18 @@ class TestTruncatedSeedNoRecallNarrowing:
         )
         seed = memo.get(SONG, ARTIST)
         assert seed is not None
-        assert len(seed.releases) == self.STEP2_LIMIT, "precondition: seed saturated the page"
+        assert seed.search_limit == self.NARROW_LIMIT
+        assert len(seed.releases) < self.NARROW_LIMIT, (
+            "precondition: seed is SHORT of its page — a len>=limit heuristic would "
+            "wrongly treat it as complete"
+        )
 
-        # Step 3 (consumer): must re-issue a fresh per_page=20 Wave A and surface the
-        # rank-11 library pressing the truncated seed lacked.
+        # Step 3 (consumer): must re-issue a fresh wider Wave A and surface the
+        # library pressing the narrow page missed.
         items, _titles = await search_compilations_for_track(
             db, parsed, discogs_service=service, candidate_memo=memo
         )
         assert {i.title for i in items} == {"The Rare Reissue"}, (
-            "a truncated seed must not suppress the fresh wider Wave A that surfaces "
-            "the library album ranked past step 2's page cap"
+            "a narrower-page seed must not suppress the fresh wider Wave A that "
+            "surfaces the library album beyond the narrow page"
         )

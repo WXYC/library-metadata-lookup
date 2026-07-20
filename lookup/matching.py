@@ -23,6 +23,19 @@ logger = logging.getLogger(__name__)
 MAX_SEARCH_RESULTS = 5
 """Maximum number of results to return from search operations."""
 
+WAVE_A_SEARCH_LIMIT = 20
+"""Page size for the artist-filtered Discogs track search ("Wave A").
+
+The shared page size for the ``artist=`` field-filtered ``search_releases_by_track``
+that step 2 (album resolution) and ``TRACK_ON_COMPILATION``'s Wave A both issue.
+They MUST match: the LML#867 carry-through reuses step 2's search as the strategy's
+Wave A, and that reuse is only non-narrowing when step 2 searched at least as wide
+as a fresh Wave A would — otherwise the reused seed is a strict subset (the keyword
+supplement in ``search_releases_by_track`` scales its page with this limit too), so
+a library pressing ranked past the smaller page would be dropped. The consumer
+gates reuse on ``TrackCandidateSet.search_limit >= WAVE_A_SEARCH_LIMIT``, which
+fails safe (re-search, never silently narrow) if the two ever diverge."""
+
 SELF_TITLED_PATTERNS = frozenset({"s/t", "s.t.", "self-titled", "self titled"})
 """Common abbreviations for self-titled albums (case-insensitive exact match)."""
 
