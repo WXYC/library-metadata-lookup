@@ -3,9 +3,9 @@
 ## Infrastructure
 
 - Hosted on Railway. Each push to `main`/`prod` produces a single CI-gated deploy via `railway up`. Railway's native GitHub auto-deploy is disabled on both the staging and production `library-metadata-lookup` environments (LML#602), so the two-deploy race the [`commit_sha`](#commit_sha-deploy-identity) section describes no longer occurs
-- Railway volume mounted at `/data` stores `library.db` persistently across deploys
+- Storage is a per-environment **Railway Bucket** (S3-compatible object store), not a Railway volume: `library.db` and `streaming_availability.db` live in the bucket, and the FastAPI lifespan fetches `library.db` to `LIBRARY_DB_PATH` on boot before serving. This is the zero-downtime, replica-ready posture from the volume-eviction epic (LML#834); it superseded the `/data` volume in the 2026-07 cutover (see the [cutover runbook](#cutover-runbook-data-volume--railway-bucket))
 - Optional PostgreSQL cache for Discogs data via `DATABASE_URL_DISCOGS` (gracefully degrades to API-only)
-- `LIBRARY_DB_PATH=/data/library.db` on Railway
+- `LIBRARY_DB_PATH=/data/library.db` on Railway — the boot-fetch destination; `/data` is now the Dockerfile-created ephemeral image dir, not a mounted volume
 
 ## Branch Strategy
 
@@ -38,7 +38,7 @@ Four classes of pin in `.github/workflows/*.yml` exist for supply-chain reasons 
 - **Workflow-level `permissions:`** scoped to the minimum each workflow needs:
   - `ci.yml`, `cross-cache-identity-flags.yml`, `set-railway-var.yml`: `contents: read` (no GITHUB_TOKEN writes).
   - `charset-corpus-drift.yml`: `contents: read` plus `packages: read` (the reusable workflow pulls `@wxyc/shared` from `npm.pkg.github.com`).
-  - `refresh-streaming.yml`: `contents: read` (its only release interaction is downloading `library.db` via `GH_TOKEN` — a read). The canonical `streaming_availability.db` round-trip goes to the Railway **volume** via `ADMIN_TOKEN` + `PRODUCTION_URL` (see [Streaming Database Backup](#streaming-database-backup-upload--download)), not GITHUB_TOKEN.
+  - `refresh-streaming.yml`: `contents: read` (its only release interaction is downloading `library.db` via `GH_TOKEN` — a read). The canonical `streaming_availability.db` round-trip goes to the Railway **Bucket** through the admin upload/download endpoints via `ADMIN_TOKEN` + `PRODUCTION_URL` (see [Streaming Database Backup](#streaming-database-backup-upload--download)), not GITHUB_TOKEN.
   Failure mode is silent — a job that needs a missing scope (e.g. `pull-requests: write`) fails its API call but the workflow stays green. When adding a step that needs to comment on PRs, push tags, mint releases, etc., explicitly grant the scope at the job level (or widen the workflow-level floor only if every job in the file needs it).
 - **Reusable-workflow refs pinned to `@gha/v1`**, not `@main` — `WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@gha/v1` (in `ci.yml`) and `WXYC/wxyc-shared/.github/workflows/check-charset-corpus-drift.yml@gha/v1` (in `charset-corpus-drift.yml`). The publishing repos treat `gha/v1` as a moving major tag — re-pointed forward on non-breaking changes, frozen on breaking changes (which get a fresh `gha/v2`). Don't downgrade either to `@main`; if a `gha/v2` migration arrives, follow the procedure at the top of the publishing repo's CLAUDE.md.
 - **`ACTIONLINT_VERSION`** in `actionlint.yml` (the `Workflow Lint` workflow). rhysd/actionlint publishes no root `action.yml`, so the job downloads a pinned binary via the official `download-actionlint.bash` script — the env var feeds both the script's release-tag ref and the binary version it fetches, keeping them in lockstep. Failure mode is loud (the lint step fails). Bump by checking the latest release at https://github.com/rhysd/actionlint/releases and updating the single `ACTIONLINT_VERSION` value. Last pin: 1.7.12.
@@ -47,7 +47,7 @@ The `Workflow Lint` workflow (job `actionlint` in `actionlint.yml`) runs `action
 
 ## Library Database Upload
 
-The `library.db` file lives on a Railway volume, not in git. It's uploaded via:
+The `library.db` file lives in the Railway Bucket, not in git — and is fetched to `LIBRARY_DB_PATH` on boot (see [Infrastructure](#infrastructure)). It's uploaded via:
 
 ```
 POST /admin/upload-library-db
@@ -55,29 +55,31 @@ Authorization: Bearer <ADMIN_TOKEN>
 Content-Type: multipart/form-data
 ```
 
-The upload endpoint validates the SQLite file, closes the current DB connection,
-atomically replaces the file, and returns `{"status": "ok", "row_count": <int>}`.
+The upload endpoint validates the SQLite file, **writes it to the bucket first** (so a
+store failure aborts before any local mutation), then closes the current DB connection,
+atomically replaces the local `LIBRARY_DB_PATH` copy, and returns
+`{"status": "ok", "row_count": <int>}`.
 
 The ETL script in [discogs-cache](https://github.com/WXYC/discogs-etl) (`scripts/sync-library.sh`) handles daily uploads to both staging and production.
 
 ## Streaming Database Backup (Upload + Download)
 
-`streaming_availability.db` is the analysis database for streaming-availability search results — it holds Apple/Spotify/Deezer URLs, track-level results, and Discogs match state. It's a sibling of `library.db` on the Railway volume. Two symmetric admin endpoints, both gated by `ADMIN_TOKEN`:
+`streaming_availability.db` is the analysis database for streaming-availability search results — it holds Apple/Spotify/Deezer URLs, track-level results, and Discogs match state. It lives in the Railway Bucket alongside `library.db`. Two symmetric admin endpoints, both gated by `ADMIN_TOKEN`:
 
 ```
 POST /admin/upload-streaming-db    # multipart upload, validates `albums` table + coverage guard
-GET  /admin/download-streaming-db  # FileResponse stream of the volume copy (404 if missing)
+GET  /admin/download-streaming-db  # streams the bucket object (404 if missing)
 ```
 
-### The volume is the single canonical lineage (LML#672)
+### The bucket is the single canonical lineage (LML#672)
 
-Before LML#672 this file was maintained as **two copies that drifted**: a `streaming-data-v1` GitHub Release asset (written weekly by `refresh-streaming.yml`, CI-only creds so Spotify/Deezer-only) and this volume copy (the rich local working DB with Apple + `track_streaming`, uploaded manually). The daily library-sync read the *release*, so production `library.db` silently carried **zero Apple Music links** while hundreds sat unused on the volume.
+Before LML#672 this file was maintained as **two copies that drifted**: a `streaming-data-v1` GitHub Release asset (written weekly by `refresh-streaming.yml`, CI-only creds so Spotify/Deezer-only) and this working copy (the rich DB with Apple + `track_streaming`, uploaded manually — then on the Railway volume, now the bucket object). The daily library-sync read the *release*, so production `library.db` silently carried **zero Apple Music links** while hundreds sat unused in the canonical copy.
 
-The volume is now the enforced single source. Every writer round-trips it (download → modify → upload):
+The bucket is now the enforced single source (the Railway volume held this role from #672 until the #834 eviction; the round-trip invariant is identical). Every writer round-trips it (download → modify → upload):
 
-- `refresh-streaming.yml` (LML, weekly): downloads the volume copy, runs the Spotify/Deezer incremental, uploads it back. (`library.db`, the input catalog, still comes from the release.)
+- `refresh-streaming.yml` (LML, weekly): downloads the bucket copy, runs the Spotify/Deezer incremental, uploads it back. (`library.db`, the input catalog, still comes from the release.)
 - The occasional manual Apple + `track_streaming` run: same download → enrich → upload round-trip, so it never clobbers the weekly incremental and vice versa.
-- `sync-library.yml` (WXYC/discogs-etl, daily): reads the volume via `GET /admin/download-streaming-db` to enrich `library.db`.
+- `sync-library.yml` (WXYC/discogs-etl, daily): reads the bucket copy via `GET /admin/download-streaming-db` to enrich `library.db`.
 
 The `streaming_availability.db` release asset has been **retired** (LML#672 cutover): nothing writes or reads it anymore. The `streaming-data-v1` release still hosts **`library.db`** (written by discogs-etl `sync-library.yml`, read by `refresh-streaming.yml` as the input catalog).
 
@@ -87,9 +89,105 @@ The `streaming_availability.db` release asset has been **retired** (LML#672 cuto
 
 ### Railway-uptime failure mode
 
-Making the volume canonical couples the daily prod sync to LML/Railway being reachable at sync time (vs. the durable GitHub-hosted release). This is deliberate and the failure mode is safe: discogs-etl's `GET /admin/download-streaming-db` step **hard-fails** on a non-200 or empty/invalid file, so a Railway outage at sync time **aborts** the sync and production keeps **yesterday's** `library.db` (which still has its streaming links) rather than publishing a zero-link db. A flaked download never strips links.
+Making the bucket canonical couples the daily prod sync to LML/Railway being reachable at sync time (vs. the durable GitHub-hosted release). This is deliberate and the failure mode is safe: discogs-etl's `GET /admin/download-streaming-db` step **hard-fails** on a non-200 or empty/invalid file, so a Railway outage at sync time **aborts** the sync and production keeps **yesterday's** `library.db` (which still has its streaming links) rather than publishing a zero-link db. A flaked download never strips links.
 
 Operational prerequisite: `refresh-streaming.yml` needs the `ADMIN_TOKEN` and `PRODUCTION_URL` repo secrets set on **WXYC/library-metadata-lookup** (they previously lived only on the discogs-etl side).
+
+## Cutover runbook: `/data` volume → Railway Bucket
+
+The seed-then-hard-cutover procedure for moving both SQLite artifacts off the Railway volume and into a per-environment Railway Bucket (the volume-eviction epic, WXYC/library-metadata-lookup#834). Run it **once per environment, staging first**; the staging run is the rehearsal for prod. There is **no dual-path transition code and no organic-fill window** — that was the #672 two-lineages anti-pattern this epic exists to avoid. The bucket-mode code (the boot-fetch + store-backed endpoints) is selected purely by whether `LML_BUCKET_NAME` + `LML_BUCKET_ENDPOINT` are set (see [env-vars.md](env-vars.md)), so a cutover is entirely a data-seed + variable-reference change plus a volume detach — no code deploy is part of the cutover itself.
+
+> **Status — executed.** Staging cutover 2026-07-18 (LML#838), production cutover 2026-07-20 (LML#839). Both environments now run bucket-only; the shared `/data` volume was soft-deleted 2026-07-20 (48h grace before hard-purge). The procedure below is retained as the reusable template for any future volume→bucket move (e.g. standing up a new environment).
+
+### Prerequisites
+
+- The bucket-mode code is already deployed to the target environment (PR 3, WXYC/library-metadata-lookup#837, on that environment's branch — `main`→staging, `prod`→production).
+- Railway CLI authenticated against the `request-o-matic` project, and an S3-protocol client (`aws` CLI or a `boto3` snippet) for the out-of-band seed.
+- **A quiet window.** Avoid the daily `sync-library.sh` window (discogs-etl, uploads `library.db`) and the weekly `refresh-streaming.yml` window, so a failed verify can be rolled back without racing a writer. Cutting over just **after** a daily sync completes also guarantees the volume `library.db` and the `streaming-data-v1` release copy are freshly identical, which the seed relies on.
+
+### Procedure (per environment)
+
+1. **Snapshot both files and retain them** (never-delete-collected-data rule). The two files have different provenance, and only one has a download endpoint:
+   - `streaming_availability.db` — **precious**: volume-canonical since #672, the single copy of expensive rate-limited Apple/Spotify/Deezer results. Snapshot it via `GET /admin/download-streaming-db` (Bearer `ADMIN_TOKEN`) and keep the file. This is the byte-source for the seed.
+   - `library.db` — **reproducible**: read-only at runtime, regenerated daily by discogs-etl and published to the `streaming-data-v1` GitHub release. **There is no `GET /admin/download-library-db` endpoint** — use the current release asset (or a fresh `sync-library.sh` output) as the seed byte-source. Because the next daily sync overwrites the bucket object via `POST /admin/upload-library-db` anyway, the seed only needs to be a valid recent catalog so boot-fetch succeeds and `/health` goes green before the volume is removed.
+2. **Create the bucket and seed it out-of-band.** Create a Railway Bucket in the target environment. Note its variable panel — the exact preset names must be read off the actual bucket at execution time, but the documented contract (see [env-vars.md](env-vars.md)) is `BUCKET`, `ENDPOINT`, and the boto3-native `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. Put both objects at their **bare-filename keys** (the keys the app reads/writes — `LIBRARY_DB_FILENAME` / `STREAMING_DB_FILENAME` in `routers/admin.py`), matching the seed client's addressing style to the bucket's: **virtual-hosted** for buckets created after Railway's mid-2026 change (the default — `LML_BUCKET_ADDRESSING_STYLE=virtual`, what both WXYC environments use), **path-style** only for legacy buckets (`LML_BUCKET_ADDRESSING_STYLE=path`, as the bucket's Credentials tab states). `S3ObjectStore`'s default has been virtual since LML#856:
+
+   ```sh
+   export AWS_ACCESS_KEY_ID=…  AWS_SECRET_ACCESS_KEY=…        # from the bucket's variable panel
+   ENDPOINT=…  BUCKET=…                                        # the bucket's ENDPOINT / BUCKET
+   aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$BUCKET" --key library.db                 --body ./library.db
+   aws --endpoint-url "$ENDPOINT" s3api put-object --bucket "$BUCKET" --key streaming_availability.db  --body ./streaming_availability.db
+   ```
+
+   Then **verify the seed against the snapshot** — compare object size (and, for `streaming_availability.db`, checksum) via `s3api head-object` against the retained local copy before trusting it. (`aws-cli` defaults to `auto`, which resolves a virtual-hosted bucket — the default — correctly; a **legacy path-style** bucket instead needs `aws configure set default.s3.addressing_style path` or a path-configured client. Best practice, used in both WXYC cutovers: seed with the app's own `S3ObjectStore` config so the addressing matches exactly what the running service will use — a mismatch then fails on your laptop, before any service flip.)
+3. **Enable bucket mode** on the LML service: set the two variable references `LML_BUCKET_NAME`→ bucket `BUCKET`, `LML_BUCKET_ENDPOINT`→ bucket `ENDPOINT`, plus the `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` presets. Leave `LIBRARY_DB_PATH=/data/library.db` **unchanged** — after the volume is gone, `/data` is still the Dockerfile-created, `appuser`-owned writable dir the boot-fetch copies the fetched bytes into. Deploy (`railway redeploy`, or a no-op push) so the process restarts and the lifespan boot-fetch runs.
+4. **Verify** (bucket mode is live, volume still attached — the safe overlap point):
+   - `/health` is green (`database: ok`) — this **is** the boot-fetch success signal; a red `database` means the fetch failed and the service is serving degraded.
+   - `GET /admin/download-streaming-db` round-trips **byte-identical** to the retained snapshot.
+   - A live `/api/v1/lookup` returns a real library hit (proves the boot-fetched `library.db` is being served).
+   - **Coverage guard is live**: a force-less **thin** `streaming_availability.db` upload is rejected **409** (don't actually replace the good file — upload a deliberately-smaller db and confirm the 409, or trust the #836 guard tests plus a `--dry-run` style check).
+5. **Remove the volume.** Delete it (`railway volume … delete`) — a **soft-delete with a ~48h grace window** (`deletedAt` = delete time + 48h; the data stays recoverable until the hard-purge). Three things learned in the WXYC cutover, each of which will bite otherwise:
+   - **A shared volume deletes globally.** The WXYC `/data` volume was a *single* volume id mounted in both staging and prod, so one `delete` flipped it `isPendingDeletion` in **every** environment at once. Check `railway volume -e <env> … list --json` across environments before assuming the delete is scoped to one.
+   - **Delete ≠ unmount.** A delete removes the volume from the service config, but the **running container keeps its mount** until it's replaced. You must **`railway redeploy`** each environment so it comes up on the Dockerfile-created `/data` dir. Do this **before** the hard-purge, or the volume is yanked out from under an open SQLite fd on a live container.
+   - **`RAILWAY_VOLUME_*` vars are stale echo.** After the redeploy they still appear in `railway variables` — that is not a live mount. Verify decoupling with `/proc/mounts` (no `/data` line via `railway ssh -e <env> … 'grep " /data " /proc/mounts'`), not the vars.
+
+   With no volume attached, deploys become zero-downtime.
+6. **Observe a zero-downtime deploy**: run a request loop (`while true; do curl -s .../health; sleep 0.5; done`, or probe `GET /` for a fast dependency-free 404) through one deploy window and confirm no blip — the old deployment keeps serving until the new one passes its `/health` gate (which now requires a successful boot-fetch).
+
+### Rollback
+
+Bucket mode is a pure configuration state. To revert before the volume is removed: **unset** `LML_BUCKET_NAME` / `LML_BUCKET_ENDPOINT` (storage falls back to local-directory mode rooted at `LIBRARY_DB_PATH`'s parent — the pre-eviction volume layout) and redeploy. If the volume was already removed, re-add the volume mount at `/data` first, then unset the vars. The retained snapshots are the recovery source if a seed was corrupted.
+
+### Soak (staging → prod gate)
+
+After the **staging** cutover, leave staging in bucket mode through **at least one daily `sync-library.sh` run** (proves the `POST /admin/upload-library-db` bucket write + local hot-swap end-to-end) and **ideally one weekly `refresh-streaming.yml`** (proves the streaming round-trip against the store) before starting the **prod** cutover (WXYC/library-metadata-lookup#839). Prod's extra acceptance bar: the next daily library sync and next weekly streaming refresh both green **with zero changes in discogs-etl or the workflow repos**, and discogs-etl's daily `GET /admin/download-streaming-db` read green.
+
+## Horizontal-scaling runbook: enabling N≥2 replicas
+
+Removing the volume makes replicas *architecturally* possible (Railway won't attach a volume to replicas), but **enabling N≥2 is deliberately out of scope for the volume-eviction epic** and gated behind the flip criteria below. The blocker is the per-process Discogs limiter/semaphore/breaker (`discogs/ratelimit.py`): N replicas each running the stock limiter would drive N×50/min against the shared 60/min Discogs token. Scaling is therefore pure env-var arithmetic (divide the shared-budget knobs by N) plus awareness of the per-replica state that stops being process-global.
+
+### Flip criteria — all three must hold
+
+1. **WXYC/discogs-etl#313 landed** (discogs-cache PG `shared_buffers` tuning) **and the #706 cold-tail re-measured healthy.** Replicas double/triple connection load onto that PG; flipping before its buffers are tuned re-creates the #706 tail.
+2. **WXYC/Backend-Service#1591 landed, or the backfill floods are otherwise controlled.** Replicas add availability, not flood immunity — an uncontrolled flood saturates every replica.
+3. **Observed CPU-bound latency under *organic* load, or an explicit availability requirement.** Absent a real signal, N=1 is simpler and cheaper. (Note the backfill flood is not organic load — see the caveat in criterion 2.)
+
+### Knob inventory
+
+Worst-case Discogs egress and PG demand are **cluster-wide sums** across replicas, so the shared-budget knobs divide by N. The per-replica compute gates do not (each replica has its own event loop).
+
+| Knob | At N≥2 | Why |
+|---|---|---|
+| `DISCOGS_RATE_LIMIT` | **divide** → `floor(50/N)` | Shared 60/min Discogs token. Per-process limiters must sum under 60. |
+| `DISCOGS_MAX_CONCURRENT` | **divide** → `floor(5/N)` (floor 1) | Per-process egress semaphore; cluster concurrent egress is the sum. |
+| `DISCOGS_BREAKER_REMAINING_FLOOR` | **raise** by ~`N × per-replica DISCOGS_MAX_CONCURRENT` | The floor is read off the **shared** `X-Discogs-Ratelimit-Remaining`; up to `N × per-replica concurrent` requests can be in flight cluster-wide when any one replica first observes the floor, so raise it to absorb that overshoot. |
+| `LML_DISCOGS_POOL_MAX_SIZE` | **shrink** (pre-#313) so `N × pool` stays under discogs-cache PG `max_connections` / memory budget | Shared PG connection budget (the LML#241/#357 FD-exhaustion lesson at cluster scale). Relax once #313 tunes the PG. |
+| `LML_LOOKUP_MAX_CONCURRENT` | **unchanged** | Per-replica in-flight lookup cap — one replica's event loop. **But** it defaults to `min(8, LML_DISCOGS_POOL_MAX_SIZE)`, so shrinking the pool lowers its effective value; re-check after the pool shrink. |
+| `LML_BULK_GLOBAL_MAX_CONCURRENT`, `LML_BULK_MAX_CONCURRENT`, `LML_STREAMING_WARM_CONCURRENCY` | **unchanged** per replica | Per-replica compute gates. `LML_BULK_GLOBAL_MAX_CONCURRENT` also defaults to `LML_DISCOGS_POOL_MAX_SIZE`, so a pool shrink pulls it down with it — size deliberately if you rely on the default. |
+
+### Worked example — N=2 (stock defaults today)
+
+| Knob | N=1 (today) | N=2 |
+|---|---|---|
+| `DISCOGS_RATE_LIMIT` | 50 | 25 |
+| `DISCOGS_MAX_CONCURRENT` | 5 | 2 |
+| `DISCOGS_BREAKER_REMAINING_FLOOR` | 3 | ~7 (`3 + 2×2`) |
+| `LML_DISCOGS_POOL_MAX_SIZE` | 5 | shrink so `2×pool` ≤ PG budget (pre-#313); revisit post-#313 |
+
+### Known permanent N≥2 degradations
+
+These are inherent to per-process state going per-replica — documented, accepted, not bugs:
+
+- **Split L1 TTL caches** — each replica has its own in-memory cache, so hit rate drops and Discogs call volume rises versus N=1.
+- **Split single-flight dedup** — the #537 dedup becomes per-replica, so two replicas can do the same live probe concurrently.
+- **N half-open breaker trials** — each replica's breaker independently admits one trial during recovery, so up to N trials hit the shared token before any one closes.
+- **`library.db` freshness skew** — the daily `POST /admin/upload-library-db` hot-swaps only the **replica that received the request**; the others keep serving yesterday's catalog until they restart. A replica on a stale catalog is *degraded* (misses new arrivals), not broken — mitigated by the redeploy step below.
+
+### Flip procedure
+
+1. Set the divided/raised env vars from the knob table (`DISCOGS_RATE_LIMIT`, `DISCOGS_MAX_CONCURRENT`, `DISCOGS_BREAKER_REMAINING_FLOOR`, and pre-#313 `LML_DISCOGS_POOL_MAX_SIZE`).
+2. Bump the replica count on the LML service.
+3. Add a `railway redeploy` step **after the daily library sync** so every replica boot-fetches the fresh `library.db` (closes the freshness-skew window above).
 
 ## Health Check Behavior
 

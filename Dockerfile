@@ -28,7 +28,11 @@ RUN pip install --no-cache-dir .
 # Copy application
 COPY . .
 
-# Create logs and data directories
+# Create logs and data directories.
+# /data MUST stay: since the volume-eviction cutover (LML#834) there is no Railway
+# volume mounted here, so this line is the only thing creating the writable,
+# appuser-owned directory the lifespan boot-fetch copies LIBRARY_DB_PATH into. Do
+# not "clean it up" — without it, boot-fetch has nowhere to write library.db.
 RUN mkdir -p /app/logs /data && chown -R appuser:appuser /app/logs /data
 
 # Unbuffer Python stdout/stderr so logs reach Railway's collector in real time
@@ -39,5 +43,5 @@ ENV PYTHONDONTWRITEBYTECODE=1
 # Expose port
 EXPOSE 8000
 
-# Entrypoint fixes volume permissions then drops to non-root user
+# Entrypoint drops to the non-root appuser and starts uvicorn
 ENTRYPOINT ["/app/entrypoint.sh"]
