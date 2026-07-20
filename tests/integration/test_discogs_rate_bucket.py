@@ -164,6 +164,28 @@ async def test_two_instances_share_one_row(pg_source, bucket_key):
     assert len(allowed) == capacity
 
 
+async def test_negative_balance_is_floored_to_zero(pg_source, bucket_key):
+    """LML#841 review (Finding 3): a pathological negative balance — e.g. a
+    backward wall-clock jump making the refill term deeply negative — must not
+    yield an unbounded ``retry_after_s`` nor persist a deeper-negative balance.
+    The ``GREATEST(0.0, …)`` floor clamps ``avail`` to ``[0, capacity]``."""
+    bucket = await _seed(pg_source, bucket_key, capacity=1, refill=100.0)
+    # No public API mints a negative balance; corrupt the row directly to model
+    # the clock-skew / underflow case. last_refill=now() minimizes accrual.
+    await pg_source.execute(
+        "UPDATE lml_cache.discogs_rate_bucket SET tokens = -100, last_refill = now() "
+        "WHERE bucket_key = $1",
+        bucket_key,
+    )
+    res = await bucket.try_acquire()
+    assert res.allowed is False
+    # Floored: retry_after ≈ (1 - 0) / 100 = 0.01s, NOT the un-floored
+    # (1 - (-100)) / 100 = 1.01s.
+    assert res.retry_after_s < 0.5
+    row = await _row(pg_source, bucket_key)
+    assert row["tokens"] >= 0.0  # never persists a deeper-negative balance
+
+
 async def test_try_acquire_missing_row_raises(pg_source):
     """An unseeded key has no row; try_acquire raises so the gate can fail open."""
     await set_up_discogs_rate_bucket_schema(

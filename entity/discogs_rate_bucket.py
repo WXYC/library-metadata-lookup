@@ -76,12 +76,21 @@ ON CONFLICT (bucket_key) DO NOTHING\
 #      the balance reaches 1 at the steady refill rate.
 # Concurrency safety comes entirely from the row lock: two acquirers cannot both
 # read the same pre-spend balance.
+#
+# ``avail`` is clamped to ``[0, capacity]`` via ``GREATEST(0.0, …)`` inside the
+# ``LEAST``: capping at ``capacity`` is the lazy-refill burst ceiling, and the
+# zero floor keeps a pathological negative balance — a backward wall-clock jump
+# making the elapsed-refill term negative — from producing an unbounded
+# ``retry_after_s`` or persisting a deeper-negative ``tokens`` (LML#841 review).
 _ACQUIRE_SQL = """\
 WITH refreshed AS (
     SELECT
         LEAST(
             capacity,
-            tokens + EXTRACT(EPOCH FROM (now() - last_refill)) * refill_per_sec
+            GREATEST(
+                0.0,
+                tokens + EXTRACT(EPOCH FROM (now() - last_refill)) * refill_per_sec
+            )
         ) AS avail,
         refill_per_sec
     FROM lml_cache.discogs_rate_bucket

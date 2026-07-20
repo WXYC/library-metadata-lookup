@@ -103,6 +103,24 @@ class TestBucketAddressingStyle:
             Settings(lml_bucket_addressing_style="bogus")
 
 
+class TestDiscogsRateLimitBounds:
+    """LML#841 review (Finding 4): ``discogs_rate_limit`` seeds the shared token
+    bucket's ``refill_per_sec`` (rate / 60). A zero would make the bucket's
+    ``retry_after_s = (1 - avail) / refill_per_sec`` divide by zero, so the knob
+    is bounded ``ge=1`` at the real config surface."""
+
+    def test_defaults_to_50(self):
+        assert Settings().discogs_rate_limit == 50
+
+    def test_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            Settings(discogs_rate_limit=0)
+
+    def test_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            Settings(discogs_rate_limit=-5)
+
+
 class TestGetSettings:
     def test_returns_settings_instance(self):
         get_settings.cache_clear()
