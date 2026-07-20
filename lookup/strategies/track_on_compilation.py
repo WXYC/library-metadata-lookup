@@ -46,6 +46,7 @@ from lookup.artist_resolution import (
     _log_resolver_pre_pass,
     resolve_canonical_artist,
 )
+from lookup.candidate_memo import TrackCandidateMemo
 from lookup.concurrency import _chunked_gather
 from lookup.matching import (
     _FALLBACK_ARTIST_SIMILARITY_FLOOR,
@@ -154,6 +155,7 @@ async def search_compilations_for_track(
     *,
     pg: PgSource | None = None,
     allow_release_resolution_fallback: bool = True,
+    candidate_memo: TrackCandidateMemo | None = None,
 ) -> tuple[list[LibraryItem], dict[int, ResolvedRelease]]:
     """Search for track on compilation albums using Discogs and library keyword search.
 
@@ -175,6 +177,18 @@ async def search_compilations_for_track(
     uncached. ``allow_release_resolution_fallback`` is the bulk kill switch
     (LML#652): ``False`` on /lookup/bulk suppresses that carry-through entirely
     (no resolve, no cache write, no row-less item).
+
+    Candidate carry-through (LML#867): ``candidate_memo`` optionally carries step
+    2's artist-filtered track search (releases + verdicts, keyed by
+    ``(track, artist)``). On a hit for ``(song_search, artist_for_probes)`` — i.e.
+    when the consumer's query matches what step 2 already searched — Wave A's
+    ``artist=`` probe is reused from the memo instead of re-issued, so an
+    artist+song lookup fires the artist-filtered search once. The wider Wave B
+    probe (``artist_as_keyword=True``) is only skipped when the reused seed already
+    holds a true-V/A compilation, which is exactly the case
+    ``merge_wave_b_compilations`` discards Wave B — so the skip cannot narrow
+    recall. A memo miss (canonical-artist swap, remix-augmented title, or no memo)
+    falls through to the pre-#867 parallel Wave A + Wave B gather unchanged.
     """
     if not parsed.song or not parsed.artist:
         return [], {}
@@ -295,7 +309,60 @@ async def search_compilations_for_track(
             except Exception as exc:
                 return None, str(exc)
 
-        if discogs_service:
+        # LML#867: reuse step 2's artist-filtered candidates as Wave A's seed when
+        # the memo holds this exact query. The key is the consumer's own probe
+        # params (``song_search``, ``artist_for_probes``), so a remix-augmented
+        # title or a canonical-artist swap — which genuinely change the query —
+        # misses and re-searches, while the common no-swap/no-remix case hits.
+        memo_seed = (
+            candidate_memo.get(song_search, artist_for_probes)
+            if candidate_memo is not None
+            else None
+        )
+
+        if discogs_service and memo_seed is not None:
+            # Wave A came free from the memo (no second ``artist=`` search). The
+            # reused seed carries step 2's ``per_page=10`` candidates — a narrower
+            # slice than a fresh ``per_page=20`` Wave A, but Wave A is the
+            # artist-scoped arm and MAX_SEARCH_RESULTS + the _chunked_gather early
+            # exit bound the practical difference; the recall-critical arm is the
+            # wider Wave B probe, preserved below.
+            wave_a_releases = list(memo_seed.releases)
+            # Skip the wider Wave B probe only when the seed already holds a
+            # true-V/A comp — ``merge_wave_b_compilations`` discards Wave B in
+            # exactly that case, so skipping its search is provably non-narrowing.
+            # An empty or non-V/A seed is "insufficient" for the compilation
+            # purpose, so the wider probe still fires (no recall narrowing).
+            seed_has_va = any(
+                r.is_compilation and is_compilation_artist(r.artist or "") for r in wave_a_releases
+            )
+            tail_probes: list[Coroutine[Any, Any, _ProbeResult]] = []
+            wave_b_index: int | None = None
+            if not seed_has_va:
+                wave_b_index = len(tail_probes)
+                tail_probes.append(
+                    discogs_service.search_releases_by_track(
+                        song_search, artist_for_probes, artist_as_keyword=True
+                    )
+                )
+            album_probe_index: int | None = None
+            if album_fallback_should_fire:
+                album_probe_index = len(tail_probes)
+                tail_probes.append(_album_title_probe_safe())
+
+            gathered_tail = await asyncio.gather(*tail_probes) if tail_probes else []
+            wave_b_releases: list[ReleaseInfo] = []
+            if wave_b_index is not None:
+                va_response = gathered_tail[wave_b_index]
+                assert isinstance(va_response, TrackReleasesResponse)
+                wave_b_releases = list(va_response.releases or [])
+            if album_probe_index is not None:
+                probe_tuple = gathered_tail[album_probe_index]
+                assert isinstance(probe_tuple, tuple)
+                album_fallback_response, album_fallback_error = probe_tuple
+
+            raw_releases = merge_wave_b_compilations(wave_a_releases, wave_b_releases)
+        elif discogs_service:
             # Two artist-scoped probes return TrackReleasesResponse; the optional
             # album-title probe returns tuple[TrackReleasesResponse | None, str | None].
             # _ProbeResult (module-scope alias) captures the heterogeneous shape.

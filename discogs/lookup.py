@@ -15,6 +15,7 @@ from discogs.service import DiscogsService
 
 if TYPE_CHECKING:
     from library.db import LibraryDB
+    from lookup.candidate_memo import TrackCandidateMemo
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ async def lookup_releases_by_track(
     artist_as_keyword: bool = False,
     db: LibraryDB | None = None,
     library_artist: str | None = None,
+    memo: TrackCandidateMemo | None = None,
 ) -> list[tuple[str, str]]:
     """Look up all releases containing a track using Discogs.
 
@@ -61,6 +63,12 @@ async def lookup_releases_by_track(
         library_artist: The library-side artist name to gate on — the fuzzy
             correction when the caller has one, else the typed ``artist``. Only
             consulted when ``db`` is provided.
+        memo: Optional request-scoped candidate carry-through (LML#867). When
+            present and an ``artist`` is supplied on the ``artist=`` field-filter
+            shape (``artist_as_keyword=False``), the raw candidate releases — and
+            the validation verdicts, once computed — are recorded under
+            ``(track, artist)`` so a downstream Discogs-aware strategy can reuse
+            them as its seed instead of re-issuing the same search.
 
     Returns:
         List of (artist, album) tuples for validated releases containing the track.
@@ -74,6 +82,18 @@ async def lookup_releases_by_track(
         track, artist, limit, artist_as_keyword=artist_as_keyword
     )
     raw_releases = list(response.releases or [])
+
+    # LML#867: carry the artist-filtered candidate set through the request. Only
+    # the ``artist=`` field-filter shape is memoized — its key is (track, artist),
+    # and the wider ``artist_as_keyword=True`` (``q=``/``format=Compilation``)
+    # probe is a distinct query the consumer owns. Recorded even when the search
+    # returned nothing (empty seed) so the consumer reuses "empty Wave A" rather
+    # than re-searching; upgraded with verdicts below once validation runs.
+    record_memo = memo is not None and bool(artist) and not artist_as_keyword
+    if record_memo:
+        assert memo is not None  # narrow for the type-checker
+        memo.record(track, artist or "", raw_releases, validated=False)
+
     if not raw_releases:
         return []
 
@@ -125,13 +145,22 @@ async def lookup_releases_by_track(
     # candidate up to ``limit`` is validated. Cost stays bounded — ``limit`` caps the
     # list and the between-chunk API-call cap bounds the fan-out.
     releases: list[tuple[str, str]] = []
+    verdicts: dict[int, bool] = {}
     async for release, is_valid in _chunked_gather(raw_releases, _validate_one, MAX_SEARCH_RESULTS):
+        # LML#867: capture the per-candidate verdict so the carry-through memo can
+        # hand the strategy validation state, not just the (artist, album) reduction.
+        if release.release_id:
+            verdicts[release.release_id] = is_valid
         if not is_valid:
             continue
-        # NOTE(#867): release.release_id and the True verdict are known here but
-        # dropped when we reduce to (artist, album). #867's candidate carry-through
-        # memo will thread them; keep them reachable so that ticket needn't refetch.
         releases.append((release.artist, release.album))
+
+    # LML#867: upgrade the memo entry now that validation has run. The verdicts map
+    # is partial by design — the early exit above stops once MAX_SEARCH_RESULTS
+    # validated candidates are collected, so unprobed ids stay verdict-unknown.
+    if record_memo:
+        assert memo is not None  # narrow for the type-checker
+        memo.record(track, artist, raw_releases, verdicts=verdicts, validated=True)
 
     return releases
 
