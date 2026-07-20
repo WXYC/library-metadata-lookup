@@ -29,13 +29,27 @@ this drain shares the prod Discogs token with live traffic uncoordinated: run
 checkpointed per master to a JSONL file, so an interrupted or re-run drain never
 re-spends API budget on a master that already reached a terminal state.
 
+**Pause on breaker shed.** The drain runs as its own process, so it owns a
+*separate* breaker from the live service — its own requests drive it. When that
+breaker sheds a live probe (a transient shared-token blip, or a competing prod
+burst pushing ``X-Discogs-Ratelimit-Remaining`` to the floor), the drain
+**pauses one cool-down and retries the shed master** instead of marking it dead
+and marching on. Its pre-fix behavior was fatal: a single proactive trip made
+every remaining master fast-fail as a swallowed ``None``, so the whole backlog
+shed to ``dead`` and the run exited — ~13k masters lost to one blip. After
+``--max-breaker-pauses`` consecutive pauses with no master settling in between (a
+*sustained* flood, not a blip), the run stops cleanly and leaves the remainder
+non-terminal for a later run.
+
 Terminal states (checkpointed, never retried): ``resolved``, ``no_main_release``,
 ``trackless``. Retryable states (re-attempted on the next run): ``dead`` (a
-``get_master`` ``None`` — ambiguous 404-vs-transient, and where a breaker shed
-that ``get_master`` swallows also lands) and ``error`` (a ``get_release``
-``None`` — transient). A raised exception (e.g. a breaker shed that
-``get_release`` re-raises) is not checkpointed at all. Either way a non-settled
-master is retried, so budget is never re-spent on one already terminal.
+``get_master`` ``None`` — ambiguous 404-vs-transient) and ``error`` (a
+``get_release`` ``None`` — transient). A breaker shed no longer *lands* in either
+bucket: ``get_release``'s raised ``DiscogsBreakerOpenError`` and ``get_master``'s
+swallowed ``None`` (recognized by the open-breaker check) both route to the pause
+path above, so a shed is ridden out rather than checkpointed. A non-shed raised
+exception is not checkpointed at all. Either way a non-settled master is retried,
+so budget is never re-spent on one already terminal.
 
 Usage (dry-run resolve, then inspect before seeding)::
 
@@ -60,10 +74,11 @@ import csv
 import json
 import logging
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from discogs.breaker import DiscogsBreakerOpenError
 from scripts._lib.csv_ids import parse_positive_int
 
 logging.basicConfig(
@@ -83,6 +98,34 @@ STATUS_ERROR = "error"  # get_release returned None (transient)
 # Terminal states are stable conclusions and are skipped on re-run. ``dead`` and
 # ``error`` are ambiguous/transient and are retried until they settle.
 TERMINAL_STATUSES = frozenset({STATUS_RESOLVED, STATUS_NO_MAIN, STATUS_TRACKLESS})
+
+# Breaker-pause defaults. On a saturation shed the drain pauses one cool-down and
+# retries the same master rather than shedding the whole backlog (its pre-fix
+# behavior: a single proactive trip marked every remaining master ``dead`` and
+# exited). ``DEFAULT_MAX_BREAKER_PAUSES`` consecutive pauses without a settled
+# master in between end the run cleanly (a transient blip clears in one pause; a
+# sustained flood — a competing backfill — won't clear within this window, so the
+# drain bails and leaves the backlog non-terminal for a later run). The pause
+# default sits a touch over the 20s breaker cool-down so the resumed probe lands
+# after the OPEN→HALF_OPEN promotion instead of re-shedding on the boundary.
+DEFAULT_MAX_BREAKER_PAUSES = 8
+_DEFAULT_PAUSE_SECONDS = 22.0
+
+
+def _live_breaker_is_open() -> bool:
+    """True when this process's Discogs saturation breaker is not CLOSED.
+
+    The drain runs as its own process, so ``get_discogs_breaker()`` returns the
+    very breaker its ``DiscogsService`` requests drive — reading its state here
+    is race-free from the live service (a different process → a different
+    breaker). Imported lazily so the pure decision core and CLI arg-parsing don't
+    pull in the rate-limiter's optional dependency chain.
+    """
+    from discogs.breaker import BreakerState
+    from discogs.ratelimit import get_discogs_breaker
+
+    return get_discogs_breaker().state is not BreakerState.CLOSED
+
 
 # Seed CSV tagging. The source tag keeps the API-derived pins separable from the
 # cache-derived Phase-2 pins (and a re-pin pass MUST reuse it or the seeder's
@@ -233,6 +276,9 @@ async def run_drain(
     *,
     concurrency: int = 4,
     limit: int | None = None,
+    breaker_is_open: Callable[[], bool] | None = None,
+    pause_seconds: float = _DEFAULT_PAUSE_SECONDS,
+    max_breaker_pauses: int = DEFAULT_MAX_BREAKER_PAUSES,
 ) -> dict[int, MasterDrainOutcome]:
     """Drain all non-terminal masters, checkpointing each outcome as it lands.
 
@@ -240,6 +286,20 @@ async def run_drain(
     service's own 50/min limiter + breaker). ``limit`` caps how many masters
     this invocation processes — use it to smoke-test a small batch before the
     full run. Returns the merged ``{master_id: outcome}`` after this pass.
+
+    **Pause on breaker shed.** When the process's saturation breaker sheds a live
+    probe — ``get_release`` raises ``DiscogsBreakerOpenError``, or ``get_master``
+    swallows the shed into a ``None`` (``STATUS_DEAD``) while ``breaker_is_open``
+    reads open — the drain does **not** mark the master dead and march on (its
+    pre-fix behavior shed the whole backlog to ``STATUS_DEAD`` on one proactive
+    trip). Instead every worker pauses one ``pause_seconds`` cool-down and the
+    shed master is retried, so a transient shared-token blip is ridden out rather
+    than converted into a run-ending stampede. After ``max_breaker_pauses``
+    consecutive pauses with no master settling in between (a sustained flood —
+    e.g. a competing backfill), the run stops cleanly, leaving the remainder
+    non-terminal for a later run; no API budget is re-spent on a settled master.
+    ``breaker_is_open`` defaults to this process's live breaker; tests inject a
+    controllable predicate.
 
     Raises ``ValueError`` for out-of-range knobs, so a typo fails fast instead of
     hanging or silently misbehaving: ``concurrency < 1`` would build an
@@ -251,6 +311,12 @@ async def run_drain(
         raise ValueError(f"concurrency must be >= 1, got {concurrency}")
     if limit is not None and limit < 1:
         raise ValueError(f"limit must be >= 1 when set, got {limit}")
+    if max_breaker_pauses < 1:
+        raise ValueError(f"max_breaker_pauses must be >= 1, got {max_breaker_pauses}")
+    if pause_seconds < 0:
+        raise ValueError(f"pause_seconds must be >= 0, got {pause_seconds}")
+    if breaker_is_open is None:
+        breaker_is_open = _live_breaker_is_open
     done = load_checkpoint(checkpoint_path)
     todo = _pending_masters(cards_by_master, done)
     if limit is not None:
@@ -266,24 +332,100 @@ async def run_drain(
 
     sem = asyncio.Semaphore(concurrency)
     write_lock = asyncio.Lock()
+    pause_lock = asyncio.Lock()
+    resume = asyncio.Event()
+    resume.set()  # workers proceed while set; a pause clears it
     counts: dict[str, int] = {}
+    # Mutated only between awaits under asyncio's cooperative scheduling, so a
+    # plain dict needs no lock beyond the two guarding their own critical section.
+    ctrl = {"consecutive_pauses": 0, "aborted": False}
+
+    async def pause_for_breaker() -> bool:
+        """Pause every worker one cool-down, then resume — or abort the run once
+        the breaker has stayed saturated ``max_breaker_pauses`` rounds.
+
+        Returns ``True`` if the caller should retry its master, ``False`` if the
+        run is aborting (the caller leaves its master non-terminal — never
+        checkpointed — for a later run). Exactly one worker per round drives the
+        pause; the rest wait on ``resume``.
+        """
+        if ctrl["aborted"]:
+            return False
+        drive = False
+        async with pause_lock:
+            if ctrl["aborted"]:
+                return False
+            if resume.is_set():
+                # First worker into this round drives the pause; the count resets
+                # to 0 whenever a master settles, so it measures a *sustained*
+                # saturation, not cumulative blips across a long clean run.
+                ctrl["consecutive_pauses"] += 1
+                if ctrl["consecutive_pauses"] > max_breaker_pauses:
+                    ctrl["aborted"] = True
+                    resume.set()  # release any waiters so they can exit
+                    log.warning(
+                        "Discogs breaker still saturated after %d consecutive pauses "
+                        "(~%.0fs) — stopping this drain run; the remaining masters stay "
+                        "non-terminal for a later run (no API budget re-spent). Re-run "
+                        "off-peak once the shared token has recovered.",
+                        max_breaker_pauses,
+                        max_breaker_pauses * pause_seconds,
+                    )
+                    return False
+                resume.clear()
+                drive = True
+                log.warning(
+                    "Discogs breaker OPEN — pausing the drain %.0fs (pause %d/%d) to let "
+                    "the shared token recover instead of shedding the backlog",
+                    pause_seconds,
+                    ctrl["consecutive_pauses"],
+                    max_breaker_pauses,
+                )
+        if drive:
+            try:
+                await asyncio.sleep(pause_seconds)
+            finally:
+                resume.set()
+        else:
+            await resume.wait()
+        return not ctrl["aborted"]
 
     async def worker(master_id: int) -> None:
-        async with sem:
-            try:
-                outcome = await drain_master(service, master_id)
-            except Exception as exc:  # noqa: BLE001 — retryable: do not checkpoint
-                log.warning("master %d raised (%s) — left for retry", master_id, exc)
-                async with write_lock:
-                    counts["_raised"] = counts.get("_raised", 0) + 1
+        while True:
+            await resume.wait()  # hold outside the semaphore while the drain is paused
+            if ctrl["aborted"]:
                 return
-        async with write_lock:
-            append_checkpoint(checkpoint_path, outcome)
-            done[master_id] = outcome
-            counts[outcome.status] = counts.get(outcome.status, 0) + 1
-            processed = sum(v for k, v in counts.items() if not k.startswith("_"))
-            if processed % 250 == 0:
-                log.info("progress: %d processed — %s", processed, dict(counts))
+            shed = False
+            async with sem:
+                try:
+                    outcome = await drain_master(service, master_id)
+                except DiscogsBreakerOpenError:
+                    # get_release shed the live probe — unambiguous saturation.
+                    shed = True
+                except Exception as exc:  # noqa: BLE001 — retryable: do not checkpoint
+                    log.warning("master %d raised (%s) — left for retry", master_id, exc)
+                    async with write_lock:
+                        counts["_raised"] = counts.get("_raised", 0) + 1
+                    return
+            if not shed and outcome.status not in TERMINAL_STATUSES and breaker_is_open():
+                # get_master swallows a shed into a None (STATUS_DEAD),
+                # indistinguishable from a real 404 at the return value — so a
+                # non-terminal outcome while our own breaker is open is a shed,
+                # not a settled conclusion. Pause rather than march the backlog.
+                shed = True
+            if shed:
+                if await pause_for_breaker():
+                    continue  # retry the same master
+                return  # aborting — leave it non-terminal for a later run
+            async with write_lock:
+                append_checkpoint(checkpoint_path, outcome)
+                done[master_id] = outcome
+                counts[outcome.status] = counts.get(outcome.status, 0) + 1
+                ctrl["consecutive_pauses"] = 0  # a settled master ends any pause streak
+                processed = sum(v for k, v in counts.items() if not k.startswith("_"))
+                if processed % 250 == 0:
+                    log.info("progress: %d processed — %s", processed, dict(counts))
+            return
 
     await asyncio.gather(*(worker(m) for m in todo))
     log.info("drain pass complete: %s", dict(counts))
@@ -352,6 +494,14 @@ async def _run(args: argparse.Namespace) -> None:
     from config.settings import get_settings
 
     settings = get_settings()
+    # Default the pause a touch over the breaker cool-down so the resumed probe
+    # lands after the OPEN->HALF_OPEN promotion rather than re-shedding on the
+    # boundary; an explicit --pause-seconds overrides.
+    pause_seconds = (
+        args.pause_seconds
+        if args.pause_seconds is not None
+        else settings.discogs_breaker_cooldown_seconds + 2.0
+    )
     db_url = settings.database_url_discogs or os.environ.get("DATABASE_URL_DISCOGS")
     token = settings.discogs_token or os.environ.get("DISCOGS_TOKEN")
     if not db_url:
@@ -376,6 +526,8 @@ async def _run(args: argparse.Namespace) -> None:
                 checkpoint_path,
                 concurrency=args.concurrency,
                 limit=args.limit,
+                pause_seconds=pause_seconds,
+                max_breaker_pauses=args.max_breaker_pauses,
             )
         finally:
             await service.close()
@@ -422,6 +574,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Cap masters processed this run (smoke-test a batch before the full drain)",
+    )
+    parser.add_argument(
+        "--max-breaker-pauses",
+        type=int,
+        default=DEFAULT_MAX_BREAKER_PAUSES,
+        help=(
+            "Consecutive breaker-cool-down pauses (no master settling in between) before "
+            f"the run stops and leaves the rest for later (default {DEFAULT_MAX_BREAKER_PAUSES})"
+        ),
+    )
+    parser.add_argument(
+        "--pause-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Seconds to pause on a breaker shed before retrying "
+            "(default: the breaker cool-down + 2s)"
+        ),
     )
     return parser
 
