@@ -27,6 +27,7 @@ from core.search import (
     execute_search_pipeline,
     resolve_search_hard_timeout_ms,
 )
+from lookup import orchestrator
 from lookup.models import LookupRequest
 from lookup.orchestrator import perform_lookup
 from lookup.spine_deadline import (
@@ -398,6 +399,53 @@ class TestSpineDeadlineBoundsStepTwo:
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get("hard_cap_fired") is True
         assert calls.get("hard_cap_step") == "album_lookup"
+
+    @pytest.mark.asyncio
+    async def test_step3_offset_reflects_step2_elapsed(
+        self, mock_library_db, mock_discogs_service, monkeypatch
+    ):
+        """The step-2 wall time is charged into step 3's clock via the offset (headline wiring).
+
+        Guards the LML#865 promise that the hard cap + caller budget bound
+        ``step2 + step3`` *together*: ``_step_search_pipeline`` must call
+        ``execute_search_pipeline`` with ``pipeline_start_offset_ms`` equal to the
+        spine time already spent. Zeroing that offset (a fresh full-budget step-3
+        clock — the ~2x-budget grind #865 set out to bound) is caught here; the
+        callee-side honoring of the offset is covered separately in
+        ``TestPipelineStartOffset``.
+        """
+        monkeypatch.delenv("LML_SEARCH_HARD_TIMEOUT_MS", raising=False)
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+
+        # Step 2 consumes measurable wall time but returns cleanly (no trip).
+        async def slow_but_ok_step2(*args, **kwargs):
+            await asyncio.sleep(0.1)
+            return []
+
+        monkeypatch.setattr(
+            "lookup.orchestrator.lookup_releases_by_track", AsyncMock(side_effect=slow_but_ok_step2)
+        )
+        # Keep the real step-3 cascade fast + empty so we only observe the offset.
+        mock_discogs_service.search.return_value = None
+
+        spy = AsyncMock(wraps=orchestrator.execute_search_pipeline)
+        monkeypatch.setattr("lookup.orchestrator.execute_search_pipeline", spy)
+
+        request = LookupRequest(
+            artist="Jimmy Scott", song="Sycamore Trees", raw_message="Jimmy Scott - Sycamore Trees"
+        )
+        await perform_lookup(
+            request,
+            mock_library_db,
+            mock_discogs_service,
+            make_lml_telemetry(),
+            caller_budget_ms=5000,
+        )
+
+        assert spy.await_count == 1
+        offset = spy.await_args.kwargs["pipeline_start_offset_ms"]
+        # Step 2 slept 100ms, so at least that much spine time is charged to step 3.
+        assert offset >= 50.0
 
     @pytest.mark.asyncio
     async def test_fast_step2_returns_normally_without_timeout(
