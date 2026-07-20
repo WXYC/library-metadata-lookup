@@ -328,17 +328,15 @@ class TestLookupReleasesByTrack:
         assert ("Duke Ellington & John Coltrane", "Duke Ellington & John Coltrane") in result
 
     @pytest.mark.asyncio
-    async def test_gate_uses_artist_column_not_truncatable_fts(self):
+    async def test_gate_falls_back_to_artist_column_when_fts_truncates(self):
         """Recall (LML#866): the library-first gate must not wrongly suppress a
         library artist whose bare-name FTS query truncates past its own rows.
 
         ``db.search(query=...)`` is a cross-column FTS with a fixed LIMIT and no
         rank ordering (``library/db.py``), so a common single-token artist
         ("Women", "Low", "Wire") can have its rows crowded out by unrelated title
-        matches. The album-fed consumer searches the far more selective
-        ``"{artist} {album}"`` and would surface the row, so the gate must probe
-        the artist column directly (``db.search(artist=...)``) — a sound lower
-        bound — rather than the truncatable FTS path.
+        matches. The gate then falls back to the artist-column filter
+        (``db.search(artist=...)``), which reliably surfaces the artist's own rows.
         """
         service = AsyncMock()
         service.search_releases_by_track = AsyncMock(
@@ -371,6 +369,48 @@ class TestLookupReleasesByTrack:
         result = await lookup_releases_by_track("Black Rice", "Women", service=service, db=db)
 
         assert result == [("Women", "Public Strain")]
+
+    @pytest.mark.asyncio
+    async def test_gate_folds_diacritics_via_fts(self):
+        """Recall (LML#866): the gate must not suppress a diacritic library artist
+        typed without the accent ("Bjork" for "Björk").
+
+        The album-fed consumer uses the FTS path, which folds diacritics, so the
+        gate must keep an FTS probe — a raw artist-column ``LIKE`` alone would
+        miss the accented row. Here the FTS probe finds "Björk" for the typed
+        "Bjork" while the artist-column ``LIKE`` does not; the gate must still pass.
+        """
+        service = AsyncMock()
+        service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Hyperballad",
+                artist="Bjork",
+                releases=[
+                    ReleaseInfo(
+                        album="Post",
+                        artist="Björk",
+                        release_id=7101,
+                        release_url="https://discogs.com/release/7101",
+                    )
+                ],
+                total=1,
+            )
+        )
+        service.validate_track_on_release = AsyncMock(return_value=True)
+
+        async def _fake_search(query=None, artist=None, title=None, **kwargs):
+            # FTS (query=) folds diacritics and finds the accented row; the raw
+            # artist-column LIKE (artist=) does not.
+            if query is not None:
+                return [make_library_item(artist="Björk", title="Post")]
+            return []
+
+        db = AsyncMock()
+        db.search = AsyncMock(side_effect=_fake_search)
+
+        result = await lookup_releases_by_track("Hyperballad", "Bjork", service=service, db=db)
+
+        assert result == [("Björk", "Post")]
 
 
 # ---------------------------------------------------------------------------

@@ -141,23 +141,36 @@ async def _artist_has_library_rows(db: LibraryDB, artist: str) -> bool:
 
     A False answer must *guarantee* that ARTIST_PLUS_ALBUM's album-fed branch —
     the sole consumer of the album names this module produces — can surface
-    nothing for the artist, so this has to be a sound lower bound on that branch.
-    It probes the artist *column* directly (``db.search(artist=...)``, a LIKE
-    filter) rather than the cross-column FTS (``db.search(query=...)``): the FTS
-    path has a fixed LIMIT and no rank ordering (``library/db.py``), so a common
-    single-token artist ("Women", "Low", "Wire") can have its rows crowded out of
-    the page by unrelated title matches — while the album-fed branch's far more
-    selective ``"{artist} {album}"`` query still surfaces them (LML#866). The
-    artist-column filter is a superset of the album-fed hits (any prefix-matching
-    row's artist contains the name), so it never suppresses a candidate that
-    branch could surface. A local SQLite read; no Discogs call.
+    nothing for the artist, so this wants to be a sound lower bound on that
+    branch. Two complementary probes are OR'd, because neither alone is one
+    (LML#866):
+
+    * ``db.search(query=...)`` — the cross-column FTS the album-fed branch itself
+      uses. It folds diacritics, so a de-accented type-in ("Bjork") still finds
+      the accented library row ("Björk"), matching the consumer's retrieval
+      semantics. But its fixed LIMIT + no rank ordering (``library/db.py``) can
+      crowd a common single-token artist's rows ("Low", "Women", "Wire") off the
+      page behind unrelated title matches.
+    * ``db.search(artist=...)`` — a LIKE filter on the artist column, which
+      reliably surfaces the artist's own rows regardless of FTS crowding, but
+      does *not* fold diacritics.
+
+    Either hit means the album-fed branch could surface a row, so we don't
+    suppress. OR'ing is strictly more permissive than either probe, so it never
+    suppresses a candidate the branch could surface for a reason either probe
+    covers. Both are local SQLite reads (cached); no Discogs call. The FTS probe
+    runs first and short-circuits, so a normally-named library artist pays one
+    read; the second runs only when the FTS probe finds nothing.
     """
     if not artist or not artist.strip():
         return True  # nothing to gate on; don't suppress (defensive)
     from lookup.matching import _FETCH_LIMIT, filter_results_by_artist
 
-    rows = await db.search(artist=artist, limit=_FETCH_LIMIT)
-    return bool(filter_results_by_artist(rows, artist))
+    fts_rows = await db.search(query=artist, limit=_FETCH_LIMIT)
+    if filter_results_by_artist(fts_rows, artist):
+        return True
+    like_rows = await db.search(artist=artist, limit=_FETCH_LIMIT)
+    return bool(filter_results_by_artist(like_rows, artist))
 
 
 async def lookup_releases_by_artist(
