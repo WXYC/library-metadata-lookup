@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -44,7 +46,7 @@ async def pg_source(pg_pool_large) -> PgSource:
 
 
 @pytest_asyncio.fixture
-async def bucket_key(pg_source) -> str:
+async def bucket_key(pg_source) -> AsyncIterator[str]:
     """A unique bucket key per test, torn down afterwards.
 
     Isolates each test from every other and from any real seeded ``'discogs'``
@@ -62,12 +64,14 @@ async def _seed(pg_source: PgSource, key: str, *, capacity: float, refill: float
     return PgTokenBucket(pg_source, bucket_key=key)
 
 
-async def _row(pg_source: PgSource, key: str) -> dict:
-    return await pg_source.fetchone(
+async def _row(pg_source: PgSource, key: str) -> dict[str, Any]:
+    row = await pg_source.fetchone(
         "SELECT tokens, capacity, refill_per_sec "
         "FROM lml_cache.discogs_rate_bucket WHERE bucket_key = $1",
         key,
     )
+    assert row is not None  # the caller always seeds the row first
+    return row
 
 
 async def test_schema_bootstrap_is_idempotent(pg_source, bucket_key):
