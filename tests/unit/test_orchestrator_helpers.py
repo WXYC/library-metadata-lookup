@@ -445,6 +445,50 @@ class TestResolveAlbumsForTrack:
 
         assert "Emperor Tomato Ketchup" in albums
 
+    @pytest.mark.asyncio
+    async def test_non_library_artist_returns_song_not_found_with_zero_validations(self):
+        """Acceptance (b) (LML#866): through the real seam, a non-library artist
+        does one Discogs search and zero tracklist fetches.
+
+        Exercises the REAL ``lookup_releases_by_track`` (not patched): the
+        library-first gate reads ``db.search`` (empty), so validation is skipped
+        entirely and album resolution reports song-not-found.
+        """
+        parsed = ParsedRequest(
+            song="Some Track",
+            artist="Some Non-Library Artist",
+            raw_message="Some Non-Library Artist - Some Track",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+        discogs_service = AsyncMock()
+        discogs_service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Some Track",
+                artist="Some Non-Library Artist",
+                releases=[
+                    ReleaseInfo(
+                        album=f"Album {i}",
+                        artist="Some Non-Library Artist",
+                        release_id=5000 + i,
+                        release_url=f"https://discogs.com/release/{5000 + i}",
+                    )
+                    for i in range(3)
+                ],
+                total=3,
+            )
+        )
+        discogs_service.validate_track_on_release = AsyncMock(return_value=True)
+
+        db = AsyncMock()
+        db.search = AsyncMock(return_value=[])  # artist not in library
+
+        albums, not_found = await resolve_albums_for_track(parsed, discogs_service, db=db)
+
+        assert albums == []
+        assert not_found is True
+        discogs_service.validate_track_on_release.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Tests: search_library_with_fallback
