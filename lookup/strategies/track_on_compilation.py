@@ -58,6 +58,7 @@ from lookup.matching import (
 )
 from lookup.release_resolution import (
     ResolvedRelease,
+    has_va_compilation,
     merge_wave_b_compilations,
     rank_resolved_releases,
     validate_release_for_track,
@@ -311,31 +312,43 @@ async def search_compilations_for_track(
 
         # LML#867: reuse step 2's artist-filtered candidates as Wave A's seed when
         # the memo holds this exact query. The key is the consumer's own probe
-        # params (``song_search``, ``artist_for_probes``), so a remix-augmented
-        # title or a canonical-artist swap — which genuinely change the query —
-        # misses and re-searches, while the common no-swap/no-remix case hits.
+        # params (``song_search``, ``artist_for_probes``) normalized via
+        # ``to_match_form``, so a remix-augmented title or a canonical-artist swap
+        # that genuinely changes the *normalized* query misses and re-searches;
+        # a swap that only re-cases or re-diacriticizes the name (an equivalent
+        # Discogs query) collapses to the same key and hits. The common
+        # no-swap/no-remix case hits.
         memo_seed = (
             candidate_memo.get(song_search, artist_for_probes)
             if candidate_memo is not None
             else None
         )
+        # Recall guard: only reuse a seed step 2 proved complete. A seed that
+        # saturated step 2's (smaller) page limit is not provably the full
+        # artist-filtered set — a fresh, wider Wave A can surface releases ranked
+        # past that cap, one of which may be the sole library pressing (and, if not
+        # a V/A comp, one Wave B's ``format=Compilation`` arm can't rescue). Fall
+        # through to the fresh gather below; suppress the search only when the
+        # surfaced set is provably unchanged.
+        if memo_seed is not None and memo_seed.truncated:
+            memo_seed = None
 
         if discogs_service and memo_seed is not None:
             # Wave A came free from the memo (no second ``artist=`` search). The
-            # reused seed carries step 2's ``per_page=10`` candidates — a narrower
-            # slice than a fresh ``per_page=20`` Wave A, but Wave A is the
-            # artist-scoped arm and MAX_SEARCH_RESULTS + the _chunked_gather early
-            # exit bound the practical difference; the recall-critical arm is the
-            # wider Wave B probe, preserved below.
+            # truncated guard above ensured this seed is the *complete*
+            # artist-filtered result set (step 2's search returned a short page), so
+            # it equals what a fresh Wave A would surface — reuse is provably
+            # non-narrowing. The recall-critical wider arm is the Wave B probe,
+            # preserved below.
             wave_a_releases = list(memo_seed.releases)
             # Skip the wider Wave B probe only when the seed already holds a
             # true-V/A comp — ``merge_wave_b_compilations`` discards Wave B in
             # exactly that case, so skipping its search is provably non-narrowing.
             # An empty or non-V/A seed is "insufficient" for the compilation
             # purpose, so the wider probe still fires (no recall narrowing).
-            seed_has_va = any(
-                r.is_compilation and is_compilation_artist(r.artist or "") for r in wave_a_releases
-            )
+            # Uses the SAME ``has_va_compilation`` predicate the merge uses, so the
+            # skip can't drift from what the merge would discard.
+            seed_has_va = has_va_compilation(wave_a_releases)
             tail_probes: list[Coroutine[Any, Any, _ProbeResult]] = []
             wave_b_index: int | None = None
             if not seed_has_va:
