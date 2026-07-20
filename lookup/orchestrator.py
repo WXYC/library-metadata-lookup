@@ -85,10 +85,18 @@ logger = logging.getLogger(__name__)
 async def resolve_albums_for_track(
     parsed: ParsedRequest,
     discogs_service: DiscogsService | None = None,
+    db: LibraryDB | None = None,
 ) -> tuple[list[str], bool]:
     """Resolve album names for a track if not provided.
 
     Searches Discogs for ALL releases containing the track, not just the first one.
+
+    When ``db`` is supplied, tracklist validation is gated library-first (LML#866):
+    the (corrected-or-typed) query artist must have at least one library row or the
+    O(N) rate-limited Discogs tracklist fetches are skipped — a non-library
+    artist+track request does one Discogs search and zero tracklist fetches, which
+    is behavior-preserving because these album names feed only ARTIST_PLUS_ALBUM,
+    whose album-fed branch re-filters every hit to the query artist.
 
     Returns:
         Tuple of (list of album names, song_not_found_flag)
@@ -106,7 +114,12 @@ async def resolve_albums_for_track(
             logger.info(f"Album '{parsed.album}' appears to be artist name, looking up albums")
         try:
             releases = await lookup_releases_by_track(
-                parsed.song, parsed.artist, limit=10, service=discogs_service
+                parsed.song,
+                parsed.artist,
+                limit=10,
+                service=discogs_service,
+                db=db,
+                library_artist=library_artist_for(parsed),
             )
             if releases:
                 albums = []
@@ -351,10 +364,11 @@ async def _step_prepare_request(
 ) -> tuple[ParsedRequest, list[str]]:
     """Steps 1+2 — prepare: build the ParsedRequest, correct artist spelling, resolve albums.
 
-    Artist correction (``db.find_similar_artist``) and album resolution
-    (``resolve_albums_for_track``) run in parallel when the request carries an
-    artist. A correction never overwrites ``parsed.artist`` — see the LML#626
-    two-channel seam comment inline.
+    Artist correction (``db.find_similar_artist``) runs BEFORE album resolution
+    (``resolve_albums_for_track``) when the request carries an artist — the
+    serialization is load-bearing for the LML#866 library-first validation gate,
+    which reads the corrected ``parsed.library_artist``. A correction never
+    overwrites ``parsed.artist`` — see the LML#626 two-channel seam comment inline.
 
     READS: nothing from ``LookupState``.
     WRITES: ``corrected_artist``, ``song_not_found``.
@@ -381,30 +395,35 @@ async def _step_prepare_request(
     )
 
     if parsed.artist:
-        correction_task = services.db.find_similar_artist(parsed.artist)
         with services.telemetry.track_step("album_lookup"):
             if parsed.song and not parsed.album:
                 services.telemetry.record_api_call("discogs")
-            corrected, (albums_for_search, song_not_found) = await asyncio.gather(
-                correction_task,
-                resolve_albums_for_track(parsed, services.discogs_service),
+            # Resolve the fuzzy library-artist correction FIRST (a cheap, cached
+            # local-SQLite lookup) so album resolution can gate its Discogs
+            # tracklist validation on library membership of the CORRECTED artist
+            # (LML#866). Previously these ran concurrently; serializing costs a
+            # sub-millisecond local read and is required for the gate to use the
+            # same library-artist notion step 3 does.
+            corrected = await services.db.find_similar_artist(parsed.artist)
+            if corrected:
+                state.corrected_artist = corrected
+                # Two-channel seam (WXYC/library-metadata-lookup#626): do NOT
+                # overwrite ``parsed.artist``. The typed value must keep flowing to
+                # every Discogs-facing path (the three Discogs-aware strategies'
+                # probes, ``validate_release_for_track``, and the library-miss
+                # Discogs probe), or a *distinct* non-library artist one edit from a
+                # library name gets snapped into the library's vocabulary on Discogs.
+                # Thread the correction on ``library_artist``, read only by the
+                # library-side legs (``db.search`` queries + ``artist_matches_item``
+                # match-backs).
+                parsed.library_artist = corrected
+            albums_for_search, song_not_found = await resolve_albums_for_track(
+                parsed, services.discogs_service, db=services.db
             )
-        if corrected:
-            state.corrected_artist = corrected
-            # Two-channel seam (WXYC/library-metadata-lookup#626): do NOT
-            # overwrite ``parsed.artist``. The typed value must keep flowing to
-            # every Discogs-facing path (the three Discogs-aware strategies'
-            # probes, ``validate_release_for_track``, and the library-miss
-            # Discogs probe), or a *distinct* non-library artist one edit from a
-            # library name gets snapped into the library's vocabulary on Discogs.
-            # Thread the correction on ``library_artist``, read only by the
-            # library-side legs (``db.search`` queries + ``artist_matches_item``
-            # match-backs).
-            parsed.library_artist = corrected
     else:
         with services.telemetry.track_step("album_lookup"):
             albums_for_search, song_not_found = await resolve_albums_for_track(
-                parsed, services.discogs_service
+                parsed, services.discogs_service, db=services.db
             )
 
     state.song_not_found = song_not_found

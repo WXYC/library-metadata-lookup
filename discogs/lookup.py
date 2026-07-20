@@ -5,10 +5,16 @@ These functions accept an optional DiscogsService instance. When provided
 When omitted, a cacheless service is created as a fallback.
 """
 
-import logging
+from __future__ import annotations
 
-from discogs.models import DiscogsSearchRequest, DiscogsSearchResult
+import logging
+from typing import TYPE_CHECKING
+
+from discogs.models import DiscogsSearchRequest, DiscogsSearchResult, ReleaseInfo
 from discogs.service import DiscogsService
+
+if TYPE_CHECKING:
+    from library.db import LibraryDB
 
 logger = logging.getLogger(__name__)
 
@@ -33,21 +39,31 @@ async def lookup_releases_by_track(
     limit: int = 20,
     service: DiscogsService | None = None,
     artist_as_keyword: bool = False,
+    db: LibraryDB | None = None,
+    library_artist: str | None = None,
 ) -> list[tuple[str, str]]:
     """Look up all releases containing a track using Discogs.
 
-    For Various Artists / compilation releases, validates the tracklist
-    to ensure the track by the artist actually exists on the release.
+    Validates that the track by the artist actually exists on each candidate
+    release (keeps VA/compilation false hits out), but only for candidates that
+    can actually surface — see the library-first gate below (LML#866).
 
     Args:
-        track: Track title
-        artist: Optional artist name
-        limit: Maximum number of results
-        service: Optional DiscogsService instance (with cache). If not provided,
-            creates a cacheless fallback service.
+        track: Track title.
+        artist: Optional artist name. When absent, releases are returned without
+            tracklist validation (unchanged).
+        limit: Maximum number of search results.
+        service: Optional DiscogsService (with cache). Cacheless fallback if omitted.
+        db: Optional library handle (LML#866). With an artist present, gates
+            tracklist validation on library membership of the (corrected-or-typed)
+            artist — a non-library artist skips every get_release fetch. When
+            omitted, every candidate is validated (pre-#866 behavior, parallelized).
+        library_artist: The library-side artist name to gate on — the fuzzy
+            correction when the caller has one, else the typed ``artist``. Only
+            consulted when ``db`` is provided.
 
     Returns:
-        List of (artist, album) tuples for releases containing the track.
+        List of (artist, album) tuples for validated releases containing the track.
     """
     if service is None:
         service = _get_service()
@@ -57,23 +73,75 @@ async def lookup_releases_by_track(
     response = await service.search_releases_by_track(
         track, artist, limit, artist_as_keyword=artist_as_keyword
     )
+    raw_releases = list(response.releases or [])
+    if not raw_releases:
+        return []
 
-    # Validate that the track actually exists on each release
-    releases = []
-    for release_info in response.releases or []:
-        if artist and release_info.release_id:
-            is_valid = await service.validate_track_on_release(
-                release_info.release_id, track, artist
-            )
-            if not is_valid:
-                logger.info(
-                    f"Skipping '{release_info.album}' - track/artist not validated on release"
-                )
-                continue
+    # Without an artist there is no track/artist pair to validate — return every
+    # release as-is (pre-#866 behavior; see test_no_artist_skips_validation).
+    if not artist:
+        return [(r.artist, r.album) for r in raw_releases]
 
-        releases.append((release_info.artist, release_info.album))
+    # Library-first gate (LML#866). The album names produced here feed only
+    # ARTIST_PLUS_ALBUM, whose album-fed branch re-filters every hit to the query
+    # artist. If the (corrected-or-typed) artist has no library rows, no tracklist
+    # validation can change the surfaced set — so skip the O(N) rate-limited
+    # get_release validations entirely. One Discogs search, zero tracklist fetches.
+    if db is not None and not await _artist_has_library_rows(db, library_artist or artist):
+        logger.info(
+            "LML#866: skipping track validation for '%s' — artist '%s' has no library rows",
+            track,
+            library_artist or artist,
+        )
+        return []
+
+    from lookup.concurrency import _chunked_gather
+    from lookup.matching import MAX_SEARCH_RESULTS
+
+    async def _validate_one(release: ReleaseInfo) -> bool:
+        # A release with no id can't be validated; keep it (pre-#866 behavior: the
+        # old loop only validated when ``artist and release.release_id``).
+        if not release.release_id:
+            return True
+        is_valid = await service.validate_track_on_release(release.release_id, track, artist)
+        if not is_valid:
+            logger.info("Skipping '%s' - track/artist not validated on release", release.album)
+        return is_valid
+
+    # Bounded-concurrency validation with early-exit once enough validated releases
+    # are collected (LML#536 pattern, ported from the step-3 kernel in
+    # lookup/strategies/track_release_matching.py). _chunked_gather also enforces
+    # the per-invocation Discogs API-call cap between chunks, keeping this inside the
+    # #755 saturation-breaker envelope. Replaces the pre-#866 sequential loop.
+    releases: list[tuple[str, str]] = []
+    async for release, is_valid in _chunked_gather(raw_releases, _validate_one, MAX_SEARCH_RESULTS):
+        if not is_valid:
+            continue
+        # NOTE(#867): release.release_id and the True verdict are known here but
+        # dropped when we reduce to (artist, album). #867's candidate carry-through
+        # memo will thread them; keep them reachable so that ticket needn't refetch.
+        releases.append((release.artist, release.album))
+        if len(releases) >= MAX_SEARCH_RESULTS:
+            break
 
     return releases
+
+
+async def _artist_has_library_rows(db: LibraryDB, artist: str) -> bool:
+    """True when the local library holds at least one row for ``artist``.
+
+    Mirrors the artist-only fallback branch of ``search_library_with_fallback``
+    (``db.search(artist)`` -> ``filter_results_by_artist``) so a False answer
+    guarantees ARTIST_PLUS_ALBUM's album-fed branch — the sole consumer of the
+    album names this module produces — can surface nothing for the artist. A local
+    SQLite read; no Discogs call.
+    """
+    if not artist or not artist.strip():
+        return True  # nothing to gate on; don't suppress (defensive)
+    from lookup.matching import _FETCH_LIMIT, filter_results_by_artist
+
+    rows = await db.search(query=artist, limit=_FETCH_LIMIT)
+    return bool(filter_results_by_artist(rows, artist))
 
 
 async def lookup_releases_by_artist(
