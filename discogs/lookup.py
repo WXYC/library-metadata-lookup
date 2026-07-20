@@ -108,11 +108,22 @@ async def lookup_releases_by_track(
             logger.info("Skipping '%s' - track/artist not validated on release", release.album)
         return is_valid
 
-    # Bounded-concurrency validation with early-exit once enough validated releases
-    # are collected (LML#536 pattern, ported from the step-3 kernel in
-    # lookup/strategies/track_release_matching.py). _chunked_gather also enforces
-    # the per-invocation Discogs API-call cap between chunks, keeping this inside the
-    # #755 saturation-breaker envelope. Replaces the pre-#866 sequential loop.
+    # Bounded-concurrency validation (LML#536 pattern, ported from the step-3
+    # kernel in lookup/strategies/track_release_matching.py). _chunked_gather runs
+    # MAX_SEARCH_RESULTS validations per wave and enforces the per-invocation
+    # Discogs API-call cap between chunks, keeping this inside the #755
+    # saturation-breaker envelope. Replaces the pre-#866 sequential loop.
+    #
+    # NO accumulator early-exit here (unlike the step-3 kernel, which breaks once
+    # it has MAX_SEARCH_RESULTS *library matches*). The releases returned here are
+    # still unfiltered: the caller (``resolve_albums_for_track``) applies the
+    # artist-prefix filter afterward, and ``search_releases_by_track`` interleaves
+    # VA/compilation and keyword-supplement releases whose primary artist is not
+    # the query artist (``ReleaseInfo.artist`` is the release's own credit). Breaking
+    # at MAX_SEARCH_RESULTS *raw* validated releases would let a run of leading
+    # comps starve the artist's own album (an LML#866 recall regression), so every
+    # candidate up to ``limit`` is validated. Cost stays bounded — ``limit`` caps the
+    # list and the between-chunk API-call cap bounds the fan-out.
     releases: list[tuple[str, str]] = []
     async for release, is_valid in _chunked_gather(raw_releases, _validate_one, MAX_SEARCH_RESULTS):
         if not is_valid:
@@ -121,8 +132,6 @@ async def lookup_releases_by_track(
         # dropped when we reduce to (artist, album). #867's candidate carry-through
         # memo will thread them; keep them reachable so that ticket needn't refetch.
         releases.append((release.artist, release.album))
-        if len(releases) >= MAX_SEARCH_RESULTS:
-            break
 
     return releases
 
@@ -130,17 +139,24 @@ async def lookup_releases_by_track(
 async def _artist_has_library_rows(db: LibraryDB, artist: str) -> bool:
     """True when the local library holds at least one row for ``artist``.
 
-    Mirrors the artist-only fallback branch of ``search_library_with_fallback``
-    (``db.search(artist)`` -> ``filter_results_by_artist``) so a False answer
-    guarantees ARTIST_PLUS_ALBUM's album-fed branch — the sole consumer of the
-    album names this module produces — can surface nothing for the artist. A local
-    SQLite read; no Discogs call.
+    A False answer must *guarantee* that ARTIST_PLUS_ALBUM's album-fed branch —
+    the sole consumer of the album names this module produces — can surface
+    nothing for the artist, so this has to be a sound lower bound on that branch.
+    It probes the artist *column* directly (``db.search(artist=...)``, a LIKE
+    filter) rather than the cross-column FTS (``db.search(query=...)``): the FTS
+    path has a fixed LIMIT and no rank ordering (``library/db.py``), so a common
+    single-token artist ("Women", "Low", "Wire") can have its rows crowded out of
+    the page by unrelated title matches — while the album-fed branch's far more
+    selective ``"{artist} {album}"`` query still surfaces them (LML#866). The
+    artist-column filter is a superset of the album-fed hits (any prefix-matching
+    row's artist contains the name), so it never suppresses a candidate that
+    branch could surface. A local SQLite read; no Discogs call.
     """
     if not artist or not artist.strip():
         return True  # nothing to gate on; don't suppress (defensive)
     from lookup.matching import _FETCH_LIMIT, filter_results_by_artist
 
-    rows = await db.search(query=artist, limit=_FETCH_LIMIT)
+    rows = await db.search(artist=artist, limit=_FETCH_LIMIT)
     return bool(filter_results_by_artist(rows, artist))
 
 
