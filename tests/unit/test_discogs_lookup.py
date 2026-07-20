@@ -115,9 +115,11 @@ class TestLookupReleasesByTrack:
         """Part A (LML#866): per-release validation fans out via _chunked_gather.
 
         Ten candidate releases each take 0.05s to validate; a serial loop would
-        cost ~0.5s. With bounded-concurrency + early-exit, the first chunk-wave
-        (MAX_SEARCH_RESULTS releases) fills the accumulator and the rest never
-        dispatch, so wall time stays well under the serial floor.
+        cost ~0.5s. With bounded concurrency (MAX_SEARCH_RESULTS per wave), the
+        ten validations run in two parallel waves (~0.1s), well under the serial
+        floor. There is no raw-count early-exit — every candidate up to the search
+        limit is validated (see test_artist_album_not_starved_by_leading_compilations
+        for why truncating the raw list would drop the artist's own album).
         """
         service = AsyncMock()
         service.search_releases_by_track = AsyncMock(
@@ -147,9 +149,11 @@ class TestLookupReleasesByTrack:
         result = await lookup_releases_by_track("Windowlicker", "Aphex Twin", service=service)
         elapsed = time.perf_counter() - start
 
-        assert elapsed < 0.2  # serial (10 x 0.05s) would be ~0.5s
-        assert service.validate_track_on_release.call_count == MAX_SEARCH_RESULTS
-        assert len(result) == MAX_SEARCH_RESULTS
+        # Two parallel waves of five ≈ 0.1s; the serial floor (10 × 0.05s) is 0.5s.
+        # The generous threshold keeps the parallelism assertion robust under CI load.
+        assert elapsed < 0.35
+        assert service.validate_track_on_release.call_count == 10
+        assert len(result) == 10
 
     @pytest.mark.asyncio
     async def test_non_library_artist_skips_all_validation(self):
@@ -261,6 +265,112 @@ class TestLookupReleasesByTrack:
         albums = [album for _artist, album in result]
         assert "Windowlicker" in albums
         assert "Drukqs" not in albums
+
+    @pytest.mark.asyncio
+    async def test_artist_album_not_starved_by_leading_compilations(self):
+        """Recall (LML#866): the artist's own album must survive even when
+        several validated Various-Artists compilations precede it.
+
+        ``search_releases_by_track`` returns each release's *primary* artist, so
+        VA compilations carry ``artist="Various"`` and the keyword-supplement leg
+        injects non-artist-scoped releases. Those validate True (the track really
+        is on the comp) but are dropped downstream by ``resolve_albums_for_track``'s
+        artist-prefix filter. If validation stops after collecting the first
+        ``MAX_SEARCH_RESULTS`` *raw* releases, a run of leading comps starves the
+        artist's own album — a false ``song_not_found`` for a library artist whose
+        album the library holds. Every candidate up to the search limit is
+        validated and returned.
+        """
+        leading_comps = [
+            ReleaseInfo(
+                album=f"Jazz Sampler {i}",
+                artist="Various",
+                release_id=6000 + i,
+                release_url=f"https://discogs.com/release/{6000 + i}",
+                is_compilation=True,
+            )
+            for i in range(MAX_SEARCH_RESULTS)
+        ]
+        artist_album = ReleaseInfo(
+            album="Duke Ellington & John Coltrane",
+            artist="Duke Ellington & John Coltrane",
+            release_id=6999,
+            release_url="https://discogs.com/release/6999",
+        )
+        service = AsyncMock()
+        service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="In a Sentimental Mood",
+                artist="Duke Ellington & John Coltrane",
+                releases=[*leading_comps, artist_album],
+                total=MAX_SEARCH_RESULTS + 1,
+            )
+        )
+        service.validate_track_on_release = AsyncMock(return_value=True)
+
+        db = AsyncMock()
+        db.search = AsyncMock(
+            return_value=[
+                make_library_item(
+                    artist="Duke Ellington & John Coltrane",
+                    title="Duke Ellington & John Coltrane",
+                )
+            ]
+        )
+
+        result = await lookup_releases_by_track(
+            "In a Sentimental Mood",
+            "Duke Ellington & John Coltrane",
+            service=service,
+            db=db,
+        )
+
+        assert ("Duke Ellington & John Coltrane", "Duke Ellington & John Coltrane") in result
+
+    @pytest.mark.asyncio
+    async def test_gate_uses_artist_column_not_truncatable_fts(self):
+        """Recall (LML#866): the library-first gate must not wrongly suppress a
+        library artist whose bare-name FTS query truncates past its own rows.
+
+        ``db.search(query=...)`` is a cross-column FTS with a fixed LIMIT and no
+        rank ordering (``library/db.py``), so a common single-token artist
+        ("Women", "Low", "Wire") can have its rows crowded out by unrelated title
+        matches. The album-fed consumer searches the far more selective
+        ``"{artist} {album}"`` and would surface the row, so the gate must probe
+        the artist column directly (``db.search(artist=...)``) — a sound lower
+        bound — rather than the truncatable FTS path.
+        """
+        service = AsyncMock()
+        service.search_releases_by_track = AsyncMock(
+            return_value=TrackReleasesResponse(
+                track="Black Rice",
+                artist="Women",
+                releases=[
+                    ReleaseInfo(
+                        album="Public Strain",
+                        artist="Women",
+                        release_id=7001,
+                        release_url="https://discogs.com/release/7001",
+                    )
+                ],
+                total=1,
+            )
+        )
+        service.validate_track_on_release = AsyncMock(return_value=True)
+
+        async def _fake_search(query=None, artist=None, title=None, **kwargs):
+            # FTS (query=) truncates past the artist's row; the artist-column
+            # filter (artist=) finds it.
+            if artist is not None:
+                return [make_library_item(artist="Women", title="Public Strain")]
+            return []
+
+        db = AsyncMock()
+        db.search = AsyncMock(side_effect=_fake_search)
+
+        result = await lookup_releases_by_track("Black Rice", "Women", service=service, db=db)
+
+        assert result == [("Women", "Public Strain")]
 
 
 # ---------------------------------------------------------------------------
