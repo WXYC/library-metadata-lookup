@@ -113,7 +113,7 @@ async def _drive_request_with_retry(service: DiscogsService) -> None:
 
     with (
         patch("discogs.service.get_semaphore", return_value=fake_semaphore),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
     ):
         await service._request_with_retry("GET", "/releases/12345")
 
@@ -345,7 +345,7 @@ async def test_cacheless_get_release_tags_with_no_pg(
 
     with (
         patch("discogs.service.get_semaphore", return_value=fake_semaphore),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
     ):
         await service.get_release(12345)
 

@@ -2,13 +2,18 @@
 
 Implements:
 - Semaphore for concurrent request limiting
-- Token bucket rate limiter for requests per minute
+- Token bucket rate limiter for requests per minute (per-process ``AsyncLimiter``)
+- Shared cross-process rate gate (LML#841): draws permits from the PG token
+  bucket when enabled, else/on-error the local ``AsyncLimiter``
 - Reset function for testing
 """
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
+from typing import Protocol
 
+import sentry_sdk
 from aiolimiter import AsyncLimiter
 
 from discogs.breaker import DiscogsCircuitBreaker
@@ -21,6 +26,9 @@ _semaphores: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 # LML#755 saturation circuit-breaker, stored per event loop alongside the
 # limiter/semaphore (same process-global-on-single-worker scope).
 _breakers: dict[asyncio.AbstractEventLoop, DiscogsCircuitBreaker] = {}
+# LML#841 shared rate gate, stored per event loop (same scope). Composes the
+# per-loop local ``AsyncLimiter`` with the shared PG token bucket.
+_rate_gates: dict[asyncio.AbstractEventLoop, "DiscogsRateGate"] = {}
 
 
 def _build_breaker() -> DiscogsCircuitBreaker:
@@ -105,10 +113,133 @@ def get_discogs_breaker() -> DiscogsCircuitBreaker:
     return _breakers[loop]
 
 
+class _LocalLimiter(Protocol):
+    """The slice of ``AsyncLimiter`` the gate needs — kept minimal so unit tests
+    can inject a recording stand-in without an event loop's real limiter."""
+
+    async def acquire(self) -> None: ...
+
+
+class _RateBucket(Protocol):
+    """The slice of ``PgTokenBucket`` the gate drives (see
+    ``entity/discogs_rate_bucket.py``)."""
+
+    async def try_acquire(self): ...
+
+
+# A factory yields the shared bucket (or ``None`` when no discogs-cache pool is
+# configured / reachable). Async because building it awaits the pool singleton.
+BucketFactory = Callable[[], Awaitable["_RateBucket | None"]]
+
+
+class DiscogsRateGate:
+    """Front door for Discogs *rate* permits, composing two limiters (LML#841).
+
+    * Flag OFF → delegate straight to the per-process local ``AsyncLimiter``
+      (today's exact behavior; PG untouched).
+    * Flag ON, bucket healthy → spend a token from the shared PG bucket, queuing
+      on ``retry_after_s`` when momentarily empty (same "wait, don't shed"
+      contract as ``AsyncLimiter.acquire``).
+    * Flag ON, PG missing/erroring/slow → fail OPEN to the local limiter so a
+      discogs-cache hiccup can never wedge the live-probe tail.
+
+    All resilience *policy* lives here; ``PgTokenBucket`` stays a pure primitive.
+    The per-round-trip ``asyncio.wait_for`` bounds a SINGLE ``try_acquire`` call
+    (a dead/slow PG fails open fast) — NOT the queue-for-a-token wait, so a
+    legitimately saturated-but-healthy bucket still queues normally.
+    """
+
+    def __init__(self, local_limiter: _LocalLimiter, bucket_factory: BucketFactory) -> None:
+        self._local = local_limiter
+        self._bucket_factory = bucket_factory
+        self._bucket: _RateBucket | None = None
+
+    async def _resolve_bucket(self) -> "_RateBucket | None":
+        # Cache the bucket once built. A ``None`` (pool not ready) is NOT cached,
+        # so a pool that comes up after first use is picked up on a later call.
+        if self._bucket is None:
+            self._bucket = await self._bucket_factory()
+        return self._bucket
+
+    async def acquire(self) -> None:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        if not settings.discogs_rate_bucket_enabled:
+            await self._local.acquire()
+            return
+
+        timeout_s = settings.discogs_rate_bucket_timeout_s
+        try:
+            bucket = await self._resolve_bucket()
+            if bucket is None:
+                raise RuntimeError("discogs-cache pool unavailable for shared rate bucket")
+            while True:
+                acquisition = await asyncio.wait_for(bucket.try_acquire(), timeout_s)
+                if acquisition.allowed:
+                    return
+                # Empty-but-healthy bucket: queue for the next token. Bounded by
+                # ~1/refill_per_sec (≈1.2s at 50/min), mirroring the local limiter.
+                await asyncio.sleep(acquisition.retry_after_s)
+        except Exception:
+            # Any PG error, missing row, or round-trip timeout: fail OPEN. Tag the
+            # enclosing trace so the fail-open rate is queryable (a bare log line
+            # is not — LML#683). Then honor the local limiter so we still respect
+            # this process's own budget.
+            sentry_sdk.set_tag("lml.discogs.rate_gate", "fallback")
+            logger.warning(
+                "Discogs shared rate bucket unavailable; failing open to local limiter",
+                exc_info=True,
+            )
+            await self._local.acquire()
+
+
+def _default_bucket_factory() -> BucketFactory:
+    """Build the production factory: wrap the discogs-cache pool in a
+    ``PgTokenBucket`` keyed by settings, or ``None`` when no pool is configured."""
+
+    async def factory() -> "_RateBucket | None":
+        # Function-local imports break the module-load cycle
+        # (core.dependencies -> discogs.service -> discogs.ratelimit) and mirror
+        # this module's existing function-local ``get_settings`` pattern.
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_pool
+        from entity.discogs_rate_bucket import PgTokenBucket
+        from entity.sources import PgSource
+
+        pool = await get_discogs_pool()
+        if pool is None:
+            return None
+        settings = get_settings()
+        return PgTokenBucket(PgSource(pool=pool), bucket_key=settings.discogs_rate_bucket_key)
+
+    return factory
+
+
+def get_discogs_rate_gate() -> "DiscogsRateGate":
+    """Get or create the shared rate gate for the current event loop.
+
+    Wraps the per-loop local ``AsyncLimiter`` (``get_rate_limiter``) with the
+    shared PG token bucket. Off-loop (legacy direct-call tests) returns a fresh
+    unshared gate, matching ``get_discogs_breaker``'s posture.
+    """
+    local = get_rate_limiter()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return DiscogsRateGate(local, _default_bucket_factory())
+
+    if loop not in _rate_gates:
+        _rate_gates[loop] = DiscogsRateGate(local, _default_bucket_factory())
+        logger.debug("Created Discogs shared rate gate")
+    return _rate_gates[loop]
+
+
 def reset_rate_limiting() -> None:
     """Reset rate limiting state for testing."""
-    global _rate_limiters, _semaphores, _breakers
+    global _rate_limiters, _semaphores, _breakers, _rate_gates
     _rate_limiters.clear()
     _semaphores.clear()
     _breakers.clear()
+    _rate_gates.clear()
     logger.debug("Reset rate limiting state")

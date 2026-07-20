@@ -279,6 +279,42 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Shared Discogs Rate Token Bucket (LML#841)
+    # The per-process `AsyncLimiter` bounds each LML process to `discogs_rate_limit`/min,
+    # but prod and staging share ONE Discogs token against ONE 60/min upstream bucket, so
+    # N uncoordinated limiters can collectively exceed it and 429-trip the #755 breaker
+    # (reference_lml_staging_shares_prod). This flag moves the *rate* dimension to a shared
+    # PG token bucket in the LML-owned `lml_cache.discogs_rate_bucket` row, giving exact
+    # global enforcement. The per-process semaphore (`discogs_max_concurrent`) and the #755
+    # breaker stay local. Default OFF: enabling is a staged rollout (merge inert → staging →
+    # prod), and any discogs-cache PG hiccup fails OPEN back to the local `AsyncLimiter`.
+    discogs_rate_bucket_enabled: bool = Field(
+        default=False,
+        description=(
+            "When True, draw Discogs rate permits from the shared PG token bucket "
+            "(`lml_cache.discogs_rate_bucket`) instead of the per-process AsyncLimiter, for "
+            "exact cross-process/-environment enforcement of the shared 60/min budget. Fails "
+            "open to the local limiter on any PG error. Default False (inert)."
+        ),
+    )
+    discogs_rate_bucket_key: str = Field(
+        default="discogs",
+        description=(
+            "Primary key of the shared bucket row. All LML processes sharing one Discogs token "
+            "and one discogs-cache PG must use the SAME key so they draw from one budget. "
+            "Override only to isolate an independent token (e.g. a second Discogs app)."
+        ),
+    )
+    discogs_rate_bucket_timeout_s: float = Field(
+        default=0.5,
+        ge=0.0,
+        description=(
+            "Per-round-trip deadline (seconds) on a SINGLE token-bucket UPDATE before the gate "
+            "fails open to the local AsyncLimiter. Bounds one PG call, NOT the queue-for-a-token "
+            "wait — a slow/locked discogs-cache can never wedge the live-probe tail. Must be >= 0."
+        ),
+    )
+
     # Admin Configuration
     admin_token: str | None = Field(
         None, description="Bearer token for admin endpoints (e.g. library.db upload)"

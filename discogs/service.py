@@ -51,7 +51,7 @@ from discogs.models import (
     TrackItem,
     TrackReleasesResponse,
 )
-from discogs.ratelimit import get_discogs_breaker, get_rate_limiter, get_semaphore
+from discogs.ratelimit import get_discogs_breaker, get_discogs_rate_gate, get_semaphore
 
 if TYPE_CHECKING:
     from discogs.cache_service import DiscogsCacheService
@@ -424,7 +424,7 @@ class DiscogsService:
 
         client = await self._get_client()
         semaphore = get_semaphore()
-        rate_limiter = get_rate_limiter()
+        rate_gate = get_discogs_rate_gate()
         breaker = get_discogs_breaker()
 
         # LML#755 saturation shed. When the breaker is OPEN, fast-fail *before*
@@ -517,7 +517,9 @@ class DiscogsService:
                         op="lock.acquire", name="lml.discogs.rate_limiter"
                     ) as span:
                         apply_request_ctx_tags(span)
-                        await rate_limiter.acquire()
+                        # LML#841: shared PG token bucket when enabled, else/on-error
+                        # the per-process AsyncLimiter (fail-open inside the gate).
+                        await rate_gate.acquire()
 
                     response = await client.request(method, path, params=params)
 

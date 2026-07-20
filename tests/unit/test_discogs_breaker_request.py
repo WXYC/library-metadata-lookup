@@ -48,6 +48,11 @@ def _response(status_code: int, headers: dict[str, str] | None = None) -> MagicM
 
 @pytest.fixture
 def fake_limiter() -> MagicMock:
+    # Stands in for the ``discogs.service.get_discogs_rate_gate()`` seam (LML#841):
+    # the service awaits ``rate_gate.acquire()``, and a gate exposes the same
+    # ``acquire()`` interface the raw ``AsyncLimiter`` did, so this fake doubles as
+    # a fake gate. Patching the gate (not the underlying limiter) keeps these tests
+    # asserting the same "rate permit acquired / not acquired" behavior.
     limiter = MagicMock()
     limiter.acquire = AsyncMock()
     return limiter
@@ -67,7 +72,7 @@ async def test_open_breaker_sheds_without_touching_limiter(fake_limiter):
     sem = asyncio.Semaphore(5)
     with (
         patch("discogs.service.get_semaphore", return_value=sem),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
     ):
         with pytest.raises(DiscogsBreakerOpenError):
@@ -93,7 +98,7 @@ async def test_open_breaker_emits_the_counter(fake_limiter):
     recorder = MagicMock()
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.get_cache_stats_recorder", return_value=recorder),
     ):
@@ -117,7 +122,7 @@ async def test_closed_breaker_healthy_request_passes_through(fake_limiter):
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
     ):
         result = await service._request_with_retry("GET", "/database/search")
@@ -151,7 +156,7 @@ async def test_sustained_429_requests_trip_the_breaker_from_the_request_path():
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.asyncio.sleep", new=AsyncMock()),
     ):
@@ -190,7 +195,7 @@ async def test_429_with_exhausted_remaining_opens_proactively():
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.asyncio.sleep", new=AsyncMock()),
     ):
@@ -217,7 +222,7 @@ async def test_5xx_does_not_reset_the_breaker_failure_run():
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.asyncio.sleep", new=AsyncMock()),
     ):
@@ -251,7 +256,7 @@ async def test_breaker_opening_mid_flight_sheds_the_retrying_request():
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.asyncio.sleep", side_effect=open_during_sleep),
     ):
@@ -283,7 +288,7 @@ async def test_closed_breaker_actually_rides_the_backoff_when_not_shed():
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.asyncio.sleep", new=sleep_spy),
     ):
@@ -329,7 +334,7 @@ async def test_inflight_shed_during_cooldown_does_not_latch_the_breaker(clock):
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.asyncio.sleep", side_effect=open_and_elapse_cooldown),
     ):
@@ -352,7 +357,7 @@ async def test_inflight_shed_during_cooldown_does_not_latch_the_breaker(clock):
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
     ):
         result = await healthy_service._request_with_retry("GET", "/database/search")
@@ -385,7 +390,7 @@ async def _assert_recovery_possible(breaker: DiscogsCircuitBreaker, clock: Monot
     fake_limiter.acquire = AsyncMock()
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
     ):
         result = await healthy_service._request_with_retry("GET", "/database/search")
@@ -409,7 +414,7 @@ async def test_trial_killed_by_request_error_does_not_latch(fake_limiter, clock)
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
     ):
         # This request is admitted as the half-open trial, then dies.
@@ -434,7 +439,7 @@ async def test_trial_cancelled_mid_request_does_not_latch(fake_limiter, clock):
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
     ):
         with pytest.raises(asyncio.CancelledError):
@@ -458,7 +463,7 @@ async def test_trial_cancelled_during_retry_sleep_does_not_latch(fake_limiter, c
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
         patch("discogs.service.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError())),
     ):
@@ -486,7 +491,7 @@ async def test_trial_cancelled_during_limiter_acquire_does_not_latch(clock):
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=cancelling_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=cancelling_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
     ):
         with pytest.raises(asyncio.CancelledError):
@@ -510,7 +515,7 @@ async def test_closed_request_error_leaves_the_breaker_closed(fake_limiter):
 
     with (
         patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
-        patch("discogs.service.get_rate_limiter", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
         patch("discogs.service.get_discogs_breaker", return_value=breaker),
     ):
         result = await service._request_with_retry("GET", "/database/search")
