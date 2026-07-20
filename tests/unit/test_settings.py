@@ -121,6 +121,28 @@ class TestDiscogsRateLimitBounds:
             Settings(discogs_rate_limit=-5)
 
 
+class TestDiscogsRateBucketTimeoutBounds:
+    """LML#841 review (round 2, Finding 4): ``discogs_rate_bucket_timeout_s`` is the
+    per-round-trip ``asyncio.wait_for`` deadline on a single bucket UPDATE. A value of
+    ``0`` times out every acquire immediately and silently fails the gate open on every
+    call — a footgun distinct from the intended ``discogs_rate_bucket_enabled=false``
+    kill switch — so the knob is bounded ``gt=0`` rather than ``ge=0``."""
+
+    def test_defaults_to_half_second(self):
+        assert Settings().discogs_rate_bucket_timeout_s == 0.5
+
+    def test_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            Settings(discogs_rate_bucket_timeout_s=0)
+
+    def test_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            Settings(discogs_rate_bucket_timeout_s=-0.1)
+
+    def test_accepts_small_positive(self):
+        assert Settings(discogs_rate_bucket_timeout_s=0.01).discogs_rate_bucket_timeout_s == 0.01
+
+
 class TestGetSettings:
     def test_returns_settings_instance(self):
         get_settings.cache_clear()

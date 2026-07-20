@@ -7,7 +7,11 @@ staging share ONE Discogs application token against ONE upstream 60/min bucket
 collectively exceed the shared budget, 429-tripping the LML#755 saturation
 breaker. This module moves the *rate* dimension to a single shared row in the
 LML-owned ``lml_cache.discogs_rate_bucket`` table so every process draws permits
-from one lazily-refilled token bucket — exact global enforcement.
+from one lazily-refilled token bucket — N processes meter against a single shared
+budget (one global burst envelope) instead of N uncoordinated ones. (The envelope
+is the same as a single ``AsyncLimiter(rate, 60)``: seeded full, a cold bucket can
+still burst up to ``capacity`` immediately; the win is that the burst is shared
+globally, not multiplied per process — not a strict rate-in-any-window cap.)
 
 Design split (deliberate):
 

@@ -290,16 +290,18 @@ class Settings(BaseSettings):
     # but prod and staging share ONE Discogs token against ONE 60/min upstream bucket, so
     # N uncoordinated limiters can collectively exceed it and 429-trip the #755 breaker
     # (reference_lml_staging_shares_prod). This flag moves the *rate* dimension to a shared
-    # PG token bucket in the LML-owned `lml_cache.discogs_rate_bucket` row, giving exact
-    # global enforcement. The per-process semaphore (`discogs_max_concurrent`) and the #755
+    # PG token bucket in the LML-owned `lml_cache.discogs_rate_bucket` row, so N processes
+    # meter against one shared global budget instead of N uncoordinated ones (same burst
+    # envelope as a single AsyncLimiter, shared globally). The per-process semaphore
+    # (`discogs_max_concurrent`) and the #755
     # breaker stay local. Default OFF: enabling is a staged rollout (merge inert → staging →
     # prod), and any discogs-cache PG hiccup fails OPEN back to the local `AsyncLimiter`.
     discogs_rate_bucket_enabled: bool = Field(
         default=False,
         description=(
             "When True, draw Discogs rate permits from the shared PG token bucket "
-            "(`lml_cache.discogs_rate_bucket`) instead of the per-process AsyncLimiter, for "
-            "exact cross-process/-environment enforcement of the shared 60/min budget. Fails "
+            "(`lml_cache.discogs_rate_bucket`) instead of the per-process AsyncLimiter, so all "
+            "processes/environments meter against one shared budget for the 60/min token. Fails "
             "open to the local limiter on any PG error. Default False (inert)."
         ),
     )
@@ -313,11 +315,13 @@ class Settings(BaseSettings):
     )
     discogs_rate_bucket_timeout_s: float = Field(
         default=0.5,
-        ge=0.0,
+        gt=0.0,
         description=(
             "Per-round-trip deadline (seconds) on a SINGLE token-bucket UPDATE before the gate "
             "fails open to the local AsyncLimiter. Bounds one PG call, NOT the queue-for-a-token "
-            "wait — a slow/locked discogs-cache can never wedge the live-probe tail. Must be >= 0."
+            "wait — a slow/locked discogs-cache can never wedge the live-probe tail. Must be > 0: "
+            "a zero deadline would immediately time out every acquire and silently fail the gate "
+            "open on every call; to disable the bucket use `discogs_rate_bucket_enabled=false`."
         ),
     )
 
