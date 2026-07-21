@@ -13,10 +13,34 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from config.settings import Settings
+from config.settings import Settings, get_settings
 from discogs.models import DiscogsSearchResponse
 from library.db import LibraryDB
 from tests.factories import make_discogs_result
+
+
+@pytest.fixture(scope="session", autouse=True)
+def scrub_posthog_env():
+    """Blank ``POSTHOG_API_KEY`` for the whole integration session (LML#879).
+
+    This tier's hermeticity convention is FastAPI ``dependency_overrides``, but
+    the rate-gate fail-open emitter (``discogs/ratelimit._capture_fail_open``)
+    bypasses DI by design — it reads ``get_posthog_client()`` (which builds a
+    real singleton client straight from ``os.environ``) and the cached real
+    ``Settings`` (telemetry default-on). Without this scrub, the first
+    integration test that drives the gate into fail-open on a host whose shell
+    or ``.env`` carries a live key would send real events to the production
+    PostHog project. Blank rather than delete, mirroring
+    ``tests/unit/conftest.py``'s ``scrub_credential_env``: env vars outrank the
+    ``.env`` source, and empty behaves like unset throughout the codebase.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("POSTHOG_API_KEY", "")
+    get_settings.cache_clear()
+    yield
+    mp.undo()
+    get_settings.cache_clear()
+
 
 # ---------------------------------------------------------------------------
 # PostgreSQL test pool (shared by the ``@pytest.mark.pg`` integration suite)
