@@ -212,6 +212,7 @@ async def lifespan(app: FastAPI):
                 set_up_release_resolution_cache_schema,
             )
             from entity.sources import PgSource
+            from entity.streaming_catalog import set_up_streaming_catalog_schema
             from entity.streaming_url_cache import set_up_streaming_url_cache_schema
 
             pool = await get_discogs_pool()
@@ -242,6 +243,14 @@ async def lifespan(app: FastAPI):
                     refill_per_sec=settings.discogs_rate_limit / 60,
                 )
                 logger.info("Discogs rate-bucket schema ready")
+                # Offline streaming-availability catalog (LML#842), the
+                # row-level PG canonical replacing the whole-file
+                # streaming_availability.db lineage. Same pool, same
+                # best-effort posture. First lml_cache.* bootstrap to install
+                # triggers/functions (CREATE OR REPLACE — idempotent by
+                # replacement; see entity/streaming_catalog.py).
+                await set_up_streaming_catalog_schema(source)
+                logger.info("Streaming-catalog schema ready")
             else:
                 logger.info(
                     "Discogs cache pool unavailable at startup — streaming-URL cache "
