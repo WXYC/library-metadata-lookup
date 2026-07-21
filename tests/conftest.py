@@ -6,11 +6,41 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from wxyc_fastapi.observability import RequestTelemetry
 
+from config.settings import get_settings
 from discogs.service import DiscogsApiCheckResult
 from lookup import streaming_url_postprocess as _streaming_mod
 from lookup.streaming_url_postprocess import set_suppress_streaming_warm
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_library_item
+
+
+@pytest.fixture(scope="session", autouse=True)
+def scrub_posthog_env():
+    """Blank ``POSTHOG_API_KEY`` for the whole pytest session (LML#879).
+
+    The integration and e2e tiers' hermeticity convention is FastAPI
+    ``dependency_overrides`` (``get_posthog_client -> None``), but the
+    rate-gate fail-open emitter (``discogs/ratelimit._capture_fail_open``)
+    bypasses DI by design — it reads ``get_posthog_client()`` (which builds a
+    real singleton client straight from ``os.environ``) and the cached real
+    ``Settings`` (telemetry default-on). Without this scrub, the first test
+    that drives the gate into fail-open on a host whose shell or ``.env``
+    carries a live key would send real ``discogs_rate_gate_fail_open`` events
+    to the production PostHog project. E2E is the most exposed tier (it
+    module-skips without a real ``DISCOGS_TOKEN``, so it runs precisely on
+    hosts with a populated ``.env``); the unit tier is already covered by its
+    own ``scrub_credential_env``, for which the extra blank here is a no-op.
+    One session fixture in this root conftest rather than per-tier copies so
+    the scrub can't drift between tiers. Blank rather than delete, mirroring
+    ``tests/unit/conftest.py``'s ``scrub_credential_env``: env vars outrank
+    the ``.env`` source, and empty behaves like unset throughout the codebase.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("POSTHOG_API_KEY", "")
+    get_settings.cache_clear()
+    yield
+    mp.undo()
+    get_settings.cache_clear()
 
 
 def reset_streaming_warm_state() -> None:
