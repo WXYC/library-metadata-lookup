@@ -11,8 +11,8 @@ the shared discogs-cache PostgreSQL.
 * ``lml_cache.streaming_album`` — one row per deduplicated library album
   (identity, Discogs match group). Seeded from the SQLite ``albums`` table
   with ids preserved via ``OVERRIDING SYSTEM VALUE`` — the identity is
-  ``GENERATED ALWAYS``, so only that deliberate seed spelling can insert an
-  explicit id; a ported pipeline can't slip one past the sequence silently.
+  ``GENERATED ALWAYS``, so a plain INSERT with an explicit id is rejected
+  outright (``COPY`` sits outside that net; see the ``_DDL_ALBUM`` comment).
 * ``lml_cache.streaming_album_service`` — one row per (album, service) probe
   outcome. Normalized service rows (vs the wide SQLite columns) dissolve the
   drift-column problem: ``tidal``/``youtube_music``/``soundcloud`` are
@@ -96,8 +96,11 @@ _SERVICES = (
 # Import-time tripwire: service values are spliced into SQL literals and read
 # back out of pg_get_constraintdef's deparse by the widen block's quoted-
 # literal extraction. A quote (or any non-slug character) in a value would
-# fragment that round-trip, so reject it before it can reach any DDL.
-assert all(re.fullmatch(r"[a-z0-9_]+", s) for s in _SERVICES), _SERVICES
+# fragment that round-trip, so reject it before it can reach any DDL. An
+# explicit raise, not ``assert`` — the repo convention keeps import-time
+# tripwires alive under ``python -O`` (see lookup/orchestrator.py).
+if not all(re.fullmatch(r"[a-z0-9_]+", s) for s in _SERVICES):
+    raise RuntimeError(f"non-slug service value in _SERVICES: {_SERVICES}")
 
 # Shared IN-list literal so the CREATE-time CHECK and the widen DO block's
 # code-side array are generated from the same source — they can never drift.
@@ -122,13 +125,18 @@ _DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 # ``GENERATED ALWAYS`` on this identity and ``streaming_track_result``'s: the
 # one-time seed (PR C) inserts the SQLite ``albums.id`` / ``track_results.id``
 # values verbatim via ``OVERRIDING SYSTEM VALUE`` so cross-table references
-# stay valid, then advances each sequence past max(id). Every other explicit
-# id errors loudly — the ported direct-sqlite scripts (PRs D/E) historically
-# managed ids by hand, exactly the class of writer that must not bypass the
-# sequence silently.
+# stay valid, then advances each sequence past max(id). Any other explicit id
+# arriving via plain INSERT errors loudly — the ported direct-sqlite scripts
+# (PRs D/E) historically managed ids by hand, exactly the class of writer
+# that must not bypass the sequence silently. ``COPY`` sits outside that net
+# (PG loads explicit ids into a GENERATED ALWAYS column without OVERRIDING
+# SYSTEM VALUE and never advances the sequence), so ports must load via
+# INSERT — or pair any COPY with an explicit ``setval``.
 # ``library_ids``/``formats`` deliberately carry NO column default: every
 # legacy SQLite row has both, and a default would let a seed that forgets to
-# map them pass silently — NOT NULL with no default makes the omission loud.
+# map them pass silently. NOT NULL with no default makes an *omitted* column
+# loud, and the jsonb-shape CHECK makes the sneaky spellings loud too —
+# ``'null'::jsonb`` and scalars satisfy NOT NULL; only SQL NULL trips it.
 _DDL_ALBUM = """\
 CREATE TABLE IF NOT EXISTS lml_cache.streaming_album (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -147,6 +155,9 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album (
     discogs_title TEXT,
     discogs_status TEXT NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT streaming_album_provenance_arrays CHECK (
+        jsonb_typeof(library_ids) = 'array' AND jsonb_typeof(formats) = 'array'
+    ),
     UNIQUE (normalized_artist, normalized_title)
 )\
 """
@@ -305,8 +316,9 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_coverage_baseline (
 # the collected Discogs match linkage need their own guard. A corrected
 # ``discogs_release_id`` (re-match to a different release) is allowed — only
 # unlinking (→ NULL) loses collected data. Same shape for the match text:
-# nulling collected ``discogs_artist``/``discogs_title`` is blocked, replacing
-# them with corrected text is allowed. Re-keying the row identity is blocked
+# discarding collected ``discogs_artist``/``discogs_title`` — to NULL *or*
+# ``''``, the extractors' two "empty" spellings — is blocked, replacing them
+# with corrected text is allowed. Re-keying the row identity is blocked
 # too — the id leg stays reachable even under GENERATED ALWAYS via ``SET id =
 # DEFAULT`` (draws a fresh sequence value; a direct ``SET id = <n>`` dies
 # earlier at parse analysis), and moving the normalized pair silently points
@@ -337,9 +349,11 @@ BEGIN
             '{_OPT_IN_HINT}',
             OLD.id;
     END IF;
-    IF (OLD.discogs_artist IS NOT NULL AND NEW.discogs_artist IS NULL)
-        OR (OLD.discogs_title IS NOT NULL AND NEW.discogs_title IS NULL) THEN
-        RAISE EXCEPTION 'streaming_album: nulling collected Discogs match metadata '
+    IF (OLD.discogs_artist IS NOT NULL AND OLD.discogs_artist <> ''
+            AND (NEW.discogs_artist IS NULL OR NEW.discogs_artist = ''))
+        OR (OLD.discogs_title IS NOT NULL AND OLD.discogs_title <> ''
+            AND (NEW.discogs_title IS NULL OR NEW.discogs_title = '')) THEN
+        RAISE EXCEPTION 'streaming_album: discarding collected Discogs match metadata '
             'blocked (id=%); '
             '{_OPT_IN_HINT}',
             OLD.id;
@@ -359,6 +373,11 @@ END;
 $$\
 """
 
+# All four row triggers deliberately carry no ``UPDATE OF`` column list: an
+# OF list fires on SET-list *membership* (not value change), so a future
+# BEFORE trigger rewriting a guarded column would bypass it, and it would be
+# a second hand-maintained column enumeration drifting from the function
+# bodies. Fire on every UPDATE; the function decides.
 _DDL_GUARD_ALBUM_TRIGGER = """\
 CREATE OR REPLACE TRIGGER streaming_album_no_regress
 BEFORE UPDATE OR DELETE ON lml_cache.streaming_album
@@ -373,7 +392,10 @@ FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_album()\
 # different album/service. Discarding collected match metadata (the text
 # columns to NULL or ``''`` — the extractors' two "empty" spellings —
 # ``confidence`` to NULL) is blocked; replacing it with corrected values is
-# allowed.
+# allowed. On the CHECK-banned url columns (here and the track guard) the
+# OLD-side ``<> ''`` legs are redundant-by-design: the guards keep one
+# uniform two-spellings predicate, and they are re-asserted every boot while
+# a CHECK dropped out-of-band stays dropped.
 _DDL_GUARD_ALBUM_SERVICE_FN = f"""\
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_album_service()
 RETURNS trigger
@@ -609,6 +631,16 @@ BEFORE TRUNCATE ON lml_cache.streaming_coverage_baseline
 FOR EACH STATEMENT EXECUTE FUNCTION lml_cache.guard_streaming_truncate()\
 """
 
+# The four catalog tables in creation order (parents before children, per the
+# FKs). The one authoritative list: tests import it instead of retyping the
+# names, and derive FK-safe drop order by reversing it.
+_TABLES = (
+    "streaming_album",
+    "streaming_album_service",
+    "streaming_track_result",
+    "streaming_coverage_baseline",
+)
+
 # Ordered: schema first, parents before children (FKs), tables before their
 # widen block/indexes/triggers. Kept as a module constant so the bootstrap
 # and the unit parity tests reference one list; the .sql reference mirrors
@@ -669,11 +701,8 @@ async def set_up_streaming_catalog_schema(pg: PgSource) -> None:
     constants above). The ``CREATE OR REPLACE`` function/trigger forms are the
     idempotent equivalents of ``IF NOT EXISTS`` (which triggers don't
     support); replacing an identical definition is a no-op in effect. The
-    widen-only DO block merges the current ``_SERVICES`` into the deployed
-    named CHECK — something CREATE TABLE IF NOT EXISTS cannot do on an
-    existing table — never narrows it, and exits without touching the
-    constraint when there is nothing to add, so a steady-state boot takes no
-    ACCESS EXCLUSIVE lock and the constraint OID stays stable.
+    service-CHECK maintenance semantics (widen-only, steady-state no-op) are
+    documented on ``_DDL_ALBUM_SERVICE_WIDEN_CHECK`` above.
     """
     async with pg.acquire() as conn:
         async with conn.transaction():

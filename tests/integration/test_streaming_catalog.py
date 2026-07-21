@@ -20,6 +20,8 @@ Run with: pytest -m pg -v tests/integration/test_streaming_catalog.py
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import asyncpg
 import pytest
 import pytest_asyncio
@@ -27,25 +29,15 @@ import pytest_asyncio
 from entity.sources import PgSource
 from entity.streaming_catalog import (
     _SERVICE_IN_LIST,
+    _TABLES,
     ALLOW_URL_REMOVAL_GUC,
     set_up_streaming_catalog_schema,
 )
 from tests.integration.conftest import skip_if_named_tables_populated
 
-_TABLES = (
-    "streaming_album",
-    "streaming_album_service",
-    "streaming_track_result",
-    "streaming_coverage_baseline",
-)
-
-# Children before parents so plain DROP TABLE succeeds against the FKs.
-_DROP_ORDER = (
-    "streaming_track_result",
-    "streaming_album_service",
-    "streaming_album",
-    "streaming_coverage_baseline",
-)
+# ``_TABLES`` is parents-before-children (creation order), so its reverse is
+# FK-safe for plain DROP TABLE.
+_DROP_ORDER = tuple(reversed(_TABLES))
 
 # ``library_ids``/``formats`` are NOT NULL with no default (seed provenance
 # must be explicit), so every album insert supplies them.
@@ -326,6 +318,29 @@ class TestSchemaBootstrap:
                 )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "non_array",
+        ["'null'::jsonb", "'\"vinyl\"'::jsonb", "'42'::jsonb", "'{}'::jsonb"],
+    )
+    @pytest.mark.parametrize("column", ["library_ids", "formats"])
+    async def test_album_provenance_jsonb_must_be_an_array(self, pg_pool, column, non_array):
+        """jsonb ``null`` (and scalars/objects) satisfy NOT NULL — SQL NULL is
+        the only spelling the no-default tripwire above catches. Without a
+        shape CHECK, a seed that maps a missing value via ``json.dumps(None)``
+        stores ``'null'::jsonb`` and the loud-omission promise never fires;
+        consumers doing ``jsonb_array_elements`` then error on scalars or
+        silently yield nothing."""
+        other = "formats" if column == "library_ids" else "library_ids"
+        with pytest.raises(asyncpg.CheckViolationError):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO lml_cache.streaming_album "
+                    "(normalized_artist, normalized_title, display_artist, display_title, "
+                    f"{column}, {other}) VALUES "
+                    f"('sun ra', 'lanquidity', 'Sun Ra', 'Lanquidity', {non_array}, '[]'::jsonb)"
+                )
+
+    @pytest.mark.asyncio
     async def test_track_unique_on_album_artist_title(self, pg_pool):
         album_id = await _make_album(pg_pool)
         await _make_track(pg_pool, album_id, artist="Stereolab", title="Pop Quiz")
@@ -459,6 +474,43 @@ class TestSchemaBootstrap:
                 _TRACK_SOURCE_TYPE,
             )
         assert row_id == 7777
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("table", ["streaming_album", "streaming_track_result"])
+    async def test_id_columns_are_generated_always(self, pg_pool, table):
+        """The plain-INSERT rejections above hold only while the identity
+        stays ``GENERATED ALWAYS`` (``attidentity = 'a'``); a drive-by
+        relaxation to BY DEFAULT would keep every other test green while
+        silently re-opening sequence-desync seeding."""
+        async with pg_pool.acquire() as conn:
+            # ``attidentity`` is the internal ``"char"`` type, which asyncpg
+            # decodes as bytes; cast to text for a plain string comparison.
+            attidentity = await conn.fetchval(
+                "SELECT attidentity::text FROM pg_attribute "
+                "WHERE attrelid = ($1)::regclass AND attname = 'id'",
+                f"lml_cache.{table}",
+            )
+        assert attidentity == "a"
+
+    @pytest.mark.asyncio
+    async def test_reference_sql_file_applies_over_a_bootstrapped_schema(self, pg_pool):
+        """The unit parity tests prove the ``.sql`` twin *textually* matches
+        ``_DDL_STATEMENTS``; this proves the file is executable SQL as shipped
+        — comments, dollar-quoted bodies and all — by applying it verbatim
+        over the bootstrapped schema (idempotent, like a second boot)."""
+        sql = (Path(__file__).resolve().parents[2] / "entity" / "streaming_catalog.sql").read_text(
+            encoding="utf-8"
+        )
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(sql)
+            rows = await conn.fetch(
+                "SELECT DISTINCT event_object_table FROM information_schema.triggers "
+                "WHERE event_object_schema = 'lml_cache' "
+                "AND event_object_table = ANY($1::text[])",
+                list(_TABLES),
+            )
+        assert sorted(r["event_object_table"] for r in rows) == sorted(_TABLES)
 
 
 @pytest.mark.pg
@@ -664,16 +716,20 @@ class TestAlbumRowGuard:
                 )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("blank_value", ["NULL", "''"])
     @pytest.mark.parametrize("column", ["discogs_artist", "discogs_title"])
-    async def test_nulling_collected_discogs_match_metadata_is_rejected(self, pg_pool, column):
+    async def test_discarding_collected_discogs_match_metadata_is_rejected(
+        self, pg_pool, column, blank_value
+    ):
         """``discogs_artist``/``discogs_title`` record WHAT was matched —
         collected alongside the release id and discarded as surely by nulling
-        them while the link itself survives."""
+        or blanking them while the link itself survives (the extractors' two
+        "empty" spellings, mirroring the service-row metadata gate)."""
         album_id = await _make_matched_album(pg_pool)
         with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
             async with pg_pool.acquire() as conn:
                 await conn.execute(
-                    f"UPDATE lml_cache.streaming_album SET {column} = NULL WHERE id = $1",
+                    f"UPDATE lml_cache.streaming_album SET {column} = {blank_value} WHERE id = $1",
                     album_id,
                 )
 
@@ -1202,6 +1258,21 @@ class TestTrackRowGuard:
                 )
 
     @pytest.mark.asyncio
+    async def test_track_id_rekey_via_default_is_rejected(self, pg_pool):
+        """``UPDATE ... SET id = DEFAULT`` slips past GENERATED ALWAYS (it
+        draws a fresh sequence value rather than erroring); the guard's
+        identity predicate is the layer that blocks it — same seam as the
+        album twin above."""
+        album_id = await _make_album(pg_pool)
+        track_id = await _make_track(pg_pool, album_id)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_track_result SET id = DEFAULT WHERE id = $1",
+                    track_id,
+                )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "column",
         [
@@ -1417,6 +1488,8 @@ class TestCoverageBaselineGuard:
         INSERT-side defusal (rename the floor away, re-INSERT it lower) has
         no first step — while a brand-new metric's first INSERT stays legal."""
         await _seed_baseline(pg_pool)
+        # Step 1 of the attack chain; its standalone rejection is
+        # test_renaming_a_metric_is_rejected above.
         with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
             async with pg_pool.acquire() as conn:
                 await conn.execute(
