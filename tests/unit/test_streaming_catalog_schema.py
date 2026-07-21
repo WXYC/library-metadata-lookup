@@ -7,8 +7,10 @@ Two surfaces, mirroring ``test_streaming_url_cache_schema.py``:
   ``streaming_album_service``, ``streaming_track_result``,
   ``streaming_coverage_baseline``), the named service CHECK, and the
   no-regress guard functions + triggers, so a reviewer / operator has the DDL
-  inline. A normalized-containment check pins every runtime statement —
-  including the PL/pgSQL guard bodies — to the reference verbatim.
+  inline. A normalized exact-equality check pins the reference to the runtime
+  statements — including the PL/pgSQL guard bodies — same statements, same
+  order, nothing stale; a per-statement containment loop keeps the diagnostics
+  readable when one statement drifts.
 * ``set_up_streaming_catalog_schema`` — the lifespan/DAO bootstrap helper. It
   must issue pure, byte-stable DDL (CREATE/ALTER only — never a row
   mutation) inside one transaction on one connection, after a preamble that
@@ -52,13 +54,18 @@ _TABLES = (
 
 
 def _normalize_sql(text: str) -> str:
-    """Strip ``--`` comments and collapse all whitespace to single spaces.
+    """Strip ``--`` comments, drop semicolons, collapse whitespace.
 
-    Safe here because no statement in either file embeds a literal ``--``
-    inside a string (the RAISE messages use an em-dash).
+    Semicolons are replaced on BOTH sides of every comparison (the .sql
+    carries statement terminators, the runtime statements don't; the ones
+    inside the PL/pgSQL bodies are dropped symmetrically, so equality is
+    unaffected). A ``--`` inside a runtime statement would silently truncate
+    it — ``test_runtime_statements_carry_no_line_comments`` guards that side;
+    the .sql's ``--`` prose is the point of the reference file. The RAISE
+    messages use an em-dash, never ``--``.
     """
     lines = [line.split("--", 1)[0] for line in text.splitlines()]
-    return " ".join(" ".join(lines).split())
+    return " ".join(" ".join(lines).replace(";", " ").split())
 
 
 class _FakeTransaction:
@@ -71,6 +78,7 @@ class _FakeTransaction:
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
+        self._source.transaction_ends += 1
         self._source.in_transaction = False
 
 
@@ -83,6 +91,9 @@ class _FakeConnection:
 
     async def execute(self, sql: str, *args: object) -> str:
         self._source.executed.append((sql, self._source.in_transaction))
+        fail_on = self._source.fail_on
+        if fail_on is not None and fail_on in sql:
+            raise RuntimeError(f"injected failure on {fail_on!r}")
         return "CREATE"
 
 
@@ -90,13 +101,17 @@ class _FakePgSource:
     """Records every statement the bootstrap issues and whether it ran inside
     the wrapping transaction. Deliberately defines only ``acquire`` — any
     other attribute access (pool-level ``execute``/``fetchone``) is an
-    ``AttributeError``, which doubles as the only-one-connection assertion."""
+    ``AttributeError``, which doubles as the only-one-connection assertion.
+    ``fail_on`` injects a mid-boot failure on the first statement containing
+    that substring, for the error-propagation test."""
 
-    def __init__(self) -> None:
+    def __init__(self, fail_on: str | None = None) -> None:
         self.executed: list[tuple[str, bool]] = []
         self.acquire_count = 0
         self.transaction_starts = 0
+        self.transaction_ends = 0
         self.in_transaction = False
+        self.fail_on = fail_on
 
     @property
     def statements(self) -> list[str]:
@@ -126,10 +141,14 @@ class TestCanonicalDDLReference:
 
     def test_check_constraint_allowlist_matches_services(self):
         # The .sql is a hand-maintained mirror of the runtime DDL, which
-        # generates its IN-list from ``_SERVICES``. Parse the first IN-list and
-        # assert exact-set equality so the mirror can't drift.
+        # generates its IN-list from ``_SERVICES``. Anchor on the named
+        # constraint (the widen DO block contains other ``service IN``
+        # fragments) and assert exact-set equality so the mirror can't drift.
         ddl = _SQL_REFERENCE.read_text()
-        match = re.search(r"service\s+IN\s*\(([^)]*)\)", ddl)
+        match = re.search(
+            r"CONSTRAINT streaming_album_service_valid CHECK\s*\(\s*service\s+IN\s*\(([^)]*)\)",
+            ddl,
+        )
         assert match is not None, "CHECK constraint IN-list not found in the .sql reference"
         sql_services = set(re.findall(r"'([^']+)'", match.group(1)))
         assert sql_services == set(_SERVICES), (
@@ -145,11 +164,12 @@ class TestCanonicalDDLReference:
             assert service in _SERVICES
 
     def test_describes_the_no_regress_guards(self):
-        # 3 functions (album-service row guard, track row guard, shared
-        # TRUNCATE guard) wired through 4 triggers (row + TRUNCATE per table).
+        # 5 functions (album, album-service, track, coverage-baseline row
+        # guards + the shared TRUNCATE guard) wired through 8 triggers (a row
+        # guard and a TRUNCATE guard per table).
         ddl = _SQL_REFERENCE.read_text()
-        assert ddl.count("CREATE OR REPLACE FUNCTION") == 3
-        assert ddl.count("CREATE OR REPLACE TRIGGER") == 4
+        assert ddl.count("CREATE OR REPLACE FUNCTION") == 5
+        assert ddl.count("CREATE OR REPLACE TRIGGER") == 8
         assert ALLOW_URL_REMOVAL_GUC in ddl
 
     def test_declares_the_key_constraints(self):
@@ -161,13 +181,34 @@ class TestCanonicalDDLReference:
     def test_reference_contains_every_runtime_statement_verbatim(self):
         # Substring checks above can't see a drifted PL/pgSQL body (guard
         # predicates live inside the $$...$$ blocks). Normalize both sides and
-        # require every runtime statement to appear verbatim in the reference.
+        # require every runtime statement to appear verbatim in the reference —
+        # kept alongside the exact-equality test below because a per-statement
+        # loop names WHICH statement drifted.
         reference = _normalize_sql(_SQL_REFERENCE.read_text())
         for statement in _DDL_STATEMENTS:
             normalized = _normalize_sql(statement)
             assert normalized in reference, (
                 "runtime DDL statement missing from (or drifted in) "
                 f"entity/streaming_catalog.sql: {statement.lstrip()[:80]!r}"
+            )
+
+    def test_reference_equals_the_runtime_statements_exactly(self):
+        # Containment alone lets the reference carry stale extra statements
+        # (or reorder them) without failing. The whole normalized file must
+        # equal the normalized runtime sequence: same statements, same order,
+        # nothing extra.
+        reference = _normalize_sql(_SQL_REFERENCE.read_text())
+        runtime = _normalize_sql(" ".join(_DDL_STATEMENTS))
+        assert reference == runtime
+
+    def test_runtime_statements_carry_no_line_comments(self):
+        # ``_normalize_sql`` strips ``--`` to end-of-line; a comment inside a
+        # runtime statement would make the parity tests compare a silently
+        # truncated statement. Keep prose in the .sql reference and in Python
+        # comments around the constants — never inside the statements.
+        for statement in _DDL_STATEMENTS:
+            assert "--" not in statement, (
+                f"line comment inside runtime DDL: {statement.lstrip()[:80]!r}"
             )
 
 
@@ -187,9 +228,9 @@ class TestSetUpStreamingCatalogSchema:
             assert f"CREATE TABLE IF NOT EXISTS lml_cache.{table}" in joined
         assert "DROP CONSTRAINT IF EXISTS streaming_album_service_valid" in joined
         assert "ADD CONSTRAINT streaming_album_service_valid CHECK" in joined
-        assert joined.count("CREATE OR REPLACE FUNCTION") == 3
-        assert joined.count("CREATE OR REPLACE TRIGGER") == 4
-        assert joined.count("BEFORE TRUNCATE ON") == 2
+        assert joined.count("CREATE OR REPLACE FUNCTION") == 5
+        assert joined.count("CREATE OR REPLACE TRIGGER") == 8
+        assert joined.count("BEFORE TRUNCATE ON") == 4
         assert "CREATE INDEX IF NOT EXISTS idx_streaming_album_service_status" in joined
         assert "CREATE INDEX IF NOT EXISTS idx_streaming_track_result_status" in joined
 
@@ -202,7 +243,22 @@ class TestSetUpStreamingCatalogSchema:
 
         assert pg.acquire_count == 1
         assert pg.transaction_starts == 1
+        assert pg.transaction_ends == 1
+        assert pg.in_transaction is False
         assert all(in_txn for _, in_txn in pg.executed)
+
+    async def test_mid_boot_failure_propagates_and_closes_the_transaction(self):
+        # The bootstrap must not swallow a mid-boot error (the lifespan caller
+        # decides how to degrade), and the transaction context must still be
+        # exited so the real asyncpg transaction rolls back cleanly.
+        pg = _FakePgSource(fail_on="streaming_track_result")
+
+        with pytest.raises(RuntimeError, match="injected failure"):
+            await set_up_streaming_catalog_schema(pg)
+
+        assert pg.transaction_starts == 1
+        assert pg.transaction_ends == 1
+        assert pg.in_transaction is False
 
     async def test_preamble_bounds_lock_waits_and_serializes_boots(self):
         pg = _FakePgSource()
@@ -213,19 +269,22 @@ class TestSetUpStreamingCatalogSchema:
         assert pg.statements[1] == _BOOTSTRAP_ADVISORY_LOCK
         assert pg.statements[2:] == list(_DDL_STATEMENTS)
 
-    async def test_alter_check_admits_the_full_service_set(self):
+    async def test_widen_block_admits_the_full_service_set(self):
+        # The widen-only DO block carries the shipped set as a PL/pgSQL array
+        # (``code_services``); the merged IN-list is computed at runtime, so
+        # this is the one place the code-side set is statically visible.
         pg = _FakePgSource()
 
         await set_up_streaming_catalog_schema(pg)
 
         joined = "\n".join(pg.statements)
-        in_list = re.search(r"ADD CONSTRAINT.*?service\s+IN\s*\(([^)]*)\)", joined, re.DOTALL)
-        assert in_list is not None, "ADD CONSTRAINT IN-list not found in the ALTER"
-        alter_services = set(re.findall(r"'([^']+)'", in_list.group(1)))
-        assert alter_services == set(_SERVICES)
+        in_list = re.search(r"code_services\s+text\[\]\s*:=\s*ARRAY\[([^\]]*)\]", joined)
+        assert in_list is not None, "code_services array not found in the widen DO block"
+        widen_services = set(re.findall(r"'([^']+)'", in_list.group(1)))
+        assert widen_services == set(_SERVICES)
 
     async def test_guards_honor_the_opt_in_guc(self):
-        # All three guard functions must consult the documented escape-hatch
+        # All five guard functions must consult the documented escape-hatch
         # GUC — it is what makes targeted manual revocation (docs/scripts.md
         # runbook) possible without superuser DISABLE TRIGGER gymnastics.
         pg = _FakePgSource()
@@ -233,27 +292,32 @@ class TestSetUpStreamingCatalogSchema:
         await set_up_streaming_catalog_schema(pg)
 
         functions = [sql for sql in pg.statements if "CREATE OR REPLACE FUNCTION" in sql]
-        assert len(functions) == 3
+        assert len(functions) == 5
         for fn_sql in functions:
             assert ALLOW_URL_REMOVAL_GUC in fn_sql
 
-    async def test_bootstrap_is_idempotent(self):
-        # Re-running the bootstrap issues the byte-identical DDL each time.
-        first_pg = _FakePgSource()
-        second_pg = _FakePgSource()
+    async def test_every_raise_carries_the_one_opt_in_hint(self):
+        # 13 RAISE sites across the five guard functions; each renders the
+        # same hoisted hint literal as its final message line, so the runbook
+        # pointer can't drift per-site.
+        pg = _FakePgSource()
 
-        await set_up_streaming_catalog_schema(first_pg)
-        await set_up_streaming_catalog_schema(second_pg)
+        await set_up_streaming_catalog_schema(pg)
 
-        assert first_pg.statements == second_pg.statements
+        functions = "\n".join(sql for sql in pg.statements if "CREATE OR REPLACE FUNCTION" in sql)
+        hint = (
+            f"opt in via set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) in this transaction"
+        )
+        assert functions.count("RAISE EXCEPTION") == 13
+        assert functions.count(hint) == 13
 
     async def test_bootstrap_is_pure_ddl_after_the_preamble(self):
         # The bootstrap must never mutate rows. The sibling tests grep for
         # INSERT/UPDATE/DELETE substrings, but the guard-trigger DDL here
         # legitimately contains "BEFORE UPDATE OR DELETE" — so assert on the
         # statement head instead: after the two-statement preamble (SET LOCAL
-        # + advisory lock SELECT, both row-neutral), every statement is CREATE
-        # or ALTER.
+        # + advisory lock SELECT, both row-neutral), every statement is CREATE,
+        # ALTER, or the widen-only DO block (which only ever EXECUTEs an ALTER).
         pg = _FakePgSource()
 
         await set_up_streaming_catalog_schema(pg)
@@ -263,4 +327,6 @@ class TestSetUpStreamingCatalogSchema:
         assert ddl, "bootstrap issued no DDL"
         for sql in ddl:
             head = sql.lstrip().split()[0]
-            assert head in {"CREATE", "ALTER"}, f"non-DDL statement in bootstrap: {sql[:80]!r}"
+            assert head in {"CREATE", "ALTER", "DO"}, (
+                f"non-DDL statement in bootstrap: {sql[:80]!r}"
+            )

@@ -37,6 +37,7 @@ from entity.streaming_url_cache import (
     set_up_streaming_url_cache_schema,
 )
 from streaming.models import SourceMatch
+from tests.integration.conftest import skip_if_named_tables_populated
 
 _SERVICE_CASES = [
     ("apple_music_album", "https://music.apple.com/us/album/aluminum-tunes/1234567890"),
@@ -64,18 +65,21 @@ async def pg_source(pg_pool):
 
 @pytest_asyncio.fixture(autouse=True)
 async def set_up_cache_schema(pg_pool, pg_source):
-    """Reset to a clean ``lml_cache`` schema and apply the cache DDL.
+    """Reset just ``lml_cache.album_streaming_url_cache``, then apply the DDL.
 
-    Surgical (not ``DROP SCHEMA entity CASCADE``): only the LML-owned
-    ``lml_cache`` schema is touched, so the discogs-cache-owned ``entity.*``
-    identity tables in the shared test PG stay intact.
+    Surgical: drops only the one table this suite owns — not the whole
+    ``lml_cache`` schema, which hosts every other LML cache (release-
+    resolution, rate bucket, override, streaming catalog) — and refuses to run
+    at all if that table already holds rows (a mispointed ``DATABASE_URL_TEST``
+    at the shared discogs-cache PG would otherwise drop real cached URLs).
     """
     async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS lml_cache CASCADE")
+        await skip_if_named_tables_populated(conn, (("lml_cache", "album_streaming_url_cache"),))
+        await conn.execute("DROP TABLE IF EXISTS lml_cache.album_streaming_url_cache")
     await set_up_streaming_url_cache_schema(pg_source)
     yield
     async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS lml_cache CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS lml_cache.album_streaming_url_cache")
 
 
 @pytest.mark.pg
@@ -109,8 +113,11 @@ class TestSchemaBootstrap:
         # NOT EXISTS is a no-op on the existing table; the idempotent ALTER is
         # what widens the named CHECK in place.
         async with pg_pool.acquire() as conn:
-            await conn.execute("DROP SCHEMA IF EXISTS lml_cache CASCADE")
-            await conn.execute("CREATE SCHEMA lml_cache")
+            # The autouse fixture already veto-checked and dropped this table;
+            # drop again here only to replace it with the frozen pre-bandcamp
+            # shape (never the whole schema — sibling caches live there too).
+            await conn.execute("DROP TABLE IF EXISTS lml_cache.album_streaming_url_cache")
+            await conn.execute("CREATE SCHEMA IF NOT EXISTS lml_cache")
             await conn.execute(
                 "CREATE TABLE lml_cache.album_streaming_url_cache ("
                 "  service TEXT NOT NULL,"

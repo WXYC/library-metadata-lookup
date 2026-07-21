@@ -150,7 +150,30 @@ async def skip_if_drop_targets_populated(conn, public_tables: "Iterable[str]") -
         )
         if exists:
             targets.append(("public", table))
+    await _veto_if_any_rows(conn, targets)
 
+
+async def skip_if_named_tables_populated(conn, tables: "Iterable[tuple[str, str]]") -> None:
+    """``pytest.skip`` when any of the named ``(schema, table)`` targets holds rows.
+
+    The table-scoped companion to :func:`skip_if_drop_targets_populated` (no
+    ``entity.*`` sweep): for fixtures that drop only tables their own suite
+    owns — e.g. the ``lml_cache.*`` cache suites — but whose targets on a
+    mispointed ``DATABASE_URL_TEST`` would be real collected data (streaming
+    URLs, resolution caches). Any-rows veto, same fail-toward-veto probe
+    semantics; a missing table is not a veto (``to_regclass`` filters it out
+    so first-run bootstraps pass).
+    """
+    targets: list[tuple[str, str]] = []
+    for schema, table in tables:
+        regclass = await conn.fetchval("SELECT to_regclass($1)", f"{schema}.{table}")
+        if regclass is not None:
+            targets.append((schema, table))
+    await _veto_if_any_rows(conn, targets)
+
+
+async def _veto_if_any_rows(conn, targets: "Iterable[tuple[str, str]]") -> None:
+    """Shared probe/veto core: ``pytest.skip`` if any target has rows (or can't be probed)."""
     populated: list[str] = []
     unprobeable: list[str] = []
     for schema, table in targets:
