@@ -105,6 +105,18 @@ class ArtistGenresResultItem(BaseModel):
     source: ArtistGenresSource = Field(
         ..., description="Where the answer came from (see ArtistGenresSource)."
     )
+    bio: str | None = Field(
+        None,
+        description=(
+            "Artist biography from the Discogs profile, keyed on "
+            "`discogs_artist_id` via a cache-only bulk read. Null when the "
+            "artist has no id (name-only), is not cached, has a blank profile, "
+            "or is a not-found tombstone. Additive + nullable and independent "
+            "of `source`, which continues to describe *genre* provenance only "
+            "(bio provenance can diverge — a cached profile may have no genre "
+            "rows, or vice-versa). Raw Discogs markup, parsed downstream."
+        ),
+    )
 
 
 class BulkArtistGenresResponse(BaseModel):

@@ -55,7 +55,27 @@ from identity.dependencies import get_entity_store
 if TYPE_CHECKING:
     from posthog import Posthog
 
+    from discogs.models import ArtistDetails
+
 logger = logging.getLogger(__name__)
+
+
+def _extract_artist_bios(details_by_id: dict[int, ArtistDetails]) -> dict[int, str]:
+    """Pull clean Discogs `profile` bios out of a bulk artist-details read.
+
+    Skips not-found tombstone rows (which carry `name=""` + defaults) and
+    blank/whitespace profiles, so a present-but-empty entry contributes no
+    mapping — the caller's `.get(...)` then yields `None`. Keyed by Discogs
+    artist id.
+    """
+    bios: dict[int, str] = {}
+    for artist_id, details in details_by_id.items():
+        if details.not_found:
+            continue
+        profile = (details.profile or "").strip()
+        if profile:
+            bios[artist_id] = profile
+    return bios
 
 
 # Per api.yaml: max names per request; over-cap returns 413.
@@ -458,6 +478,21 @@ async def genres_bulk(
         http_span.set_data("lml.artist_genres.artists", len(artists))
 
         try:
+            # Bio enrichment: one cache-only bulk artist-details read for the
+            # whole batch, keyed on the supplied Discogs ids (name-only inputs
+            # can't be keyed and get no bio). Cheap and additive — it stays
+            # inside the bulk budget rather than fanning out a per-artist live
+            # API call on top of the genres fallback. A cache-pool failure here
+            # raises `CacheUnavailableError`, handled by the same 503 arm below.
+            bio_ids = sorted(
+                {a.discogs_artist_id for a in artists if a.discogs_artist_id is not None}
+            )
+            bio_by_id = (
+                _extract_artist_bios(await discogs_cache.get_artist_details_bulk(bio_ids))
+                if bio_ids
+                else {}
+            )
+
             results: list[ArtistGenresResultItem] = []
             for item in artists:
                 # Free the shared Discogs rate-limit budget promptly if the
@@ -481,6 +516,11 @@ async def genres_bulk(
                         genres=agg.genres,
                         styles=agg.styles,
                         source=agg.source,
+                        bio=(
+                            bio_by_id.get(item.discogs_artist_id)
+                            if item.discogs_artist_id is not None
+                            else None
+                        ),
                     )
                 )
         except asyncio.CancelledError:

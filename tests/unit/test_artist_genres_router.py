@@ -18,7 +18,7 @@ from artists.router import _GENRES_INPUT_CAP
 from config.settings import Settings, get_settings
 from core.dependencies import get_discogs_cache_service_from_pool, get_discogs_service
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
-from discogs.models import ReleaseMetadataResponse
+from discogs.models import ArtistDetails, ReleaseMetadataResponse
 from discogs.service import DiscogsService
 from tests.unit.conftest import override_deps
 
@@ -42,6 +42,10 @@ def _release(release_id: int, genres, styles) -> ReleaseMetadataResponse:
 def mock_cache():
     cache = AsyncMock(spec=DiscogsCacheService)
     cache.aggregate_artist_genre_style = AsyncMock(return_value=({}, {}))
+    # Bio enrichment (LML#XXX): one cache-only bulk artist-details read per batch,
+    # keyed on the supplied discogs_artist_ids. Default empty → bio null everywhere
+    # unless a test seeds a profile.
+    cache.get_artist_details_bulk = AsyncMock(return_value={})
     return cache
 
 
@@ -146,6 +150,96 @@ class TestHappyPath:
             )
         assert resp.status_code == 200
         assert resp.json()["results"][0]["source"] == "cache"
+
+
+class TestBio:
+    """Artist bio (Discogs `profile`) rides the bulk response, keyed on
+    `discogs_artist_id` via one cache-only `get_artist_details_bulk` read per
+    batch. Additive + nullable: name-only, uncached, blank-profile, and
+    tombstone rows all report `bio: null`. The `source` enum stays genre-only.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cached_profile_returned_as_bio(self, make_app, mock_cache):
+        mock_cache.aggregate_artist_genre_style.return_value = ({"Rock": 1}, {})
+        mock_cache.get_artist_details_bulk.return_value = {
+            12345: ArtistDetails(
+                artist_id=12345, name="Juana Molina", profile="An Argentine musician."
+            )
+        }
+        ctx, app = make_app()
+        with ctx:
+            resp = await _post(
+                app, {"artists": [{"artist_name": "Juana Molina", "discogs_artist_id": 12345}]}
+            )
+        assert resp.status_code == 200
+        (result,) = resp.json()["results"]
+        assert result["bio"] == "An Argentine musician."
+        # Bio provenance is independent of genre provenance — `source` unchanged.
+        assert result["source"] == "cache"
+
+    @pytest.mark.asyncio
+    async def test_name_only_artist_has_null_bio(self, make_app, mock_cache):
+        # No discogs_artist_id → bio can't be keyed → null.
+        mock_cache.aggregate_artist_genre_style.return_value = ({"Rock": 1}, {})
+        ctx, app = make_app()
+        with ctx:
+            resp = await _post(app, {"artists": [{"artist_name": "Wishy"}]})
+        assert resp.status_code == 200
+        assert resp.json()["results"][0]["bio"] is None
+
+    @pytest.mark.asyncio
+    async def test_uncached_artist_has_null_bio(self, make_app, mock_cache):
+        # id supplied but absent from the bulk cache dict → null.
+        mock_cache.get_artist_details_bulk.return_value = {}
+        ctx, app = make_app(service=None)
+        with ctx:
+            resp = await _post(app, {"artists": [{"artist_name": "X", "discogs_artist_id": 999}]})
+        assert resp.status_code == 200
+        assert resp.json()["results"][0]["bio"] is None
+
+    @pytest.mark.asyncio
+    async def test_blank_profile_is_null_bio(self, make_app, mock_cache):
+        mock_cache.get_artist_details_bulk.return_value = {
+            7: ArtistDetails(artist_id=7, name="Y", profile="   ")
+        }
+        ctx, app = make_app(service=None)
+        with ctx:
+            resp = await _post(app, {"artists": [{"artist_name": "Y", "discogs_artist_id": 7}]})
+        assert resp.status_code == 200
+        assert resp.json()["results"][0]["bio"] is None
+
+    @pytest.mark.asyncio
+    async def test_tombstone_row_is_null_bio(self, make_app, mock_cache):
+        # not_found tombstone rows carry name="" + defaults; must be guarded.
+        mock_cache.get_artist_details_bulk.return_value = {
+            8: ArtistDetails(artist_id=8, name="", not_found=True)
+        }
+        ctx, app = make_app(service=None)
+        with ctx:
+            resp = await _post(app, {"artists": [{"artist_name": "Z", "discogs_artist_id": 8}]})
+        assert resp.status_code == 200
+        assert resp.json()["results"][0]["bio"] is None
+
+    @pytest.mark.asyncio
+    async def test_bulk_details_fetched_once_for_batch(self, make_app, mock_cache):
+        # Budget guard: one cache-only bulk read per batch, with all non-null ids.
+        ctx, app = make_app(service=None)
+        with ctx:
+            resp = await _post(
+                app,
+                {
+                    "artists": [
+                        {"artist_name": "A", "discogs_artist_id": 1},
+                        {"artist_name": "B", "discogs_artist_id": 2},
+                        {"artist_name": "NameOnly"},
+                    ]
+                },
+            )
+        assert resp.status_code == 200
+        mock_cache.get_artist_details_bulk.assert_awaited_once()
+        (called_ids,) = mock_cache.get_artist_details_bulk.await_args.args
+        assert sorted(called_ids) == [1, 2]
 
 
 class TestErrorSurface:
