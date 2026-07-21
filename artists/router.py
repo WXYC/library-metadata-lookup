@@ -485,20 +485,41 @@ async def genres_bulk(
         http_span.set_data("lml.artist_genres.artists", len(artists))
 
         try:
+            # Don't spend the bio read if the client already walked away
+            # (mirrors the per-item guard's budget-freeing intent, run once
+            # up front rather than only inside the genres loop below).
+            if await http_request.is_disconnected():
+                http_span.set_data("http.status_code", 499)
+                logger.warning("artist-genres bulk aborted by client: artists=%d", len(artists))
+                raise HTTPException(status_code=499, detail="client disconnected")
+
             # Bio enrichment: one cache-only bulk artist-details read for the
             # whole batch, keyed on the supplied Discogs ids (name-only inputs
             # can't be keyed and get no bio). Cheap and additive — it stays
             # inside the bulk budget rather than fanning out a per-artist live
-            # API call on top of the genres fallback. A cache-pool failure here
-            # raises `CacheUnavailableError`, handled by the same 503 arm below.
+            # API call on top of the genres fallback.
+            #
+            # Best-effort + fault-isolated: bio is a nullable add-on, so a
+            # failure in THIS extra read must never fail the genres batch the
+            # endpoint exists to serve. Degrade to no-bios and press on; the
+            # genres path below hits the cache on its own and still 503s on a
+            # genuine pool outage. `CancelledError` (client abort / shutdown)
+            # is a `BaseException`, so `except Exception` lets it propagate.
             bio_ids = sorted(
                 {a.discogs_artist_id for a in artists if a.discogs_artist_id is not None}
             )
-            bio_by_id = (
-                _extract_artist_bios(await discogs_cache.get_artist_details_bulk(bio_ids))
-                if bio_ids
-                else {}
-            )
+            try:
+                bio_by_id = (
+                    _extract_artist_bios(await discogs_cache.get_artist_details_bulk(bio_ids))
+                    if bio_ids
+                    else {}
+                )
+            except Exception:
+                logger.warning(
+                    "artist-genres bio enrichment read failed; serving genres without bios",
+                    exc_info=True,
+                )
+                bio_by_id = {}
 
             results: list[ArtistGenresResultItem] = []
             for item in artists:

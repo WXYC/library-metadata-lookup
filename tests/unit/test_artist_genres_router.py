@@ -249,6 +249,23 @@ class TestBio:
         (called_ids,) = mock_cache.get_artist_details_bulk.await_args.args
         assert sorted(called_ids) == [1, 2]
 
+    @pytest.mark.asyncio
+    async def test_bio_read_failure_still_serves_genres(self, make_app, mock_cache):
+        # Fault isolation: bio is additive, so a failure in the bio read must
+        # NOT fail the genres batch. Genres serve; bio degrades to null.
+        mock_cache.aggregate_artist_genre_style.return_value = ({"Rock": 1}, {})
+        mock_cache.get_artist_details_bulk.side_effect = CacheUnavailableError("bio read blip")
+        ctx, app = make_app()
+        with ctx:
+            resp = await _post(
+                app, {"artists": [{"artist_name": "Stereolab", "discogs_artist_id": 42}]}
+            )
+        assert resp.status_code == 200
+        (result,) = resp.json()["results"]
+        assert result["genres"] == ["Rock"]
+        assert result["source"] == "cache"
+        assert result["bio"] is None
+
 
 class TestErrorSurface:
     @pytest.mark.asyncio
