@@ -27,6 +27,7 @@ from entity.library_release_override import (
     set_up_library_release_override_schema,
 )
 from entity.sources import PgSource
+from tests.integration.conftest import skip_if_named_tables_populated
 
 _INSERT_SQL = (
     "INSERT INTO lml_cache.library_release_override "
@@ -47,9 +48,12 @@ async def set_up_override_schema(pg_pool, pg_source):
     Surgical: drops only ``lml_cache.library_release_override`` (not the whole
     ``lml_cache`` schema), so sibling LML caches present in the shared test PG
     stay intact. ``CREATE SCHEMA IF NOT EXISTS`` inside the bootstrap re-creates
-    the schema if a prior suite dropped it.
+    the schema if a prior suite dropped it. The populated-table veto runs
+    FIRST: a mispointed ``DATABASE_URL_TEST`` at the shared discogs-cache PG
+    must skip, not drop collected override pins.
     """
     async with pg_pool.acquire() as conn:
+        await skip_if_named_tables_populated(conn, (("lml_cache", "library_release_override"),))
         await conn.execute("DROP TABLE IF EXISTS lml_cache.library_release_override")
     await set_up_library_release_override_schema(pg_source)
     yield

@@ -166,7 +166,15 @@ async def skip_if_named_tables_populated(conn, tables: "Iterable[tuple[str, str]
     """
     targets: list[tuple[str, str]] = []
     for schema, table in tables:
-        regclass = await conn.fetchval("SELECT to_regclass($1)", f"{schema}.{table}")
+        try:
+            regclass = await conn.fetchval("SELECT to_regclass($1)", f"{schema}.{table}")
+        except Exception:
+            # Fail toward veto: an unprobeable existence check (connection
+            # loss mid-sweep) must not read as "table absent, safe to drop".
+            # _veto_if_any_rows' own probe will fail the same way and report
+            # it as unprobeable rather than silently passing.
+            targets.append((schema, table))
+            continue
         if regclass is not None:
             targets.append((schema, table))
     await _veto_if_any_rows(conn, targets)
