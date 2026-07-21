@@ -11,7 +11,7 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 
-from config.settings import Settings
+from config.settings import Settings, get_settings
 from discogs.models import (
     DiscogsSearchResponse,
     ReleaseInfo,
@@ -21,6 +21,31 @@ from discogs.models import (
 )
 from library.db import LibraryDB
 from tests.factories import make_discogs_result
+
+
+@pytest.fixture(scope="session", autouse=True)
+def scrub_posthog_env():
+    """Blank ``POSTHOG_API_KEY`` for the whole e2e session (LML#879).
+
+    Same rationale as the identically-named integration-tier scrub
+    (``tests/integration/conftest.py``): this tier's hermeticity rests on
+    ``dependency_overrides`` (``get_posthog_client -> None`` in
+    :func:`e2e_client`), but the rate-gate fail-open emitter
+    (``discogs/ratelimit._capture_fail_open``) bypasses DI by design. E2E is
+    the tier most likely to run with a real populated shell/``.env`` (it
+    module-skips without a real ``DISCOGS_TOKEN``), so an operator with
+    ``DISCOGS_RATE_BUCKET_ENABLED=true`` and a live key ambient would
+    otherwise send real ``discogs_rate_gate_fail_open`` events to production
+    PostHog. Blank rather than delete: env vars outrank the ``.env`` source,
+    and empty behaves like unset throughout the codebase.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("POSTHOG_API_KEY", "")
+    get_settings.cache_clear()
+    yield
+    mp.undo()
+    get_settings.cache_clear()
+
 
 # ---------------------------------------------------------------------------
 # Seed data: WXYC example artists for full-pipeline E2E

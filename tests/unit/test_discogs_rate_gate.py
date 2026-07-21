@@ -107,11 +107,16 @@ def captured_posthog(monkeypatch):
     Pins ``ENABLE_TELEMETRY=true``: the emitter early-returns when telemetry is
     off, and the unit-wide credential scrub blanks keys but not this toggle, so
     an ambient ``false`` (shell or ``.env``) would otherwise fail the positive
-    tests spuriously. The default ``raising=True`` keeps the patch seam honest —
-    if the accessor ref ever moves (e.g. goes function-local), the patch errors
-    instead of silently no-oping the negative tests.
+    tests spuriously. Pins ``ENVIRONMENT`` to a sentinel so the environment
+    property assertion proves the value flows from ``Settings.environment`` —
+    comparing against ``get_settings().environment`` would read back the same
+    cached object the emitter used and pass even if the emitter hard-coded or
+    mis-sourced the value. The default ``raising=True`` keeps the patch seam
+    honest — if the accessor ref ever moves (e.g. goes function-local), the
+    patch errors instead of silently no-oping the negative tests.
     """
     monkeypatch.setenv("ENABLE_TELEMETRY", "true")
+    monkeypatch.setenv("ENVIRONMENT", "unit-test-env")
     get_settings.cache_clear()
     events: list[dict] = []
 
@@ -301,7 +306,7 @@ async def test_fail_open_emits_unsampled_counter(
     assert event["distinct_id"] == "library-metadata-lookup-service"
     assert event["event"] == "discogs_rate_gate_fail_open"
     assert event["properties"]["error_type"] == expected_error_type
-    assert event["properties"]["environment"] == get_settings().environment
+    assert event["properties"]["environment"] == "unit-test-env"
 
 
 async def test_healthy_and_queueing_paths_emit_no_counter(rate_bucket_env, captured_posthog):
@@ -360,7 +365,12 @@ async def test_counter_emission_failure_never_breaks_fail_open(
     rate_bucket_env, captured_tags, monkeypatch
 ):
     """A broken PostHog client (accessor raising) must not turn a graceful
-    fail-open into a hard error — telemetry is strictly best-effort here."""
+    fail-open into a hard error — telemetry is strictly best-effort here.
+
+    Pins ``ENABLE_TELEMETRY=true`` (can't reuse ``captured_posthog`` — this test
+    replaces the accessor): an ambient ``false`` would early-return before the
+    exploding accessor and pass this test vacuously."""
+    monkeypatch.setenv("ENABLE_TELEMETRY", "true")
     rate_bucket_env(enabled=True)
 
     def _exploding_accessor(event_prefix):
