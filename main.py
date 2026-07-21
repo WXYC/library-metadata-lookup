@@ -203,33 +203,31 @@ async def lifespan(app: FastAPI):
     # request rather than failing startup. Each bootstrap then runs under its
     # own handler: one failing does not skip the ones after it.
     if settings.database_url_discogs:
+        from core.dependencies import get_discogs_pool
+        from entity.discogs_rate_bucket import set_up_discogs_rate_bucket_schema
+        from entity.library_release_override import (
+            set_up_library_release_override_schema,
+        )
+        from entity.release_resolution_cache import (
+            set_up_release_resolution_cache_schema,
+        )
+        from entity.sources import PgSource
+        from entity.streaming_catalog import set_up_streaming_catalog_schema
+        from entity.streaming_url_cache import set_up_streaming_url_cache_schema
+
         pool = None
         try:
-            from core.dependencies import get_discogs_pool
-            from entity.discogs_rate_bucket import set_up_discogs_rate_bucket_schema
-            from entity.library_release_override import (
-                set_up_library_release_override_schema,
-            )
-            from entity.release_resolution_cache import (
-                set_up_release_resolution_cache_schema,
-            )
-            from entity.sources import PgSource
-            from entity.streaming_catalog import set_up_streaming_catalog_schema
-            from entity.streaming_url_cache import set_up_streaming_url_cache_schema
-
             pool = await get_discogs_pool()
-            if pool is None:
-                logger.info(
-                    "Discogs cache pool unavailable at startup — skipping the "
-                    "lml_cache.* bootstraps; their consumers no-op until the next deploy"
-                )
         except Exception:
-            pool = None
-            logger.exception(
-                "Discogs cache pool acquisition failed — skipping the lml_cache.* "
-                "bootstraps; their consumers no-op until the next deploy"
+            # Cause only; the consequence is the single skip message below,
+            # shared with the returned-None case.
+            logger.exception("Discogs cache pool acquisition failed")
+        if pool is None:
+            logger.info(
+                "Discogs cache pool unavailable at startup — skipping the "
+                "lml_cache.* bootstraps; their consumers no-op until the next deploy"
             )
-        if pool is not None:
+        else:
             source = PgSource(pool=pool)
             bootstraps = (
                 (
@@ -257,7 +255,7 @@ async def lifespan(app: FastAPI):
                 # ``DISCOGS_RATE_BUCKET_ENABLED`` is set; the gate fails open to
                 # the local limiter regardless of this bootstrap's outcome.
                 (
-                    "Discogs rate bucket",
+                    "Discogs rate-bucket",
                     lambda: set_up_discogs_rate_bucket_schema(
                         source,
                         bucket_key=settings.discogs_rate_bucket_key,

@@ -41,18 +41,12 @@ from entity.streaming_catalog import (
     _BOOTSTRAP_LOCK_TIMEOUT,
     _DDL_STATEMENTS,
     _SERVICES,
+    _TABLES,
     ALLOW_URL_REMOVAL_GUC,
     set_up_streaming_catalog_schema,
 )
 
 _SQL_REFERENCE = Path(__file__).resolve().parent.parent.parent / "entity" / "streaming_catalog.sql"
-
-_TABLES = (
-    "streaming_album",
-    "streaming_album_service",
-    "streaming_track_result",
-    "streaming_coverage_baseline",
-)
 
 
 def _normalize_sql(text: str) -> str:
@@ -142,10 +136,11 @@ class TestCanonicalDDLReference:
         assert "CONSTRAINT streaming_album_service_valid CHECK" in ddl
 
     def test_check_constraint_allowlist_matches_services(self):
-        # The .sql is a hand-maintained mirror of the runtime DDL, which
-        # generates its IN-list from ``_SERVICES``. Anchor on the named
-        # constraint (the widen DO block contains other ``service IN``
-        # fragments) and assert exact-set equality so the mirror can't drift.
+        # The .sql mirrors the runtime DDL (regenerated via
+        # scripts/regenerate_streaming_catalog_sql.py), which generates its
+        # IN-list from ``_SERVICES``. Anchor on the named constraint (the
+        # widen DO block contains other ``service IN`` fragments) and assert
+        # exact-set equality so the mirror can't drift.
         ddl = _SQL_REFERENCE.read_text(encoding="utf-8")
         match = re.search(
             r"CONSTRAINT streaming_album_service_valid CHECK\s*\(\s*service\s+IN\s*\(([^)]*)\)",
@@ -202,6 +197,28 @@ class TestCanonicalDDLReference:
         reference = _normalize_sql(_SQL_REFERENCE.read_text(encoding="utf-8"))
         runtime = _normalize_sql(" ".join(_DDL_STATEMENTS))
         assert reference == runtime
+
+    def test_tables_constant_matches_the_create_table_statements(self):
+        # ``_TABLES`` is the one authoritative table list (tests derive
+        # FK-safe drop order by reversing it), so it must track the CREATE
+        # TABLE statements exactly — names AND creation order.
+        created = re.findall(
+            r"CREATE TABLE IF NOT EXISTS lml_cache\.([a-z_]+) \(",
+            "\n".join(_DDL_STATEMENTS),
+        )
+        assert created == list(_TABLES)
+
+    def test_reference_equals_the_generator_output_byte_for_byte(self):
+        # The normalized-equality tests above pin the STATEMENTS; this pins
+        # the whole file — prose included — to the generator, so a hand edit
+        # to the .sql (or an unregenerated statement change) fails loudly
+        # with the fix being "run the generator".
+        from scripts.regenerate_streaming_catalog_sql import build_reference
+
+        assert _SQL_REFERENCE.read_text(encoding="utf-8") == build_reference(), (
+            "entity/streaming_catalog.sql is stale — regenerate via "
+            "`uv run python -m scripts.regenerate_streaming_catalog_sql`"
+        )
 
     def test_runtime_statements_carry_no_line_comments(self):
         # ``_normalize_sql`` strips ``--`` to end-of-line; a comment inside a

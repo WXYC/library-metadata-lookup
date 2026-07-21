@@ -1,3 +1,9 @@
+-- GENERATED FILE — regenerate via:
+--   uv run python -m scripts.regenerate_streaming_catalog_sql
+-- Statements come verbatim from entity/streaming_catalog.py
+-- (_DDL_STATEMENTS); this prose lives in the generator. Do not edit this
+-- file by hand: unit tests pin both the statement text and these bytes.
+--
 -- Streaming-catalog schema for LML#842: the row-level PG canonical replacing
 -- the whole-file streaming_availability.db lineage.
 --
@@ -45,11 +51,7 @@
 -- for the named service CHECK. The bootstrap runs all of it as one transaction
 -- on one connection, after `SET LOCAL lock_timeout = '10s'` and
 -- `SELECT pg_advisory_xact_lock(842001)` — bounded lock waits, serialized
--- concurrent boots. This file and the runtime tuple are pinned to each other
--- by a normalized EXACT-EQUALITY test in
--- tests/unit/test_streaming_catalog_schema.py (same statements, same order,
--- PL/pgSQL bodies included; comments and whitespace excluded) — edit both
--- places together or CI fails.
+-- concurrent boots.
 --
 -- The guards police DML only — a tripwire against accidental pipeline or
 -- operator writes discarding collected (rate-limited) streaming data, not a
@@ -66,11 +68,15 @@ CREATE SCHEMA IF NOT EXISTS lml_cache;
 -- ids verbatim via the deliberate OVERRIDING SYSTEM VALUE spelling (so
 -- track_results.album_id references stay valid), then advances each sequence
 -- past max(id); a plain INSERT with an explicit id is rejected outright.
--- library_ids/formats are JSON arrays in SQLite TEXT today (JSONB here) and
--- deliberately carry NO default: a seed that forgets to map them must fail
--- loudly, not insert '[]'. The discogs_* columns are the Discogs match group
--- — album identity, not a streaming probe result, hence kept here rather
--- than as a service row.
+-- (COPY sits outside that net — it loads explicit ids without OVERRIDING
+-- SYSTEM VALUE and never advances the sequence — so ports must load via
+-- INSERT, or pair any COPY with an explicit setval.) library_ids/formats are
+-- JSON arrays in SQLite TEXT today (JSONB here) and deliberately carry NO
+-- default: a seed that forgets to map them must fail loudly, not insert '[]'.
+-- The named jsonb-shape CHECK catches the spellings NOT NULL can't —
+-- 'null'::jsonb, scalars, objects all satisfy NOT NULL. The discogs_* columns
+-- are the Discogs match group — album identity, not a streaming probe result,
+-- hence kept here rather than as a service row.
 
 CREATE TABLE IF NOT EXISTS lml_cache.streaming_album (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -89,6 +95,9 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album (
     discogs_title TEXT,
     discogs_status TEXT NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT streaming_album_provenance_arrays CHECK (
+        jsonb_typeof(library_ids) = 'array' AND jsonb_typeof(formats) = 'array'
+    ),
     UNIQUE (normalized_artist, normalized_title)
 );
 
@@ -253,8 +262,9 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_coverage_baseline (
 -- (unlinking to NULL blocked; re-matching to a different release allowed)
 -- need their own guard. It also blocks re-keying the album identity (id —
 -- reachable even under GENERATED ALWAYS via SET id = DEFAULT — and the
--- normalized artist/title pair) and nulling collected Discogs match
--- metadata; corrected replacements stay allowed.
+-- normalized artist/title pair) and discarding collected Discogs match
+-- metadata (to NULL or '', the extractors' two "empty" spellings); corrected
+-- replacements stay allowed.
 
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_album()
 RETURNS trigger
@@ -281,9 +291,11 @@ BEGIN
             'opt in via set_config(''lml_cache.allow_url_removal'', ''on'', true) in this transaction',
             OLD.id;
     END IF;
-    IF (OLD.discogs_artist IS NOT NULL AND NEW.discogs_artist IS NULL)
-        OR (OLD.discogs_title IS NOT NULL AND NEW.discogs_title IS NULL) THEN
-        RAISE EXCEPTION 'streaming_album: nulling collected Discogs match metadata '
+    IF (OLD.discogs_artist IS NOT NULL AND OLD.discogs_artist <> ''
+            AND (NEW.discogs_artist IS NULL OR NEW.discogs_artist = ''))
+        OR (OLD.discogs_title IS NOT NULL AND OLD.discogs_title <> ''
+            AND (NEW.discogs_title IS NULL OR NEW.discogs_title = '')) THEN
+        RAISE EXCEPTION 'streaming_album: discarding collected Discogs match metadata '
             'blocked (id=%); '
             'opt in via set_config(''lml_cache.allow_url_removal'', ''on'', true) in this transaction',
             OLD.id;

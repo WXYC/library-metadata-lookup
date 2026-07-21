@@ -105,6 +105,31 @@ def test_lml_cache_fixture_file_uses_table_scoped_guard(name: str) -> None:
     )
 
 
+def test_every_lml_cache_dropping_suite_is_registered() -> None:
+    """Discovery net for the roster itself: the two checks above only bind
+    files someone remembered to add to ``_LML_CACHE_FIXTURE_FILES``. Sweep
+    every integration file for the co-occurrence of ``lml_cache`` with a
+    ``DROP TABLE``/``TRUNCATE`` (coarse on purpose — a qualified name built
+    in an f-string still names the schema somewhere in the file) and require
+    each hit to be on the roster, so a new cache suite can't sit outside the
+    guard checks unnoticed. This file self-excludes: it exercises the guard
+    against scratch lml_cache tables by design."""
+    pattern = re.compile(r"DROP\s+TABLE|TRUNCATE", re.IGNORECASE)
+    flagged = {
+        path.name
+        for path in Path(__file__).parent.glob("*.py")
+        if path.name != Path(__file__).name
+        and "lml_cache" in (src := path.read_text(encoding="utf-8"))
+        and pattern.search(src)
+    }
+    unregistered = flagged - set(_LML_CACHE_FIXTURE_FILES)
+    assert not unregistered, (
+        f"{sorted(unregistered)} touch lml_cache with DROP TABLE/TRUNCATE but are not in "
+        "_LML_CACHE_FIXTURE_FILES — add them so the guard-adoption checks bind them "
+        "(or route their teardown through skip_if_named_tables_populated first)."
+    )
+
+
 @pytest.mark.parametrize("name", _LML_CACHE_FIXTURE_FILES)
 def test_lml_cache_fixture_file_never_drops_the_whole_schema(name: str) -> None:
     """No cache suite may ``DROP SCHEMA lml_cache CASCADE`` — the schema hosts
