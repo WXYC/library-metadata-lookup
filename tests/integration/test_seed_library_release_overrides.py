@@ -27,6 +27,7 @@ from entity.library_release_override import (
 )
 from entity.sources import PgSource
 from scripts.seed_library_release_overrides import OverrideRow, seed_overrides
+from tests.integration.conftest import skip_if_named_tables_populated
 
 _SOURCE = "alex-l-2026"
 
@@ -39,9 +40,10 @@ async def pg_source(pg_pool):
 
 @pytest_asyncio.fixture(autouse=True)
 async def set_up_override_schema(pg_pool, pg_source):
-    """Reset just the override table, then apply its DDL (surgical — see the
-    read-path integration file for the rationale)."""
+    """Reset just the override table, then apply its DDL (surgical, veto-gated
+    — see the read-path integration file for the rationale)."""
     async with pg_pool.acquire() as conn:
+        await skip_if_named_tables_populated(conn, (("lml_cache", "library_release_override"),))
         await conn.execute("DROP TABLE IF EXISTS lml_cache.library_release_override")
     await set_up_library_release_override_schema(pg_source)
     yield

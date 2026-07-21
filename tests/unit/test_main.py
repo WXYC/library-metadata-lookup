@@ -25,6 +25,65 @@ class TestLifespan:
             mock_db_close.assert_called_once()
             mock_discogs_close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_lml_cache_bootstraps_degrade_independently(self, mock_settings):
+        """A throw in an earlier ``lml_cache.*`` bootstrap must not skip the
+        later ones — each degrades on its own, so the streaming catalog (last
+        in line) still bootstraps when the streaming-URL cache (first) fails.
+
+        The five ``set_up_*`` functions are patched at their source modules:
+        the lifespan imports them lazily inside the guarded block, so the
+        late ``from entity.X import set_up_Y`` binds the patched attribute.
+        """
+        import main
+        from main import app, lifespan
+
+        pool = AsyncMock(name="discogs_pool")
+        with (
+            patch.object(main.settings, "database_url_discogs", "postgresql://unit/test"),
+            # bucket_mode is a property over these two fields; force local
+            # mode so the lifespan's boot-fetch branch stays out of the way.
+            patch.object(main.settings, "lml_bucket_name", None),
+            patch.object(main.settings, "lml_bucket_endpoint", None),
+            patch(
+                "core.dependencies.get_discogs_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "entity.streaming_url_cache.set_up_streaming_url_cache_schema",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("streaming-URL bootstrap boom"),
+            ) as mock_url_cache,
+            patch(
+                "entity.release_resolution_cache.set_up_release_resolution_cache_schema",
+                new_callable=AsyncMock,
+            ) as mock_resolution,
+            patch(
+                "entity.library_release_override.set_up_library_release_override_schema",
+                new_callable=AsyncMock,
+            ) as mock_override,
+            patch(
+                "entity.discogs_rate_bucket.set_up_discogs_rate_bucket_schema",
+                new_callable=AsyncMock,
+            ) as mock_rate_bucket,
+            patch(
+                "entity.streaming_catalog.set_up_streaming_catalog_schema",
+                new_callable=AsyncMock,
+            ) as mock_catalog,
+            patch("main.shutdown_posthog"),
+            patch("main.close_library_db", new_callable=AsyncMock),
+            patch("main.close_discogs_service", new_callable=AsyncMock),
+        ):
+            async with lifespan(app):
+                pass  # startup must not raise despite the first bootstrap failing
+
+            mock_url_cache.assert_awaited_once()
+            mock_resolution.assert_awaited_once()
+            mock_override.assert_awaited_once()
+            mock_rate_bucket.assert_awaited_once()
+            mock_catalog.assert_awaited_once()
+
 
 class TestMiddleware:
     @pytest.mark.asyncio

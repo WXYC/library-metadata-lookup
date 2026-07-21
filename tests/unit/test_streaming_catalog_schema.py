@@ -20,8 +20,10 @@ Two surfaces, mirroring ``test_streaming_url_cache_schema.py``:
   EXISTS``, so their idempotent form is ``CREATE OR REPLACE`` (PG14+; the
   discogs-cache runs PG17).
 
-PG is faked with a recording double (``AsyncMock(spec=PgSource)`` can't model
-``async with pg.acquire()``); the integration layer
+PG is faked with a recording double: ``AsyncMock`` can model ``async with
+pg.acquire()``, but the nested ``conn.transaction()`` state tracking, the
+per-statement ``(sql, in_transaction)`` record, and ordered failure injection
+aren't expressible with the conftest AsyncMock helpers. The integration layer
 (``tests/integration/test_streaming_catalog.py``) drives the real DDL and the
 trigger semantics matrix against PostgreSQL.
 """
@@ -130,13 +132,13 @@ class TestCanonicalDDLReference:
         assert _SQL_REFERENCE.is_file()
 
     def test_targets_lml_cache_schema_and_all_four_tables(self):
-        ddl = _SQL_REFERENCE.read_text()
+        ddl = _SQL_REFERENCE.read_text(encoding="utf-8")
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in ddl
         for table in _TABLES:
             assert f"lml_cache.{table}" in ddl, f"missing table {table} in the .sql reference"
 
     def test_has_named_service_check_constraint(self):
-        ddl = _SQL_REFERENCE.read_text()
+        ddl = _SQL_REFERENCE.read_text(encoding="utf-8")
         assert "CONSTRAINT streaming_album_service_valid CHECK" in ddl
 
     def test_check_constraint_allowlist_matches_services(self):
@@ -144,7 +146,7 @@ class TestCanonicalDDLReference:
         # generates its IN-list from ``_SERVICES``. Anchor on the named
         # constraint (the widen DO block contains other ``service IN``
         # fragments) and assert exact-set equality so the mirror can't drift.
-        ddl = _SQL_REFERENCE.read_text()
+        ddl = _SQL_REFERENCE.read_text(encoding="utf-8")
         match = re.search(
             r"CONSTRAINT streaming_album_service_valid CHECK\s*\(\s*service\s+IN\s*\(([^)]*)\)",
             ddl,
@@ -167,13 +169,13 @@ class TestCanonicalDDLReference:
         # 5 functions (album, album-service, track, coverage-baseline row
         # guards + the shared TRUNCATE guard) wired through 8 triggers (a row
         # guard and a TRUNCATE guard per table).
-        ddl = _SQL_REFERENCE.read_text()
+        ddl = _SQL_REFERENCE.read_text(encoding="utf-8")
         assert ddl.count("CREATE OR REPLACE FUNCTION") == 5
         assert ddl.count("CREATE OR REPLACE TRIGGER") == 8
         assert ALLOW_URL_REMOVAL_GUC in ddl
 
     def test_declares_the_key_constraints(self):
-        ddl = _SQL_REFERENCE.read_text()
+        ddl = _SQL_REFERENCE.read_text(encoding="utf-8")
         assert "UNIQUE (normalized_artist, normalized_title)" in ddl
         assert "PRIMARY KEY (album_id, service)" in ddl
         assert "UNIQUE (album_id, artist, title)" in ddl
@@ -184,7 +186,7 @@ class TestCanonicalDDLReference:
         # require every runtime statement to appear verbatim in the reference —
         # kept alongside the exact-equality test below because a per-statement
         # loop names WHICH statement drifted.
-        reference = _normalize_sql(_SQL_REFERENCE.read_text())
+        reference = _normalize_sql(_SQL_REFERENCE.read_text(encoding="utf-8"))
         for statement in _DDL_STATEMENTS:
             normalized = _normalize_sql(statement)
             assert normalized in reference, (
@@ -197,7 +199,7 @@ class TestCanonicalDDLReference:
         # (or reorder them) without failing. The whole normalized file must
         # equal the normalized runtime sequence: same statements, same order,
         # nothing extra.
-        reference = _normalize_sql(_SQL_REFERENCE.read_text())
+        reference = _normalize_sql(_SQL_REFERENCE.read_text(encoding="utf-8"))
         runtime = _normalize_sql(" ".join(_DDL_STATEMENTS))
         assert reference == runtime
 
@@ -284,9 +286,12 @@ class TestSetUpStreamingCatalogSchema:
         assert widen_services == set(_SERVICES)
 
     async def test_guards_honor_the_opt_in_guc(self):
-        # All five guard functions must consult the documented escape-hatch
-        # GUC — it is what makes targeted manual revocation (docs/scripts.md
-        # runbook) possible without superuser DISABLE TRIGGER gymnastics.
+        # All five guard functions must CONSULT the documented escape-hatch
+        # GUC — it is what makes targeted manual revocation possible without
+        # superuser DISABLE TRIGGER gymnastics. Assert the current_setting()
+        # read, not the bare GUC name: every RAISE hint also contains the
+        # name, so a substring check alone is satisfied by a guard that
+        # mentions the opt-in without ever honoring it.
         pg = _FakePgSource()
 
         await set_up_streaming_catalog_schema(pg)
@@ -294,10 +299,10 @@ class TestSetUpStreamingCatalogSchema:
         functions = [sql for sql in pg.statements if "CREATE OR REPLACE FUNCTION" in sql]
         assert len(functions) == 5
         for fn_sql in functions:
-            assert ALLOW_URL_REMOVAL_GUC in fn_sql
+            assert f"current_setting('{ALLOW_URL_REMOVAL_GUC}'" in fn_sql
 
     async def test_every_raise_carries_the_one_opt_in_hint(self):
-        # 13 RAISE sites across the five guard functions; each renders the
+        # 20 RAISE sites across the five guard functions; each renders the
         # same hoisted hint literal as its final message line, so the runbook
         # pointer can't drift per-site.
         pg = _FakePgSource()
@@ -308,8 +313,8 @@ class TestSetUpStreamingCatalogSchema:
         hint = (
             f"opt in via set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) in this transaction"
         )
-        assert functions.count("RAISE EXCEPTION") == 13
-        assert functions.count(hint) == 13
+        assert functions.count("RAISE EXCEPTION") == 20
+        assert functions.count(hint) == 20
 
     async def test_bootstrap_is_pure_ddl_after_the_preamble(self):
         # The bootstrap must never mutate rows. The sibling tests grep for

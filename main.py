@@ -188,20 +188,22 @@ async def lifespan(app: FastAPI):
         store = await get_object_store(settings)
         await _boot_fetch_library_db(settings, store)
 
-    # Bootstrap the persistent streaming-URL cache table directly off the
+    # Bootstrap the LML-owned ``lml_cache.*`` tables directly off the
     # discogs-cache pool. Going through ``get_entity_store`` (and its
-    # ``entity.identity`` probe) would gate the cache on an unrelated table's
+    # ``entity.identity`` probe) would gate the caches on an unrelated table's
     # health — a missing-but-recoverable ``entity.identity`` row set would
-    # silently disable the streaming-URL cache for the process lifetime even
-    # though the cache schema could have been created against the same pool.
+    # silently disable them for the process lifetime even though their schemas
+    # could have been created against the same pool.
     # ``set_up_streaming_url_cache_schema`` runs ``CREATE SCHEMA IF NOT EXISTS
     # lml_cache`` first (the LML-owned application-cache schema, per
     # discogs-etl#288 Option 3), so a fresh PG without any LML schema applied
     # still bootstraps cleanly. If the pool itself is unavailable, log and
     # continue — the cache layer's get/set wrap their queries in try/except and
     # return "miss" on any PG error, so /lookup degrades to one extra probe per
-    # request rather than failing startup.
+    # request rather than failing startup. Each bootstrap then runs under its
+    # own handler: one failing does not skip the ones after it.
     if settings.database_url_discogs:
+        pool = None
         try:
             from core.dependencies import get_discogs_pool
             from entity.discogs_rate_bucket import set_up_discogs_rate_bucket_schema
@@ -216,59 +218,77 @@ async def lifespan(app: FastAPI):
             from entity.streaming_url_cache import set_up_streaming_url_cache_schema
 
             pool = await get_discogs_pool()
-            if pool is not None:
-                source = PgSource(pool=pool)
-                await set_up_streaming_url_cache_schema(source)
-                logger.info("Streaming-URL cache schema ready")
+            if pool is None:
+                logger.info(
+                    "Discogs cache pool unavailable at startup — skipping the "
+                    "lml_cache.* bootstraps; their consumers no-op until the next deploy"
+                )
+        except Exception:
+            pool = None
+            logger.exception(
+                "Discogs cache pool acquisition failed — skipping the lml_cache.* "
+                "bootstraps; their consumers no-op until the next deploy"
+            )
+        if pool is not None:
+            source = PgSource(pool=pool)
+            bootstraps = (
+                (
+                    "Streaming-URL cache",
+                    lambda: set_up_streaming_url_cache_schema(source),
+                ),
                 # Positive release-resolution cache (LML#632), another LML-owned
                 # ``lml_cache.*`` application cache. Same pool, same best-effort
                 # posture; #628 wires its read/write into the lookup path.
-                await set_up_release_resolution_cache_schema(source)
-                logger.info("Release-resolution cache schema ready")
+                (
+                    "Release-resolution cache",
+                    lambda: set_up_release_resolution_cache_schema(source),
+                ),
                 # Verified library-release override (LML#850), another LML-owned
                 # ``lml_cache.*`` table. Same pool, same best-effort posture; the
                 # orchestrator prefetches it on the flag-gated lookup path.
-                await set_up_library_release_override_schema(source)
-                logger.info("Library-release override schema ready")
+                (
+                    "Library-release override",
+                    lambda: set_up_library_release_override_schema(source),
+                ),
                 # Shared Discogs rate token bucket (LML#841), one LML-owned
                 # ``lml_cache.*`` row seeded from the rate-limit budget. Seed is
                 # ``ON CONFLICT DO NOTHING`` so a second process/environment does
                 # not clobber the shared budget. Inert until
                 # ``DISCOGS_RATE_BUCKET_ENABLED`` is set; the gate fails open to
                 # the local limiter regardless of this bootstrap's outcome.
-                await set_up_discogs_rate_bucket_schema(
-                    source,
-                    bucket_key=settings.discogs_rate_bucket_key,
-                    capacity=settings.discogs_rate_limit,
-                    refill_per_sec=settings.discogs_rate_limit / 60,
-                )
-                logger.info("Discogs rate-bucket schema ready")
+                (
+                    "Discogs rate bucket",
+                    lambda: set_up_discogs_rate_bucket_schema(
+                        source,
+                        bucket_key=settings.discogs_rate_bucket_key,
+                        capacity=settings.discogs_rate_limit,
+                        refill_per_sec=settings.discogs_rate_limit / 60,
+                    ),
+                ),
                 # Offline streaming-availability catalog (LML#842), the
                 # row-level PG canonical replacing the whole-file
                 # streaming_availability.db lineage. Same pool, same
                 # best-effort posture. First lml_cache.* bootstrap to install
                 # triggers/functions (CREATE OR REPLACE — idempotent by
                 # replacement; see entity/streaming_catalog.py).
-                await set_up_streaming_catalog_schema(source)
-                logger.info("Streaming-catalog schema ready")
-            else:
-                logger.info(
-                    "Discogs cache pool unavailable at startup — skipping all five "
-                    "lml_cache.* bootstraps (streaming-URL cache, release-resolution "
-                    "cache, library-release override, Discogs rate bucket, streaming "
-                    "catalog); their consumers no-op until the next deploy"
-                )
-        except Exception:
-            # One handler covers all five lml_cache.* bootstraps above: a
-            # failure in any of them skips the rest for this boot (they rerun
-            # next deploy). Caches bootstrapped before the failure stay
-            # active; the skipped ones degrade independently — they no-op to
-            # miss, the rate-bucket gate fails open, and the streaming
-            # catalog stays offline-pipeline-only in this PR.
-            logger.exception(
-                "lml_cache schema bootstrap failed — already-bootstrapped caches stay "
-                "active; the remaining ones are disabled until the next boot"
+                (
+                    "Streaming catalog",
+                    lambda: set_up_streaming_catalog_schema(source),
+                ),
             )
+            for label, bootstrap in bootstraps:
+                try:
+                    await bootstrap()
+                    logger.info("%s schema ready", label)
+                except Exception:
+                    # Degrade just this cache: it no-ops to miss (the
+                    # rate-bucket gate fails open) until the next boot reruns
+                    # its bootstrap.
+                    logger.exception(
+                        "%s schema bootstrap failed — this cache is disabled until "
+                        "the next boot; the other lml_cache.* bootstraps continue",
+                        label,
+                    )
 
     yield
 

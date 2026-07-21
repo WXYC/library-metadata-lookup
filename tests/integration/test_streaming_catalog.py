@@ -25,7 +25,11 @@ import pytest
 import pytest_asyncio
 
 from entity.sources import PgSource
-from entity.streaming_catalog import _SERVICES, set_up_streaming_catalog_schema
+from entity.streaming_catalog import (
+    _SERVICE_IN_LIST,
+    ALLOW_URL_REMOVAL_GUC,
+    set_up_streaming_catalog_schema,
+)
 from tests.integration.conftest import skip_if_named_tables_populated
 
 _TABLES = (
@@ -62,6 +66,12 @@ _INSERT_SERVICE_WITH_SLUG = (
     "(album_id, service, status, url, slug) VALUES ($1, $2, $3, $4, $5)"
 )
 
+_INSERT_SERVICE_FULL = (
+    "INSERT INTO lml_cache.streaming_album_service "
+    "(album_id, service, status, url, service_item_id, confidence, "
+    "matched_artist, matched_title) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+)
+
 _INSERT_TRACK = (
     "INSERT INTO lml_cache.streaming_track_result "
     "(album_id, artist, title, source, source_type, spotify_url, deezer_url, resolution_status) "
@@ -73,16 +83,15 @@ _INSERT_TRACK = (
 _TRACK_SOURCE = "discogs_tracklist"
 _TRACK_SOURCE_TYPE = "compilation"
 
-_OPT_IN = "SELECT set_config('lml_cache.allow_url_removal', 'on', true)"
+# Derived from the module constant so the opt-in these tests exercise can't
+# drift from the GUC the guards consult; the guard layer itself stays pinned
+# by the many ``match="allow_url_removal"`` rejection sites below.
+_OPT_IN = f"SELECT set_config('{ALLOW_URL_REMOVAL_GUC}', 'on', true)"
 
 _SPOTIFY_URL = "https://open.spotify.com/album/2u30gztZTylY4RG7IvfXs8"
 _APPLE_URL = "https://music.apple.com/us/album/aluminum-tunes/1443179207"
 # Opaque album id — never dereferenced by tests or code; any digits work.
 _DEEZER_URL = "https://www.deezer.com/album/103248"
-
-# The IN-list the code ships, for hand-building constraint variants in the
-# widen tests. Derived from the module's tuple so it can't drift.
-_SERVICE_IN_LIST = ", ".join(f"'{s}'" for s in _SERVICES)
 
 _SERVICE_CHECK_OID = (
     "SELECT oid FROM pg_constraint WHERE conname = 'streaming_album_service_valid' "
@@ -172,6 +181,58 @@ async def _make_track(
             spotify_url,
             deezer_url,
             resolution_status,
+        )
+
+
+async def _make_full_service_row(pg_pool) -> int:
+    """A found spotify probe with every collected match-metadata column
+    populated — the state the metadata-discard guard protects."""
+    album_id = await _make_album(pg_pool)
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            _INSERT_SERVICE_FULL,
+            album_id,
+            "spotify",
+            "found",
+            _SPOTIFY_URL,
+            "2u30gztZTylY4RG7IvfXs8",
+            0.97,
+            "Stereolab",
+            "Aluminum Tunes",
+        )
+    return album_id
+
+
+async def _make_resolved_track(pg_pool, album_id: int) -> int:
+    """A resolved track with the full resolution-metadata group populated
+    (linkage, confidences) — the state the resolution-discard guard protects.
+    Populated via UPDATE, which doubles as coverage that promotion writes
+    pass the guard."""
+    track_id = await _make_track(
+        pg_pool,
+        album_id,
+        spotify_url=_SPOTIFY_URL,
+        deezer_url=_DEEZER_URL,
+        resolution_status="pending",
+    )
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE lml_cache.streaming_track_result SET resolution_status = 'api_match', "
+            "resolved_via = 'album_match', resolved_album_id = $2, "
+            "resolved_release_id = 118423, spotify_confidence = 0.93, "
+            "deezer_confidence = 0.88 WHERE id = $1",
+            track_id,
+            album_id,
+        )
+    return track_id
+
+
+async def _seed_baseline(pg_pool, value: int = 294) -> None:
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO lml_cache.streaming_coverage_baseline (metric, value) "
+            "VALUES ('apple_music_found', $1)",
+            value,
         )
 
 
@@ -300,7 +361,9 @@ class TestSchemaBootstrap:
         errors at the FK level before any trigger fires, so presence is the
         only testable property. (Queried via ``pg_trigger`` —
         ``information_schema.triggers`` omits TRUNCATE triggers entirely; bit
-        32 of ``tgtype`` marks TRUNCATE.)"""
+        32 of ``tgtype`` marks TRUNCATE. The ``tgfoid`` predicate pins that
+        each trigger is bound to the shared guard function, not merely that
+        SOME truncate trigger exists.)"""
         async with pg_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT c.relname FROM pg_trigger t "
@@ -308,6 +371,7 @@ class TestSchemaBootstrap:
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
                 "WHERE n.nspname = 'lml_cache' AND NOT t.tgisinternal "
                 "AND (t.tgtype::integer & 32) = 32 "
+                "AND t.tgfoid = 'lml_cache.guard_streaming_truncate'::regproc "
                 "AND c.relname = ANY($1::text[])",
                 list(_TABLES),
             )
@@ -334,13 +398,32 @@ class TestSchemaBootstrap:
                     )
 
     @pytest.mark.asyncio
-    async def test_explicit_id_insert_is_preserved(self, pg_pool):
-        """The seed (PR C) inserts SQLite ids verbatim; IDENTITY must be BY DEFAULT."""
+    async def test_album_plain_explicit_id_insert_is_rejected(self, pg_pool):
+        """IDENTITY is GENERATED ALWAYS: only the seed (PR C), which states
+        ``OVERRIDING SYSTEM VALUE`` explicitly, may supply ids. The PR D/E
+        script ports come from a direct-sqlite lineage that historically
+        managed its own ids — exactly the class of caller that could silently
+        insert explicit ids without advancing the sequence, priming later
+        pipeline inserts for unique-violation failures."""
+        with pytest.raises(asyncpg.GeneratedAlwaysError):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO lml_cache.streaming_album "
+                    "(id, normalized_artist, normalized_title, display_artist, display_title, "
+                    "library_ids, formats) "
+                    "VALUES (4242, 'jessica pratt', 'on your own love again', "
+                    "'Jessica Pratt', 'On Your Own Love Again', '[]'::jsonb, '[]'::jsonb)"
+                )
+
+    @pytest.mark.asyncio
+    async def test_album_seed_explicit_id_with_overriding_is_preserved(self, pg_pool):
+        """The one-time seed (PR C) preserves SQLite ``albums.id`` values via
+        ``OVERRIDING SYSTEM VALUE`` so cross-table references stay valid."""
         async with pg_pool.acquire() as conn:
             row_id = await conn.fetchval(
                 "INSERT INTO lml_cache.streaming_album "
                 "(id, normalized_artist, normalized_title, display_artist, display_title, "
-                "library_ids, formats) "
+                "library_ids, formats) OVERRIDING SYSTEM VALUE "
                 "VALUES (4242, 'jessica pratt', 'on your own love again', "
                 "'Jessica Pratt', 'On Your Own Love Again', '[]'::jsonb, '[]'::jsonb) "
                 "RETURNING id"
@@ -348,14 +431,28 @@ class TestSchemaBootstrap:
         assert row_id == 4242
 
     @pytest.mark.asyncio
-    async def test_track_explicit_id_insert_is_preserved(self, pg_pool):
-        """The seed also inserts SQLite ``track_results`` ids verbatim; the
-        track table's IDENTITY must be BY DEFAULT too, not just the album's."""
+    async def test_track_plain_explicit_id_insert_is_rejected(self, pg_pool):
+        """Same GENERATED ALWAYS posture on the track table, not just the album's."""
+        album_id = await _make_album(pg_pool)
+        with pytest.raises(asyncpg.GeneratedAlwaysError):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO lml_cache.streaming_track_result "
+                    "(id, album_id, artist, title, source, source_type) "
+                    "VALUES (7777, $1, 'Sessa', 'Grandeza', $2, $3)",
+                    album_id,
+                    _TRACK_SOURCE,
+                    _TRACK_SOURCE_TYPE,
+                )
+
+    @pytest.mark.asyncio
+    async def test_track_seed_explicit_id_with_overriding_is_preserved(self, pg_pool):
+        """The seed also inserts SQLite ``track_results.id`` values verbatim."""
         album_id = await _make_album(pg_pool)
         async with pg_pool.acquire() as conn:
             row_id = await conn.fetchval(
                 "INSERT INTO lml_cache.streaming_track_result "
-                "(id, album_id, artist, title, source, source_type) "
+                "(id, album_id, artist, title, source, source_type) OVERRIDING SYSTEM VALUE "
                 "VALUES (7777, $1, 'Sessa', 'Grandeza', $2, $3) RETURNING id",
                 album_id,
                 _TRACK_SOURCE,
@@ -439,6 +536,43 @@ class TestServiceCheckWiden:
             oid_after_reboot = await conn.fetchval(_SERVICE_CHECK_OID)
         assert oid_after_reboot == oid_after_widen
 
+    @pytest.mark.asyncio
+    async def test_boot_recovers_when_constraint_is_absent_over_out_of_set_rows(
+        self, pg_pool, pg_source
+    ):
+        """Constraint dropped out-of-band (manual repair gone sideways) while
+        the table holds rows using a service this code doesn't ship. The
+        re-ADD must fold the table's live service values into the rebuilt
+        list: re-validating against ``_SERVICES`` alone fails on those rows
+        and aborts the whole bootstrap transaction — on EVERY boot, until a
+        human intervenes, which is a self-selecting incident state (the
+        constraint-absent case only arises when something already went
+        wrong)."""
+        album_id = await _make_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE lml_cache.streaming_album_service "
+                "DROP CONSTRAINT streaming_album_service_valid"
+            )
+            await conn.execute(
+                _INSERT_SERVICE, album_id, "pandora", "found", "https://example.test/pandora"
+            )
+
+        await set_up_streaming_catalog_schema(pg_source)
+
+        async with pg_pool.acquire() as conn:
+            oid = await conn.fetchval(_SERVICE_CHECK_OID)
+            preserved = await conn.fetchval(
+                "SELECT count(*) FROM lml_cache.streaming_album_service WHERE service = 'pandora'"
+            )
+            # The rebuilt constraint must still admit the shipped services...
+            await conn.execute(_INSERT_SERVICE, album_id, "spotify", "pending", None)
+            # ...and still reject services from neither set.
+            with pytest.raises(asyncpg.CheckViolationError):
+                await conn.execute(_INSERT_SERVICE, album_id, "myspace", "pending", None)
+        assert oid is not None
+        assert preserved == 1
+
 
 @pytest.mark.pg
 class TestAlbumRowGuard:
@@ -489,6 +623,76 @@ class TestAlbumRowGuard:
                 album_id,
             )
         assert release_id == 456
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("column", ["normalized_artist", "normalized_title"])
+    async def test_rekeying_album_identity_is_rejected(self, pg_pool, column):
+        """Re-keying identity re-labels every collected child probe row: the
+        data survives physically but is discarded semantically, attached to
+        an album it wasn't collected for."""
+        album_id = await _make_album(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE lml_cache.streaming_album SET {column} = 'someone else' WHERE id = $1",
+                    album_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_album_id_rekey_via_default_is_rejected(self, pg_pool):
+        """``UPDATE ... SET id = DEFAULT`` slips past GENERATED ALWAYS (it
+        draws a fresh sequence value rather than erroring); the guard's
+        identity predicate is the layer that blocks it."""
+        album_id = await _make_album(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_album SET id = DEFAULT WHERE id = $1",
+                    album_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_album_id_direct_update_is_rejected_by_identity(self, pg_pool):
+        """A direct id rewrite is blocked below the guard layer by GENERATED
+        ALWAYS itself."""
+        album_id = await _make_album(pg_pool)
+        with pytest.raises(asyncpg.GeneratedAlwaysError):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_album SET id = id + 100000 WHERE id = $1",
+                    album_id,
+                )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("column", ["discogs_artist", "discogs_title"])
+    async def test_nulling_collected_discogs_match_metadata_is_rejected(self, pg_pool, column):
+        """``discogs_artist``/``discogs_title`` record WHAT was matched —
+        collected alongside the release id and discarded as surely by nulling
+        them while the link itself survives."""
+        album_id = await _make_matched_album(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE lml_cache.streaming_album SET {column} = NULL WHERE id = $1",
+                    album_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_correcting_discogs_match_metadata_is_allowed(self, pg_pool):
+        """A re-match REPLACES the collected names; only discarding (→ NULL)
+        loses data, mirroring the release-id correction rule."""
+        album_id = await _make_matched_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.streaming_album SET "
+                "discogs_artist = 'Stereolab & Nurse With Wound', "
+                "discogs_title = 'Simple Headphone Mind' WHERE id = $1",
+                album_id,
+            )
+            matched = await conn.fetchval(
+                "SELECT discogs_artist FROM lml_cache.streaming_album WHERE id = $1", album_id
+            )
+        assert matched == "Stereolab & Nurse With Wound"
 
     @pytest.mark.asyncio
     async def test_metadata_update_is_allowed(self, pg_pool):
@@ -578,11 +782,13 @@ class TestServiceRowGuard:
     @pytest.mark.asyncio
     async def test_blanking_a_found_url_to_empty_string_is_rejected(self, pg_pool):
         """The pipelines' URL extractors default to ``''`` on a missing key —
-        an empty string discards a collected URL as surely as NULL. (The
-        column CHECK also rejects ``''`` outright; the guard message is the
-        one that points at the opt-in, so both layers stay tested.)"""
+        an empty string discards a collected URL as surely as NULL. The
+        ``match`` pins WHICH layer rejects: the BEFORE-trigger guard fires
+        ahead of the column CHECK on UPDATE, and its message is the one that
+        points at the opt-in (the CHECK still backstops opted-in blanking and
+        NULL→'' on uncollected rows)."""
         album_id = await _make_found_service_row(pg_pool)
-        with pytest.raises(asyncpg.PostgresError):
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
             async with pg_pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE lml_cache.streaming_album_service SET url = '' "
@@ -663,6 +869,84 @@ class TestServiceRowGuard:
         message = str(excinfo.value)
         assert "DELETE blocked" in message
         assert "allow_url_removal" in message
+
+    @pytest.mark.asyncio
+    async def test_rekeying_service_row_service_is_rejected(self, pg_pool):
+        """Relabeling a found spotify row as deezer discards the spotify
+        result AND forges a deezer one in a single in-set UPDATE the CHECK
+        constraint can't see."""
+        album_id = await _make_found_service_row(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_album_service SET service = 'deezer' "
+                    "WHERE album_id = $1 AND service = 'spotify'",
+                    album_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_rekeying_service_row_album_is_rejected(self, pg_pool):
+        """Repointing a probe row at a different album mis-attributes the
+        collected result; the FK stays satisfied, so only the guard sees it."""
+        album_id = await _make_found_service_row(pg_pool)
+        other_album_id = await _make_album(pg_pool, artist="juana molina", title="doga")
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_album_service SET album_id = $2 "
+                    "WHERE album_id = $1 AND service = 'spotify'",
+                    album_id,
+                    other_album_id,
+                )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blank_value", ["NULL", "''"])
+    @pytest.mark.parametrize("column", ["service_item_id", "matched_artist", "matched_title"])
+    async def test_discarding_collected_match_metadata_is_rejected(
+        self, pg_pool, column, blank_value
+    ):
+        """``service_item_id``/``matched_artist``/``matched_title`` record
+        what the probe matched — collected API results, discarded as surely
+        by blanking as the url itself."""
+        album_id = await _make_full_service_row(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE lml_cache.streaming_album_service SET {column} = {blank_value} "
+                    "WHERE album_id = $1 AND service = 'spotify'",
+                    album_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_nulling_collected_confidence_is_rejected(self, pg_pool):
+        album_id = await _make_full_service_row(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_album_service SET confidence = NULL "
+                    "WHERE album_id = $1 AND service = 'spotify'",
+                    album_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_replacing_match_metadata_is_allowed(self, pg_pool):
+        """A re-probe may CORRECT the matched names and confidence; only
+        discarding loses data."""
+        album_id = await _make_full_service_row(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.streaming_album_service "
+                "SET matched_title = 'Aluminum Tunes (Switched On Volume 3)', confidence = 0.99 "
+                "WHERE album_id = $1 AND service = 'spotify'",
+                album_id,
+            )
+            row = await conn.fetchrow(
+                "SELECT matched_title, confidence FROM lml_cache.streaming_album_service "
+                "WHERE album_id = $1 AND service = 'spotify'",
+                album_id,
+            )
+        assert row["matched_title"] == "Aluminum Tunes (Switched On Volume 3)"
+        assert row["confidence"] == 0.99
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("demoted_status", ["not_found", "error", "pending", "skipped"])
@@ -821,8 +1105,9 @@ class TestTrackRowGuard:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("url_column", ["spotify_url", "deezer_url"])
     async def test_blanking_a_found_track_url_is_rejected(self, pg_pool, url_column):
-        """`''` discards as surely as NULL; the column CHECK also rejects it,
-        and either layer failing the write keeps the URL collected."""
+        """`''` discards as surely as NULL. The ``match`` pins WHICH layer
+        rejects: the BEFORE-trigger guard fires ahead of the column CHECK on
+        UPDATE, and its message is the one that points at the opt-in."""
         album_id = await _make_album(pg_pool)
         track_id = await _make_track(
             pg_pool,
@@ -831,7 +1116,7 @@ class TestTrackRowGuard:
             deezer_url=_DEEZER_URL,
             resolution_status="api_match",
         )
-        with pytest.raises(asyncpg.PostgresError):
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
             async with pg_pool.acquire() as conn:
                 await conn.execute(
                     f"UPDATE lml_cache.streaming_track_result SET {url_column} = '' WHERE id = $1",
@@ -885,6 +1170,108 @@ class TestTrackRowGuard:
                 track_id,
             )
         assert status == "local_match"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("column", ["artist", "title"])
+    async def test_rekeying_track_identity_is_rejected(self, pg_pool, column):
+        """Re-keying (album_id, artist, title) re-attributes a collected
+        resolution to a track it wasn't resolved for."""
+        album_id = await _make_album(pg_pool)
+        track_id = await _make_track(pg_pool, album_id)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE lml_cache.streaming_track_result SET {column} = 'someone else' "
+                    "WHERE id = $1",
+                    track_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_rekeying_track_album_is_rejected(self, pg_pool):
+        """Repointing a track at a different album keeps the FK satisfied, so
+        only the guard sees the re-attribution."""
+        album_id = await _make_album(pg_pool)
+        other_album_id = await _make_album(pg_pool, artist="juana molina", title="doga")
+        track_id = await _make_track(pg_pool, album_id)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_track_result SET album_id = $2 WHERE id = $1",
+                    track_id,
+                    other_album_id,
+                )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "column",
+        [
+            "resolved_via",
+            "resolved_album_id",
+            "resolved_release_id",
+            "spotify_confidence",
+            "deezer_confidence",
+        ],
+    )
+    async def test_discarding_collected_resolution_metadata_is_rejected(self, pg_pool, column):
+        """The resolved_*/confidence group records HOW a track resolved —
+        collected linkage the album guard's discogs columns get but tracks
+        historically didn't; nulling any of it discards collected data."""
+        album_id = await _make_album(pg_pool)
+        track_id = await _make_resolved_track(pg_pool, album_id)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE lml_cache.streaming_track_result SET {column} = NULL WHERE id = $1",
+                    track_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_blanking_resolved_via_is_rejected(self, pg_pool):
+        """``resolved_via`` is TEXT, so ``''`` discards it as surely as NULL
+        (same blank-or-null shape as the url and slug guards)."""
+        album_id = await _make_album(pg_pool)
+        track_id = await _make_resolved_track(pg_pool, album_id)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_track_result SET resolved_via = '' WHERE id = $1",
+                    track_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_correcting_resolution_metadata_is_allowed(self, pg_pool):
+        """Re-resolution may CORRECT the linkage; only discarding loses data."""
+        album_id = await _make_album(pg_pool)
+        track_id = await _make_resolved_track(pg_pool, album_id)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.streaming_track_result SET resolved_release_id = 456, "
+                "spotify_confidence = 0.99 WHERE id = $1",
+                track_id,
+            )
+            release_id = await conn.fetchval(
+                "SELECT resolved_release_id FROM lml_cache.streaming_track_result WHERE id = $1",
+                track_id,
+            )
+        assert release_id == 456
+
+    @pytest.mark.asyncio
+    async def test_setting_resolution_status_null_is_rejected_as_a_demotion(self, pg_pool):
+        """A NULL new status must hit the guard's demotion gate (a clear,
+        opt-in-pointing error), not fall through to the bare NOT NULL
+        violation: ``NOT IN`` returns NULL for a NULL operand, and an
+        unhardened predicate silently waves NULL past the guard layer."""
+        album_id = await _make_album(pg_pool)
+        track_id = await _make_track(
+            pg_pool, album_id, spotify_url=_SPOTIFY_URL, resolution_status="api_match"
+        )
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_track_result SET resolution_status = NULL "
+                    "WHERE id = $1",
+                    track_id,
+                )
 
     @pytest.mark.asyncio
     async def test_opt_in_allows_status_demotion(self, pg_pool):
@@ -1000,17 +1387,9 @@ class TestCoverageBaselineGuard:
     regression assertion can't be quietly defused by lowering (or deleting)
     the baseline it compares against."""
 
-    async def _seed(self, pg_pool, value: int = 294) -> None:
-        async with pg_pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO lml_cache.streaming_coverage_baseline (metric, value) "
-                "VALUES ('apple_music_found', $1)",
-                value,
-            )
-
     @pytest.mark.asyncio
     async def test_lowering_a_baseline_is_rejected(self, pg_pool):
-        await self._seed(pg_pool)
+        await _seed_baseline(pg_pool)
         with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
             async with pg_pool.acquire() as conn:
                 await conn.execute(
@@ -1019,8 +1398,65 @@ class TestCoverageBaselineGuard:
                 )
 
     @pytest.mark.asyncio
+    async def test_renaming_a_metric_is_rejected(self, pg_pool):
+        """Renaming sidelines the floor: the export looks up
+        ``apple_music_found`` and finds nothing — quietly defusing the very
+        assertion this guard exists to protect."""
+        await _seed_baseline(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_coverage_baseline "
+                    "SET metric = 'apple_music_found_old' WHERE metric = 'apple_music_found'"
+                )
+
+    @pytest.mark.asyncio
+    async def test_rename_plus_reinsert_defusal_dies_at_the_first_step(self, pg_pool):
+        """INSERTs are unguarded on purpose: with rename blocked and DELETE
+        blocked, re-INSERTing a guarded metric dies on the PK, so the
+        INSERT-side defusal (rename the floor away, re-INSERT it lower) has
+        no first step — while a brand-new metric's first INSERT stays legal."""
+        await _seed_baseline(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_coverage_baseline "
+                    "SET metric = 'apple_music_found_old' WHERE metric = 'apple_music_found'"
+                )
+        async with pg_pool.acquire() as conn:
+            with pytest.raises(asyncpg.UniqueViolationError):
+                await conn.execute(
+                    "INSERT INTO lml_cache.streaming_coverage_baseline (metric, value) "
+                    "VALUES ('apple_music_found', 5)"
+                )
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO lml_cache.streaming_coverage_baseline (metric, value) "
+                "VALUES ('bandcamp_found', 2816)"
+            )
+            value = await conn.fetchval(
+                "SELECT value FROM lml_cache.streaming_coverage_baseline "
+                "WHERE metric = 'apple_music_found'"
+            )
+        assert value == 294
+
+    @pytest.mark.asyncio
+    async def test_setting_value_null_is_rejected_as_a_lowering(self, pg_pool):
+        """A NULL new value must hit the guard's lowering gate, not fall
+        through to the bare NOT NULL violation: ``NEW.value < OLD.value`` is
+        NULL for a NULL operand, which an unhardened predicate treats as
+        pass."""
+        await _seed_baseline(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_coverage_baseline SET value = NULL "
+                    "WHERE metric = 'apple_music_found'"
+                )
+
+    @pytest.mark.asyncio
     async def test_raising_and_equal_updates_are_allowed(self, pg_pool):
-        await self._seed(pg_pool)
+        await _seed_baseline(pg_pool)
         async with pg_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE lml_cache.streaming_coverage_baseline SET value = 301 "
@@ -1039,7 +1475,7 @@ class TestCoverageBaselineGuard:
 
     @pytest.mark.asyncio
     async def test_delete_is_rejected_without_opt_in(self, pg_pool):
-        await self._seed(pg_pool)
+        await _seed_baseline(pg_pool)
         with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
             async with pg_pool.acquire() as conn:
                 await conn.execute(
@@ -1049,7 +1485,7 @@ class TestCoverageBaselineGuard:
 
     @pytest.mark.asyncio
     async def test_opt_in_allows_lowering_and_delete(self, pg_pool):
-        await self._seed(pg_pool)
+        await _seed_baseline(pg_pool)
         async with pg_pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(_OPT_IN)

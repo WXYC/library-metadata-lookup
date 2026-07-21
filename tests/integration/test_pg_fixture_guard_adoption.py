@@ -58,11 +58,18 @@ _LML_CACHE_FIXTURE_FILES = (
     "test_release_resolution_cache.py",
     "test_streaming_url_persistent_lookup.py",
     "test_streaming_catalog.py",
+    "test_library_release_override.py",
+    "test_seed_library_release_overrides.py",
 )
+
+# Any DROP SCHEMA aimed at lml_cache, however spelled (with/without IF
+# EXISTS, arbitrary whitespace) — mirrors the ``_INLINE_IDENTITY_DDL``
+# pattern above so a cosmetic rewrite can't slip past an exact literal.
+_DROP_LML_CACHE_SCHEMA = re.compile(r"DROP\s+SCHEMA\s+(?:IF\s+EXISTS\s+)?lml_cache", re.IGNORECASE)
 
 
 def _source(name: str) -> str:
-    return (Path(__file__).parent / name).read_text()
+    return (Path(__file__).parent / name).read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("name", _MIGRATED_FILES)
@@ -104,7 +111,7 @@ def test_lml_cache_fixture_file_never_drops_the_whole_schema(name: str) -> None:
     every LML cache (streaming-URL, release-resolution, rate bucket, override,
     streaming catalog), so a schema-wide drop has cross-suite blast radius and
     bypasses any per-table populated veto."""
-    assert "DROP SCHEMA IF EXISTS lml_cache" not in _source(name), (
+    assert not _DROP_LML_CACHE_SCHEMA.search(_source(name)), (
         f"{name} drops the whole lml_cache schema — drop only the tables the "
         "suite owns, behind skip_if_named_tables_populated."
     )
