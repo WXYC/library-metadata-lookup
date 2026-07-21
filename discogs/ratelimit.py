@@ -23,13 +23,11 @@ from discogs.breaker import DiscogsCircuitBreaker
 logger = logging.getLogger(__name__)
 
 # PostHog contract for the unsampled fail-open counter (LML#879 Deliverable A).
-# The Sentry ``fallback`` tag below rides *sampled* transactions, and the
-# dominant fail-open traffic — the BS flowsheet/album backfill floods — runs
-# ``tracesSampleRate=0`` and client-discards its LML transactions, so the tag
-# under-counts fail-open during exactly the floods it is meant to catch. PostHog
-# capture is independent of trace sampling, so this event is the authoritative
-# fail-open rate for the bucket-enablement rollout (a sustained non-zero rate
-# means the shared bucket is silently not enforcing).
+# Unlike the Sentry ``fallback`` tag below, PostHog capture is independent of
+# trace sampling, so this event keeps counting during the backfill floods that
+# client-discard their LML transactions. Full rationale + operator
+# interpretation: docs/observability-rowless-flag.md, "Rate-gate fail-open
+# counter".
 _FAIL_OPEN_EVENT = "discogs_rate_gate_fail_open"
 _POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
 _POSTHOG_EVENT_PREFIX = "discogs_rate_gate"
