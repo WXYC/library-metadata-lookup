@@ -27,9 +27,13 @@
 -- boot: `IF NOT EXISTS` for schema/tables/indexes, `CREATE OR REPLACE` for the
 -- guard functions and triggers (triggers have no `IF NOT EXISTS`; OR REPLACE is
 -- the idempotent form, PG14+ — this deliberately extends the `lml_cache.*`
--- bootstrap convention beyond CREATE-TABLE-only). If the canonical shape
--- changes, update both places (and the parity assertions in
--- tests/unit/test_streaming_catalog_schema.py).
+-- bootstrap convention beyond CREATE-TABLE-only). The bootstrap runs all of it
+-- as one transaction on one connection, after `SET LOCAL lock_timeout = '10s'`
+-- and `SELECT pg_advisory_xact_lock(842001)` — bounded lock waits, serialized
+-- concurrent boots, and never tables without their guard triggers. If the
+-- canonical shape changes, update both places (a normalized-containment test
+-- in tests/unit/test_streaming_catalog_schema.py pins every runtime statement,
+-- PL/pgSQL bodies included, to this file).
 
 CREATE SCHEMA IF NOT EXISTS lml_cache;
 
@@ -76,7 +80,9 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album_service (
     url TEXT,
     slug TEXT,             -- bandcamp only
     service_item_id TEXT,  -- spotify_id today; service-scoped opaque id
-    confidence REAL,
+    -- DOUBLE PRECISION (not REAL): SQLite REAL is an 8-byte double; float4
+    -- would silently narrow the seeded values.
+    confidence DOUBLE PRECISION,
     matched_artist TEXT,
     matched_title TEXT,
     checked_at TIMESTAMPTZ,
@@ -109,8 +115,10 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_track_result (
     artist TEXT NOT NULL,
     title TEXT NOT NULL,
     position TEXT,
-    source TEXT,
-    source_type TEXT,
+    -- NOT NULL: every legacy SQLite row carries both provenance columns; the
+    -- seed must not be able to silently drop them.
+    source TEXT NOT NULL,
+    source_type TEXT NOT NULL,
     -- Per-track resolution state ('pending' | 'local_match' | 'api_match' |
     -- 'not_found' | ...); the table stays wide (vs service rows) because this
     -- status is per-track and only spotify/deezer apply to tracks.
@@ -119,9 +127,9 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_track_result (
     resolved_album_id BIGINT,
     resolved_release_id BIGINT,
     spotify_url TEXT,
-    spotify_confidence REAL,
+    spotify_confidence DOUBLE PRECISION,
     deezer_url TEXT,
-    deezer_confidence REAL,
+    deezer_confidence DOUBLE PRECISION,
     checked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- Doubles as the FK-side index for the ON DELETE RESTRICT check (leading
@@ -144,8 +152,9 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_coverage_baseline (
 );
 
 -- No-regress guards: transitions that would discard collected streaming data
--- (nulling a found URL, demoting a found status, any DELETE) are rejected at
--- the database unless the transaction opts in:
+-- (nulling or blanking-to-'' a found URL, demoting a found album-service
+-- status or a resolved track resolution_status, any DELETE, any TRUNCATE) are
+-- rejected at the database unless the transaction opts in:
 --
 --   BEGIN;
 --   SELECT set_config('lml_cache.allow_url_removal', 'on', true);
@@ -173,8 +182,9 @@ BEGIN
             'set_config(''lml_cache.allow_url_removal'', ''on'', true) in this transaction',
             OLD.album_id, OLD.service;
     END IF;
-    IF OLD.url IS NOT NULL AND NEW.url IS NULL THEN
-        RAISE EXCEPTION 'streaming_album_service: nulling a found url blocked '
+    IF (OLD.url IS NOT NULL AND OLD.url <> '')
+        AND (NEW.url IS NULL OR NEW.url = '') THEN
+        RAISE EXCEPTION 'streaming_album_service: discarding a found url blocked '
             '(album_id=%, service=%); opt in via '
             'set_config(''lml_cache.allow_url_removal'', ''on'', true) in this transaction',
             OLD.album_id, OLD.service;
@@ -210,12 +220,21 @@ BEGIN
             'set_config(''lml_cache.allow_url_removal'', ''on'', true) in this transaction',
             OLD.id;
     END IF;
-    IF (OLD.spotify_url IS NOT NULL AND NEW.spotify_url IS NULL)
-        OR (OLD.deezer_url IS NOT NULL AND NEW.deezer_url IS NULL) THEN
-        RAISE EXCEPTION 'streaming_track_result: nulling a found track url blocked (id=%); '
+    IF ((OLD.spotify_url IS NOT NULL AND OLD.spotify_url <> '')
+            AND (NEW.spotify_url IS NULL OR NEW.spotify_url = ''))
+        OR ((OLD.deezer_url IS NOT NULL AND OLD.deezer_url <> '')
+            AND (NEW.deezer_url IS NULL OR NEW.deezer_url = '')) THEN
+        RAISE EXCEPTION 'streaming_track_result: discarding a found track url blocked (id=%); '
             'opt in via set_config(''lml_cache.allow_url_removal'', ''on'', true) '
             'in this transaction',
             OLD.id;
+    END IF;
+    IF OLD.resolution_status IN ('local_match', 'api_match')
+        AND NEW.resolution_status IN ('not_found', 'error', 'false_positive') THEN
+        RAISE EXCEPTION 'streaming_track_result: demoting resolution_status % to % blocked '
+            '(id=%); opt in via '
+            'set_config(''lml_cache.allow_url_removal'', ''on'', true) in this transaction',
+            OLD.resolution_status, NEW.resolution_status, OLD.id;
     END IF;
     RETURN NEW;
 END;
@@ -224,3 +243,31 @@ $$;
 CREATE OR REPLACE TRIGGER streaming_track_result_no_regress
 BEFORE UPDATE OR DELETE ON lml_cache.streaming_track_result
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_track_result();
+
+-- TRUNCATE never fires row-level triggers, so without these the row guards
+-- leave a one-statement wipe path open. One shared statement-level guard
+-- closes it for both result tables; streaming_album itself is covered
+-- transitively (bare TRUNCATE errors on the inbound FKs, and CASCADE reaches
+-- these guards). Same GUC opts in.
+
+CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_truncate()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF current_setting('lml_cache.allow_url_removal', true) = 'on' THEN
+        RETURN NULL;
+    END IF;
+    RAISE EXCEPTION '%: TRUNCATE blocked — would discard all collected streaming data; '
+        'opt in via set_config(''lml_cache.allow_url_removal'', ''on'', true) in this transaction',
+        TG_TABLE_NAME;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER streaming_album_service_no_truncate
+BEFORE TRUNCATE ON lml_cache.streaming_album_service
+FOR EACH STATEMENT EXECUTE FUNCTION lml_cache.guard_streaming_truncate();
+
+CREATE OR REPLACE TRIGGER streaming_track_result_no_truncate
+BEFORE TRUNCATE ON lml_cache.streaming_track_result
+FOR EACH STATEMENT EXECUTE FUNCTION lml_cache.guard_streaming_truncate();
