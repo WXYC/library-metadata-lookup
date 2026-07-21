@@ -811,7 +811,12 @@ class Concert(BaseModel):
     )
     station_plays: int | None = Field(
         None,
-        description='All-time WXYC flowsheet play count of the resolved (in-library) headliner, computed nightly from the semantic-index graph; null when the headliner is not in the library or has no play count. Identical for every listener — the station-affinity signal behind the On Tour "For You" shelf. Not personalized; carries no listener data. Optional (not in `required`) so it can land ahead of the Backend-Service emitter and older clients decode forward-compatibly — same discipline as `Concert.similar_artists`.',
+        deprecated=True,
+        description='Deprecated — use `station_recommended` instead. Play counts were rejected as the station-tier signal in the "WXYC recommends" redesign (WXYC/wxyc-ios-64#576); the tier now keys on rotation membership. All-time WXYC flowsheet play count of the resolved (in-library) headliner, computed nightly from the semantic-index graph; null when the headliner is not in the library or has no play count. Identical for every listener. Stays on the wire until the removal ticket (WXYC/Backend-Service#1732) clears its adoption gate; will be removed in a future major version.',
+    )
+    station_recommended: bool | None = Field(
+        None,
+        description='True when the concert\'s resolved headliner (`headlining_artist_id`) has at least one WXYC library release that has been in rotation — any rotation row, past or present ("has been in rotation", not "currently in rotation"). Omitted or false for concerts with no library-resolved headliner, including Discogs-only resolutions (`headlining_discogs_artist_id` without `headlining_artist_id` in the Backend), which by construction have no library releases to hold rotation membership. The rotation-membership signal behind the On Tour "For You" station tier ("WXYC recommends", WXYC/wxyc-ios-64#576); replaces the deprecated `station_plays`. Identical for every listener; carries no listener data. Optional (not in `required`) so it can land ahead of the Backend-Service emitter and older clients decode forward-compatibly — same discipline as `Concert.similar_artists`.',
     )
 
 
