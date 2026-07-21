@@ -1845,13 +1845,18 @@ class DiscogsCacheService:
                 member_rows,
             ) = await asyncio.gather(
                 self.pool.fetch(
-                    # `fetched_at` is projected so the bulk path can carry
-                    # the LML#503 stub-vs-hydrated discriminator on the
-                    # returned `ArtistDetails`, matching the singular
-                    # `get_artist_details` shape. Bulk stays cache-only
-                    # by design (LML#503) — this is information-level
-                    # parity, not an API-escalation change.
-                    "SELECT id, name, profile, image_url, fetched_at "
+                    # `fetched_at` and `not_found` are projected so the bulk
+                    # path carries the LML#503 stub-vs-hydrated discriminator
+                    # AND the LML#510 tombstone flag on the returned
+                    # `ArtistDetails`, matching the singular `get_artist_details`
+                    # shape. `not_found` matters to callers that read `.profile`:
+                    # a 404-after-200 tombstone retains its stale profile (the
+                    # UPSERT in `write_artist_details` omits profile on conflict),
+                    # so consumers must guard on `not_found` to avoid surfacing a
+                    # bio for an artist Discogs now 404s. Bulk stays cache-only by
+                    # design (LML#503) — this is information-level parity, not an
+                    # API-escalation change.
+                    "SELECT id, name, profile, image_url, fetched_at, not_found "
                     "FROM artist WHERE id = ANY($1::int[])",
                     artist_ids,
                 ),
@@ -1905,6 +1910,7 @@ class DiscogsCacheService:
                     members=members_by_id.get(artist_id, []),
                     urls=[],
                     fetched_at=row["fetched_at"],
+                    not_found=row["not_found"],
                     cached=True,
                 )
             return result

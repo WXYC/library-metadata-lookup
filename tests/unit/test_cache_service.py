@@ -2191,6 +2191,7 @@ class TestGetArtistDetailsBulkStubSemantics:
                             "profile": None,
                             "image_url": None,
                             "fetched_at": None,
+                            "not_found": False,
                         },
                     ],
                     "artist_alias": [],
@@ -2234,6 +2235,7 @@ class TestGetArtistDetailsBulkStubSemantics:
                             "profile": None,
                             "image_url": None,
                             "fetched_at": None,
+                            "not_found": False,
                         },
                         # Fully-fetched (DB: fetched_at IS NOT NULL).
                         {
@@ -2242,6 +2244,7 @@ class TestGetArtistDetailsBulkStubSemantics:
                             "profile": "Argentinian artist...",
                             "image_url": "https://example.com/jm.jpg",
                             "fetched_at": hydrated_ts,
+                            "not_found": False,
                         },
                     ],
                     "artist_alias": [],
