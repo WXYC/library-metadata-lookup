@@ -82,7 +82,8 @@ async def set_up_schemas(pg_pool):
                     name TEXT NOT NULL,
                     profile TEXT,
                     image_url TEXT,
-                    fetched_at TIMESTAMPTZ
+                    fetched_at TIMESTAMPTZ,
+                    not_found BOOLEAN NOT NULL DEFAULT FALSE
                 )
             """)
             await conn.execute("""
