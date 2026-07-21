@@ -253,16 +253,22 @@ async def lifespan(app: FastAPI):
                 logger.info("Streaming-catalog schema ready")
             else:
                 logger.info(
-                    "Discogs cache pool unavailable at startup — streaming-URL cache "
-                    "disabled (cache layer will no-op until next deploy)"
+                    "Discogs cache pool unavailable at startup — skipping all five "
+                    "lml_cache.* bootstraps (streaming-URL cache, release-resolution "
+                    "cache, library-release override, Discogs rate bucket, streaming "
+                    "catalog); their consumers no-op until the next deploy"
                 )
         except Exception:
             # One handler covers all five lml_cache.* bootstraps above: a
             # failure in any of them skips the rest for this boot (they rerun
-            # next deploy), and every consumer degrades independently — the
-            # caches no-op to miss, the rate-bucket gate fails open, and the
-            # streaming catalog is offline-pipeline-only in this PR.
-            logger.exception("lml_cache schema bootstrap failed — dependent caches disabled")
+            # next deploy). Caches bootstrapped before the failure stay
+            # active; the skipped ones degrade independently — they no-op to
+            # miss, the rate-bucket gate fails open, and the streaming
+            # catalog stays offline-pipeline-only in this PR.
+            logger.exception(
+                "lml_cache schema bootstrap failed — already-bootstrapped caches stay "
+                "active; the remaining ones are disabled until the next boot"
+            )
 
     yield
 

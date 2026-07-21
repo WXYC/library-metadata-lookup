@@ -6,12 +6,14 @@ row per deduplicated library album), ``lml_cache.streaming_album_service``
 (one row per album x service probe), ``lml_cache.streaming_track_result``
 (compilation-track resolution), and ``lml_cache.streaming_coverage_baseline``
 (write-side floor metrics). This file drives the real DDL against an actual
-PostgreSQL: bootstrap idempotency, the service CHECK, the uniqueness/FK
-contract, and — the load-bearing part — the no-regress trigger matrix that
-structurally replaces the #672 whole-file coverage guard: collected streaming
-URLs cannot be discarded (``url`` nulled or blanked, a resolved status
-demoted, a row deleted, or a table truncated) unless the transaction opts in
-via ``set_config('lml_cache.allow_url_removal', 'on', true)``.
+PostgreSQL: bootstrap idempotency, the widen-only service CHECK, the
+uniqueness/FK contract, and — the load-bearing part — the no-regress guard
+matrix on all four tables that structurally replaces the #672 whole-file
+coverage guard: collected streaming data cannot be discarded (a ``url`` or
+``slug`` nulled or blanked, a resolved status demoted, a Discogs match
+unlinked, a coverage baseline lowered, a row deleted, or a table truncated)
+unless the transaction opts in via
+``set_config('lml_cache.allow_url_removal', 'on', true)``.
 
 Run with: pytest -m pg -v tests/integration/test_streaming_catalog.py
 """
@@ -23,7 +25,8 @@ import pytest
 import pytest_asyncio
 
 from entity.sources import PgSource
-from entity.streaming_catalog import set_up_streaming_catalog_schema
+from entity.streaming_catalog import _SERVICES, set_up_streaming_catalog_schema
+from tests.integration.conftest import skip_if_named_tables_populated
 
 _TABLES = (
     "streaming_album",
@@ -40,15 +43,23 @@ _DROP_ORDER = (
     "streaming_coverage_baseline",
 )
 
+# ``library_ids``/``formats`` are NOT NULL with no default (seed provenance
+# must be explicit), so every album insert supplies them.
 _INSERT_ALBUM = (
     "INSERT INTO lml_cache.streaming_album "
-    "(normalized_artist, normalized_title, display_artist, display_title) "
-    "VALUES ($1, $2, $3, $4) RETURNING id"
+    "(normalized_artist, normalized_title, display_artist, display_title, "
+    "library_ids, formats) "
+    "VALUES ($1, $2, $3, $4, '[]'::jsonb, '[]'::jsonb) RETURNING id"
 )
 
 _INSERT_SERVICE = (
     "INSERT INTO lml_cache.streaming_album_service "
     "(album_id, service, status, url) VALUES ($1, $2, $3, $4)"
+)
+
+_INSERT_SERVICE_WITH_SLUG = (
+    "INSERT INTO lml_cache.streaming_album_service "
+    "(album_id, service, status, url, slug) VALUES ($1, $2, $3, $4, $5)"
 )
 
 _INSERT_TRACK = (
@@ -66,6 +77,17 @@ _OPT_IN = "SELECT set_config('lml_cache.allow_url_removal', 'on', true)"
 
 _SPOTIFY_URL = "https://open.spotify.com/album/2u30gztZTylY4RG7IvfXs8"
 _APPLE_URL = "https://music.apple.com/us/album/aluminum-tunes/1443179207"
+# Opaque album id — never dereferenced by tests or code; any digits work.
+_DEEZER_URL = "https://www.deezer.com/album/103248"
+
+# The IN-list the code ships, for hand-building constraint variants in the
+# widen tests. Derived from the module's tuple so it can't drift.
+_SERVICE_IN_LIST = ", ".join(f"'{s}'" for s in _SERVICES)
+
+_SERVICE_CHECK_OID = (
+    "SELECT oid FROM pg_constraint WHERE conname = 'streaming_album_service_valid' "
+    "AND conrelid = 'lml_cache.streaming_album_service'::regclass"
+)
 
 
 @pytest_asyncio.fixture
@@ -74,47 +96,24 @@ async def pg_source(pg_pool):
     return PgSource(pool=pg_pool)
 
 
-# Well above anything this suite inserts (a handful of rows per test), well
-# below any real dataset (the prod catalog holds ~29K albums / 72K tracks).
-_POPULATED_GUARD_THRESHOLD = 500
-
-
-async def _skip_if_catalog_tables_populated(pg_pool) -> None:
-    """Refuse to drop tables that already hold real collected data.
-
-    ``DATABASE_URL_TEST`` chooses the target database; if it is ever pointed
-    at a populated streaming catalog (e.g. the shared discogs-cache PG after
-    the PR C seed), the autouse fixture's ``DROP TABLE`` would destroy
-    rate-limited API results. Skip instead — the suite only runs against a
-    scratch database.
-    """
-    async with pg_pool.acquire() as conn:
-        for table in _DROP_ORDER:
-            regclass = await conn.fetchval("SELECT to_regclass($1)", f"lml_cache.{table}")
-            if regclass is None:
-                continue
-            count = await conn.fetchval(f"SELECT count(*) FROM lml_cache.{table}")
-            if count > _POPULATED_GUARD_THRESHOLD:
-                pytest.skip(
-                    f"lml_cache.{table} holds {count} rows — refusing to drop what looks "
-                    "like real collected data; point DATABASE_URL_TEST at a scratch database"
-                )
-
-
 @pytest_asyncio.fixture(autouse=True)
 async def set_up_catalog_schema(pg_pool, pg_source):
     """Reset just the four streaming-catalog tables, then apply the DDL.
 
     Surgical: drops only the tables this suite owns (not the whole
     ``lml_cache`` schema), so sibling LML caches present in the shared test PG
-    stay intact, and refuses to run at all if those tables already hold what
-    looks like real collected data (see ``_skip_if_catalog_tables_populated``).
-    Guard functions survive the table drops; the bootstrap's
-    ``CREATE OR REPLACE`` re-binds them, which is itself part of the
-    idempotency contract under test.
+    stay intact. The shared table-scoped guard vetoes on ANY pre-existing row:
+    this suite always tears its tables down, so rows here mean either a
+    mispointed ``DATABASE_URL_TEST`` (e.g. the shared discogs-cache PG after
+    the PR C seed) or crash residue holding real inserts — both veto-worthy,
+    neither droppable. Guard functions survive the table drops; the
+    bootstrap's ``CREATE OR REPLACE`` re-binds them, which is itself part of
+    the idempotency contract under test.
     """
-    await _skip_if_catalog_tables_populated(pg_pool)
     async with pg_pool.acquire() as conn:
+        await skip_if_named_tables_populated(
+            conn, tuple(("lml_cache", table) for table in _DROP_ORDER)
+        )
         for table in _DROP_ORDER:
             await conn.execute(f"DROP TABLE IF EXISTS lml_cache.{table}")
     await set_up_streaming_catalog_schema(pg_source)
@@ -127,6 +126,20 @@ async def set_up_catalog_schema(pg_pool, pg_source):
 async def _make_album(pg_pool, artist: str = "stereolab", title: str = "aluminum tunes") -> int:
     async with pg_pool.acquire() as conn:
         return await conn.fetchval(_INSERT_ALBUM, artist, title, "Stereolab", "Aluminum Tunes")
+
+
+async def _make_matched_album(pg_pool) -> int:
+    """An album whose Discogs match has been collected (status found plus a
+    linked release id) — the state the album-row guard protects."""
+    album_id = await _make_album(pg_pool)
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE lml_cache.streaming_album SET discogs_status = 'found', "
+            "discogs_release_id = 118423, discogs_artist = 'Stereolab', "
+            "discogs_title = 'Aluminum Tunes' WHERE id = $1",
+            album_id,
+        )
+    return album_id
 
 
 async def _make_found_service_row(
@@ -162,6 +175,16 @@ async def _make_track(
         )
 
 
+async def _replace_service_check(conn, in_list: str) -> None:
+    """Hand-swap the named CHECK, simulating a table deployed by another code
+    version (older = narrower, newer = wider than what this code ships)."""
+    await conn.execute(
+        "ALTER TABLE lml_cache.streaming_album_service "
+        "DROP CONSTRAINT streaming_album_service_valid, "
+        f"ADD CONSTRAINT streaming_album_service_valid CHECK (service IN ({in_list}))"
+    )
+
+
 @pytest.mark.pg
 class TestSchemaBootstrap:
     @pytest.mark.asyncio
@@ -176,18 +199,15 @@ class TestSchemaBootstrap:
         assert sorted(r["table_name"] for r in rows) == sorted(_TABLES)
 
     @pytest.mark.asyncio
-    async def test_boot_installs_no_regress_triggers_on_both_result_tables(self, pg_pool):
+    async def test_boot_installs_no_regress_triggers_on_all_four_tables(self, pg_pool):
         async with pg_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT DISTINCT event_object_table FROM information_schema.triggers "
                 "WHERE event_object_schema = 'lml_cache' "
                 "AND event_object_table = ANY($1::text[])",
-                ["streaming_album_service", "streaming_track_result"],
+                list(_TABLES),
             )
-        assert sorted(r["event_object_table"] for r in rows) == [
-            "streaming_album_service",
-            "streaming_track_result",
-        ]
+        assert sorted(r["event_object_table"] for r in rows) == sorted(_TABLES)
 
     @pytest.mark.asyncio
     async def test_boot_installs_status_indexes(self, pg_pool):
@@ -207,10 +227,42 @@ class TestSchemaBootstrap:
                 await conn.execute(_INSERT_SERVICE, album_id, "myspace", "pending", None)
 
     @pytest.mark.asyncio
+    async def test_service_url_empty_string_is_rejected_at_insert(self, pg_pool):
+        """The pipelines' URL extractors default to ``''`` on a missing key; a
+        blank must never enter as collected data (NULL stays the one "no url"
+        value — the PR B DAO normalizes ``''`` to NULL at the boundary)."""
+        album_id = await _make_album(pg_pool)
+        with pytest.raises(asyncpg.CheckViolationError):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(_INSERT_SERVICE, album_id, "spotify", "pending", "")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("url_column", ["spotify_url", "deezer_url"])
+    async def test_track_url_empty_string_is_rejected_at_insert(self, pg_pool, url_column):
+        album_id = await _make_album(pg_pool)
+        with pytest.raises(asyncpg.CheckViolationError):
+            await _make_track(pg_pool, album_id, **{url_column: ""})
+
+    @pytest.mark.asyncio
     async def test_album_normalized_pair_is_unique(self, pg_pool):
         await _make_album(pg_pool)
         with pytest.raises(asyncpg.UniqueViolationError):
             await _make_album(pg_pool)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("omitted", ["library_ids", "formats"])
+    async def test_album_seed_provenance_columns_are_required(self, pg_pool, omitted):
+        """``library_ids``/``formats`` carry seed provenance on every legacy
+        SQLite album row; no column default may paper over a seed (PR C) that
+        forgets to map them."""
+        kept = "formats" if omitted == "library_ids" else "library_ids"
+        with pytest.raises(asyncpg.NotNullViolationError):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO lml_cache.streaming_album "
+                    "(normalized_artist, normalized_title, display_artist, display_title, "
+                    f"{kept}) VALUES ('sun ra', 'lanquidity', 'Sun Ra', 'Lanquidity', '[]'::jsonb)"
+                )
 
     @pytest.mark.asyncio
     async def test_track_unique_on_album_artist_title(self, pg_pool):
@@ -241,11 +293,14 @@ class TestSchemaBootstrap:
                 )
 
     @pytest.mark.asyncio
-    async def test_boot_installs_truncate_guards_on_both_result_tables(self, pg_pool):
+    async def test_boot_installs_truncate_guards_on_all_four_tables(self, pg_pool):
         """TRUNCATE never fires row-level triggers, so the no-regress guards
-        need statement-level BEFORE TRUNCATE companions. (Queried via
-        ``pg_trigger`` — ``information_schema.triggers`` omits TRUNCATE
-        triggers entirely; bit 32 of ``tgtype`` marks TRUNCATE.)"""
+        need statement-level BEFORE TRUNCATE companions on every guarded
+        table. ``streaming_album``'s is defense-in-depth — bare TRUNCATE on it
+        errors at the FK level before any trigger fires, so presence is the
+        only testable property. (Queried via ``pg_trigger`` —
+        ``information_schema.triggers`` omits TRUNCATE triggers entirely; bit
+        32 of ``tgtype`` marks TRUNCATE.)"""
         async with pg_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT c.relname FROM pg_trigger t "
@@ -254,12 +309,9 @@ class TestSchemaBootstrap:
                 "WHERE n.nspname = 'lml_cache' AND NOT t.tgisinternal "
                 "AND (t.tgtype::integer & 32) = 32 "
                 "AND c.relname = ANY($1::text[])",
-                ["streaming_album_service", "streaming_track_result"],
+                list(_TABLES),
             )
-        assert sorted(r["relname"] for r in rows) == [
-            "streaming_album_service",
-            "streaming_track_result",
-        ]
+        assert sorted(r["relname"] for r in rows) == sorted(_TABLES)
 
     @pytest.mark.asyncio
     async def test_service_row_requires_existing_album(self, pg_pool):
@@ -268,11 +320,18 @@ class TestSchemaBootstrap:
                 await conn.execute(_INSERT_SERVICE, 999_999, "spotify", "pending", None)
 
     @pytest.mark.asyncio
-    async def test_album_delete_restricted_while_service_rows_exist(self, pg_pool):
+    async def test_album_delete_restricted_by_fk_even_with_opt_in(self, pg_pool):
+        """ON DELETE RESTRICT is an independent layer under the row guard:
+        even an opted-in transaction cannot take collected probe rows down
+        with their album — children must be removed explicitly first."""
         album_id = await _make_found_service_row(pg_pool)
         with pytest.raises(asyncpg.ForeignKeyViolationError):
             async with pg_pool.acquire() as conn:
-                await conn.execute("DELETE FROM lml_cache.streaming_album WHERE id = $1", album_id)
+                async with conn.transaction():
+                    await conn.execute(_OPT_IN)
+                    await conn.execute(
+                        "DELETE FROM lml_cache.streaming_album WHERE id = $1", album_id
+                    )
 
     @pytest.mark.asyncio
     async def test_explicit_id_insert_is_preserved(self, pg_pool):
@@ -280,11 +339,187 @@ class TestSchemaBootstrap:
         async with pg_pool.acquire() as conn:
             row_id = await conn.fetchval(
                 "INSERT INTO lml_cache.streaming_album "
-                "(id, normalized_artist, normalized_title, display_artist, display_title) "
+                "(id, normalized_artist, normalized_title, display_artist, display_title, "
+                "library_ids, formats) "
                 "VALUES (4242, 'jessica pratt', 'on your own love again', "
-                "'Jessica Pratt', 'On Your Own Love Again') RETURNING id"
+                "'Jessica Pratt', 'On Your Own Love Again', '[]'::jsonb, '[]'::jsonb) "
+                "RETURNING id"
             )
         assert row_id == 4242
+
+    @pytest.mark.asyncio
+    async def test_track_explicit_id_insert_is_preserved(self, pg_pool):
+        """The seed also inserts SQLite ``track_results`` ids verbatim; the
+        track table's IDENTITY must be BY DEFAULT too, not just the album's."""
+        album_id = await _make_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            row_id = await conn.fetchval(
+                "INSERT INTO lml_cache.streaming_track_result "
+                "(id, album_id, artist, title, source, source_type) "
+                "VALUES (7777, $1, 'Sessa', 'Grandeza', $2, $3) RETURNING id",
+                album_id,
+                _TRACK_SOURCE,
+                _TRACK_SOURCE_TYPE,
+            )
+        assert row_id == 7777
+
+
+@pytest.mark.pg
+class TestServiceCheckWiden:
+    """Boot-time service-CHECK maintenance must be widen-only: it may add
+    services the code ships, but must never narrow away (or abort on) services
+    a deployed table already admits, and a boot with nothing to add must leave
+    the constraint untouched entirely."""
+
+    @pytest.mark.asyncio
+    async def test_second_boot_leaves_the_check_constraint_untouched(self, pg_pool, pg_source):
+        """Re-booting over an up-to-date table must not DROP+ADD the CHECK:
+        the constraint OID is the tell (a rewrite allocates a new one), and a
+        rewrite costs an ACCESS EXCLUSIVE lock plus a full-table re-validation
+        scan on every production boot."""
+        async with pg_pool.acquire() as conn:
+            oid_before = await conn.fetchval(_SERVICE_CHECK_OID)
+        await set_up_streaming_catalog_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            oid_after = await conn.fetchval(_SERVICE_CHECK_OID)
+        assert oid_before is not None
+        assert oid_after == oid_before
+
+    @pytest.mark.asyncio
+    async def test_boot_preserves_a_preexisting_unknown_service(self, pg_pool, pg_source):
+        """A deployed table may admit services this code version doesn't ship
+        (a newer deploy widened it, then rolled back). Boot must merge, never
+        narrow: narrowing re-validates and aborts on the collected rows using
+        the extra service, taking the whole bootstrap transaction — and every
+        table it creates — down with it."""
+        album_id = await _make_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await _replace_service_check(conn, _SERVICE_IN_LIST + ", 'pandora'")
+            await conn.execute(
+                _INSERT_SERVICE, album_id, "pandora", "found", "https://example.test/pandora"
+            )
+            oid_before = await conn.fetchval(_SERVICE_CHECK_OID)
+
+        await set_up_streaming_catalog_schema(pg_source)
+
+        async with pg_pool.acquire() as conn:
+            # Nothing to add (existing set is a superset), so the constraint
+            # must be untouched — and the collected pandora row intact.
+            oid_after = await conn.fetchval(_SERVICE_CHECK_OID)
+            preserved = await conn.fetchval(
+                "SELECT count(*) FROM lml_cache.streaming_album_service WHERE service = 'pandora'"
+            )
+            await conn.execute(_INSERT_SERVICE, album_id, "spotify", "pending", None)
+        assert oid_after == oid_before
+        assert preserved == 1
+
+    @pytest.mark.asyncio
+    async def test_boot_widens_a_narrower_check_then_stabilizes(self, pg_pool, pg_source):
+        """The production migration path: a table frozen at an older, narrower
+        service set picks up the shipped services on the next boot (one
+        constraint rewrite), and the boot after that recognizes the widened
+        constraint and leaves it alone. The second half is the round-trip
+        guard: a generated CHECK form PG deparses into something the next
+        boot can't parse back would rewrite — or corrupt — the list on every
+        boot."""
+        album_id = await _make_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await _replace_service_check(conn, "'spotify', 'deezer'")
+        with pytest.raises(asyncpg.CheckViolationError):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(_INSERT_SERVICE, album_id, "bandcamp", "pending", None)
+
+        await set_up_streaming_catalog_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(_INSERT_SERVICE, album_id, "bandcamp", "pending", None)
+            oid_after_widen = await conn.fetchval(_SERVICE_CHECK_OID)
+
+        await set_up_streaming_catalog_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            oid_after_reboot = await conn.fetchval(_SERVICE_CHECK_OID)
+        assert oid_after_reboot == oid_after_widen
+
+
+@pytest.mark.pg
+class TestAlbumRowGuard:
+    """The no-regress trigger on ``streaming_album``. The FK RESTRICT only
+    protects albums that HAVE child rows; a childless album (just seeded, or
+    children removed by an earlier opted-in cleanup) and the collected Discogs
+    match linkage need their own guard."""
+
+    @pytest.mark.asyncio
+    async def test_childless_album_delete_is_rejected(self, pg_pool):
+        album_id = await _make_album(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute("DELETE FROM lml_cache.streaming_album WHERE id = $1", album_id)
+
+    @pytest.mark.asyncio
+    async def test_demoting_discogs_status_found_is_rejected(self, pg_pool):
+        album_id = await _make_matched_album(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_album SET discogs_status = 'pending' WHERE id = $1",
+                    album_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_nulling_discogs_release_id_is_rejected(self, pg_pool):
+        album_id = await _make_matched_album(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_album SET discogs_release_id = NULL WHERE id = $1",
+                    album_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_discogs_match_promotion_and_correction_are_allowed(self, pg_pool):
+        album_id = await _make_matched_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            # A re-match may CORRECT the linked release; only unlinking loses
+            # collected data.
+            await conn.execute(
+                "UPDATE lml_cache.streaming_album SET discogs_release_id = 456 WHERE id = $1",
+                album_id,
+            )
+            release_id = await conn.fetchval(
+                "SELECT discogs_release_id FROM lml_cache.streaming_album WHERE id = $1",
+                album_id,
+            )
+        assert release_id == 456
+
+    @pytest.mark.asyncio
+    async def test_metadata_update_is_allowed(self, pg_pool):
+        album_id = await _make_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.streaming_album SET genre = 'Rock', label = 'Drag City' "
+                "WHERE id = $1",
+                album_id,
+            )
+            genre = await conn.fetchval(
+                "SELECT genre FROM lml_cache.streaming_album WHERE id = $1", album_id
+            )
+        assert genre == "Rock"
+
+    @pytest.mark.asyncio
+    async def test_opt_in_allows_demotion_and_delete(self, pg_pool):
+        album_id = await _make_matched_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(_OPT_IN)
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_album SET discogs_status = 'pending', "
+                    "discogs_release_id = NULL WHERE id = $1",
+                    album_id,
+                )
+                await conn.execute("DELETE FROM lml_cache.streaming_album WHERE id = $1", album_id)
+            remaining = await conn.fetchval(
+                "SELECT count(*) FROM lml_cache.streaming_album WHERE id = $1", album_id
+            )
+        assert remaining == 0
 
 
 @pytest.mark.pg
@@ -343,9 +578,11 @@ class TestServiceRowGuard:
     @pytest.mark.asyncio
     async def test_blanking_a_found_url_to_empty_string_is_rejected(self, pg_pool):
         """The pipelines' URL extractors default to ``''`` on a missing key —
-        an empty string discards a collected URL as surely as NULL."""
+        an empty string discards a collected URL as surely as NULL. (The
+        column CHECK also rejects ``''`` outright; the guard message is the
+        one that points at the opt-in, so both layers stay tested.)"""
         album_id = await _make_found_service_row(pg_pool)
-        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+        with pytest.raises(asyncpg.PostgresError):
             async with pg_pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE lml_cache.streaming_album_service SET url = '' "
@@ -354,20 +591,85 @@ class TestServiceRowGuard:
                 )
 
     @pytest.mark.asyncio
-    async def test_delete_rejection_message_names_the_scope(self, pg_pool):
-        """Pin the operative message body, not just the GUC name, so a future
-        reword can't quietly hollow out the runbook pointer."""
+    @pytest.mark.parametrize("blank_value", ["NULL", "''"])
+    async def test_blanking_a_collected_slug_is_rejected(self, pg_pool, blank_value):
+        """Bandcamp probes can store a slug with no url; the slug IS the
+        collected result on such rows and must be guarded like a url."""
+        album_id = await _make_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                _INSERT_SERVICE_WITH_SLUG, album_id, "bandcamp", "found", None, "stereolab"
+            )
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE lml_cache.streaming_album_service SET slug = {blank_value} "
+                    "WHERE album_id = $1 AND service = 'bandcamp'",
+                    album_id,
+                )
+
+    @pytest.mark.asyncio
+    async def test_slug_replacement_is_allowed(self, pg_pool):
+        album_id = await _make_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                _INSERT_SERVICE_WITH_SLUG, album_id, "bandcamp", "found", None, "stereolab"
+            )
+            await conn.execute(
+                "UPDATE lml_cache.streaming_album_service SET slug = 'stereolab-remastered' "
+                "WHERE album_id = $1 AND service = 'bandcamp'",
+                album_id,
+            )
+            slug = await conn.fetchval(
+                "SELECT slug FROM lml_cache.streaming_album_service "
+                "WHERE album_id = $1 AND service = 'bandcamp'",
+                album_id,
+            )
+        assert slug == "stereolab-remastered"
+
+    @pytest.mark.asyncio
+    async def test_opt_in_allows_slug_blanking(self, pg_pool):
+        album_id = await _make_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                _INSERT_SERVICE_WITH_SLUG, album_id, "bandcamp", "found", None, "stereolab"
+            )
+            async with conn.transaction():
+                await conn.execute(_OPT_IN)
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_album_service SET slug = NULL "
+                    "WHERE album_id = $1 AND service = 'bandcamp'",
+                    album_id,
+                )
+            slug = await conn.fetchval(
+                "SELECT slug FROM lml_cache.streaming_album_service "
+                "WHERE album_id = $1 AND service = 'bandcamp'",
+                album_id,
+            )
+        assert slug is None
+
+    @pytest.mark.asyncio
+    async def test_delete_is_rejected_naming_scope_and_opt_in(self, pg_pool):
+        """One raise pins both halves of the contract: the operative message
+        body ("DELETE blocked" — so a reword can't hollow out the runbook
+        pointer) and the opt-in GUC name."""
         album_id = await _make_found_service_row(pg_pool)
-        with pytest.raises(asyncpg.PostgresError, match="DELETE blocked"):
+        with pytest.raises(asyncpg.PostgresError) as excinfo:
             async with pg_pool.acquire() as conn:
                 await conn.execute(
                     "DELETE FROM lml_cache.streaming_album_service WHERE album_id = $1",
                     album_id,
                 )
+        message = str(excinfo.value)
+        assert "DELETE blocked" in message
+        assert "allow_url_removal" in message
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("demoted_status", ["not_found", "error"])
+    @pytest.mark.parametrize("demoted_status", ["not_found", "error", "pending", "skipped"])
     async def test_demoting_found_status_is_rejected(self, pg_pool, demoted_status):
+        """ANY transition away from ``found`` is a loss — including back to
+        ``pending``/``skipped``, which a demotion blocklist would wave through
+        (and which re-queues the row for a redundant rate-limited probe)."""
         album_id = await _make_found_service_row(pg_pool)
         with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
             async with pg_pool.acquire() as conn:
@@ -379,14 +681,27 @@ class TestServiceRowGuard:
                 )
 
     @pytest.mark.asyncio
-    async def test_delete_is_rejected_without_opt_in(self, pg_pool):
+    async def test_two_step_status_laundering_is_rejected_at_the_first_hop(self, pg_pool):
+        """found → pending → not_found: under a demotion blocklist each hop is
+        individually allowed (``pending`` isn't on the list, and hop two
+        starts from a non-found status), laundering the demotion the direct
+        hop blocks. Blocking every transition out of ``found`` kills the
+        launder at hop one."""
         album_id = await _make_found_service_row(pg_pool)
         with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
             async with pg_pool.acquire() as conn:
                 await conn.execute(
-                    "DELETE FROM lml_cache.streaming_album_service WHERE album_id = $1",
+                    "UPDATE lml_cache.streaming_album_service SET status = 'pending' "
+                    "WHERE album_id = $1 AND service = 'spotify'",
                     album_id,
                 )
+        async with pg_pool.acquire() as conn:
+            status = await conn.fetchval(
+                "SELECT status FROM lml_cache.streaming_album_service "
+                "WHERE album_id = $1 AND service = 'spotify'",
+                album_id,
+            )
+        assert status == "found"
 
     @pytest.mark.asyncio
     async def test_opt_in_allows_url_removal(self, pg_pool):
@@ -459,34 +774,81 @@ class TestTrackRowGuard:
         assert url == _SPOTIFY_URL
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("from_status", "to_status"),
+        [("local_match", "api_match"), ("api_match", "local_match")],
+    )
+    async def test_resolved_to_resolved_lateral_move_is_allowed(
+        self, pg_pool, from_status, to_status
+    ):
+        """Re-resolution may flip ``local_match`` <-> ``api_match``; both are
+        resolved states, no data is discarded, the guard must not fire."""
+        album_id = await _make_album(pg_pool)
+        track_id = await _make_track(
+            pg_pool, album_id, spotify_url=_SPOTIFY_URL, resolution_status=from_status
+        )
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.streaming_track_result SET resolution_status = $2 WHERE id = $1",
+                track_id,
+                to_status,
+            )
+            status = await conn.fetchval(
+                "SELECT resolution_status FROM lml_cache.streaming_track_result WHERE id = $1",
+                track_id,
+            )
+        assert status == to_status
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("url_column", ["spotify_url", "deezer_url"])
-    @pytest.mark.parametrize("blank_value", ["NULL", "''"])
-    async def test_discarding_a_found_track_url_is_rejected(self, pg_pool, url_column, blank_value):
+    async def test_discarding_a_found_track_url_is_rejected(self, pg_pool, url_column):
         album_id = await _make_album(pg_pool)
         track_id = await _make_track(
             pg_pool,
             album_id,
             spotify_url=_SPOTIFY_URL,
-            deezer_url="https://www.deezer.com/album/302127",
+            deezer_url=_DEEZER_URL,
             resolution_status="api_match",
         )
         with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
             async with pg_pool.acquire() as conn:
                 await conn.execute(
-                    f"UPDATE lml_cache.streaming_track_result SET {url_column} = {blank_value} "
+                    f"UPDATE lml_cache.streaming_track_result SET {url_column} = NULL "
                     "WHERE id = $1",
                     track_id,
                 )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("url_column", ["spotify_url", "deezer_url"])
+    async def test_blanking_a_found_track_url_is_rejected(self, pg_pool, url_column):
+        """`''` discards as surely as NULL; the column CHECK also rejects it,
+        and either layer failing the write keeps the URL collected."""
+        album_id = await _make_album(pg_pool)
+        track_id = await _make_track(
+            pg_pool,
+            album_id,
+            spotify_url=_SPOTIFY_URL,
+            deezer_url=_DEEZER_URL,
+            resolution_status="api_match",
+        )
+        with pytest.raises(asyncpg.PostgresError):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE lml_cache.streaming_track_result SET {url_column} = '' WHERE id = $1",
+                    track_id,
+                )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("resolved_status", ["local_match", "api_match"])
-    @pytest.mark.parametrize("demoted_status", ["not_found", "error", "false_positive"])
+    @pytest.mark.parametrize(
+        "demoted_status", ["not_found", "error", "false_positive", "pending", "local_miss"]
+    )
     async def test_demoting_resolved_status_is_rejected(
         self, pg_pool, resolved_status, demoted_status
     ):
-        """The album-side guard rejects found→not_found/error; tracks need the
-        same for their resolution vocabulary, else a re-run that misses can
-        silently un-resolve collected matches."""
+        """ANY transition out of the resolved pair is a loss — including back
+        to ``pending``/``local_miss``, which a demotion blocklist would wave
+        through and which silently un-resolves collected matches."""
         album_id = await _make_album(pg_pool)
         track_id = await _make_track(
             pg_pool, album_id, spotify_url=_SPOTIFY_URL, resolution_status=resolved_status
@@ -499,6 +861,30 @@ class TestTrackRowGuard:
                     track_id,
                     demoted_status,
                 )
+
+    @pytest.mark.asyncio
+    async def test_two_step_status_laundering_is_rejected_at_the_first_hop(self, pg_pool):
+        """local_match → pending → not_found: each hop is individually allowed
+        under a demotion blocklist, laundering the demotion the direct hop
+        blocks. Blocking every transition out of the resolved pair kills the
+        launder at hop one."""
+        album_id = await _make_album(pg_pool)
+        track_id = await _make_track(
+            pg_pool, album_id, spotify_url=_SPOTIFY_URL, resolution_status="local_match"
+        )
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_track_result SET resolution_status = 'pending' "
+                    "WHERE id = $1",
+                    track_id,
+                )
+        async with pg_pool.acquire() as conn:
+            status = await conn.fetchval(
+                "SELECT resolution_status FROM lml_cache.streaming_track_result WHERE id = $1",
+                track_id,
+            )
+        assert status == "local_match"
 
     @pytest.mark.asyncio
     async def test_opt_in_allows_status_demotion(self, pg_pool):
@@ -548,13 +934,17 @@ class TestTrackRowGuard:
 
 @pytest.mark.pg
 class TestTruncateGuard:
-    """TRUNCATE never fires row-level triggers, so the two result tables get
-    statement-level ``BEFORE TRUNCATE`` guards. ``streaming_album`` itself is
-    covered transitively: bare TRUNCATE errors on the inbound FKs, and CASCADE
-    reaches the children's guards."""
+    """TRUNCATE never fires row-level triggers, so every guarded table gets a
+    statement-level ``BEFORE TRUNCATE`` guard. ``streaming_album``'s fires
+    only via CASCADE — bare TRUNCATE on it errors at the FK level first — so
+    its behavioral coverage is the CASCADE test; the other three are directly
+    truncatable."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("table", ["streaming_album_service", "streaming_track_result"])
+    @pytest.mark.parametrize(
+        "table",
+        ["streaming_album_service", "streaming_track_result", "streaming_coverage_baseline"],
+    )
     async def test_truncate_is_rejected_without_opt_in(self, pg_pool, table):
         with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
             async with pg_pool.acquire() as conn:
@@ -601,3 +991,78 @@ class TestCoverageBaseline:
                 "WHERE metric = 'apple_music_found'"
             )
         assert value == 301
+
+
+@pytest.mark.pg
+class TestCoverageBaselineGuard:
+    """The no-regress trigger on ``streaming_coverage_baseline``: outside an
+    opted-in transaction the floor only ratchets upward, so the export's
+    regression assertion can't be quietly defused by lowering (or deleting)
+    the baseline it compares against."""
+
+    async def _seed(self, pg_pool, value: int = 294) -> None:
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO lml_cache.streaming_coverage_baseline (metric, value) "
+                "VALUES ('apple_music_found', $1)",
+                value,
+            )
+
+    @pytest.mark.asyncio
+    async def test_lowering_a_baseline_is_rejected(self, pg_pool):
+        await self._seed(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_coverage_baseline SET value = 200 "
+                    "WHERE metric = 'apple_music_found'"
+                )
+
+    @pytest.mark.asyncio
+    async def test_raising_and_equal_updates_are_allowed(self, pg_pool):
+        await self._seed(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.streaming_coverage_baseline SET value = 301 "
+                "WHERE metric = 'apple_music_found'"
+            )
+            # Equal value (a re-run that found the same coverage) must pass.
+            await conn.execute(
+                "UPDATE lml_cache.streaming_coverage_baseline "
+                "SET value = 301, updated_at = now() WHERE metric = 'apple_music_found'"
+            )
+            value = await conn.fetchval(
+                "SELECT value FROM lml_cache.streaming_coverage_baseline "
+                "WHERE metric = 'apple_music_found'"
+            )
+        assert value == 301
+
+    @pytest.mark.asyncio
+    async def test_delete_is_rejected_without_opt_in(self, pg_pool):
+        await self._seed(pg_pool)
+        with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM lml_cache.streaming_coverage_baseline "
+                    "WHERE metric = 'apple_music_found'"
+                )
+
+    @pytest.mark.asyncio
+    async def test_opt_in_allows_lowering_and_delete(self, pg_pool):
+        await self._seed(pg_pool)
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(_OPT_IN)
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_coverage_baseline SET value = 100 "
+                    "WHERE metric = 'apple_music_found'"
+                )
+                await conn.execute(
+                    "DELETE FROM lml_cache.streaming_coverage_baseline "
+                    "WHERE metric = 'apple_music_found'"
+                )
+            remaining = await conn.fetchval(
+                "SELECT count(*) FROM lml_cache.streaming_coverage_baseline "
+                "WHERE metric = 'apple_music_found'"
+            )
+        assert remaining == 0

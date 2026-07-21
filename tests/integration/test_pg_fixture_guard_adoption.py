@@ -32,6 +32,7 @@ from tests.integration.conftest import (
     ENTITY_IDENTITY_DDL,
     RECONCILER_TABLE_DDL,
     skip_if_drop_targets_populated,
+    skip_if_named_tables_populated,
 )
 
 # Every file the #768 hoist touches: the four previously-unguarded fixtures
@@ -47,6 +48,17 @@ _MIGRATED_FILES = (
 )
 
 _INLINE_IDENTITY_DDL = re.compile(r"CREATE\s+TABLE\s+entity\.identity", re.IGNORECASE)
+
+# Every ``lml_cache.*`` cache suite whose fixture drops tables it owns. Each
+# must veto through the table-scoped guard (``skip_if_named_tables_populated``)
+# and drop only its own tables — never ``DROP SCHEMA lml_cache CASCADE``,
+# which takes every sibling cache (and, post-LML#842, the seeded streaming
+# catalog) with it.
+_LML_CACHE_FIXTURE_FILES = (
+    "test_release_resolution_cache.py",
+    "test_streaming_url_persistent_lookup.py",
+    "test_streaming_catalog.py",
+)
 
 
 def _source(name: str) -> str:
@@ -73,6 +85,59 @@ def test_migrated_file_imports_shared_guard_and_ddl(name: str) -> None:
         f"{name} does not reference the shared data-safety guard."
     )
     assert "ENTITY_IDENTITY_DDL" in src, f"{name} does not reference the shared entity DDL."
+
+
+@pytest.mark.parametrize("name", _LML_CACHE_FIXTURE_FILES)
+def test_lml_cache_fixture_file_uses_table_scoped_guard(name: str) -> None:
+    """Every lml_cache-dropping suite vetoes through the shared table-scoped
+    guard before touching anything — a mispointed ``DATABASE_URL_TEST`` at the
+    shared discogs-cache PG must skip, not silently drop collected cache data."""
+    src = _source(name)
+    assert "skip_if_named_tables_populated" in src, (
+        f"{name} does not reference the shared table-scoped data-safety guard."
+    )
+
+
+@pytest.mark.parametrize("name", _LML_CACHE_FIXTURE_FILES)
+def test_lml_cache_fixture_file_never_drops_the_whole_schema(name: str) -> None:
+    """No cache suite may ``DROP SCHEMA lml_cache CASCADE`` — the schema hosts
+    every LML cache (streaming-URL, release-resolution, rate bucket, override,
+    streaming catalog), so a schema-wide drop has cross-suite blast radius and
+    bypasses any per-table populated veto."""
+    assert "DROP SCHEMA IF EXISTS lml_cache" not in _source(name), (
+        f"{name} drops the whole lml_cache schema — drop only the tables the "
+        "suite owns, behind skip_if_named_tables_populated."
+    )
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+async def test_named_tables_guard_vetoes_only_on_rows(pg_pool) -> None:
+    """The table-scoped guard's contract: a missing table passes (first-run
+    bootstrap), an empty table passes (clean teardown state), a single row
+    vetoes with a message naming the table."""
+    scratch = ("lml_cache", "guard_probe_scratch")
+    async with pg_pool.acquire() as conn:
+        try:
+            await conn.execute("CREATE SCHEMA IF NOT EXISTS lml_cache")
+            await conn.execute("DROP TABLE IF EXISTS lml_cache.guard_probe_scratch")
+
+            # Missing table: no veto.
+            await skip_if_named_tables_populated(conn, (scratch,))
+
+            # Empty table: no veto.
+            await conn.execute("CREATE TABLE lml_cache.guard_probe_scratch (id int)")
+            await skip_if_named_tables_populated(conn, (scratch,))
+
+            # One row: veto, naming the table.
+            await conn.execute("INSERT INTO lml_cache.guard_probe_scratch VALUES (1)")
+            with pytest.raises(pytest.skip.Exception) as excinfo:
+                await skip_if_named_tables_populated(conn, (scratch,))
+            message = str(excinfo.value)
+            assert "Refusing to DROP" in message
+            assert "lml_cache.guard_probe_scratch" in message
+        finally:
+            await conn.execute("DROP TABLE IF EXISTS lml_cache.guard_probe_scratch")
 
 
 @pytest.mark.pg

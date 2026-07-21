@@ -36,6 +36,7 @@ from entity.release_resolution_cache import (
     set_up_release_resolution_cache_schema,
 )
 from entity.sources import PgSource
+from tests.integration.conftest import skip_if_named_tables_populated
 
 
 @pytest_asyncio.fixture
@@ -46,21 +47,21 @@ async def pg_source(pg_pool):
 
 @pytest_asyncio.fixture(autouse=True)
 async def set_up_cache_schema(pg_pool, pg_source):
-    """Reset to a clean ``lml_cache`` schema and apply the cache DDL.
+    """Reset just ``lml_cache.release_resolution_cache``, then apply the DDL.
 
-    Surgical (not ``DROP SCHEMA entity CASCADE``): only the LML-owned
-    ``lml_cache`` schema is touched, so the discogs-cache-owned ``entity.*``
-    identity tables in the shared test PG stay intact. ``DROP SCHEMA ...
-    CASCADE`` also drops the sibling ``album_streaming_url_cache`` if present;
-    both are LML-owned application caches and are re-bootstrapped on demand by
-    their own suites, so this is safe.
+    Surgical: drops only the one table this suite owns — not the whole
+    ``lml_cache`` schema, which hosts every other LML cache (streaming-URL,
+    rate bucket, override, streaming catalog) — and refuses to run at all if
+    that table already holds rows (a mispointed ``DATABASE_URL_TEST`` at the
+    shared discogs-cache PG would otherwise drop real resolution results).
     """
     async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS lml_cache CASCADE")
+        await skip_if_named_tables_populated(conn, (("lml_cache", "release_resolution_cache"),))
+        await conn.execute("DROP TABLE IF EXISTS lml_cache.release_resolution_cache")
     await set_up_release_resolution_cache_schema(pg_source)
     yield
     async with pg_pool.acquire() as conn:
-        await conn.execute("DROP SCHEMA IF EXISTS lml_cache CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS lml_cache.release_resolution_cache")
 
 
 @pytest.mark.pg

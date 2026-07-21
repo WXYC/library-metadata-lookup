@@ -14,8 +14,8 @@ the shared discogs-cache PostgreSQL.
 * ``lml_cache.streaming_album_service`` — one row per (album, service) probe
   outcome. Normalized service rows (vs the wide SQLite columns) dissolve the
   drift-column problem: ``tidal``/``youtube_music``/``soundcloud`` are
-  ordinary service values, and adding a service is a CHECK-widen via the same
-  ``_DDL_ALTER_CHECK`` pattern as ``entity/streaming_url_cache.py``.
+  ordinary service values, and adding a service extends ``_SERVICES`` — the
+  widen-only DO block merges it into the deployed CHECK on the next boot.
 * ``lml_cache.streaming_track_result`` — compilation-track resolution; stays
   wide because ``resolution_status`` is per-track and only spotify/deezer
   apply.
@@ -29,15 +29,20 @@ post-process cache keyed on normalized request strings): this is the offline
 catalog keyed on library-album identity. Do not conflate them.
 
 **No-regress guards.** ``BEFORE UPDATE OR DELETE`` row triggers plus ``BEFORE
-TRUNCATE`` statement triggers on the two result tables structurally replace
-the #672 whole-file coverage guard: a transition that would discard collected
-streaming data — nulling *or blanking to ''* a found URL (the pipelines' URL
-extractors default to ``''``), demoting a ``found`` album-service status to
-``not_found``/``error``, demoting a resolved track ``resolution_status``
-(``local_match``/``api_match`` → ``not_found``/``error``/``false_positive``),
-any ``DELETE``, or a ``TRUNCATE`` — is rejected at the database, not detected
-after the fact. Streaming URLs are rate-limited API results and expensive to
-replace (org data-safety rules). Legitimate revocation (bad-URL stripping,
+TRUNCATE`` statement triggers on all four tables structurally replace the
+#672 whole-file coverage guard: any DML transition that would discard
+collected streaming data is rejected at the database, not detected after the
+fact. Blocked transitions: nulling *or blanking to ''* a found url or a
+collected slug (the pipelines' URL extractors default to ``''``); ANY
+transition out of a collected status — ``found`` for albums and
+album-services, the ``local_match``/``api_match`` pair for tracks — rather
+than a demotion blocklist, which two individually-legal hops would launder
+(``found`` → ``pending`` → ``not_found``); unlinking an album's collected
+Discogs match; lowering a coverage baseline; any ``DELETE``; any
+``TRUNCATE``. Streaming URLs are rate-limited API results and expensive to
+replace (org data-safety rules). The guards police DML only — a tripwire
+against accidental pipeline/operator writes, not a security perimeter: any
+role with DDL rights can drop them. Legitimate revocation (bad-URL stripping,
 dedup repair) opts in per transaction; the single GUC deliberately arms *all*
 guarded operations at once, so an opted-in transaction should touch exactly
 the rows it SELECTed first::
@@ -47,8 +52,9 @@ the rows it SELECTed first::
     -- SELECT the scope first, then the targeted UPDATE/DELETE
     COMMIT;
 
-The runbook lives in ``docs/scripts.md``. No DAO revocation method exists on
-purpose — the only URL-stripping scripts are in the archived do-not-port set.
+The operator runbook lives in ``docs/scripts.md``. No DAO revocation method
+exists on purpose — the only URL-stripping scripts are in the archived
+do-not-port set.
 
 **Bootstrap convention note.** Triggers and PL/pgSQL functions have no ``IF
 NOT EXISTS``, so this module extends the ``lml_cache.*`` boot convention with
@@ -68,7 +74,7 @@ from entity.sources import PgSource
 # the DB level; the seed maps the SQLite wide columns (spotify_*, deezer_*,
 # apple_*, bandcamp_*) and the real prod file's drift columns (tidal_url,
 # youtube_music_url, soundcloud_url) onto these values. Adding a service
-# extends this tuple and the ALTER below picks it up.
+# extends this tuple and the widen DO block below picks it up.
 _SERVICES = (
     "spotify",
     "deezer",
@@ -79,21 +85,33 @@ _SERVICES = (
     "soundcloud",
 )
 
-# Shared IN-list literal so the CREATE-time CHECK and the idempotent ALTER are
-# generated from the same source — they can never drift.
+# Shared IN-list literal so the CREATE-time CHECK and the widen DO block's
+# code-side array are generated from the same source — they can never drift.
 _SERVICE_IN_LIST = ", ".join(f"'{s}'" for s in _SERVICES)
 
-# Transaction-local GUC consulted by both guard functions. Set via
+# Transaction-local GUC consulted by every guard function. Set via
 # ``set_config('lml_cache.allow_url_removal', 'on', true)`` — the ``true``
 # (is_local) confines the opt-in to the enclosing transaction, so protection
 # is restored automatically at COMMIT/ROLLBACK.
 ALLOW_URL_REMOVAL_GUC = "lml_cache.allow_url_removal"
 
+# Every guard RAISE renders this hint as its own final message line — one
+# hoisted constant so the runbook pointer can't drift per-site. The doubled
+# quotes are SQL-literal escaping: the text is spliced into the guard
+# functions' single-quoted RAISE format strings.
+_OPT_IN_HINT = (
+    f"opt in via set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) in this transaction"
+)
+
 _DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
-# ``GENERATED BY DEFAULT`` (not ``ALWAYS``): the one-time seed inserts SQLite
-# ids verbatim to keep ``track_results.album_id`` references valid, then
-# advances the sequence past max(id).
+# ``GENERATED BY DEFAULT`` (not ``ALWAYS``) on this identity and
+# ``streaming_track_result``'s: the one-time seed (PR C) inserts the SQLite
+# ``albums.id`` / ``track_results.id`` values verbatim so cross-table
+# references stay valid, then advances each sequence past max(id).
+# ``library_ids``/``formats`` deliberately carry NO column default: every
+# legacy SQLite row has both, and a default would let a seed that forgets to
+# map them pass silently — NOT NULL with no default makes the omission loud.
 _DDL_ALBUM = """\
 CREATE TABLE IF NOT EXISTS lml_cache.streaming_album (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -101,8 +119,8 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album (
     normalized_title TEXT NOT NULL,
     display_artist TEXT NOT NULL,
     display_title TEXT NOT NULL,
-    library_ids JSONB NOT NULL DEFAULT '[]',
-    formats JSONB NOT NULL DEFAULT '[]',
+    library_ids JSONB NOT NULL,
+    formats JSONB NOT NULL,
     genre TEXT,
     label TEXT,
     is_compilation BOOLEAN NOT NULL DEFAULT FALSE,
@@ -117,12 +135,17 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album (
 """
 
 # Named CHECK constraint (``streaming_album_service_valid``) avoids reliance
-# on PG auto-naming so the ALTER below can DROP/ADD it by name. ``ON DELETE
-# RESTRICT`` (not CASCADE): deleting an album must never silently take its
-# collected probe rows with it. Confidence columns are DOUBLE PRECISION, not
-# REAL: SQLite's REAL storage class is an 8-byte double, and PG REAL (float4)
-# would silently narrow the seeded values (matches the
-# ``entity/discogs_rate_bucket.py`` float convention).
+# on PG auto-naming so the widen DO block below can manage it by name. ``ON
+# DELETE RESTRICT`` (not CASCADE): deleting an album must never silently take
+# its collected probe rows with it. Confidence columns are DOUBLE PRECISION,
+# not REAL: SQLite's REAL storage class is an 8-byte double, and PG REAL
+# (float4) would silently narrow the seeded values (matches the
+# ``entity/discogs_rate_bucket.py`` float convention). ``url`` additionally
+# rejects ``''`` at the column level (NULL-tolerant CHECK): the pipelines'
+# URL extractors default to ``''`` on a missing key, and NULL must stay the
+# one "no url" value — the row guard covers the UPDATE transition, this CHECK
+# covers INSERT. ``slug`` is transition-guarded but not CHECK-banned: legacy
+# SQLite rows may legitimately carry ``''`` slugs.
 _DDL_ALBUM_SERVICE = f"""\
 CREATE TABLE IF NOT EXISTS lml_cache.streaming_album_service (
     album_id BIGINT NOT NULL REFERENCES lml_cache.streaming_album(id) ON DELETE RESTRICT,
@@ -138,21 +161,52 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album_service (
     PRIMARY KEY (album_id, service),
     CONSTRAINT streaming_album_service_valid CHECK (
         service IN ({_SERVICE_IN_LIST})
-    )
+    ),
+    CONSTRAINT streaming_album_service_url_nonempty CHECK (url <> '')
 )\
 """
 
-# Idempotent widen of the named CHECK — same rationale and cost note as
-# ``entity/streaming_url_cache.py``: CREATE TABLE IF NOT EXISTS is a no-op on
-# an existing table, so a new ``_SERVICES`` value only reaches deployed tables
-# through this DROP-IF-EXISTS + ADD pair (atomic within the one statement; the
-# re-validation seq scan on boot is acceptable at this table's size).
-_DDL_ALBUM_SERVICE_ALTER_CHECK = f"""\
-ALTER TABLE lml_cache.streaming_album_service
-    DROP CONSTRAINT IF EXISTS streaming_album_service_valid,
-    ADD CONSTRAINT streaming_album_service_valid CHECK (
-        service IN ({_SERVICE_IN_LIST})
-    )\
+# Widen-only maintenance of the named service CHECK. A static DROP+ADD (the
+# ``entity/streaming_url_cache.py`` pattern) would (a) take an ACCESS
+# EXCLUSIVE lock plus a full re-validation scan on EVERY boot, and (b) narrow
+# the constraint under a rollback deploy, aborting the whole bootstrap
+# transaction against collected rows that use a service the older code
+# doesn't ship. This DO block instead deparses the deployed constraint,
+# extracts its quoted literals, and rewrites only when the shipped
+# ``_SERVICES`` adds something — merging, never narrowing, and leaving the
+# constraint (and its OID) untouched on a steady-state boot. The rewrite must
+# emit the ``service IN (...)`` form: PG deparses IN as ``= ANY (ARRAY[...])``
+# and the extraction reads the quoted literals out of that deparse, whereas an
+# array-literal Const (``'{...}'::text[]``) deparses as ONE literal and would
+# corrupt the next boot's extraction.
+_DDL_ALBUM_SERVICE_WIDEN_CHECK = f"""\
+DO $catalog_check$
+DECLARE
+    existing_def text;
+    existing_services text[];
+    code_services text[] := ARRAY[{_SERVICE_IN_LIST}];
+    merged_list text;
+BEGIN
+    SELECT pg_get_constraintdef(oid) INTO existing_def
+        FROM pg_constraint
+        WHERE conrelid = 'lml_cache.streaming_album_service'::regclass
+            AND conname = 'streaming_album_service_valid';
+    IF existing_def IS NOT NULL THEN
+        SELECT array_agg(m[1]) INTO existing_services
+            FROM regexp_matches(existing_def, '''([^'']+)''', 'g') AS m;
+        IF existing_services @> code_services THEN
+            RETURN;
+        END IF;
+    END IF;
+    SELECT string_agg(DISTINCT quote_literal(s), ', ' ORDER BY quote_literal(s))
+        INTO merged_list
+        FROM unnest(coalesce(existing_services, ARRAY[]::text[]) || code_services) AS s;
+    EXECUTE 'ALTER TABLE lml_cache.streaming_album_service '
+        'DROP CONSTRAINT IF EXISTS streaming_album_service_valid, '
+        'ADD CONSTRAINT streaming_album_service_valid CHECK (service IN ('
+        || merged_list || '))';
+END;
+$catalog_check$\
 """
 
 # Pending-scan support for the pipelines ("next albums to probe on service X"),
@@ -169,7 +223,9 @@ _DDL_ALBUM_SERVICE_STATUS_INDEX = (
 # ``UNIQUE (album_id, artist, title)`` doubles as the FK-side index for the
 # ON DELETE RESTRICT check (leading album_id), so no separate album index.
 # ``source``/``source_type`` are NOT NULL: every legacy SQLite row carries
-# both, and the seed must not silently drop provenance.
+# both, and the seed must not silently drop provenance. The urls CHECK is
+# NULL-tolerant (a NULL operand makes the AND null, which CHECK passes): it
+# bans only the empty string, same rationale as the album-service ``url``.
 _DDL_TRACK_RESULT = """\
 CREATE TABLE IF NOT EXISTS lml_cache.streaming_track_result (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -189,7 +245,10 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_track_result (
     deezer_confidence DOUBLE PRECISION,
     checked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (album_id, artist, title)
+    UNIQUE (album_id, artist, title),
+    CONSTRAINT streaming_track_result_urls_nonempty CHECK (
+        spotify_url <> '' AND deezer_url <> ''
+    )
 )\
 """
 
@@ -210,6 +269,54 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_coverage_baseline (
 )\
 """
 
+# The FK RESTRICT only protects albums that HAVE child rows; a childless
+# album (just seeded, or children removed by an earlier opted-in cleanup) and
+# the collected Discogs match linkage need their own guard. A corrected
+# ``discogs_release_id`` (re-match to a different release) is allowed — only
+# unlinking (→ NULL) loses collected data.
+_DDL_GUARD_ALBUM_FN = f"""\
+CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_album()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF current_setting('{ALLOW_URL_REMOVAL_GUC}', true) = 'on' THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'streaming_album: DELETE blocked (id=%) — '
+            'would discard collected streaming data; '
+            '{_OPT_IN_HINT}',
+            OLD.id;
+    END IF;
+    IF OLD.discogs_status = 'found' AND NEW.discogs_status IS DISTINCT FROM 'found' THEN
+        RAISE EXCEPTION 'streaming_album: demoting discogs_status found to % blocked (id=%); '
+            '{_OPT_IN_HINT}',
+            NEW.discogs_status, OLD.id;
+    END IF;
+    IF OLD.discogs_release_id IS NOT NULL AND NEW.discogs_release_id IS NULL THEN
+        RAISE EXCEPTION 'streaming_album: unlinking discogs_release_id blocked (id=%); '
+            '{_OPT_IN_HINT}',
+            OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$\
+"""
+
+_DDL_GUARD_ALBUM_TRIGGER = """\
+CREATE OR REPLACE TRIGGER streaming_album_no_regress
+BEFORE UPDATE OR DELETE ON lml_cache.streaming_album
+FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_album()\
+"""
+
+# Status gate is total (``IS DISTINCT FROM 'found'``), not a demotion
+# blocklist: a blocklist lets two individually-legal hops launder the
+# demotion (found → pending → not_found), and a bounce back to pending also
+# re-queues the row for a redundant rate-limited probe.
 _DDL_GUARD_ALBUM_SERVICE_FN = f"""\
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_album_service()
 RETURNS trigger
@@ -224,21 +331,28 @@ BEGIN
     END IF;
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'streaming_album_service: DELETE blocked (album_id=%, service=%) — '
-            'would discard collected streaming data; opt in via '
-            'set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) in this transaction',
+            'would discard collected streaming data; '
+            '{_OPT_IN_HINT}',
             OLD.album_id, OLD.service;
     END IF;
     IF (OLD.url IS NOT NULL AND OLD.url <> '')
         AND (NEW.url IS NULL OR NEW.url = '') THEN
         RAISE EXCEPTION 'streaming_album_service: discarding a found url blocked '
-            '(album_id=%, service=%); opt in via '
-            'set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) in this transaction',
+            '(album_id=%, service=%); '
+            '{_OPT_IN_HINT}',
             OLD.album_id, OLD.service;
     END IF;
-    IF OLD.status = 'found' AND NEW.status IN ('not_found', 'error') THEN
+    IF (OLD.slug IS NOT NULL AND OLD.slug <> '')
+        AND (NEW.slug IS NULL OR NEW.slug = '') THEN
+        RAISE EXCEPTION 'streaming_album_service: discarding a collected slug blocked '
+            '(album_id=%, service=%); '
+            '{_OPT_IN_HINT}',
+            OLD.album_id, OLD.service;
+    END IF;
+    IF OLD.status = 'found' AND NEW.status IS DISTINCT FROM 'found' THEN
         RAISE EXCEPTION 'streaming_album_service: demoting found status to % blocked '
-            '(album_id=%, service=%); opt in via '
-            'set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) in this transaction',
+            '(album_id=%, service=%); '
+            '{_OPT_IN_HINT}',
             NEW.status, OLD.album_id, OLD.service;
     END IF;
     RETURN NEW;
@@ -252,6 +366,8 @@ BEFORE UPDATE OR DELETE ON lml_cache.streaming_album_service
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_album_service()\
 """
 
+# Same total gate on the resolved pair; the lateral local_match <-> api_match
+# move stays allowed (both resolved, nothing discarded).
 _DDL_GUARD_TRACK_RESULT_FN = f"""\
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_track_result()
 RETURNS trigger
@@ -265,9 +381,9 @@ BEGIN
         RETURN NEW;
     END IF;
     IF TG_OP = 'DELETE' THEN
-        RAISE EXCEPTION 'streaming_track_result: DELETE blocked (id=%) — would discard '
-            'collected streaming data; opt in via '
-            'set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) in this transaction',
+        RAISE EXCEPTION 'streaming_track_result: DELETE blocked (id=%) — '
+            'would discard collected streaming data; '
+            '{_OPT_IN_HINT}',
             OLD.id;
     END IF;
     IF ((OLD.spotify_url IS NOT NULL AND OLD.spotify_url <> '')
@@ -275,15 +391,14 @@ BEGIN
         OR ((OLD.deezer_url IS NOT NULL AND OLD.deezer_url <> '')
             AND (NEW.deezer_url IS NULL OR NEW.deezer_url = '')) THEN
         RAISE EXCEPTION 'streaming_track_result: discarding a found track url blocked (id=%); '
-            'opt in via set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) '
-            'in this transaction',
+            '{_OPT_IN_HINT}',
             OLD.id;
     END IF;
     IF OLD.resolution_status IN ('local_match', 'api_match')
-        AND NEW.resolution_status IN ('not_found', 'error', 'false_positive') THEN
-        RAISE EXCEPTION 'streaming_track_result: demoting resolution_status % to % blocked '
-            '(id=%); opt in via '
-            'set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) in this transaction',
+        AND NEW.resolution_status NOT IN ('local_match', 'api_match') THEN
+        RAISE EXCEPTION 'streaming_track_result: demoting resolution_status % to % '
+            'blocked (id=%); '
+            '{_OPT_IN_HINT}',
             OLD.resolution_status, NEW.resolution_status, OLD.id;
     END IF;
     RETURN NEW;
@@ -297,11 +412,50 @@ BEFORE UPDATE OR DELETE ON lml_cache.streaming_track_result
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_track_result()\
 """
 
+# Outside an opted-in transaction the floor only ratchets upward (equal is
+# fine — a re-run that found the same coverage), so the export's regression
+# assertion can't be quietly defused by lowering or deleting the baseline it
+# compares against.
+_DDL_GUARD_BASELINE_FN = f"""\
+CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_coverage_baseline()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF current_setting('{ALLOW_URL_REMOVAL_GUC}', true) = 'on' THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'streaming_coverage_baseline: DELETE blocked (metric=%) — '
+            'would discard the collected coverage floor; '
+            '{_OPT_IN_HINT}',
+            OLD.metric;
+    END IF;
+    IF NEW.value < OLD.value THEN
+        RAISE EXCEPTION 'streaming_coverage_baseline: lowering baseline % from % to % blocked; '
+            '{_OPT_IN_HINT}',
+            OLD.metric, OLD.value, NEW.value;
+    END IF;
+    RETURN NEW;
+END;
+$$\
+"""
+
+_DDL_GUARD_BASELINE_TRIGGER = """\
+CREATE OR REPLACE TRIGGER streaming_coverage_baseline_no_regress
+BEFORE UPDATE OR DELETE ON lml_cache.streaming_coverage_baseline
+FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_coverage_baseline()\
+"""
+
 # TRUNCATE never fires row-level triggers, so without these the row guards
-# leave a one-statement wipe path open. One shared statement-level guard
-# closes it for both result tables; ``streaming_album`` itself is covered
-# transitively (bare TRUNCATE errors on the inbound FKs, and CASCADE reaches
-# these guards). Same GUC opts in.
+# leave a one-statement wipe path open. One shared TG_TABLE_NAME-generic
+# statement-level guard closes it for all four tables. ``streaming_album``'s
+# is defense-in-depth: bare TRUNCATE on it errors at the inbound FKs before
+# any trigger fires, and CASCADE reaches the children's guards — but the
+# direct guard stays in case the FK topology ever changes. Same GUC opts in.
 _DDL_GUARD_TRUNCATE_FN = f"""\
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_truncate()
 RETURNS trigger
@@ -312,10 +466,16 @@ BEGIN
         RETURN NULL;
     END IF;
     RAISE EXCEPTION '%: TRUNCATE blocked — would discard all collected streaming data; '
-        'opt in via set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) in this transaction',
+        '{_OPT_IN_HINT}',
         TG_TABLE_NAME;
 END;
 $$\
+"""
+
+_DDL_GUARD_ALBUM_TRUNCATE_TRIGGER = """\
+CREATE OR REPLACE TRIGGER streaming_album_no_truncate
+BEFORE TRUNCATE ON lml_cache.streaming_album
+FOR EACH STATEMENT EXECUTE FUNCTION lml_cache.guard_streaming_truncate()\
 """
 
 _DDL_GUARD_ALBUM_SERVICE_TRUNCATE_TRIGGER = """\
@@ -330,25 +490,38 @@ BEFORE TRUNCATE ON lml_cache.streaming_track_result
 FOR EACH STATEMENT EXECUTE FUNCTION lml_cache.guard_streaming_truncate()\
 """
 
+_DDL_GUARD_BASELINE_TRUNCATE_TRIGGER = """\
+CREATE OR REPLACE TRIGGER streaming_coverage_baseline_no_truncate
+BEFORE TRUNCATE ON lml_cache.streaming_coverage_baseline
+FOR EACH STATEMENT EXECUTE FUNCTION lml_cache.guard_streaming_truncate()\
+"""
+
 # Ordered: schema first, parents before children (FKs), tables before their
-# ALTER/indexes/triggers. Kept as a module constant so the bootstrap and the
-# unit parity tests reference one list.
+# widen block/indexes/triggers. Kept as a module constant so the bootstrap
+# and the unit parity tests reference one list; the .sql reference mirrors
+# this exact sequence (pinned by a normalized exact-equality test).
 _DDL_STATEMENTS = (
     _DDL_SCHEMA,
     _DDL_ALBUM,
     _DDL_ALBUM_SERVICE,
-    _DDL_ALBUM_SERVICE_ALTER_CHECK,
+    _DDL_ALBUM_SERVICE_WIDEN_CHECK,
     _DDL_ALBUM_SERVICE_STATUS_INDEX,
     _DDL_TRACK_RESULT,
     _DDL_TRACK_RESULT_STATUS_INDEX,
     _DDL_COVERAGE_BASELINE,
+    _DDL_GUARD_ALBUM_FN,
+    _DDL_GUARD_ALBUM_TRIGGER,
     _DDL_GUARD_ALBUM_SERVICE_FN,
     _DDL_GUARD_ALBUM_SERVICE_TRIGGER,
     _DDL_GUARD_TRACK_RESULT_FN,
     _DDL_GUARD_TRACK_RESULT_TRIGGER,
+    _DDL_GUARD_BASELINE_FN,
+    _DDL_GUARD_BASELINE_TRIGGER,
     _DDL_GUARD_TRUNCATE_FN,
+    _DDL_GUARD_ALBUM_TRUNCATE_TRIGGER,
     _DDL_GUARD_ALBUM_SERVICE_TRUNCATE_TRIGGER,
     _DDL_GUARD_TRACK_RESULT_TRUNCATE_TRIGGER,
+    _DDL_GUARD_BASELINE_TRUNCATE_TRIGGER,
 )
 
 # Bootstrap preamble, run inside the single wrapping transaction:
@@ -360,9 +533,12 @@ _DDL_STATEMENTS = (
 #   REPLACE FUNCTION`` has no built-in self-serialization, so two simultaneous
 #   boots (deploy overlap, app + offline DAO) can otherwise hard-abort with
 #   "tuple concurrently updated". Key 842001 = LML#842; arbitrary but stable,
-#   auto-released at COMMIT/ROLLBACK.
+#   auto-released at COMMIT/ROLLBACK. Advisory keys share one keyspace per
+#   database — record new discogs-cache advisory keys in discogs-etl's
+#   CLAUDE.md before allocating another.
+_BOOTSTRAP_ADVISORY_LOCK_KEY = 842001
 _BOOTSTRAP_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '10s'"
-_BOOTSTRAP_ADVISORY_LOCK = "SELECT pg_advisory_xact_lock(842001)"
+_BOOTSTRAP_ADVISORY_LOCK = f"SELECT pg_advisory_xact_lock({_BOOTSTRAP_ADVISORY_LOCK_KEY})"
 
 
 async def set_up_streaming_catalog_schema(pg: PgSource) -> None:
@@ -380,9 +556,11 @@ async def set_up_streaming_catalog_schema(pg: PgSource) -> None:
     constants above). The ``CREATE OR REPLACE`` function/trigger forms are the
     idempotent equivalents of ``IF NOT EXISTS`` (which triggers don't
     support); replacing an identical definition is a no-op in effect. The
-    service-CHECK ALTER widens the named constraint to the current
-    ``_SERVICES`` set, which CREATE TABLE IF NOT EXISTS cannot do on an
-    existing table.
+    widen-only DO block merges the current ``_SERVICES`` into the deployed
+    named CHECK — something CREATE TABLE IF NOT EXISTS cannot do on an
+    existing table — never narrows it, and exits without touching the
+    constraint when there is nothing to add, so a steady-state boot takes no
+    ACCESS EXCLUSIVE lock and the constraint OID stays stable.
     """
     async with pg.acquire() as conn:
         async with conn.transaction():
