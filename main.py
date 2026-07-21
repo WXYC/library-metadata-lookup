@@ -257,7 +257,12 @@ async def lifespan(app: FastAPI):
                     "disabled (cache layer will no-op until next deploy)"
                 )
         except Exception:
-            logger.exception("Streaming-URL cache schema bootstrap failed — cache disabled")
+            # One handler covers all five lml_cache.* bootstraps above: a
+            # failure in any of them skips the rest for this boot (they rerun
+            # next deploy), and every consumer degrades independently — the
+            # caches no-op to miss, the rate-bucket gate fails open, and the
+            # streaming catalog is offline-pipeline-only in this PR.
+            logger.exception("lml_cache schema bootstrap failed — dependent caches disabled")
 
     yield
 
