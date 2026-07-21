@@ -73,6 +73,7 @@ class TestGetArtistDetailsBulk:
                             "profile": None,
                             "image_url": None,
                             "fetched_at": None,
+                            "not_found": False,
                         },
                         {
                             "id": 305253,
@@ -80,6 +81,7 @@ class TestGetArtistDetailsBulk:
                             "profile": None,
                             "image_url": None,
                             "fetched_at": None,
+                            "not_found": False,
                         },
                     ],
                     "artist_alias": [
@@ -118,6 +120,7 @@ class TestGetArtistDetailsBulk:
                             "profile": None,
                             "image_url": None,
                             "fetched_at": None,
+                            "not_found": False,
                         },
                     ],
                     "artist_alias": [],
@@ -164,6 +167,7 @@ class TestGetArtistDetailsBulk:
                 "profile": None,
                 "image_url": None,
                 "fetched_at": None,
+                "not_found": False,
             },
             {
                 "id": 305253,
@@ -171,6 +175,7 @@ class TestGetArtistDetailsBulk:
                 "profile": None,
                 "image_url": None,
                 "fetched_at": None,
+                "not_found": False,
             },
         ]
         mock_asyncpg_pool.fetch = AsyncMock(
@@ -265,6 +270,7 @@ class TestGetArtistDetailsBulk:
                             "profile": None,
                             "image_url": None,
                             "fetched_at": stamp,
+                            "not_found": False,
                         },
                         {
                             "id": 6998498,
@@ -272,6 +278,7 @@ class TestGetArtistDetailsBulk:
                             "profile": None,
                             "image_url": None,
                             "fetched_at": None,
+                            "not_found": False,
                         },
                     ],
                     "artist_alias": [],

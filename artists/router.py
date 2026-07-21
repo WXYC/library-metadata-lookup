@@ -63,10 +63,17 @@ logger = logging.getLogger(__name__)
 def _extract_artist_bios(details_by_id: dict[int, ArtistDetails]) -> dict[int, str]:
     """Pull clean Discogs `profile` bios out of a bulk artist-details read.
 
-    Skips not-found tombstone rows (which carry `name=""` + defaults) and
-    blank/whitespace profiles, so a present-but-empty entry contributes no
-    mapping — the caller's `.get(...)` then yields `None`. Keyed by Discogs
-    artist id.
+    Skips two kinds of row, so each contributes no mapping and the caller's
+    `.get(...)` yields `None`:
+
+    - `not_found` tombstones (LML#510) — a 404-after-200 tombstone RETAINS its
+      last-known `profile` (the `write_artist_details` UPSERT omits profile on
+      conflict), so the flag, not a blank profile, is what keeps a bio for an
+      artist Discogs now 404s from leaking. `get_artist_details_bulk` projects
+      `not_found` for exactly this guard.
+    - blank / whitespace-only profiles.
+
+    Keyed by Discogs artist id.
     """
     bios: dict[int, str] = {}
     for artist_id, details in details_by_id.items():

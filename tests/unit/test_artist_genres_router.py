@@ -42,7 +42,7 @@ def _release(release_id: int, genres, styles) -> ReleaseMetadataResponse:
 def mock_cache():
     cache = AsyncMock(spec=DiscogsCacheService)
     cache.aggregate_artist_genre_style = AsyncMock(return_value=({}, {}))
-    # Bio enrichment (LML#XXX): one cache-only bulk artist-details read per batch,
+    # Bio enrichment (LML#888): one cache-only bulk artist-details read per batch,
     # keyed on the supplied discogs_artist_ids. Default empty → bio null everywhere
     # unless a test seeds a profile.
     cache.get_artist_details_bulk = AsyncMock(return_value={})
@@ -210,10 +210,18 @@ class TestBio:
         assert resp.json()["results"][0]["bio"] is None
 
     @pytest.mark.asyncio
-    async def test_tombstone_row_is_null_bio(self, make_app, mock_cache):
-        # not_found tombstone rows carry name="" + defaults; must be guarded.
+    async def test_tombstone_with_retained_profile_is_null_bio(self, make_app, mock_cache):
+        # The load-bearing case: a 404-after-200 tombstone (`not_found=True`)
+        # RETAINS its stale profile (write_artist_details omits profile on the
+        # tombstone UPSERT), and get_artist_details_bulk now projects not_found —
+        # so the guard, not a blank profile, must suppress the stale bio.
         mock_cache.get_artist_details_bulk.return_value = {
-            8: ArtistDetails(artist_id=8, name="", not_found=True)
+            8: ArtistDetails(
+                artist_id=8,
+                name="Defunct Act",
+                profile="A now-deleted Discogs bio.",
+                not_found=True,
+            )
         }
         ctx, app = make_app(service=None)
         with ctx:
