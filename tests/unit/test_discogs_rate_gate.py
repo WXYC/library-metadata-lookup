@@ -95,6 +95,33 @@ def rate_bucket_env(monkeypatch):
 
 
 @pytest.fixture
+def captured_posthog(monkeypatch):
+    """Capture the unsampled PostHog fail-open counter events (LML#879).
+
+    The Sentry ``fallback`` tag rides *sampled* transactions, and the dominant
+    fail-open traffic (BS backfill floods) runs ``tracesSampleRate=0`` — so the
+    tag systematically under-counts during exactly the floods it should catch.
+    The PostHog event is the sampling-independent signal; these tests pin its
+    name, distinct_id, and properties as the queryable contract.
+
+    Patches the accessor ref inside ``discogs.ratelimit`` (``raising=False`` so
+    the negative tests stay runnable red-first, before the ref exists).
+    """
+    events: list[dict] = []
+
+    class _FakePosthog:
+        def capture(self, *, distinct_id, event, properties):
+            events.append({"distinct_id": distinct_id, "event": event, "properties": properties})
+
+    monkeypatch.setattr(
+        "discogs.ratelimit.get_posthog_client",
+        lambda event_prefix: _FakePosthog(),
+        raising=False,
+    )
+    return events
+
+
+@pytest.fixture
 def captured_tags(monkeypatch):
     """Capture ``sentry_sdk.set_tag`` calls made by the gate.
 
@@ -234,3 +261,127 @@ async def test_slow_pg_times_out_and_fails_open(rate_bucket_env, captured_tags):
     assert local.acquired == 1
     assert captured_tags["lml.discogs.rate_gate"] == "fallback"
     assert elapsed < 0.5  # bounded by timeout_s, not the 1s hang
+
+
+# --- LML#879 Deliverable A: unsampled PostHog fail-open counter ---------------
+
+
+async def test_pg_error_fail_open_emits_unsampled_counter(rate_bucket_env, captured_posthog):
+    """Every fail-open must emit the PostHog counter event with the queryable
+    contract shape: conventional distinct_id, stable event name, and the
+    exception type so a PG outage is distinguishable from a code defect."""
+    rate_bucket_env(enabled=True)
+    gate = DiscogsRateGate(
+        local_limiter=_RecordingLimiter(),
+        bucket_factory=await _factory_returning(_RaisingBucket()),
+    )
+
+    await gate.acquire()
+
+    assert len(captured_posthog) == 1
+    event = captured_posthog[0]
+    assert event["distinct_id"] == "library-metadata-lookup-service"
+    assert event["event"] == "discogs_rate_gate_fail_open"
+    assert event["properties"]["error_type"] == "RuntimeError"
+    assert event["properties"]["environment"] == get_settings().environment
+
+
+async def test_timeout_fail_open_emits_counter_with_timeout_error_type(
+    rate_bucket_env, captured_posthog
+):
+    rate_bucket_env(enabled=True, timeout_s=0.02)
+    gate = DiscogsRateGate(
+        local_limiter=_RecordingLimiter(),
+        bucket_factory=await _factory_returning(_HangingBucket()),
+    )
+
+    await gate.acquire()
+
+    assert len(captured_posthog) == 1
+    assert captured_posthog[0]["properties"]["error_type"] == "TimeoutError"
+
+
+async def test_missing_pool_fail_open_emits_counter(rate_bucket_env, captured_posthog):
+    rate_bucket_env(enabled=True)
+    gate = DiscogsRateGate(
+        local_limiter=_RecordingLimiter(), bucket_factory=await _factory_returning(None)
+    )
+
+    await gate.acquire()
+
+    assert len(captured_posthog) == 1
+    assert captured_posthog[0]["event"] == "discogs_rate_gate_fail_open"
+
+
+async def test_healthy_and_queueing_paths_emit_no_counter(rate_bucket_env, captured_posthog):
+    """Neither a granted token nor an empty-but-healthy QUEUE is a fail-open —
+    the counter must stay silent so a sustained non-zero rate is a trustworthy
+    'bucket is silently not enforcing' signal during the enablement rollout."""
+    rate_bucket_env(enabled=True)
+    gate = DiscogsRateGate(
+        local_limiter=_RecordingLimiter(),
+        bucket_factory=await _factory_returning(_AllowingBucket()),
+    )
+    await gate.acquire()
+
+    queueing_gate = DiscogsRateGate(
+        local_limiter=_RecordingLimiter(),
+        bucket_factory=await _factory_returning(_DeniedThenAllowedBucket(retry_after_s=0.01)),
+    )
+    await queueing_gate.acquire()
+
+    assert captured_posthog == []
+
+
+async def test_flag_off_emits_no_counter(rate_bucket_env, captured_posthog):
+    """Flag OFF never touches PG, so it can never fail open — counter stays 0."""
+    rate_bucket_env(enabled=False)
+    gate = DiscogsRateGate(
+        local_limiter=_RecordingLimiter(),
+        bucket_factory=await _factory_returning(_RaisingBucket()),
+    )
+
+    await gate.acquire()
+
+    assert captured_posthog == []
+
+
+async def test_telemetry_disabled_skips_counter_but_still_fails_open(
+    rate_bucket_env, captured_posthog, captured_tags, monkeypatch
+):
+    """``ENABLE_TELEMETRY=false`` suppresses the PostHog emit (mirroring the DI
+    dependencies' short-circuit) without disturbing the fail-open contract."""
+    monkeypatch.setenv("ENABLE_TELEMETRY", "false")
+    rate_bucket_env(enabled=True)
+    local = _RecordingLimiter()
+    gate = DiscogsRateGate(
+        local_limiter=local, bucket_factory=await _factory_returning(_RaisingBucket())
+    )
+
+    await gate.acquire()
+
+    assert captured_posthog == []
+    assert local.acquired == 1
+    assert captured_tags["lml.discogs.rate_gate"] == "fallback"
+
+
+async def test_counter_emission_failure_never_breaks_fail_open(
+    rate_bucket_env, captured_tags, monkeypatch
+):
+    """A broken PostHog client (accessor raising) must not turn a graceful
+    fail-open into a hard error — telemetry is strictly best-effort here."""
+    rate_bucket_env(enabled=True)
+
+    def _exploding_accessor(event_prefix):
+        raise RuntimeError("posthog accessor broken")
+
+    monkeypatch.setattr("discogs.ratelimit.get_posthog_client", _exploding_accessor, raising=False)
+    local = _RecordingLimiter()
+    gate = DiscogsRateGate(
+        local_limiter=local, bucket_factory=await _factory_returning(_RaisingBucket())
+    )
+
+    await gate.acquire()  # must not raise
+
+    assert local.acquired == 1
+    assert captured_tags["lml.discogs.rate_gate"] == "fallback"

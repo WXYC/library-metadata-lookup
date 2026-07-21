@@ -16,10 +16,23 @@ from typing import Protocol
 
 import sentry_sdk
 from aiolimiter import AsyncLimiter
+from wxyc_fastapi.observability import get_posthog_client
 
 from discogs.breaker import DiscogsCircuitBreaker
 
 logger = logging.getLogger(__name__)
+
+# PostHog contract for the unsampled fail-open counter (LML#879 Deliverable A).
+# The Sentry ``fallback`` tag below rides *sampled* transactions, and the
+# dominant fail-open traffic — the BS flowsheet/album backfill floods — runs
+# ``tracesSampleRate=0`` and client-discards its LML transactions, so the tag
+# under-counts fail-open during exactly the floods it is meant to catch. PostHog
+# capture is independent of trace sampling, so this event is the authoritative
+# fail-open rate for the bucket-enablement rollout (a sustained non-zero rate
+# means the shared bucket is silently not enforcing).
+_FAIL_OPEN_EVENT = "discogs_rate_gate_fail_open"
+_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
+_POSTHOG_EVENT_PREFIX = "discogs_rate_gate"
 
 # Upper bound on a SINGLE queue-for-a-token sleep in the rate gate. At the
 # default 50/min this never binds (retry_after ≈ 1.2s); it only clamps a
@@ -229,11 +242,13 @@ class DiscogsRateGate:
                 # in lock-step onto the single row lock.
                 base_sleep = min(acquisition.retry_after_s, _MAX_QUEUE_SLEEP_S)
                 await asyncio.sleep(base_sleep + random.random() * base_sleep * _QUEUE_SLEEP_JITTER)
-        except Exception:
+        except Exception as exc:
             # Any PG error, missing row, or round-trip timeout: fail OPEN. We have
             # ALREADY paced via the local limiter above, so there is nothing more
-            # to acquire — just tag the enclosing trace so the fail-open rate is
-            # queryable (a bare log line is not — LML#683).
+            # to acquire — tag the enclosing trace and emit the unsampled PostHog
+            # counter so the fail-open rate is queryable even when the traffic's
+            # transactions are client-discarded (a bare log line is not — LML#683;
+            # sampled-tag blindness — LML#879).
             #
             # The catch is deliberately broad (LML#841 review, round 2, Finding 3):
             # the real PG-outage surface is wide and raw (PgSource passes asyncpg
@@ -246,10 +261,43 @@ class DiscogsRateGate:
             # distinguishable from a PG outage in Sentry issue-grouping and the logs
             # rather than silently masquerading as one.
             sentry_sdk.set_tag("lml.discogs.rate_gate", "fallback")
+            _capture_fail_open(exc)
             logger.warning(
                 "Discogs shared rate bucket unavailable; already paced by local limiter",
                 exc_info=True,
             )
+
+
+def _capture_fail_open(exc: BaseException) -> None:
+    """Emit the unsampled PostHog fail-open counter (see module constants).
+
+    Runs deep in ``discogs/service._request_with_retry`` — outside any request
+    handler — so it goes through the shared ``wxyc_fastapi`` accessor the LML#683
+    ``cache.*`` counters use, not FastAPI DI. ``error_type`` keeps a real defect
+    (schema-drift ``KeyError``) distinguishable from a PG outage; ``environment``
+    identifies which process failed open, since staging and prod draw from the
+    same shared bucket. Strictly best-effort: a telemetry failure must never
+    turn a graceful fail-open into a hard error.
+    """
+    try:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        if not settings.enable_telemetry:
+            return
+        client = get_posthog_client(event_prefix=_POSTHOG_EVENT_PREFIX)
+        if client is None:
+            return
+        client.capture(
+            distinct_id=_POSTHOG_DISTINCT_ID,
+            event=_FAIL_OPEN_EVENT,
+            properties={
+                "error_type": type(exc).__name__,
+                "environment": settings.environment,
+            },
+        )
+    except Exception:
+        logger.warning("Failed to emit %s counter", _FAIL_OPEN_EVENT, exc_info=True)
 
 
 def _default_bucket_factory() -> BucketFactory:
