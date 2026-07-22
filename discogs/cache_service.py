@@ -1174,7 +1174,13 @@ class DiscogsCacheService:
                 ),
             )
 
-            # Genre/style/video tables may not exist if the pipeline hasn't been re-run
+            # Genre/style tables may not exist if the pipeline hasn't been re-run.
+            # LML#894 (lever L4a): the `release_video` child read was dropped here.
+            # Its rows populate `ReleaseMetadataResponse.videos`, which is never
+            # surfaced in the `/lookup` response nor consumed by any caller, so
+            # reading it on every hydration was pure dead cost. The column stays in
+            # the response model (emitted empty) and `write_release` still persists
+            # videos from the live-API path, so the data is preserved in PG.
             genre_style_results = await asyncio.gather(
                 self.pool.fetch(
                     "SELECT genre FROM release_genre WHERE release_id = $1",
@@ -1182,15 +1188,6 @@ class DiscogsCacheService:
                 ),
                 self.pool.fetch(
                     "SELECT style FROM release_style WHERE release_id = $1",
-                    release_id,
-                ),
-                self.pool.fetch(
-                    """
-                    SELECT sequence, src, title, duration, embed
-                    FROM release_video
-                    WHERE release_id = $1
-                    ORDER BY sequence
-                    """,
                     release_id,
                 ),
                 return_exceptions=True,
@@ -1203,11 +1200,6 @@ class DiscogsCacheService:
             style_rows = (
                 genre_style_results[1]
                 if not isinstance(genre_style_results[1], BaseException)
-                else []
-            )
-            video_rows = (
-                genre_style_results[2]
-                if not isinstance(genre_style_results[2], BaseException)
                 else []
             )
 
@@ -1298,15 +1290,10 @@ class DiscogsCacheService:
                 if position and position_track_counts.get(position) == 1:
                     track_writers[position] = credits
 
-            videos = [
-                ReleaseVideo(
-                    src=row["src"],
-                    title=row["title"],
-                    duration=row["duration"],
-                    embed=row["embed"] if row["embed"] is not None else True,
-                )
-                for row in video_rows
-            ]
+            # LML#894: `videos` is no longer hydrated from the cache (see the
+            # dropped `release_video` read above); it is emitted empty to keep the
+            # response shape unchanged.
+            videos: list[ReleaseVideo] = []
 
             return ReleaseMetadataResponse(
                 release_id=release_id,
@@ -1766,24 +1753,18 @@ class DiscogsCacheService:
                     cached=True,
                 )
 
-            # Fetch all child tables in parallel (independent queries)
-            alias_rows, nv_rows, member_rows, url_rows = await asyncio.gather(
-                self.pool.fetch(
-                    "SELECT alias_id, alias_name FROM artist_alias WHERE artist_id = $1",
-                    artist_id,
-                ),
-                self.pool.fetch(
-                    "SELECT name FROM artist_name_variation WHERE artist_id = $1",
-                    artist_id,
-                ),
-                self.pool.fetch(
-                    "SELECT member_id, member_name, active FROM artist_member WHERE artist_id = $1",
-                    artist_id,
-                ),
-                self.pool.fetch(
-                    "SELECT url FROM artist_url WHERE artist_id = $1",
-                    artist_id,
-                ),
+            # LML#894 (lever L4a): the `artist_alias`, `artist_name_variation`, and
+            # `artist_member` child reads were dropped here. Their rows populate
+            # `ArtistDetails.aliases` / `.name_variations` / `.members`, none of
+            # which is surfaced in the `/lookup` response nor consumed by any caller
+            # (the artist-search-alias composer reads them via the *bulk* path,
+            # `get_artist_details_bulk`, which is untouched). Only `artist_url`
+            # remains read. The dropped fields stay in the response model, emitted
+            # empty, so the shape is unchanged; `write_artist_details` still
+            # persists all child rows, so the data is preserved in PG.
+            url_rows = await self.pool.fetch(
+                "SELECT url FROM artist_url WHERE artist_id = $1",
+                artist_id,
             )
 
             return ArtistDetails(
@@ -1791,16 +1772,9 @@ class DiscogsCacheService:
                 name=artist_row["name"],
                 profile=artist_row["profile"],
                 image_url=artist_row["image_url"],
-                aliases=[
-                    ArtistRef(id=r["alias_id"], name=r["alias_name"])
-                    for r in alias_rows
-                    if r["alias_id"] is not None
-                ],
-                name_variations=[r["name"] for r in nv_rows],
-                members=[
-                    MemberRef(id=r["member_id"], name=r["member_name"], active=r["active"])
-                    for r in member_rows
-                ],
+                aliases=[],
+                name_variations=[],
+                members=[],
                 urls=[r["url"] for r in url_rows],
                 fetched_at=artist_row["fetched_at"],
                 cached=True,

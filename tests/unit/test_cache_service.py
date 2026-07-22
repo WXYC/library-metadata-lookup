@@ -749,8 +749,13 @@ class TestGetRelease:
         assert result.track_writers is None
 
     @pytest.mark.asyncio
-    async def test_reads_videos(self, cache_service, mock_asyncpg_pool):
-        """get_release returns videos fetched from release_video table."""
+    async def test_videos_not_hydrated_from_cache(self, cache_service, mock_asyncpg_pool):
+        """LML#894 (lever L4a): get_release no longer reads the `release_video`
+        child table — its rows populate `videos`, which is never surfaced in the
+        `/lookup` response nor consumed by any caller. Even when video rows exist,
+        the field is emitted empty and the table is never queried. See
+        TestLookupHydrationDropsDeadChildReads for the round-trip-count contract.
+        """
         mock_asyncpg_pool.fetchrow = AsyncMock(
             return_value={
                 "id": 1,
@@ -772,6 +777,7 @@ class TestGetRelease:
                 release_label=[],
                 release_genre=[],
                 release_style=[],
+                # Seeded but must be ignored — get_release never queries this table.
                 release_video=[
                     {
                         "sequence": 1,
@@ -779,84 +785,16 @@ class TestGetRelease:
                         "title": "Metronomic Underground",
                         "duration": 456,
                         "embed": True,
-                    },
-                    {
-                        "sequence": 2,
-                        "src": "https://www.youtube.com/watch?v=def",
-                        "title": "French Disko",
-                        "duration": 204,
-                        "embed": False,
-                    },
+                    }
                 ],
             )
         )
 
         result = await cache_service.get_release(1)
         assert result is not None
-        assert len(result.videos) == 2
-        assert result.videos[0].src == "https://www.youtube.com/watch?v=abc"
-        assert result.videos[0].title == "Metronomic Underground"
-        assert result.videos[0].duration == 456
-        assert result.videos[0].embed is True
-        assert result.videos[1].embed is False
-
-    @pytest.mark.asyncio
-    async def test_reads_videos_empty_when_none_exist(self, cache_service, mock_asyncpg_pool):
-        """get_release returns empty videos list when release has no videos."""
-        mock_asyncpg_pool.fetchrow = AsyncMock(
-            return_value={
-                "id": 1,
-                "title": "Aluminum Tunes",
-                "release_year": 1998,
-                "artwork_url": None,
-                "released": None,
-                "artwork_checked_at": None,
-                "not_found": False,
-            }
-        )
-        mock_asyncpg_pool.fetch = AsyncMock(
-            side_effect=make_fetch_router(
-                release_track_artist=[],
-                release_track=[],
-                release_artist=[
-                    {"artist_id": None, "artist_name": "Stereolab", "extra": 0, "role": None}
-                ],
-                release_label=[],
-                release_genre=[],
-                release_style=[],
-                release_video=[],
-            )
-        )
-
-        result = await cache_service.get_release(1)
-        assert result is not None
         assert result.videos == []
-
-    @pytest.mark.asyncio
-    async def test_videos_gracefully_absent(self, cache_service, mock_asyncpg_pool):
-        """get_release returns empty videos list when release_video table does not exist."""
-        mock_asyncpg_pool.fetchrow = AsyncMock(
-            return_value={
-                "id": 1,
-                "title": "Emperor Tomato Ketchup",
-                "release_year": 1996,
-                "artwork_url": None,
-                "released": None,
-                "artwork_checked_at": None,
-                "not_found": False,
-            }
-        )
-
-        def raise_on_video(query, *args):
-            if "release_video" in query:
-                raise Exception("relation does not exist")
-            return []
-
-        mock_asyncpg_pool.fetch = AsyncMock(side_effect=raise_on_video)
-
-        result = await cache_service.get_release(1)
-        assert result is not None
-        assert result.videos == []
+        issued = [c.args[0] for c in mock_asyncpg_pool.fetch.call_args_list]
+        assert not any("release_video" in sql for sql in issued)
 
     @pytest.mark.asyncio
     async def test_error_raises(self, cache_service, mock_asyncpg_pool):
@@ -1908,6 +1846,11 @@ class TestGetArtistDetails:
 
     @pytest.mark.asyncio
     async def test_full_details(self, cache_service, mock_asyncpg_pool):
+        """Row-level fields plus `urls` are hydrated. LML#894 (lever L4a): the
+        `aliases` / `name_variations` / `members` child reads were dropped — those
+        tables are never queried and the fields are emitted empty (seeded rows
+        below are ignored). See TestLookupHydrationDropsDeadChildReads.
+        """
         from datetime import datetime
 
         mock_asyncpg_pool.fetchrow = AsyncMock(
@@ -1922,6 +1865,8 @@ class TestGetArtistDetails:
         )
         mock_asyncpg_pool.fetch = AsyncMock(
             side_effect=make_fetch_router(
+                # Seeded but must be ignored — get_artist_details no longer reads
+                # these three tables.
                 artist_alias=[{"alias_id": 500, "alias_name": "Gescom"}],
                 artist_name_variation=[{"name": "Ae"}, {"name": "Autechre."}],
                 artist_member=[{"member_id": 200, "member_name": "Rob Brown", "active": True}],
@@ -1935,13 +1880,15 @@ class TestGetArtistDetails:
         assert result.name == "Autechre"
         assert result.profile == "Electronic duo from Rochdale."
         assert result.image_url == "https://i.discogs.com/autechre.jpg"
-        assert len(result.aliases) == 1
-        assert result.aliases[0].name == "Gescom"
-        assert result.name_variations == ["Ae", "Autechre."]
-        assert len(result.members) == 1
-        assert result.members[0].name == "Rob Brown"
+        assert result.aliases == []
+        assert result.name_variations == []
+        assert result.members == []
         assert result.urls == ["https://autechre.ws"]
         assert result.cached is True
+        issued = [c.args[0] for c in mock_asyncpg_pool.fetch.call_args_list]
+        assert not any("artist_alias" in sql for sql in issued)
+        assert not any("artist_name_variation" in sql for sql in issued)
+        assert not any("artist_member" in sql for sql in issued)
 
     @pytest.mark.asyncio
     async def test_projects_fetched_at_for_stub_discrimination(
@@ -2862,3 +2809,142 @@ class TestArtistTrigramCandidates:
         conn.fetch = AsyncMock(return_value=[{"input": "not in batch", "artist_ids": [1]}])
         with pytest.raises(CacheUnavailableError):
             await cache_service.artist_trigram_candidates(["Stereolab"])
+
+
+def _recording_fetch_router(recorded: list[str], **table_results):
+    """Like ``make_fetch_router`` but appends every issued SQL query to
+    ``recorded`` so a test can assert exactly which child tables were (and were
+    not) read during a hydration. Routing is longest-table-name-first so
+    ``release_track_artist`` matches before ``release_track``.
+    """
+    sorted_tables = sorted(table_results.keys(), key=len, reverse=True)
+
+    async def route(query, *args):
+        recorded.append(query)
+        for table_name in sorted_tables:
+            if table_name in query:
+                return table_results[table_name]
+        return []
+
+    return route
+
+
+class TestLookupHydrationDropsDeadChildReads:
+    """LML#894 (lever L4a): the release/artist hydration on the ``/lookup`` path
+    must not read the four child tables whose values are never surfaced in the
+    ``/lookup`` response nor consumed by any caller — ``release_video``,
+    ``artist_alias``, ``artist_name_variation``, ``artist_member``. The live
+    children (notably ``release_track_artist``, which carries the LML#699 writer
+    credits, and ``artist_url``) must still be read, and the response object
+    shape must be unchanged (the dropped fields stay present, just empty).
+    """
+
+    _DEAD_RELEASE_CHILD = "release_video"
+    _DEAD_ARTIST_CHILDREN = ("artist_alias", "artist_name_variation", "artist_member")
+
+    @pytest.mark.asyncio
+    async def test_get_release_does_not_read_release_video(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 1,
+                "title": "Aluminum Tunes",
+                "release_year": 1998,
+                "artwork_url": None,
+                "released": None,
+                "artwork_checked_at": None,
+                "not_found": False,
+                "master_id": None,
+            }
+        )
+        recorded: list[str] = []
+        # Seed release_video rows to prove they are ignored even when present.
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=_recording_fetch_router(
+                recorded,
+                release_track_artist=[],
+                release_track=[
+                    {"position": "1", "title": "Pop Quiz", "duration": None, "sequence": 1}
+                ],
+                release_artist=[
+                    {"artist_id": 42, "artist_name": "Stereolab", "extra": 0, "role": None}
+                ],
+                release_label=[{"label_id": 7, "label_name": "Duophonic", "catno": "D-UHF-CD11"}],
+                release_genre=[{"genre": "Electronic"}],
+                release_style=[{"style": "Krautrock"}],
+                release_video=[
+                    {
+                        "sequence": 1,
+                        "src": "https://www.youtube.com/watch?v=abc",
+                        "title": "Metronomic Underground",
+                        "duration": 456,
+                        "embed": True,
+                    }
+                ],
+            )
+        )
+
+        result = await cache_service.get_release(1)
+
+        # (a) the dead child table is never queried
+        assert not any(self._DEAD_RELEASE_CHILD in q for q in recorded), (
+            f"get_release must not read {self._DEAD_RELEASE_CHILD}; issued: {recorded!r}"
+        )
+        # (b) the live children — including the #699 writer-credit read — still fire
+        assert any("release_track_artist" in q for q in recorded)
+        assert any("release_label" in q for q in recorded)
+        assert any("release_genre" in q for q in recorded)
+        assert any("release_style" in q for q in recorded)
+        # (c) response shape unchanged: field still present, just empty
+        assert isinstance(result, ReleaseMetadataResponse)
+        assert result.title == "Aluminum Tunes"
+        assert result.artist == "Stereolab"
+        assert result.genres == ["Electronic"]
+        assert result.styles == ["Krautrock"]
+        assert result.label == "Duophonic"
+        assert result.videos == []
+
+    @pytest.mark.asyncio
+    async def test_get_artist_details_does_not_read_alias_variation_member(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        from datetime import datetime
+
+        mock_asyncpg_pool.fetchrow = AsyncMock(
+            return_value={
+                "id": 99,
+                "name": "Juana Molina",
+                "profile": "Argentine singer-songwriter.",
+                "image_url": "https://i.discogs.com/juana.jpg",
+                "fetched_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "not_found": False,
+            }
+        )
+        recorded: list[str] = []
+        # Seed the dead child rows to prove they are ignored even when present.
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=_recording_fetch_router(
+                recorded,
+                artist_alias=[{"alias_id": 500, "alias_name": "Juana"}],
+                artist_name_variation=[{"name": "J. Molina"}],
+                artist_member=[{"member_id": 200, "member_name": "Someone", "active": True}],
+                artist_url=[{"url": "https://juanamolina.com"}],
+            )
+        )
+
+        result = await cache_service.get_artist_details(99)
+
+        # (a) none of the three dead child tables are queried
+        for dead in self._DEAD_ARTIST_CHILDREN:
+            assert not any(dead in q for q in recorded), (
+                f"get_artist_details must not read {dead}; issued: {recorded!r}"
+            )
+        # (b) the live child (artist_url) still fires
+        assert any("artist_url" in q for q in recorded)
+        # (c) response shape unchanged: fields still present, just empty
+        assert isinstance(result, ArtistDetails)
+        assert result.name == "Juana Molina"
+        assert result.profile == "Argentine singer-songwriter."
+        assert result.urls == ["https://juanamolina.com"]
+        assert result.aliases == []
+        assert result.name_variations == []
+        assert result.members == []
