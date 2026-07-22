@@ -818,6 +818,10 @@ class Concert(BaseModel):
         None,
         description='True when the concert\'s resolved headliner (`headlining_artist_id`) has at least one WXYC library release that has been in rotation — any rotation row, past or present ("has been in rotation", not "currently in rotation"). Omitted or false for concerts with no library-resolved headliner, including Discogs-only resolutions (`headlining_discogs_artist_id` without `headlining_artist_id` in the Backend), which by construction have no library releases to hold rotation membership. The rotation-membership signal behind the On Tour "For You" station tier ("WXYC recommends", WXYC/wxyc-ios-64#576); replaces the deprecated `station_plays`. Identical for every listener; carries no listener data. Optional (not in `required`) so it can land ahead of the Backend-Service emitter and older clients decode forward-compatibly — same discipline as `Concert.similar_artists`.',
     )
+    artist_bio: str | None = Field(
+        None,
+        description='Artist biography from the resolved headliner\'s Discogs profile (raw Discogs markup, parsed client-side), keyed on the effective Discogs artist id and cached nightly on `artist_metadata`. Null when the headliner is unresolved, has no Discogs profile, or enrichment has not run. Identical for every listener; carries no listener data. Renders the On Tour concert-detail "About the Artist" card. Optional (not in `required`) so it can land ahead of the Backend-Service emitter and older clients decode forward-compatibly — same discipline as `Concert.similar_artists`.',
+    )
 
 
 class ConcertsResponse(BaseModel):
