@@ -374,7 +374,7 @@ async def test_artist_lean_no_urls_returns_empty_list(pg_pool):
 
 @pytest.mark.pg
 @pytest.mark.asyncio
-async def test_release_lean_tombstone_returns_none(pg_pool):
+async def test_release_lean_tombstone_surfaces_not_found(pg_pool):
     async with pg_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO release (id, title, not_found, artwork_checked_at) "

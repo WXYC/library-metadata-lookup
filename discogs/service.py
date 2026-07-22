@@ -1109,10 +1109,12 @@ class DiscogsService:
 
         Args:
             release_id: Discogs release ID
-            lean: LML#894 (lever L4a). When ``True``, route the PG read through
-                the SEPARATE lean cache method (:meth:`DiscogsCacheService.get_release_lean`),
-                which skips the ``release_video`` child ``/lookup`` never uses
-                (9 → 8 PG round-trips). The shared cached read (``lean=False``,
+            lean: LML#894 (lever L4a) / LML#895 (lever L4c). When ``True``, route
+                the PG read through the SEPARATE lean cache method
+                (:meth:`DiscogsCacheService.get_release_lean`), which collapses
+                the per-child hydration into ``json_agg`` reads (≤ 2 PG
+                round-trips) and never surfaces the ``release_video`` child
+                ``/lookup`` never uses. The shared cached read (``lean=False``,
                 the default) is untouched and keeps serving ``/discogs/*``. The
                 ``@async_cached`` key includes ``lean``, so lean and full
                 results occupy disjoint L1 entries — a lean read can never be
@@ -1368,11 +1370,13 @@ class DiscogsService:
 
         Args:
             artist_id: Discogs artist ID
-            lean: LML#894 (lever L4a). When ``True``, route the PG read through
-                the SEPARATE lean cache method (:meth:`DiscogsCacheService.get_artist_details_lean`),
-                which skips the ``artist_alias`` / ``artist_name_variation`` /
-                ``artist_member`` children ``/lookup`` never uses (5 → 2 PG
-                round-trips; ``profile`` + ``urls`` are still read). The shared
+            lean: LML#894 (lever L4a) / LML#895 (lever L4c). When ``True``, route
+                the PG read through the SEPARATE lean cache method
+                (:meth:`DiscogsCacheService.get_artist_details_lean`), which folds
+                ``artist_url`` into the parent row via ``json_agg`` (a single PG
+                round-trip; ``profile`` + ``urls`` are still read) and never reads
+                the ``artist_alias`` / ``artist_name_variation`` /
+                ``artist_member`` children ``/lookup`` never uses. The shared
                 cached read (``lean=False``, the default) is untouched and keeps
                 serving ``/discogs/*``; the ``@async_cached`` key includes
                 ``lean`` so lean and full results occupy disjoint L1 entries.
