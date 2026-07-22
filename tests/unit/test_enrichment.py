@@ -4340,6 +4340,58 @@ class TestAppleMusicUrlCacheFirst:
         assert write_back.await_args.kwargs["url"] == resolved_url
 
     @pytest.mark.asyncio
+    async def test_fresh_known_miss_still_probes_live_not_serves_null(self):
+        """A fresh known-miss row in the SHARED cache must NOT short-circuit the
+        happy path into serving a null (guards #782 / BS#1192).
+
+        The ``album_streaming_url_cache`` is shared with the LML#706 post-process,
+        which writes null-miss rows (``resolve_streaming_url_with_cache`` →
+        ``live_miss``). Those surface here as a ``peek`` of ``(None, True)`` — a
+        cached "checked, not found within TTL" decision. The cache-first helper
+        keys its short-circuit on ``cached_url is not None`` (NOT
+        ``has_fresh_decision``), so a known-miss falls through to the live probe
+        and the first-lookup URL stays present. An "optimization" that honored
+        ``has_fresh_decision`` would persist that null — exactly the
+        #782/BS#1192 failure mode — so pin the re-probe explicitly."""
+        item, artwork, discogs_service = self._acceptable_happy_path_inputs()
+        resolved_url = "https://music.apple.com/us/song/back-baby/123"
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock()
+        apple_music.find_track_url = AsyncMock(return_value=resolved_url)
+
+        with (
+            patch(
+                "lookup.enrichment.item.peek_cached_streaming_url",
+                # Fresh known-miss: no URL, but the cache holds a within-TTL
+                # "not found" decision (has_fresh_decision=True).
+                new=AsyncMock(return_value=(None, True)),
+            ),
+            patch(
+                "lookup.enrichment.item.set_cached_streaming_url",
+                new=AsyncMock(),
+            ) as write_back,
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                song="Back, Baby",
+                album="On Your Own Love Again",
+                artist="Jessica Pratt",
+                apple_music=apple_music,
+                discogs_cache_pg=MagicMock(),
+            )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # Known-miss did NOT suppress the probe — the live URL is present, not null.
+        apple_music.find_track_url.assert_awaited_once()
+        assert enriched.apple_music_url == resolved_url
+        # The freshly resolved URL is written back under the album service key.
+        write_back.assert_awaited_once()
+        assert write_back.await_args.kwargs["url"] == resolved_url
+
+    @pytest.mark.asyncio
     async def test_cache_miss_returning_none_writes_no_row(self):
         """A live probe that resolves nothing writes no cache row (only the
         resolved URL is ever cached) and leaves ``apple_music_url`` None."""
