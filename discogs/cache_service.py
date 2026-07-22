@@ -1176,11 +1176,13 @@ class DiscogsCacheService:
 
             # Genre/style tables may not exist if the pipeline hasn't been re-run.
             # LML#894 (lever L4a): the `release_video` child read was dropped here.
-            # Its rows populate `ReleaseMetadataResponse.videos`, which is never
-            # surfaced in the `/lookup` response nor consumed by any caller, so
-            # reading it on every hydration was pure dead cost. The column stays in
-            # the response model (emitted empty) and `write_release` still persists
-            # videos from the live-API path, so the data is preserved in PG.
+            # Its rows populate `ReleaseMetadataResponse.videos`, which the `/lookup`
+            # path never reads, so reading it on every hydration was dead cost there.
+            # The field is still declared on the response model — the diagnostic
+            # `/api/v1/discogs/release/{id}` endpoint returns it, now empty on a warm
+            # cache hit (the live-API path in `discogs/service.py` still fills it on a
+            # cold miss) — but no consumer reads `videos`. `write_release` still
+            # persists videos from the live-API path, so the data is preserved in PG.
             genre_style_results = await asyncio.gather(
                 self.pool.fetch(
                     "SELECT genre FROM release_genre WHERE release_id = $1",
@@ -1755,13 +1757,15 @@ class DiscogsCacheService:
 
             # LML#894 (lever L4a): the `artist_alias`, `artist_name_variation`, and
             # `artist_member` child reads were dropped here. Their rows populate
-            # `ArtistDetails.aliases` / `.name_variations` / `.members`, none of
-            # which is surfaced in the `/lookup` response nor consumed by any caller
-            # (the artist-search-alias composer reads them via the *bulk* path,
-            # `get_artist_details_bulk`, which is untouched). Only `artist_url`
-            # remains read. The dropped fields stay in the response model, emitted
-            # empty, so the shape is unchanged; `write_artist_details` still
-            # persists all child rows, so the data is preserved in PG.
+            # `ArtistDetails.aliases` / `.name_variations` / `.members`, which the
+            # `/lookup` path never reads. The artist-search-alias composer reads them
+            # via the *bulk* path, `get_artist_details_bulk`, which is untouched; the
+            # diagnostic `/api/v1/discogs/artist/{id}` endpoint returns them, now
+            # empty on a warm cache hit (the live-API path in `discogs/service.py`
+            # still fills them on a cold miss), but no consumer reads those fields.
+            # Only `artist_url` remains read. The dropped fields stay in the response
+            # model, emitted empty, so the shape is unchanged; `write_artist_details`
+            # still persists all child rows, so the data is preserved in PG.
             url_rows = await self.pool.fetch(
                 "SELECT url FROM artist_url WHERE artist_id = $1",
                 artist_id,
