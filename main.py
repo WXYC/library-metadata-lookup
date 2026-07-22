@@ -11,9 +11,9 @@ from typing import Any
 
 import sentry_sdk
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from wxyc_fastapi.observability import flush_posthog, init_sentry, shutdown_posthog
+from wxyc_fastapi.observability import init_sentry, shutdown_posthog
 
 from artists.router import router as artists_router
 from cache.router import router as cache_router
@@ -494,26 +494,18 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-# Registered BEFORE `posthog_flush_middleware` below deliberately — Starlette's
-# `add_middleware`/`@app.middleware("http")` prepend to the user-middleware
-# list, so the LAST one registered ends up OUTERMOST (it sees the request
-# first and the response last). Registering the wall-clock timer first makes
-# it the INNER of the two: `posthog_flush_middleware`'s synchronous
-# `flush_posthog()` call then runs OUTSIDE the timed window, so it can't
-# inflate the `lml_wall` Server-Timing leg with unrelated middleware cost. See
-# `core/server_timing_middleware.py` for what the leg measures and why. Pure
-# ASGI middleware (LmlWallTimingMiddleware) still goes through `add_middleware`
-# like any other Starlette middleware, so this ordering rule applies exactly
-# the same as it did for the old `@app.middleware("http")` registration.
+# Registered after CORSMiddleware, so it is the OUTERMOST user middleware —
+# Starlette's `add_middleware` prepends to the user-middleware list, and the
+# LAST one registered ends up outermost (sees the request first, the response
+# last). That used to matter for keeping `posthog_flush_middleware`'s
+# synchronous `flush_posthog()` call OUTSIDE the timed window so it couldn't
+# inflate the `lml_wall` Server-Timing leg; that middleware blocked the event
+# loop for ~2.5s per request and was removed outright (LML#881/#949) rather
+# than reordered around, so there is no longer a sibling middleware this one
+# needs to exclude. It now simply wraps CORS + the router, which is exactly
+# the window `lml_wall` is meant to measure — see
+# `core/server_timing_middleware.py` for what the leg measures and why.
 app.add_middleware(LmlWallTimingMiddleware)
-
-
-@app.middleware("http")
-async def posthog_flush_middleware(request: Request, call_next):
-    """Flush PostHog events after each request to prevent data loss."""
-    response = await call_next(request)
-    flush_posthog()
-    return response
 
 
 # Health and admin keep their own auth posture:

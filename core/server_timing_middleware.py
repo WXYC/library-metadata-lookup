@@ -107,11 +107,12 @@ class LmlWallTimingMiddleware:
     """ASGI middleware appending the ``lml_wall`` Server-Timing leg.
 
     Registered via ``app.add_middleware(LmlWallTimingMiddleware)`` in
-    ``main.py``, positioned so it wraps only the routing/handler/serialization
-    layer (see the registration site's comment for the ordering rationale — it
-    deliberately excludes the sibling ``posthog_flush_middleware``'s
-    synchronous flush from the timed window, so ``lml_wall`` isn't inflated by
-    unrelated middleware cost).
+    ``main.py`` as the outermost user middleware, so it wraps CORS and the
+    router — the routing/handler/serialization layer this leg exists to
+    measure (see the registration site's comment for the ordering history:
+    it used to also need to keep the now-removed ``posthog_flush_middleware``
+    outside this window; that middleware blocked the event loop with a
+    synchronous flush and was deleted entirely, LML#881/#949).
 
     The wrapped app (``self.app``) is never called inside a try/except: a
     genuine failure inside routing must still propagate to Starlette's
