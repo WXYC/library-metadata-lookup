@@ -33,6 +33,11 @@ from discogs.models import (
 )
 from discogs.service import find_track_position
 from discogs.writer_roles import writer_credits_from_release
+from entity.track_streaming_url_cache import (
+    APPLE_MUSIC_TRACK_SERVICE,
+    get_cached_track_streaming_url,
+    set_cached_track_streaming_url,
+)
 from library.models import LibraryItem
 from lookup.artist_resolution import (
     _artist_pair_verified,
@@ -194,13 +199,76 @@ async def enrich_one(
     probe_release_year: int | None = None
     probe_method = "find_track_metadata" if not library_row_acceptable else "find_track_url"
     skip_happy_probe = library_row_acceptable and apple_music_override
-    if ctx.apple_music is not None and row_artist and search_term and not skip_happy_probe:
+
+    # L1 (LML#893): cache-first Apple track probe on the happy path. When the
+    # lookup carries a played track (``ctx.song``), peek a track-scoped cache
+    # (``lml_cache.track_streaming_url_cache``, keyed on
+    # ``(service, artist, album, song)``) before paying the ~4.8s live
+    # ``find_track_url``. A HIT returns the cached exact-track deep-link and
+    # skips the probe; a MISS runs the probe live (first-lookup URL preserved)
+    # and writes the resolved deep-link back to the TRACK cache. Both the peek
+    # and the write are gated on the kill-switch flags — an incident flip
+    # disables L1's cache read/write. Track deep-links live ONLY in this table:
+    # never the album-keyed cache (the PR #898 poisoning bug). The synthesis
+    # path (``find_track_metadata``) is untouched — track-absent lookups fall
+    # back to today's album/post-process behavior.
+    settings = get_settings()
+    track_cache_enabled = (
+        settings.lml_persist_streaming_urls and settings.lml_persist_streaming_url_apple_music
+    )
+    l1_eligible = bool(
+        library_row_acceptable
+        and ctx.apple_music is not None
+        and row_artist
+        and ctx.song
+        and ctx.discogs_cache_pg is not None
+        and track_cache_enabled
+        and not skip_happy_probe
+    )
+    track_cache_hit = False
+    if l1_eligible:
+        # Narrowed by ``l1_eligible``; asserted for mypy + as a runtime contract.
+        assert ctx.discogs_cache_pg is not None
+        assert ctx.song is not None
+        cached_track_url = await get_cached_track_streaming_url(
+            ctx.discogs_cache_pg,
+            service=APPLE_MUSIC_TRACK_SERVICE,
+            artist=row_artist,
+            album=ctx.album,
+            song=ctx.song,
+        )
+        if cached_track_url is not None:
+            apple_music_url = cached_track_url
+            track_cache_hit = True
+
+    if (
+        ctx.apple_music is not None
+        and row_artist
+        and search_term
+        and not skip_happy_probe
+        and not track_cache_hit
+    ):
         try:
             if library_row_acceptable:
                 apple_music_url = await asyncio.wait_for(
                     ctx.apple_music.find_track_url(row_artist, search_term, album=ctx.album),
                     timeout=apple_music_lookup_timeout_s(),
                 )
+                # L1 write-back: persist a freshly-resolved track deep-link so
+                # the next lookup of this ``(artist, album, song)`` is a HIT.
+                # Never persist a null (#782/BS#1192) — guarded on a non-null
+                # URL and the same kill-switch flags as the peek.
+                if l1_eligible and apple_music_url is not None:
+                    assert ctx.discogs_cache_pg is not None
+                    assert ctx.song is not None
+                    await set_cached_track_streaming_url(
+                        ctx.discogs_cache_pg,
+                        service=APPLE_MUSIC_TRACK_SERVICE,
+                        artist=row_artist,
+                        album=ctx.album,
+                        song=ctx.song,
+                        url=apple_music_url,
+                    )
             else:
                 probe_match = await asyncio.wait_for(
                     ctx.apple_music.find_track_metadata(row_artist, search_term, album=ctx.album),
@@ -461,7 +529,7 @@ async def enrich_one(
         entity_store=ctx.entity_store,
         request_artist=ctx.artist,
         request_album=ctx.album,
-        settings=get_settings(),
+        settings=settings,
     )
 
     # Bandcamp's templated search-URL fallback, deferred past the

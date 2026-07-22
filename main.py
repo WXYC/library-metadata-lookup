@@ -214,6 +214,9 @@ async def lifespan(app: FastAPI):
         from entity.sources import PgSource
         from entity.streaming_catalog import set_up_streaming_catalog_schema
         from entity.streaming_url_cache import set_up_streaming_url_cache_schema
+        from entity.track_streaming_url_cache import (
+            set_up_track_streaming_url_cache_schema,
+        )
 
         pool = None
         try:
@@ -233,6 +236,15 @@ async def lifespan(app: FastAPI):
                 (
                     "Streaming-URL cache",
                     lambda: set_up_streaming_url_cache_schema(source),
+                ),
+                # Track-scoped streaming-URL cache (LML#893, lever L1), a
+                # SEPARATE LML-owned ``lml_cache.*`` table keyed on the played
+                # song so the /lookup happy path can skip the ~4.8s live Apple
+                # track probe on a repeat lookup. Never bends the album cache
+                # (the PR #898 poisoning bug). Same pool, same best-effort posture.
+                (
+                    "Track streaming-URL cache",
+                    lambda: set_up_track_streaming_url_cache_schema(source),
                 ),
                 # Positive release-resolution cache (LML#632), another LML-owned
                 # ``lml_cache.*`` application cache. Same pool, same best-effort
