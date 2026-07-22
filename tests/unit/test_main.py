@@ -3,7 +3,6 @@
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from httpx import ASGITransport, AsyncClient
 
 
 class _FakeAcquire:
@@ -187,31 +186,35 @@ class TestLifespan:
 
 
 class TestMiddleware:
-    @pytest.mark.asyncio
-    async def test_posthog_flush_middleware(self, mock_settings):
-        """PostHog flush middleware flushes after each request."""
-        from config.settings import get_settings
-        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+    def test_no_per_request_posthog_flush_middleware(self, mock_settings):
+        """The request path must not synchronously flush PostHog (LML#881).
+
+        ``posthog_flush_middleware`` used to call ``flush_posthog()`` on every response.
+        ``flush_posthog()`` is ``Posthog.flush()`` == ``queue.join()`` — a blocking wait on
+        the asyncio event loop until the background consumer drains every queued event, so a
+        PostHog slowdown stalled the loop for tens of seconds once per in-flight request,
+        serializing the whole service behind PostHog delivery. Delivery is instead covered by
+        the consumer thread's periodic flush + the lifespan ``shutdown_posthog()`` + posthog's
+        ``atexit`` join, so the per-request flush is removed. Regression guard: no HTTP
+        middleware named ``posthog_flush_middleware`` may be registered on the app.
+        """
         from main import app
 
-        mock_db = AsyncMock()
-        mock_db.is_available = AsyncMock(return_value=True)
+        dispatch_names = []
+        for mw in app.user_middleware:
+            # ``@app.middleware("http")`` registers ``BaseHTTPMiddleware(dispatch=<func>)``;
+            # Starlette exposes the function in ``.kwargs`` (newer) or positionally in
+            # ``.args`` (older), so check both.
+            dispatch = getattr(mw, "kwargs", {}).get("dispatch")
+            if dispatch is None:
+                dispatch = next((a for a in getattr(mw, "args", ()) if callable(a)), None)
+            if dispatch is not None:
+                dispatch_names.append(getattr(dispatch, "__name__", ""))
 
-        app.dependency_overrides[get_library_db] = lambda: mock_db
-        app.dependency_overrides[get_discogs_service] = lambda: None
-        app.dependency_overrides[get_posthog_client] = lambda: None
-        app.dependency_overrides[get_settings] = lambda: mock_settings
-
-        try:
-            with patch("main.flush_posthog") as mock_flush:
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as client:
-                    await client.get("/health")
-
-                mock_flush.assert_called()
-        finally:
-            app.dependency_overrides.clear()
+        assert "posthog_flush_middleware" not in dispatch_names, (
+            "posthog_flush_middleware must be removed — it blocks the event loop with a "
+            "synchronous queue.join() on every request (LML#881)"
+        )
 
 
 class TestAppRouterRegistration:
