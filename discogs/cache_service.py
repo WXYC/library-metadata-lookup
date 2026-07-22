@@ -11,6 +11,7 @@ The cache uses PostgreSQL's pg_trgm extension for fuzzy text matching.
 
 import asyncio
 import hashlib
+import json
 import logging
 from dataclasses import dataclass, field, fields
 
@@ -356,6 +357,25 @@ ORDER BY mt.sim DESC\
 # ``_WORK_MEM_RE`` (imported from ``config.settings``, the single source of the
 # grammar) before interpolation — defense in depth at the interpolation point,
 # complementing the ``Settings._validate_work_mem`` boot-time gate.
+
+
+def _decode_json_agg(value: object) -> list:
+    """Decode a ``json_agg`` result column into a Python list.
+
+    ``json_agg`` returns SQL ``NULL`` (Python ``None``) when the correlated
+    subquery matches no rows, and a ``json`` value otherwise. asyncpg hands a
+    ``json`` column back as a ``str`` unless a type codec is registered (LML
+    registers none), so this decodes the string. Test doubles pass the already-
+    parsed Python list/dict structure, which is returned as-is. Any other value
+    (an unexpected scalar) is treated as empty.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return json.loads(value)
+    if isinstance(value, list):
+        return value
+    return []
 
 
 def _build_search_bounds_sql(statement_timeout_ms: int, work_mem: str) -> str:
@@ -1076,43 +1096,281 @@ class DiscogsCacheService:
             CacheUnavailableError: If database is unreachable
         """
         try:
-            return await self._hydrate_release(release_id, include_videos=True)
+            return await self._hydrate_release(release_id)
         except Exception as e:
             logger.error(f"Cache get_release failed: {e}")
             raise CacheUnavailableError(f"Cache get_release failed: {e}") from e
 
     async def get_release_lean(self, release_id: int) -> ReleaseMetadataResponse | None:
-        """Lean ``/lookup``-only release hydration (LML#894, lever L4a).
+        """Lean ``/lookup``-only release hydration (LML#894 L4a; LML#895 L4c).
 
-        Identical to :meth:`get_release` except it does NOT read the
-        ``release_video`` child table — ``/lookup`` never surfaces release
-        videos, so skipping that leg trims one PG round-trip per release
-        hydration (9 → 8). ``release_track_artist`` (both legs, incl. the
-        LML#699 ``extra = 1`` writer credits) is still read.
+        Returns a payload **shape-identical** to :meth:`get_release` on the
+        ``/lookup``-visible surface, but reads it in **≤ 2 PG round-trips**
+        instead of the per-child N+1 the shared method issues:
+
+        * one ``json_agg`` SELECT hydrating the release row together with the
+          ``release_artist`` / ``release_label`` / ``release_track`` children
+          and **both** ``release_track_artist`` legs (``extra = 0`` performers
+          and the LML#699 ``extra = 1`` writer credits) in a single read; and
+        * one resilient ``release_genre`` / ``release_style`` read (their tables
+          can be absent on an un-rebuilt cache, so a failure degrades to empty
+          lists rather than failing the lookup — mirroring the shared path).
+
+        ``release_video`` is not read (``/lookup`` never surfaces videos, so
+        ``videos`` is always ``[]``). Collapsing the read burst also subsumes
+        the connection-churn ("L5") win: one acquire per read instead of the
+        ~7.5 acquire/``RESET ALL`` release cycles the per-child loop paid.
 
         The shared :meth:`get_release` is deliberately left untouched so the
         public ``/api/v1/discogs/release`` response keeps returning ``videos``
-        on BOTH warm and cold cache paths (the ``plans/lookup-latency-plan.md``
-        §6.3 fence: a field-drop must never mutate the shared cached read the
-        ``/discogs/*`` surface serves from).
+        (and every other child) on BOTH warm and cold cache paths — the
+        ``plans/lookup-latency-plan.md`` §6.3 fence: a field-drop or read-shape
+        change must never mutate the shared cached read ``/discogs/*`` serves
+        from.
         """
         try:
-            return await self._hydrate_release(release_id, include_videos=False)
+            return await self._hydrate_release_lean(release_id)
         except Exception as e:
             logger.error(f"Cache get_release_lean failed: {e}")
             raise CacheUnavailableError(f"Cache get_release_lean failed: {e}") from e
 
-    async def _hydrate_release(
-        self, release_id: int, *, include_videos: bool
-    ) -> ReleaseMetadataResponse | None:
-        """Shared hydration core for :meth:`get_release` / :meth:`get_release_lean`.
+    # ``json_agg`` single-round-trip release hydration for the lean ``/lookup``
+    # path (LML#895 L4c). Each correlated subquery aggregates one child table
+    # into a JSON array; ordering is applied inside the aggregate so the decoded
+    # lists match the per-child ``ORDER BY`` the shared path uses. ``json_agg``
+    # yields SQL NULL for an empty child, which ``_decode_json_agg`` maps to
+    # ``[]``. ``release_video`` is intentionally absent — ``/lookup`` never
+    # surfaces videos. Genre/style are read separately (see ``_LEAN_GENRE_STYLE_SQL``)
+    # so their optional tables can fail-soft without sinking the core read.
+    _LEAN_RELEASE_SQL = """
+        SELECT
+            r.id,
+            r.title,
+            r.release_year,
+            r.artwork_url,
+            r.released,
+            r.artwork_checked_at,
+            r.not_found,
+            r.master_id,
+            (
+                SELECT json_agg(json_build_object(
+                    'artist_id', ra.artist_id,
+                    'artist_name', ra.artist_name,
+                    'extra', ra.extra,
+                    'role', ra.role
+                ) ORDER BY ra.extra, ra.artist_name)
+                FROM release_artist ra
+                WHERE ra.release_id = r.id
+            ) AS artists,
+            (
+                SELECT json_agg(json_build_object(
+                    'label_id', rl.label_id,
+                    'label_name', rl.label_name,
+                    'catno', rl.catno
+                ))
+                FROM release_label rl
+                WHERE rl.release_id = r.id
+            ) AS labels,
+            (
+                SELECT json_agg(json_build_object(
+                    'position', rt.position,
+                    'title', rt.title,
+                    'duration', rt.duration,
+                    'sequence', rt.sequence
+                ) ORDER BY rt.sequence)
+                FROM release_track rt
+                WHERE rt.release_id = r.id
+            ) AS tracks,
+            (
+                SELECT json_agg(json_build_object(
+                    'track_sequence', rta.track_sequence,
+                    'artist_name', rta.artist_name
+                ) ORDER BY rta.track_sequence)
+                FROM release_track_artist rta
+                WHERE rta.release_id = r.id AND rta.extra = 0
+            ) AS track_artists,
+            (
+                SELECT json_agg(json_build_object(
+                    'track_sequence', rta.track_sequence,
+                    'artist_name', rta.artist_name,
+                    'role', rta.role
+                ) ORDER BY rta.track_sequence)
+                FROM release_track_artist rta
+                WHERE rta.release_id = r.id AND rta.extra = 1
+            ) AS track_writers
+        FROM release r
+        WHERE r.id = $1
+    """
 
-        ``include_videos`` toggles only the ``release_video`` read: the full
-        path passes ``True``; the lean ``/lookup`` path passes ``False`` and
-        returns an empty ``videos`` list. Every other child read — including
-        both ``release_track_artist`` legs (LML#699) — is identical across the
-        two callers. Exceptions propagate to the public wrappers, which log and
-        translate them to :class:`CacheUnavailableError`.
+    # Second (resilient) round-trip: genre + style as two json_agg columns.
+    # Kept out of ``_LEAN_RELEASE_SQL`` so that a missing/absent genre or style
+    # table (possible on an un-rebuilt cache) fails only this read — which the
+    # caller swallows to empty lists — rather than sinking the core hydration.
+    _LEAN_GENRE_STYLE_SQL = """
+        SELECT
+            (SELECT json_agg(genre) FROM release_genre WHERE release_id = $1) AS genres,
+            (SELECT json_agg(style) FROM release_style WHERE release_id = $1) AS styles
+    """
+
+    async def _hydrate_release_lean(self, release_id: int) -> ReleaseMetadataResponse | None:
+        """L4c single-burst hydration backing :meth:`get_release_lean`.
+
+        Round-trip 1 (:attr:`_LEAN_RELEASE_SQL`) hydrates the release row and
+        every ``/lookup`` child in one read; round-trip 2
+        (:attr:`_LEAN_GENRE_STYLE_SQL`) reads genre/style resiliently. No PG
+        connection is held across an HTTP hop — both reads are pure cache reads.
+        Exceptions from the core read propagate to :meth:`get_release_lean`,
+        which translates them to :class:`CacheUnavailableError`.
+        """
+        release_row = await self.pool.fetchrow(self._LEAN_RELEASE_SQL, release_id)
+
+        if release_row is None:
+            return None
+
+        # LML#510: tombstone short-circuit (same contract as the shared path).
+        # The parent's ``not_found`` flag is authoritative; a tombstone has no
+        # child rows, so the aggregated JSON columns are all empty anyway.
+        if release_row["not_found"]:
+            return ReleaseMetadataResponse(
+                release_id=release_id,
+                title="",
+                artist="",
+                release_url=f"https://www.discogs.com/release/{release_id}",
+                not_found=True,
+                artwork_checked_at=release_row["artwork_checked_at"],
+                cached=True,
+            )
+
+        # Round-trip 2: genre/style, fail-soft to empty lists (their tables can
+        # be absent on an un-rebuilt cache) — mirrors the shared path's
+        # ``return_exceptions=True`` gather.
+        try:
+            gs_row = await self.pool.fetchrow(self._LEAN_GENRE_STYLE_SQL, release_id)
+            genre_names = _decode_json_agg(gs_row["genres"]) if gs_row else []
+            style_names = _decode_json_agg(gs_row["styles"]) if gs_row else []
+        except Exception as e:
+            logger.warning(f"Lean genre/style read failed for release {release_id}: {e}")
+            genre_names = []
+            style_names = []
+
+        artist_rows = _decode_json_agg(release_row["artists"])
+        label_rows = _decode_json_agg(release_row["labels"])
+        track_rows = _decode_json_agg(release_row["tracks"])
+        track_artist_rows = _decode_json_agg(release_row["track_artists"])
+        track_writer_rows = _decode_json_agg(release_row["track_writers"])
+
+        primary_artist = ""
+        primary_artist_id = None
+        artist_credits: list[ArtistCredit] = []
+        extra_artist_credits: list[ArtistCredit] = []
+        for row in artist_rows:
+            credit = ArtistCredit(
+                artist_id=row["artist_id"],
+                name=row["artist_name"],
+                role=row["role"],
+            )
+            if row["extra"] == 0:
+                artist_credits.append(credit)
+                if not primary_artist:
+                    primary_artist = row["artist_name"]
+                    primary_artist_id = row["artist_id"]
+            else:
+                extra_artist_credits.append(credit)
+
+        label_credits = [
+            LabelCredit(
+                label_id=row["label_id"],
+                name=row["label_name"],
+                catno=row["catno"],
+            )
+            for row in label_rows
+        ]
+        primary_label = label_credits[0].name if label_credits else None
+        primary_label_id = label_credits[0].label_id if label_credits else None
+
+        track_artists: dict[int, list[str]] = {}
+        for row in track_artist_rows:
+            seq = row["track_sequence"]
+            if seq not in track_artists:
+                track_artists[seq] = []
+            track_artists[seq].append(row["artist_name"])
+
+        # LML#699 Phase 2: per-track writer credits keyed by ``track_sequence``,
+        # pre-filtered to writer roles (``is_writer_role``). Identical
+        # post-processing to the shared path — only the row source (the decoded
+        # ``extra = 1`` json_agg leg) differs.
+        track_writers_by_seq: dict[int, list[ArtistCredit]] = {}
+        for row in track_writer_rows:
+            role = row.get("role")
+            if not is_writer_role(role):
+                continue
+            seq = row["track_sequence"]
+            track_writers_by_seq.setdefault(seq, []).append(
+                ArtistCredit(name=row["artist_name"], role=role)
+            )
+
+        tracklist = []
+        seq_to_position: dict[int, str] = {}
+        for row in track_rows:
+            seq = row["sequence"]
+            position = row["position"] or ""
+            seq_to_position[seq] = position
+            tracklist.append(
+                TrackItem(
+                    position=position,
+                    title=row["title"],
+                    duration=row["duration"],
+                    artists=track_artists.get(seq, []),
+                )
+            )
+
+        # Re-key per-track writer credits by display position. A position shared
+        # by more than one track is ambiguous (non-unique Discogs ``position``
+        # text) and dropped rather than mis-attributed — same fence as the
+        # shared path (see LML#699 rationale there).
+        position_track_counts: dict[str, int] = {}
+        for position in seq_to_position.values():
+            if position:
+                position_track_counts[position] = position_track_counts.get(position, 0) + 1
+        track_writers: dict[str, list[ArtistCredit]] = {}
+        for seq, credits in track_writers_by_seq.items():
+            position = seq_to_position.get(seq)
+            if position and position_track_counts.get(position) == 1:
+                track_writers[position] = credits
+
+        return ReleaseMetadataResponse(
+            release_id=release_id,
+            title=release_row["title"],
+            artist=primary_artist,
+            artist_id=primary_artist_id,
+            year=release_row["release_year"],
+            label=primary_label,
+            label_id=primary_label_id,
+            genres=list(genre_names),
+            styles=list(style_names),
+            artwork_url=release_row["artwork_url"],
+            artwork_checked_at=release_row["artwork_checked_at"],
+            tracklist=tracklist,
+            release_url=f"https://www.discogs.com/release/{release_id}",
+            cached=True,
+            artists=artist_credits,
+            extra_artists=extra_artist_credits,
+            labels=label_credits,
+            released=release_row["released"],
+            master_id=release_row["master_id"],
+            # ``/lookup`` never surfaces videos — always empty on the lean path.
+            videos=[],
+            track_writers=track_writers or None,
+        )
+
+    async def _hydrate_release(self, release_id: int) -> ReleaseMetadataResponse | None:
+        """Full hydration core for the shared, read-through-cached :meth:`get_release`.
+
+        Reads every child table (including ``release_video``) via the per-child
+        N+1 the ``/discogs/*`` surface, the warmer, and genre-agg rely on. The
+        lean ``/lookup`` path does NOT use this method — it uses the collapsed
+        :meth:`_hydrate_release_lean`. Exceptions propagate to :meth:`get_release`,
+        which translates them to :class:`CacheUnavailableError`.
         """
         release_row = await self.pool.fetchrow(
             "SELECT id, title, release_year, artwork_url, released, "
@@ -1212,49 +1470,34 @@ class DiscogsCacheService:
             ),
         )
 
-        # Genre/style tables may not exist if the pipeline hasn't been re-run.
-        # The ``release_video`` leg rides the same resilient gather on the full
-        # path but is skipped entirely on the lean ``/lookup`` path (LML#894):
-        # ``/lookup`` never surfaces videos, so we save the round-trip.
-        if include_videos:
-            gsv = await asyncio.gather(
-                self.pool.fetch(
-                    "SELECT genre FROM release_genre WHERE release_id = $1",
-                    release_id,
-                ),
-                self.pool.fetch(
-                    "SELECT style FROM release_style WHERE release_id = $1",
-                    release_id,
-                ),
-                self.pool.fetch(
-                    """
-                    SELECT sequence, src, title, duration, embed
-                    FROM release_video
-                    WHERE release_id = $1
-                    ORDER BY sequence
-                    """,
-                    release_id,
-                ),
-                return_exceptions=True,
-            )
-            genre_rows = gsv[0] if not isinstance(gsv[0], BaseException) else []
-            style_rows = gsv[1] if not isinstance(gsv[1], BaseException) else []
-            video_rows = gsv[2] if not isinstance(gsv[2], BaseException) else []
-        else:
-            gs = await asyncio.gather(
-                self.pool.fetch(
-                    "SELECT genre FROM release_genre WHERE release_id = $1",
-                    release_id,
-                ),
-                self.pool.fetch(
-                    "SELECT style FROM release_style WHERE release_id = $1",
-                    release_id,
-                ),
-                return_exceptions=True,
-            )
-            genre_rows = gs[0] if not isinstance(gs[0], BaseException) else []
-            style_rows = gs[1] if not isinstance(gs[1], BaseException) else []
-            video_rows = []
+        # Genre/style/video tables may not exist if the pipeline hasn't been
+        # re-run, so this gather is resilient (``return_exceptions=True``). This
+        # is the shared full path serving ``/discogs/*`` — it always reads
+        # ``release_video``; the lean ``/lookup`` path uses
+        # :meth:`_hydrate_release_lean` instead and never touches videos.
+        gsv = await asyncio.gather(
+            self.pool.fetch(
+                "SELECT genre FROM release_genre WHERE release_id = $1",
+                release_id,
+            ),
+            self.pool.fetch(
+                "SELECT style FROM release_style WHERE release_id = $1",
+                release_id,
+            ),
+            self.pool.fetch(
+                """
+                SELECT sequence, src, title, duration, embed
+                FROM release_video
+                WHERE release_id = $1
+                ORDER BY sequence
+                """,
+                release_id,
+            ),
+            return_exceptions=True,
+        )
+        genre_rows = gsv[0] if not isinstance(gsv[0], BaseException) else []
+        style_rows = gsv[1] if not isinstance(gsv[1], BaseException) else []
+        video_rows = gsv[2] if not isinstance(gsv[2], BaseException) else []
 
         primary_artist = ""
         primary_artist_id = None
@@ -1779,21 +2022,42 @@ class DiscogsCacheService:
             CacheUnavailableError: If database is unreachable
         """
         try:
-            return await self._hydrate_artist_details(artist_id, include_related=True)
+            return await self._hydrate_artist_details(artist_id)
         except Exception as e:
             logger.error(f"Cache get_artist_details failed: {e}")
             raise CacheUnavailableError(f"Cache get_artist_details failed: {e}") from e
 
-    async def get_artist_details_lean(self, artist_id: int) -> ArtistDetails | None:
-        """Lean ``/lookup``-only artist hydration (LML#894, lever L4a).
+    # ``json_agg`` single-round-trip artist hydration for the lean ``/lookup``
+    # path (LML#895 L4c). Only ``artist_url`` (the Wikipedia bio link) is
+    # aggregated — ``/lookup`` never reads aliases / name-variations / members —
+    # folding the former second round-trip into the parent read.
+    _LEAN_ARTIST_SQL = """
+        SELECT
+            a.id,
+            a.name,
+            a.profile,
+            a.image_url,
+            a.fetched_at,
+            a.not_found,
+            (
+                SELECT json_agg(au.url)
+                FROM artist_url au
+                WHERE au.artist_id = a.id
+            ) AS urls
+        FROM artist a
+        WHERE a.id = $1
+    """
 
-        Identical to :meth:`get_artist_details` except it does NOT read the
-        ``artist_alias`` / ``artist_name_variation`` / ``artist_member`` child
-        tables — ``/lookup`` only reads ``profile`` (bio) and ``urls`` (the
-        Wikipedia link), never aliases / name-variations / members. Skipping
-        those three legs trims the artist hydration from 5 PG round-trips to 2
-        (``artist`` row + ``artist_url``); the returned model carries empty
-        ``aliases`` / ``name_variations`` / ``members``.
+    async def get_artist_details_lean(self, artist_id: int) -> ArtistDetails | None:
+        """Lean ``/lookup``-only artist hydration (LML#894 L4a; LML#895 L4c).
+
+        Returns the same ``/lookup``-visible surface as :meth:`get_artist_details`
+        (``name`` / ``profile`` / ``image_url`` / ``urls`` / ``fetched_at``) but
+        in a **single** ``json_agg`` PG round-trip (:attr:`_LEAN_ARTIST_SQL`) —
+        the ``artist_url`` leg is folded into the parent read. ``/lookup`` never
+        reads ``artist_alias`` / ``artist_name_variation`` / ``artist_member``,
+        so the returned model carries empty ``aliases`` / ``name_variations`` /
+        ``members``.
 
         The shared :meth:`get_artist_details` is deliberately left untouched so
         the public ``/api/v1/discogs/artist`` response keeps returning those
@@ -1801,22 +2065,54 @@ class DiscogsCacheService:
         ``plans/lookup-latency-plan.md`` §6.3 fence).
         """
         try:
-            return await self._hydrate_artist_details(artist_id, include_related=False)
+            return await self._hydrate_artist_details_lean(artist_id)
         except Exception as e:
             logger.error(f"Cache get_artist_details_lean failed: {e}")
             raise CacheUnavailableError(f"Cache get_artist_details_lean failed: {e}") from e
 
-    async def _hydrate_artist_details(
-        self, artist_id: int, *, include_related: bool
-    ) -> ArtistDetails | None:
-        """Shared core for get_artist_details / get_artist_details_lean.
+    async def _hydrate_artist_details_lean(self, artist_id: int) -> ArtistDetails | None:
+        """L4c single-burst hydration backing :meth:`get_artist_details_lean`.
 
-        ``include_related`` toggles the ``artist_alias`` / ``artist_name_variation``
-        / ``artist_member`` reads: the full path passes ``True``; the lean
-        ``/lookup`` path passes ``False``, reads only ``artist_url``, and returns
-        empty ``aliases`` / ``name_variations`` / ``members``. Exceptions
-        propagate to the public wrappers, which translate them to
-        :class:`CacheUnavailableError`.
+        One :attr:`_LEAN_ARTIST_SQL` read hydrates the artist row and its
+        ``artist_url`` list; no PG connection is held across an HTTP hop.
+        Exceptions propagate to :meth:`get_artist_details_lean`.
+        """
+        artist_row = await self.pool.fetchrow(self._LEAN_ARTIST_SQL, artist_id)
+
+        if artist_row is None:
+            return None
+
+        # LML#510: tombstone short-circuit (same contract as the shared path).
+        if artist_row["not_found"]:
+            return ArtistDetails(
+                artist_id=artist_id,
+                name="",
+                not_found=True,
+                fetched_at=artist_row["fetched_at"],
+                cached=True,
+            )
+
+        return ArtistDetails(
+            artist_id=artist_row["id"],
+            name=artist_row["name"],
+            profile=artist_row["profile"],
+            image_url=artist_row["image_url"],
+            aliases=[],
+            name_variations=[],
+            members=[],
+            urls=list(_decode_json_agg(artist_row["urls"])),
+            fetched_at=artist_row["fetched_at"],
+            cached=True,
+        )
+
+    async def _hydrate_artist_details(self, artist_id: int) -> ArtistDetails | None:
+        """Full hydration core for the shared, read-through-cached :meth:`get_artist_details`.
+
+        Reads every related child (``artist_alias`` / ``artist_name_variation`` /
+        ``artist_member`` / ``artist_url``) the ``/discogs/*`` surface, the
+        warmer, and genre-agg rely on. The lean ``/lookup`` path does NOT use
+        this method — it uses :meth:`_hydrate_artist_details_lean`. Exceptions
+        propagate to :meth:`get_artist_details`.
         """
         # `fetched_at` is projected so the service-layer `is_pg_hit`
         # predicate can distinguish stub rows (rebuild-created, never
@@ -1845,35 +2141,25 @@ class DiscogsCacheService:
                 cached=True,
             )
 
-        if include_related:
-            # Fetch all child tables in parallel (independent queries)
-            alias_rows, nv_rows, member_rows, url_rows = await asyncio.gather(
-                self.pool.fetch(
-                    "SELECT alias_id, alias_name FROM artist_alias WHERE artist_id = $1",
-                    artist_id,
-                ),
-                self.pool.fetch(
-                    "SELECT name FROM artist_name_variation WHERE artist_id = $1",
-                    artist_id,
-                ),
-                self.pool.fetch(
-                    "SELECT member_id, member_name, active FROM artist_member WHERE artist_id = $1",
-                    artist_id,
-                ),
-                self.pool.fetch(
-                    "SELECT url FROM artist_url WHERE artist_id = $1",
-                    artist_id,
-                ),
-            )
-        else:
-            # Lean /lookup path: only the URL leg (Wikipedia bio link) is read.
-            alias_rows = []
-            nv_rows = []
-            member_rows = []
-            url_rows = await self.pool.fetch(
+        # Fetch all child tables in parallel (independent queries)
+        alias_rows, nv_rows, member_rows, url_rows = await asyncio.gather(
+            self.pool.fetch(
+                "SELECT alias_id, alias_name FROM artist_alias WHERE artist_id = $1",
+                artist_id,
+            ),
+            self.pool.fetch(
+                "SELECT name FROM artist_name_variation WHERE artist_id = $1",
+                artist_id,
+            ),
+            self.pool.fetch(
+                "SELECT member_id, member_name, active FROM artist_member WHERE artist_id = $1",
+                artist_id,
+            ),
+            self.pool.fetch(
                 "SELECT url FROM artist_url WHERE artist_id = $1",
                 artist_id,
-            )
+            ),
+        )
 
         return ArtistDetails(
             artist_id=artist_row["id"],
