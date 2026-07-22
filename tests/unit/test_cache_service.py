@@ -2862,3 +2862,264 @@ class TestArtistTrigramCandidates:
         conn.fetch = AsyncMock(return_value=[{"input": "not in batch", "artist_ids": [1]}])
         with pytest.raises(CacheUnavailableError):
             await cache_service.artist_trigram_candidates(["Stereolab"])
+
+
+# ---------------------------------------------------------------------------
+# get_release_lean / get_artist_details_lean (LML#894, lever L4a)
+#
+# The lean /lookup-only hydration read path omits the 4 children /lookup never
+# consumes (release_video; artist_alias, artist_name_variation, artist_member)
+# to cut PG round-trips 14->10. The shared get_release / get_artist_details
+# MUST keep reading those children so the public /api/v1/discogs/* responses
+# stay full on both warm and cold paths (the plans/lookup-latency-plan.md
+# section 6.3 fence). release_track_artist (LML#699 writer credits) stays on
+# the lean release path.
+# ---------------------------------------------------------------------------
+
+
+def _capture_release_row():
+    return {
+        "id": 1,
+        "title": "Aluminum Tunes",
+        "release_year": 1998,
+        "artwork_url": "https://img.com/a.jpg",
+        "released": None,
+        "artwork_checked_at": None,
+        "not_found": False,
+        "master_id": None,
+    }
+
+
+class TestGetReleaseLean:
+    @pytest.mark.asyncio
+    async def test_lean_skips_release_video(self, cache_service, mock_asyncpg_pool):
+        """get_release_lean must NOT query release_video, but MUST still read
+        the tracklist / artist / label / genre / style children AND both the
+        extra=0 and extra=1 release_track_artist legs (LML#699 writer credits).
+        """
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=_capture_release_row())
+        captured_queries: list[str] = []
+
+        async def capture_fetch(query, *args):
+            captured_queries.append(query)
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=capture_fetch)
+
+        result = await cache_service.get_release_lean(1)
+        assert result is not None
+
+        joined = [" ".join(q.split()) for q in captured_queries]
+        assert not any("release_video" in q for q in joined), (
+            f"lean release path must not read release_video; got: {joined!r}"
+        )
+        # Kept children.
+        for table in (
+            "release_artist",
+            "release_label",
+            "release_track",
+            "release_genre",
+            "release_style",
+        ):
+            assert any(table in q for q in joined), (
+                f"lean release path must still read {table}; got: {joined!r}"
+            )
+        # LML#699: both release_track_artist legs survive on the lean path.
+        rta = [q for q in joined if "release_track_artist" in q]
+        assert any("AND extra = 0" in q for q in rta), (
+            f"lean path must keep the extra=0 release_track_artist read; got: {rta!r}"
+        )
+        assert any("AND extra = 1" in q for q in rta), (
+            f"lean path must keep the extra=1 writer-credit read (LML#699); got: {rta!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lean_returns_empty_videos(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=_capture_release_row())
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                release_track_artist=[],
+                release_track=[
+                    {"position": "1", "title": "Space Moment", "duration": None, "sequence": 1}
+                ],
+                release_artist=[
+                    {"artist_id": 42, "artist_name": "Stereolab", "extra": 0, "role": None}
+                ],
+                release_label=[{"label_id": 7, "label_name": "Duophonic", "catno": "D-1"}],
+                release_genre=[{"genre": "Rock"}],
+                release_style=[{"style": "Post-Rock"}],
+            )
+        )
+
+        result = await cache_service.get_release_lean(1)
+        assert result is not None
+        assert result.videos == []
+        # Core /lookup-consumed fields are intact.
+        assert result.title == "Aluminum Tunes"
+        assert result.artist == "Stereolab"
+        assert result.artist_id == 42
+        assert result.genres == ["Rock"]
+        assert result.styles == ["Post-Rock"]
+        assert result.label == "Duophonic"
+        assert len(result.tracklist) == 1
+        assert result.cached is True
+
+    @pytest.mark.asyncio
+    async def test_lean_shape_parity_with_full_for_videoless_release(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """For a release with no videos, get_release_lean returns the same core
+        payload get_release does (the /lookup-visible surface is unchanged)."""
+        router = make_fetch_router(
+            release_track_artist=[{"track_sequence": 1, "artist_name": "Stereolab"}],
+            release_track=[
+                {"position": "1", "title": "Space Moment", "duration": None, "sequence": 1}
+            ],
+            release_artist=[
+                {"artist_id": 42, "artist_name": "Stereolab", "extra": 0, "role": None}
+            ],
+            release_label=[{"label_id": 7, "label_name": "Duophonic", "catno": "D-1"}],
+            release_genre=[{"genre": "Rock"}],
+            release_style=[{"style": "Post-Rock"}],
+            release_video=[],
+        )
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=_capture_release_row())
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=router)
+        full = await cache_service.get_release(1)
+
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=_capture_release_row())
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=router)
+        lean = await cache_service.get_release_lean(1)
+
+        assert full is not None and lean is not None
+        assert lean.title == full.title
+        assert lean.artist == full.artist
+        assert lean.artist_id == full.artist_id
+        assert lean.genres == full.genres
+        assert lean.styles == full.styles
+        assert lean.label == full.label
+        assert [t.title for t in lean.tracklist] == [t.title for t in full.tracklist]
+        assert [t.artists for t in lean.tracklist] == [t.artists for t in full.tracklist]
+        assert lean.videos == full.videos == []
+
+    @pytest.mark.asyncio
+    async def test_shared_get_release_still_reads_release_video(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """Regression fence: the shared get_release path (serves /discogs/*) must
+        keep querying release_video so warm hits are not empty vs cold full."""
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=_capture_release_row())
+        captured_queries: list[str] = []
+
+        async def capture_fetch(query, *args):
+            captured_queries.append(query)
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=capture_fetch)
+        await cache_service.get_release(1)
+        assert any("release_video" in q for q in captured_queries), (
+            "shared get_release must still read release_video (LML#894 fence); "
+            f"got: {captured_queries!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lean_not_found_returns_none(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=None)
+        assert await cache_service.get_release_lean(999) is None
+
+    @pytest.mark.asyncio
+    async def test_lean_error_raises_cache_unavailable(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetchrow = AsyncMock(side_effect=Exception("db error"))
+        with pytest.raises(CacheUnavailableError):
+            await cache_service.get_release_lean(1)
+
+
+def _capture_artist_row():
+    from datetime import datetime
+
+    return {
+        "id": 77,
+        "name": "Stereolab",
+        "profile": "Anglo-French band.",
+        "image_url": "https://i.discogs.com/stereolab.jpg",
+        "fetched_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "not_found": False,
+    }
+
+
+class TestGetArtistDetailsLean:
+    @pytest.mark.asyncio
+    async def test_lean_skips_related_children(self, cache_service, mock_asyncpg_pool):
+        """get_artist_details_lean must NOT query artist_alias /
+        artist_name_variation / artist_member, but MUST still read artist_url
+        (the /lookup wikipedia-URL surface)."""
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=_capture_artist_row())
+        captured_queries: list[str] = []
+
+        async def capture_fetch(query, *args):
+            captured_queries.append(query)
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=capture_fetch)
+        result = await cache_service.get_artist_details_lean(77)
+        assert result is not None
+
+        for table in ("artist_alias", "artist_name_variation", "artist_member"):
+            assert not any(table in q for q in captured_queries), (
+                f"lean artist path must not read {table}; got: {captured_queries!r}"
+            )
+        assert any("artist_url" in q for q in captured_queries), (
+            f"lean artist path must still read artist_url; got: {captured_queries!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lean_returns_empty_related_but_keeps_urls_and_profile(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=_capture_artist_row())
+        mock_asyncpg_pool.fetch = AsyncMock(
+            side_effect=make_fetch_router(
+                artist_url=[{"url": "https://en.wikipedia.org/wiki/Stereolab"}],
+            )
+        )
+        result = await cache_service.get_artist_details_lean(77)
+        assert result is not None
+        assert result.name == "Stereolab"
+        assert result.profile == "Anglo-French band."
+        assert result.aliases == []
+        assert result.name_variations == []
+        assert result.members == []
+        assert result.urls == ["https://en.wikipedia.org/wiki/Stereolab"]
+        assert result.cached is True
+
+    @pytest.mark.asyncio
+    async def test_shared_get_artist_details_still_reads_children(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """Regression fence: the shared get_artist_details path (serves
+        /discogs/*) must keep reading all three related-child tables."""
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=_capture_artist_row())
+        captured_queries: list[str] = []
+
+        async def capture_fetch(query, *args):
+            captured_queries.append(query)
+            return []
+
+        mock_asyncpg_pool.fetch = AsyncMock(side_effect=capture_fetch)
+        await cache_service.get_artist_details(77)
+        for table in ("artist_alias", "artist_name_variation", "artist_member", "artist_url"):
+            assert any(table in q for q in captured_queries), (
+                f"shared get_artist_details must still read {table} (LML#894 fence); "
+                f"got: {captured_queries!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_lean_not_found_returns_none(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetchrow = AsyncMock(return_value=None)
+        assert await cache_service.get_artist_details_lean(999) is None
+
+    @pytest.mark.asyncio
+    async def test_lean_error_raises_cache_unavailable(self, cache_service, mock_asyncpg_pool):
+        mock_asyncpg_pool.fetchrow = AsyncMock(side_effect=Exception("db error"))
+        with pytest.raises(CacheUnavailableError):
+            await cache_service.get_artist_details_lean(77)

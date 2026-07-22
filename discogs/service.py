@@ -1097,7 +1097,9 @@ class DiscogsService:
         )
 
     @async_cached(RELEASE_CACHE)
-    async def get_release(self, release_id: int) -> ReleaseMetadataResponse | None:
+    async def get_release(
+        self, release_id: int, *, lean: bool = False
+    ) -> ReleaseMetadataResponse | None:
         """Get full release metadata by ID.
 
         Read-through via :func:`fallthrough`: in-memory (decorator) → PG → API
@@ -1107,6 +1109,14 @@ class DiscogsService:
 
         Args:
             release_id: Discogs release ID
+            lean: LML#894 (lever L4a). When ``True``, route the PG read through
+                the SEPARATE lean cache method (:meth:`DiscogsCacheService.get_release_lean`),
+                which skips the ``release_video`` child ``/lookup`` never uses
+                (9 → 8 PG round-trips). The shared cached read (``lean=False``,
+                the default) is untouched and keeps serving ``/discogs/*``. The
+                ``@async_cached`` key includes ``lean``, so lean and full
+                results occupy disjoint L1 entries — a lean read can never be
+                served to (or poison) the ``/discogs/*`` full-object surface.
 
         Returns:
             ReleaseMetadataResponse with full metadata, or None on error
@@ -1290,7 +1300,7 @@ class DiscogsService:
         else:
             value = await fallthrough(
                 label="get_release",
-                pg_read=lambda: cache.get_release(release_id),
+                pg_read=lambda: (cache.get_release_lean if lean else cache.get_release)(release_id),
                 api_fetch=_api_fetch,
                 # LML#510: mypy widens fallthrough's generic `T` to
                 # `T | None` when the result is assigned to a variable
@@ -1346,7 +1356,9 @@ class DiscogsService:
         return value
 
     @async_cached(ARTIST_CACHE)
-    async def get_artist_details(self, artist_id: int) -> ArtistDetails | None:
+    async def get_artist_details(
+        self, artist_id: int, *, lean: bool = False
+    ) -> ArtistDetails | None:
         """Fetch full artist details from Discogs.
 
         Read-through via :func:`fallthrough`: in-memory (decorator) → PG → API
@@ -1356,6 +1368,14 @@ class DiscogsService:
 
         Args:
             artist_id: Discogs artist ID
+            lean: LML#894 (lever L4a). When ``True``, route the PG read through
+                the SEPARATE lean cache method (:meth:`DiscogsCacheService.get_artist_details_lean`),
+                which skips the ``artist_alias`` / ``artist_name_variation`` /
+                ``artist_member`` children ``/lookup`` never uses (5 → 2 PG
+                round-trips; ``profile`` + ``urls`` are still read). The shared
+                cached read (``lean=False``, the default) is untouched and keeps
+                serving ``/discogs/*``; the ``@async_cached`` key includes
+                ``lean`` so lean and full results occupy disjoint L1 entries.
 
         Returns:
             ArtistDetails with full metadata, or None on error
@@ -1451,7 +1471,9 @@ class DiscogsService:
         else:
             value = await fallthrough(
                 label="get_artist_details",
-                pg_read=lambda: cache.get_artist_details(artist_id),
+                pg_read=lambda: (
+                    cache.get_artist_details_lean if lean else cache.get_artist_details
+                )(artist_id),
                 api_fetch=_api_fetch,
                 # LML#510: see the note on `get_release` above.
                 pg_write=cache.write_artist_details,  # type: ignore[arg-type]

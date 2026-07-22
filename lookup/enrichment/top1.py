@@ -39,7 +39,13 @@ async def fetch_top1_release_details(
     if top_artwork is None or top_artwork.release_id <= 0:
         return None, None, None, None, None
     try:
-        release = await discogs_service.get_release(top_artwork.release_id)
+        # LML#894 (lever L4a): the /lookup hydration path uses the lean cache
+        # read, which skips the 4 children /lookup never surfaces
+        # (release_video; artist_alias / artist_name_variation / artist_member).
+        # This stage reads only year / artist_id / artist bio + Wikipedia URL,
+        # so the lean shape is byte-identical for what it consumes while cutting
+        # the top-1 hydration from 14 PG round-trips to 10.
+        release = await discogs_service.get_release(top_artwork.release_id, lean=True)
         if not release:
             return None, None, None, None, None
 
@@ -48,7 +54,7 @@ async def fetch_top1_release_details(
         if not isinstance(artist_id, int) or artist_id <= 0:
             return year, None, None, release, None
 
-        details = await discogs_service.get_artist_details(artist_id)
+        details = await discogs_service.get_artist_details(artist_id, lean=True)
         if not details:
             return year, None, None, release, None
 

@@ -3428,3 +3428,131 @@ class TestDiscogsSearchResultArtistVariants:
 
         r = make_discogs_result(artist="Juana Molina")
         assert r.artist_variants() == ["Juana Molina"]
+
+
+# ---------------------------------------------------------------------------
+# Lean /lookup hydration routing (LML#894, lever L4a)
+#
+# DiscogsService.get_release / get_artist_details gain a keyword-only ``lean``
+# flag that routes the read-through PG read to the SEPARATE lean cache method
+# (cache.get_release_lean / cache.get_artist_details_lean). The shared cached
+# path (lean=False, the default) is unchanged and keeps serving /discogs/*.
+# The @async_cached key includes the ``lean`` kwarg, so lean and full results
+# live in disjoint L1 entries — /discogs/* never reads a lean object.
+# ---------------------------------------------------------------------------
+
+
+class TestLeanHydrationRouting:
+    @pytest.mark.asyncio
+    async def test_get_release_lean_routes_to_lean_cache_read(self, mock_asyncpg_pool):
+        from discogs.cache_service import DiscogsCacheService
+
+        cache = DiscogsCacheService(mock_asyncpg_pool)
+        full = ReleaseMetadataResponse(
+            release_id=123,
+            title="FULL",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/123",
+            artwork_checked_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        lean = ReleaseMetadataResponse(
+            release_id=123,
+            title="LEAN",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/123",
+            artwork_checked_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        cache.get_release = AsyncMock(return_value=full)
+        cache.get_release_lean = AsyncMock(return_value=lean)
+        svc = DiscogsService(token="test-token", cache_service=cache)
+
+        result = await svc.get_release(123, lean=True)
+        assert result is not None and result.title == "LEAN"
+        cache.get_release_lean.assert_awaited_once_with(123)
+        cache.get_release.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_release_default_routes_to_full_cache_read(self, mock_asyncpg_pool):
+        from discogs.cache_service import DiscogsCacheService
+
+        cache = DiscogsCacheService(mock_asyncpg_pool)
+        full = ReleaseMetadataResponse(
+            release_id=123,
+            title="FULL",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/123",
+            artwork_checked_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        cache.get_release = AsyncMock(return_value=full)
+        cache.get_release_lean = AsyncMock(return_value=None)
+        svc = DiscogsService(token="test-token", cache_service=cache)
+
+        result = await svc.get_release(123)
+        assert result is not None and result.title == "FULL"
+        cache.get_release.assert_awaited_once_with(123)
+        cache.get_release_lean.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_lean_and_full_l1_entries_are_disjoint(self, mock_asyncpg_pool):
+        """A lean read must not be served from (or poison) the full L1 entry:
+        /discogs/* (full) and /lookup (lean) hit disjoint cache keys."""
+        from discogs.cache_service import DiscogsCacheService
+
+        cache = DiscogsCacheService(mock_asyncpg_pool)
+        full = ReleaseMetadataResponse(
+            release_id=123,
+            title="FULL",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/123",
+            artwork_checked_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        lean = ReleaseMetadataResponse(
+            release_id=123,
+            title="LEAN",
+            artist="Stereolab",
+            release_url="https://discogs.com/release/123",
+            artwork_checked_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        cache.get_release = AsyncMock(return_value=full)
+        cache.get_release_lean = AsyncMock(return_value=lean)
+        svc = DiscogsService(token="test-token", cache_service=cache)
+
+        # Prime the lean L1 entry, then a full read must still hit the full
+        # cache method (not be served the cached lean object).
+        assert (await svc.get_release(123, lean=True)).title == "LEAN"
+        assert (await svc.get_release(123)).title == "FULL"
+        cache.get_release_lean.assert_awaited_once_with(123)
+        cache.get_release.assert_awaited_once_with(123)
+
+    @pytest.mark.asyncio
+    async def test_get_artist_details_lean_routes_to_lean_cache_read(self, mock_asyncpg_pool):
+        from discogs.cache_service import DiscogsCacheService
+        from discogs.models import ArtistDetails
+
+        cache = DiscogsCacheService(mock_asyncpg_pool)
+        full = ArtistDetails(artist_id=77, name="FULL", fetched_at=datetime(2026, 1, 1, tzinfo=UTC))
+        lean = ArtistDetails(artist_id=77, name="LEAN", fetched_at=datetime(2026, 1, 1, tzinfo=UTC))
+        cache.get_artist_details = AsyncMock(return_value=full)
+        cache.get_artist_details_lean = AsyncMock(return_value=lean)
+        svc = DiscogsService(token="test-token", cache_service=cache)
+
+        result = await svc.get_artist_details(77, lean=True)
+        assert result is not None and result.name == "LEAN"
+        cache.get_artist_details_lean.assert_awaited_once_with(77)
+        cache.get_artist_details.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_artist_details_default_routes_to_full_cache_read(self, mock_asyncpg_pool):
+        from discogs.cache_service import DiscogsCacheService
+        from discogs.models import ArtistDetails
+
+        cache = DiscogsCacheService(mock_asyncpg_pool)
+        full = ArtistDetails(artist_id=77, name="FULL", fetched_at=datetime(2026, 1, 1, tzinfo=UTC))
+        cache.get_artist_details = AsyncMock(return_value=full)
+        cache.get_artist_details_lean = AsyncMock(return_value=None)
+        svc = DiscogsService(token="test-token", cache_service=cache)
+
+        result = await svc.get_artist_details(77)
+        assert result is not None and result.name == "FULL"
+        cache.get_artist_details.assert_awaited_once_with(77)
+        cache.get_artist_details_lean.assert_not_awaited()
