@@ -1076,106 +1076,148 @@ class DiscogsCacheService:
             CacheUnavailableError: If database is unreachable
         """
         try:
-            release_row = await self.pool.fetchrow(
-                "SELECT id, title, release_year, artwork_url, released, "
-                "artwork_checked_at, not_found, master_id "
-                "FROM release WHERE id = $1",
-                release_id,
+            return await self._hydrate_release(release_id, include_videos=True)
+        except Exception as e:
+            logger.error(f"Cache get_release failed: {e}")
+            raise CacheUnavailableError(f"Cache get_release failed: {e}") from e
+
+    async def get_release_lean(self, release_id: int) -> ReleaseMetadataResponse | None:
+        """Lean ``/lookup``-only release hydration (LML#894, lever L4a).
+
+        Identical to :meth:`get_release` except it does NOT read the
+        ``release_video`` child table — ``/lookup`` never surfaces release
+        videos, so skipping that leg trims one PG round-trip per release
+        hydration (9 → 8). ``release_track_artist`` (both legs, incl. the
+        LML#699 ``extra = 1`` writer credits) is still read.
+
+        The shared :meth:`get_release` is deliberately left untouched so the
+        public ``/api/v1/discogs/release`` response keeps returning ``videos``
+        on BOTH warm and cold cache paths (the ``plans/lookup-latency-plan.md``
+        §6.3 fence: a field-drop must never mutate the shared cached read the
+        ``/discogs/*`` surface serves from).
+        """
+        try:
+            return await self._hydrate_release(release_id, include_videos=False)
+        except Exception as e:
+            logger.error(f"Cache get_release_lean failed: {e}")
+            raise CacheUnavailableError(f"Cache get_release_lean failed: {e}") from e
+
+    async def _hydrate_release(
+        self, release_id: int, *, include_videos: bool
+    ) -> ReleaseMetadataResponse | None:
+        """Shared hydration core for :meth:`get_release` / :meth:`get_release_lean`.
+
+        ``include_videos`` toggles only the ``release_video`` read: the full
+        path passes ``True``; the lean ``/lookup`` path passes ``False`` and
+        returns an empty ``videos`` list. Every other child read — including
+        both ``release_track_artist`` legs (LML#699) — is identical across the
+        two callers. Exceptions propagate to the public wrappers, which log and
+        translate them to :class:`CacheUnavailableError`.
+        """
+        release_row = await self.pool.fetchrow(
+            "SELECT id, title, release_year, artwork_url, released, "
+            "artwork_checked_at, not_found, master_id "
+            "FROM release WHERE id = $1",
+            release_id,
+        )
+
+        if release_row is None:
+            return None
+
+        # LML#510: tombstone short-circuit. The parent row's `not_found`
+        # flag is authoritative — there are no child rows for a
+        # tombstone (the tombstone branch in write_release skips the
+        # cascade), so the 4-7 PG round-trips below would all be empty
+        # selects. Returning a tombstone-shaped model keeps the
+        # `is_pg_hit` predicate at the public boundary happy (the
+        # `artwork_checked_at` stamp is set, so the seam treats it as
+        # a hit) and the public method's tombstone translation
+        # converts it back to None for the caller.
+        if release_row["not_found"]:
+            return ReleaseMetadataResponse(
+                release_id=release_id,
+                title="",
+                artist="",
+                release_url=f"https://www.discogs.com/release/{release_id}",
+                not_found=True,
+                artwork_checked_at=release_row["artwork_checked_at"],
+                cached=True,
             )
 
-            if release_row is None:
-                return None
-
-            # LML#510: tombstone short-circuit. The parent row's `not_found`
-            # flag is authoritative — there are no child rows for a
-            # tombstone (the tombstone branch in write_release skips the
-            # cascade), so the 4-7 PG round-trips below would all be empty
-            # selects. Returning a tombstone-shaped model keeps the
-            # `is_pg_hit` predicate at the public boundary happy (the
-            # `artwork_checked_at` stamp is set, so the seam treats it as
-            # a hit) and the public method's tombstone translation
-            # converts it back to None for the caller.
-            if release_row["not_found"]:
-                return ReleaseMetadataResponse(
-                    release_id=release_id,
-                    title="",
-                    artist="",
-                    release_url=f"https://www.discogs.com/release/{release_id}",
-                    not_found=True,
-                    artwork_checked_at=release_row["artwork_checked_at"],
-                    cached=True,
-                )
-
-            # Fetch all child tables in parallel (independent queries)
-            (
-                artist_rows,
-                label_rows,
-                track_rows,
-                track_artist_rows,
-                track_writer_rows,
-            ) = await asyncio.gather(
-                self.pool.fetch(
-                    """
+        # Fetch all child tables in parallel (independent queries)
+        (
+            artist_rows,
+            label_rows,
+            track_rows,
+            track_artist_rows,
+            track_writer_rows,
+        ) = await asyncio.gather(
+            self.pool.fetch(
+                """
                     SELECT artist_id, artist_name, extra, role
                     FROM release_artist
                     WHERE release_id = $1
                     ORDER BY extra, artist_name
                     """,
-                    release_id,
-                ),
-                self.pool.fetch(
-                    "SELECT label_id, label_name, catno FROM release_label WHERE release_id = $1",
-                    release_id,
-                ),
-                self.pool.fetch(
-                    """
+                release_id,
+            ),
+            self.pool.fetch(
+                "SELECT label_id, label_name, catno FROM release_label WHERE release_id = $1",
+                release_id,
+            ),
+            self.pool.fetch(
+                """
                     SELECT position, title, duration, sequence
                     FROM release_track
                     WHERE release_id = $1
                     ORDER BY sequence
                     """,
-                    release_id,
-                ),
-                self.pool.fetch(
-                    # `extra = 0` keeps TrackItem.artists tight on main-performer
-                    # credits; extras (writer/producer/remixer) live with
-                    # `extra = 1` and would otherwise cross-pollinate the
-                    # `(artist, track)` validation `_scan_tracklist_for_match`
-                    # runs over this list in `discogs/service.py`. Mirrors the
-                    # filter `validate_track_on_release` already applies; see
-                    # #333 for the precision/recall trade-off and #588 for this
-                    # call site.
-                    """
+                release_id,
+            ),
+            self.pool.fetch(
+                # `extra = 0` keeps TrackItem.artists tight on main-performer
+                # credits; extras (writer/producer/remixer) live with
+                # `extra = 1` and would otherwise cross-pollinate the
+                # `(artist, track)` validation `_scan_tracklist_for_match`
+                # runs over this list in `discogs/service.py`. Mirrors the
+                # filter `validate_track_on_release` already applies; see
+                # #333 for the precision/recall trade-off and #588 for this
+                # call site.
+                """
                     SELECT track_sequence, artist_name
                     FROM release_track_artist
                     WHERE release_id = $1
                       AND extra = 0
                     ORDER BY track_sequence
                     """,
-                    release_id,
-                ),
-                self.pool.fetch(
-                    # LML#699 Phase 2: the `extra = 1` companion read — per-track
-                    # writer/producer/remixer credits carrying `role`. Kept as a
-                    # SEPARATE query (not a widening of the `extra = 0` read
-                    # above) so `TrackItem.artists` stays performers-only for the
-                    # validation scan; the writer-role subset is keyed by track
-                    # position into `track_writers` below for BMI composer
-                    # credits. `release_track_artist` has no `artist_id` column,
-                    # so only `artist_name` + `role` are selected.
-                    """
+                release_id,
+            ),
+            self.pool.fetch(
+                # LML#699 Phase 2: the `extra = 1` companion read — per-track
+                # writer/producer/remixer credits carrying `role`. Kept as a
+                # SEPARATE query (not a widening of the `extra = 0` read
+                # above) so `TrackItem.artists` stays performers-only for the
+                # validation scan; the writer-role subset is keyed by track
+                # position into `track_writers` below for BMI composer
+                # credits. `release_track_artist` has no `artist_id` column,
+                # so only `artist_name` + `role` are selected.
+                """
                     SELECT track_sequence, artist_name, role
                     FROM release_track_artist
                     WHERE release_id = $1
                       AND extra = 1
                     ORDER BY track_sequence
                     """,
-                    release_id,
-                ),
-            )
+                release_id,
+            ),
+        )
 
-            # Genre/style/video tables may not exist if the pipeline hasn't been re-run
-            genre_style_results = await asyncio.gather(
+        # Genre/style tables may not exist if the pipeline hasn't been re-run.
+        # The ``release_video`` leg rides the same resilient gather on the full
+        # path but is skipped entirely on the lean ``/lookup`` path (LML#894):
+        # ``/lookup`` never surfaces videos, so we save the round-trip.
+        if include_videos:
+            gsv = await asyncio.gather(
                 self.pool.fetch(
                     "SELECT genre FROM release_genre WHERE release_id = $1",
                     release_id,
@@ -1195,152 +1237,151 @@ class DiscogsCacheService:
                 ),
                 return_exceptions=True,
             )
-            genre_rows = (
-                genre_style_results[0]
-                if not isinstance(genre_style_results[0], BaseException)
-                else []
+            genre_rows = gsv[0] if not isinstance(gsv[0], BaseException) else []
+            style_rows = gsv[1] if not isinstance(gsv[1], BaseException) else []
+            video_rows = gsv[2] if not isinstance(gsv[2], BaseException) else []
+        else:
+            gs = await asyncio.gather(
+                self.pool.fetch(
+                    "SELECT genre FROM release_genre WHERE release_id = $1",
+                    release_id,
+                ),
+                self.pool.fetch(
+                    "SELECT style FROM release_style WHERE release_id = $1",
+                    release_id,
+                ),
+                return_exceptions=True,
             )
-            style_rows = (
-                genre_style_results[1]
-                if not isinstance(genre_style_results[1], BaseException)
-                else []
+            genre_rows = gs[0] if not isinstance(gs[0], BaseException) else []
+            style_rows = gs[1] if not isinstance(gs[1], BaseException) else []
+            video_rows = []
+
+        primary_artist = ""
+        primary_artist_id = None
+        artist_credits: list[ArtistCredit] = []
+        extra_artist_credits: list[ArtistCredit] = []
+        for row in artist_rows:
+            credit = ArtistCredit(
+                artist_id=row["artist_id"],
+                name=row["artist_name"],
+                role=row["role"],
             )
-            video_rows = (
-                genre_style_results[2]
-                if not isinstance(genre_style_results[2], BaseException)
-                else []
+            if row["extra"] == 0:
+                artist_credits.append(credit)
+                if not primary_artist:
+                    primary_artist = row["artist_name"]
+                    primary_artist_id = row["artist_id"]
+            else:
+                extra_artist_credits.append(credit)
+
+        label_credits = [
+            LabelCredit(
+                label_id=row["label_id"],
+                name=row["label_name"],
+                catno=row["catno"],
+            )
+            for row in label_rows
+        ]
+        primary_label = label_credits[0].name if label_credits else None
+        primary_label_id = label_credits[0].label_id if label_credits else None
+
+        track_artists: dict[int, list[str]] = {}
+        for row in track_artist_rows:
+            seq = row["track_sequence"]
+            if seq not in track_artists:
+                track_artists[seq] = []
+            track_artists[seq].append(row["artist_name"])
+
+        # LML#699 Phase 2: per-track writer credits, keyed by `track_sequence`
+        # first, then translated to the display `position` via the tracklist
+        # build below. Pre-filtered to writer roles (`is_writer_role`, pure)
+        # so the carried map is a true writer map; `role` is read defensively
+        # (`.get`) because partial test doubles route extra=0-shaped rows here
+        # without a `role` column.
+        track_writers_by_seq: dict[int, list[ArtistCredit]] = {}
+        for row in track_writer_rows:
+            role = row.get("role")
+            if not is_writer_role(role):
+                continue
+            seq = row["track_sequence"]
+            track_writers_by_seq.setdefault(seq, []).append(
+                ArtistCredit(name=row["artist_name"], role=role)
             )
 
-            primary_artist = ""
-            primary_artist_id = None
-            artist_credits: list[ArtistCredit] = []
-            extra_artist_credits: list[ArtistCredit] = []
-            for row in artist_rows:
-                credit = ArtistCredit(
-                    artist_id=row["artist_id"],
-                    name=row["artist_name"],
-                    role=row["role"],
-                )
-                if row["extra"] == 0:
-                    artist_credits.append(credit)
-                    if not primary_artist:
-                        primary_artist = row["artist_name"]
-                        primary_artist_id = row["artist_id"]
-                else:
-                    extra_artist_credits.append(credit)
-
-            label_credits = [
-                LabelCredit(
-                    label_id=row["label_id"],
-                    name=row["label_name"],
-                    catno=row["catno"],
-                )
-                for row in label_rows
-            ]
-            primary_label = label_credits[0].name if label_credits else None
-            primary_label_id = label_credits[0].label_id if label_credits else None
-
-            track_artists: dict[int, list[str]] = {}
-            for row in track_artist_rows:
-                seq = row["track_sequence"]
-                if seq not in track_artists:
-                    track_artists[seq] = []
-                track_artists[seq].append(row["artist_name"])
-
-            # LML#699 Phase 2: per-track writer credits, keyed by `track_sequence`
-            # first, then translated to the display `position` via the tracklist
-            # build below. Pre-filtered to writer roles (`is_writer_role`, pure)
-            # so the carried map is a true writer map; `role` is read defensively
-            # (`.get`) because partial test doubles route extra=0-shaped rows here
-            # without a `role` column.
-            track_writers_by_seq: dict[int, list[ArtistCredit]] = {}
-            for row in track_writer_rows:
-                role = row.get("role")
-                if not is_writer_role(role):
-                    continue
-                seq = row["track_sequence"]
-                track_writers_by_seq.setdefault(seq, []).append(
-                    ArtistCredit(name=row["artist_name"], role=role)
-                )
-
-            tracklist = []
-            seq_to_position: dict[int, str] = {}
-            for row in track_rows:
-                seq = row["sequence"]
-                position = row["position"] or ""
-                seq_to_position[seq] = position
-                tracklist.append(
-                    TrackItem(
-                        position=position,
-                        title=row["title"],
-                        duration=row["duration"],
-                        artists=track_artists.get(seq, []),
-                    )
-                )
-
-            # Re-key the per-track writer credits by display position (the only
-            # track identifier `TrackItem` carries downstream). A writer row
-            # whose `track_sequence` has no tracklist row, or whose position is
-            # empty, is dropped — it can't be looked up by position anyway. A
-            # position shared by more than one track is AMBIGUOUS (Discogs
-            # `position` is non-unique text; multi-disc / mispressed releases
-            # repeat the bare position) and is dropped rather than merged, so the
-            # track-level path falls back to the release-level credit instead of
-            # attributing one track's composers to a co-positioned sibling — a
-            # wrong-attribution we must never make on a BMI royalty field.
-            position_track_counts: dict[str, int] = {}
-            for position in seq_to_position.values():
-                if position:
-                    position_track_counts[position] = position_track_counts.get(position, 0) + 1
-            track_writers: dict[str, list[ArtistCredit]] = {}
-            for seq, credits in track_writers_by_seq.items():
-                position = seq_to_position.get(seq)
-                if position and position_track_counts.get(position) == 1:
-                    track_writers[position] = credits
-
-            videos = [
-                ReleaseVideo(
-                    src=row["src"],
+        tracklist = []
+        seq_to_position: dict[int, str] = {}
+        for row in track_rows:
+            seq = row["sequence"]
+            position = row["position"] or ""
+            seq_to_position[seq] = position
+            tracklist.append(
+                TrackItem(
+                    position=position,
                     title=row["title"],
                     duration=row["duration"],
-                    embed=row["embed"] if row["embed"] is not None else True,
+                    artists=track_artists.get(seq, []),
                 )
-                for row in video_rows
-            ]
-
-            return ReleaseMetadataResponse(
-                release_id=release_id,
-                title=release_row["title"],
-                artist=primary_artist,
-                artist_id=primary_artist_id,
-                year=release_row["release_year"],
-                label=primary_label,
-                label_id=primary_label_id,
-                genres=[row["genre"] for row in genre_rows],
-                styles=[row["style"] for row in style_rows],
-                artwork_url=release_row["artwork_url"],
-                artwork_checked_at=release_row["artwork_checked_at"],
-                tracklist=tracklist,
-                release_url=f"https://www.discogs.com/release/{release_id}",
-                cached=True,
-                artists=artist_credits,
-                extra_artists=extra_artist_credits,
-                labels=label_credits,
-                released=release_row["released"],
-                # LML#688: nullable, recently-added column. ``.get`` tolerates
-                # cache rows written before master_id was plumbed (and partial
-                # test doubles); a real ``SELECT … master_id`` row always carries
-                # the key, None when Discogs has no master for the release.
-                master_id=release_row.get("master_id"),
-                videos=videos,
-                # LML#699 Phase 2: per-track writer credits keyed by display
-                # position; None (not {}) when the release has none.
-                track_writers=track_writers or None,
             )
 
-        except Exception as e:
-            logger.error(f"Cache get_release failed: {e}")
-            raise CacheUnavailableError(f"Cache get_release failed: {e}") from e
+        # Re-key the per-track writer credits by display position (the only
+        # track identifier `TrackItem` carries downstream). A writer row
+        # whose `track_sequence` has no tracklist row, or whose position is
+        # empty, is dropped — it can't be looked up by position anyway. A
+        # position shared by more than one track is AMBIGUOUS (Discogs
+        # `position` is non-unique text; multi-disc / mispressed releases
+        # repeat the bare position) and is dropped rather than merged, so the
+        # track-level path falls back to the release-level credit instead of
+        # attributing one track's composers to a co-positioned sibling — a
+        # wrong-attribution we must never make on a BMI royalty field.
+        position_track_counts: dict[str, int] = {}
+        for position in seq_to_position.values():
+            if position:
+                position_track_counts[position] = position_track_counts.get(position, 0) + 1
+        track_writers: dict[str, list[ArtistCredit]] = {}
+        for seq, credits in track_writers_by_seq.items():
+            position = seq_to_position.get(seq)
+            if position and position_track_counts.get(position) == 1:
+                track_writers[position] = credits
+
+        videos = [
+            ReleaseVideo(
+                src=row["src"],
+                title=row["title"],
+                duration=row["duration"],
+                embed=row["embed"] if row["embed"] is not None else True,
+            )
+            for row in video_rows
+        ]
+
+        return ReleaseMetadataResponse(
+            release_id=release_id,
+            title=release_row["title"],
+            artist=primary_artist,
+            artist_id=primary_artist_id,
+            year=release_row["release_year"],
+            label=primary_label,
+            label_id=primary_label_id,
+            genres=[row["genre"] for row in genre_rows],
+            styles=[row["style"] for row in style_rows],
+            artwork_url=release_row["artwork_url"],
+            artwork_checked_at=release_row["artwork_checked_at"],
+            tracklist=tracklist,
+            release_url=f"https://www.discogs.com/release/{release_id}",
+            cached=True,
+            artists=artist_credits,
+            extra_artists=extra_artist_credits,
+            labels=label_credits,
+            released=release_row["released"],
+            # LML#688: nullable, recently-added column. ``.get`` tolerates
+            # cache rows written before master_id was plumbed (and partial
+            # test doubles); a real ``SELECT … master_id`` row always carries
+            # the key, None when Discogs has no master for the release.
+            master_id=release_row.get("master_id"),
+            videos=videos,
+            # LML#699 Phase 2: per-track writer credits keyed by display
+            # position; None (not {}) when the release has none.
+            track_writers=track_writers or None,
+        )
 
     async def write_release(self, release: ReleaseMetadataResponse) -> None:
         """Write or update a release in the cache.
@@ -1738,34 +1779,73 @@ class DiscogsCacheService:
             CacheUnavailableError: If database is unreachable
         """
         try:
-            # `fetched_at` is projected so the service-layer `is_pg_hit`
-            # predicate can distinguish stub rows (rebuild-created, never
-            # hydrated from Discogs) from rows we've actually fetched. See
-            # `DiscogsService.get_artist_details` and WXYC#502.
-            #
-            # `not_found` (LML#510) is the tombstone discriminator — see
-            # the short-circuit just below.
-            artist_row = await self.pool.fetchrow(
-                "SELECT id, name, profile, image_url, fetched_at, not_found "
-                "FROM artist WHERE id = $1",
-                artist_id,
+            return await self._hydrate_artist_details(artist_id, include_related=True)
+        except Exception as e:
+            logger.error(f"Cache get_artist_details failed: {e}")
+            raise CacheUnavailableError(f"Cache get_artist_details failed: {e}") from e
+
+    async def get_artist_details_lean(self, artist_id: int) -> ArtistDetails | None:
+        """Lean ``/lookup``-only artist hydration (LML#894, lever L4a).
+
+        Identical to :meth:`get_artist_details` except it does NOT read the
+        ``artist_alias`` / ``artist_name_variation`` / ``artist_member`` child
+        tables — ``/lookup`` only reads ``profile`` (bio) and ``urls`` (the
+        Wikipedia link), never aliases / name-variations / members. Skipping
+        those three legs trims the artist hydration from 5 PG round-trips to 2
+        (``artist`` row + ``artist_url``); the returned model carries empty
+        ``aliases`` / ``name_variations`` / ``members``.
+
+        The shared :meth:`get_artist_details` is deliberately left untouched so
+        the public ``/api/v1/discogs/artist`` response keeps returning those
+        children on BOTH warm and cold cache paths (the
+        ``plans/lookup-latency-plan.md`` §6.3 fence).
+        """
+        try:
+            return await self._hydrate_artist_details(artist_id, include_related=False)
+        except Exception as e:
+            logger.error(f"Cache get_artist_details_lean failed: {e}")
+            raise CacheUnavailableError(f"Cache get_artist_details_lean failed: {e}") from e
+
+    async def _hydrate_artist_details(
+        self, artist_id: int, *, include_related: bool
+    ) -> ArtistDetails | None:
+        """Shared core for get_artist_details / get_artist_details_lean.
+
+        ``include_related`` toggles the ``artist_alias`` / ``artist_name_variation``
+        / ``artist_member`` reads: the full path passes ``True``; the lean
+        ``/lookup`` path passes ``False``, reads only ``artist_url``, and returns
+        empty ``aliases`` / ``name_variations`` / ``members``. Exceptions
+        propagate to the public wrappers, which translate them to
+        :class:`CacheUnavailableError`.
+        """
+        # `fetched_at` is projected so the service-layer `is_pg_hit`
+        # predicate can distinguish stub rows (rebuild-created, never
+        # hydrated from Discogs) from rows we've actually fetched. See
+        # `DiscogsService.get_artist_details` and WXYC#502.
+        #
+        # `not_found` (LML#510) is the tombstone discriminator — see
+        # the short-circuit just below.
+        artist_row = await self.pool.fetchrow(
+            "SELECT id, name, profile, image_url, fetched_at, not_found FROM artist WHERE id = $1",
+            artist_id,
+        )
+
+        if artist_row is None:
+            return None
+
+        # LML#510: tombstone short-circuit. Same rationale as the
+        # release path — no child rows exist for a tombstone, so
+        # the asyncio.gather below would just be empty selects.
+        if artist_row["not_found"]:
+            return ArtistDetails(
+                artist_id=artist_id,
+                name="",
+                not_found=True,
+                fetched_at=artist_row["fetched_at"],
+                cached=True,
             )
 
-            if artist_row is None:
-                return None
-
-            # LML#510: tombstone short-circuit. Same rationale as the
-            # release path — no child rows exist for a tombstone, so
-            # the asyncio.gather below would just be empty selects.
-            if artist_row["not_found"]:
-                return ArtistDetails(
-                    artist_id=artist_id,
-                    name="",
-                    not_found=True,
-                    fetched_at=artist_row["fetched_at"],
-                    cached=True,
-                )
-
+        if include_related:
             # Fetch all child tables in parallel (independent queries)
             alias_rows, nv_rows, member_rows, url_rows = await asyncio.gather(
                 self.pool.fetch(
@@ -1785,30 +1865,35 @@ class DiscogsCacheService:
                     artist_id,
                 ),
             )
-
-            return ArtistDetails(
-                artist_id=artist_row["id"],
-                name=artist_row["name"],
-                profile=artist_row["profile"],
-                image_url=artist_row["image_url"],
-                aliases=[
-                    ArtistRef(id=r["alias_id"], name=r["alias_name"])
-                    for r in alias_rows
-                    if r["alias_id"] is not None
-                ],
-                name_variations=[r["name"] for r in nv_rows],
-                members=[
-                    MemberRef(id=r["member_id"], name=r["member_name"], active=r["active"])
-                    for r in member_rows
-                ],
-                urls=[r["url"] for r in url_rows],
-                fetched_at=artist_row["fetched_at"],
-                cached=True,
+        else:
+            # Lean /lookup path: only the URL leg (Wikipedia bio link) is read.
+            alias_rows = []
+            nv_rows = []
+            member_rows = []
+            url_rows = await self.pool.fetch(
+                "SELECT url FROM artist_url WHERE artist_id = $1",
+                artist_id,
             )
 
-        except Exception as e:
-            logger.error(f"Cache get_artist_details failed: {e}")
-            raise CacheUnavailableError(f"Cache get_artist_details failed: {e}") from e
+        return ArtistDetails(
+            artist_id=artist_row["id"],
+            name=artist_row["name"],
+            profile=artist_row["profile"],
+            image_url=artist_row["image_url"],
+            aliases=[
+                ArtistRef(id=r["alias_id"], name=r["alias_name"])
+                for r in alias_rows
+                if r["alias_id"] is not None
+            ],
+            name_variations=[r["name"] for r in nv_rows],
+            members=[
+                MemberRef(id=r["member_id"], name=r["member_name"], active=r["active"])
+                for r in member_rows
+            ],
+            urls=[r["url"] for r in url_rows],
+            fetched_at=artist_row["fetched_at"],
+            cached=True,
+        )
 
     async def get_artist_details_bulk(self, artist_ids: list[int]) -> dict[int, ArtistDetails]:
         """Batched cache-only read of full artist details across many ids.

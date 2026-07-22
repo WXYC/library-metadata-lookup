@@ -281,7 +281,8 @@ class TestEnrichArtworkResults:
                 release_url=f"https://discogs.com/release/{release_id}",
             )
 
-        discogs_service.get_release.side_effect = lambda rid: make_release(rid)
+        # ``make_release`` accepts the LML#894 ``lean=`` kwarg the /lookup path passes.
+        discogs_service.get_release.side_effect = make_release
 
         results = await enrich_artwork_results(items_with_artwork, discogs_service, song="Song")
         assert len(results) == 3
@@ -346,7 +347,44 @@ class TestTop1SentinelGuard:
 
         await enrich_artwork_results([(item, artwork)], discogs_service, song="Cross Bones Style")
 
-        discogs_service.get_release.assert_called_once_with(12345)
+        # LML#894: the /lookup hydration path reads the lean cache variant.
+        discogs_service.get_release.assert_called_once_with(12345, lean=True)
+
+
+class TestTop1LeanHydration:
+    """LML#894 (lever L4a): the top-1 hydration N+1 — the 14-round-trip
+    ``get_release`` + ``get_artist_details`` pair — must use the lean read
+    path so ``/lookup`` skips the 4 children it never surfaces."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_top1_uses_lean_release_and_artist_reads(self):
+        from lookup.enrichment.top1 import fetch_top1_release_details
+
+        artwork = make_discogs_result(
+            release_id=555,
+            artist="Duke Ellington & John Coltrane",
+            album="Duke Ellington & John Coltrane",
+        )
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=555,
+            title="Duke Ellington & John Coltrane",
+            artist="Duke Ellington & John Coltrane",
+            year=1963,
+            artist_id=99,
+            release_url="https://discogs.com/release/555",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Duke Ellington",
+            profile="American composer and bandleader.",
+            urls=["https://en.wikipedia.org/wiki/Duke_Ellington"],
+        )
+
+        await fetch_top1_release_details(discogs_service, artwork)
+
+        discogs_service.get_release.assert_awaited_once_with(555, lean=True)
+        discogs_service.get_artist_details.assert_awaited_once_with(99, lean=True)
 
 
 class TestEnrichArtworkResultsExtended:
