@@ -4208,3 +4208,257 @@ class TestBandcampStreamingUrlPostprocessWiring:
         _, enriched = results[0]
         assert enriched.bandcamp_url is not None
         assert enriched.bandcamp_url.startswith("https://bandcamp.com/search?q=")
+
+
+class TestAppleMusicUrlCacheFirst:
+    """LML#893 (lever L1): the happy-path Apple Music URL probe is cache-FIRST.
+
+    Before paying the ~4.8s live Apple probe (``find_track_url``) on the
+    ``library_row_acceptable`` happy path, ``enrich_one`` peeks
+    ``lml_cache.album_streaming_url_cache`` for the REQUEST album's Apple Music
+    URL. A hit skips the live call; a miss runs it synchronously (so the
+    first-lookup URL is still present — guards #782 / BS#1192) and writes the
+    resolved URL back so the repeat lookups that dominate the flood
+    short-circuit the API. The synthesis-path artwork probe
+    (``find_track_metadata``) is deliberately untouched (guards the #337 outage
+    class).
+    """
+
+    @staticmethod
+    def _acceptable_happy_path_inputs():
+        """A library row that clears the LML#477 title gate (artwork present +
+        title matches the request album), so ``enrich_one`` takes the
+        ``library_row_acceptable`` happy path that calls ``find_track_url``."""
+        item = make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Jessica Pratt",
+            album="On Your Own Love Again",
+            artwork_url="https://example.com/oyola.jpg",
+            release_year=2015,
+        )
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="On Your Own Love Again",
+            artist="Jessica Pratt",
+            year=2015,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+        return item, artwork, discogs_service
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_skips_live_apple_probe(self):
+        """A cached Apple Music URL for the request album is surfaced WITHOUT
+        issuing a live ``find_track_url`` probe (acceptance criterion 1)."""
+        item, artwork, discogs_service = self._acceptable_happy_path_inputs()
+        cached_url = "https://music.apple.com/us/album/on-your-own-love-again/999"
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock()
+        apple_music.find_track_url = AsyncMock(
+            return_value="https://music.apple.com/us/song/should-not-be-used/1"
+        )
+
+        with (
+            patch(
+                "lookup.enrichment.item.peek_cached_streaming_url",
+                new=AsyncMock(return_value=(cached_url, True)),
+            ) as peek,
+            patch(
+                "lookup.enrichment.item.set_cached_streaming_url",
+                new=AsyncMock(),
+            ) as write_back,
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                song="Back, Baby",
+                album="On Your Own Love Again",
+                artist="Jessica Pratt",
+                apple_music=apple_music,
+                discogs_cache_pg=MagicMock(),
+            )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # Cache hit — the live Apple probe is skipped entirely.
+        apple_music.find_track_url.assert_not_called()
+        # The cached URL is surfaced on the response.
+        assert enriched.apple_music_url == cached_url
+        # Peek keyed on the album service + REQUEST (artist, album).
+        peek.assert_awaited_once()
+        assert peek.await_args.kwargs["service"] == "apple_music_album"
+        assert peek.await_args.kwargs["artist"] == "Jessica Pratt"
+        assert peek.await_args.kwargs["album"] == "On Your Own Love Again"
+        # A hit already minted its URL on the original resolution — no re-write.
+        write_back.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_probes_live_and_writes_back(self):
+        """On a cache miss the live probe runs synchronously, its URL is still
+        present on the response (guards #782 / BS#1192), AND the resolved URL is
+        written back to the cache (acceptance criterion 2)."""
+        item, artwork, discogs_service = self._acceptable_happy_path_inputs()
+        resolved_url = "https://music.apple.com/us/song/back-baby/123"
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock()
+        apple_music.find_track_url = AsyncMock(return_value=resolved_url)
+
+        with (
+            patch(
+                "lookup.enrichment.item.peek_cached_streaming_url",
+                new=AsyncMock(return_value=(None, False)),
+            ),
+            patch(
+                "lookup.enrichment.item.set_cached_streaming_url",
+                new=AsyncMock(),
+            ) as write_back,
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                song="Back, Baby",
+                album="On Your Own Love Again",
+                artist="Jessica Pratt",
+                apple_music=apple_music,
+                discogs_cache_pg=MagicMock(),
+            )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # Miss → live probe ran synchronously and its URL is on the response.
+        apple_music.find_track_url.assert_awaited_once()
+        assert enriched.apple_music_url == resolved_url
+        # The resolved URL was written back under the album service key.
+        write_back.assert_awaited_once()
+        assert write_back.await_args.kwargs["service"] == "apple_music_album"
+        assert write_back.await_args.kwargs["artist"] == "Jessica Pratt"
+        assert write_back.await_args.kwargs["album"] == "On Your Own Love Again"
+        assert write_back.await_args.kwargs["url"] == resolved_url
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_returning_none_writes_no_row(self):
+        """A live probe that resolves nothing writes no cache row (only the
+        resolved URL is ever cached) and leaves ``apple_music_url`` None."""
+        item, artwork, discogs_service = self._acceptable_happy_path_inputs()
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock()
+        apple_music.find_track_url = AsyncMock(return_value=None)
+
+        with (
+            patch(
+                "lookup.enrichment.item.peek_cached_streaming_url",
+                new=AsyncMock(return_value=(None, False)),
+            ),
+            patch(
+                "lookup.enrichment.item.set_cached_streaming_url",
+                new=AsyncMock(),
+            ) as write_back,
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                song="Back, Baby",
+                album="On Your Own Love Again",
+                artist="Jessica Pratt",
+                apple_music=apple_music,
+                discogs_cache_pg=MagicMock(),
+            )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        apple_music.find_track_url.assert_awaited_once()
+        assert enriched.apple_music_url is None
+        write_back.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_cache_pg_probes_live_without_peek(self):
+        """With no ``discogs_cache_pg`` the happy path still probes live and
+        surfaces the URL — the cache-first path degrades to today's behaviour."""
+        item, artwork, discogs_service = self._acceptable_happy_path_inputs()
+        resolved_url = "https://music.apple.com/us/song/back-baby/123"
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock()
+        apple_music.find_track_url = AsyncMock(return_value=resolved_url)
+
+        with (
+            patch(
+                "lookup.enrichment.item.peek_cached_streaming_url",
+                new=AsyncMock(return_value=(None, False)),
+            ) as peek,
+            patch(
+                "lookup.enrichment.item.set_cached_streaming_url",
+                new=AsyncMock(),
+            ) as write_back,
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                discogs_service,
+                song="Back, Baby",
+                album="On Your Own Love Again",
+                artist="Jessica Pratt",
+                apple_music=apple_music,
+                discogs_cache_pg=None,
+            )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        apple_music.find_track_url.assert_awaited_once()
+        assert enriched.apple_music_url == resolved_url
+        # No PG → no cache peek or write.
+        peek.assert_not_called()
+        write_back.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_synthesis_path_artwork_probe_ignores_url_cache(self):
+        """Regression guard (acceptance criterion 4): the synthesis path still
+        runs the synchronous ``find_track_metadata`` artwork probe even when a
+        URL sits in the cache. Only the happy-path URL is cache-first; nulling
+        the synthesis artwork probe would recreate the #337 outage class."""
+        item = make_library_item(
+            artist="Julianna Barwick & Mary Lattimore",
+            title="The Four Sleeping Princesses",
+        )
+        apple_url = "https://music.apple.com/us/album/tragic-magic/1843854211"
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(
+            return_value=AppleMusicTrackMatch(
+                url=apple_url, artwork_url=None, release_year=None, album_verified=True
+            )
+        )
+        apple_music.find_track_url = AsyncMock()
+
+        with (
+            patch(
+                "lookup.enrichment.item.peek_cached_streaming_url",
+                new=AsyncMock(return_value=("https://music.apple.com/cached/should-not-win", True)),
+            ) as peek,
+            patch(
+                "lookup.enrichment.item.set_cached_streaming_url",
+                new=AsyncMock(),
+            ),
+        ):
+            results = await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="The Four Sleeping Princesses",
+                album="Tragic Magic",
+                artist="Julianna Barwick & Mary Lattimore",
+                apple_music=apple_music,
+                discogs_cache_pg=MagicMock(),
+            )
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # Synthesis path ran its live artwork probe, not a cache peek.
+        apple_music.find_track_metadata.assert_awaited_once()
+        apple_music.find_track_url.assert_not_called()
+        peek.assert_not_called()
+        # The synthesis probe's URL wins — the cache is not consulted here.
+        assert enriched.apple_music_url == apple_url

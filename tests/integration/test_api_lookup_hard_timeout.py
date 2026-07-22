@@ -35,6 +35,7 @@ from entity.sources import PgSource
 from entity.store import EntityStore
 from entity.streaming_url_cache import ResolveOutcome
 from lookup import streaming_url_postprocess as streaming_mod
+from lookup.enrichment import item as enrichment_item_mod
 from tests.conftest import drain_streaming_warm_tasks, reset_streaming_warm_state
 from tests.factories import make_discogs_result
 
@@ -308,6 +309,21 @@ async def offpath_harness(library_db, test_settings, monkeypatch):
                 streaming_mod,
                 "resolve_streaming_url_with_cache",
                 new=AsyncMock(side_effect=gated_resolve),
+            ),
+            # LML#893: the happy-path (Discogs-match) branch now peeks the album
+            # URL cache before the synchronous ``find_track_url`` probe. Stub it
+            # to a clean miss so the mock ``PgSource`` above can't hand the peek a
+            # fake truthy row (which would masquerade as a cache hit and suppress
+            # the very probe the off-path guard asserts still runs in-request).
+            patch.object(
+                enrichment_item_mod,
+                "peek_cached_streaming_url",
+                new=AsyncMock(return_value=(None, False)),
+            ),
+            patch.object(
+                enrichment_item_mod,
+                "set_cached_streaming_url",
+                new=AsyncMock(),
             ),
         ):
             async with AsyncClient(

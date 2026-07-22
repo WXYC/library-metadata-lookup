@@ -33,6 +33,10 @@ from discogs.models import (
 )
 from discogs.service import find_track_position
 from discogs.writer_roles import writer_credits_from_release
+from entity.streaming_url_cache import (
+    peek_cached_streaming_url,
+    set_cached_streaming_url,
+)
 from library.models import LibraryItem
 from lookup.artist_resolution import (
     _artist_pair_verified,
@@ -50,11 +54,100 @@ from release.musicbrainz_resolver import resolve_tracklist_via_musicbrainz
 
 logger = logging.getLogger(__name__)
 
+# The ``album_streaming_url_cache`` service key for Apple Music. Must be one of
+# ``entity.streaming_url_cache._SERVICES`` (the named CHECK constraint pins the
+# valid set) — it is the same ``"apple_music_album"`` key the LML#573
+# post-process caches album URLs under, so the happy-path cache-first probe
+# (LML#893) and the synthesis-path post-process warm share cache rows.
+_APPLE_MUSIC_URL_CACHE_SERVICE = "apple_music_album"
+
 
 def _build_streaming_search_url(base: str, artist: str, term: str) -> str:
     """Build a streaming service search URL from artist + song/album."""
     query = f"{artist} {term}" if term else artist
     return f"{base}{quote(query)}"
+
+
+async def _probe_apple_music_url_cache_first(
+    ctx: EnrichmentContext, *, row_artist: str, search_term: str
+) -> str | None:
+    """Resolve the happy-path Apple Music URL cache-first (LML#893, lever L1).
+
+    Peeks ``lml_cache.album_streaming_url_cache`` (a ~2.5ms PG SELECT) for the
+    REQUEST album's Apple Music URL BEFORE paying the ~4.8s live ``find_track_url``
+    probe (a shared 1 req/s AsyncLimiter inside the ``apple_music_lookup_timeout_s``
+    ceiling). The flood the epic (#706/#803) fights is dominated by repeat
+    lookups of the same albums, so a cache read removes Apple from the hot path
+    for those repeats:
+
+    * **Cache hit** → skip the live Apple call entirely and surface the cached URL.
+    * **Cache miss** → run the live probe synchronously (so the first lookup's URL
+      is still present — nulling it would recreate the #782 / BS#1192 persisted-null
+      failure mode) AND write the resolved URL back so subsequent lookups hit.
+
+    The cache is album-keyed, so the peek/write only apply when both the request
+    artist and album are present; artist+song-only lookups (~40% of traffic) fall
+    straight through to the live probe as before. Only the **URL** is cache-first
+    here — the synthesis-path artwork probe (``find_track_metadata``) stays
+    synchronous and untouched (nulling artwork caused the #337 outage class).
+
+    The caller guards ``ctx.apple_music is not None``; a ``TimeoutError`` from the
+    live probe propagates to the caller's existing degrade-to-None handling. Cache
+    peek/write failures are logged and treated as best-effort (fall through to the
+    live probe / still surface the URL) so a PG hiccup never sinks a lookup.
+    """
+    assert ctx.apple_music is not None  # caller-guarded
+    pg = ctx.discogs_cache_pg
+    request_artist = ctx.artist
+    request_album = ctx.album
+    cache_keyed = pg is not None and bool(request_artist) and bool(request_album)
+
+    if cache_keyed:
+        assert pg is not None and request_artist is not None and request_album is not None
+        try:
+            cached_url, _has_fresh_decision = await peek_cached_streaming_url(
+                pg,
+                service=_APPLE_MUSIC_URL_CACHE_SERVICE,
+                artist=request_artist,
+                album=request_album,
+            )
+        except Exception:
+            logger.exception(
+                "Apple Music URL cache peek failed for %s / %s — probing live",
+                request_artist,
+                request_album,
+            )
+            cached_url = None
+        if cached_url is not None:
+            return cached_url
+
+    url = await asyncio.wait_for(
+        ctx.apple_music.find_track_url(row_artist, search_term, album=request_album),
+        timeout=apple_music_lookup_timeout_s(),
+    )
+
+    # Only the resolved URL is cached (never a null) — recording a known-miss
+    # here would suppress the live re-probe that keeps the first-lookup URL
+    # present, and the album-keyed post-process already owns null-miss recording
+    # on the synthesis path.
+    if cache_keyed and url is not None:
+        assert pg is not None and request_artist is not None and request_album is not None
+        try:
+            await set_cached_streaming_url(
+                pg,
+                service=_APPLE_MUSIC_URL_CACHE_SERVICE,
+                artist=request_artist,
+                album=request_album,
+                url=url,
+            )
+        except Exception:
+            logger.exception(
+                "Apple Music URL cache write-back failed for %s / %s — URL still surfaced",
+                request_artist,
+                request_album,
+            )
+
+    return url
 
 
 async def enrich_one(
@@ -176,9 +269,11 @@ async def enrich_one(
             bandcamp_url = links.get("bandcamp_url")
             soundcloud_url = links.get("soundcloud_url")
 
-    # Apple Music probe. ``library_row_acceptable`` picks ``find_track_url``
-    # (URL only — preserves LML#401 baseline); the synthesis path
-    # (LML#487) needs artwork + year too, so calls ``find_track_metadata``.
+    # Apple Music probe. ``library_row_acceptable`` picks the cache-first
+    # ``find_track_url`` path (URL only — preserves LML#401 baseline; LML#893
+    # peeks the album-URL cache before paying the live probe and writes the
+    # resolved URL back); the synthesis path (LML#487) needs artwork + year too,
+    # so calls ``find_track_metadata``.
     # Both make one ``search_song`` call, so per-request quota is identical
     # to the LML#401 baseline. Skip the happy-path probe when the
     # librarian override would win anyway (saves one Apple call per
@@ -197,9 +292,8 @@ async def enrich_one(
     if ctx.apple_music is not None and row_artist and search_term and not skip_happy_probe:
         try:
             if library_row_acceptable:
-                apple_music_url = await asyncio.wait_for(
-                    ctx.apple_music.find_track_url(row_artist, search_term, album=ctx.album),
-                    timeout=apple_music_lookup_timeout_s(),
+                apple_music_url = await _probe_apple_music_url_cache_first(
+                    ctx, row_artist=row_artist, search_term=search_term
                 )
             else:
                 probe_match = await asyncio.wait_for(
