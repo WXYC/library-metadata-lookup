@@ -77,3 +77,14 @@ class TestServiceValidation:
         dao = StreamingCatalogDAO(dsn=_NEVER_DIALED_DSN)
         with pytest.raises(ValueError, match="napster"):
             await dao.update_result(1, "napster", "found")
+
+    @pytest.mark.asyncio
+    async def test_update_track_resolution_rejects_false_positive(self) -> None:
+        """``false_positive`` is the guarded demotion, sanctioned only via
+        ``mark_track_false_positive``. The legacy validate phase wrote it
+        through this method; accepting it here would let the PR A trigger
+        kill a PR D drain mid-phase — a loud redirect at the call site (and
+        at port time) beats a RaiseError in production."""
+        dao = StreamingCatalogDAO(dsn=_NEVER_DIALED_DSN)
+        with pytest.raises(ValueError, match="mark_track_false_positive"):
+            await dao.update_track_resolution(1, "false_positive")

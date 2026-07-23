@@ -35,7 +35,11 @@ translation decisions:
   deliberate demotion the legacy surface performs — the validate phase's
   ``api_match`` → ``false_positive`` flip — goes through
   ``mark_track_false_positive``, which opts into the guard
-  transaction-locally instead of asking callers to speak GUCs.
+  transaction-locally instead of asking callers to speak GUCs;
+  ``update_track_resolution`` rejects ``'false_positive'`` outright, so the
+  legacy validate-phase demotion call — the one *method-surface* call site
+  PR D must rewrite rather than merely re-point — fails loudly at port time
+  instead of tripping the trigger mid-drain.
 * **Loud service validation.** Unknown or unsupported service tokens raise
   ``ValueError`` before any I/O (the legacy DAO silently no-opped on unknown
   services in ``update_result``). Validation precedes pool access so a typo'd
@@ -552,7 +556,21 @@ class StreamingCatalogDAO:
         deezer_url: str | None = None,
         deezer_confidence: float | None = None,
     ) -> None:
-        """Record a track-resolution attempt; omitted params never null prior finds."""
+        """Record a track-resolution attempt; omitted params never null prior finds.
+
+        Rejects ``status='false_positive'`` before any I/O: that is the one
+        guarded demotion, sanctioned only via ``mark_track_false_positive``.
+        The legacy method accepted it (the validate phase's demotion call is
+        the one method-surface call site PR D must rewrite); accepting it
+        here would let the PR A trigger kill a drain mid-phase with a
+        RaiseError instead of failing loudly at the call site.
+        """
+        if status == "false_positive":
+            raise ValueError(
+                "status 'false_positive' is the guarded demotion — route it through "
+                "mark_track_false_positive, which opts into the no-regress guard "
+                "transaction-locally"
+            )
         await self._pg.execute(
             """
             UPDATE lml_cache.streaming_track_result SET
@@ -587,8 +605,16 @@ class StreamingCatalogDAO:
         method opts in via ``set_config(..., is_local => true)`` inside its own
         transaction — the opt-in covers exactly this UPDATE and evaporates at
         COMMIT, never leaking to other statements on the pooled connection.
+
         Collected URLs and resolution metadata stay in place as the audit
-        trail (legacy ``phase_validate`` only ever flipped the status).
+        trail. That is a deliberate improvement over the legacy demotion, NOT
+        parity: the legacy ``update_track_resolution`` wrote every metadata
+        column from its None-defaulted params, so a legacy ``false_positive``
+        flip nulled the URLs, confidences, and provenance it was invalidating.
+        Retention is safe because nothing downstream reads URLs off
+        ``false_positive`` rows — the streaming-links export and the coverage
+        baseline both filter on ``resolution_status IN ('local_match',
+        'api_match')``.
         """
         async with self._pg.acquire() as conn:
             async with conn.transaction():
