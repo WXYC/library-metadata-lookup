@@ -13,7 +13,7 @@ header or a comment, edit this file. Then regenerate:
 
     uv run python -m scripts.regenerate_streaming_catalog_sql
 
-Comments are keyed by each statement's FIRST LINE (all 21 are unique — an
+Comments are keyed by each statement's FIRST LINE (all 22 are unique — an
 import-time check below enforces that), not by tuple index, so inserting or
 reordering statements never silently shifts prose onto the wrong statement:
 an unmatched or leftover key raises instead.
@@ -155,8 +155,16 @@ _COMMENTS: dict[str, str] = {
 -- provenance columns and the seed must not silently drop them. The UNIQUE
 -- doubles as the FK-side index for the ON DELETE RESTRICT check (leading
 -- album_id). The urls CHECK bans only the empty string and is NULL-tolerant.""",
-    "CREATE INDEX IF NOT EXISTS idx_streaming_track_result_status": """\
--- Same provisional-shape caveat as the album-service status index above.""",
+    "DROP INDEX IF EXISTS lml_cache.idx_streaming_track_result_status": """\
+-- Reshape of the track status index: drop the original single-column
+-- (resolution_status) form so the composite below can supersede it under a
+-- new name (CREATE INDEX IF NOT EXISTS never redefines an existing index).
+-- No-op once the old index is gone.""",
+    "CREATE INDEX IF NOT EXISTS idx_streaming_track_result_status_id": """\
+-- get_pending_tracks / get_local_miss_tracks scan one resolution_status
+-- ORDER BY id LIMIT n; the composite (resolution_status, id) serves both the
+-- equality filter and the id ordering from one index (ordered read + early
+-- LIMIT stop, no Sort node).""",
     "CREATE TABLE IF NOT EXISTS lml_cache.streaming_coverage_baseline (": """\
 -- Write-side floor metrics (one row per metric, e.g. 'apple_music_found').
 -- Refreshed only at the end of successful pipeline runs — never by the daily

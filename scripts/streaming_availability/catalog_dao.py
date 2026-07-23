@@ -227,8 +227,9 @@ _UPSERT_BASELINE = """
     INSERT INTO lml_cache.streaming_coverage_baseline (metric, value, updated_at)
     VALUES ($1, $2, now())
     ON CONFLICT (metric) DO UPDATE SET
-        value = EXCLUDED.value,
+        value = GREATEST(EXCLUDED.value, lml_cache.streaming_coverage_baseline.value),
         updated_at = EXCLUDED.updated_at
+    RETURNING value
 """
 
 
@@ -500,12 +501,8 @@ class StreamingCatalogDAO:
         """Per-service status histograms plus the album total (legacy key set)."""
         stats: dict[str, Any] = {}
         async with self._pg.acquire() as conn:
-            for legacy, canonical in (
-                ("spotify", "spotify"),
-                ("apple", "apple_music"),
-                ("deezer", "deezer"),
-                ("bandcamp", "bandcamp"),
-            ):
+            # canonical slug -> legacy stats key is exactly the pivot-alias map.
+            for canonical, legacy in _PIVOT_ALIAS.items():
                 rows = await conn.fetch(_SERVICE_STATS, canonical)
                 stats[legacy] = {row["status"]: row["n"] for row in rows}
             discogs_rows = await conn.fetch(
@@ -662,7 +659,15 @@ class StreamingCatalogDAO:
         return stats
 
     async def get_album_track_summary(self, album_id: int) -> dict[str, Any]:
-        """Per-album track rollup with the legacy resolved-by-subtraction arithmetic."""
+        """Per-album track rollup: ``resolved`` counts the two resolved statuses directly.
+
+        Counting ``local_match`` + ``api_match`` (rather than subtracting the
+        enumerated unresolved statuses from the total) is robust to a novel or
+        unmapped ``resolution_status``: an unrecognized value stays unresolved
+        instead of silently inflating ``resolved`` — matching the export and
+        coverage-baseline filters, which likewise gate on
+        ``resolution_status IN ('local_match', 'api_match')``.
+        """
         rows = await self._pg.fetchall(
             "SELECT resolution_status AS status, COUNT(*) AS n"
             " FROM lml_cache.streaming_track_result WHERE album_id = $1 GROUP BY 1",
@@ -672,14 +677,7 @@ class StreamingCatalogDAO:
         total = sum(counts.values())
         pending = counts.get("pending", 0)
         not_found = counts.get("not_found", 0)
-        resolved = (
-            total
-            - pending
-            - counts.get("local_miss", 0)
-            - not_found
-            - counts.get("false_positive", 0)
-            - counts.get("error", 0)
-        )
+        resolved = counts.get("local_match", 0) + counts.get("api_match", 0)
         return {
             "total": total,
             "resolved": resolved,
@@ -691,13 +689,22 @@ class StreamingCatalogDAO:
     # -- coverage baseline -----------------------------------------------------
 
     async def refresh_coverage_baseline(self) -> dict[str, int]:
-        """Recompute and upsert the coverage floors from live catalog counts.
+        """Recompute the coverage floors from live catalog counts, ratcheting up.
 
         The five metric keys mirror ``routers/admin.py``'s
         ``_STREAMING_COVERAGE_METRICS`` exactly — that endpoint is the reader
         this table feeds post-cutover (plan PR F). Runs in one transaction so a
-        partial failure never publishes a half-refreshed floor set; the PR A
-        lowering guard fires through unmasked if live counts ever regress.
+        partial failure never publishes a half-refreshed floor set.
+
+        Each metric ratchets **up only** (``GREATEST(live, stored)``): the
+        baseline is a monotonic high-water mark, so a live regression — e.g. a
+        sanctioned ``mark_track_false_positive`` demotion between runs — holds
+        the floor rather than lowering it or aborting the refresh through PR A's
+        lowering guard (the writer never attempts a downward move, so the guard
+        never trips). Detecting a genuine coverage regression is the read-side
+        export check's job, not this writer's. Returns the effective
+        post-ratchet floor per metric (== the stored row), which can exceed the
+        live count when a metric held.
         """
         async with self._pg.acquire() as conn:
             async with conn.transaction():
@@ -712,13 +719,14 @@ class StreamingCatalogDAO:
                     " WHERE resolution_status IN ('local_match', 'api_match')"
                     " AND (spotify_url IS NOT NULL OR deezer_url IS NOT NULL)"
                 )
-                metrics: dict[str, int] = {
+                live: dict[str, int] = {
                     "apple_url": url_counts.get("apple_music", 0),
                     "spotify_url": url_counts.get("spotify", 0),
                     "deezer_url": url_counts.get("deezer", 0),
                     "albums": albums,
                     "track_results": track_results,
                 }
-                for metric, value in metrics.items():
-                    await conn.execute(_UPSERT_BASELINE, metric, value)
-        return metrics
+                floors: dict[str, int] = {}
+                for metric, value in live.items():
+                    floors[metric] = await conn.fetchval(_UPSERT_BASELINE, metric, value)
+        return floors
