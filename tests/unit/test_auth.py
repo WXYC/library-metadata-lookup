@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
 from config.settings import Settings
+from core.api_key_cache import ApiKeyCache, hash_token, reset_api_key_cache
 
 
 def _settings(*, require_auth: bool = False, key: str | None = None) -> Settings:
@@ -53,6 +55,32 @@ def _request(
         "server": ("testserver", 80),
     }
     return Request(scope)
+
+
+def _seeded_cache(token_to_caller: dict[str, str]) -> ApiKeyCache:
+    """Build an ``ApiKeyCache`` whose snapshot is seeded directly (no PG).
+
+    Reaches into the "private" ``_hash_to_caller`` attribute the same way the
+    existing ``core/event_loop_lag.py`` tests reach into ``_gauge`` — no PG
+    connection or event loop is needed to exercise ``resolve()``/``is_empty``.
+    """
+    # pg is never used: resolve()/is_empty do no I/O.
+    cache = ApiKeyCache(pg=None)  # type: ignore[arg-type]
+    cache._hash_to_caller = {hash_token(t): caller for t, caller in token_to_caller.items()}
+    return cache
+
+
+@pytest.fixture(autouse=True)
+def _isolate_api_key_cache():
+    """Every test starts with an unstarted (``None``) singleton.
+
+    Mirrors ``core/event_loop_lag.py``'s ``TestRouterStamp._isolate`` fixture.
+    A test that needs a populated cache calls ``reset_api_key_cache(_seeded_cache(...))``
+    itself.
+    """
+    reset_api_key_cache()
+    yield
+    reset_api_key_cache()
 
 
 class TestRequireLmlKey:
@@ -150,6 +178,22 @@ class TestRequireLmlKey:
         )
 
     @pytest.mark.asyncio
+    async def test_flag_on_non_ascii_token_is_rejected_not_500(self):
+        # The legacy-key comparison uses secrets.compare_digest for constant-
+        # time matching. compare_digest on *str* raises TypeError for non-ASCII
+        # input, which would surface as a 500; the bytes form does not, so a
+        # non-ASCII bearer token is a clean 403 rather than a crash.
+        from core.auth import require_lml_key
+
+        with pytest.raises(HTTPException) as exc:
+            await require_lml_key(
+                request=_request(),
+                settings=_settings(require_auth=True, key="secret"),
+                authorization="Bearer nördic-tøken",
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
     async def test_flag_on_key_unset_returns_500(self):
         # Misconfiguration: enforcement on but no key configured. Fail loudly.
         from core.auth import require_lml_key
@@ -161,6 +205,150 @@ class TestRequireLmlKey:
                 authorization="Bearer anything",
             )
         assert exc.value.status_code == 500
+
+
+class TestRequireLmlKeyTableBackedKeys:
+    """Dual-accept behavior added by the LML per-consumer API keys plan.
+
+    A resolving table-backed hash passes and attributes the caller; a miss
+    falls through to the legacy shared key (still-live throughout the
+    migration); a miss on both is a 403 identical to today's. The distinction
+    between "revoked" and "never existed" must never leak past ``resolve()``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_table_backed_key_passes_with_no_legacy_key_configured(self):
+        from core.auth import require_lml_key
+
+        reset_api_key_cache(_seeded_cache({"secret-canary-token": "wxyc-canary"}))
+
+        await require_lml_key(
+            request=_request(),
+            settings=_settings(require_auth=True, key=None),
+            authorization="Bearer secret-canary-token",
+        )
+
+    @pytest.mark.asyncio
+    async def test_table_backed_key_touches_last_used(self):
+        # require_lml_key hashes the bearer token exactly once and reuses the
+        # digest for both the lookup and the touch, so it drives the
+        # hash-based touch_by_hash (not the token-based touch_last_used).
+        from core.auth import require_lml_key
+
+        cache = _seeded_cache({"secret-canary-token": "wxyc-canary"})
+        with patch.object(cache, "touch_by_hash") as touch:
+            reset_api_key_cache(cache)
+            await require_lml_key(
+                request=_request(),
+                settings=_settings(require_auth=True, key=None),
+                authorization="Bearer secret-canary-token",
+            )
+        touch.assert_called_once_with(hash_token("secret-canary-token"))
+
+    @pytest.mark.asyncio
+    async def test_table_backed_key_tags_caller_on_sentry(self):
+        from core.auth import require_lml_key
+
+        reset_api_key_cache(_seeded_cache({"secret-canary-token": "wxyc-canary"}))
+
+        with patch("core.auth.sentry_sdk.set_tag") as set_tag:
+            await require_lml_key(
+                request=_request(),
+                settings=_settings(require_auth=True, key=None),
+                authorization="Bearer secret-canary-token",
+            )
+        set_tag.assert_called_once_with("lml.auth.caller_name", "wxyc-canary")
+
+    @pytest.mark.asyncio
+    async def test_hash_miss_falls_through_to_legacy_key_and_passes(self):
+        from core.auth import require_lml_key
+
+        reset_api_key_cache(_seeded_cache({"secret-canary-token": "wxyc-canary"}))
+
+        # "legacy-secret" is not in the table-backed cache, but matches the
+        # still-configured legacy LML_API_KEY.
+        await require_lml_key(
+            request=_request(),
+            settings=_settings(require_auth=True, key="legacy-secret"),
+            authorization="Bearer legacy-secret",
+        )
+
+    @pytest.mark.asyncio
+    async def test_hash_miss_with_no_legacy_match_returns_403(self):
+        from core.auth import require_lml_key
+
+        reset_api_key_cache(_seeded_cache({"secret-canary-token": "wxyc-canary"}))
+
+        with pytest.raises(HTTPException) as exc:
+            await require_lml_key(
+                request=_request(),
+                settings=_settings(require_auth=True, key="legacy-secret"),
+                authorization="Bearer neither-table-nor-legacy",
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_revoked_key_fails_identically_to_a_key_that_never_existed(self):
+        # A revoked row is simply absent from the active-key SELECT (entity/
+        # api_keys.py's _SELECT_ACTIVE_SQL), so from ApiKeyCache's point of
+        # view a "revoked" token and one that never existed are the same
+        # thing: both miss the dict. Both must land on the same 403 reason.
+        from core.auth import require_lml_key
+
+        # No legacy key configured, so a resolve() miss on either token has
+        # nothing else to fall through to.
+        reset_api_key_cache(_seeded_cache({"still-active-token": "backend-service"}))
+
+        never_existed_exc = None
+        revoked_exc = None
+        with pytest.raises(HTTPException) as exc:
+            await require_lml_key(
+                request=_request(),
+                settings=_settings(require_auth=True, key=None),
+                authorization="Bearer some-revoked-token",
+            )
+        revoked_exc = exc.value
+        with pytest.raises(HTTPException) as exc:
+            await require_lml_key(
+                request=_request(),
+                settings=_settings(require_auth=True, key=None),
+                authorization="Bearer some-never-issued-token",
+            )
+        never_existed_exc = exc.value
+
+        assert revoked_exc.status_code == never_existed_exc.status_code == 403
+        assert revoked_exc.detail == never_existed_exc.detail
+
+    @pytest.mark.asyncio
+    async def test_empty_cache_and_no_legacy_key_returns_500(self):
+        # A cache that started (unlike the bare-None case already covered by
+        # test_flag_on_key_unset_returns_500) but has zero active rows must
+        # still 500 when there is no legacy key either.
+        from core.auth import require_lml_key
+
+        reset_api_key_cache(_seeded_cache({}))
+
+        with pytest.raises(HTTPException) as exc:
+            await require_lml_key(
+                request=_request(),
+                settings=_settings(require_auth=True, key=None),
+                authorization="Bearer anything",
+            )
+        assert exc.value.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_nonempty_cache_with_no_legacy_key_does_not_misconfigure_500(self):
+        # The 500 only fires when BOTH the legacy key is unset AND the cache
+        # is empty/unstarted -- a populated cache alone is a valid config.
+        from core.auth import require_lml_key
+
+        reset_api_key_cache(_seeded_cache({"secret-canary-token": "wxyc-canary"}))
+
+        await require_lml_key(
+            request=_request(),
+            settings=_settings(require_auth=True, key=None),
+            authorization="Bearer secret-canary-token",
+        )
 
 
 class TestRequireLmlKeyLogging:
@@ -278,17 +466,48 @@ class TestRequireLmlKeyLogging:
 
     @pytest.mark.asyncio
     async def test_success_emits_no_warning(self, caplog):
-        # Healthy requests must not pollute the log stream.
+        # Healthy requests must not pollute the log stream. A table-backed
+        # key hit is the fully-migrated, silent-success shape (unlike the
+        # transitional legacy-key hit below, which deliberately DOES log).
         from core.auth import require_lml_key
+
+        reset_api_key_cache(_seeded_cache({"secret": "wxyc-canary"}))
 
         with caplog.at_level(logging.WARNING, logger="core.auth"):
             await require_lml_key(
                 request=_request(),
-                settings=_settings(require_auth=True, key="secret"),
+                settings=_settings(require_auth=True, key=None),
                 authorization="Bearer secret",
             )
 
         assert [r for r in caplog.records if r.name == "core.auth"] == []
+
+    @pytest.mark.asyncio
+    async def test_legacy_key_success_logs_warning_with_reason(self, caplog):
+        # Transitional: a still-live legacy LML_API_KEY hit succeeds but is
+        # deliberately NOT silent -- so not-yet-migrated traffic stays
+        # visible for the length of the per-consumer-keys rollout.
+        from core.auth import require_lml_key
+
+        with caplog.at_level(logging.WARNING, logger="core.auth"):
+            await require_lml_key(
+                request=_request(
+                    client=("10.0.0.9", 4321),
+                    headers={"user-agent": "tubafrenzy/1.0"},
+                ),
+                settings=_settings(require_auth=True, key="secret"),
+                authorization="Bearer secret",
+            )
+
+        records = [r for r in caplog.records if r.name == "core.auth"]
+        assert len(records) == 1, f"expected 1 auth log, got {len(records)}: {records}"
+        rec = records[0]
+        assert rec.levelno == logging.WARNING
+        assert rec.client_ip == "10.0.0.9"
+        assert rec.user_agent == "tubafrenzy/1.0"
+        assert rec.path == "/api/v1/lookup"
+        assert rec.method == "POST"
+        assert rec.reason == "legacy_shared_key_used"
 
     @pytest.mark.asyncio
     async def test_log_does_not_contain_token_value(self, caplog):
