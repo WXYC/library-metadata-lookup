@@ -114,13 +114,20 @@ _SEARCH_URL = "https://api.music.apple.com/v1/catalog/us/search"
 # LML_APPLE_MUSIC_RATE_PER_MIN. The default 60/min = 1 req/sec sustained is a
 # SELF-imposed throttle, NOT an Apple-published limit — Apple publishes no
 # official Apple Music API rate limit, and at 1 req/s the 4 s probe wait_for
-# ceiling nulls a majority of live find_track_url probes under load. The knob
-# lets the ceiling be widened from Railway with no redeploy + instant rollback
-# (mirrors LML_STREAMING_WARM_CONCURRENCY). Raise it in steps
-# (60 -> 300 -> 600/min = 1 -> 5 -> 10 req/s, still under the ~20 req/s
-# community estimate) watching the 429-count + null-rate; the token is SHARED
-# with staging + the docs/scripts.md resolver scripts, so the safe ceiling is
-# the aggregate across all consumers, not prod /lookup alone.
+# ceiling nulls a majority of live find_track_url probes under load.
+#
+# Two coupling caveats for anyone raising this (docs/env-vars.md has the full
+# rollout runbook + shared-token aggregate):
+#   - AsyncLimiter's bucket capacity == max_rate, so a higher ceiling widens
+#     the INSTANTANEOUS burst too, not just the sustained rate: 600/min permits
+#     a 600-call burst to Apple after any idle period, then drains at 10/s.
+#   - _SEMAPHORE_LIMIT (below) caps concurrency at 5, so with a ~338 ms call the
+#     effective throughput ceiling is ~15 req/s regardless of this knob —
+#     raising it past ~900/min buys no extra sustained throughput.
+#
+# Read once at client construction (the client is an async_singleton), so a new
+# value takes effect on the next process start; a Railway var change restarts
+# the service, so no code change / manual deploy is needed to re-rate.
 _APPLE_MUSIC_RATE_PER_MIN_DEFAULT = 60
 _APPLE_MUSIC_RATE_PERIOD_S = 60.0
 APPLE_MUSIC_RATE_PER_MIN_ENV_VAR = "LML_APPLE_MUSIC_RATE_PER_MIN"
@@ -134,10 +141,13 @@ def resolve_apple_music_rate_limit() -> tuple[float, float]:
     :data:`APPLE_MUSIC_RATE_PER_MIN_ENV_VAR`; the window is fixed at 60 s so
     only the per-minute ceiling moves. The default preserves the historical
     1 req/s self-throttle when the var is unset (zero-behavior-change on
-    merge). Read per-call (not at import) via :func:`resolve_positive_int_env`
-    so the knob honors a runtime override and tests can monkeypatch it — see
+    merge). Resolved via :func:`resolve_positive_int_env` at each call — see
     that helper for the unparseable/zero/negative -> default-with-WARN contract
-    (a typo must not throttle to 0, which would serialize every probe).
+    (a typo must not throttle to 0, which would serialize every probe). The
+    only caller is :meth:`AppleMusicClient.__init__`, and the client is an
+    ``async_singleton``, so in production this is read **once per process** (a
+    new value takes effect on the next start, e.g. the restart a Railway var
+    change triggers); tests monkeypatch it by constructing a fresh client.
     """
     max_rate = resolve_positive_int_env(
         APPLE_MUSIC_RATE_PER_MIN_ENV_VAR, _APPLE_MUSIC_RATE_PER_MIN_DEFAULT
