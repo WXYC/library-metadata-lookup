@@ -3715,6 +3715,68 @@ class TestTop1PrefetchSynthesisSkip:
         assert enriched.release_year == probe_match.release_year
 
     @pytest.mark.asyncio
+    async def test_extended_wholly_fuzzy_miss_skips_and_synthesizes(self):
+        """Extended-path counterpart to ``test_wholly_fuzzy_miss_skips_prefetch``.
+
+        On ``extended=True`` the LML#507 skip condition (title fails AND artist
+        doesn't verify) necessarily coincides with the LML#504 per-item
+        artwork-suppression gate — both key off the library-row artist failing
+        to verify — so probe artwork is intentionally withheld here (that gate
+        is exercised in ``TestArtistIdentitySplitGate``). What this pins instead
+        is the *response coherence* the skip must preserve on the extended path:
+        the BS#1185 synthesized sentinel is still produced end-to-end, and none
+        of the prefetch-fed extended fields leak a stale value now that
+        ``top1_release``/``top1_bio`` are ``None``. No prior test inspects the
+        response on the extended skip branch — ``test_warm_cache_not_scheduled``
+        asserts only that the fetch and the warm task don't fire."""
+        item = make_library_item(id=42, artist="Larry Gus", title="Somewhere Waiting")
+        larry_gus_artwork = make_discogs_result(
+            release_id=7,
+            artist="Larry Gus",
+            album="Somewhere Waiting",
+            artwork_url="https://example.com/larry-gus-WRONG.jpg",
+            release_year=2014,
+        )
+        probe_match = AppleMusicTrackMatch(
+            url="https://music.apple.com/us/song/rita/9",
+            artwork_url="https://is1-ssl.mzstatic.com/image/thumb/sessa.jpg",
+            release_year=2022,
+            album_verified=True,
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+        apple_music.find_track_url = AsyncMock(return_value=probe_match.url)
+
+        discogs_service = AsyncMock()
+
+        results = await enrich_artwork_results(
+            [(item, larry_gus_artwork)],
+            discogs_service,
+            song="Rita",
+            album="Pequena Vertigem de Amor",
+            artist="Sessa",
+            apple_music=apple_music,
+            extended=True,
+        )
+
+        # The skip still fires on the extended path.
+        discogs_service.get_release.assert_not_called()
+        discogs_service.get_artist_details.assert_not_called()
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # BS#1185 synthesized sentinel still produced end-to-end under extended.
+        assert enriched.release_id == 0
+        assert enriched.release_url == ""
+        # No prefetch-fed extended field leaks a stale value once the fetch is
+        # skipped: artist-derived (bio/wiki) and album-derived (tracklist) all
+        # stay absent, matching a fetch that ran and found nothing.
+        assert enriched.artist_bio is None
+        assert enriched.wikipedia_url is None
+        assert enriched.tracklist is None
+
+    @pytest.mark.asyncio
     async def test_same_artist_sibling_prefetch_still_fires(self):
         """Yenbett-vs-Tzenni same-artist-sibling shape: the library row's
         title fails the LML#477 floor, but its artist verifies against the
