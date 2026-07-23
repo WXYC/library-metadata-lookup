@@ -13,9 +13,10 @@ reach past the method surface into ``results_db._db`` raw SQL or
 compilation-skip and ``--retry-misses`` bulk updates, the track pipeline's
 extract/build-index/validate scans and album rollup, and the bandcamp
 pipeline's slug-discovery writes (found-slug + searched-not-found
-sentinel), Wikidata slug loader, and URL migration all bypass the methods
-today, and PR D rewrites those sites against DAO methods (adding any
-that are missing) rather than swapping a constructor. The load-bearing
+sentinel), Wikidata slug loader, URL migration, and dry-run preview
+counters all bypass the methods today, and PR D rewrites those sites
+against DAO methods (adding any that are missing) rather than swapping a
+constructor. The load-bearing
 translation decisions:
 
 * **Anti-join pending semantics.** The legacy SQLite schema materialized a
