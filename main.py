@@ -22,6 +22,7 @@ from core.dependencies import (
     close_musicbrainz_pg,
     get_object_store,
 )
+from core.event_loop_lag import start_sampler, stop_sampler
 from core.logging import setup_logging
 from discogs.router import router as discogs_router
 from identity.dependencies import close_entity_store
@@ -300,9 +301,24 @@ async def lifespan(app: FastAPI):
                         label,
                     )
 
+    # LML#907: start the event-loop-lag sampler — a background task that measures
+    # the single-worker starvation tax (plans/lookup-latency-event-loop-starvation.md
+    # §3) and exposes it as a process-global gauge the lookup router stamps onto
+    # cache_stats. Gated on the LML_EVENT_LOOP_LAG_GAUGE kill switch (default on).
+    # Best-effort: a failure to start must never block serving.
+    lag_sampler_task = None
+    if settings.lml_event_loop_lag_gauge:
+        try:
+            lag_sampler_task = start_sampler()
+            logger.info("Event-loop-lag sampler started")
+        except Exception:
+            logger.exception("Event-loop-lag sampler failed to start; continuing without it")
+
     yield
 
     logger.info("Shutting down application")
+    if lag_sampler_task is not None:
+        await stop_sampler(lag_sampler_task)
     shutdown_posthog()
     await close_library_db()
     await close_discogs_service()
