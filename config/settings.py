@@ -448,6 +448,26 @@ class Settings(BaseSettings):
             "WXYC/Backend-Service#881 (Epic G)."
         ),
     )
+    lml_event_loop_lag_gauge: bool = Field(
+        default=True,
+        description=(
+            "When True, a background sampler task (started in main.py lifespan) "
+            "measures event-loop scheduling lag — how long the single uvicorn "
+            "worker's loop takes to resume past a fixed sleep — and the router "
+            "stamps the current value onto each request's cache_stats as "
+            "event_loop_lag_ms, riding the cache.* / lml.cache.* projection to "
+            "PostHog + Sentry. This surfaces the /lookup single-worker starvation "
+            "tax (plans/lookup-latency-event-loop-starvation.md §3) that "
+            "track_step and the Server-Timing header structurally cannot see, and "
+            "is the before/after metric for Lever A' (#904) and Lever B (#747). "
+            "Default True. To disable, set False and confirm a redeploy landed: "
+            "the flag is read at process start (the sampler is a lifespan task and "
+            "the stamp reads @lru_cache'd Settings), so a var flip takes effect only "
+            "on the next boot, and a Railway var-set that comes back SKIPPED leaves "
+            "the running sampler untouched. Near-zero cost; see "
+            "WXYC/library-metadata-lookup#907."
+        ),
+    )
     # Persistent streaming-URL cache flags (LML#573). A service is persisted
     # only when BOTH the master kill switch AND its per-service flag are true
     # (AND-gate). The master defaults True and the per-service flags default

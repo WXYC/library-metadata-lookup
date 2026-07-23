@@ -37,6 +37,7 @@ from core.dependencies import (
     get_musicbrainz_pg,
     get_posthog_client,
 )
+from core.event_loop_lag import get_event_loop_lag_ms
 from core.search import SEARCH_API_CALL_CAP_FIRED_STAT_KEY, resolve_positive_int_env
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
@@ -219,6 +220,15 @@ def _project_inflight_capped(wait_ms: float) -> None:
 LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY = "lml_resolve_nonlibrary_release"
 LML_RESOLVE_COMPILATION_RELEASE_STAT_KEY = "lml_resolve_compilation_release"
 
+# LML#907 event-loop-lag gauge. The process-global sampler (core.event_loop_lag,
+# started in main.py lifespan) measures how long the single uvicorn worker's loop
+# takes to resume past a fixed sleep — the /lookup starvation tax
+# (plans/lookup-latency-event-loop-starvation.md §3) that no track_step or
+# Server-Timing leg can see. Stamped once per cache_stats context so it rides the
+# cache.* / lml.cache.* projection to PostHog + Sentry as a per-request sample of
+# the process-global gauge.
+EVENT_LOOP_LAG_STAT_KEY = "event_loop_lag_ms"
+
 _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     "memory_cache_inflight_join",
     "memory_cache_inflight_retry_after_cancel",
@@ -234,6 +244,9 @@ _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     # LML#755 Discogs saturation breaker: shed counter seeds to 0 so
     # breaker-open time is an alertable baseline series on the #683 surface.
     BREAKER_OPEN_STAT_KEY,
+    # LML#907 event-loop-lag gauge: seeded to 0 so the series is present even
+    # when the sampler is off / unsampled (the stamp is skipped, leaving the 0).
+    EVENT_LOOP_LAG_STAT_KEY,
 )
 """LML-specific keys seeded into every request's cache_stats dict so PostHog
 and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and
@@ -271,6 +284,32 @@ def _record_lml_flag_tags() -> None:
         )
     except Exception as e:
         logger.warning("Failed to record LML flag tags into cache_stats: %s", e)
+
+
+def _record_event_loop_lag() -> None:
+    """Stamp the current event-loop-lag gauge onto ``cache_stats`` (LML#907).
+
+    Called once per ``cache_stats`` context, right after ``_record_lml_flag_tags``
+    at BOTH ``handle_lookup`` and ``handle_bulk_lookup``. What it records is a
+    per-request *sample* of the process-global gauge (``core.event_loop_lag``),
+    not this request's own tail — aggregated avg/p95 across requests in Sentry /
+    PostHog, it tracks loop health over time and is the before/after metric for
+    Lever A' (#904) and Lever B (#747).
+
+    Gated on ``lml_event_loop_lag_gauge`` (the Railway kill switch) and a no-op
+    when the gauge is unsampled (sampler off, or the first ~interval of process
+    life), leaving the seeded ``0``. Observability must not break the request
+    path: any exception is swallowed at WARNING (matches ``_record_lml_flag_tags``).
+    """
+    try:
+        if not get_settings().lml_event_loop_lag_gauge:
+            return
+        lag_ms = get_event_loop_lag_ms()
+        if lag_ms is None:
+            return
+        get_cache_stats_recorder().record(EVENT_LOOP_LAG_STAT_KEY, lag_ms)
+    except Exception as e:
+        logger.warning("Failed to record event-loop lag into cache_stats: %s", e)
 
 
 # Canonical full path for the bulk endpoint. Referenced by the explicit
@@ -408,6 +447,7 @@ async def handle_lookup(
     # LML#681: tag the per-request payload with the row-less-family flag state
     # (0/1) once per context so the flip is sliceable in PostHog/Sentry.
     _record_lml_flag_tags()
+    _record_event_loop_lag()
     if skip_cache:
         set_skip_cache(True)
 
@@ -690,6 +730,7 @@ async def handle_bulk_lookup(
     # LML#681: record the flag tag once for the whole batch (shared context),
     # so the bulk value stays 0/1 instead of summing across items.
     _record_lml_flag_tags()
+    _record_event_loop_lag()
 
     max_concurrent = max_concurrency_from_env(_BULK_LOOKUP_DEFAULT_CONCURRENCY)
     semaphore = asyncio.Semaphore(max_concurrent)
