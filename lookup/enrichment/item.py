@@ -62,6 +62,55 @@ def _build_streaming_search_url(base: str, artist: str, term: str) -> str:
     return f"{base}{quote(query)}"
 
 
+def compute_row_title_matches_requested_album(
+    album: str | None,
+    item: LibraryItem,
+    artwork: DiscogsSearchResult | None,
+    *,
+    found_on_compilation: bool,
+) -> bool:
+    """LML#477: does ``item``'s catalog title plausibly match the requested album?
+
+    Extracted (LML#507) so the per-item synthesis gate in ``enrich_one`` and
+    the top-1-only prefetch-skip gate in
+    ``lookup/enrichment/__init__.py::enrich_artwork_results`` share one
+    implementation instead of two copies that can drift.
+
+    ``_fuzzy_search`` in library/db.py accepts token_set_ratio >= 70 —
+    permissive enough to surface sibling-album rows (same artist, different
+    release) whose verified streaming URLs (and Discogs artwork) would
+    otherwise propagate as if they pointed at the requested album. The 80
+    floor mirrors ``is_acceptable_match`` in ``clients/streaming/matching``.
+    When no album was requested (artist-only lookup) or the row's title is
+    missing, there is no signal to gate against — fall through.
+    """
+    return (
+        not album
+        or not item.title
+        or score_match(album, item.title) >= SCORE_MATCH_ACCEPTANCE_FLOOR
+        # LML#628: a row-less carry-through item (id == ROWLESS_LIBRARY_ID,
+        # carrying an already-validated Discogs release) has no library row,
+        # so the LML#487 sibling-leak concern — a *row's* artwork/streaming
+        # links bleeding onto a mismatched album — cannot apply. The
+        # carry-through resolves by *track*, so its release title (``item.title``)
+        # routinely differs from a typed album; gating it here clobbered the
+        # validated ``release_id`` down to the BS#1185 ``release_id=0`` sentinel
+        # the feature exists to avoid. The release_id was validated to carry the
+        # track, and item.title IS that release's title, so trust the binding.
+        or (item.id == ROWLESS_LIBRARY_ID and artwork is not None and artwork.release_id > 0)
+        # LML#684: an in-library found_on_compilation row is the analog of the
+        # row-less carry-through above — TRACK_ON_COMPILATION located the track
+        # on a release that IS shelved, and validate_release_for_track confirmed
+        # the track sits on it. Its release title ("Orcutt-Shelley-Miller")
+        # legitimately differs from the typed album (the trio/collab name
+        # "Orcutt Shelley Miller", which scores 61.9 here), so the sibling-leak
+        # gate would clobber the validated release_id to the release_id=0
+        # sentinel — the silent-no-artwork bug this fix exists to kill. The row
+        # was track-validated, so the leak concern doesn't apply.
+        or (found_on_compilation and artwork is not None and artwork.release_id > 0)
+    )
+
+
 async def enrich_one(
     ctx: EnrichmentContext,
     item: LibraryItem,
@@ -93,40 +142,14 @@ async def enrich_one(
     row_artist = item.alternate_artist_name or item.artist or ""
     search_term = ctx.song or item.title or ""
 
-    # LML#477: only trust the library row when its title plausibly
-    # matches the requested album. ``_fuzzy_search`` in library/db.py
-    # accepts token_set_ratio >= 70 — permissive enough to surface
-    # sibling-album rows (same artist, different release) whose
-    # verified streaming URLs (and Discogs artwork) would otherwise
-    # propagate as if they pointed at the requested album. The 80
-    # floor mirrors ``is_acceptable_match`` in
-    # ``clients/streaming/matching``. When no album was requested
-    # (artist-only lookup) or the row's title is missing, there is
-    # no signal to gate against — fall through.
-    row_title_matches_requested_album = (
-        not ctx.album
-        or not item.title
-        or score_match(ctx.album, item.title) >= SCORE_MATCH_ACCEPTANCE_FLOOR
-        # LML#628: a row-less carry-through item (id == ROWLESS_LIBRARY_ID,
-        # carrying an already-validated Discogs release) has no library row,
-        # so the LML#487 sibling-leak concern — a *row's* artwork/streaming
-        # links bleeding onto a mismatched album — cannot apply. The
-        # carry-through resolves by *track*, so its release title (``item.title``)
-        # routinely differs from a typed album; gating it here clobbered the
-        # validated ``release_id`` down to the BS#1185 ``release_id=0`` sentinel
-        # the feature exists to avoid. The release_id was validated to carry the
-        # track, and item.title IS that release's title, so trust the binding.
-        or (item.id == ROWLESS_LIBRARY_ID and artwork is not None and artwork.release_id > 0)
-        # LML#684: an in-library found_on_compilation row is the analog of the
-        # row-less carry-through above — TRACK_ON_COMPILATION located the track
-        # on a release that IS shelved, and validate_release_for_track confirmed
-        # the track sits on it. Its release title ("Orcutt-Shelley-Miller")
-        # legitimately differs from the typed album (the trio/collab name
-        # "Orcutt Shelley Miller", which scores 61.9 here), so the sibling-leak
-        # gate would clobber the validated release_id to the release_id=0
-        # sentinel — the silent-no-artwork bug this fix exists to kill. The row
-        # was track-validated, so the leak concern doesn't apply.
-        or (ctx.found_on_compilation and artwork is not None and artwork.release_id > 0)
+    # LML#477: only trust the library row when its title plausibly matches
+    # the requested album. Rationale + the ROWLESS_LIBRARY_ID / #684
+    # carve-outs live on ``compute_row_title_matches_requested_album``
+    # (LML#507 extracted it so this per-item gate and the top-1-only
+    # prefetch-skip gate in ``lookup/enrichment/__init__.py`` share one
+    # implementation).
+    row_title_matches_requested_album = compute_row_title_matches_requested_album(
+        ctx.album, item, artwork, found_on_compilation=ctx.found_on_compilation
     )
     # LML#850: a hand-verified library-release override (bound in ``fetch_one``
     # via ``release_overrides``) deliberately gets NO carve-out here. This gate

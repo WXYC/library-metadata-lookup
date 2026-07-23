@@ -71,6 +71,26 @@ def _mb_rescue_song_match_required() -> bool:
     return raw.strip().lower() not in _FALSE_FLAG_VALUES
 
 
+_SKIP_PREFETCH_ON_SYNTHESIS_ENV_VAR = "LML_ENRICH_SKIP_PREFETCH_ON_SYNTHESIS"
+"""When set to any common false spelling (``false``, ``0``, ``no``, ``off``,
+``disabled``), the LML#507 top-1-only prefetch skip is bypassed and
+``fetch_top1_release_details`` fires unconditionally, exactly as it did before
+this ticket — even when the top-1 item's synthesis-path outcome will consume
+neither the album-derived nor the artist-derived fields. Emergency rollback
+only — default is ``true`` (on)."""
+
+
+def _skip_prefetch_on_synthesis_enabled() -> bool:
+    """Read the LML#507 rollback flag at request time (no Settings
+    indirection) so the knob can be flipped via Railway env vars without a
+    redeploy. See ``LML_ENRICH_SKIP_PREFETCH_ON_SYNTHESIS`` in
+    ``docs/env-vars.md``."""
+    raw = os.getenv(_SKIP_PREFETCH_ON_SYNTHESIS_ENV_VAR)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _FALSE_FLAG_VALUES
+
+
 def _artist_pair_verified(query_stripped: str, candidate: str | None) -> bool:
     """Score-floor + V/A guard for one (request, candidate-artist) hop.
 

@@ -11,6 +11,9 @@ fire-and-forget bio cache warm (``background``).
 import asyncio
 import logging
 
+import sentry_sdk
+from wxyc_fastapi.observability import get_cache_stats_recorder
+
 from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.matching import strip_discogs_disambig
@@ -30,6 +33,7 @@ from library.models import LibraryItem
 from lookup.artist_resolution import (
     _artist_identity_split_gate_enabled,
     _artist_pair_verified,
+    _skip_prefetch_on_synthesis_enabled,
 )
 
 # Submodules are referenced via module attributes (``background._warm_bio_cache``,
@@ -41,6 +45,14 @@ from lookup.enrichment import background, item, top1
 from lookup.enrichment.context import EnrichmentContext
 
 logger = logging.getLogger(__name__)
+
+# LML#507 top-1-only prefetch-skip counter. Emitted on the #683 ``cache.*``
+# counter surface (``get_cache_stats_recorder().record(...)``) every time the
+# top-1 Discogs prefetch is skipped because the top-1 item's synthesis-path
+# outcome would have consumed neither the album- nor the artist-derived
+# fields, so the skip rate is alertable on the same PostHog/Sentry seam as the
+# row-less flag degradation alerts and the LML#755 breaker-open counter.
+SKIPPED_PREFETCH_STAT_KEY = "skipped_prefetch"
 
 
 async def enrich_artwork_results(
@@ -128,6 +140,27 @@ async def enrich_artwork_results(
     because the fallback winner's album axis failed the floor
     (``AppleMusicTrackMatch.album_verified=False``).
 
+    **Behavior change (LML#507):** the top-1-only prefetch below
+    (``top1.fetch_top1_release_details`` — the ``get_release`` +
+    ``get_artist_details`` Discogs round-trip feeding
+    ``top1_year``/``top1_bio``/``top1_wiki``/``top1_release``/``top1_details``)
+    is skipped entirely when the top-1 item's own gates show that neither
+    the album-derived nor the artist-derived fields would end up consumed —
+    the synthesis-path cohort where the fetch's output was previously
+    discarded. ``top1_library_row_acceptable`` /
+    ``top1_library_row_artist_verified`` are computed from the same
+    predicates the per-item gates in ``lookup/enrichment/item.py`` use
+    (``compute_row_title_matches_requested_album`` / ``_artist_pair_verified``),
+    for the top-1 item only. Because ``is_album_derived_eligible`` and
+    ``is_artist_derived_eligible`` in ``item.py`` are both ``is_top1``-gated,
+    no non-top-1 item can ever consume this prefetch's output, so gating it
+    on the top-1 item's predicate alone cannot suppress anything a non-top-1
+    item would have surfaced. The same-artist-sibling shape (title fails,
+    artist verifies — LML#504's recovery cohort) still fires the prefetch.
+    Env kill-switch ``LML_ENRICH_SKIP_PREFETCH_ON_SYNTHESIS`` (default on)
+    reverts to the pre-LML#507 always-fetch behavior; see
+    ``docs/env-vars.md``.
+
     ``extended=True`` additionally populates the new DiscogsMatchResult
     fields LML already loaded during the release+artist fetches:
     ``discogs_artist_id``, ``tracklist``, ``genres``, ``styles``, ``label``,
@@ -172,14 +205,68 @@ async def enrich_artwork_results(
         found_on_compilation=found_on_compilation,
     )
 
-    # Top-1-only expensive enrichment; rationale in ``lookup/enrichment/top1.py``.
-    (
-        top1_year,
-        top1_bio,
-        top1_wiki,
-        top1_release,
-        top1_details,
-    ) = await top1.fetch_top1_release_details(discogs_service, items_with_artwork[0][1])
+    # LML#507: gate the once-per-request top-1 prefetch on whether the
+    # top-1 item's synthesis-path outcome will actually consume its output.
+    # Computed here (not inside ``top1.fetch_top1_release_details``, which
+    # deliberately stays fetch-only) so the decision is visible to both the
+    # skip branch and the observability below. See the docstring above for
+    # the "why gating on top-1 alone is safe" argument.
+    top1_item, top1_artwork = items_with_artwork[0]
+    top1_row_title_matches = item.compute_row_title_matches_requested_album(
+        album, top1_item, top1_artwork, found_on_compilation=found_on_compilation
+    )
+    top1_library_row_acceptable = top1_artwork is not None and top1_row_title_matches
+    top1_library_row_artist_verified = _artist_pair_verified(
+        request_artist_stripped, top1_item.artist
+    ) or _artist_pair_verified(request_artist_stripped, top1_item.alternate_artist_name)
+    should_prefetch_top1 = top1_library_row_acceptable or top1_library_row_artist_verified
+
+    if should_prefetch_top1 or not _skip_prefetch_on_synthesis_enabled():
+        (
+            top1_year,
+            top1_bio,
+            top1_wiki,
+            top1_release,
+            top1_details,
+        ) = await top1.fetch_top1_release_details(discogs_service, top1_artwork)
+    else:
+        # Wholly-fuzzy-miss synthesis path: the top-1 item's title doesn't
+        # match the request AND its artist doesn't verify, so the fetch's
+        # release/artist/bio output would have been discarded anyway (see
+        # ``is_album_derived_eligible`` / ``is_artist_derived_eligible`` in
+        # ``item.py``). Skip it entirely — identical downstream shape to a
+        # fetch that ran and found nothing.
+        top1_year = None
+        top1_bio = None
+        top1_wiki = None
+        top1_release = None
+        top1_details = None
+        get_cache_stats_recorder().record(SKIPPED_PREFETCH_STAT_KEY)
+        try:
+            transaction = sentry_sdk.get_current_scope().transaction
+            if transaction is not None:
+                transaction.set_data("lml.enrich.synthesis_path_skipped_prefetch", True)
+        except Exception as e:
+            logger.warning(
+                "Failed to project synthesis_path_skipped_prefetch onto Sentry transaction: %s",
+                e,
+            )
+
+    # LML#504-recovery cohort marker: fires whenever the top-1 item's artist
+    # verifies but its title doesn't (Yenbett-vs-Tzenni shape) — independent
+    # of the flag above, since it quantifies how often the prefetch pays off
+    # for bio-only recovery vs. how often it's pure waste (the skipped-
+    # prefetch counter above).
+    if top1_library_row_artist_verified and not top1_library_row_acceptable:
+        try:
+            transaction = sentry_sdk.get_current_scope().transaction
+            if transaction is not None:
+                transaction.set_data("lml.enrich.synthesis_path_recovered_artist", True)
+        except Exception as e:
+            logger.warning(
+                "Failed to project synthesis_path_recovered_artist onto Sentry transaction: %s",
+                e,
+            )
 
     # LML#504: release-side artist-identity hop. Computed once (shared across
     # all items in this batch) since ``top1_release`` is by definition top-1-only
