@@ -1907,6 +1907,10 @@ class ArtistMetadataResponse(BaseModel):
     bio: str | None = Field(None, description="Artist biography from Discogs")
     wikipediaUrl: str | None = Field(None, description="Wikipedia URL for the artist")
     imageUrl: str | None = Field(None, description="Artist image URL from Discogs")
+    bioTokens: list[DiscogsResolvedToken] | None = Field(
+        None,
+        description="Pre-parsed structured tokens from the artist's Discogs profile markup. Pass-through of DiscogsArtistDetails.profile_tokens, so clients can share token rendering across the two payloads.\n",
+    )
 
 
 class ArtworkSearchResponse(BaseModel):
