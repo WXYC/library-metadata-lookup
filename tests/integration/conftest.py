@@ -15,6 +15,7 @@ import pytest_asyncio
 
 from config.settings import Settings
 from discogs.models import DiscogsSearchResponse
+from entity.streaming_catalog import ALLOW_URL_REMOVAL_GUC
 from library.db import LibraryDB
 from tests.factories import make_discogs_result
 
@@ -210,6 +211,19 @@ async def _veto_if_any_rows(conn, targets: "Iterable[tuple[str, str]]") -> None:
             f"Refusing to DROP: {'; '.join(parts)}. Point DATABASE_URL_TEST "
             "at a clean, reachable PG before running this suite."
         )
+
+
+async def opted_in(conn) -> None:
+    """Arm the ``lml_cache`` no-regress guards' opt-in for the current transaction.
+
+    Wraps the runbook spelling — ``set_config(<GUC>, 'on', true)`` with
+    ``is_local=true`` — so suites exercising legitimate discard paths can't
+    typo the GUC name. Must be called INSIDE an open transaction block
+    (``async with conn.transaction():``): asyncpg autocommits otherwise, and a
+    transaction-local setting evaporates the instant its implicit transaction
+    commits. Protection restores automatically at COMMIT/ROLLBACK.
+    """
+    await conn.execute(f"SELECT set_config('{ALLOW_URL_REMOVAL_GUC}', 'on', true)")
 
 
 async def skip_unless_wxyc_identity_match_artist(conn) -> None:
