@@ -708,8 +708,9 @@ class TestTracks:
         pipeline's validate phase flips ``api_match`` tracks whose URLs fail
         service-metadata validation to ``false_positive``. The DAO opts into
         the PR A no-regress guard transaction-locally for exactly this write;
-        the collected URLs stay in place as the audit trail (legacy behavior —
-        ``phase_validate`` only ever flipped the status)."""
+        the collected URLs stay in place as the audit trail — deliberately
+        better than the legacy demotion, which nulled every omitted metadata
+        column (nothing downstream reads URLs off ``false_positive`` rows)."""
         album_id = await _seed_album(dao, pg_pool)
         track_id = await _seed_track(dao, pg_pool, album_id)
         await dao.update_track_resolution(track_id, "api_match", spotify_url=_SPOTIFY_URL)
