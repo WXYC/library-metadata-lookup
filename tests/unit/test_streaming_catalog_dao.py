@@ -29,6 +29,22 @@ class TestConstruction:
             StreamingCatalogDAO(dsn=_NEVER_DIALED_DSN, pool=object())  # type: ignore[arg-type]
 
 
+class TestEmptyBatches:
+    """Empty batches return 0 without dialing PG — the set-based bulk inserts
+    have no rows to arbitrate, and an offline caller flushing an empty buffer
+    should not pay (or fail on) a connection."""
+
+    @pytest.mark.asyncio
+    async def test_insert_albums_empty_batch_returns_zero_without_connecting(self) -> None:
+        dao = StreamingCatalogDAO(dsn=_NEVER_DIALED_DSN)
+        assert await dao.insert_albums([]) == 0
+
+    @pytest.mark.asyncio
+    async def test_insert_tracks_empty_batch_returns_zero_without_connecting(self) -> None:
+        dao = StreamingCatalogDAO(dsn=_NEVER_DIALED_DSN)
+        assert await dao.insert_tracks([]) == 0
+
+
 class TestServiceValidation:
     @pytest.mark.asyncio
     async def test_get_pending_unknown_service_raises_before_any_connection(self) -> None:

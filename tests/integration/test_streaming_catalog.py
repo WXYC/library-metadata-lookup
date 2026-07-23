@@ -30,10 +30,9 @@ from entity.sources import PgSource
 from entity.streaming_catalog import (
     _SERVICE_IN_LIST,
     _TABLES,
-    ALLOW_URL_REMOVAL_GUC,
     set_up_streaming_catalog_schema,
 )
-from tests.integration.conftest import skip_if_named_tables_populated
+from tests.integration.conftest import opted_in, skip_if_named_tables_populated
 
 # ``_TABLES`` is parents-before-children (creation order), so its reverse is
 # FK-safe for plain DROP TABLE.
@@ -74,11 +73,6 @@ _INSERT_TRACK = (
 # tracks are discogs_tracklist/compilation).
 _TRACK_SOURCE = "discogs_tracklist"
 _TRACK_SOURCE_TYPE = "compilation"
-
-# Derived from the module constant so the opt-in these tests exercise can't
-# drift from the GUC the guards consult; the guard layer itself stays pinned
-# by the many ``match="allow_url_removal"`` rejection sites below.
-_OPT_IN = f"SELECT set_config('{ALLOW_URL_REMOVAL_GUC}', 'on', true)"
 
 _SPOTIFY_URL = "https://open.spotify.com/album/2u30gztZTylY4RG7IvfXs8"
 _APPLE_URL = "https://music.apple.com/us/album/aluminum-tunes/1443179207"
@@ -407,7 +401,7 @@ class TestSchemaBootstrap:
         with pytest.raises(asyncpg.ForeignKeyViolationError):
             async with pg_pool.acquire() as conn:
                 async with conn.transaction():
-                    await conn.execute(_OPT_IN)
+                    await opted_in(conn)
                     await conn.execute(
                         "DELETE FROM lml_cache.streaming_album WHERE id = $1", album_id
                     )
@@ -769,7 +763,7 @@ class TestAlbumRowGuard:
         album_id = await _make_matched_album(pg_pool)
         async with pg_pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(_OPT_IN)
+                await opted_in(conn)
                 await conn.execute(
                     "UPDATE lml_cache.streaming_album SET discogs_status = 'pending', "
                     "discogs_release_id = NULL WHERE id = $1",
@@ -897,7 +891,7 @@ class TestServiceRowGuard:
                 _INSERT_SERVICE_WITH_SLUG, album_id, "bandcamp", "found", None, "stereolab"
             )
             async with conn.transaction():
-                await conn.execute(_OPT_IN)
+                await opted_in(conn)
                 await conn.execute(
                     "UPDATE lml_cache.streaming_album_service SET slug = NULL "
                     "WHERE album_id = $1 AND service = 'bandcamp'",
@@ -1048,7 +1042,7 @@ class TestServiceRowGuard:
         album_id = await _make_found_service_row(pg_pool)
         async with pg_pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(_OPT_IN)
+                await opted_in(conn)
                 await conn.execute(
                     "UPDATE lml_cache.streaming_album_service SET url = NULL, "
                     "status = 'not_found' WHERE album_id = $1 AND service = 'spotify'",
@@ -1067,7 +1061,7 @@ class TestServiceRowGuard:
         album_id = await _make_found_service_row(pg_pool)
         async with pg_pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(_OPT_IN)
+                await opted_in(conn)
                 await conn.execute(
                     "DELETE FROM lml_cache.streaming_album_service WHERE album_id = $1",
                     album_id,
@@ -1083,7 +1077,7 @@ class TestServiceRowGuard:
         album_id = await _make_found_service_row(pg_pool)
         async with pg_pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(_OPT_IN)
+                await opted_in(conn)
             # Same connection, new transaction: the GUC must not leak.
             with pytest.raises(asyncpg.PostgresError, match="allow_url_removal"):
                 await conn.execute(
@@ -1352,7 +1346,7 @@ class TestTrackRowGuard:
         )
         async with pg_pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(_OPT_IN)
+                await opted_in(conn)
                 await conn.execute(
                     "UPDATE lml_cache.streaming_track_result SET resolution_status = "
                     "'false_positive', spotify_url = NULL WHERE id = $1",
@@ -1380,7 +1374,7 @@ class TestTrackRowGuard:
         track_id = await _make_track(pg_pool, album_id)
         async with pg_pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(_OPT_IN)
+                await opted_in(conn)
                 await conn.execute(
                     "DELETE FROM lml_cache.streaming_track_result WHERE id = $1", track_id
                 )
@@ -1420,7 +1414,7 @@ class TestTruncateGuard:
         album_id = await _make_found_service_row(pg_pool)
         async with pg_pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(_OPT_IN)
+                await opted_in(conn)
                 await conn.execute("TRUNCATE lml_cache.streaming_album_service")
             remaining = await conn.fetchval(
                 "SELECT count(*) FROM lml_cache.streaming_album_service WHERE album_id = $1",
@@ -1561,7 +1555,7 @@ class TestCoverageBaselineGuard:
         await _seed_baseline(pg_pool)
         async with pg_pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(_OPT_IN)
+                await opted_in(conn)
                 await conn.execute(
                     "UPDATE lml_cache.streaming_coverage_baseline SET value = 100 "
                     "WHERE metric = 'apple_music_found'"

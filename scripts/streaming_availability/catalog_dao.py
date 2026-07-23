@@ -3,8 +3,15 @@
 ``StreamingCatalogDAO`` reproduces the ``results_db.ResultsDB`` method surface
 over the PR A row-level schema (``lml_cache.streaming_album`` +
 ``streaming_album_service`` + ``streaming_track_result`` +
-``streaming_coverage_baseline``) so the PR D/E pipeline and script callers
-port by swapping the construction site, not their call sites. The load-bearing
+``streaming_coverage_baseline``): callers that go through ResultsDB *methods*
+port by swapping the construction site, not their call sites. Callers that
+reach past the method surface into ``results_db._db`` raw SQL or
+``_write_lock`` get no such promise — the streaming pipeline's
+compilation-skip and ``--retry-misses`` bulk updates, the track pipeline's
+extract/build-index/validate scans and album rollup, and the bandcamp
+pipeline's searched-not-found sentinel and URL migration all bypass the
+methods today, and PR D rewrites those sites against DAO methods (adding any
+that are missing) rather than swapping a constructor. The load-bearing
 translation decisions:
 
 * **Anti-join pending semantics.** The legacy SQLite schema materialized a
@@ -24,7 +31,11 @@ translation decisions:
   every metadata column: a follow-up write with omitted params never nulls
   collected data at the DAO layer, and the PR A no-regress guards backstop
   anything that slips past (the DAO is a tripwire, not a pre-masker — guard
-  errors and CHECK violations propagate to the caller unmasked).
+  errors and CHECK violations propagate to the caller unmasked). The one
+  deliberate demotion the legacy surface performs — the validate phase's
+  ``api_match`` → ``false_positive`` flip — goes through
+  ``mark_track_false_positive``, which opts into the guard
+  transaction-locally instead of asking callers to speak GUCs.
 * **Loud service validation.** Unknown or unsupported service tokens raise
   ``ValueError`` before any I/O (the legacy DAO silently no-opped on unknown
   services in ``update_result``). Validation precedes pool access so a typo'd
@@ -45,7 +56,7 @@ from typing import Any
 import asyncpg
 
 from entity.sources import PgSource
-from entity.streaming_catalog import set_up_streaming_catalog_schema
+from entity.streaming_catalog import ALLOW_URL_REMOVAL_GUC, set_up_streaming_catalog_schema
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
 
 # Legacy service token -> canonical `_SERVICES` slug (the value stored in
@@ -127,21 +138,33 @@ _WIDE_ALBUM_SELECT = """
         ON bandcamp.album_id = a.id AND bandcamp.service = 'bandcamp'
 """
 
-_INSERT_ALBUM = """
+# Set-based inserts: one statement per batch (columnar arrays + unnest), not
+# one round-trip per row. The PR C full-catalog seed pushes ~65k albums through
+# insert_albums against the remote discogs-cache PG, where a per-row loop pays
+# tens of minutes in pure RTT. ON CONFLICT DO NOTHING arbitrates duplicates
+# both against existing rows and within the batch itself, so interrupted runs
+# stay idempotent; RETURNING id preserves the new-row-count contract.
+_INSERT_ALBUMS_BULK = """
     INSERT INTO lml_cache.streaming_album (
         normalized_artist, normalized_title, display_artist, display_title,
         library_ids, formats, genre, label, is_compilation, is_single
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    SELECT * FROM unnest(
+        $1::text[], $2::text[], $3::text[], $4::text[],
+        $5::jsonb[], $6::jsonb[], $7::text[], $8::text[],
+        $9::boolean[], $10::boolean[]
+    )
     ON CONFLICT (normalized_artist, normalized_title) DO NOTHING
     RETURNING id
 """
 
-_INSERT_TRACK = """
+_INSERT_TRACKS_BULK = """
     INSERT INTO lml_cache.streaming_track_result (
         album_id, artist, title, position, source, source_type
     )
-    VALUES ($1, $2, $3, $4, $5, $6)
+    SELECT * FROM unnest(
+        $1::bigint[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[]
+    )
     ON CONFLICT (album_id, artist, title) DO NOTHING
     RETURNING id
 """
@@ -217,26 +240,27 @@ class StreamingCatalogDAO:
     # -- albums ----------------------------------------------------------
 
     async def insert_albums(self, albums: list[DeduplicatedAlbum]) -> int:
-        """Insert deduplicated albums, ignoring already-known ones; return the new-row count."""
-        inserted = 0
-        async with self._pg.acquire() as conn:
-            for album in albums:
-                new_id = await conn.fetchval(
-                    _INSERT_ALBUM,
-                    album.normalized_artist,
-                    album.normalized_title,
-                    album.display_artist,
-                    album.display_title,
-                    json.dumps(album.library_ids),
-                    json.dumps(album.formats),
-                    album.genre,
-                    album.label,
-                    album.is_compilation,
-                    album.is_single,
-                )
-                if new_id is not None:
-                    inserted += 1
-        return inserted
+        """Insert deduplicated albums, ignoring already-known ones; return the new-row count.
+
+        One set-based statement per call (see ``_INSERT_ALBUMS_BULK``); an
+        empty batch returns 0 without touching PG.
+        """
+        if not albums:
+            return 0
+        rows = await self._pg.fetchall(
+            _INSERT_ALBUMS_BULK,
+            [a.normalized_artist for a in albums],
+            [a.normalized_title for a in albums],
+            [a.display_artist for a in albums],
+            [a.display_title for a in albums],
+            [json.dumps(a.library_ids) for a in albums],
+            [json.dumps(a.formats) for a in albums],
+            [a.genre for a in albums],
+            [a.label for a in albums],
+            [a.is_compilation for a in albums],
+            [a.is_single for a in albums],
+        )
+        return len(rows)
 
     async def get_pending(self, service: str, limit: int = 100) -> list[dict[str, Any]]:
         """Albums still pending for ``service`` (or the ``discogs`` pseudo-service).
@@ -483,22 +507,23 @@ class StreamingCatalogDAO:
     # -- tracks ---------------------------------------------------------------
 
     async def insert_tracks(self, tracks: list[dict[str, Any]]) -> int:
-        """Insert track rows, ignoring already-known ones; return the new-row count."""
-        inserted = 0
-        async with self._pg.acquire() as conn:
-            for track in tracks:
-                new_id = await conn.fetchval(
-                    _INSERT_TRACK,
-                    track["album_id"],
-                    track["artist"],
-                    track["title"],
-                    track.get("position"),
-                    track["source"],
-                    track["source_type"],
-                )
-                if new_id is not None:
-                    inserted += 1
-        return inserted
+        """Insert track rows, ignoring already-known ones; return the new-row count.
+
+        One set-based statement per call (see ``_INSERT_TRACKS_BULK``); an
+        empty batch returns 0 without touching PG.
+        """
+        if not tracks:
+            return 0
+        rows = await self._pg.fetchall(
+            _INSERT_TRACKS_BULK,
+            [t["album_id"] for t in tracks],
+            [t["artist"] for t in tracks],
+            [t["title"] for t in tracks],
+            [t.get("position") for t in tracks],
+            [t["source"] for t in tracks],
+            [t["source_type"] for t in tracks],
+        )
+        return len(rows)
 
     async def get_pending_tracks(self, limit: int = 100) -> list[dict[str, Any]]:
         return await self._pg.fetchall(
@@ -552,6 +577,28 @@ class StreamingCatalogDAO:
             deezer_url,
             deezer_confidence,
         )
+
+    async def mark_track_false_positive(self, track_id: int) -> None:
+        """Demote a resolved track to ``false_positive`` (the validate phase).
+
+        The one deliberate status demotion in the legacy surface: URL
+        validation flips ``api_match`` tracks whose URLs fail service-metadata
+        checks. The PR A no-regress guard blocks demotions by default, so this
+        method opts in via ``set_config(..., is_local => true)`` inside its own
+        transaction — the opt-in covers exactly this UPDATE and evaporates at
+        COMMIT, never leaking to other statements on the pooled connection.
+        Collected URLs and resolution metadata stay in place as the audit
+        trail (legacy ``phase_validate`` only ever flipped the status).
+        """
+        async with self._pg.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT set_config($1, 'on', true)", ALLOW_URL_REMOVAL_GUC)
+                await conn.execute(
+                    "UPDATE lml_cache.streaming_track_result SET"
+                    " resolution_status = 'false_positive', checked_at = now()"
+                    " WHERE id = $1",
+                    track_id,
+                )
 
     async def get_track_stats(self) -> dict[str, int]:
         """Track counts by resolution status plus their total (legacy shape)."""

@@ -1,8 +1,9 @@
 """Integration (``@pytest.mark.pg``) tests for ``StreamingCatalogDAO`` (LML#842 PR B).
 
 The PG rewrite of ``scripts/streaming_availability/results_db.py``'s
-``ResultsDB``: same method surface (so the PR D/E callers port by
-construction-site changes), backed by the PR A row-level schema
+``ResultsDB``: same method surface (so PR D/E callers that go through
+ResultsDB methods port by construction-site changes; the raw ``_db``
+reach-ins get rewritten in PR D), backed by the PR A row-level schema
 (``lml_cache.streaming_album`` + ``streaming_album_service`` +
 ``streaming_track_result`` + ``streaming_coverage_baseline``) instead of the
 whole-file SQLite lineage. The load-bearing contracts pinned here:
@@ -256,6 +257,20 @@ class TestInsertAlbums:
         assert await dao.insert_albums([_make_album()]) == 1
         assert await dao.insert_albums([_make_album()]) == 0
         assert (await dao.get_stats())["total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_insert_skips_intra_batch_duplicates(self, dao) -> None:
+        """Two rows sharing a normalized key inside ONE batch: first wins,
+        duplicate skipped. Pins the set-based single-statement insert path,
+        where intra-batch conflicts are arbitrated by ON CONFLICT DO NOTHING
+        rather than by the earlier row already being committed."""
+        batch = [
+            _make_album(),
+            _make_album(display_title="Aluminum Tunes (reissue)"),
+            _make_album(**_PRATT),
+        ]
+        assert await dao.insert_albums(batch) == 2
+        assert (await dao.get_stats())["total"] == 2
 
     @pytest.mark.asyncio
     async def test_provenance_json_round_trips_as_str(self, dao) -> None:
@@ -674,6 +689,54 @@ class TestTracks:
         await dao.update_track_resolution(track_id, "local_match", spotify_url=_SPOTIFY_URL)
         with pytest.raises(asyncpg.exceptions.PostgresError, match="allow_url_removal"):
             await dao.update_track_resolution(track_id, "not_found")
+
+    @pytest.mark.asyncio
+    async def test_insert_tracks_skips_intra_batch_duplicates(self, dao, pg_pool) -> None:
+        """Same intra-batch arbitration pin as the album insert: a duplicate
+        (album_id, artist, title) inside one batch is skipped, not an error."""
+        album_id = await _seed_album(dao, pg_pool)
+        batch = [
+            _make_track(album_id),
+            _make_track(album_id, position="B7"),
+            _make_track(album_id, artist="Jessica Pratt", title="Back, Baby"),
+        ]
+        assert await dao.insert_tracks(batch) == 2
+
+    @pytest.mark.asyncio
+    async def test_mark_track_false_positive_demotes_api_match(self, dao, pg_pool) -> None:
+        """The one deliberate demotion in the legacy surface: the track
+        pipeline's validate phase flips ``api_match`` tracks whose URLs fail
+        service-metadata validation to ``false_positive``. The DAO opts into
+        the PR A no-regress guard transaction-locally for exactly this write;
+        the collected URLs stay in place as the audit trail (legacy behavior —
+        ``phase_validate`` only ever flipped the status)."""
+        album_id = await _seed_album(dao, pg_pool)
+        track_id = await _seed_track(dao, pg_pool, album_id)
+        await dao.update_track_resolution(track_id, "api_match", spotify_url=_SPOTIFY_URL)
+        await dao.mark_track_false_positive(track_id)
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM lml_cache.streaming_track_result WHERE id = $1", track_id
+            )
+        assert row["resolution_status"] == "false_positive"
+        assert row["spotify_url"] == _SPOTIFY_URL
+        assert row["checked_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_mark_track_false_positive_opt_in_does_not_leak(self, dao, pg_pool) -> None:
+        """The demotion's guard opt-in is transaction-local: a plain demotion
+        attempted right after — very likely on the same pooled connection —
+        must still trip the no-regress guard."""
+        album_id = await _seed_album(dao, pg_pool)
+        demoted_id = await _seed_track(dao, pg_pool, album_id)
+        guarded_id = await _seed_track(
+            dao, pg_pool, album_id, artist="Jessica Pratt", title="Back, Baby"
+        )
+        await dao.update_track_resolution(demoted_id, "api_match", spotify_url=_SPOTIFY_URL)
+        await dao.update_track_resolution(guarded_id, "api_match", deezer_url=_DEEZER_URL)
+        await dao.mark_track_false_positive(demoted_id)
+        with pytest.raises(asyncpg.exceptions.PostgresError, match="allow_url_removal"):
+            await dao.update_track_resolution(guarded_id, "not_found")
 
     @pytest.mark.asyncio
     async def test_get_track_stats(self, dao, pg_pool) -> None:
