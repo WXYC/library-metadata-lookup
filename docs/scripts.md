@@ -204,6 +204,23 @@ uv run python -m scripts.seed_library_release_overrides \
 
 `load_rows` opens the CSV `utf-8-sig` (BOM-tolerant), drops rows with a missing/non-integer/non-positive id, and dedupes by `library_id` (last row wins — a later hand-correction supersedes an earlier automated entry). The seeder writes the override table only; minting `entity.release_identity` for the pinned releases and warming the release cache are separate optional operational steps via the existing HTTP surfaces (`POST /api/v1/identity/resolve`, `POST /api/v1/cache/refresh-for-identities`) against a running service.
 
+## Per-Consumer API Key Admin (`scripts/api_keys/`)
+
+Seed / revoke / list CLI for `lml_cache.api_keys` (the [LML per-consumer API keys plan](plans/lml-per-consumer-api-keys.md)), which replaces the single shared `LML_API_KEY` with one row per consumer (tubafrenzy, backend-service, wxyc-canary, the operator drain script) so rotation is issue-new -> confirm -> revoke-old instead of a synchronized cutover. `core/auth.py:require_lml_key` dual-accepts a resolving table-backed key alongside the still-live legacy `LML_API_KEY` for the length of the migration.
+
+**Safety:** `seed` prints the plaintext token to stdout **exactly once**, with a "will not be shown again" warning, and never logs it -- only its SHA-256 hash reaches `lml_cache.api_keys`. Hand the plaintext to the consumer's own secret store immediately. `revoke` is idempotent (a second revoke of the same id logs a WARNING, not an error). `list` never prints `key_hash` or the plaintext -- it is the direct operational answer to "can we delete this key yet," via `last_used_at`. Targets the shared discogs-cache PG via `DATABASE_URL_DISCOGS`; each subcommand bootstraps the schema (idempotent `IF NOT EXISTS`) before its query.
+
+```bash
+# mint a new key for a consumer -- prints the plaintext EXACTLY ONCE
+uv run python -m scripts.api_keys seed --caller wxyc-canary --note "initial rollout"
+
+# revoke by id (idempotent)
+uv run python -m scripts.api_keys revoke --id 4
+
+# list operational metadata (never key_hash or plaintext)
+uv run python -m scripts.api_keys list
+```
+
 ## Master → Release Resolver (`scripts/resolve_master_overrides.py`)
 
 Phase 2 of the Alex L. import (LML#858). The bulk of Alex's dataset links each card to a Discogs **master** id, not a release — and a master yields no single tracklist. This read-only pre-step converts the master-typed rows of `merged_discogs_links.csv` into concrete release ids and emits CSVs the [seeder](#library-release-override-seeder-scriptsseed_library_release_overridespy) consumes **unchanged** (it reads `card_catalog_id` + `discogs_release_id` by name; the extra `master_id,tier,confidence,reason` audit columns are ignored). It only reads the shared discogs-cache (`DATABASE_URL_DISCOGS`) — it never writes.
