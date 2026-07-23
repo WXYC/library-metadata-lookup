@@ -6,14 +6,15 @@ over the PR A row-level schema (``lml_cache.streaming_album`` +
 ``streaming_coverage_baseline``): callers that go through ResultsDB *methods*
 port by swapping the construction site, not their call sites — except the
 demotion-exposed calls the *Upsert discipline* bullet names (the validate
-phase's ``false_positive`` write and the album pipeline's two cross-service
+phase's ``false_positive`` write and the album pipeline's two
 ``not_found`` miss writes), which PR D must rewrite. Callers that
 reach past the method surface into ``results_db._db`` raw SQL or
 ``_write_lock`` get no such promise — the streaming pipeline's
 compilation-skip and ``--retry-misses`` bulk updates, the track pipeline's
 extract/build-index/validate scans and album rollup, and the bandcamp
-pipeline's searched-not-found sentinel and URL migration all bypass the
-methods today, and PR D rewrites those sites against DAO methods (adding any
+pipeline's slug-discovery writes (found-slug + searched-not-found
+sentinel), Wikidata slug loader, and URL migration all bypass the methods
+today, and PR D rewrites those sites against DAO methods (adding any
 that are missing) rather than swapping a constructor. The load-bearing
 translation decisions:
 
@@ -42,18 +43,24 @@ translation decisions:
   ``update_track_resolution`` rejects ``'false_positive'`` outright, so the
   legacy validate-phase demotion call fails loudly at port time instead of
   tripping the trigger mid-drain. That static tripwire is track-side only:
-  the legacy album pipeline's deezer- and spotify-stage miss handlers
+  the legacy album pipeline's miss handlers
   (``scripts/streaming_availability/__main__.py``) also demote through the
-  method surface — each writes ``update_result(album_id, "spotify",
-  "not_found")`` that can land on a row already ``'found'`` for spotify,
+  method surface — a deezer miss writes ``update_result(album_id,
+  "spotify", "not_found")`` cross-service ("not digitally distributed"),
+  and a spotify-stage miss writes the same status for spotify itself —
+  and either write can land on a row already ``'found'`` for spotify,
   because the pipeline admits every deezer-pending album regardless of
-  spotify status and found-with-deezer-pending rows are a real legacy state
-  (the ``deezer_*`` columns arrived by ``_migrate`` with ``DEFAULT
-  'pending'`` after Spotify-only runs had populated ``spotify_status``).
+  spotify status. What mints those rows is the ``--retry-misses`` reset
+  (same file): it flips ``deezer_status`` ``not_found``→``pending``
+  unconditionally while its spotify reset only covers
+  ``spotify_status='not_found' AND deezer_status='pending'``, so every
+  spotify-found/deezer-not_found album (29,861 of 65,147 in the 2026-04
+  snapshot) re-enters the deezer stage with spotify still ``'found'``.
   ``'not_found'`` is usually legal, so no static rejection is possible
-  there; PR D must rewrite those two call sites as conditional writes (skip
-  services already resolved) rather than re-point them, or the album drain
-  trips the found→``not_found`` no-regress trigger mid-batch.
+  there; PR D must rewrite the two miss-handler call sites as conditional
+  writes (skip services already resolved) and port ``--retry-misses`` in
+  the same change, or the first retried drain trips the
+  found→``not_found`` no-regress trigger per re-missed row.
 * **Loud service validation.** Unknown or unsupported service tokens raise
   ``ValueError`` before any I/O (the legacy DAO silently no-opped on unknown
   services in ``update_result``). Validation precedes pool access so a typo'd
@@ -578,9 +585,9 @@ class StreamingCatalogDAO:
         validate phase's demotion call is a site PR D must rewrite, not
         merely re-point); accepting it here would let the PR A trigger kill
         a drain mid-phase with a RaiseError instead of failing loudly at
-        the call site. The album pipeline's cross-service ``not_found``
-        miss writes carry the same trigger exposure but admit no static
-        tripwire — see the module docstring's *Upsert discipline* bullet.
+        the call site. The album pipeline's ``not_found`` miss writes
+        carry the same trigger exposure but admit no static tripwire —
+        see the module docstring's *Upsert discipline* bullet.
         """
         if status == "false_positive":
             raise ValueError(
