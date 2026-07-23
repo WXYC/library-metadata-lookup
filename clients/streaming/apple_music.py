@@ -54,6 +54,7 @@ from clients.streaming.matching import (
     record_match_telemetry,
     title_subset_is_degenerate,
 )
+from core.search import resolve_positive_int_env
 from streaming.models import SourceMatch
 
 
@@ -108,11 +109,42 @@ _JWT_LIFETIME_SECONDS = 1200
 
 _SEARCH_URL = "https://api.music.apple.com/v1/catalog/us/search"
 
-# Apple's published catalog quota and our concurrency ceiling. (60, 60) =
-# 1 req/sec sustained = 3600 req/h; sized below Apple's per-team daily cap
-# with comfort margin for request-o-matic bursts.
-_RATE_LIMIT = (60.0, 60.0)
+# Apple Music AsyncLimiter rate. The (max_rate, time_period) window is a fixed
+# 60 s; only the per-minute ceiling (max_rate) is tunable, via
+# LML_APPLE_MUSIC_RATE_PER_MIN. The default 60/min = 1 req/sec sustained is a
+# SELF-imposed throttle, NOT an Apple-published limit — Apple publishes no
+# official Apple Music API rate limit, and at 1 req/s the 4 s probe wait_for
+# ceiling nulls a majority of live find_track_url probes under load. The knob
+# lets the ceiling be widened from Railway with no redeploy + instant rollback
+# (mirrors LML_STREAMING_WARM_CONCURRENCY). Raise it in steps
+# (60 -> 300 -> 600/min = 1 -> 5 -> 10 req/s, still under the ~20 req/s
+# community estimate) watching the 429-count + null-rate; the token is SHARED
+# with staging + the docs/scripts.md resolver scripts, so the safe ceiling is
+# the aggregate across all consumers, not prod /lookup alone.
+_APPLE_MUSIC_RATE_PER_MIN_DEFAULT = 60
+_APPLE_MUSIC_RATE_PERIOD_S = 60.0
+APPLE_MUSIC_RATE_PER_MIN_ENV_VAR = "LML_APPLE_MUSIC_RATE_PER_MIN"
 _SEMAPHORE_LIMIT = 5
+
+
+def resolve_apple_music_rate_limit() -> tuple[float, float]:
+    """Resolve the Apple Music ``AsyncLimiter`` ``(max_rate, time_period)``.
+
+    ``max_rate`` (requests per fixed 60 s window) is env-tunable via
+    :data:`APPLE_MUSIC_RATE_PER_MIN_ENV_VAR`; the window is fixed at 60 s so
+    only the per-minute ceiling moves. The default preserves the historical
+    1 req/s self-throttle when the var is unset (zero-behavior-change on
+    merge). Read per-call (not at import) via :func:`resolve_positive_int_env`
+    so the knob honors a runtime override and tests can monkeypatch it — see
+    that helper for the unparseable/zero/negative -> default-with-WARN contract
+    (a typo must not throttle to 0, which would serialize every probe).
+    """
+    max_rate = resolve_positive_int_env(
+        APPLE_MUSIC_RATE_PER_MIN_ENV_VAR, _APPLE_MUSIC_RATE_PER_MIN_DEFAULT
+    )
+    return (float(max_rate), _APPLE_MUSIC_RATE_PERIOD_S)
+
+
 # Latency budget: ``find_track_url`` is on the lookup hot path. With
 # ``_MAX_RETRIES=4`` and a 60s ``Retry-After`` cap, a single sustained 429
 # storm pinned one of 5 Semaphore slots for up to 240s — bulk burst then
@@ -156,7 +188,9 @@ class AppleMusicClient(BaseStreamingClient):
     """
 
     def __init__(self, team_id: str, key_id: str, private_key: str):
-        super().__init__(rate_limit=_RATE_LIMIT, semaphore_limit=_SEMAPHORE_LIMIT)
+        super().__init__(
+            rate_limit=resolve_apple_music_rate_limit(), semaphore_limit=_SEMAPHORE_LIMIT
+        )
         self._team_id = team_id
         self._key_id = key_id
         # Parse once at startup so per-request cost is just the ECDSA

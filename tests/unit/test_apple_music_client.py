@@ -19,9 +19,12 @@ import pytest
 
 from clients.streaming.apple_music import (
     _APPLE_MUSIC_MATCH_FLOOR,
+    _APPLE_MUSIC_RATE_PER_MIN_DEFAULT,
+    APPLE_MUSIC_RATE_PER_MIN_ENV_VAR,
     AppleMusicClient,
     _extract_release_year,
     _parse_retry_after,
+    resolve_apple_music_rate_limit,
 )
 
 TEAM_ID = "92V374HC38"
@@ -90,6 +93,61 @@ def _albums_response(albums: list[dict] | None = None) -> httpx.Response:
 def _client(es256_keypair: tuple[str, str]) -> AppleMusicClient:
     private_pem, _ = es256_keypair
     return AppleMusicClient(team_id=TEAM_ID, key_id=KEY_ID, private_key=private_pem)
+
+
+class TestRateLimitEnvKnob:
+    """The Apple Music ``AsyncLimiter`` rate is LML's own self-imposed throttle
+    (``(60, 60)`` = 1 req/s sustained), NOT an Apple-published limit — Apple
+    publishes no official Apple Music API rate limit. At 1 req/s the 4 s probe
+    ``wait_for`` ceiling nulls a majority of live probes under load, so the
+    per-minute ceiling is made an env knob (``LML_APPLE_MUSIC_RATE_PER_MIN``)
+    to widen it from Railway with no redeploy + instant rollback, mirroring
+    ``LML_STREAMING_WARM_CONCURRENCY``. The 60 s window is fixed; only
+    ``max_rate`` moves. Unset ⇒ unchanged 1 req/s (zero-behavior-change on
+    merge)."""
+
+    def test_default_is_one_req_per_second(self, monkeypatch):
+        monkeypatch.delenv(APPLE_MUSIC_RATE_PER_MIN_ENV_VAR, raising=False)
+        assert _APPLE_MUSIC_RATE_PER_MIN_DEFAULT == 60
+        assert resolve_apple_music_rate_limit() == (
+            float(_APPLE_MUSIC_RATE_PER_MIN_DEFAULT),
+            60.0,
+        )
+
+    def test_env_var_raises_the_per_minute_ceiling(self, monkeypatch):
+        monkeypatch.setenv(APPLE_MUSIC_RATE_PER_MIN_ENV_VAR, "300")
+        assert resolve_apple_music_rate_limit() == (300.0, 60.0)
+
+    def test_window_stays_fixed_at_60s(self, monkeypatch):
+        # Only max_rate is tunable; the time_period window never moves.
+        monkeypatch.setenv(APPLE_MUSIC_RATE_PER_MIN_ENV_VAR, "600")
+        _, time_period = resolve_apple_music_rate_limit()
+        assert time_period == 60.0
+
+    @pytest.mark.parametrize("bad", ["abc", "0", "-5", "3.5", ""])
+    def test_unparseable_or_nonpositive_falls_back_to_default(self, monkeypatch, bad):
+        # An operator typo must not throttle to 0 (would serialize every probe)
+        # or crash /lookup — fall back to the 1 req/s default (with a WARN, per
+        # resolve_positive_int_env's contract).
+        monkeypatch.setenv(APPLE_MUSIC_RATE_PER_MIN_ENV_VAR, bad)
+        assert resolve_apple_music_rate_limit() == (
+            float(_APPLE_MUSIC_RATE_PER_MIN_DEFAULT),
+            60.0,
+        )
+
+    def test_client_applies_env_rate_to_its_limiter(self, es256_keypair, monkeypatch):
+        # Wiring assertion: constructing the client reads the knob at __init__
+        # (runtime, not import) and hands it to the AsyncLimiter.
+        monkeypatch.setenv(APPLE_MUSIC_RATE_PER_MIN_ENV_VAR, "300")
+        client = _client(es256_keypair)
+        assert client._rate_limiter.max_rate == 300.0
+        assert client._rate_limiter.time_period == 60.0
+
+    def test_client_default_limiter_is_one_req_per_second(self, es256_keypair, monkeypatch):
+        monkeypatch.delenv(APPLE_MUSIC_RATE_PER_MIN_ENV_VAR, raising=False)
+        client = _client(es256_keypair)
+        assert client._rate_limiter.max_rate == 60.0
+        assert client._rate_limiter.time_period == 60.0
 
 
 class TestConstruction:
