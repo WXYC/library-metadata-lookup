@@ -251,7 +251,11 @@ class TestSetUpStreamingCatalogSchema:
         assert joined.count("CREATE OR REPLACE TRIGGER") == 8
         assert joined.count("BEFORE TRUNCATE ON") == 4
         assert "CREATE INDEX IF NOT EXISTS idx_streaming_album_service_status" in joined
-        assert "CREATE INDEX IF NOT EXISTS idx_streaming_track_result_status" in joined
+        assert (
+            "CREATE INDEX IF NOT EXISTS idx_streaming_track_result_status_id\n"
+            "    ON lml_cache.streaming_track_result (resolution_status, id)" in joined
+        )
+        assert "DROP INDEX IF EXISTS lml_cache.idx_streaming_track_result_status" in joined
 
     async def test_runs_as_one_transaction_on_one_connection(self):
         # All-or-nothing: a mid-boot failure must never leave tables standing
@@ -339,7 +343,9 @@ class TestSetUpStreamingCatalogSchema:
         # legitimately contains "BEFORE UPDATE OR DELETE" — so assert on the
         # statement head instead: after the two-statement preamble (SET LOCAL
         # + advisory lock SELECT, both row-neutral), every statement is CREATE,
-        # ALTER, or the widen-only DO block (which only ever EXECUTEs an ALTER).
+        # ALTER, the widen-only DO block (which only ever EXECUTEs an ALTER), or
+        # a DROP INDEX IF EXISTS (row-neutral DDL: the track status-index
+        # reshape drops the superseded single-column form).
         pg = _FakePgSource()
 
         await set_up_streaming_catalog_schema(pg)
@@ -349,6 +355,6 @@ class TestSetUpStreamingCatalogSchema:
         assert ddl, "bootstrap issued no DDL"
         for sql in ddl:
             head = sql.lstrip().split()[0]
-            assert head in {"CREATE", "ALTER", "DO"}, (
+            assert head in {"CREATE", "ALTER", "DO", "DROP"}, (
                 f"non-DDL statement in bootstrap: {sql[:80]!r}"
             )

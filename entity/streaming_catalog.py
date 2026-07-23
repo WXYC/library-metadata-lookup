@@ -293,10 +293,21 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_track_result (
 )\
 """
 
-# Same provisional-shape caveat as the album-service status index above.
+# ``get_pending_tracks`` / ``get_local_miss_tracks`` scan a single
+# ``resolution_status`` ORDER BY id LIMIT n; the composite
+# ``(resolution_status, id)`` serves both the equality filter and the id
+# ordering from one index (ordered index read + early LIMIT stop, no Sort
+# node). Reshaped from the original single-column ``(resolution_status)`` now
+# that PR B's real track scans have landed: ``CREATE INDEX IF NOT EXISTS``
+# never redefines an existing index, so the new shape takes a NEW name and the
+# old one is dropped first. Both statements are idempotent — the drop is a
+# no-op once the old index is gone, the create once the new one exists.
+_DDL_TRACK_RESULT_STATUS_INDEX_DROP = (
+    "DROP INDEX IF EXISTS lml_cache.idx_streaming_track_result_status"
+)
 _DDL_TRACK_RESULT_STATUS_INDEX = (
-    "CREATE INDEX IF NOT EXISTS idx_streaming_track_result_status\n"
-    "    ON lml_cache.streaming_track_result (resolution_status)"
+    "CREATE INDEX IF NOT EXISTS idx_streaming_track_result_status_id\n"
+    "    ON lml_cache.streaming_track_result (resolution_status, id)"
 )
 
 # Write-side floor metrics (one row per metric, e.g. 'apple_music_found').
@@ -652,6 +663,7 @@ _DDL_STATEMENTS = (
     _DDL_ALBUM_SERVICE_WIDEN_CHECK,
     _DDL_ALBUM_SERVICE_STATUS_INDEX,
     _DDL_TRACK_RESULT,
+    _DDL_TRACK_RESULT_STATUS_INDEX_DROP,
     _DDL_TRACK_RESULT_STATUS_INDEX,
     _DDL_COVERAGE_BASELINE,
     _DDL_GUARD_ALBUM_FN,

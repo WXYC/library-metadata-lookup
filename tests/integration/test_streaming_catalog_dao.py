@@ -36,6 +36,7 @@ import pytest
 import pytest_asyncio
 
 from entity.streaming_catalog import _TABLES
+from routers.admin import _STREAMING_COVERAGE_METRICS
 from scripts.streaming_availability.catalog_dao import StreamingCatalogDAO
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
 from tests.integration.conftest import (
@@ -770,6 +771,22 @@ class TestTracks:
             "on_streaming": True,
         }
 
+    @pytest.mark.asyncio
+    async def test_get_album_track_summary_counts_only_resolved_statuses(
+        self, dao, pg_pool
+    ) -> None:
+        """``resolved`` is a direct count of the two resolved statuses, not a
+        subtraction of the enumerated unresolved ones — a novel/unmapped
+        status (a future resolution_status, or a raw pipeline write the
+        subtraction list never learned about) must not silently inflate it."""
+        album_id = await _seed_album(dao, pg_pool)
+        track_id = await _seed_track(dao, pg_pool, album_id)
+        await dao.update_track_resolution(track_id, "skipped")  # novel, unmapped status
+        summary = await dao.get_album_track_summary(album_id)
+        assert summary["total"] == 1
+        assert summary["resolved"] == 0
+        assert summary["on_streaming"] is False
+
 
 @pytest.mark.pg
 class TestCoverageBaseline:
@@ -788,6 +805,15 @@ class TestCoverageBaseline:
                 "SELECT metric, value FROM lml_cache.streaming_coverage_baseline"
             )
         assert {r["metric"]: r["value"] for r in rows} == metrics
+
+    @pytest.mark.asyncio
+    async def test_refresh_metric_keys_match_admin_constant(self, dao) -> None:
+        """The floor keys the DAO writes are exactly the reader's
+        ``routers/admin.py`` ``_STREAMING_COVERAGE_METRICS`` set — pinning the
+        two hardcoded lists together so a future edit to one that forgets the
+        other fails here instead of silently desyncing the export check."""
+        floors = await dao.refresh_coverage_baseline()
+        assert set(floors) == set(_STREAMING_COVERAGE_METRICS)
 
     @pytest.mark.asyncio
     async def test_refresh_computes_live_counts(self, dao, pg_pool) -> None:
@@ -821,17 +847,27 @@ class TestCoverageBaseline:
         assert second["albums"] == 2
 
     @pytest.mark.asyncio
-    async def test_refresh_lowering_propagates_guard_error(self, dao, pg_pool) -> None:
-        """A refresh computing LESS coverage than the stored floor must raise
-        through PR A's baseline guard — the DAO never pre-masks the tripwire."""
+    async def test_refresh_lowering_holds_the_floor(self, dao, pg_pool) -> None:
+        """A refresh computing LESS coverage than the stored floor must not
+        lower it: the baseline is a monotonic high-water mark. Each metric
+        ratchets up only (``GREATEST(live, stored)``), so a live regression —
+        e.g. a sanctioned ``mark_track_false_positive`` demotion between runs —
+        holds the floor rather than lowering it or aborting the whole refresh
+        through PR A's guard. Regression *detection* is the read-side export
+        check's job, not this writer's."""
         await _seed_album(dao, pg_pool)
         async with pg_pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO lml_cache.streaming_coverage_baseline (metric, value) "
                 "VALUES ('albums', 5)"
             )
-        with pytest.raises(asyncpg.exceptions.PostgresError, match="allow_url_removal"):
-            await dao.refresh_coverage_baseline()
+        floors = await dao.refresh_coverage_baseline()
+        assert floors["albums"] == 5  # held at the high-water mark, not lowered to live 1
+        async with pg_pool.acquire() as conn:
+            stored = await conn.fetchval(
+                "SELECT value FROM lml_cache.streaming_coverage_baseline WHERE metric = 'albums'"
+            )
+        assert stored == 5
 
 
 @pytest.mark.pg

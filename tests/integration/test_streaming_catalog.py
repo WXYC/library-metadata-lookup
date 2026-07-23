@@ -260,11 +260,19 @@ class TestSchemaBootstrap:
     async def test_boot_installs_status_indexes(self, pg_pool):
         async with pg_pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT indexname FROM pg_indexes WHERE schemaname = 'lml_cache' "
-                "AND indexname = ANY($1::text[])",
-                ["idx_streaming_album_service_status", "idx_streaming_track_result_status"],
+                "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'lml_cache' "
+                "AND indexname LIKE 'idx_streaming_%status%'"
             )
-        assert len(rows) == 2
+        by_name = {r["indexname"]: r["indexdef"] for r in rows}
+        # exactly these two — the reshaped composite track index has superseded
+        # (dropped) the original single-column idx_streaming_track_result_status
+        assert set(by_name) == {
+            "idx_streaming_album_service_status",
+            "idx_streaming_track_result_status_id",
+        }
+        # the composite serves get_pending_tracks / get_local_miss_tracks's
+        # (resolution_status = X ORDER BY id LIMIT n) from one index
+        assert "(resolution_status, id)" in by_name["idx_streaming_track_result_status_id"]
 
     @pytest.mark.asyncio
     async def test_service_check_rejects_unknown_service(self, pg_pool):

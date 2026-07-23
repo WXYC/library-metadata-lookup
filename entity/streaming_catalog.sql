@@ -222,10 +222,20 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_track_result (
     )
 );
 
--- Same provisional-shape caveat as the album-service status index above.
+-- Reshape of the track status index: drop the original single-column
+-- (resolution_status) form so the composite below can supersede it under a
+-- new name (CREATE INDEX IF NOT EXISTS never redefines an existing index).
+-- No-op once the old index is gone.
 
-CREATE INDEX IF NOT EXISTS idx_streaming_track_result_status
-    ON lml_cache.streaming_track_result (resolution_status);
+DROP INDEX IF EXISTS lml_cache.idx_streaming_track_result_status;
+
+-- get_pending_tracks / get_local_miss_tracks scan one resolution_status
+-- ORDER BY id LIMIT n; the composite (resolution_status, id) serves both the
+-- equality filter and the id ordering from one index (ordered read + early
+-- LIMIT stop, no Sort node).
+
+CREATE INDEX IF NOT EXISTS idx_streaming_track_result_status_id
+    ON lml_cache.streaming_track_result (resolution_status, id);
 
 -- Write-side floor metrics (one row per metric, e.g. 'apple_music_found').
 -- Refreshed only at the end of successful pipeline runs — never by the daily
