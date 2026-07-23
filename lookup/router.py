@@ -52,6 +52,7 @@ from entity.store import EntityStore
 from generated.api_models import CacheStats
 from identity.dependencies import get_entity_store
 from library.db import LibraryDB
+from lookup.enrichment import SKIPPED_PREFETCH_STAT_KEY
 from lookup.models import (
     BulkLookupRequest,
     BulkLookupResponse,
@@ -247,6 +248,9 @@ _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     # LML#907 event-loop-lag gauge: seeded to 0 so the series is present even
     # when the sampler is off / unsampled (the stamp is skipped, leaving the 0).
     EVENT_LOOP_LAG_STAT_KEY,
+    # LML#507: top-1 prefetch skip counter, seeded to 0 so the skip rate is an
+    # alertable baseline series on the #683 cache.* surface.
+    SKIPPED_PREFETCH_STAT_KEY,
 )
 """LML-specific keys seeded into every request's cache_stats dict so PostHog
 and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and

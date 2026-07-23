@@ -3637,6 +3637,271 @@ class TestArtistIdentitySplitGate:
         )
 
 
+class TestTop1PrefetchSynthesisSkip:
+    """LML#507: skip the top-1 Discogs prefetch (``fetch_top1_release_details``)
+    when the top-1 item's synthesis-path outcome will consume neither the
+    album-derived nor the artist-derived fields.
+
+    ``should_prefetch_top1 = top1_library_row_acceptable or
+    top1_library_row_artist_verified``, computed at ``enrich_artwork_results``
+    scope for ``items_with_artwork[0]`` before the prefetch is awaited. Both
+    inputs mirror the per-item gates in ``lookup/enrichment/item.py``
+    (``compute_row_title_matches_requested_album`` / ``_artist_pair_verified``),
+    so gating the once-per-request prefetch on the top-1 item's predicate is
+    correct by construction: ``is_album_derived_eligible`` /
+    ``is_artist_derived_eligible`` are both ``is_top1``-gated, so no non-top-1
+    item can ever consume the prefetch's output.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wholly_fuzzy_miss_skips_prefetch(self):
+        """Wholly-fuzzy-miss synthesis path: the top-1 library row's title
+        does not match the requested album AND its artist does not verify
+        against the requested artist. Neither ``top1_library_row_acceptable``
+        nor ``top1_library_row_artist_verified`` holds, so the prefetch must
+        not fire at all — its output would be pure waste (LML#507's core
+        win). The response still surfaces the LML#401/BS#1185 synthesized
+        sentinel with the Apple-probe artwork; only the wasted Discogs
+        round-trip is cut."""
+        from clients.streaming.apple_music import AppleMusicTrackMatch
+
+        item = make_library_item(id=42, artist="Larry Gus", title="Somewhere Waiting")
+        larry_gus_artwork = make_discogs_result(
+            release_id=7,
+            artist="Larry Gus",
+            album="Somewhere Waiting",
+            artwork_url="https://example.com/larry-gus-WRONG.jpg",
+            release_year=2014,
+        )
+        probe_match = AppleMusicTrackMatch(
+            url="https://music.apple.com/us/song/rita/9",
+            artwork_url="https://is1-ssl.mzstatic.com/image/thumb/sessa.jpg",
+            release_year=2022,
+            album_verified=True,
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+        apple_music.find_track_url = AsyncMock(return_value=probe_match.url)
+
+        discogs_service = AsyncMock()
+
+        # ``extended=False`` (the default): the unrelated LML#504 per-item
+        # gate in ``item.py`` additionally suppresses probe artwork when
+        # ``extended`` AND the library row's artist fails to verify — this
+        # test isolates the LML#507 prefetch-skip behavior from that gate,
+        # which is exercised separately in ``TestArtistIdentitySplitGate``.
+        results = await enrich_artwork_results(
+            [(item, larry_gus_artwork)],
+            discogs_service,
+            song="Rita",
+            album="Pequena Vertigem de Amor",
+            artist="Sessa",
+            apple_music=apple_music,
+        )
+
+        # The wasted prefetch never fires.
+        discogs_service.get_release.assert_not_called()
+        discogs_service.get_artist_details.assert_not_called()
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # BS#1185 sentinel contract preserved — synthesis path taken.
+        assert enriched.release_id == 0
+        assert enriched.release_url == ""
+        # Apple-probe artwork still surfaces — the skip only cuts the
+        # wasted Discogs prefetch, not the synthesis-path Apple probe.
+        assert enriched.artwork_url == probe_match.artwork_url
+        assert enriched.release_year == probe_match.release_year
+
+    @pytest.mark.asyncio
+    async def test_same_artist_sibling_prefetch_still_fires(self):
+        """Yenbett-vs-Tzenni same-artist-sibling shape: the library row's
+        title fails the LML#477 floor, but its artist verifies against the
+        requested artist. ``top1_library_row_artist_verified`` alone is
+        enough to keep ``should_prefetch_top1`` True, so the prefetch must
+        still fire — otherwise LML#504's bio-recovery cohort would regress
+        back to the pre-#504 suppression."""
+        item = make_library_item(id=42, artist="Noura Mint Seymali", title="Tzenni")
+        tzenni_artwork = make_discogs_result(
+            release_id=1,
+            artist="Noura Mint Seymali",
+            album="Tzenni",
+            artwork_url="https://example.com/tzenni-WRONG.jpg",
+            release_year=2014,
+        )
+        probe_match = AppleMusicTrackMatch(
+            url="https://music.apple.com/us/song/hebebeb-zrag/9",
+            artwork_url="https://is1-ssl.mzstatic.com/image/thumb/abc/600x600bb.jpg",
+            release_year=2025,
+            album_verified=True,
+        )
+
+        apple_music = AsyncMock(spec=AppleMusicClient)
+        apple_music.find_track_metadata = AsyncMock(return_value=probe_match)
+        apple_music.find_track_url = AsyncMock(return_value=probe_match.url)
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Tzenni",
+            artist="Noura Mint Seymali",
+            year=2014,
+            artist_id=99,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=99,
+            name="Noura Mint Seymali",
+            profile="Mauritanian singer.",
+            urls=["https://en.wikipedia.org/wiki/Noura_Mint_Seymali"],
+        )
+
+        results = await enrich_artwork_results(
+            [(item, tzenni_artwork)],
+            discogs_service,
+            song="Hebebeb (Zrag)",
+            album="Yenbett",
+            artist="Noura Mint Seymali",
+            apple_music=apple_music,
+            extended=True,
+        )
+
+        # Sibling shape still pays the prefetch — LML#504's recovery is preserved.
+        discogs_service.get_release.assert_called()
+        discogs_service.get_artist_details.assert_called()
+
+        _, enriched = results[0]
+        assert enriched is not None
+        assert enriched.artist_bio == "Mauritanian singer."
+
+    @pytest.mark.asyncio
+    async def test_happy_path_prefetch_fires_and_fields_surface(self):
+        """Happy path: the library row's title matches the requested album,
+        so ``top1_library_row_acceptable`` is True. The prefetch must fire
+        and both album- and artist-derived fields must surface — guards
+        against accidentally inverting the gate."""
+        item = make_library_item(id=42, artist="Jessica Pratt", title="On Your Own Love Again")
+        artwork = make_discogs_result(
+            release_id=1,
+            artist="Jessica Pratt",
+            album="On Your Own Love Again",
+            artwork_url="https://example.com/oyola.jpg",
+            release_year=2015,
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="On Your Own Love Again",
+            artist="Jessica Pratt",
+            year=2015,
+            artist_id=50,
+            release_url="https://discogs.com/release/1",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=50,
+            name="Jessica Pratt",
+            profile="American singer-songwriter.",
+            urls=["https://en.wikipedia.org/wiki/Jessica_Pratt"],
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            song="Back, Baby",
+            album="On Your Own Love Again",
+            artist="Jessica Pratt",
+            extended=True,
+        )
+
+        discogs_service.get_release.assert_called()
+        discogs_service.get_artist_details.assert_called()
+
+        _, enriched = results[0]
+        assert enriched is not None
+        # Album-derived field.
+        assert enriched.release_year == 2015
+        # Artist-derived field.
+        assert enriched.artist_bio == "American singer-songwriter."
+
+    @pytest.mark.asyncio
+    async def test_flag_off_prefetch_always_fires(self, monkeypatch):
+        """``LML_ENRICH_SKIP_PREFETCH_ON_SYNTHESIS=false`` reverts to
+        today's unconditional-prefetch behaviour: even on the wholly-fuzzy-
+        miss shape (which the default-on flag would skip), the prefetch
+        fires."""
+        monkeypatch.setenv("LML_ENRICH_SKIP_PREFETCH_ON_SYNTHESIS", "false")
+
+        item = make_library_item(id=42, artist="Larry Gus", title="Somewhere Waiting")
+        larry_gus_artwork = make_discogs_result(
+            release_id=7,
+            artist="Larry Gus",
+            album="Somewhere Waiting",
+            artwork_url="https://example.com/larry-gus.jpg",
+            release_year=2014,
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=7,
+            title="Somewhere Waiting",
+            artist="Larry Gus",
+            year=2014,
+            artist_id=55,
+            release_url="https://discogs.com/release/7",
+        )
+        discogs_service.get_artist_details.return_value = ArtistDetails(
+            artist_id=55,
+            name="Larry Gus",
+            profile="Greek musician.",
+            urls=[],
+        )
+
+        await enrich_artwork_results(
+            [(item, larry_gus_artwork)],
+            discogs_service,
+            song="Rita",
+            album="Pequena Vertigem de Amor",
+            artist="Sessa",
+            extended=True,
+        )
+
+        discogs_service.get_release.assert_called()
+        discogs_service.get_artist_details.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_warm_cache_not_scheduled_when_prefetch_skipped(self):
+        """``warm_cache=True`` needs no LML#507-specific change: the warm
+        task already gates on ``top1_bio``, which stays None when the
+        prefetch is skipped. Cheap regression guard that the skip doesn't
+        somehow leave a stale bio behind for the warm gate to key off."""
+        item = make_library_item(id=42, artist="Larry Gus", title="Somewhere Waiting")
+        larry_gus_artwork = make_discogs_result(
+            release_id=7,
+            artist="Larry Gus",
+            album="Somewhere Waiting",
+            artwork_url="https://example.com/larry-gus.jpg",
+            release_year=2014,
+        )
+
+        discogs_service = AsyncMock()
+
+        with patch("lookup.enrichment.asyncio.create_task") as mock_create_task:
+            await enrich_artwork_results(
+                [(item, larry_gus_artwork)],
+                discogs_service,
+                song="Rita",
+                album="Pequena Vertigem de Amor",
+                artist="Sessa",
+                extended=True,
+                warm_cache=True,
+            )
+
+        discogs_service.get_release.assert_not_called()
+        mock_create_task.assert_not_called()
+
+
 class TestSiblingOverrideProbeDivergence:
     """LML#505: post-hoc invalidation of sibling-row override URLs on the
     synthesis branch.
