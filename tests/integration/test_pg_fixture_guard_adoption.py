@@ -62,6 +62,7 @@ _LML_CACHE_FIXTURE_FILES = (
     "test_streaming_catalog_dao.py",
     "test_library_release_override.py",
     "test_seed_library_release_overrides.py",
+    "test_api_keys_pg.py",
 )
 
 # Any DROP SCHEMA aimed at lml_cache, however spelled (with/without IF

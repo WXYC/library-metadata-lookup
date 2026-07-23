@@ -15,6 +15,7 @@ from wxyc_fastapi.observability import flush_posthog, init_sentry, shutdown_post
 from artists.router import router as artists_router
 from cache.router import router as cache_router
 from config.settings import Settings, get_settings
+from core.api_key_cache import start_api_key_cache, stop_api_key_cache
 from core.auth import require_lml_key
 from core.dependencies import (
     close_discogs_service,
@@ -203,8 +204,10 @@ async def lifespan(app: FastAPI):
     # return "miss" on any PG error, so /lookup degrades to one extra probe per
     # request rather than failing startup. Each bootstrap then runs under its
     # own handler: one failing does not skip the ones after it.
+    api_key_cache_task = None
     if settings.database_url_discogs:
         from core.dependencies import get_discogs_pool
+        from entity.api_keys import set_up_api_keys_schema
         from entity.discogs_rate_bucket import set_up_discogs_rate_bucket_schema
         from entity.library_release_override import (
             set_up_library_release_override_schema,
@@ -286,6 +289,14 @@ async def lifespan(app: FastAPI):
                     "Streaming catalog",
                     lambda: set_up_streaming_catalog_schema(source),
                 ),
+                # Per-consumer LML API keys (LML per-consumer API keys plan),
+                # another LML-owned lml_cache.* table. Same pool, same
+                # best-effort posture; the in-process ApiKeyCache started
+                # below is the actual request-path consumer.
+                (
+                    "API keys",
+                    lambda: set_up_api_keys_schema(source),
+                ),
             )
             for label, bootstrap in bootstraps:
                 try:
@@ -300,6 +311,23 @@ async def lifespan(app: FastAPI):
                         "the next boot; the other lml_cache.* bootstraps continue",
                         label,
                     )
+
+            # LML per-consumer API keys: start the in-process cache AFTER the
+            # bootstraps loop so it reuses this block's `source` (same
+            # borrowed discogs-cache pool). Not itself a bootstraps entry — a
+            # long-lived refresh task can't be, since that loop discards
+            # return values (mirrors how the event-loop-lag sampler below is
+            # a separate start/stop pair, not folded into `bootstraps`).
+            # Best-effort: a failure to start must never block serving, and
+            # if it never starts, require_lml_key's get_api_key_cache() stays
+            # None and every request falls through to the legacy key.
+            try:
+                api_key_cache_task = await start_api_key_cache(
+                    source, refresh_seconds=settings.lml_api_key_cache_refresh_seconds
+                )
+                logger.info("API-key cache started")
+            except Exception:
+                logger.exception("API-key cache failed to start; continuing without it")
 
     # LML#907: start the event-loop-lag sampler — a background task that measures
     # the single-worker starvation tax (plans/lookup-latency-event-loop-starvation.md
@@ -319,6 +347,8 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application")
     if lag_sampler_task is not None:
         await stop_sampler(lag_sampler_task)
+    if api_key_cache_task is not None:
+        await stop_api_key_cache(api_key_cache_task)
     shutdown_posthog()
     await close_library_db()
     await close_discogs_service()

@@ -346,6 +346,21 @@ class Settings(BaseSettings):
             "flip to True after all callers send the bearer header."
         ),
     )
+    lml_api_key_cache_refresh_seconds: int = Field(
+        default=300,
+        ge=1,
+        description=(
+            "How often (seconds) the in-process ApiKeyCache (core/api_key_cache.py) "
+            "reloads its active-key snapshot from lml_cache.api_keys (LML per-consumer "
+            "API keys plan). Bounds revocation staleness: a revoked key stays valid in "
+            "an already-booted process for up to this long after the revoke lands in "
+            "PG. Default 300 (5 minutes), the same cadence this org already reasons in "
+            "elsewhere (e.g. the wxyc-canary schedule). Must be >= 1 -- a bad value fails "
+            "loudly at Settings load rather than busy-looping the refresh task, mirroring "
+            "discogs_search_statement_timeout_ms's ge=1. See "
+            "docs/plans/lml-per-consumer-api-keys.md."
+        ),
+    )
     lml_resolve_artist_canonical: bool = Field(
         default=False,
         description=(
