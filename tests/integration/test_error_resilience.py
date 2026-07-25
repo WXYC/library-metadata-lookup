@@ -335,14 +335,17 @@ class TestSourceTransportFailures:
 
     @pytest.mark.asyncio
     async def test_discogs_service_search_with_http_error_degrades(self):
-        """DiscogsService.search returns empty results on HTTP transport failure."""
+        """DiscogsService.search degrades to None (not an exception) on HTTP
+        transport failure. Post-LML#918 the degraded result is None rather than
+        an empty response, so @async_cached does not memoize the transient
+        failure as an hour-long no-match; callers treat None like an empty."""
         from discogs.models import DiscogsSearchRequest
         from discogs.service import DiscogsService
 
         service = DiscogsService(token="test_token", cache_service=None)
 
         # Mock the httpx client to simulate a connection error.
-        # DiscogsService catches exceptions internally and returns empty results.
+        # DiscogsService catches exceptions internally and degrades to None.
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(side_effect=Exception("simulated HTTP connection failure"))
         service._client = mock_client
@@ -351,9 +354,8 @@ class TestSourceTransportFailures:
 
         result = await service.search(request)
 
-        # The service gracefully degrades -- returns empty results, not an exception
-        assert result is not None
-        assert result.results == []
+        # Graceful degrade: None, not an exception and not a cacheable empty.
+        assert result is None
 
         # Clean up (avoid real close calls)
         service._client = None

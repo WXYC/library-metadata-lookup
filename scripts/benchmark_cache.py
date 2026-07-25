@@ -160,7 +160,8 @@ async def time_search(service: DiscogsService, query: dict[str, str | None]) -> 
     result = await service.search(request)
     elapsed_ms = (time.perf_counter() - start) * 1000
 
-    return elapsed_ms, result.cached
+    # None = degraded Discogs call (LML#918); count it as an uncached miss.
+    return elapsed_ms, (result.cached if result is not None else False)
 
 
 async def run_benchmark(iterations: int) -> None:

@@ -112,7 +112,7 @@ async def _library_miss_discogs_search(
         try:
             retry = await discogs_service.search(request, skip_pg=True)
         except Exception:
-            # A raised (or, below, empty) retry keeps the PG-served
+            # A raised (or, below, empty/None) retry keeps the PG-served
             # candidates: the rescue works during an API outage (segments
             # are pure CPU; the tracklist fetch reads the PG tier first).
             logger.warning(
@@ -120,10 +120,11 @@ async def _library_miss_discogs_search(
             )
         else:
             best = _floor_best(retry)
-            if retry.results:
+            if retry is not None and retry.results:
                 # A non-empty retry supersedes even when it floor-fails: the
                 # fuzzy API arm's retrieval is category 2's own premise. Only
-                # an empty retry keeps the PG-served candidates.
+                # an empty (or degraded None, LML#918) retry keeps the
+                # PG-served candidates.
                 response = retry
 
     if best is None and response is not None and response.results:

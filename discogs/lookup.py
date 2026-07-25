@@ -235,5 +235,8 @@ async def lookup_releases_by_artist(
 
     request = DiscogsSearchRequest(artist=artist)
     response = await service.search(request, limit=limit)
+    if response is None:
+        # Degraded Discogs call (LML#918): treat like an empty result set.
+        return []
 
     return list(response.results)
