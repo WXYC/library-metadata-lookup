@@ -136,10 +136,11 @@ _suppress_streaming_warm_var: ContextVar[bool] = ContextVar(
 NO background warm (cache-read-only). Set once at the top of a ``/lookup/bulk``
 batch so the bulk drain never spawns a decoupled warm tail that competes with
 the live ``/lookup`` path. Mirrors the bulk ``skip_cache`` ContextVar and the
-``bandcamp=None`` / ``allow_release_resolution_fallback=False`` bulk kill
-switches — the offline warmer (#548) is the right tier for bulk cache fill.
-Backed by a ContextVar so setting it at the batch top propagates into each
-per-item task via the inherited context."""
+unconditional ``bandcamp=None`` pin — the offline warmer (#548) is the right
+tier for bulk cache fill. (``allow_release_resolution_fallback`` used to be a
+third always-off sibling here; since LML#920 it is a caller-controlled query
+flag, default off.) Backed by a ContextVar so setting it at the batch top
+propagates into each per-item task via the inherited context."""
 
 
 def set_suppress_streaming_warm(suppress: bool) -> None:

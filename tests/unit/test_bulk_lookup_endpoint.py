@@ -17,12 +17,22 @@ import sentry_sdk
 from httpx import ASGITransport, AsyncClient
 
 from config.settings import get_settings
-from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+from core.dependencies import (
+    get_discogs_cache_pg,
+    get_discogs_cache_service,
+    get_discogs_service,
+    get_library_db,
+    get_musicbrainz_pg,
+    get_posthog_client,
+)
+from discogs.models import DiscogsSearchResponse
 from discogs.service import DiscogsService
+from identity.dependencies import get_entity_store
 from library.db import LibraryDB
 from lookup.models import LookupResponse, LookupResultItem
 from main import app
-from tests.factories import make_catalog_item, make_match_result
+from streaming.dependencies import get_apple_music_client, get_spotify_client
+from tests.factories import make_catalog_item, make_discogs_result, make_match_result
 from tests.unit.conftest import override_deps
 
 
@@ -134,6 +144,38 @@ class TestBulkLookupEndpoint:
         assert resp.status_code == 200
         assert mock_lookup.await_count == 1
         assert mock_lookup.await_args.kwargs.get("allow_release_resolution_fallback") is False
+
+    @pytest.mark.asyncio
+    async def test_bulk_release_resolution_fallback_query_flag_forwards_true(self, app_client):
+        """LML#920: ``?allow_release_resolution_fallback=true`` must thread
+        through to every per-item ``perform_lookup`` call. Mirrors the
+        ``skip_cache`` query flag on this same endpoint — the kill switch
+        default stays ``False`` (pinned above), but a caller (the live
+        enrichment worker, BS#1815) can opt in per-request."""
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_no_match_response(),
+        ) as mock_lookup:
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk?allow_release_resolution_fallback=true",
+                    json={
+                        "items": [
+                            {
+                                "artist": "A Guy Called Gerald",
+                                "album": "When There Is No Sun",
+                                "song": "Message to Black Youth",
+                            }
+                        ]
+                    },
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_count == 1
+        assert mock_lookup.await_args.kwargs.get("allow_release_resolution_fallback") is True
 
     @pytest.mark.asyncio
     async def test_bulk_emits_total_only_server_timing(self, app_client):
@@ -716,6 +758,115 @@ class TestBulkLookupEndpoint:
                 )
 
         assert resp.status_code == 200
+
+
+class TestBulkLookupReleaseResolutionFallbackFlag:
+    """LML#920: ``allow_release_resolution_fallback`` is a per-caller query flag
+    on ``/lookup/bulk``, mirroring ``skip_cache``, instead of the LML#671
+    hardcoded ``False``. Default stays ``False`` — the 35k-album offline drain
+    is unchanged — but a caller (the live enrichment worker, BS#1815) can pass
+    ``?allow_release_resolution_fallback=true`` to restore the LML#583
+    library-miss probe that ``/lookup`` gets by default.
+
+    Unlike the rest of this file (which mocks ``perform_lookup`` entirely),
+    these tests let the REAL orchestrator run so the step-3a gate genuinely
+    fires or doesn't — only the library DB and Discogs service are mocked,
+    mirroring ``tests/unit/test_library_miss_discogs.py``'s orchestrator-level
+    coverage of the same gate (``test_step_3a_fires_on_non_bulk_with_typed_artist_album``
+    / ``test_step_3a_suppressed_on_bulk_kill_switch``), but driven through the
+    actual HTTP endpoint instead of a direct ``perform_lookup`` call.
+    """
+
+    @pytest.fixture
+    def app_client_live_orchestrator(self, mock_library_db, mock_discogs_service, mock_settings):
+        """Real ``perform_lookup``. Only the library DB and Discogs service are
+        mocked; every other optional dependency is pinned to ``None`` so the
+        request exercises the step-3a gate without needing a live discogs-cache
+        pool, MusicBrainz source, entity store, or streaming clients."""
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_library_db,
+                get_discogs_service: mock_discogs_service,
+                get_discogs_cache_service: None,
+                get_musicbrainz_pg: None,
+                get_entity_store: None,
+                get_discogs_cache_pg: None,
+                get_posthog_client: None,
+                get_apple_music_client: None,
+                get_spotify_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            yield app
+
+    @pytest.mark.asyncio
+    async def test_flag_true_resolves_nonlibrary_album_via_step_3a(
+        self, app_client_live_orchestrator, mock_discogs_service
+    ):
+        """``?allow_release_resolution_fallback=true`` plus a library-miss
+        (artist, album) pair resolves via the #583
+        ``_library_miss_discogs_search`` path: an exact-title Discogs
+        candidate clears the 80/80 floor and the item surfaces as a
+        ``match`` — the same outcome ``/lookup`` gives by default."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=5150001,
+                    artist="Sessa",
+                    album="Pequena Vertigem de Amor",
+                    artwork_url="https://img.discogs.com/sessa-cover.jpg",
+                )
+            ]
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client_live_orchestrator), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/lookup/bulk?allow_release_resolution_fallback=true",
+                json={"items": [{"artist": "Sessa", "album": "Pequena Vertigem de Amor"}]},
+            )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["status"] == "match", (
+            f"expected step-3a to resolve the library-miss album; got {result!r}"
+        )
+        assert result["lookup"]["results"][0]["library_item"]["artist"] == "Sessa"
+
+    @pytest.mark.asyncio
+    async def test_flag_default_false_keeps_kill_switch_on_same_item(
+        self, app_client_live_orchestrator, mock_discogs_service
+    ):
+        """The identical library-miss item WITHOUT the query flag must stay
+        ``no_match`` — the LML#671 kill switch still holds for callers that
+        omit the flag (the 35k-album offline drain), even though Discogs
+        would confidently resolve it if asked."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=5150001,
+                    artist="Sessa",
+                    album="Pequena Vertigem de Amor",
+                    artwork_url="https://img.discogs.com/sessa-cover.jpg",
+                )
+            ]
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_client_live_orchestrator), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/v1/lookup/bulk",
+                json={"items": [{"artist": "Sessa", "album": "Pequena Vertigem de Amor"}]},
+            )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["status"] == "no_match", (
+            f"expected the default kill switch to suppress step-3a; got {result!r}"
+        )
 
 
 class TestBulkLookupObservability:

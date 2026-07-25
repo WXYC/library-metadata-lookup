@@ -9,7 +9,7 @@ from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 import sentry_sdk
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from wxyc_fastapi.observability import (
     RequestTelemetry,
     get_cache_stats,
@@ -656,9 +656,10 @@ async def handle_lookup(
     fires per-bio-ref live Discogs calls. On this path the flag is hard-pinned
     off (LML#742) — a per-item ``warm_cache: true`` is discarded (with a
     server-side warning log) before the item reaches ``perform_lookup``, same
-    enforced guarantee as the ``bandcamp`` / ``allow_release_resolution_fallback``
-    pins. Callers that want the bio cache populated at bulk scale should use
-    the offline warmer (#548).
+    enforced guarantee as the ``bandcamp`` pin (``allow_release_resolution_fallback``
+    is caller-controlled since LML#920 — see the query flag below). Callers
+    that want the bio cache populated at bulk scale should use the offline
+    warmer (#548).
     """,
     responses={
         200: {"description": "Per-item verdicts in input order."},
@@ -682,6 +683,14 @@ async def handle_bulk_lookup(
     # here (bandcamp=None at the perform_lookup call below), so resolving its
     # client would be dead work. See the call site for the rate-limit rationale.
     skip_cache: bool = False,
+    allow_release_resolution_fallback: bool = Query(
+        False,
+        description=(
+            "Per-caller opt-in to non-library release resolution — the LML#671 "
+            "bulk kill switch. Default False keeps the offline drain unchanged; "
+            "true restores `/lookup`'s default resolution (LML#583/#652, BS#1815)."
+        ),
+    ),
     x_caller_budget_ms: int | None = Header(
         default=None,
         alias="X-Caller-Budget-Ms",
@@ -719,8 +728,8 @@ async def handle_bulk_lookup(
     # warm (LML#706). A 35k-album drain returns fast per item, so an enqueued
     # warm tail would decouple from the request and starve the live /lookup
     # path's own warms. Same ContextVar-propagation mechanism as `skip_cache`,
-    # and the same posture as `bandcamp=None` / `allow_release_resolution_fallback
-    # =False` below: the offline warmer (#548) is the right tier for bulk fill.
+    # and the same posture as the unconditional `bandcamp=None` pin below —
+    # `allow_release_resolution_fallback` is caller-controlled since LML#920.
     set_suppress_streaming_warm(True)
 
     # One cache_stats context for the whole batch: the in-process caches are
@@ -752,11 +761,12 @@ async def handle_bulk_lookup(
         # cache refresh, so N concurrent batches can't multiply into N x
         # LML_BULK_MAX_CONCURRENT in-flight items against the shared pool.
         async with semaphore, acquire_bulk_global_permit():
-            # Hard-pin warm_cache off (LML#742), completing the set with
-            # `bandcamp=None` / `allow_release_resolution_fallback=False` below:
-            # a truthy per-item flag would schedule the `_warm_bio_cache`
-            # per-bio-ref live Discogs fan-out for every batch item. Unlike its
-            # two siblings, warm_cache is read from the request *inside*
+            # Hard-pin warm_cache off (LML#742), pairing with the unconditional
+            # `bandcamp=None` pin below (`allow_release_resolution_fallback` is
+            # caller-controlled since LML#920, no longer a hard pin here): a
+            # truthy per-item flag would schedule the `_warm_bio_cache`
+            # per-bio-ref live Discogs fan-out for every batch item. Unlike
+            # `bandcamp`, warm_cache is read from the request *inside*
             # perform_lookup (whose signature is frozen for LML#722), so the pin
             # is a copied item rather than a kwarg. The offline warmer (#548)
             # remains the right tier for bulk cache population.
@@ -806,9 +816,11 @@ async def handle_bulk_lookup(
                         bandcamp=None,
                         discogs_cache_pg=discogs_cache_pg,
                         caller_budget_ms=x_caller_budget_ms,
-                        # The 35k-album bulk drain must never trigger the LML#604
-                        # lazy release-resolution fan-out (per-row Discogs probe).
-                        allow_release_resolution_fallback=False,
+                        # Caller-controlled since LML#920 (default False, the
+                        # LML#671 bulk kill switch): the enrichment worker
+                        # (Backend-Service#1815) opts in via the query flag to
+                        # restore the resolution `/lookup` gets by default.
+                        allow_release_resolution_fallback=allow_release_resolution_fallback,
                     )
             except Exception as e:
                 # Per-item isolation: one failure must not poison siblings.
