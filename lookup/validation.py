@@ -60,7 +60,8 @@ async def filter_results_by_track_validation(
             response = await discogs_service.search(
                 DiscogsSearchRequest(album=album_for_search, artist=artist)
             )
-            if not response.results:
+            if response is None or not response.results:
+                # None = degraded Discogs call (LML#918); treat like no results.
                 return None
 
             best_result = response.results[0]

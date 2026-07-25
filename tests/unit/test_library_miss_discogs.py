@@ -1377,3 +1377,46 @@ class TestVaRescueWiring:
             discogs_service=mock_discogs_service,
         )
         assert result is None
+
+
+class TestLibraryMissNoPoison:
+    """LML#918: under the no-poison contract ``discogs_service.search()`` can
+    now return ``None`` on a degraded/shed/5xx Discogs call (instead of a
+    cacheable empty). The library-miss probe must treat ``None`` exactly like
+    an empty result — no crash — on both the primary and the LML#784 skip_pg
+    retry."""
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_primary_search_returns_none(self, mock_discogs_service):
+        mock_discogs_service.search.return_value = None
+        result = await _library_miss_discogs_search(
+            _parsed("My New Band Believe", "My New Band Believe"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_skip_pg_retry_returning_none_does_not_crash(
+        self, mock_discogs_service, monkeypatch
+    ):
+        """PG-served candidates that all floor-fail trigger the skip_pg retry;
+        if that retry degrades to ``None``, the caller must not raise on
+        ``retry.results`` — it keeps the PG-served candidates and returns None
+        once nothing clears."""
+        floor_fail = make_discogs_result(
+            release_id=1, artist="Totally Unrelated Act", album="Nothing Alike"
+        )
+        primary = DiscogsSearchResponse(results=[floor_fail], pg_served=True)
+        # primary floor-fails (pg_served) → skip_pg retry fires → retry degrades to None.
+        mock_discogs_service.search.side_effect = [primary, None]
+        # Neutralize the category-2 VA rescue so the assertion isolates the None guard.
+        monkeypatch.setattr(
+            "lookup.strategies.library_miss.find_va_comp_match",
+            AsyncMock(return_value=None),
+        )
+        result = await _library_miss_discogs_search(
+            _parsed("My New Band Believe", "My New Band Believe"),
+            discogs_service=mock_discogs_service,
+        )
+        assert result is None
+        assert mock_discogs_service.search.call_count == 2

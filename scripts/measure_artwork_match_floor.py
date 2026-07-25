@@ -268,7 +268,9 @@ async def run(args: argparse.Namespace) -> None:
                     )
                     continue
 
-                old_pick, new_pick, a_score, t_score, best = classify(response.results, query)
+                # None = degraded Discogs call (LML#918); classify an empty set.
+                results = response.results if response is not None else []
+                old_pick, new_pick, a_score, t_score, best = classify(results, query)
 
                 if old_pick is None:
                     no_results += 1

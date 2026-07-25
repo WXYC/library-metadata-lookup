@@ -3556,3 +3556,113 @@ class TestLeanHydrationRouting:
         assert result is not None and result.name == "FULL"
         cache.get_artist_details.assert_awaited_once_with(77)
         cache.get_artist_details_lean.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# search — no-poison contract (LML#918)
+# ---------------------------------------------------------------------------
+
+
+class TestSearchNoPoison:
+    """LML#918: a *degraded* Discogs ``search()`` (rate-limited/None, breaker
+    shed, or 5xx) must return ``None`` rather than a cacheable empty response —
+    otherwise ``@async_cached`` memoizes the transient failure for an hour and
+    a real album (a new rotation release) sticks as a false no-match. A genuine
+    200-with-zero-results is a real negative and stays a (cacheable) response.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["none_response", "breaker_shed", "server_error"])
+    async def test_degraded_search_returns_none(self, service, mode):
+        req = DiscogsSearchRequest(artist="Chuquimamani-Condori", album="DJ E")
+
+        if mode == "none_response":
+            # _request_with_retry exhausted retries / was rate-limited.
+            rr = AsyncMock(return_value=None)
+        elif mode == "breaker_shed":
+            rr = AsyncMock(side_effect=DiscogsBreakerOpenError("saturation shed"))
+        else:  # server_error: raise_for_status() raises inside _api_fetch
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock(
+                side_effect=httpx.HTTPStatusError("502", request=MagicMock(), response=MagicMock())
+            )
+            rr = AsyncMock(return_value=resp)
+
+        with patch.object(service, "_request_with_retry", rr):
+            result = await service.search(req)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_degraded_result_not_cached_and_recovers(self, service):
+        """Headline guarantee: the degraded result is not memoized, so the very
+        next call re-hits the API and recovers once Discogs returns."""
+        req = DiscogsSearchRequest(artist="Jessica Pratt", album="On Your Own Love Again")
+
+        good = MagicMock()
+        good.raise_for_status = MagicMock()
+        good.json.return_value = {
+            "results": [{"title": "Jessica Pratt - On Your Own Love Again", "id": 7, "thumb": ""}]
+        }
+        rr = AsyncMock(side_effect=[None, good])
+
+        with patch.object(service, "_request_with_retry", rr):
+            first = await service.search(req)
+            second = await service.search(req)
+
+        assert first is None
+        # Not cached → the second call had to hit the API again (would be 1 if poisoned).
+        assert rr.await_count == 2
+        assert second is not None
+        assert second.results and second.results[0].release_id == 7
+
+    @pytest.mark.asyncio
+    async def test_degraded_fuzzy_fallback_is_not_cached_and_recovers(self, service):
+        """When the strict leg returns 200-empty and the fuzzy ``q=`` leg
+        degrades (None), the whole search degrades to None — the strict empty
+        must NOT be cached, because the fuzzy leg is the one that resolves
+        non-library releases (the exact path this fix targets)."""
+        strict_empty = MagicMock()
+        strict_empty.raise_for_status = MagicMock()
+        strict_empty.json.return_value = {"results": []}
+
+        good = MagicMock()
+        good.raise_for_status = MagicMock()
+        good.json.return_value = {
+            "results": [{"title": "Boards of Canada - Inferno", "id": 9, "thumb": ""}]
+        }
+        # 1st search: strict 200-empty -> fuzzy None -> degrade. 2nd search: strict good.
+        rr = AsyncMock(side_effect=[strict_empty, None, good])
+
+        with patch.object(service, "_request_with_retry", rr):
+            first = await service.search(
+                DiscogsSearchRequest(artist="Boards of Canada", album="Inferno")
+            )
+            second = await service.search(
+                DiscogsSearchRequest(artist="Boards of Canada", album="Inferno")
+            )
+
+        assert first is None
+        # Both legs of call 1 (strict + fuzzy) plus the single strict leg of
+        # call 2 — proves the degraded empty was not cached (else count == 2).
+        assert rr.await_count == 3
+        assert second is not None
+        assert second.results and second.results[0].release_id == 9
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_is_still_a_response(self, service):
+        """A real 200-with-no-results is a legitimate negative — a response
+        (cacheable), not the degraded ``None``."""
+        empty = MagicMock()
+        empty.raise_for_status = MagicMock()
+        empty.json.return_value = {"results": []}
+
+        with patch.object(
+            service, "_request_with_retry", new_callable=AsyncMock, return_value=empty
+        ):
+            result = await service.search(
+                DiscogsSearchRequest(artist="Nonexistent Act", album="No Such Album")
+            )
+
+        assert result is not None
+        assert result.results == []

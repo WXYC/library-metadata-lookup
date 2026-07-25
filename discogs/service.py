@@ -1584,7 +1584,7 @@ class DiscogsService:
     @async_cached(SEARCH_CACHE)
     async def search(
         self, request: DiscogsSearchRequest, limit: int = 5, skip_pg: bool = False
-    ) -> DiscogsSearchResponse:
+    ) -> DiscogsSearchResponse | None:
         """General release search for artwork discovery.
 
         Read-through via :func:`fallthrough` with ``pg_write=None`` — the PG
@@ -1604,7 +1604,12 @@ class DiscogsService:
                 re-searched API-only or the working API arm stays masked.
 
         Returns:
-            DiscogsSearchResponse with ranked results
+            DiscogsSearchResponse with ranked results (possibly empty on a
+            genuine 200-with-no-results negative), or None when the Discogs
+            call *degraded* — rate-limited / retries exhausted, saturation
+            breaker shed, or a 5xx. None is deliberately propagated so
+            ``@async_cached`` does not memoize a transient failure as a
+            1-hour no-match; the next call retries (LML#918).
         """
         params = self._build_search_params(request, limit=limit)
         if not params:
@@ -1657,8 +1662,12 @@ class DiscogsService:
                     )
 
                 if response is None:
+                    # Degraded (rate-limited / retries exhausted). Return None so
+                    # @async_cached does NOT memoize this transient failure as a
+                    # 1-hour no-match (LML#918). A genuine 200-with-no-results
+                    # below stays a real, cacheable (empty) response.
                     logger.warning("Discogs search failed (rate limited or error)")
-                    return DiscogsSearchResponse(cached=False)
+                    return None
 
                 get_cache_stats_recorder().record_api_call()
                 response.raise_for_status()
@@ -1681,10 +1690,20 @@ class DiscogsService:
                         response = await self._request_with_retry(
                             "GET", "/database/search", params=fallback_params
                         )
-                    if response is not None:
-                        get_cache_stats_recorder().record_api_call()
-                        response.raise_for_status()
-                        data = response.json()
+                    if response is None:
+                        # Degraded fuzzy leg (rate-limited / retries exhausted).
+                        # The strict leg returned 200-empty, but the fuzzy ``q=``
+                        # query is the one that resolves non-library releases, so
+                        # a transient failure here must NOT be cached as a
+                        # no-match — return None like the strict-leg degrade
+                        # above so @async_cached skips it (LML#918). Otherwise
+                        # the strict empty would be memoized for an hour on
+                        # exactly the non-library path this fix targets.
+                        logger.warning("Discogs fuzzy search failed (rate limited or error)")
+                        return None
+                    get_cache_stats_recorder().record_api_call()
+                    response.raise_for_status()
+                    data = response.json()
 
                 results = []
                 for item in data.get("results", []):
@@ -1739,13 +1758,13 @@ class DiscogsService:
                 # search failure — DEBUG, not ERROR, so a sustained OPEN episode
                 # doesn't flood Sentry with per-request error events (#755). The
                 # breaker logs the OPEN/CLOSED transitions; the shed counter
-                # carries the volume. Return the same empty response as the
-                # generic path (this seam is read-only, no negative cache write).
-                logger.debug("Discogs saturation breaker shed search; returning empty (cache-only)")
-                return DiscogsSearchResponse(cached=False)
+                # carries the volume. Return None like the generic degraded
+                # path so the shed isn't memoized as a no-match (LML#918).
+                logger.debug("Discogs saturation breaker shed search; returning None (no-poison)")
+                return None
             except Exception as e:
                 logger.error(f"Discogs search failed: {e}")
-                return DiscogsSearchResponse(cached=False)
+                return None
 
         cache = self.cache_service
         if cache is None or skip_pg:
@@ -1762,10 +1781,10 @@ class DiscogsService:
                 # pg_write=None: read-only by design — see method docstring.
                 breadcrumb_data={"artist": request.artist, "album": request.album},
             )
-        # ``api_fetch`` returns a non-None DiscogsSearchResponse on every path
-        # (parses or constructs a cached=False empty), so the seam's `T | None`
-        # never narrows to None here in practice.
-        assert result is not None
+        # ``result`` is None when the API leg degraded (rate-limited / breaker
+        # shed / 5xx): LML#918 propagates that None so @async_cached skips
+        # memoizing the transient failure. A PG hit or a genuine (possibly
+        # empty) API parse is a real response and is cached as before.
         return result
 
     def _build_search_params(self, request: DiscogsSearchRequest, limit: int = 5) -> dict:

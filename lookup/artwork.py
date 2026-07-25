@@ -299,7 +299,9 @@ async def fetch_artwork_for_items(
             if item.title and item.title != album and not is_self_titled(item.title):
                 album_variants.append(item.title)
             result = find_best_typed_match(
-                response.results,
+                # None = degraded Discogs call (LML#918); score an empty set,
+                # which falls into the same "no match" path as an empty response.
+                response.results if response is not None else [],
                 query_artist=artist_variants,
                 query_title=album_variants,
                 artist_fn=lambda r: r.artist_variants(),
