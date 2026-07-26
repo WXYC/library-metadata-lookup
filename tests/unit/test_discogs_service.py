@@ -500,6 +500,39 @@ class TestRequestWithRetrySpans:
         )
 
     @pytest.mark.asyncio
+    async def test_semaphore_queue_depth_projected_as_transaction_measurement(self, service):
+        """LML#879 Deliverable B needs queue depth as an aggregatable series,
+        not only per-span drill-down data. Project the per-request max onto the
+        active transaction using the same set_measurement + set_data shape as
+        the other queue-wait metrics."""
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_client.request = AsyncMock(return_value=mock_resp)
+        service._client = mock_client
+
+        transaction = MagicMock()
+        scope = MagicMock(transaction=transaction)
+        captured_spans: dict[str, MagicMock] = {}
+
+        def _start_span(*, op: str, name: str, **kwargs):
+            ctx = MagicMock()
+            span = MagicMock()
+            ctx.__enter__.return_value = span
+            ctx.__exit__.return_value = False
+            captured_spans[name] = span
+            return ctx
+
+        with patch("discogs.service.sentry_sdk") as mock_sdk:
+            mock_sdk.start_span.side_effect = _start_span
+            mock_sdk.get_current_scope.return_value = scope
+            await service._request_with_retry("GET", "/test", max_retries=0)
+
+        transaction.set_measurement.assert_any_call("lml.discogs.semaphore_queue_depth", 0)
+        transaction.set_data.assert_any_call("lml.discogs.semaphore_queue_depth", 0)
+
+    @pytest.mark.asyncio
     async def test_semaphore_released_after_exception(self, service):
         """The acquire/release pair must survive an exception inside the request.
 

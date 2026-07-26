@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import weakref
 from collections.abc import Iterator
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -87,6 +88,14 @@ BREAKER_OPEN_STAT_KEY = "discogs_breaker_open_shed"
 # this to tell payload-shape drift (fail red) apart from transient
 # unavailability (skip) — both paths return None to callers.
 SEARCH_ARTISTS_DISTRUST_LOG_PREFIX = "search_artists distrusting page"
+_SEMAPHORE_QUEUE_DEPTH_MEASUREMENT = "lml.discogs.semaphore_queue_depth"
+_semaphore_queue_depth_max_by_transaction: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+"""Per-transaction running max of Discogs semaphore queue depth.
+
+One lookup can make several live Discogs requests; the request-level measurement
+should retain the worst observed backlog, not whichever request happened to run
+last. Weak keys mirror ``core.bulk_concurrency``'s queue-wait measurement cache.
+"""
 
 # Fuzzy fallback for `validate_track_on_release` artist matching. Strict substring
 # matching loses on collaboration trios where neither name is a substring of the
@@ -128,6 +137,31 @@ def _approx_semaphore_queue_depth(semaphore: asyncio.Semaphore) -> int:
         return len(waiters) if waiters else 0
     except AttributeError:
         return -1
+
+
+def _project_semaphore_queue_depth(queue_depth: int) -> None:
+    """Project Discogs semaphore queue depth as an aggregatable Sentry metric.
+
+    The per-call span still carries ``lml.semaphore.queue_depth`` for trace
+    drill-down. This transaction measurement is the LML#879 Deliverable B
+    double-flood surface for querying queue-depth tails across requests.
+    Observability must not break the request path.
+    """
+    if queue_depth < 0:
+        return
+    try:
+        if queue_depth > 0:
+            sentry_sdk.set_tag("lml.discogs.semaphore_queued", "true")
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is None:
+            return
+        if queue_depth <= _semaphore_queue_depth_max_by_transaction.get(transaction, -1):
+            return
+        _semaphore_queue_depth_max_by_transaction[transaction] = queue_depth
+        transaction.set_measurement(_SEMAPHORE_QUEUE_DEPTH_MEASUREMENT, queue_depth)
+        transaction.set_data(_SEMAPHORE_QUEUE_DEPTH_MEASUREMENT, queue_depth)
+    except Exception as e:
+        logger.warning("Failed to project Discogs semaphore queue depth: %s", e)
 
 
 def _parse_ratelimit_remaining(raw: str | None) -> int | None:
@@ -506,9 +540,9 @@ class DiscogsService:
                 # explorer a relative-load signal per call. See
                 # WXYC/library-metadata-lookup#358.
                 with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
-                    span.set_data(
-                        "lml.semaphore.queue_depth", _approx_semaphore_queue_depth(semaphore)
-                    )
+                    queue_depth = _approx_semaphore_queue_depth(semaphore)
+                    span.set_data("lml.semaphore.queue_depth", queue_depth)
+                    _project_semaphore_queue_depth(queue_depth)
                     apply_request_ctx_tags(span)
                     await semaphore.acquire()
 

@@ -326,7 +326,32 @@ async def test_healthy_and_queueing_paths_emit_no_counter(rate_bucket_env, captu
     )
     await queueing_gate.acquire()
 
-    assert captured_posthog == []
+    assert [
+        event for event in captured_posthog if event["event"] == "discogs_rate_gate_fail_open"
+    ] == []
+
+
+async def test_queueing_path_emits_queue_wait_event(rate_bucket_env, captured_posthog, monkeypatch):
+    """A saturated-but-healthy bucket should emit the token-queue wait once it
+    eventually grants a token. This is the LML#879 Deliverable B measurement
+    surface for the N>=2 double-flood: fail-open stays silent, but the queue
+    tail is queryable independently of Sentry trace sampling."""
+    rate_bucket_env(enabled=True)
+    monkeypatch.setattr("discogs.ratelimit.random.random", lambda: 0.0)
+    gate = DiscogsRateGate(
+        local_limiter=_RecordingLimiter(),
+        bucket_factory=await _factory_returning(_DeniedThenAllowedBucket(retry_after_s=0.01)),
+    )
+
+    await gate.acquire()
+
+    assert len(captured_posthog) == 1
+    event = captured_posthog[0]
+    assert event["distinct_id"] == "library-metadata-lookup-service"
+    assert event["event"] == "discogs_rate_gate_queue_wait"
+    assert event["properties"]["queue_sleeps"] == 1
+    assert event["properties"]["wait_ms"] >= 5
+    assert event["properties"]["environment"] == "unit-test-env"
 
 
 async def test_flag_off_emits_no_counter(rate_bucket_env, captured_posthog):
