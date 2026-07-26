@@ -201,6 +201,43 @@ class TestGetLibraryDB:
                 db_file
             )
 
+    @pytest.mark.asyncio
+    async def test_connects_when_library_db_file_appears_after_missing_start(
+        self, tmp_path, mock_settings
+    ):
+        """A worker that booted before library.db existed must connect once it does.
+
+        A boot-time ``FileNotFoundError`` caches an unconnected instance (health
+        reports unhealthy) with a ``None`` signature. When a sibling worker's
+        admin upload lands the file, the next ``get_library_db`` call must drop
+        the stub and connect — otherwise this worker serves the unhealthy stub
+        until it restarts.
+        """
+        db_file = tmp_path / "library.db"
+        mock_settings.library_db_path = str(db_file)
+
+        # The FileNotFoundError-cached stub: instance present, signature None.
+        stub_db = AsyncMock()
+        deps_module._library_db = stub_db
+        deps_module._library_db_signature = None
+
+        # The file now appears (a sibling worker's admin upload landed).
+        db_file.write_text("new-content")
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            new_db = AsyncMock()
+            mock_db_cls.return_value = new_db
+
+            result = await get_library_db(mock_settings)
+
+            stub_db.close.assert_awaited_once()
+            mock_db_cls.assert_called_once_with(db_path=db_file)
+            new_db.connect.assert_awaited_once()
+            assert result is new_db
+            assert deps_module._library_db_signature == deps_module._library_db_file_signature(
+                db_file
+            )
+
 
 # ---------------------------------------------------------------------------
 # close_library_db

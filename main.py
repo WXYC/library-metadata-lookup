@@ -68,6 +68,13 @@ setup_logging(level=settings.log_level, log_file=log_file)
 
 logger = logging.getLogger(__name__)
 
+# LML#706 multi-worker startup guard. One session-scoped advisory lock
+# serializes the lml_cache.* bootstraps across worker processes so N uvicorn
+# workers don't race the CREATE ... IF NOT EXISTS DDL on boot. Key 747706 =
+# LML#747 + LML#706; arbitrary but stable. Advisory keys share ONE keyspace per
+# database, so this must not collide with the discogs-cache xact key 842001 that
+# entity/streaming_catalog.py acquires (a bootstrap this lock wraps) — record new
+# discogs-cache advisory keys before allocating another.
 _LML_CACHE_BOOTSTRAP_ADVISORY_LOCK_KEY = 747706
 _LML_CACHE_BOOTSTRAP_LOCK_TIMEOUT = "SET lock_timeout = '10s'"
 _LML_CACHE_BOOTSTRAP_RESET_LOCK_TIMEOUT = "RESET lock_timeout"
@@ -113,44 +120,58 @@ class _ConnectionPgSource:
 
 
 async def _run_lml_cache_bootstraps(source: Any, bootstraps: tuple[tuple[str, Any], ...]) -> None:
-    """Run all lifespan ``lml_cache.*`` bootstraps under one advisory lock."""
-    async with source.acquire() as conn:
-        locked = False
-        try:
+    """Run all lifespan ``lml_cache.*`` bootstraps under one advisory lock.
+
+    Best-effort, like the sibling ``set_up_*_schema`` helpers: the lifespan calls
+    this without its own ``try``, so even failing to *check out* the pooled
+    connection (checkout timeout, dead connection on a degraded discogs-cache PG)
+    must be logged and swallowed here — otherwise it aborts startup and
+    crash-loops the container, the opposite of the #706 hardening. The cache
+    consumers no-op to "miss" until the next boot reruns the bootstraps.
+    """
+    try:
+        async with source.acquire() as conn:
+            locked = False
             try:
-                await conn.execute(_LML_CACHE_BOOTSTRAP_LOCK_TIMEOUT)
-                await conn.execute(_LML_CACHE_BOOTSTRAP_ADVISORY_LOCK)
-                locked = True
-            except Exception:
-                logger.exception(
-                    "lml_cache bootstrap advisory lock acquisition failed — skipping "
-                    "lml_cache.* bootstraps until the next boot"
-                )
-                return
-            locked_source = _ConnectionPgSource(conn)
-            for label, bootstrap in bootstraps:
                 try:
-                    await bootstrap(locked_source)
-                    logger.info("%s schema ready", label)
+                    await conn.execute(_LML_CACHE_BOOTSTRAP_LOCK_TIMEOUT)
+                    await conn.execute(_LML_CACHE_BOOTSTRAP_ADVISORY_LOCK)
+                    locked = True
                 except Exception:
-                    # Degrade just this cache: it no-ops to miss (the
-                    # rate-bucket gate fails open) until the next boot reruns
-                    # its bootstrap.
                     logger.exception(
-                        "%s schema bootstrap failed — this cache is disabled until "
-                        "the next boot; the other lml_cache.* bootstraps continue",
-                        label,
+                        "lml_cache bootstrap advisory lock acquisition failed — skipping "
+                        "lml_cache.* bootstraps until the next boot"
                     )
-        finally:
-            if locked:
+                    return
+                locked_source = _ConnectionPgSource(conn)
+                for label, bootstrap in bootstraps:
+                    try:
+                        await bootstrap(locked_source)
+                        logger.info("%s schema ready", label)
+                    except Exception:
+                        # Degrade just this cache: it no-ops to miss (the
+                        # rate-bucket gate fails open) until the next boot reruns
+                        # its bootstrap.
+                        logger.exception(
+                            "%s schema bootstrap failed — this cache is disabled until "
+                            "the next boot; the other lml_cache.* bootstraps continue",
+                            label,
+                        )
+            finally:
+                if locked:
+                    try:
+                        await conn.execute(_LML_CACHE_BOOTSTRAP_ADVISORY_UNLOCK)
+                    except Exception:
+                        logger.exception("lml_cache bootstrap advisory unlock failed")
                 try:
-                    await conn.execute(_LML_CACHE_BOOTSTRAP_ADVISORY_UNLOCK)
+                    await conn.execute(_LML_CACHE_BOOTSTRAP_RESET_LOCK_TIMEOUT)
                 except Exception:
-                    logger.exception("lml_cache bootstrap advisory unlock failed")
-            try:
-                await conn.execute(_LML_CACHE_BOOTSTRAP_RESET_LOCK_TIMEOUT)
-            except Exception:
-                logger.exception("lml_cache bootstrap lock_timeout reset failed")
+                    logger.exception("lml_cache bootstrap lock_timeout reset failed")
+    except Exception:
+        logger.exception(
+            "lml_cache bootstrap connection acquisition failed — skipping "
+            "lml_cache.* bootstraps until the next boot"
+        )
 
 
 # Wall-clock ceiling on the whole bucket-mode boot fetch (retries included). A
