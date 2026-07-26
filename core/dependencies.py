@@ -95,10 +95,22 @@ async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryD
     global _library_db, _library_db_signature
 
     db_path = Path(settings.resolved_library_db_path)
-    if _library_db is not None and _library_db_signature is not None:
+    if _library_db is not None:
         current_signature = _library_db_file_signature(db_path)
-        if current_signature is not None and current_signature != _library_db_signature:
-            logger.info("Library database file changed; reopening: %s", db_path)
+        if _library_db_signature is not None:
+            # Connected instance: reopen only when the backing file was
+            # atomically swapped (an admin upload's os.replace() gives the path
+            # a new inode). A sibling worker that missed the in-process close
+            # otherwise keeps serving the old, unlinked inode. See #706.
+            if current_signature is not None and current_signature != _library_db_signature:
+                logger.info("Library database file changed; reopening: %s", db_path)
+                await close_library_db()
+        elif current_signature is not None:
+            # A prior connect() hit FileNotFoundError and cached an unconnected
+            # instance (health reports unhealthy) with a None signature. The
+            # file exists now — e.g. a sibling worker's admin upload landed — so
+            # drop the stub and connect on the fall-through below. See #706.
+            logger.info("Library database file now present; connecting: %s", db_path)
             await close_library_db()
 
     if _library_db is None:

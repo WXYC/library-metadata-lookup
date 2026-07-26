@@ -152,6 +152,39 @@ class TestLifespan:
             main._LML_CACHE_BOOTSTRAP_RESET_LOCK_TIMEOUT,
         ]
 
+    @pytest.mark.asyncio
+    async def test_lml_cache_bootstrap_connection_acquire_failure_is_nonfatal(self):
+        """A pooled-connection checkout failure degrades, it does not crash boot.
+
+        The lifespan calls this helper without its own try/except, so a
+        connection acquisition that raises (checkout timeout, dead connection on
+        a degraded discogs-cache PG) must be swallowed here or it aborts startup
+        and crash-loops the container — the opposite of the #706 hardening.
+        """
+        import main
+        from entity.sources import PgSource
+
+        class _FailingAcquire:
+            async def __aenter__(self):
+                raise RuntimeError("pool checkout failed")
+
+            async def __aexit__(self, *exc_info):
+                return None
+
+        class _FailingPool:
+            def acquire(self):
+                return _FailingAcquire()
+
+        bootstrap = AsyncMock()
+
+        # Must not raise.
+        await main._run_lml_cache_bootstraps(
+            PgSource(pool=_FailingPool()),
+            (("Streaming-URL cache", bootstrap),),
+        )
+
+        bootstrap.assert_not_awaited()
+
 
 class TestMiddleware:
     @pytest.mark.asyncio
