@@ -323,6 +323,9 @@ def _capture_queue_wait(*, wait_ms: float, queue_sleeps: int) -> None:
             return
         if wait_ms <= _queue_wait_max_by_transaction.get(transaction, 0.0):
             return
+        # Retain the transaction's WORST (max-wait_ms) queue. queue_sleeps rides
+        # that same selection — it is the sleep count of the worst queue, NOT an
+        # independently-maxed series — so the pair always describes one queue.
         _queue_wait_max_by_transaction[transaction] = wait_ms
         transaction.set_measurement(_QUEUE_WAIT_MEASUREMENT, wait_ms)
         transaction.set_data(_QUEUE_WAIT_MEASUREMENT, wait_ms)
