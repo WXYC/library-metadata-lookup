@@ -29,11 +29,13 @@ def reset_globals():
     fixtures don't work for sync tests under pytest-asyncio strict mode).
     """
     deps_module._library_db = None
+    deps_module._library_db_signature = None
     deps_module._object_store = None
     asyncio.run(close_discogs_service())
     asyncio.run(close_musicbrainz_pg())
     yield
     deps_module._library_db = None
+    deps_module._library_db_signature = None
     deps_module._object_store = None
     asyncio.run(close_discogs_service())
     asyncio.run(close_musicbrainz_pg())
@@ -98,6 +100,9 @@ class TestGetLibraryDB:
             mock_db_cls.assert_called_once()
             mock_db.connect.assert_called_once()
             assert result is mock_db
+            assert deps_module._library_db_signature == deps_module._library_db_file_signature(
+                db_file
+            )
 
     @pytest.mark.asyncio
     async def test_cached_instance(self, mock_settings):
@@ -159,6 +164,42 @@ class TestGetLibraryDB:
 
             result2 = await get_library_db(mock_settings)
             assert await result2.is_available() is True
+
+    @pytest.mark.asyncio
+    async def test_reopens_cached_instance_after_library_db_file_replace(
+        self, tmp_path, mock_settings
+    ):
+        """A sibling uvicorn worker notices the admin upload's atomic file swap.
+
+        The upload handler closes the DB only in the worker that handles the
+        request. Other workers must reopen on their next ``get_library_db`` call
+        or they keep serving the old unlinked SQLite inode indefinitely.
+        """
+        db_file = tmp_path / "library.db"
+        db_file.write_text("old")
+        mock_settings.library_db_path = str(db_file)
+
+        old_db = AsyncMock()
+        deps_module._library_db = old_db
+        deps_module._library_db_signature = deps_module._library_db_file_signature(db_file)
+
+        replacement = tmp_path / "library-new.db"
+        replacement.write_text("new-content")
+        replacement.replace(db_file)
+
+        with patch("core.dependencies.LibraryDB") as mock_db_cls:
+            new_db = AsyncMock()
+            mock_db_cls.return_value = new_db
+
+            result = await get_library_db(mock_settings)
+
+            old_db.close.assert_awaited_once()
+            mock_db_cls.assert_called_once_with(db_path=db_file)
+            new_db.connect.assert_awaited_once()
+            assert result is new_db
+            assert deps_module._library_db_signature == deps_module._library_db_file_signature(
+                db_file
+            )
 
 
 # ---------------------------------------------------------------------------

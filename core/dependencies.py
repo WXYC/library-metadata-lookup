@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import asyncpg
@@ -59,6 +60,24 @@ logger = logging.getLogger(__name__)
 # health endpoint reports `unhealthy` instead of repeatedly retrying connect).
 # See WXYC/library-metadata-lookup#283.
 _library_db: LibraryDB | None = None
+_LibraryDbSignature = tuple[int, int, int]
+_library_db_signature: _LibraryDbSignature | None = None
+
+
+def _library_db_file_signature(db_path: Path) -> _LibraryDbSignature | None:
+    """Return the on-disk identity used to detect an atomic library.db hot-swap.
+
+    ``POST /admin/upload-library-db`` refreshes the serving process with
+    ``os.replace()``. In a multi-worker container, sibling worker processes keep
+    an open SQLite fd to the old, unlinked inode unless they notice that the path
+    now resolves to a different file. This cheap stat keeps that detection in the
+    dependency that every catalog-backed request already calls.
+    """
+    try:
+        stat_result = db_path.stat()
+    except FileNotFoundError:
+        return None
+    return (stat_result.st_ino, stat_result.st_mtime_ns, stat_result.st_size)
 
 
 async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryDB:
@@ -73,15 +92,23 @@ async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryD
     Raises:
         ServiceInitializationError: If database initialization fails
     """
-    global _library_db
+    global _library_db, _library_db_signature
+
+    db_path = Path(settings.resolved_library_db_path)
+    if _library_db is not None and _library_db_signature is not None:
+        current_signature = _library_db_file_signature(db_path)
+        if current_signature is not None and current_signature != _library_db_signature:
+            logger.info("Library database file changed; reopening: %s", db_path)
+            await close_library_db()
 
     if _library_db is None:
         try:
-            db_path = settings.resolved_library_db_path
             _library_db = LibraryDB(db_path=db_path)
             await _library_db.connect()
+            _library_db_signature = _library_db_file_signature(db_path)
             logger.info(f"Library database connected: {db_path}")
         except FileNotFoundError:
+            _library_db_signature = None
             logger.warning(
                 f"Library database not found at {settings.resolved_library_db_path}. "
                 "Service will start without database (health check will report unhealthy). "
@@ -97,10 +124,11 @@ async def get_library_db(settings: Settings = Depends(get_settings)) -> LibraryD
 
 async def close_library_db() -> None:
     """Close library database connection."""
-    global _library_db
+    global _library_db, _library_db_signature
     if _library_db:
         await _library_db.close()
         _library_db = None
+        _library_db_signature = None
 
 
 # Object store selection (WXYC/library-metadata-lookup#835). Built once and
