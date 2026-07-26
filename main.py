@@ -3,8 +3,10 @@
 import asyncio
 import logging
 import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import sentry_sdk
 from dotenv import load_dotenv
@@ -65,6 +67,90 @@ if settings.log_level != "DEBUG":
 setup_logging(level=settings.log_level, log_file=log_file)
 
 logger = logging.getLogger(__name__)
+
+_LML_CACHE_BOOTSTRAP_ADVISORY_LOCK_KEY = 747706
+_LML_CACHE_BOOTSTRAP_LOCK_TIMEOUT = "SET lock_timeout = '10s'"
+_LML_CACHE_BOOTSTRAP_RESET_LOCK_TIMEOUT = "RESET lock_timeout"
+_LML_CACHE_BOOTSTRAP_ADVISORY_LOCK = (
+    f"SELECT pg_advisory_lock({_LML_CACHE_BOOTSTRAP_ADVISORY_LOCK_KEY})"
+)
+_LML_CACHE_BOOTSTRAP_ADVISORY_UNLOCK = (
+    f"SELECT pg_advisory_unlock({_LML_CACHE_BOOTSTRAP_ADVISORY_LOCK_KEY})"
+)
+
+
+class _ConnectionPgSource:
+    """PgSource-shaped adapter bound to one existing asyncpg connection.
+
+    The multi-worker bootstrap guard holds a session advisory lock on this
+    connection. Running every bootstrap through the same connection keeps the
+    lock effective even when ``LML_DISCOGS_POOL_MAX_SIZE=1``; holding a separate
+    lock connection while helpers use the pool would deadlock at that size.
+    """
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    async def fetchall(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        records = await self._conn.fetch(query, *args)
+        return [dict(r) for r in records]
+
+    async def fetchone(self, query: str, *args: Any) -> dict[str, Any] | None:
+        record = await self._conn.fetchrow(query, *args)
+        if record is None:
+            return None
+        return dict(record)
+
+    async def execute(self, query: str, *args: Any) -> str:
+        return await self._conn.execute(query, *args)
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[Any]:
+        yield self._conn
+
+    async def close(self) -> None:
+        return None
+
+
+async def _run_lml_cache_bootstraps(source: Any, bootstraps: tuple[tuple[str, Any], ...]) -> None:
+    """Run all lifespan ``lml_cache.*`` bootstraps under one advisory lock."""
+    async with source.acquire() as conn:
+        locked = False
+        try:
+            try:
+                await conn.execute(_LML_CACHE_BOOTSTRAP_LOCK_TIMEOUT)
+                await conn.execute(_LML_CACHE_BOOTSTRAP_ADVISORY_LOCK)
+                locked = True
+            except Exception:
+                logger.exception(
+                    "lml_cache bootstrap advisory lock acquisition failed — skipping "
+                    "lml_cache.* bootstraps until the next boot"
+                )
+                return
+            locked_source = _ConnectionPgSource(conn)
+            for label, bootstrap in bootstraps:
+                try:
+                    await bootstrap(locked_source)
+                    logger.info("%s schema ready", label)
+                except Exception:
+                    # Degrade just this cache: it no-ops to miss (the
+                    # rate-bucket gate fails open) until the next boot reruns
+                    # its bootstrap.
+                    logger.exception(
+                        "%s schema bootstrap failed — this cache is disabled until "
+                        "the next boot; the other lml_cache.* bootstraps continue",
+                        label,
+                    )
+        finally:
+            if locked:
+                try:
+                    await conn.execute(_LML_CACHE_BOOTSTRAP_ADVISORY_UNLOCK)
+                except Exception:
+                    logger.exception("lml_cache bootstrap advisory unlock failed")
+            try:
+                await conn.execute(_LML_CACHE_BOOTSTRAP_RESET_LOCK_TIMEOUT)
+            except Exception:
+                logger.exception("lml_cache bootstrap lock_timeout reset failed")
 
 
 # Wall-clock ceiling on the whole bucket-mode boot fetch (retries included). A
@@ -239,7 +325,7 @@ async def lifespan(app: FastAPI):
             bootstraps = (
                 (
                     "Streaming-URL cache",
-                    lambda: set_up_streaming_url_cache_schema(source),
+                    set_up_streaming_url_cache_schema,
                 ),
                 # Track-scoped streaming-URL cache (LML#893, lever L1), a
                 # SEPARATE LML-owned ``lml_cache.*`` table keyed on the played
@@ -248,21 +334,21 @@ async def lifespan(app: FastAPI):
                 # (the PR #898 poisoning bug). Same pool, same best-effort posture.
                 (
                     "Track streaming-URL cache",
-                    lambda: set_up_track_streaming_url_cache_schema(source),
+                    set_up_track_streaming_url_cache_schema,
                 ),
                 # Positive release-resolution cache (LML#632), another LML-owned
                 # ``lml_cache.*`` application cache. Same pool, same best-effort
                 # posture; #628 wires its read/write into the lookup path.
                 (
                     "Release-resolution cache",
-                    lambda: set_up_release_resolution_cache_schema(source),
+                    set_up_release_resolution_cache_schema,
                 ),
                 # Verified library-release override (LML#850), another LML-owned
                 # ``lml_cache.*`` table. Same pool, same best-effort posture; the
                 # orchestrator prefetches it on the flag-gated lookup path.
                 (
                     "Library-release override",
-                    lambda: set_up_library_release_override_schema(source),
+                    set_up_library_release_override_schema,
                 ),
                 # Shared Discogs rate token bucket (LML#841), one LML-owned
                 # ``lml_cache.*`` row seeded from the rate-limit budget. Seed is
@@ -272,8 +358,8 @@ async def lifespan(app: FastAPI):
                 # the local limiter regardless of this bootstrap's outcome.
                 (
                     "Discogs rate-bucket",
-                    lambda: set_up_discogs_rate_bucket_schema(
-                        source,
+                    lambda locked_source: set_up_discogs_rate_bucket_schema(
+                        locked_source,
                         bucket_key=settings.discogs_rate_bucket_key,
                         capacity=settings.discogs_rate_limit,
                         refill_per_sec=settings.discogs_rate_limit / 60,
@@ -287,7 +373,7 @@ async def lifespan(app: FastAPI):
                 # replacement; see entity/streaming_catalog.py).
                 (
                     "Streaming catalog",
-                    lambda: set_up_streaming_catalog_schema(source),
+                    set_up_streaming_catalog_schema,
                 ),
                 # Per-consumer LML API keys (LML per-consumer API keys plan),
                 # another LML-owned lml_cache.* table. Same pool, same
@@ -295,22 +381,10 @@ async def lifespan(app: FastAPI):
                 # below is the actual request-path consumer.
                 (
                     "API keys",
-                    lambda: set_up_api_keys_schema(source),
+                    set_up_api_keys_schema,
                 ),
             )
-            for label, bootstrap in bootstraps:
-                try:
-                    await bootstrap()
-                    logger.info("%s schema ready", label)
-                except Exception:
-                    # Degrade just this cache: it no-ops to miss (the
-                    # rate-bucket gate fails open) until the next boot reruns
-                    # its bootstrap.
-                    logger.exception(
-                        "%s schema bootstrap failed — this cache is disabled until "
-                        "the next boot; the other lml_cache.* bootstraps continue",
-                        label,
-                    )
+            await _run_lml_cache_bootstraps(source, bootstraps)
 
             # LML per-consumer API keys: start the in-process cache AFTER the
             # bootstraps loop so it reuses this block's `source` (same

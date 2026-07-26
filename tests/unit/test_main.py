@@ -6,6 +6,39 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 
+class _FakeAcquire:
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *exc_info):
+        return None
+
+
+class _FakeConnection:
+    def __init__(self, fail_on: str | None = None):
+        self.executed: list[str] = []
+        self.fail_on = fail_on
+
+    async def execute(self, sql: str, *args: object) -> str:
+        self.executed.append(sql)
+        if self.fail_on is not None and self.fail_on in sql:
+            raise RuntimeError(f"injected failure on {self.fail_on}")
+        return "OK"
+
+
+class _FakePool:
+    def __init__(self, fail_on: str | None = None):
+        self.connection = _FakeConnection(fail_on=fail_on)
+        self.acquire_count = 0
+
+    def acquire(self):
+        self.acquire_count += 1
+        return _FakeAcquire(self.connection)
+
+
 class TestLifespan:
     @pytest.mark.asyncio
     async def test_shutdown_calls_cleanup(self, mock_settings):
@@ -38,7 +71,7 @@ class TestLifespan:
         import main
         from main import app, lifespan
 
-        pool = AsyncMock(name="discogs_pool")
+        pool = _FakePool()
         with (
             patch.object(main.settings, "database_url_discogs", "postgresql://unit/test"),
             # bucket_mode is a property over these two fields; force local
@@ -78,11 +111,46 @@ class TestLifespan:
             async with lifespan(app):
                 pass  # startup must not raise despite the first bootstrap failing
 
+            assert pool.acquire_count == 1
+            assert pool.connection.executed[:2] == [
+                main._LML_CACHE_BOOTSTRAP_LOCK_TIMEOUT,
+                main._LML_CACHE_BOOTSTRAP_ADVISORY_LOCK,
+            ]
+            assert pool.connection.executed[-2:] == [
+                main._LML_CACHE_BOOTSTRAP_ADVISORY_UNLOCK,
+                main._LML_CACHE_BOOTSTRAP_RESET_LOCK_TIMEOUT,
+            ]
             mock_url_cache.assert_awaited_once()
             mock_resolution.assert_awaited_once()
             mock_override.assert_awaited_once()
             mock_rate_bucket.assert_awaited_once()
             mock_catalog.assert_awaited_once()
+            locked_source = mock_url_cache.await_args.args[0]
+            assert mock_resolution.await_args.args[0] is locked_source
+            assert mock_override.await_args.args[0] is locked_source
+            assert mock_rate_bucket.await_args.args[0] is locked_source
+            assert mock_catalog.await_args.args[0] is locked_source
+
+    @pytest.mark.asyncio
+    async def test_lml_cache_bootstrap_lock_failure_is_nonfatal(self):
+        """A bootstrap advisory-lock timeout skips caches, not the whole boot."""
+        import main
+        from entity.sources import PgSource
+
+        pool = _FakePool(fail_on=main._LML_CACHE_BOOTSTRAP_ADVISORY_LOCK)
+        bootstrap = AsyncMock()
+
+        await main._run_lml_cache_bootstraps(
+            PgSource(pool=pool),
+            (("Streaming-URL cache", bootstrap),),
+        )
+
+        bootstrap.assert_not_awaited()
+        assert pool.connection.executed == [
+            main._LML_CACHE_BOOTSTRAP_LOCK_TIMEOUT,
+            main._LML_CACHE_BOOTSTRAP_ADVISORY_LOCK,
+            main._LML_CACHE_BOOTSTRAP_RESET_LOCK_TIMEOUT,
+        ]
 
 
 class TestMiddleware:
