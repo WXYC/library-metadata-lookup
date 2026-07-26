@@ -11,6 +11,8 @@ Implements:
 import asyncio
 import logging
 import random
+import time
+import weakref
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
@@ -29,8 +31,11 @@ logger = logging.getLogger(__name__)
 # interpretation: docs/observability-rowless-flag.md, "Rate-gate fail-open
 # counter".
 _FAIL_OPEN_EVENT = "discogs_rate_gate_fail_open"
+_QUEUE_WAIT_EVENT = "discogs_rate_gate_queue_wait"
 _POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
 _POSTHOG_EVENT_PREFIX = "discogs_rate_gate"
+_QUEUE_WAIT_MEASUREMENT = "lml.discogs.rate_gate_queue_wait_ms"
+_QUEUE_SLEEP_MEASUREMENT = "lml.discogs.rate_gate_queue_sleeps"
 
 # Upper bound on a SINGLE queue-for-a-token sleep in the rate gate. At the
 # default 50/min this never binds (retry_after ≈ 1.2s); it only clamps a
@@ -52,6 +57,7 @@ _breakers: dict[asyncio.AbstractEventLoop, DiscogsCircuitBreaker] = {}
 # LML#841 shared rate gate, stored per event loop (same scope). Composes the
 # per-loop local ``AsyncLimiter`` with the shared PG token bucket.
 _rate_gates: dict[asyncio.AbstractEventLoop, "DiscogsRateGate"] = {}
+_queue_wait_max_by_transaction: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def _build_breaker() -> DiscogsCircuitBreaker:
@@ -226,6 +232,8 @@ class DiscogsRateGate:
         await self._local.acquire()
 
         timeout_s = settings.discogs_rate_bucket_timeout_s
+        queue_started_at: float | None = None
+        queue_sleeps = 0
         try:
             bucket = await self._resolve_bucket()
             if bucket is None:
@@ -233,11 +241,19 @@ class DiscogsRateGate:
             while True:
                 acquisition = await asyncio.wait_for(bucket.try_acquire(), timeout_s)
                 if acquisition.allowed:
+                    if queue_started_at is not None:
+                        _capture_queue_wait(
+                            wait_ms=(time.perf_counter() - queue_started_at) * 1000.0,
+                            queue_sleeps=queue_sleeps,
+                        )
                     return
                 # Empty-but-healthy bucket: queue for the next token. Normally
                 # ~1/refill_per_sec (≈1.2s at 50/min); clamp a degenerate hint and
                 # jitter the wake-up so the (semaphore-bounded) waiters don't wake
                 # in lock-step onto the single row lock.
+                if queue_started_at is None:
+                    queue_started_at = time.perf_counter()
+                queue_sleeps += 1
                 base_sleep = min(acquisition.retry_after_s, _MAX_QUEUE_SLEEP_S)
                 await asyncio.sleep(base_sleep + random.random() * base_sleep * _QUEUE_SLEEP_JITTER)
         except Exception as exc:
@@ -259,11 +275,61 @@ class DiscogsRateGate:
             # distinguishable from a PG outage in Sentry issue-grouping and the logs
             # rather than silently masquerading as one.
             sentry_sdk.set_tag("lml.discogs.rate_gate", "fallback")
+            if queue_started_at is not None:
+                _capture_queue_wait(
+                    wait_ms=(time.perf_counter() - queue_started_at) * 1000.0,
+                    queue_sleeps=queue_sleeps,
+                )
             _capture_fail_open(exc)
             logger.warning(
                 "Discogs shared rate bucket unavailable; already paced by local limiter",
                 exc_info=True,
             )
+
+
+def _capture_queue_wait(*, wait_ms: float, queue_sleeps: int) -> None:
+    """Emit the rate-token queue wait measurement for saturated-but-healthy buckets.
+
+    This is LML#879 Deliverable B's "measure first" surface for N>=2
+    double-floods. A queue wait is not a failure — it is the no-overshoot
+    invariant working — so it uses a separate event from ``_FAIL_OPEN_EVENT``.
+    PostHog gives a sampling-independent tail distribution; Sentry carries the
+    per-transaction max alongside traces for drill-down. Strictly best-effort:
+    observability must never turn healthy saturation into a request failure.
+    """
+    try:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        if settings.enable_telemetry:
+            client = get_posthog_client(event_prefix=_POSTHOG_EVENT_PREFIX)
+            if client is not None:
+                client.capture(
+                    distinct_id=_POSTHOG_DISTINCT_ID,
+                    event=_QUEUE_WAIT_EVENT,
+                    properties={
+                        "wait_ms": wait_ms,
+                        "queue_sleeps": queue_sleeps,
+                        "environment": settings.environment,
+                    },
+                )
+    except Exception:
+        logger.warning("Failed to emit %s event", _QUEUE_WAIT_EVENT, exc_info=True)
+
+    try:
+        sentry_sdk.set_tag("lml.discogs.rate_gate_queued", "true")
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is None:
+            return
+        if wait_ms <= _queue_wait_max_by_transaction.get(transaction, 0.0):
+            return
+        _queue_wait_max_by_transaction[transaction] = wait_ms
+        transaction.set_measurement(_QUEUE_WAIT_MEASUREMENT, wait_ms)
+        transaction.set_data(_QUEUE_WAIT_MEASUREMENT, wait_ms)
+        transaction.set_measurement(_QUEUE_SLEEP_MEASUREMENT, queue_sleeps)
+        transaction.set_data(_QUEUE_SLEEP_MEASUREMENT, queue_sleeps)
+    except Exception:
+        logger.warning("Failed to project %s measurement", _QUEUE_WAIT_EVENT, exc_info=True)
 
 
 def _capture_fail_open(exc: BaseException) -> None:
@@ -341,9 +407,10 @@ def get_discogs_rate_gate() -> "DiscogsRateGate":
 
 def reset_rate_limiting() -> None:
     """Reset rate limiting state for testing."""
-    global _rate_limiters, _semaphores, _breakers, _rate_gates
+    global _rate_limiters, _semaphores, _breakers, _rate_gates, _queue_wait_max_by_transaction
     _rate_limiters.clear()
     _semaphores.clear()
     _breakers.clear()
     _rate_gates.clear()
+    _queue_wait_max_by_transaction.clear()
     logger.debug("Reset rate limiting state")
