@@ -441,3 +441,18 @@ class TestLmlWallTimingMiddlewareRawASGI:
         assert _with_appended_server_timing(
             [(b"server-timing", b"total;dur=5")], b"lml_wall;dur=1"
         ) == [(b"server-timing", b"total;dur=5, lml_wall;dur=1")]
+
+    def test_with_appended_server_timing_appends_to_first_of_multiple(self):
+        """If the app emitted more than one ``Server-Timing`` header line,
+        ``lml_wall`` is appended to the FIRST match only -- never duplicated
+        onto every line. A naive append-to-each would emit ``lml_wall`` twice,
+        so a reader would double-count the wall-clock leg.
+        """
+        result = _with_appended_server_timing(
+            [(b"server-timing", b"a;dur=1"), (b"server-timing", b"b;dur=2")],
+            b"lml_wall;dur=3",
+        )
+        assert result == [
+            (b"server-timing", b"a;dur=1, lml_wall;dur=3"),
+            (b"server-timing", b"b;dur=2"),
+        ]
