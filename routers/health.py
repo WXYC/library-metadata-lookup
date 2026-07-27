@@ -212,8 +212,12 @@ async def health_check(
     # that would advance the state machine / consume a trial slot. The same
     # reading feeds both the ``discogs_api`` probe (so it dominates the
     # independent live probe) and the raw ``discogs_breaker_state`` field
-    # below, so the two can never disagree with each other.
-    breaker_state = get_discogs_breaker().state
+    # below, so the two can never disagree with each other. Only consulted
+    # when Discogs is configured: with no service there is no live probe for
+    # the breaker to dominate and no breaker worth materializing, so the
+    # field reports ``null`` (same "null when N/A" convention as
+    # ``commit_sha``) rather than a misleading ``"closed"`` for an inert breaker.
+    breaker_state = get_discogs_breaker().state if discogs_service is not None else None
     checks = _build_checks(db=db, discogs_service=discogs_service, breaker_state=breaker_state)
     results = await asyncio.gather(
         *(_run_check_preserving_value(c, DEFAULT_TIMEOUT_SECONDS) for c in checks)
@@ -236,11 +240,12 @@ async def health_check(
         "commit_sha": _resolve_commit_sha(),
         # LML#757: the raw breaker state, for drill-down alongside the
         # derived (and now breaker-dominated) ``services.discogs_api`` value.
-        # Kept OUT of ``services`` deliberately -- that dict feeds
-        # ``all_configured_ok`` above via an ``("ok", "unavailable")``
-        # membership check, and "closed" is neither, so folding it in there
-        # would spuriously flip a fully healthy service to "degraded".
-        "discogs_breaker_state": breaker_state.value,
+        # ``null`` when Discogs is unconfigured (no breaker). Kept OUT of
+        # ``services`` deliberately -- that dict feeds ``all_configured_ok``
+        # above via an ``("ok", "unavailable")`` membership check, and
+        # "closed" is neither, so folding it in there would spuriously flip a
+        # fully healthy service to "degraded".
+        "discogs_breaker_state": breaker_state.value if breaker_state is not None else None,
         "services": services,
     }
 
