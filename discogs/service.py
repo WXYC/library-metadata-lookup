@@ -24,6 +24,7 @@ from wxyc_fastapi.observability import (
 from config.settings import get_settings
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.fallthrough import apply_request_ctx_tags, fallthrough, request_context
+from discogs.live_request_counter import increment_discogs_live_requests_total
 from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
 from discogs.memory_cache import (
     ARTIST_CACHE,
@@ -472,6 +473,13 @@ class DiscogsService:
         # live-probe tail is shed. ``epoch`` guards the half-open trial: the
         # terminal ``record_*`` below only drives a half-open transition when its
         # epoch still matches (FIX 6).
+        #
+        # LML#940: count every live-Discogs request *attempt* right here,
+        # before the admit/shed decision -- a shed attempt is demand too, and
+        # this is the sole ``allow_request()`` call site. See
+        # ``discogs/live_request_counter.py`` for why counting here (not per
+        # ``/lookup``) is required for the wxyc-canary idle-tail fix.
+        increment_discogs_live_requests_total()
         epoch = breaker.allow_request()
         if epoch is None:
             self._record_breaker_shed(method, path)

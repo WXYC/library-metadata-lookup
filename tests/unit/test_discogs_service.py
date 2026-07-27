@@ -675,6 +675,37 @@ class TestSearchReleasesByTrack:
         assert len(result.releases) == 1
 
     @pytest.mark.asyncio
+    async def test_cache_hit_does_not_increment_live_request_counter(self, service_with_cache):
+        """LML#940: a PG cache hit short-circuits before ``_request_with_retry``
+        -- and therefore before the live-Discogs-attempt chokepoint -- so it
+        must not advance the counter the wxyc-canary idle-tail fix reads.
+        Counting ``/lookup`` calls instead of live-Discogs attempts would show
+        "traffic flowing" during a busy-cache / idle-Discogs window, exactly
+        the false-positive scenario the counter exists to rule out."""
+        from discogs.live_request_counter import (
+            get_discogs_live_requests_total,
+            reset_discogs_live_requests_total,
+        )
+        from discogs.models import ReleaseInfo
+
+        reset_discogs_live_requests_total()
+        service_with_cache.cache_service.search_releases_by_track = AsyncMock(
+            return_value=[
+                ReleaseInfo(
+                    album="On Your Own Love Again",
+                    artist="Jessica Pratt",
+                    release_id=456,
+                    release_url="https://discogs.com/release/456",
+                )
+            ]
+        )
+
+        result = await service_with_cache.search_releases_by_track("Back, Baby", "Jessica Pratt")
+
+        assert result.cached is True
+        assert get_discogs_live_requests_total() == 0
+
+    @pytest.mark.asyncio
     async def test_cache_error_falls_back_to_api(self, service_with_cache):
         service_with_cache.cache_service.search_releases_by_track = AsyncMock(
             side_effect=Exception("cache down")

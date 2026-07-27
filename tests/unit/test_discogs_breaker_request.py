@@ -29,6 +29,10 @@ import httpx
 import pytest
 
 from discogs.breaker import DiscogsBreakerOpenError, DiscogsCircuitBreaker
+from discogs.live_request_counter import (
+    get_discogs_live_requests_total,
+    reset_discogs_live_requests_total,
+)
 from discogs.service import BREAKER_OPEN_STAT_KEY, DiscogsService
 from tests.unit.conftest import MonotonicClock
 
@@ -109,6 +113,34 @@ async def test_open_breaker_emits_the_counter(fake_limiter):
 
 
 @pytest.mark.asyncio
+async def test_open_breaker_shed_increments_live_request_counter(fake_limiter):
+    """LML#940: a shed attempt still counts as live-Discogs *demand*.
+
+    During a real sustained shed the breaker sheds almost everything, so if
+    shed attempts didn't count, the counter would flatline during exactly the
+    incident it exists to distinguish from the wxyc-canary idle-tail false
+    positive (a quiet period with zero live-Discogs demand, where the breaker
+    is merely latched OPEN with nothing to shed)."""
+    reset_discogs_live_requests_total()
+    breaker = DiscogsCircuitBreaker(failure_threshold=1, remaining_floor=0, cooldown_seconds=60.0)
+    breaker.force_open()
+
+    client = MagicMock()
+    client.request = AsyncMock()
+    service = _make_service(client)
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+    ):
+        with pytest.raises(DiscogsBreakerOpenError):
+            await service._request_with_retry("GET", "/database/search")
+
+    assert get_discogs_live_requests_total() == 1
+
+
+@pytest.mark.asyncio
 async def test_closed_breaker_healthy_request_passes_through(fake_limiter):
     """A CLOSED breaker with a healthy Discogs response is a pure pass-through:
     the client is called and the response is returned unchanged. Organic
@@ -133,6 +165,28 @@ async def test_closed_breaker_healthy_request_passes_through(fake_limiter):
     # assert the return, don't discard it).
     assert breaker.allow_request() is not None
     assert breaker.state.value == "closed"
+
+
+@pytest.mark.asyncio
+async def test_admitted_request_increments_live_request_counter(fake_limiter):
+    """LML#940: an admitted (non-shed) live-Discogs attempt also counts -- the
+    counter measures demand at the chokepoint regardless of outcome."""
+    reset_discogs_live_requests_total()
+    breaker = DiscogsCircuitBreaker(failure_threshold=3, remaining_floor=2, cooldown_seconds=60.0)
+
+    client = MagicMock()
+    ok = _response(200, {"X-Discogs-Ratelimit-Remaining": "48"})
+    client.request = AsyncMock(return_value=ok)
+    service = _make_service(client)
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+    ):
+        await service._request_with_retry("GET", "/database/search")
+
+    assert get_discogs_live_requests_total() == 1
 
 
 @pytest.mark.asyncio
