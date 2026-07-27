@@ -40,7 +40,9 @@ from wxyc_fastapi.healthcheck import DEFAULT_TIMEOUT_SECONDS, Check
 
 from config.settings import Settings, get_settings
 from core.dependencies import get_discogs_service, get_library_db
-from discogs.service import DiscogsService
+from discogs.breaker import BreakerState
+from discogs.ratelimit import get_discogs_breaker
+from discogs.service import DiscogsApiCheckResult, DiscogsService
 from library.db import LibraryDB
 
 logger = logging.getLogger(__name__)
@@ -105,14 +107,32 @@ async def _check_database(db: LibraryDB) -> str:
     return "ok" if await db.is_available() else "error"
 
 
-async def _check_discogs_api(discogs_service: DiscogsService | None) -> str:
+async def _check_discogs_api(
+    discogs_service: DiscogsService | None,
+    breaker_state: BreakerState | None = None,
+) -> str:
     """Ping the Discogs API via the service's own client.
 
     Returns the ``DiscogsApiCheckResult`` enum's string value so operators can
     distinguish auth drift, rate limits, and upstream outages from one another.
+
+    ``breaker_state`` is the LML#755 saturation circuit-breaker's *current*
+    state (read-only — callers must pass ``breaker.state``, never a mutating
+    accessor like ``allow_request()``). When it is OPEN or HALF_OPEN, the
+    breaker is already shedding live Discogs probes, so that state is
+    authoritative over this probe's own independent live call: the probe is
+    skipped entirely and the result short-circuits to ``rate-limited``. This
+    closes the gap behind the 2026-07-13/14 incident, where the breaker
+    latched HALF_OPEN and shed 100% of live Discogs calls for ~8h while this
+    probe's own call kept landing in a momentary token-bucket refill and
+    reporting ``ok`` -- two saturation detectors that could disagree. ``None``
+    (the default) preserves the pre-LML#757 behavior of trusting the live
+    probe alone, for callers that don't have a breaker reading handy.
     """
     if discogs_service is None:
         return "unavailable"
+    if breaker_state is not None and breaker_state is not BreakerState.CLOSED:
+        return DiscogsApiCheckResult.RATE_LIMITED.value
     return (await discogs_service.check_api()).value
 
 
@@ -123,18 +143,29 @@ async def _check_discogs_cache(discogs_service: DiscogsService | None) -> str:
     return "ok" if await discogs_service.cache_service.is_available() else "error"
 
 
-def _build_checks(*, db: LibraryDB, discogs_service: DiscogsService | None) -> list[Check]:
+def _build_checks(
+    *,
+    db: LibraryDB,
+    discogs_service: DiscogsService | None,
+    breaker_state: BreakerState | None = None,
+) -> list[Check]:
     """Build the readiness ``Check`` list for this request.
 
     ``database`` is required (a failing probe -> 503); the Discogs probes are
     optional (failing probes -> ``degraded`` + 200), matching the prior
     ``CORE_SERVICES = {"database"}`` aggregation rule.
+
+    ``breaker_state`` (LML#757) threads the saturation breaker's current state
+    into the ``discogs_api`` probe so it dominates the independent live probe
+    -- see ``_check_discogs_api``. ``None`` preserves the pre-LML#757 behavior
+    for callers that don't have a breaker reading (e.g. the shared-Check
+    shape-only test).
     """
     return [
         Check(name="database", probe=lambda: _check_database(db), required=True),
         Check(
             name="discogs_api",
-            probe=lambda: _check_discogs_api(discogs_service),
+            probe=lambda: _check_discogs_api(discogs_service, breaker_state),
             required=False,
         ),
         Check(
@@ -176,7 +207,14 @@ async def health_check(
     discogs_service: DiscogsService | None = Depends(get_discogs_service),
 ):
     """Health check with real connectivity probes for every dependency."""
-    checks = _build_checks(db=db, discogs_service=discogs_service)
+    # LML#757: read the breaker's state ONCE, up front, via the read-only
+    # ``.state`` property -- never ``allow_request()`` or any other accessor
+    # that would advance the state machine / consume a trial slot. The same
+    # reading feeds both the ``discogs_api`` probe (so it dominates the
+    # independent live probe) and the raw ``discogs_breaker_state`` field
+    # below, so the two can never disagree with each other.
+    breaker_state = get_discogs_breaker().state
+    checks = _build_checks(db=db, discogs_service=discogs_service, breaker_state=breaker_state)
     results = await asyncio.gather(
         *(_run_check_preserving_value(c, DEFAULT_TIMEOUT_SECONDS) for c in checks)
     )
@@ -196,6 +234,13 @@ async def health_check(
         "status": status,
         "version": settings.app_version,
         "commit_sha": _resolve_commit_sha(),
+        # LML#757: the raw breaker state, for drill-down alongside the
+        # derived (and now breaker-dominated) ``services.discogs_api`` value.
+        # Kept OUT of ``services`` deliberately -- that dict feeds
+        # ``all_configured_ok`` above via an ``("ok", "unavailable")``
+        # membership check, and "closed" is neither, so folding it in there
+        # would spuriously flip a fully healthy service to "degraded".
+        "discogs_breaker_state": breaker_state.value,
         "services": services,
     }
 

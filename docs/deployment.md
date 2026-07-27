@@ -219,6 +219,16 @@ Any value other than `ok` / `unavailable` flips the overall status to `degraded`
 
 The probe also projects its result onto the active Sentry trace as the `discogs_api.check` tag (e.g. `discogs_api.check=auth-error`), so historic `/health` incidents can be queried by failure mode in the Sentry trace explorer without re-pulling Railway logs.
 
+### `discogs_breaker_state` and its effect on `discogs_api` (LML#757)
+
+`GET /health` also reads the LML#755 Discogs saturation circuit-breaker's current state (`discogs/breaker.py`'s `BreakerState`, via the read-only `.state` property — the probe never calls `allow_request()` or anything else that would advance the state machine or consume a trial) and surfaces it verbatim as a top-level `discogs_breaker_state` field: `closed`, `open`, or `half-open`. It is deliberately kept out of the `services` object rather than added as another `services.*` key — `services` values feed the `healthy`/`degraded` aggregation via an `("ok", "unavailable")` membership check, and `"closed"` is neither, so folding it in there would spuriously flip a fully healthy deploy to `degraded`.
+
+The breaker's state is authoritative over `services.discogs_api`'s independent live probe: when the breaker is `open` or `half-open` (both are "shedding" — a half-open breaker still sheds every caller except its single in-flight trial), `services.discogs_api` short-circuits to `rate-limited` and the probe's own live call to Discogs is skipped entirely — it does not run and then get overridden. This closes the two-independent-detectors gap behind the 2026-07-13/14 incident: the breaker latched `half-open` and shed 100% of live Discogs calls for roughly 8 hours while the old `services.discogs_api` probe, dispatched independently of the breaker, kept landing in a momentary token-bucket refill and reporting `ok` the whole time — so the one signal an operator or the wxyc-canary would check said everything was fine while the lookup path was actually degraded to cache-only. Only when the breaker is `closed` does `services.discogs_api` defer to the live probe's own result (the vocabulary table above).
+
+```json
+{ "status": "degraded", "version": "0.1.0", "commit_sha": "abc123...", "discogs_breaker_state": "open", "services": { "database": "ok", "discogs_api": "rate-limited", "discogs_cache": "ok" } }
+```
+
 ### `commit_sha` (deploy identity)
 
 `GET /health` returns a `commit_sha` field identifying the deployed commit. It is resolved in priority order by `_resolve_commit_sha` in `routers/health.py`:
@@ -230,7 +240,7 @@ The probe also projects its result onto the active Sentry trace as the `discogs_
 Empty or whitespace-only values at any tier coerce to `null`, so the "null when unset" contract holds and downstream equality checks are never fooled by `""`.
 
 ```json
-{ "status": "healthy", "version": "0.1.0", "commit_sha": "abc123...", "services": { ... } }
+{ "status": "healthy", "version": "0.1.0", "commit_sha": "abc123...", "discogs_breaker_state": "closed", "services": { ... } }
 ```
 
 #### Why a baked file rather than `RAILWAY_GIT_COMMIT_SHA` (LML#509)
