@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from discogs.breaker import BreakerState
+from discogs.breaker import BreakerState, DiscogsCircuitBreaker
 from discogs.service import DiscogsApiCheckResult, DiscogsService
 from library.db import LibraryDB
 from routers.health import (
@@ -596,7 +596,7 @@ class TestHealthEndpoint:
         from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
         from main import app
 
-        open_breaker = MagicMock()
+        open_breaker = MagicMock(spec=DiscogsCircuitBreaker)
         open_breaker.state = BreakerState.OPEN
         monkeypatch.setattr(health_module, "get_discogs_breaker", lambda: open_breaker)
 
@@ -632,7 +632,7 @@ class TestHealthEndpoint:
         from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
         from main import app
 
-        half_open_breaker = MagicMock()
+        half_open_breaker = MagicMock(spec=DiscogsCircuitBreaker)
         half_open_breaker.state = BreakerState.HALF_OPEN
         monkeypatch.setattr(health_module, "get_discogs_breaker", lambda: half_open_breaker)
 
@@ -668,7 +668,7 @@ class TestHealthEndpoint:
         from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
         from main import app
 
-        closed_breaker = MagicMock()
+        closed_breaker = MagicMock(spec=DiscogsCircuitBreaker)
         closed_breaker.state = BreakerState.CLOSED
         monkeypatch.setattr(health_module, "get_discogs_breaker", lambda: closed_breaker)
 
@@ -691,6 +691,43 @@ class TestHealthEndpoint:
         assert body["status"] == "healthy"
         assert body["services"]["discogs_api"] == "ok"
         assert body["discogs_breaker_state"] == "closed"
+
+    @pytest.mark.asyncio
+    async def test_breaker_state_null_when_discogs_unconfigured(
+        self, mock_db, mock_settings, monkeypatch
+    ):
+        """LML#757: with Discogs unconfigured (``discogs_service is None``) there
+        is no live probe for the breaker to dominate and no breaker worth
+        materializing, so ``discogs_breaker_state`` reports ``null`` (the same
+        "null when N/A" convention as ``commit_sha``) and ``get_discogs_breaker``
+        is never called just to answer a health probe."""
+        import routers.health as health_module
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        breaker_probe = MagicMock()
+        monkeypatch.setattr(health_module, "get_discogs_breaker", breaker_probe)
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: None,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["discogs_breaker_state"] is None
+        assert body["services"]["discogs_api"] == "unavailable"
+        breaker_probe.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unhealthy_returns_503(self, mock_settings):
