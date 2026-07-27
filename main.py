@@ -197,16 +197,29 @@ def _atomic_write_bytes(dest: Path, data: bytes) -> None:
     ``FileNotFoundError`` — fatal to a uvicorn child, crash-looping the process
     group (observed on the ``UVICORN_WORKERS=3`` staging soak). The temp shares
     ``dest``'s directory so the replace stays a same-filesystem atomic rename.
+
+    ``mkstemp`` creates its temp 0600; we ``chmod`` it back to the umask-022
+    default (0644) the pre-fix ``Path.write_bytes`` produced, so ``dest``'s mode
+    is unchanged. The temp fd/file are created inside the ``try`` and tracked so
+    any failure — including one raised by ``os.fdopen`` before it takes ownership
+    of the descriptor — closes the fd and unlinks the temp rather than leaking it.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=dest.name + ".", suffix=".boot.tmp")
-    tmp = Path(tmp_name)
+    fd: int | None = None
+    tmp: Path | None = None
     try:
+        fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=dest.name + ".", suffix=".boot.tmp")
+        tmp = Path(tmp_name)
         with os.fdopen(fd, "wb") as f:
+            fd = None  # fdopen owns the descriptor now; the ``with`` closes it
             f.write(data)
+        os.chmod(tmp, 0o644)
         os.replace(tmp, dest)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        if fd is not None:
+            os.close(fd)
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
         raise
 
 

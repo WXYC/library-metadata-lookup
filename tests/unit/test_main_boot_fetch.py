@@ -16,6 +16,8 @@ store tests use.
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
 from unittest.mock import AsyncMock
 
 import boto3
@@ -215,6 +217,66 @@ class TestAtomicWriteConcurrency:
         assert dest.read_bytes() == payload  # atomic: never torn or partial
         # No temp file leaks: dest is the only artifact in the directory.
         assert list(tmp_path.iterdir()) == [dest]
+
+
+class TestAtomicWriteBytes:
+    """Single-writer behavior of ``_atomic_write_bytes`` (LML#933 review hardening)."""
+
+    def test_dest_keeps_default_mode_not_mkstemp_0600(self, tmp_path):
+        # ``tempfile.mkstemp`` creates its temp 0600; the pre-fix ``Path.write_bytes``
+        # produced the umask-022 default (0644). The destination mode must match the
+        # pre-fix behavior, not silently tighten to 0600.
+        from main import _atomic_write_bytes
+
+        dest = tmp_path / "library.db"
+        _atomic_write_bytes(dest, b"SQLite format 3\x00data")
+
+        assert dest.read_bytes() == b"SQLite format 3\x00data"
+        assert stat.S_IMODE(dest.stat().st_mode) == 0o644
+
+    def test_replace_failure_leaves_no_temp_and_no_dest(self, tmp_path, monkeypatch):
+        # A failure after the temp exists (here: ``os.replace`` raising) must unlink
+        # the unique temp rather than leak it, and must not create ``dest``.
+        from main import _atomic_write_bytes
+
+        dest = tmp_path / "library.db"
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(os, "replace", _boom)
+
+        with pytest.raises(OSError, match="simulated replace failure"):
+            _atomic_write_bytes(dest, b"payload")
+
+        assert not dest.exists()
+        assert list(tmp_path.iterdir()) == []  # temp cleaned up, nothing leaked
+
+    def test_fdopen_failure_closes_fd_and_removes_temp(self, tmp_path, monkeypatch):
+        # If ``os.fdopen`` raises before taking ownership of the mkstemp descriptor,
+        # the raw fd must still be closed (pre-fix it leaked) and the temp removed.
+        from main import _atomic_write_bytes
+
+        dest = tmp_path / "library.db"
+        closed: list[int] = []
+        real_close = os.close
+
+        def _recording_close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("simulated fdopen failure")
+
+        monkeypatch.setattr(os, "fdopen", _boom)
+        monkeypatch.setattr(os, "close", _recording_close)
+
+        with pytest.raises(OSError, match="simulated fdopen failure"):
+            _atomic_write_bytes(dest, b"payload")
+
+        assert closed, "raw mkstemp fd was leaked (never closed) on fdopen failure"
+        assert not dest.exists()
+        assert list(tmp_path.iterdir()) == []  # temp cleaned up, nothing leaked
 
 
 class TestLifespanWiring:
