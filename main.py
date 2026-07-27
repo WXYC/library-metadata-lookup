@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -186,11 +187,23 @@ _BOOT_FETCH_DEADLINE_SECONDS = 60.0
 
 
 def _atomic_write_bytes(dest: Path, data: bytes) -> None:
-    """Write ``data`` to ``dest`` via a temp file + ``os.replace`` (no torn reads)."""
+    """Write ``data`` to ``dest`` via a unique temp file + ``os.replace`` (no torn reads).
+
+    Safe under concurrent writers to the same ``dest`` (LML#747): each call lands
+    the bytes in a distinct ``mkstemp`` file in ``dest``'s directory, so N uvicorn
+    workers boot-fetching ``library.db`` in parallel never share one temp path.
+    The pre-fix fixed name (``dest + ".boot.tmp"``) let one worker's ``os.replace``
+    consume the temp out from under another, whose ``os.replace`` then raised
+    ``FileNotFoundError`` — fatal to a uvicorn child, crash-looping the process
+    group (observed on the ``UVICORN_WORKERS=3`` staging soak). The temp shares
+    ``dest``'s directory so the replace stays a same-filesystem atomic rename.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".boot.tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=dest.name + ".", suffix=".boot.tmp")
+    tmp = Path(tmp_name)
     try:
-        tmp.write_bytes(data)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
         os.replace(tmp, dest)
     except BaseException:
         tmp.unlink(missing_ok=True)
