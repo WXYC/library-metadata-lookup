@@ -130,11 +130,31 @@ async def test_burst_exhausts_then_denies_with_retry_after(pg_source, bucket_key
     assert denied.retry_after_s > 0.0
 
 
-async def test_tokens_refill_over_time(pg_source, bucket_key):
-    # Fast refill (100/s => a token every 10ms), capacity 1.
-    bucket = await _seed(pg_source, bucket_key, capacity=1, refill=100.0)
+async def test_stays_drained_immediately_after_burst(pg_source, bucket_key):
+    """No meaningful refill happens between two back-to-back acquires.
+
+    Uses ``_TINY_REFILL`` (like the concurrency tests below) so the "still
+    drained" claim never races the wall clock against real PG round-trip
+    latency -- see ``test_tokens_refill_over_time`` for the fast-refill,
+    accrual-over-a-real-sleep counterpart.
+    """
+    bucket = await _seed(pg_source, bucket_key, capacity=1, refill=_TINY_REFILL)
     assert (await bucket.try_acquire()).allowed is True
     assert (await bucket.try_acquire()).allowed is False  # drained
+
+
+async def test_tokens_refill_over_time(pg_source, bucket_key):
+    """A token becomes available again once enough wall-clock time has passed.
+
+    Fast refill (100/s => a token every 10ms), capacity 1. Deliberately does
+    NOT assert "still drained immediately after draining" -- with a 10ms
+    token width, two real PG round-trips (``try_acquire`` is a `FOR UPDATE`
+    select + update) can exceed that window under CI load, so that assertion
+    is racy against the fast refill rate (LML#934). The 50ms sleep here is
+    far larger than any round-trip jitter, so it stays deterministic.
+    """
+    bucket = await _seed(pg_source, bucket_key, capacity=1, refill=100.0)
+    assert (await bucket.try_acquire()).allowed is True  # drains the seeded token
     await asyncio.sleep(0.05)  # 0.05 * 100 = 5 tokens accrue, capped at capacity 1
     assert (await bucket.try_acquire()).allowed is True
 
