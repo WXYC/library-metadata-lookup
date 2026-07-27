@@ -28,6 +28,7 @@ from core.dependencies import (
 )
 from core.event_loop_lag import start_sampler, stop_sampler
 from core.logging import setup_logging
+from core.server_timing_middleware import lml_wall_timing_middleware
 from discogs.router import router as discogs_router
 from identity.dependencies import close_entity_store
 from identity.router import api_v1_router as identity_api_v1_router
@@ -492,6 +493,16 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+# Registered BEFORE `posthog_flush_middleware` below deliberately — Starlette's
+# `add_middleware`/`@app.middleware("http")` prepend to the user-middleware
+# list, so the LAST one registered ends up OUTERMOST (it sees the request
+# first and the response last). Registering the wall-clock timer first makes
+# it the INNER of the two: `posthog_flush_middleware`'s synchronous
+# `flush_posthog()` call then runs OUTSIDE the timed window, so it can't
+# inflate the `lml_wall` Server-Timing leg with unrelated middleware cost. See
+# `core/server_timing_middleware.py` for what the leg measures and why.
+app.middleware("http")(lml_wall_timing_middleware)
 
 
 @app.middleware("http")

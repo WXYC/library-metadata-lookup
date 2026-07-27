@@ -62,6 +62,7 @@ from lookup.models import (
 )
 from lookup.orchestrator import perform_lookup
 from lookup.rowless import NONLIBRARY_RELEASE_SURFACED_STAT_KEY
+from lookup.server_timing_legs import EVENT_LOOP_LAG_STAT_KEY, event_loop_lag_extra_leg
 from lookup.streaming_url_postprocess import set_suppress_streaming_warm
 from streaming.dependencies import (
     get_apple_music_client,
@@ -220,15 +221,6 @@ def _project_inflight_capped(wait_ms: float) -> None:
 # Settings field names so the dimension is self-describing.
 LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY = "lml_resolve_nonlibrary_release"
 LML_RESOLVE_COMPILATION_RELEASE_STAT_KEY = "lml_resolve_compilation_release"
-
-# LML#907 event-loop-lag gauge. The process-global sampler (core.event_loop_lag,
-# started in main.py lifespan) measures how long the single uvicorn worker's loop
-# takes to resume past a fixed sleep — the /lookup starvation tax
-# (plans/lookup-latency-event-loop-starvation.md §3) that no track_step or
-# Server-Timing leg can see. Stamped once per cache_stats context so it rides the
-# cache.* / lml.cache.* projection to PostHog + Sentry as a per-request sample of
-# the process-global gauge.
-EVENT_LOOP_LAG_STAT_KEY = "event_loop_lag_ms"
 
 _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     "memory_cache_inflight_join",
@@ -534,9 +526,13 @@ async def handle_lookup(
             permit_held = True
             # Stop watching for disconnect; the permit-held phase is not reaped.
             await cancel_and_drain(sentinel_task)
+            # `queue_wait` Server-Timing leg (LML#907 follow-up): always
+            # computed (0.0 when uncontended) so it always renders via `extra`
+            # below; `total` (built after this point) never includes it.
+            queue_wait_ms = 0.0
             if capped_on_arrival:
-                wait_ms = (time.perf_counter() - wait_start) * 1000.0
-                _project_inflight_capped(wait_ms)
+                queue_wait_ms = (time.perf_counter() - wait_start) * 1000.0
+                _project_inflight_capped(queue_wait_ms)
                 # Debit the queue wait from the caller's budget so the A8 /
                 # LML#345 contract ("LML returns slightly before the caller
                 # times out") holds under saturation — the pipeline's budget
@@ -547,7 +543,7 @@ async def handle_lookup(
                 # almost immediately — the cheap outcome the (likely already
                 # timed-out) caller would want.
                 if x_caller_budget_ms is not None and x_caller_budget_ms > 0:
-                    x_caller_budget_ms = max(1, x_caller_budget_ms - int(wait_ms))
+                    x_caller_budget_ms = max(1, x_caller_budget_ms - int(queue_wait_ms))
             # Constructed inside the permit so telemetry's total-duration
             # series keeps meaning "lookup work", not "queue wait + work" —
             # the wait is reported separately via the Sentry measurement.
@@ -593,7 +589,12 @@ async def handle_lookup(
         # to 0 rather than TypeError, mirroring the CacheStats guard above.
         pg_ms = stats.get("pg_time_ms", 0) if stats else 0
         api_ms = stats.get("api_time_ms", 0) if stats else 0
-        _emit_server_timing_header(http_response, telemetry, extra={"discogs": pg_ms + api_ms})
+        # `queue_wait` nets out of the middleware-timed `lml_wall` leg to
+        # isolate DI/(de)serialization overhead; `event_loop_lag` is omitted
+        # (not zeroed) when unsampled — see `lookup.server_timing_legs`.
+        extra: dict[str, float] = {"discogs": pg_ms + api_ms, "queue_wait": queue_wait_ms}
+        extra.update(event_loop_lag_extra_leg(stats))
+        _emit_server_timing_header(http_response, telemetry, extra=extra)
 
         # Send telemetry
         if posthog_client:

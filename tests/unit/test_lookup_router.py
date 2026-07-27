@@ -658,7 +658,10 @@ class TestHandleLookup:
     @pytest.mark.asyncio
     async def test_server_timing_header_absent_when_flag_off(self, app_client, mock_settings):
         """With LML_EMIT_SERVER_TIMING off, no header is emitted — the kill
-        switch is honored and the response is otherwise unchanged.
+        switch is honored and the response is otherwise unchanged. Both
+        Server-Timing writers read the flag independently (the router's own
+        legs AND the ``lml_wall`` middleware leg — see
+        ``core/server_timing_middleware.py``), so both must be pinned off here.
         """
         response = LookupResponse(results=[], search_type="direct")
         flag_off = mock_settings.model_copy(update={"lml_emit_server_timing": False})
@@ -666,6 +669,7 @@ class TestHandleLookup:
         with (
             patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
             patch("lookup.router.get_settings", return_value=flag_off),
+            patch("core.server_timing_middleware.get_settings", return_value=flag_off),
         ):
             mock_lookup.return_value = response
             async with AsyncClient(
@@ -735,6 +739,10 @@ class TestHandleLookup:
                 patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
                 patch("lookup.router.get_cache_stats", return_value=stats),
                 patch("lookup.router.get_settings", return_value=get_settings_return),
+                patch(
+                    "core.server_timing_middleware.get_settings",
+                    return_value=get_settings_return,
+                ),
             ):
                 mock_lookup.return_value = response
                 async with AsyncClient(
@@ -798,8 +806,12 @@ class TestHandleLookup:
 
     @pytest.mark.asyncio
     async def test_server_timing_failure_does_not_break_request(self, app_client):
-        """Observability must not break the request path: if the header build
-        raises, the request still returns 200 with no header.
+        """Observability must not break the request path: if the router's own
+        header build raises, the request still returns 200 and the router
+        contributes no legs. The ``lml_wall`` middleware leg is a SEPARATE,
+        independent measurement (it never touches ``RequestTelemetry``), so it
+        still renders — proving the router-side failure was swallowed rather
+        than corrupting the header outright.
         """
         response = LookupResponse(results=[], search_type="direct")
 
@@ -817,7 +829,8 @@ class TestHandleLookup:
                 resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
 
         assert resp.status_code == 200
-        assert "Server-Timing" not in resp.headers
+        parsed = _parse_server_timing(resp.headers["Server-Timing"])
+        assert set(parsed) == {"lml_wall"}
 
     @pytest.mark.asyncio
     async def test_server_timing_wire_format_is_strict_parser_safe(
@@ -827,12 +840,19 @@ class TestHandleLookup:
         (request-o-matic's ``lookup`` CLI, the next PR in the trace). Drives the REAL
         orchestrator and asserts LML's own wiring end-to-end: every entry is
         ``name;dur=<plain-decimal>`` joined by ``", "`` (never scientific notation),
-        ``total`` appears exactly once and last, and the derived ``discogs`` leg sits
-        among the entries. Parsing into an ordered LIST (not a dict/set) is deliberate
-        so a double-``total`` regression — e.g. an accidental ``extra={"total": …}`` —
+        ``total`` appears exactly once, and the derived ``discogs`` leg sits among
+        the entries. Parsing into an ordered LIST (not a dict/set) is deliberate so
+        a double-``total`` regression — e.g. an accidental ``extra={"total": …}`` —
         is visible; that LML-side wiring the upstream ``as_server_timing`` unit tests
-        can't see. The flag is pinned on explicitly (``lookup.router.get_settings``, the
-        module global the helper reads) so the assertion never rides the ambient default.
+        can't see. The flag is pinned on explicitly for both Server-Timing writers
+        (``lookup.router.get_settings`` for the router's own legs,
+        ``core.server_timing_middleware.get_settings`` for the appended ``lml_wall``
+        leg) so the assertion never rides the ambient default.
+
+        ``lml_wall`` (the middleware-appended leg, see
+        ``core/server_timing_middleware.py``) is necessarily the LAST entry — it is
+        appended after the router has already finished building its own header — so
+        the router's own canonical ``total`` is second-to-last, not last.
         """
         import re
 
@@ -853,6 +873,7 @@ class TestHandleLookup:
                 },
             ),
             patch("lookup.router.get_settings", return_value=mock_settings),
+            patch("core.server_timing_middleware.get_settings", return_value=mock_settings),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
@@ -872,9 +893,126 @@ class TestHandleLookup:
 
         names = [entry.split(";")[0] for entry in entries]
         assert names.count("total") == 1  # exactly one canonical total
-        assert names[-1] == "total"  # ...and it is last
+        assert names.count("lml_wall") == 1  # exactly one middleware-appended leg
+        assert names[-1] == "lml_wall"  # the middleware leg is appended last
+        assert names[-2] == "total"  # ...right after the router's own canonical total
         assert "discogs" in names  # the derived pg+api leg
+        assert "queue_wait" in names  # always-present LML#907 follow-up leg
         assert "library_search" in names  # a real track_step stage
+
+    @pytest.mark.asyncio
+    async def test_server_timing_queue_wait_present_and_zero_when_uncontended(self, app_client):
+        """``queue_wait`` (LML#907 fine-grained-timing follow-up) is always
+        present, not only when the in-flight cap was engaged. An uncontended
+        request (the default single-request `app_client` case) never queued,
+        so the leg must read exactly 0 — never absent.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+
+        with patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup:
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        parsed = _parse_server_timing(resp.headers["Server-Timing"])
+        assert "queue_wait" in parsed
+        assert parsed["queue_wait"] == 0
+
+    @pytest.mark.asyncio
+    async def test_server_timing_event_loop_lag_present_when_gauge_yields_a_value(
+        self, app_client, mock_settings
+    ):
+        """When the LML#907 gauge has sampled a value, it rides the header as
+        ``event_loop_lag`` alongside the existing cache_stats projection. The
+        leg builder lives in ``lookup.server_timing_legs`` (split out to stay
+        under the router's module-budget ceiling), which imports its own
+        ``get_settings`` — pinned here alongside the router's, mirroring the
+        ``core.server_timing_middleware`` pattern above.
+        """
+        from lookup.router import EVENT_LOOP_LAG_STAT_KEY
+
+        response = LookupResponse(results=[], search_type="direct")
+        stats = {**_full_cache_stats(), EVENT_LOOP_LAG_STAT_KEY: 42.5}
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value=stats),
+            patch("lookup.router.get_settings", return_value=mock_settings),
+            patch("lookup.server_timing_legs.get_settings", return_value=mock_settings),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        parsed = _parse_server_timing(resp.headers["Server-Timing"])
+        assert parsed.get("event_loop_lag") == pytest.approx(42.5)
+
+    @pytest.mark.asyncio
+    async def test_server_timing_event_loop_lag_omitted_when_gauge_disabled(
+        self, app_client, mock_settings
+    ):
+        """With ``lml_event_loop_lag_gauge`` off, the leg is OMITTED, never a
+        misleading zero — the sampled ``cache_stats`` value (present here to
+        prove the omission isn't just "value absent") must not leak through.
+        Both Server-Timing writers that read settings independently
+        (``lookup.router`` and ``lookup.server_timing_legs``) are pinned off.
+        """
+        from lookup.router import EVENT_LOOP_LAG_STAT_KEY
+
+        response = LookupResponse(results=[], search_type="direct")
+        stats = {**_full_cache_stats(), EVENT_LOOP_LAG_STAT_KEY: 42.5}
+        gauge_off = mock_settings.model_copy(update={"lml_event_loop_lag_gauge": False})
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value=stats),
+            patch("lookup.router.get_settings", return_value=gauge_off),
+            patch("lookup.server_timing_legs.get_settings", return_value=gauge_off),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        parsed = _parse_server_timing(resp.headers["Server-Timing"])
+        assert "event_loop_lag" not in parsed
+        # The rest of the header is unaffected by the gate.
+        assert "discogs" in parsed
+        assert "total" in parsed
+
+    @pytest.mark.asyncio
+    async def test_server_timing_event_loop_lag_omitted_when_key_absent(
+        self, app_client, mock_settings
+    ):
+        """Defensive: an uninitialized/older cache_stats dict missing the LML#907
+        key degrades to omission rather than a KeyError -> 500.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+        stats = _full_cache_stats()  # no EVENT_LOOP_LAG_STAT_KEY entry
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
+            patch("lookup.router.get_cache_stats", return_value=stats),
+            patch("lookup.router.get_settings", return_value=mock_settings),
+            patch("lookup.server_timing_legs.get_settings", return_value=mock_settings),
+        ):
+            mock_lookup.return_value = response
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        parsed = _parse_server_timing(resp.headers["Server-Timing"])
+        assert "event_loop_lag" not in parsed
 
     @pytest.mark.asyncio
     async def test_response_includes_call_number(self, app_client):

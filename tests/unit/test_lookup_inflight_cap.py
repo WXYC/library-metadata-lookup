@@ -53,6 +53,28 @@ LOOKUP_BODY = {
 }
 
 
+def _parse_server_timing(value: str) -> dict[str, float | None]:
+    """Parse a ``Server-Timing`` header value into ``{name: dur_ms}``.
+
+    Local copy of the helper in ``tests/unit/test_lookup_router.py`` — small
+    enough (and this repo's tests don't import fixtures across test modules)
+    that duplicating it here is simpler than adding cross-file coupling.
+    """
+    parsed: dict[str, float | None] = {}
+    for entry in value.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, _, params = entry.partition(";")
+        dur: float | None = None
+        for param in params.split(";"):
+            param = param.strip()
+            if param.startswith("dur="):
+                dur = float(param[len("dur=") :])
+        parsed[name.strip()] = dur
+    return parsed
+
+
 async def _wait_until(predicate, *, timeout_s: float = 5.0, message: str = "condition"):
     """Poll ``predicate`` on the loop until true, failing loudly at the deadline.
 
@@ -522,6 +544,82 @@ class TestInFlightCapObservability:
             c.args[0] == "lml.lookup.inflight_wait_ms"
             for c in transaction.set_measurement.call_args_list
         )
+
+
+class TestQueueWaitServerTimingLeg:
+    """The ``queue_wait`` Server-Timing leg (LML#907 fine-grained-timing
+    follow-up) must render on EVERY response — 0 on the uncontended path, the
+    actual measured wait on a capped one — mirroring the Sentry
+    ``lml.lookup.inflight_wait_ms`` measurement above but surfaced in-band on
+    the response itself. Reuses the cap=1 gating pattern from
+    ``TestCallerBudgetDeduction``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_capped_request_queue_wait_leg_reflects_measured_wait(
+        self, app_client, monkeypatch
+    ):
+        monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "1")
+
+        gate = asyncio.Event()
+        started = 0
+
+        async def gated_lookup(request, **kwargs):
+            nonlocal started
+            started += 1
+            if started == 1:
+                await gate.wait()
+            return _empty_response()
+
+        with patch(
+            "lookup.router.perform_lookup", new_callable=AsyncMock, side_effect=gated_lookup
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                first = asyncio.create_task(ac.post("/api/v1/lookup", json=LOOKUP_BODY))
+                await _wait_until(lambda: started >= 1, message="first lookup to start")
+                second = asyncio.create_task(ac.post("/api/v1/lookup", json=LOOKUP_BODY))
+                # Deterministic parking, then accrue >=50ms of measured queue
+                # wait before releasing (same pattern as
+                # TestCallerBudgetDeduction's capped-deduction test).
+                await _wait_until(
+                    _lookup_semaphore_has_waiters, message="second request to park on the cap"
+                )
+                await asyncio.sleep(0.05)
+                gate.set()
+                first_resp, second_resp = await asyncio.gather(first, second)
+
+        assert first_resp.status_code == 200
+        assert second_resp.status_code == 200
+
+        first_parsed = _parse_server_timing(first_resp.headers["Server-Timing"])
+        second_parsed = _parse_server_timing(second_resp.headers["Server-Timing"])
+
+        # The permit-holder never queued: its leg is exactly 0, not absent.
+        assert first_parsed.get("queue_wait") == 0
+        # The parked request accrued >=50ms of real wait; allow a little
+        # scheduling slack (>=40ms) the way the budget-deduction test does.
+        assert second_parsed.get("queue_wait") is not None
+        assert second_parsed["queue_wait"] >= 40
+
+    @pytest.mark.asyncio
+    async def test_uncontended_request_queue_wait_leg_is_zero(self, app_client, monkeypatch):
+        monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "8")
+
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_empty_response(),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        parsed = _parse_server_timing(resp.headers["Server-Timing"])
+        assert parsed.get("queue_wait") == 0
 
 
 class TestInFlightCapClientAbort:
