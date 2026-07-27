@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 
 from config.settings import get_settings
+from core.event_loop_lag import get_event_loop_lag_ms
 
 logger = logging.getLogger(__name__)
 
@@ -28,37 +29,35 @@ logger = logging.getLogger(__name__)
 EVENT_LOOP_LAG_STAT_KEY = "event_loop_lag_ms"
 
 
-def event_loop_lag_extra_leg(stats: dict | None) -> dict[str, float]:
+def event_loop_lag_extra_leg() -> dict[str, float]:
     """Build the ``event_loop_lag`` Server-Timing ``extra`` leg, if any.
 
-    Surfaces the LML#907 gauge sample that ``lookup.router._record_event_loop_lag``
-    already stamped onto ``cache_stats`` (``EVENT_LOOP_LAG_STAT_KEY``) as a
-    per-request Server-Timing entry, so a reader can see loop starvation on the
-    SAME request whose wall time it inflated, not only in the aggregated
-    PostHog/Sentry series.
+    Surfaces the LML#907 gauge as a per-request Server-Timing entry, so a reader
+    can see loop starvation on the SAME request whose wall time it inflated, not
+    only in the aggregated PostHog/Sentry series.
 
-    Mirrors ``_record_event_loop_lag``'s own gate rather than trusting the
-    ``cache_stats`` value alone: ``init_cache_stats`` seeds the key to ``0`` for
-    every request (a shape guarantee), so "the gauge is off" and "the gauge
-    measured ~0 lag" are indistinguishable from the stats value by itself.
-    Reading the same ``lml_event_loop_lag_gauge`` setting the recorder reads
-    keeps the two in lockstep: disabled or unsampled (first ~interval of
-    process life, or the kill switch off) degrades to an OMITTED leg, never a
-    misleading zero.
+    Reads the process-global gauge directly (``get_event_loop_lag_ms``) — the
+    SAME source ``lookup.router._record_event_loop_lag`` samples — rather than
+    the ``cache_stats`` value. ``init_cache_stats`` seeds ``event_loop_lag_ms``
+    to ``0`` for every request (a shape guarantee), so an enabled-but-unsampled
+    gauge (the first ~interval of process life, right after a redeploy) would
+    leave that seeded ``0`` and leak a misleading ``event_loop_lag;dur=0``
+    exactly when starvation matters most. Gating on the gauge's own ``None``
+    return — the same signal the recorder gates on — keeps the two in lockstep:
+    the kill switch off, or an unsampled gauge, degrades to an OMITTED leg,
+    never a zero.
 
     Observability must not break the request path: any exception (a settings
-    read, a malformed stats value) degrades to "leg omitted", matching
+    read, a gauge read) degrades to "leg omitted", matching
     ``lookup.router._emit_server_timing_header``'s own failure posture.
     """
     try:
         if not get_settings().lml_event_loop_lag_gauge:
             return {}
-        if not stats or EVENT_LOOP_LAG_STAT_KEY not in stats:
+        lag_ms = get_event_loop_lag_ms()
+        if lag_ms is None:
             return {}
-        value = stats[EVENT_LOOP_LAG_STAT_KEY]
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            return {}
-        return {"event_loop_lag": float(value)}
+        return {"event_loop_lag": float(lag_ms)}
     except Exception as e:
         logger.warning("Failed to build event_loop_lag Server-Timing leg: %s", e)
         return {}

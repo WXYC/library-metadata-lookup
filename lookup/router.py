@@ -593,7 +593,7 @@ async def handle_lookup(
         # isolate DI/(de)serialization overhead; `event_loop_lag` is omitted
         # (not zeroed) when unsampled — see `lookup.server_timing_legs`.
         extra: dict[str, float] = {"discogs": pg_ms + api_ms, "queue_wait": queue_wait_ms}
-        extra.update(event_loop_lag_extra_leg(stats))
+        extra.update(event_loop_lag_extra_leg())
         _emit_server_timing_header(http_response, telemetry, extra=extra)
 
         # Send telemetry
