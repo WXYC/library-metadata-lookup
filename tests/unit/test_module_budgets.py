@@ -27,6 +27,7 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/artwork.py": 500,
     "lookup/candidate_memo.py": 150,
     "lookup/concurrency.py": 200,
+    "lookup/endpoint_family.py": 100,
     "lookup/enrichment/__init__.py": 350,
     "lookup/enrichment/background.py": 100,
     "lookup/enrichment/context.py": 150,
@@ -37,7 +38,15 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/models.py": 150,
     "lookup/orchestrator.py": 1300,
     "lookup/release_resolution.py": 550,
-    "lookup/router.py": 950,
+    # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
+    # calibration had already carried this file to exactly its old 950-line
+    # ceiling (zero headroom) before this ticket's two mandated Sentry-tag call
+    # sites landed. The new endpoint-family concern itself was extracted to
+    # `lookup/endpoint_family.py` per this module's own policy; the residual
+    # growth here (an import plus the two irreducible call sites) is
+    # recalibrated with the same formula as every other entry: smallest
+    # multiple of 50 at or above 1.3x the post-change 959-line size.
+    "lookup/router.py": 1250,
     "lookup/rowless.py": 450,
     "lookup/server_timing_legs.py": 100,
     "lookup/spine_deadline.py": 250,

@@ -52,6 +52,11 @@ from entity.store import EntityStore
 from generated.api_models import CacheStats
 from identity.dependencies import get_entity_store
 from library.db import LibraryDB
+from lookup.endpoint_family import (
+    ENDPOINT_FAMILY_LOOKUP,
+    ENDPOINT_FAMILY_LOOKUP_BULK,
+    record_endpoint_family_tag,
+)
 from lookup.enrichment import SKIPPED_PREFETCH_STAT_KEY
 from lookup.models import (
     BulkLookupRequest,
@@ -444,6 +449,7 @@ async def handle_lookup(
     # (0/1) once per context so the flip is sliceable in PostHog/Sentry.
     _record_lml_flag_tags()
     _record_event_loop_lag()
+    record_endpoint_family_tag(ENDPOINT_FAMILY_LOOKUP)
     if skip_cache:
         set_skip_cache(True)
 
@@ -610,6 +616,7 @@ async def handle_lookup(
                     "reconciled_identity_count": sum(
                         1 for r in results if r.reconciled_identity is not None
                     ),
+                    "endpoint_family": ENDPOINT_FAMILY_LOOKUP,
                 },
             )
 
@@ -745,6 +752,7 @@ async def handle_bulk_lookup(
     # so the bulk value stays 0/1 instead of summing across items.
     _record_lml_flag_tags()
     _record_event_loop_lag()
+    record_endpoint_family_tag(ENDPOINT_FAMILY_LOOKUP_BULK)
 
     max_concurrent = max_concurrency_from_env(_BULK_LOOKUP_DEFAULT_CONCURRENCY)
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -926,6 +934,7 @@ async def handle_bulk_lookup(
                     "no_match_count": counts["no_match"],
                     "error_count": counts["error"],
                     "max_concurrent": max_concurrent,
+                    "endpoint_family": ENDPOINT_FAMILY_LOOKUP_BULK,
                 },
             )
 
