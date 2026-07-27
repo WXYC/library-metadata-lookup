@@ -172,6 +172,51 @@ class TestBootFetchHelper:
         assert not settings.resolved_library_db_path.exists()
 
 
+class TestAtomicWriteConcurrency:
+    """LML#747: N uvicorn workers boot-fetch library.db in parallel, each calling
+    ``_atomic_write_bytes`` against the SAME dest. The pre-fix fixed temp name
+    (``dest + ".boot.tmp"``) made every worker share one temp path, so one
+    worker's ``os.replace`` consumed the temp out from under another — whose own
+    ``os.replace`` then raised ``FileNotFoundError``, and because uvicorn treats a
+    child that fails startup as fatal, the whole process group crash-looped
+    (observed on the staging ``UVICORN_WORKERS=3`` soak). Concurrent writers to
+    one dest must each use a distinct temp and all land the bytes atomically.
+    """
+
+    def test_concurrent_writers_do_not_collide(self, tmp_path):
+        import threading
+
+        from main import _atomic_write_bytes
+
+        dest = tmp_path / "library.db"
+        # Identical bytes across writers (every worker fetches the same object),
+        # long enough that the write/replace window is non-trivial.
+        payload = b"SQLite format 3\x00" + b"x" * (256 * 1024)
+        n = 16
+        barrier = threading.Barrier(n)
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def _writer() -> None:
+            barrier.wait()  # release all writers together to maximize overlap
+            try:
+                _atomic_write_bytes(dest, payload)
+            except BaseException as exc:  # noqa: BLE001 - collected for assertion
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=_writer) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"concurrent boot-fetch writers collided: {errors!r}"
+        assert dest.read_bytes() == payload  # atomic: never torn or partial
+        # No temp file leaks: dest is the only artifact in the directory.
+        assert list(tmp_path.iterdir()) == [dest]
+
+
 class TestLifespanWiring:
     @pytest.mark.asyncio
     async def test_bucket_mode_invokes_boot_fetch(self, tmp_path, monkeypatch):
