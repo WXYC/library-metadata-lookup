@@ -1527,6 +1527,13 @@ class TestCallerBudget:
         calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
         assert calls.get("search_budget_exceeded") is True
         assert calls.get("lml.caller_budget_ms") == TRANSPORT_OVERHEAD_MS + 1
+        # LML#944: the same value is ALSO promoted to a measurement (aggregatable
+        # across traces via avg/percentile), alongside the set_data above — set_data
+        # alone is opaque to the spans/metrics datasets ("Unknown attribute").
+        measurement_calls = {
+            c.args[0]: c.args[1] for c in mock_transaction.set_measurement.call_args_list
+        }
+        assert measurement_calls.get("lml.caller_budget_ms") == TRANSPORT_OVERHEAD_MS + 1
 
     @pytest.mark.asyncio
     async def test_pipeline_no_caller_budget_does_not_set_caller_attr(self, monkeypatch):
@@ -1568,6 +1575,10 @@ class TestCallerBudget:
 
         keys = {c.args[0] for c in mock_transaction.set_data.call_args_list}
         assert "lml.caller_budget_ms" not in keys
+        # LML#944: the set_measurement promotion sits behind the same
+        # `if caller_budget_ms is not None` guard, so it must be equally absent.
+        measurement_keys = {c.args[0] for c in mock_transaction.set_measurement.call_args_list}
+        assert "lml.caller_budget_ms" not in measurement_keys
 
     @pytest.mark.asyncio
     async def test_pipeline_caller_budget_cuts_off_empty_results(self, monkeypatch):

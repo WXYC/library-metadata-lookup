@@ -824,6 +824,13 @@ async def _run_strategy_pipeline(
             transaction = sentry_sdk.get_current_scope().transaction
             if transaction is not None:
                 transaction.set_data("lml.caller_budget_ms", caller_budget_ms)
+                # LML#944: promoted alongside the existing set_data. set_data alone
+                # is per-trace only (opaque to the spans/metrics datasets — reads
+                # back as "Unknown attribute"); set_measurement makes the series
+                # aggregatable (avg/percentile), mirroring the set_data +
+                # set_measurement pairing in `_project_cache_stats_to_transaction`
+                # (lookup/router.py).
+                transaction.set_measurement("lml.caller_budget_ms", caller_budget_ms)
         except Exception as e:
             logger.warning("Failed to project lml.caller_budget_ms onto Sentry transaction: %s", e)
     # Re-base the clock to the lookup-spine start when a prior-work offset is
