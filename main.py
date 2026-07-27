@@ -28,7 +28,7 @@ from core.dependencies import (
 )
 from core.event_loop_lag import start_sampler, stop_sampler
 from core.logging import setup_logging
-from core.server_timing_middleware import lml_wall_timing_middleware
+from core.server_timing_middleware import LmlWallTimingMiddleware
 from discogs.router import router as discogs_router
 from identity.dependencies import close_entity_store
 from identity.router import api_v1_router as identity_api_v1_router
@@ -501,8 +501,11 @@ app.add_middleware(
 # it the INNER of the two: `posthog_flush_middleware`'s synchronous
 # `flush_posthog()` call then runs OUTSIDE the timed window, so it can't
 # inflate the `lml_wall` Server-Timing leg with unrelated middleware cost. See
-# `core/server_timing_middleware.py` for what the leg measures and why.
-app.middleware("http")(lml_wall_timing_middleware)
+# `core/server_timing_middleware.py` for what the leg measures and why. Pure
+# ASGI middleware (LmlWallTimingMiddleware) still goes through `add_middleware`
+# like any other Starlette middleware, so this ordering rule applies exactly
+# the same as it did for the old `@app.middleware("http")` registration.
+app.add_middleware(LmlWallTimingMiddleware)
 
 
 @app.middleware("http")

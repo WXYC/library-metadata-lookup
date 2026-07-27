@@ -1,5 +1,5 @@
 """Unit tests for core/server_timing_middleware.py (LML#907 fine-grained-timing
-follow-up: the `lml_wall` Server-Timing leg).
+leg; LML#946 rewrote the middleware itself as pure ASGI).
 
 Exercises the middleware in isolation against a minimal FastAPI app rather than
 the full `main.app` — the router-level integration is covered by
@@ -7,6 +7,13 @@ the full `main.app` — the router-level integration is covered by
 strict_parser_safe` and `test_server_timing_failure_does_not_break_request`,
 which drive the real app end-to-end and assert `lml_wall` shows up alongside
 the router's own legs.
+
+`TestLmlWallTimingMiddleware` drives the middleware through a real FastAPI/
+httpx round trip (installed via `app.add_middleware`, same as `main.py`).
+`TestLmlWallTimingMiddlewareRawASGI` drives `LmlWallTimingMiddleware.__call__`
+directly against bare `(scope, receive, send)` — the only way to prove the
+passthrough paths build zero `send` wrapper, which is the entire point of the
+pure-ASGI rewrite (see the module docstring on `core/server_timing_middleware.py`).
 """
 
 from __future__ import annotations
@@ -17,9 +24,10 @@ from unittest.mock import patch
 import pytest
 from fastapi import FastAPI, Response
 from httpx import ASGITransport, AsyncClient
+from starlette.types import Message, Receive, Scope, Send
 
 from config.settings import Settings
-from core.server_timing_middleware import lml_wall_timing_middleware
+from core.server_timing_middleware import LmlWallTimingMiddleware, _with_appended_server_timing
 
 _DUR_GRAMMAR = re.compile(r"^lml_wall;dur=\d+(?:\.\d+)?$")
 
@@ -33,7 +41,7 @@ def _build_app(*, existing_header: str | None) -> FastAPI:
     or the build failed).
     """
     app = FastAPI()
-    app.middleware("http")(lml_wall_timing_middleware)
+    app.add_middleware(LmlWallTimingMiddleware)
 
     @app.get("/api/v1/lookup")
     async def timed_route(response: Response):
@@ -217,7 +225,7 @@ class TestLmlWallTimingMiddleware:
         proves this middleware doesn't intercept and suppress it.
         """
         app = FastAPI()
-        app.middleware("http")(lml_wall_timing_middleware)
+        app.add_middleware(LmlWallTimingMiddleware)
 
         @app.get("/api/v1/lookup")
         async def boom():
@@ -229,3 +237,207 @@ class TestLmlWallTimingMiddleware:
             ) as client:
                 with pytest.raises(RuntimeError, match="handler exploded"):
                     await client.get("/api/v1/lookup")
+
+
+class _RecordingApp:
+    """A bare ASGI app standing in for ``self.app`` inside the middleware.
+
+    Records the exact ``send`` callable it was handed (so tests can assert
+    object identity — proof the middleware did NOT build a wrapper) and, for
+    HTTP scopes, replays a canned ``http.response.start``/``http.response.body``
+    pair through whatever ``send`` it was given.
+    """
+
+    def __init__(self, *, response_headers: list[tuple[bytes, bytes]] | None = None) -> None:
+        self.received_scope: Scope | None = None
+        self.received_send: Send | None = None
+        self._response_headers = response_headers or []
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        self.received_scope = scope
+        self.received_send = send
+        if scope["type"] != "http":
+            return
+        await send(
+            {"type": "http.response.start", "status": 200, "headers": self._response_headers}
+        )
+        await send({"type": "http.response.body", "body": b"{}"})
+
+
+def _noop_receive() -> Receive:
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return receive
+
+
+class TestLmlWallTimingMiddlewareRawASGI:
+    """Exercises ``LmlWallTimingMiddleware.__call__`` directly against the raw
+    ASGI protocol (bypassing FastAPI/httpx) to prove the passthrough paths do
+    NOT build a ``send`` wrapper at all, and to pin the byte-level header
+    format the ``send`` wrapper produces when it does engage.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_http_scope_is_passthrough_and_never_reads_settings(self):
+        """A non-``http`` scope (e.g. ``lifespan``, ``websocket``) must
+        short-circuit before the settings gate is even consulted — proven by
+        making ``get_settings`` raise if it's called at all — and the inner
+        app must receive the ORIGINAL ``send`` (identity, not a wrapper).
+        """
+        inner = _RecordingApp()
+        middleware = LmlWallTimingMiddleware(inner)
+        scope: Scope = {"type": "lifespan"}
+        sent: list[Message] = []
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        with patch(
+            "core.server_timing_middleware.get_settings",
+            side_effect=AssertionError("get_settings must not be called for a non-http scope"),
+        ) as mock_settings:
+            await middleware(scope, _noop_receive(), send)
+
+        mock_settings.assert_not_called()
+        assert inner.received_send is send
+
+    @pytest.mark.asyncio
+    async def test_non_lookup_path_is_passthrough_with_no_send_wrapping(self, settings_on):
+        """An HTTP request outside ``/api/v1/lookup`` never gets a ``send``
+        wrapper — the inner app's ``send`` is the exact object passed in.
+        """
+        inner = _RecordingApp(response_headers=[(b"server-timing", b"total;dur=1")])
+        middleware = LmlWallTimingMiddleware(inner)
+        scope: Scope = {"type": "http", "path": "/health"}
+        sent: list[Message] = []
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        with patch("core.server_timing_middleware.get_settings", return_value=settings_on):
+            await middleware(scope, _noop_receive(), send)
+
+        assert inner.received_send is send
+        start = sent[0]
+        assert start["headers"] == [(b"server-timing", b"total;dur=1")]
+
+    @pytest.mark.asyncio
+    async def test_gate_off_is_passthrough_with_no_send_wrapping(self, settings_off):
+        """Scoped path + gate off must also be a bare passthrough: no wrapper
+        object is created merely because the path matched.
+        """
+        inner = _RecordingApp()
+        middleware = LmlWallTimingMiddleware(inner)
+        scope: Scope = {"type": "http", "path": "/api/v1/lookup"}
+        sent: list[Message] = []
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        with patch("core.server_timing_middleware.get_settings", return_value=settings_off):
+            await middleware(scope, _noop_receive(), send)
+
+        assert inner.received_send is send
+
+    @pytest.mark.asyncio
+    async def test_send_wrapper_appends_when_server_timing_present(self, settings_on):
+        inner = _RecordingApp(response_headers=[(b"server-timing", b"total;dur=5")])
+        middleware = LmlWallTimingMiddleware(inner)
+        scope: Scope = {"type": "http", "path": "/api/v1/lookup"}
+        sent: list[Message] = []
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        with patch("core.server_timing_middleware.get_settings", return_value=settings_on):
+            await middleware(scope, _noop_receive(), send)
+
+        # A wrapper WAS built for the matching, gated-on path.
+        assert inner.received_send is not send
+        start = sent[0]
+        assert start["type"] == "http.response.start"
+        headers = dict(start["headers"])
+        assert headers[b"server-timing"].startswith(b"total;dur=5, lml_wall;dur=")
+        # Everything else on the message (status, other keys) is untouched.
+        assert start["status"] == 200
+        # The body message passes straight through, unmodified.
+        assert sent[1] == {"type": "http.response.body", "body": b"{}"}
+
+    @pytest.mark.asyncio
+    async def test_send_wrapper_sets_header_when_absent(self, settings_on):
+        inner = _RecordingApp(response_headers=[])
+        middleware = LmlWallTimingMiddleware(inner)
+        scope: Scope = {"type": "http", "path": "/api/v1/lookup"}
+        sent: list[Message] = []
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        with patch("core.server_timing_middleware.get_settings", return_value=settings_on):
+            await middleware(scope, _noop_receive(), send)
+
+        headers = dict(sent[0]["headers"])
+        assert _DUR_GRAMMAR.match(headers[b"server-timing"].decode("latin-1"))
+
+    @pytest.mark.asyncio
+    async def test_send_wrapper_matches_server_timing_case_insensitively(self, settings_on):
+        """Defensive against an upstream app that didn't lowercase the header
+        name (ASGI/Starlette always do, but the merge must not assume it).
+        Original name casing is preserved; only the match is case-folded.
+        """
+        inner = _RecordingApp(response_headers=[(b"Server-Timing", b"total;dur=5")])
+        middleware = LmlWallTimingMiddleware(inner)
+        scope: Scope = {"type": "http", "path": "/api/v1/lookup"}
+        sent: list[Message] = []
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        with patch("core.server_timing_middleware.get_settings", return_value=settings_on):
+            await middleware(scope, _noop_receive(), send)
+
+        headers = sent[0]["headers"]
+        assert len(headers) == 1
+        name, value = headers[0]
+        assert name == b"Server-Timing"  # casing preserved, not forced to lowercase
+        assert value.startswith(b"total;dur=5, lml_wall;dur=")
+
+    @pytest.mark.asyncio
+    async def test_send_wrapper_injection_failure_forwards_original_message(self, settings_on):
+        """If the header-merge step itself raises, the ORIGINAL message must
+        still reach ``send`` unmodified — never a broken/partial response.
+        """
+        inner = _RecordingApp(response_headers=[(b"server-timing", b"total;dur=5")])
+        middleware = LmlWallTimingMiddleware(inner)
+        scope: Scope = {"type": "http", "path": "/api/v1/lookup"}
+        sent: list[Message] = []
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        with (
+            patch("core.server_timing_middleware.get_settings", return_value=settings_on),
+            patch(
+                "core.server_timing_middleware._with_appended_server_timing",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            await middleware(scope, _noop_receive(), send)
+
+        assert sent[0] == {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"server-timing", b"total;dur=5")],
+        }
+
+    def test_with_appended_server_timing_helper_appends_and_sets(self):
+        """Unit-level pin on the pure header-merge helper, independent of the
+        ASGI plumbing around it.
+        """
+        assert _with_appended_server_timing([], b"lml_wall;dur=1") == [
+            (b"server-timing", b"lml_wall;dur=1")
+        ]
+        assert _with_appended_server_timing(
+            [(b"server-timing", b"total;dur=5")], b"lml_wall;dur=1"
+        ) == [(b"server-timing", b"total;dur=5, lml_wall;dur=1")]
