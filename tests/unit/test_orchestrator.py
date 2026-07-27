@@ -374,6 +374,9 @@ class TestPerformLookupTelemetrySpans:
         assert response.results[0].library_item.id == stereolab_item.id
         assert telemetry.steps.get("streaming_status") is not None
         assert telemetry.steps["streaming_status"].success is True
+        # Narrowing the span to just the await must not drop the sync fan-out
+        # that sets on_streaming — lock the observable effect.
+        assert response.results[0].library_item.on_streaming is True
 
     @pytest.mark.asyncio
     async def test_streaming_status_step_not_tracked_when_no_streaming_links(

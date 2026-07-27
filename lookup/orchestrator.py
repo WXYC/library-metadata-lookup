@@ -723,12 +723,14 @@ async def _step_populate_streaming_status(
     WRITES: no ``LookupState`` field is rebound.
     """
     if state.library_results and getattr(services.db, "_has_streaming_links", None) is True:
+        # Time only the awaited DB call; the sync fan-out below is not I/O and
+        # would otherwise inflate the streaming_status leg on large result sets.
         with services.telemetry.track_step("streaming_status"):
             streaming_status = await services.db.get_streaming_status(
                 [r.id for r in state.library_results]
             )
-            for result in state.library_results:
-                result.on_streaming = streaming_status.get(result.id, False)
+        for result in state.library_results:
+            result.on_streaming = streaming_status.get(result.id, False)
 
 
 async def _prefetch_release_overrides(
