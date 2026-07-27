@@ -41,6 +41,7 @@ from wxyc_fastapi.healthcheck import DEFAULT_TIMEOUT_SECONDS, Check
 from config.settings import Settings, get_settings
 from core.dependencies import get_discogs_service, get_library_db
 from discogs.breaker import BreakerState
+from discogs.live_request_counter import get_discogs_live_requests_total
 from discogs.ratelimit import get_discogs_breaker
 from discogs.service import DiscogsApiCheckResult, DiscogsService
 from library.db import LibraryDB
@@ -218,6 +219,12 @@ async def health_check(
     # field reports ``null`` (same "null when N/A" convention as
     # ``commit_sha``) rather than a misleading ``"closed"`` for an inert breaker.
     breaker_state = get_discogs_breaker().state if discogs_service is not None else None
+    # LML#940: read the process-global live-Discogs-request-attempt counter
+    # once, up front -- same pattern as ``breaker_state`` above. Unlike the
+    # breaker, this is a plain global-int read with nothing to materialize, so
+    # it is read unconditionally: a fresh process with Discogs unconfigured
+    # correctly reports 0 rather than null/absent.
+    discogs_live_requests_total = get_discogs_live_requests_total()
     checks = _build_checks(db=db, discogs_service=discogs_service, breaker_state=breaker_state)
     results = await asyncio.gather(
         *(_run_check_preserving_value(c, DEFAULT_TIMEOUT_SECONDS) for c in checks)
@@ -246,6 +253,19 @@ async def health_check(
         # "closed" is neither, so folding it in there would spuriously flip a
         # fully healthy service to "degraded".
         "discogs_breaker_state": breaker_state.value if breaker_state is not None else None,
+        # LML#940: a read-only, additive volume signal alongside the breaker
+        # state above -- the count of live-Discogs request *attempts* this
+        # process has made (including breaker-shed ones), monotonic until
+        # restart. Lets a black-box caller (the wxyc-canary) tell a real
+        # sustained shed (this total climbing across polls while
+        # ``discogs_breaker_state`` is open/half-open) apart from the idle
+        # tail (this total flat -- no live-Discogs traffic attempted, so the
+        # breaker's recovery is merely unproven, not blocked). Kept OUT of
+        # ``services`` for the same reason as ``discogs_breaker_state``: that
+        # dict feeds ``all_configured_ok`` via an ``("ok", "unavailable")``
+        # membership check, and a number there is neither. See
+        # docs/deployment.md for the full unit + semantics writeup.
+        "discogs_live_requests_total": discogs_live_requests_total,
         "services": services,
     }
 

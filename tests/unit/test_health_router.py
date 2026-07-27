@@ -729,6 +729,113 @@ class TestHealthEndpoint:
         assert body["services"]["discogs_api"] == "unavailable"
         breaker_probe.assert_not_called()
 
+    # -----------------------------------------------------------------
+    # LML#940: a read-only, additive top-level field carrying the
+    # process-global live-Discogs-request-attempt count -- the volume signal
+    # the wxyc-canary needs to tell a real sustained breaker shed (this total
+    # climbing across polls) apart from the idle-tail false positive (breaker
+    # latched open/half-open but this total is flat, i.e. no live-Discogs
+    # traffic has been attempted).
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_includes_discogs_live_requests_total(
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
+    ):
+        """The field is read once up front (mirroring ``breaker_state`` at
+        :220) and reflects the counter verbatim."""
+        import routers.health as health_module
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        monkeypatch.setattr(health_module, "get_discogs_live_requests_total", lambda: 42)
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["discogs_live_requests_total"] == 42
+
+    @pytest.mark.asyncio
+    async def test_discogs_live_requests_total_kept_out_of_services(
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
+    ):
+        """Kept out of ``services`` -- that dict feeds the ``("ok",
+        "unavailable")`` ``all_configured_ok`` check, and a number there would
+        spuriously flip a healthy deploy to degraded (same reasoning as
+        ``discogs_breaker_state``)."""
+        import routers.health as health_module
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        monkeypatch.setattr(health_module, "get_discogs_live_requests_total", lambda: 7)
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "healthy"
+        assert "discogs_live_requests_total" not in body["services"]
+
+    @pytest.mark.asyncio
+    async def test_discogs_live_requests_total_present_when_discogs_unconfigured(
+        self, mock_db, mock_settings
+    ):
+        """Unlike ``discogs_breaker_state``, no breaker needs to exist to
+        answer this field -- it's a plain global-int read, so a fresh process
+        with Discogs unconfigured still reports ``0`` (correct: no
+        live-Discogs traffic has happened), not ``null`` or an absent key."""
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from discogs.live_request_counter import reset_discogs_live_requests_total
+        from main import app
+
+        reset_discogs_live_requests_total()
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: None,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["discogs_live_requests_total"] == 0
+
     @pytest.mark.asyncio
     async def test_unhealthy_returns_503(self, mock_settings):
         """Core service (database) down -> unhealthy + 503."""

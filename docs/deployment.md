@@ -226,13 +226,31 @@ The probe also projects its result onto the active Sentry trace as the `discogs_
 The breaker's state is authoritative over `services.discogs_api`'s independent live probe: when the breaker is `open` or `half-open` (both are "shedding" — a half-open breaker still sheds every caller except its single in-flight trial), `services.discogs_api` short-circuits to `rate-limited` and the probe's own live call to Discogs is skipped entirely — it does not run and then get overridden. This closes the two-independent-detectors gap behind the 2026-07-13/14 incident: the breaker latched `half-open` and shed 100% of live Discogs calls for roughly 8 hours while the old `services.discogs_api` probe, dispatched independently of the breaker, kept landing in a momentary token-bucket refill and reporting `ok` the whole time — so the one signal an operator or the wxyc-canary would check said everything was fine while the lookup path was actually degraded to cache-only. Only when the breaker is `closed` does `services.discogs_api` defer to the live probe's own result (the vocabulary table above).
 
 ```json
-{ "status": "degraded", "version": "0.1.0", "commit_sha": "abc123...", "discogs_breaker_state": "open", "services": { "database": "ok", "discogs_api": "rate-limited", "discogs_cache": "ok" } }
+{ "status": "degraded", "version": "0.1.0", "commit_sha": "abc123...", "discogs_breaker_state": "open", "discogs_live_requests_total": 1842, "services": { "database": "ok", "discogs_api": "rate-limited", "discogs_cache": "ok" } }
 ```
 
 Two known limitations follow from `/health` reading the breaker's raw `.state` and treating any shedding state as authoritative:
 
-- **Idle post-cooldown `open` reads as `degraded` until traffic resumes.** The `open → half-open` recovery transition (and the LML#787 watchdog) fire only inside `allow_request()`, which only the live lookup path calls — reading `.state` never advances the state machine. So after an `open` episode's cool-down elapses, if no live Discogs lookups follow, `.state` stays `open` and `/health` keeps reporting `discogs_api: rate-limited` / `status: degraded` even though the next request would admit a recovery trial and likely close the breaker. This is honest (recovery is unproven until a request tries), but a canary that probes `/health` without generating live Discogs traffic (cache-hit library searches don't advance the breaker) can see a sustained `degraded` on an already-recovered-pending-traffic breaker — size any wxyc-canary#79 sustained-shed alarm window with this idle tail in mind.
+- **Idle post-cooldown `open` reads as `degraded` until traffic resumes.** The `open → half-open` recovery transition (and the LML#787 watchdog) fire only inside `allow_request()`, which only the live lookup path calls — reading `.state` never advances the state machine. So after an `open` episode's cool-down elapses, if no live Discogs lookups follow, `.state` stays `open` and `/health` keeps reporting `discogs_api: rate-limited` / `status: degraded` even though the next request would admit a recovery trial and likely close the breaker. This is honest (recovery is unproven until a request tries), but a canary that probes `/health` without generating live Discogs traffic (cache-hit library searches don't advance the breaker) can see a sustained `degraded` on an already-recovered-pending-traffic breaker — size any wxyc-canary#79 sustained-shed alarm window with this idle tail in mind. **`discogs_live_requests_total` (LML#940, below) is the eventual fix**: a caller diffs it across polls to tell a real sustained shed (climbing) apart from this idle tail (flat).
 - **A shed masks a concurrent auth/network fault on `discogs_api`.** When the breaker is `open`/`half-open` the live probe is skipped, so a coincident token/auth drift (401/403) or connection failure surfaces as `rate-limited` rather than `auth-error`/`network-error`. The `discogs_api.check` Sentry trace tag also goes quiet during a shed (the probe that sets it doesn't run). Drop to `discogs_breaker_state: closed` windows to read live Discogs auth/network health.
+
+### `discogs_live_requests_total` (LML#940 — the wxyc-canary idle-tail fix)
+
+`GET /health` also returns a top-level `discogs_live_requests_total`: a process-global, monotonic count of live-Discogs request *attempts*. It increments at the sole `breaker.allow_request()` call site inside `DiscogsService._request_with_retry` (`discogs/service.py`), **before** the breaker's admit/shed decision — so an attempt the breaker sheds (`allow_request()` returning `None`) still counts. Cache hits short-circuit in `discogs/fallthrough.py` before ever reaching that call site, so they are correctly excluded. Implementation lives in `discogs/live_request_counter.py`, modeled on the `core/event_loop_lag.py` process-global-primitive pattern.
+
+Unit and semantics:
+
+- **Counts live-Discogs-leg attempts, not `/lookup` calls.** One uncached `/lookup` fans out roughly five live Discogs calls (the primary search plus supplemental strategies), so this total runs well ahead of `/lookup` request volume — it is not a request-rate metric, and counting `/lookup` calls instead would defeat the point: a busy-cache / idle-Discogs window would show "traffic flowing" even though live Discogs demand is zero, which is exactly the idle-latched-open scenario this field must NOT mistake for real traffic.
+- **Monotonic total, resets to 0 on process restart.** There is no rolling window. A caller polling on a fixed cadence (e.g. the wxyc-canary's 5-minute tick) diffs `total_now - total_prev`; a negative diff means the process restarted mid-window and carries no signal for that tick (treat as an abstain, not a drop to zero).
+- **Present even when Discogs is unconfigured.** Unlike `discogs_breaker_state`, no breaker is read to answer this field — it's a plain global-int read, so a fresh process with no Discogs token reports `0` (correct: no live-Discogs traffic has happened, or ever will, for that process).
+- **Kept out of `services`**, same reasoning as `discogs_breaker_state`: `services` values feed the `("ok", "unavailable")` `all_configured_ok` check, and a number there would spuriously flip a healthy deploy to `degraded`.
+- **Single-worker scope today.** Per-worker (not service-wide) if `UVICORN_WORKERS > 1` ever ships (LML#747) — same caveat as the breaker and the event-loop-lag gauge.
+
+This is the read-only volume signal the idle-tail limitation above was missing: a caller can now distinguish "breaker `open`/`half-open` and this total is climbing across polls" (a real shed under load — page) from "breaker `open`/`half-open` and this total is flat" (the idle tail — no live-Discogs traffic has been attempted since the last poll, so recovery is simply unproven, not blocked — don't page). Consuming this signal in the wxyc-canary is tracked as a follow-up filed once this field ships; see WXYC/library-metadata-lookup#940.
+
+```json
+{ "status": "degraded", "version": "0.1.0", "commit_sha": "abc123...", "discogs_breaker_state": "open", "discogs_live_requests_total": 1842, "services": { "database": "ok", "discogs_api": "rate-limited", "discogs_cache": "ok" } }
+```
 
 ### `commit_sha` (deploy identity)
 
@@ -245,7 +263,7 @@ Two known limitations follow from `/health` reading the breaker's raw `.state` a
 Empty or whitespace-only values at any tier coerce to `null`, so the "null when unset" contract holds and downstream equality checks are never fooled by `""`.
 
 ```json
-{ "status": "healthy", "version": "0.1.0", "commit_sha": "abc123...", "discogs_breaker_state": "closed", "services": { ... } }
+{ "status": "healthy", "version": "0.1.0", "commit_sha": "abc123...", "discogs_breaker_state": "closed", "discogs_live_requests_total": 1842, "services": { ... } }
 ```
 
 #### Why a baked file rather than `RAILWAY_GIT_COMMIT_SHA` (LML#509)

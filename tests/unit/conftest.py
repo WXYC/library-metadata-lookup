@@ -8,6 +8,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from config.settings import Settings, get_settings
+from discogs.live_request_counter import reset_discogs_live_requests_total
 from discogs.memory_cache import clear_all_caches, set_skip_cache
 from discogs.ratelimit import reset_rate_limiting
 
@@ -287,6 +288,10 @@ def reset_caches():
     yield
     clear_all_caches()
     reset_rate_limiting()
+    # LML#940: the live-Discogs-attempt counter is a process global fed from
+    # the same ``_request_with_retry`` chokepoint the rate limiter guards, so
+    # it resets alongside it for the same reason -- test isolation.
+    reset_discogs_live_requests_total()
     # Clear library caches (separate from Discogs caches)
     from library.db import clear_library_caches
 
