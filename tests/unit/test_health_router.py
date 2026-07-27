@@ -12,11 +12,12 @@ LML's contracted response shape:
   why we don't mount it directly.
 """
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from discogs.breaker import BreakerState
 from discogs.service import DiscogsApiCheckResult, DiscogsService
 from library.db import LibraryDB
 from routers.health import (
@@ -68,6 +69,62 @@ class TestCheckDiscogsApi:
     @pytest.mark.asyncio
     async def test_none_service(self):
         assert await _check_discogs_api(None) == "unavailable"
+
+    # -----------------------------------------------------------------
+    # LML#757: the LML#755 saturation breaker's state is authoritative over
+    # the independent live probe. An OPEN or HALF_OPEN breaker is already
+    # shedding live Discogs traffic, so the probe must not report "ok" just
+    # because its own live call happened to land in a momentary token-bucket
+    # refill -- that disagreement is exactly what let the 2026-07-13/14
+    # incident shed 100% of live Discogs calls for ~8h while /health stayed
+    # green. The probe is skipped entirely (not merely overridden) when the
+    # breaker is shedding, so /health adds no extra live Discogs load during
+    # an active shed.
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_breaker_open_overrides_live_probe_to_rate_limited(self):
+        svc = AsyncMock(spec=DiscogsService)
+        svc.check_api = AsyncMock(return_value=DiscogsApiCheckResult.OK)
+
+        result = await _check_discogs_api(svc, BreakerState.OPEN)
+
+        assert result == "rate-limited"
+        svc.check_api.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_breaker_half_open_overrides_live_probe_to_rate_limited(self):
+        """HALF_OPEN still has only a single trial slot admitted -- every
+        other caller is shed, so it must be reported as degraded, not ok."""
+        svc = AsyncMock(spec=DiscogsService)
+        svc.check_api = AsyncMock(return_value=DiscogsApiCheckResult.OK)
+
+        result = await _check_discogs_api(svc, BreakerState.HALF_OPEN)
+
+        assert result == "rate-limited"
+        svc.check_api.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_breaker_closed_defers_to_live_probe(self):
+        svc = AsyncMock(spec=DiscogsService)
+        svc.check_api = AsyncMock(return_value=DiscogsApiCheckResult.OK)
+
+        result = await _check_discogs_api(svc, BreakerState.CLOSED)
+
+        assert result == "ok"
+        svc.check_api.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_breaker_state_defers_to_live_probe(self):
+        """Omitting ``breaker_state`` preserves the pre-LML#757 behavior of
+        trusting the live probe alone -- keeps direct callers backward
+        compatible."""
+        svc = AsyncMock(spec=DiscogsService)
+        svc.check_api = AsyncMock(return_value=DiscogsApiCheckResult.OK)
+
+        result = await _check_discogs_api(svc)
+
+        assert result == "ok"
 
 
 class TestCheckDiscogsCache:
@@ -522,6 +579,119 @@ class TestHealthEndpoint:
         assert body["services"]["discogs_api"] == "auth-error"
         assert body["services"]["discogs_cache"] == "error"
 
+    # -----------------------------------------------------------------
+    # LML#757: the breaker's shedding state must be surfaced on GET /health,
+    # dominating the independent live probe, plus the raw state must be
+    # exposed for drill-down. Reproduces the 2026-07-13/14 incident scenario
+    # where the breaker was OPEN/HALF_OPEN (shedding 100% of live Discogs
+    # calls) while the independent probe kept landing "ok".
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_discogs_api_degraded_when_breaker_open(
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
+    ):
+        import routers.health as health_module
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        open_breaker = MagicMock()
+        open_breaker.state = BreakerState.OPEN
+        monkeypatch.setattr(health_module, "get_discogs_breaker", lambda: open_breaker)
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["services"]["discogs_api"] == "rate-limited"
+        assert body["discogs_breaker_state"] == "open"
+        assert body["status"] == "degraded"
+        mock_discogs.check_api.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discogs_api_degraded_when_breaker_half_open(
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
+    ):
+        """HALF_OPEN is still shedding (a single trial slot occupied) -- must
+        not be reported as healthy even though it is one step from CLOSED."""
+        import routers.health as health_module
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        half_open_breaker = MagicMock()
+        half_open_breaker.state = BreakerState.HALF_OPEN
+        monkeypatch.setattr(health_module, "get_discogs_breaker", lambda: half_open_breaker)
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["services"]["discogs_api"] == "rate-limited"
+        assert body["discogs_breaker_state"] == "half-open"
+        assert body["status"] == "degraded"
+        mock_discogs.check_api.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discogs_api_ok_when_breaker_closed(
+        self, mock_db, mock_discogs, mock_settings, monkeypatch
+    ):
+        """CLOSED (normal operation) -- discogs_api reflects the live probe,
+        and the raw breaker state rides along as "closed"."""
+        import routers.health as health_module
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        closed_breaker = MagicMock()
+        closed_breaker.state = BreakerState.CLOSED
+        monkeypatch.setattr(health_module, "get_discogs_breaker", lambda: closed_breaker)
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+            },
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "healthy"
+        assert body["services"]["discogs_api"] == "ok"
+        assert body["discogs_breaker_state"] == "closed"
+
     @pytest.mark.asyncio
     async def test_unhealthy_returns_503(self, mock_settings):
         """Core service (database) down -> unhealthy + 503."""
@@ -571,6 +741,24 @@ class TestHealthEndpoint:
         assert checks[0].required is True  # database is core
         assert checks[1].required is False  # discogs_api is optional
         assert checks[2].required is False  # discogs_cache is optional
+
+    @pytest.mark.asyncio
+    async def test_build_checks_threads_breaker_state_into_discogs_api_probe(self):
+        """LML#757: ``_build_checks`` must wire ``breaker_state`` into the
+        ``discogs_api`` probe so an OPEN/HALF_OPEN breaker dominates the
+        independent live probe end-to-end, not just when ``_check_discogs_api``
+        is called directly."""
+        from routers.health import _build_checks
+
+        db = AsyncMock(spec=LibraryDB)
+        svc = AsyncMock(spec=DiscogsService)
+        svc.check_api = AsyncMock(return_value=DiscogsApiCheckResult.OK)
+
+        checks = _build_checks(db=db, discogs_service=svc, breaker_state=BreakerState.OPEN)
+        result = await checks[1].probe()
+
+        assert result == "rate-limited"
+        svc.check_api.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_local_helpers_removed(self):
