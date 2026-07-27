@@ -338,6 +338,67 @@ class TestPerformLookupBasic:
 
 
 # ---------------------------------------------------------------------------
+# Tests: perform_lookup - intra-spine telemetry spans
+# ---------------------------------------------------------------------------
+
+
+class TestPerformLookupTelemetrySpans:
+    """Cover pipeline regions that run awaited work outside every existing
+    ``track_step`` span (the "intra-spine" gap between spans)."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_status_step_is_tracked(
+        self, mock_library_db, mock_discogs_service, telemetry, stereolab_item
+    ):
+        """Step 3c's ``get_streaming_status`` DB call is awaited work with no
+        span of its own — it must be tracked so the Server-Timing sum stops
+        losing that duration."""
+        mock_library_db.search.return_value = [stereolab_item]
+        mock_library_db._has_streaming_links = True
+        mock_library_db.get_streaming_status = AsyncMock(return_value={stereolab_item.id: True})
+        # Also exercised by enrichment's librarian-override lookup (item.py) once
+        # ``_has_streaming_links`` is True; None keeps it a no-op so this test
+        # stays focused on step 3c's own span.
+        mock_library_db.get_streaming_links = AsyncMock(return_value=None)
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Stereolab",
+            album="Emperor Tomato Ketchup",
+            raw_message="Emperor Tomato Ketchup by Stereolab",
+        )
+
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        mock_library_db.get_streaming_status.assert_awaited_once_with([stereolab_item.id])
+        assert response.results[0].library_item.id == stereolab_item.id
+        assert telemetry.steps.get("streaming_status") is not None
+        assert telemetry.steps["streaming_status"].success is True
+
+    @pytest.mark.asyncio
+    async def test_streaming_status_step_not_tracked_when_no_streaming_links(
+        self, mock_library_db, mock_discogs_service, telemetry, stereolab_item
+    ):
+        """Sanity check on the negative: when the library has no streaming_links
+        table, step 3c does no awaited work, so no span should be recorded
+        (mirrors the existing gate at ``_step_populate_streaming_status``)."""
+        mock_library_db.search.return_value = [stereolab_item]
+        mock_library_db._has_streaming_links = False
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Stereolab",
+            album="Emperor Tomato Ketchup",
+            raw_message="Emperor Tomato Ketchup by Stereolab",
+        )
+
+        await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        mock_library_db.get_streaming_status.assert_not_awaited()
+        assert "streaming_status" not in telemetry.steps
+
+
+# ---------------------------------------------------------------------------
 # Tests: perform_lookup - artist correction
 # ---------------------------------------------------------------------------
 
