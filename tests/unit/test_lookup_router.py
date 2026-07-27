@@ -932,16 +932,20 @@ class TestHandleLookup:
         ``get_settings`` — pinned here alongside the router's, mirroring the
         ``core.server_timing_middleware`` pattern above.
         """
+        # Value comes from the process-global gauge (the same source the
+        # recorder reads), NOT the cache_stats dict — seed the stats key with a
+        # decoy 0.0 to prove the leg reflects the gauge, not the seeded value.
         from lookup.router import EVENT_LOOP_LAG_STAT_KEY
 
         response = LookupResponse(results=[], search_type="direct")
-        stats = {**_full_cache_stats(), EVENT_LOOP_LAG_STAT_KEY: 42.5}
+        stats = {**_full_cache_stats(), EVENT_LOOP_LAG_STAT_KEY: 0.0}
 
         with (
             patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
             patch("lookup.router.get_cache_stats", return_value=stats),
             patch("lookup.router.get_settings", return_value=mock_settings),
             patch("lookup.server_timing_legs.get_settings", return_value=mock_settings),
+            patch("lookup.server_timing_legs.get_event_loop_lag_ms", return_value=42.5),
         ):
             mock_lookup.return_value = response
             async with AsyncClient(
@@ -974,6 +978,7 @@ class TestHandleLookup:
             patch("lookup.router.get_cache_stats", return_value=stats),
             patch("lookup.router.get_settings", return_value=gauge_off),
             patch("lookup.server_timing_legs.get_settings", return_value=gauge_off),
+            patch("lookup.server_timing_legs.get_event_loop_lag_ms", return_value=42.5),
         ):
             mock_lookup.return_value = response
             async with AsyncClient(
@@ -989,20 +994,28 @@ class TestHandleLookup:
         assert "total" in parsed
 
     @pytest.mark.asyncio
-    async def test_server_timing_event_loop_lag_omitted_when_key_absent(
+    async def test_server_timing_event_loop_lag_omitted_when_gauge_unsampled(
         self, app_client, mock_settings
     ):
-        """Defensive: an uninitialized/older cache_stats dict missing the LML#907
-        key degrades to omission rather than a KeyError -> 500.
+        """Regression (review B#1): with the gauge ENABLED but unsampled (the
+        first ~interval of process life, right after a redeploy),
+        ``get_event_loop_lag_ms()`` returns ``None`` while ``init_cache_stats``
+        has already seeded ``event_loop_lag_ms`` to 0. The leg must be OMITTED,
+        not emitted as a misleading ``event_loop_lag;dur=0`` — the builder reads
+        the gauge, not the seeded stats value.
         """
+        from lookup.router import EVENT_LOOP_LAG_STAT_KEY
+
         response = LookupResponse(results=[], search_type="direct")
-        stats = _full_cache_stats()  # no EVENT_LOOP_LAG_STAT_KEY entry
+        # Production shape: init_cache_stats seeds the key to 0 on every request.
+        stats = {**_full_cache_stats(), EVENT_LOOP_LAG_STAT_KEY: 0.0}
 
         with (
             patch("lookup.router.perform_lookup", new_callable=AsyncMock) as mock_lookup,
             patch("lookup.router.get_cache_stats", return_value=stats),
             patch("lookup.router.get_settings", return_value=mock_settings),
             patch("lookup.server_timing_legs.get_settings", return_value=mock_settings),
+            patch("lookup.server_timing_legs.get_event_loop_lag_ms", return_value=None),
         ):
             mock_lookup.return_value = response
             async with AsyncClient(
