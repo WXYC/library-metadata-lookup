@@ -4,8 +4,8 @@
 see ``lookup/router.py:handle_lookup``) only times the window between its own
 construction and ``as_server_timing()``: the pipeline itself. FastAPI's
 dependency injection, the Pydantic request deserialization, and the
-``LookupResponse`` JSON serialization all happen OUTSIDE that window, inside
-the ASGI ``call_next`` a middleware wraps — no ``track_step`` span nor the
+``LookupResponse`` JSON serialization all happen OUTSIDE that window, in the
+routing and serialization layer this middleware wraps — no ``track_step`` span nor the
 ``queue_wait``/``discogs`` ``extra`` legs can see that time. A caller measuring
 its own wall-clock time for the whole HTTP round trip (request-o-matic's
 ``lookup_service`` metric) then sees a residual the LML-side header cannot
@@ -84,16 +84,21 @@ def _with_appended_server_timing(
     against any upstream app that doesn't normalize casing. The original
     name's casing is preserved in the merged tuple; only the comparison is
     case-folded.
+
+    If the app emitted more than one ``Server-Timing`` line (legal but rare),
+    ``entry`` is appended to the FIRST match only -- appending to every line
+    would emit ``lml_wall`` more than once and a reader would double-count it.
+    The ``/lookup`` handler emits exactly one, so this guard is defensive.
     """
     merged: list[tuple[bytes, bytes]] = []
-    found = False
+    appended = False
     for name, value in headers:
-        if name.lower() == _SERVER_TIMING_HEADER:
+        if not appended and name.lower() == _SERVER_TIMING_HEADER:
             merged.append((name, value + b", " + entry))
-            found = True
+            appended = True
         else:
             merged.append((name, value))
-    if not found:
+    if not appended:
         merged.append((_SERVER_TIMING_HEADER, entry))
     return merged
 
