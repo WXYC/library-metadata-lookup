@@ -156,16 +156,21 @@ async def fetch_artwork_for_items(
     soft-confidence on a row-less carried bind (LML#629): a no-album query's
     row-less release binds at ``ROWLESS_NO_ALBUM_CONFIDENCE`` rather than 1.0.
 
-    ``found_on_compilation`` (LML#684): when the result came from
-    ``search_compilations_for_track`` (TRACK_ON_COMPILATION), an in-library row
-    carries an already-validated ``ResolvedRelease`` on the seam. The artist-floor
-    re-search systematically rejects *non*-Various-Artists trio / collaboration
-    credits (the row is filed under one member, e.g. "Bill Orcutt", while Discogs
-    credits the full trio), leaving the result with no artwork. When the floor
-    rejects every candidate and a release is carried, that validated release is
-    trust-bound for artwork — independent of ``lml_resolve_compilation_release``,
-    since binding an already-carried release costs no extra Discogs fan-out
-    (unlike the flag-gated lazy ``resolve_release_for_track`` fallback below).
+    ``found_on_compilation`` (LML#684, widened by LML#956): when the result came
+    from ``search_compilations_for_track`` (TRACK_ON_COMPILATION), an in-library
+    row carries an already-validated ``ResolvedRelease`` on the seam. That
+    carried release is trust-bound for artwork *before* the artist-floor
+    re-search — whenever one is carried, not only when the floor rejects — so the
+    displayed release is always the one validation confirmed. This covers two
+    floor failure modes: the floor *rejects* every candidate (the systematic
+    *non*-Various-Artists trio / collaboration case, e.g. the row filed under
+    "Bill Orcutt" while Discogs credits the full trio, which would otherwise leave
+    the result with no artwork), and the floor *clears on the wrong release* (a
+    generic V/A comp title where the title+artist floor binds a *same-titled*
+    release that does not carry the track — LML#956). Independent of
+    ``lml_resolve_compilation_release``, since binding an already-carried release
+    costs no extra Discogs fan-out (unlike the flag-gated lazy
+    ``resolve_release_for_track`` fallback below).
 
     ``release_overrides`` (LML#850): a ``library_id -> discogs_release_id`` map of
     **hand-verified** pins the orchestrator prefetched for this request (empty /
@@ -331,8 +336,10 @@ async def fetch_artwork_for_items(
             if result is None:
                 # A found-on-compilation in-library row that carries a validated
                 # release is already trust-bound above (before this re-search), so
-                # only the resolved-is-None cases reach here. The lazy fallback
-                # below resolves a release when the seam carried none.
+                # no such row reaches here — the remaining found-on-compilation
+                # rows that reach this branch carried nothing (resolved is None).
+                # The lazy fallback below resolves a release for exactly that
+                # resolved-is-None case.
                 #
                 # Lazy release-resolution fallback (LML#604): the artist floor
                 # rejected every candidate — the systematic failure for a V/A

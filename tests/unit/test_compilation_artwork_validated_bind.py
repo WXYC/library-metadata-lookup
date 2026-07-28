@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from discogs.models import DiscogsSearchResponse, ReleaseMetadataResponse
+from library.models import LibraryItem
 from lookup.artwork import fetch_artwork_for_items
 from lookup.release_resolution import ResolvedRelease
 from tests.factories import make_discogs_result, make_library_item
@@ -84,7 +85,7 @@ def _carried_validated_release() -> ResolvedRelease:
     )
 
 
-def _comp_row() -> object:
+def _comp_row() -> LibraryItem:
     return make_library_item(
         id=_LIBRARY_ID,
         artist="Various Artists - Rock - G",

@@ -2404,8 +2404,11 @@ class TestFetchArtworkFoundOnCompilation:
         rejects. Binding the carried release also skips the re-search entirely.
         """
         item, discogs_titles, svc = self._trio_inputs()
-        # Even when the floor search returns a clean, matching candidate, the
-        # validated carried release (34993109) is preferred over it (111).
+        # Arm the floor with a clean, matching candidate (111) that WOULD win if
+        # the re-search ran. The early trust-bind returns before the search, so
+        # this candidate is deliberately never consumed — the ``assert_not_awaited``
+        # below proves the carried release (34993109) pre-empts even a
+        # would-succeed floor, not merely a rejecting one.
         svc.search = AsyncMock(
             return_value=DiscogsSearchResponse(
                 results=[
