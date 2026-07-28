@@ -9,6 +9,7 @@ are isolated so one item cannot poison the batch.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -1336,3 +1337,63 @@ class TestBulkLookupFamilyAlignment:
         assert detail[0]["loc"] == ["items"]
         assert detail[0]["type"] == "missing"
         mock_lookup.assert_not_awaited()
+
+
+class TestCallerClassAntiUpRankInvariant:
+    """LML#928 anti-up-rank guard: no ``X-Caller-Class`` value can let a
+    `/lookup/bulk` caller escape the low-priority lane.
+
+    Every item already runs under ``acquire_bulk_global_permit`` (see
+    ``_run_one`` in the router) regardless of caller class -- `/lookup/bulk`
+    is unconditionally low-priority today. This pins that as a REGRESSION
+    GUARD: the header is accepted (so it doesn't 422 and so a future
+    emission/observability seam has it in scope) but must never be read as a
+    signal to skip the LML#716/#924 budget. Down-rank only, never up-rank --
+    a caller cannot self-declare a "higher" class to get preferential
+    treatment on this endpoint.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {},
+            {"X-Caller-Class": "1"},
+            {"X-Caller-Class": "4"},
+            {"X-Caller-Class": "5"},
+            {"X-Caller-Class": "not-a-class"},
+        ],
+        ids=["absent", "class-1", "class-4", "class-5", "non-numeric"],
+    )
+    async def test_every_item_still_acquires_the_global_permit(self, app_client, headers):
+        calls = 0
+
+        @contextlib.asynccontextmanager
+        async def _counting_permit():
+            nonlocal calls
+            calls += 1
+            yield
+
+        with (
+            patch(
+                "lookup.router.perform_lookup",
+                new_callable=AsyncMock,
+                return_value=_no_match_response(),
+            ),
+            patch("lookup.router.acquire_bulk_global_permit", _counting_permit),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={"items": [{"artist": f"a{i}", "album": "x"} for i in range(3)]},
+                    headers=headers,
+                )
+
+        assert resp.status_code == 200
+        assert calls == 3, (
+            "every item must acquire the low-priority global permit regardless of "
+            "X-Caller-Class -- the header must never up-rank a bulk caller out of "
+            "the low-priority lane"
+        )

@@ -25,7 +25,10 @@ from core.bulk_body import parse_bulk_body
 from core.bulk_concurrency import (
     acquire_bulk_global_permit,
     cancel_and_drain,
+    is_low_priority_caller_class,
     max_concurrency_from_env,
+    maybe_acquire_bulk_global_permit,
+    resolve_caller_class,
     watch_disconnect,
 )
 from core.dependencies import (
@@ -451,6 +454,21 @@ async def handle_lookup(
             "BS#1843 -- treated as a safe no-op, never fabricated."
         ),
     ),
+    x_caller_class: str | None = Header(
+        default=None,
+        alias="X-Caller-Class",
+        description=(
+            "Optional caller-declared traffic class, 1-5 (LML#928; forwarded by "
+            "Backend-Service per BS#1843). Class 5 (batch/cron/backfill) "
+            "additionally routes this request onto the low-priority lane -- the "
+            "LML#716/#924 process-global bulk permit (LML_BULK_GLOBAL_MAX_CONCURRENT) "
+            "`/lookup/bulk` items already share. Missing or invalid values "
+            "(including 1-4) are a no-op: today's lane placement is unchanged. "
+            "Down-rank only -- never trusted to grant a protected lane beyond the "
+            "caller's entitlement, since this header is honored only on the "
+            "authenticated Backend-Service-to-LML channel."
+        ),
+    ),
 ):
     """Process a lookup request."""
     # Pre-declare LML-specific cache-stats keys so PostHog/Sentry payload shapes
@@ -572,20 +590,27 @@ async def handle_lookup(
                 distinct_id="library-metadata-lookup-service",
                 event_prefix="lookup",
             )
-            response = await perform_lookup(
-                request=request,
-                db=db,
-                discogs_service=discogs_service,
-                telemetry=telemetry,
-                entity_store=entity_store,
-                discogs_cache=discogs_cache,
-                mb_pg=mb_pg,
-                apple_music=apple_music,
-                spotify=spotify,
-                bandcamp=bandcamp,
-                discogs_cache_pg=discogs_cache_pg,
-                caller_budget_ms=x_caller_budget_ms,
-            )
+            # LML#928: class 5 (batch/cron/backfill) additionally routes this
+            # request onto the low-priority lane -- the same LML#716/#924
+            # process-global bulk permit `/lookup/bulk` items already share.
+            # Down-rank only: classes 1-4, absent, and invalid values resolve
+            # to a no-op here (today's interactive-only behavior, unchanged).
+            caller_class = resolve_caller_class(x_caller_class)
+            async with maybe_acquire_bulk_global_permit(is_low_priority_caller_class(caller_class)):
+                response = await perform_lookup(
+                    request=request,
+                    db=db,
+                    discogs_service=discogs_service,
+                    telemetry=telemetry,
+                    entity_store=entity_store,
+                    discogs_cache=discogs_cache,
+                    mb_pg=mb_pg,
+                    apple_music=apple_music,
+                    spotify=spotify,
+                    bandcamp=bandcamp,
+                    discogs_cache_pg=discogs_cache_pg,
+                    caller_budget_ms=x_caller_budget_ms,
+                )
         finally:
             if permit_held:
                 semaphore.release()
@@ -734,6 +759,19 @@ async def handle_bulk_lookup(
             "observational: tagged onto the Sentry transaction and the "
             "PostHog completion event. Absent on callers that predate "
             "BS#1843 -- treated as a safe no-op, never fabricated."
+        ),
+    ),
+    x_caller_class: str | None = Header(
+        default=None,
+        alias="X-Caller-Class",
+        description=(
+            "Optional caller-declared traffic class, 1-5 (LML#928; forwarded by "
+            "Backend-Service per BS#1843). Accepted for parity with `/lookup` "
+            "and documentation, but NOT branched on here: every item on this "
+            "route already runs under the low-priority lane "
+            "(`acquire_bulk_global_permit`, LML#716/#924) unconditionally, so "
+            "no class value -- including 1-4 -- can escalate a bulk caller out "
+            "of it. Down-rank only, never up-rank."
         ),
     ),
 ) -> BulkLookupResponse:
