@@ -6,9 +6,11 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from core.search import detect_ambiguous_format
 from discogs.matching import (
+    credit_uses_anv,
     normalize_artist_for_validation,
     normalize_for_track_comparison,
     strip_discogs_suffix,
+    strip_release_artist_suffix,
 )
 from discogs.service import calculate_confidence
 from lookup.matching import is_self_titled, map_library_format_to_discogs
@@ -38,6 +40,62 @@ class TestStripDiscogsSuffix:
     )
     def test_strip_discogs_suffix(self, input_text, expected):
         assert strip_discogs_suffix(input_text) == expected
+
+
+# ---------------------------------------------------------------------------
+# strip_release_artist_suffix
+# ---------------------------------------------------------------------------
+
+
+class TestStripReleaseArtistSuffix:
+    """Tests for the release-credit ANV-marker + numeric-suffix strip.
+
+    See WXYC/library-metadata-lookup#971 -- the "C.S. Yeh*" repro.
+    """
+
+    @pytest.mark.parametrize(
+        "input_text, expected",
+        [
+            pytest.param("C.S. Yeh*", "C.S. Yeh", id="anv-marker"),
+            pytest.param("DNA (22)", "DNA", id="numeric-suffix-22"),
+            pytest.param("Bjork", "Bjork", id="no-decoration-unchanged"),
+            pytest.param("", "", id="empty-string"),
+            pytest.param("John Smith (3)*", "John Smith", id="anv-marker-and-numeric-suffix"),
+            pytest.param(
+                "Moon Pix (Deluxe Edition)",
+                "Moon Pix (Deluxe Edition)",
+                id="non-numeric-parens-preserved",
+            ),
+        ],
+    )
+    def test_strip_release_artist_suffix(self, input_text, expected):
+        assert strip_release_artist_suffix(input_text) == expected
+
+
+# ---------------------------------------------------------------------------
+# credit_uses_anv
+# ---------------------------------------------------------------------------
+
+
+class TestCreditUsesAnv:
+    """The ANV-`*`-specific gate: a numeric disambiguator alone is NOT an
+    alias signal and must not be conflated with the ANV marker.
+    """
+
+    @pytest.mark.parametrize(
+        "input_text, expected",
+        [
+            pytest.param("C.S. Yeh*", True, id="anv-marker"),
+            pytest.param("John Smith (3)*", True, id="anv-marker-after-numeric-suffix"),
+            pytest.param("Sun (2)", False, id="numeric-suffix-only-not-anv"),
+            pytest.param("Various (2)", False, id="numeric-suffix-only-not-anv-various"),
+            pytest.param("Bjork", False, id="no-decoration"),
+            pytest.param("", False, id="empty-string"),
+            pytest.param(None, False, id="none"),
+        ],
+    )
+    def test_credit_uses_anv(self, input_text, expected):
+        assert credit_uses_anv(input_text) is expected
 
 
 # ---------------------------------------------------------------------------

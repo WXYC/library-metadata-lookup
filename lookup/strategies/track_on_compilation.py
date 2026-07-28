@@ -36,6 +36,7 @@ from core.search import (
     song_not_found_with_artist_and_song,
 )
 from discogs.lookup import lookup_releases_by_track
+from discogs.matching import credit_uses_anv, strip_release_artist_suffix
 from discogs.models import ReleaseInfo, TrackReleasesResponse
 from discogs.service import DiscogsService
 from entity.sources import PgSource
@@ -490,9 +491,40 @@ async def search_compilations_for_track(
                 filtered_matches = []
                 discogs_is_compilation = release_info.is_compilation
                 release_album_lower = release_album.lower()
+                # LML#971: also keep a title-matched row when it prefix-matches the
+                # release's OWN ANV-marked Discogs credit, not only the typed
+                # `lib_artist` -- rescues rows filed under a band name / abbreviated
+                # alias (e.g. library "Burning Star Core" / alternate_artist_name
+                # "C.S. Yeh" for Discogs release credit "C.S. Yeh*") that the typed
+                # artist alone can't prefix-match and that isn't a V/A compilation,
+                # so the carve-out below can't rescue it either.
+                #
+                # Gated on `credit_uses_anv` (the trailing `*` marker) SPECIFICALLY,
+                # not on "any decoration". A numeric disambiguator alone
+                # (``"Sun (2)"``) is NOT an alias signal -- it only says "the Nth
+                # Discogs artist named Sun" -- so treating it as trustworthy would
+                # reopen the exact false-positive prefix collisions `lib_artist` and
+                # the title-score gate below both exist to close (a plain "Sun (2)"
+                # credit prefix-matching library row "Sunburned Hand of the Man"; a
+                # plain "Various (2)" credit -- not compilation-artist-shaped, so
+                # `is_compilation_artist` is False too -- bypassing the title-score
+                # check below entirely). Still a STRICT prefix match;
+                # `validate_release_for_track` below (on the TYPED artist) validates
+                # the release, not the surfaced row, so it does NOT catch a
+                # wrong-row bind here -- the ANV gate is the only thing standing
+                # between this branch and that false-positive class.
+                raw_release_credit = (release_info.artist or "").strip()
+                credit_has_anv_marker = credit_uses_anv(raw_release_credit)
+                release_credit = strip_release_artist_suffix(raw_release_credit)
 
                 for match in matches:
                     if artist_matches_item(match, lib_artist):
+                        filtered_matches.append(match)
+                    elif (
+                        credit_has_anv_marker
+                        and release_credit
+                        and artist_matches_item(match, release_credit)
+                    ):
                         filtered_matches.append(match)
                     elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
                         title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
