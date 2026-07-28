@@ -216,6 +216,46 @@ class TestMiddleware:
             "synchronous queue.join() on every request (LML#881)"
         )
 
+    @pytest.mark.asyncio
+    async def test_request_path_never_calls_flush_posthog(self, mock_settings):
+        """Behavioral companion to the structural guard above (LML#949).
+
+        The structural test only proves ``posthog_flush_middleware`` isn't registered by
+        name; it would stay green even if a future change called ``flush_posthog()`` from
+        somewhere else on the request path (a dependency, a route handler, a different
+        middleware). This test drives an actual request through the ASGI app end to end and
+        asserts ``flush_posthog`` is never invoked while handling it — ``main`` no longer
+        imports ``flush_posthog`` at all post-fix, so the patch target is created on the fly
+        (``create=True``); if a regression reintroduces the import and a call, this starts
+        patching the real bound name and the call would be caught the same way the deleted
+        ``test_posthog_flush_middleware`` used to assert the opposite.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        mock_db = AsyncMock()
+        mock_db.is_available = AsyncMock(return_value=True)
+
+        app.dependency_overrides[get_library_db] = lambda: mock_db
+        app.dependency_overrides[get_discogs_service] = lambda: None
+        app.dependency_overrides[get_posthog_client] = lambda: None
+        app.dependency_overrides[get_settings] = lambda: mock_settings
+
+        try:
+            with patch("main.flush_posthog", create=True) as mock_flush:
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    response = await client.get("/health")
+
+            assert response.status_code == 200
+            mock_flush.assert_not_called()
+        finally:
+            app.dependency_overrides.clear()
+
 
 class TestAppRouterRegistration:
     def test_routes_registered(self):
