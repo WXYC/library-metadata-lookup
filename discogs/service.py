@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 import weakref
 from collections.abc import Iterator
 from enum import StrEnum
@@ -53,7 +54,13 @@ from discogs.models import (
     TrackItem,
     TrackReleasesResponse,
 )
-from discogs.ratelimit import get_discogs_breaker, get_discogs_rate_gate, get_semaphore
+from discogs.ratelimit import (
+    get_bulk_discogs_semaphore,
+    get_discogs_breaker,
+    get_discogs_rate_gate,
+    get_semaphore,
+    is_discogs_low_priority,
+)
 
 if TYPE_CHECKING:
     from discogs.cache_service import DiscogsCacheService
@@ -163,6 +170,67 @@ def _project_semaphore_queue_depth(queue_depth: int) -> None:
         transaction.set_data(_SEMAPHORE_QUEUE_DEPTH_MEASUREMENT, queue_depth)
     except Exception as e:
         logger.warning("Failed to project Discogs semaphore queue depth: %s", e)
+
+
+# LML#927 bulk-lane reservation telemetry. Mirrors the #358/#879 shared-semaphore
+# measurement pair above, plus the entry-level ``lml.bulk.global_capped`` /
+# ``lml.bulk.global_wait_ms`` shape (``core/bulk_concurrency.py``) for the
+# "capped on arrival" tag + wait measurement -- filterable Sentry TAGS +
+# aggregatable MEASUREMENTS, never ``set_data`` alone (the LML#683 lesson).
+_BULK_SEMAPHORE_QUEUE_DEPTH_MEASUREMENT = "lml.discogs.bulk_semaphore_queue_depth"
+_BULK_SEMAPHORE_WAIT_MEASUREMENT = "lml.discogs.bulk_semaphore_wait_ms"
+DISCOGS_BULK_RESERVED_CAPPED_STAT_KEY = "discogs_bulk_reserved_capped"
+_bulk_semaphore_queue_depth_max_by_transaction: weakref.WeakKeyDictionary = (
+    weakref.WeakKeyDictionary()
+)
+_bulk_semaphore_wait_max_by_transaction: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _project_bulk_semaphore_queue_depth(queue_depth: int) -> None:
+    """Project bulk sub-semaphore queue depth, mirroring
+    :func:`_project_semaphore_queue_depth` for the reservation lane's own
+    saturation -- so it doesn't hide inside the shared semaphore's number.
+    """
+    if queue_depth < 0:
+        return
+    try:
+        if queue_depth > 0:
+            sentry_sdk.set_tag("lml.discogs.bulk_semaphore_queued", "true")
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is None:
+            return
+        if queue_depth <= _bulk_semaphore_queue_depth_max_by_transaction.get(transaction, -1):
+            return
+        _bulk_semaphore_queue_depth_max_by_transaction[transaction] = queue_depth
+        transaction.set_measurement(_BULK_SEMAPHORE_QUEUE_DEPTH_MEASUREMENT, queue_depth)
+        transaction.set_data(_BULK_SEMAPHORE_QUEUE_DEPTH_MEASUREMENT, queue_depth)
+    except Exception as e:
+        logger.warning("Failed to project Discogs bulk semaphore queue depth: %s", e)
+
+
+def _project_bulk_semaphore_wait(wait_ms: float) -> None:
+    """Project a capped bulk sub-semaphore acquire onto Sentry + cache_stats.
+
+    Same two-channel shape as ``core.bulk_concurrency._project_global_capped``:
+    a filterable ``lml.discogs.bulk_semaphore_capped`` tag plus the
+    ``lml.discogs.bulk_semaphore_wait_ms`` measurement (running max across the
+    request's Discogs calls). Also increments the ``discogs_bulk_reserved_capped``
+    cache-stats counter, mirroring ``lml.bulk.global_capped`` on the #683
+    ``cache.*`` surface, so bulk-reservation pressure is alertable the same way.
+    Observability must not break the request path.
+    """
+    try:
+        sentry_sdk.set_tag("lml.discogs.bulk_semaphore_capped", "true")
+        get_cache_stats_recorder().record(DISCOGS_BULK_RESERVED_CAPPED_STAT_KEY)
+        transaction = sentry_sdk.get_current_scope().transaction
+        if transaction is not None and wait_ms > _bulk_semaphore_wait_max_by_transaction.get(
+            transaction, 0.0
+        ):
+            _bulk_semaphore_wait_max_by_transaction[transaction] = wait_ms
+            transaction.set_measurement(_BULK_SEMAPHORE_WAIT_MEASUREMENT, wait_ms)
+            transaction.set_data(_BULK_SEMAPHORE_WAIT_MEASUREMENT, wait_ms)
+    except Exception as e:
+        logger.warning("Failed to project Discogs bulk semaphore wait: %s", e)
 
 
 def _parse_ratelimit_remaining(raw: str | None) -> int | None:
@@ -461,6 +529,12 @@ class DiscogsService:
         semaphore = get_semaphore()
         rate_gate = get_discogs_rate_gate()
         breaker = get_discogs_breaker()
+        # LML#927: resolved once per request (the contextvar doesn't change
+        # mid-retry-loop), mirroring how the gates above are fetched once and
+        # applied per attempt below. ``None`` when the caller is interactive --
+        # the bulk sub-semaphore is never touched on that path.
+        low_priority = is_discogs_low_priority()
+        bulk_semaphore = get_bulk_discogs_semaphore() if low_priority else None
 
         # LML#755 saturation shed. When the breaker is OPEN, fast-fail *before*
         # ``rate_limiter.acquire()`` — no queuing on the 50/min limiter, no
@@ -541,20 +615,66 @@ class DiscogsService:
                         f"Discogs saturation breaker opened mid-flight: {method} {path}"
                     )
 
-                # Explicit acquire/release (not `async with semaphore:`) so the
-                # wait is wrapped in a Sentry span. The 5-permit semaphore is the
-                # dominant source of pre-request dark time on backfill cascades —
-                # sampling the queue depth right before the await gives the trace
-                # explorer a relative-load signal per call. See
-                # WXYC/library-metadata-lookup#358.
-                with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
-                    queue_depth = _approx_semaphore_queue_depth(semaphore)
-                    span.set_data("lml.semaphore.queue_depth", queue_depth)
-                    _project_semaphore_queue_depth(queue_depth)
-                    apply_request_ctx_tags(span)
-                    await semaphore.acquire()
-
+                # LML#927: a low-priority call holds the bulk reservation
+                # semaphore OUTER to the shared semaphore below, acquired
+                # first so bulk can never occupy more than
+                # ``LML_DISCOGS_BULK_MAX_CONCURRENT`` of the shared permits --
+                # reserving the rest for interactive callers. Both acquires
+                # (and everything downstream) now live inside the same
+                # try/finally as the request itself -- not just the bare
+                # `await ...acquire()` calls the pre-#927 code used outside any
+                # try -- so a cancellation between the two acquires (bulk
+                # granted, then cancelled while waiting on the shared one)
+                # cannot strand the bulk permit. Released INNER -> OUTER
+                # (shared semaphore first, then bulk) in the `finally`, the
+                # same ordered, deadlock-free discipline LML#953 established:
+                # nothing already holding the shared semaphore ever waits on
+                # this one, so no acquire cycle can form.
+                bulk_permit_held = False
+                main_permit_held = False
                 try:
+                    if bulk_semaphore is not None:
+                        with sentry_sdk.start_span(
+                            op="lock.acquire", name="lml.discogs.bulk_semaphore"
+                        ) as bulk_span:
+                            bulk_queue_depth = _approx_semaphore_queue_depth(bulk_semaphore)
+                            bulk_span.set_data("lml.bulk_semaphore.queue_depth", bulk_queue_depth)
+                            _project_bulk_semaphore_queue_depth(bulk_queue_depth)
+                            apply_request_ctx_tags(bulk_span)
+                            bulk_capped_on_arrival = bulk_semaphore.locked()
+                            bulk_wait_start = time.perf_counter()
+                            await bulk_semaphore.acquire()
+                            bulk_permit_held = True
+                            if bulk_capped_on_arrival:
+                                _project_bulk_semaphore_wait(
+                                    (time.perf_counter() - bulk_wait_start) * 1000.0
+                                )
+
+                    # Explicit acquire/release (not `async with semaphore:`) so
+                    # the wait is wrapped in a Sentry span. The 5-permit
+                    # semaphore is the dominant source of pre-request dark time
+                    # on backfill cascades — sampling the queue depth right
+                    # before the await gives the trace explorer a
+                    # relative-load signal per call. See
+                    # WXYC/library-metadata-lookup#358.
+                    with sentry_sdk.start_span(
+                        op="lock.acquire", name="lml.discogs.semaphore"
+                    ) as span:
+                        queue_depth = _approx_semaphore_queue_depth(semaphore)
+                        span.set_data("lml.semaphore.queue_depth", queue_depth)
+                        _project_semaphore_queue_depth(queue_depth)
+                        apply_request_ctx_tags(span)
+                        # LML#927: tag this span with the traffic class so
+                        # ``lml.discogs.semaphore`` p95/p99 wait can be sliced
+                        # by class -- the direct signal for verifying
+                        # interactive is no longer head-of-line-blocked behind
+                        # bulk.
+                        sentry_sdk.set_tag(
+                            "lml.discogs.priority", "bulk" if low_priority else "interactive"
+                        )
+                        await semaphore.acquire()
+                        main_permit_held = True
+
                     with sentry_sdk.start_span(
                         op="lock.acquire", name="lml.discogs.rate_limiter"
                     ) as span:
@@ -587,8 +707,16 @@ class DiscogsService:
                 finally:
                     # Released before the retry sleep below, on success, and on
                     # any error/cancellation in this attempt — one release per
-                    # acquire.
-                    semaphore.release()
+                    # acquire. Inner (shared semaphore) released before outer
+                    # (bulk reservation).
+                    if main_permit_held:
+                        semaphore.release()
+                    if bulk_permit_held:
+                        # `bulk_permit_held` is only ever set True inside the
+                        # `bulk_semaphore is not None` branch above, so the
+                        # semaphore itself is never None here.
+                        assert bulk_semaphore is not None
+                        bulk_semaphore.release()
 
                 # LML#755: feed the breaker **once per request, on the terminal
                 # outcome** (FIX 2/5), not per attempt — the counting unit is

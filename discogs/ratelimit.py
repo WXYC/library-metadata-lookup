@@ -14,6 +14,7 @@ import random
 import time
 import weakref
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from typing import Protocol
 
 import sentry_sdk
@@ -51,6 +52,11 @@ _QUEUE_SLEEP_JITTER = 0.25
 # Lazily-initialized rate limiting primitives, stored per event loop
 _rate_limiters: dict[asyncio.AbstractEventLoop, AsyncLimiter] = {}
 _semaphores: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+# LML#927: the bulk-lane reservation sub-semaphore, stored per event loop
+# alongside the shared semaphore (same process-global-on-single-worker scope).
+# Low-priority Discogs calls hold this OUTER to the shared semaphore, so bulk
+# can occupy at most this many of the shared permits.
+_bulk_semaphores: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 # LML#755 saturation circuit-breaker, stored per event loop alongside the
 # limiter/semaphore (same process-global-on-single-worker scope).
 _breakers: dict[asyncio.AbstractEventLoop, DiscogsCircuitBreaker] = {}
@@ -58,6 +64,32 @@ _breakers: dict[asyncio.AbstractEventLoop, DiscogsCircuitBreaker] = {}
 # per-loop local ``AsyncLimiter`` with the shared PG token bucket.
 _rate_gates: dict[asyncio.AbstractEventLoop, "DiscogsRateGate"] = {}
 _queue_wait_max_by_transaction: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+# LML#927: request-scoped low-priority flag, mirroring
+# ``discogs.memory_cache._skip_cache_var`` / ``lookup.streaming_url_postprocess.
+# _suppress_streaming_warm_var``'s set-once-at-the-handler-boundary shape. Read
+# by ``discogs.service.DiscogsService._request_with_retry`` to decide whether a
+# live Discogs call must additionally hold the bulk sub-semaphore above before
+# the shared one -- interactive callers (unset/False) are unaffected.
+_discogs_low_priority_var: ContextVar[bool] = ContextVar("discogs_low_priority", default=False)
+
+
+def set_discogs_low_priority(low_priority: bool) -> None:
+    """Set the per-request low-priority flag for the Discogs semaphore gate.
+
+    Call once at a handler's top (``lookup.router.handle_lookup`` from the
+    caller-class-derived ``low_priority``; ``handle_bulk_lookup``, the
+    identity bulk-resolve handler, and the cache-refresh handler
+    unconditionally, since the whole bulk family is always low priority) --
+    the value propagates into every task the handler spawns via the
+    inherited context, same as ``set_skip_cache`` / ``set_suppress_streaming_warm``.
+    """
+    _discogs_low_priority_var.set(low_priority)
+
+
+def is_discogs_low_priority() -> bool:
+    """Whether the current context routes Discogs calls through the bulk lane."""
+    return _discogs_low_priority_var.get()
 
 
 def _build_breaker() -> DiscogsCircuitBreaker:
@@ -116,6 +148,45 @@ def get_semaphore() -> asyncio.Semaphore:
         _semaphores[loop] = asyncio.Semaphore(settings.discogs_max_concurrent)
         logger.debug(f"Created semaphore: {settings.discogs_max_concurrent} concurrent")
     return _semaphores[loop]
+
+
+def get_bulk_discogs_semaphore() -> asyncio.Semaphore:
+    """Get or create the LML#927 bulk-lane reservation semaphore for the
+    current event loop.
+
+    Mirrors :func:`get_semaphore`'s per-loop-dict pattern exactly, sized from
+    ``Settings.discogs_bulk_max_concurrent`` (``LML_DISCOGS_BULK_MAX_CONCURRENT``,
+    default 2). Low-priority Discogs calls (``is_discogs_low_priority()``)
+    acquire this semaphore BEFORE (outer) the shared :func:`get_semaphore`
+    (inner) and release inner -> outer, the same ordered, deadlock-free
+    discipline LML#953 established for the entry-level bulk-global permit --
+    nothing that already holds the shared semaphore ever waits on this one, so
+    no acquire cycle can form.
+
+    Per-process (per-event-loop) like every sibling primitive in this module:
+    correct at ``UVICORN_WORKERS=1`` (today) and >1 (LML#747) alike, since each
+    worker reserves independently against its own shared semaphore.
+
+    Returns:
+        asyncio.Semaphore bounding concurrent low-priority Discogs calls.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        return asyncio.Semaphore(settings.discogs_bulk_max_concurrent)
+
+    if loop not in _bulk_semaphores:
+        from config.settings import get_settings
+
+        settings = get_settings()
+        _bulk_semaphores[loop] = asyncio.Semaphore(settings.discogs_bulk_max_concurrent)
+        logger.debug(
+            f"Created bulk Discogs semaphore: {settings.discogs_bulk_max_concurrent} concurrent"
+        )
+    return _bulk_semaphores[loop]
 
 
 def get_discogs_breaker() -> DiscogsCircuitBreaker:
@@ -410,9 +481,16 @@ def get_discogs_rate_gate() -> "DiscogsRateGate":
 
 def reset_rate_limiting() -> None:
     """Reset rate limiting state for testing."""
-    global _rate_limiters, _semaphores, _breakers, _rate_gates, _queue_wait_max_by_transaction
+    global \
+        _rate_limiters, \
+        _semaphores, \
+        _bulk_semaphores, \
+        _breakers, \
+        _rate_gates, \
+        _queue_wait_max_by_transaction
     _rate_limiters.clear()
     _semaphores.clear()
+    _bulk_semaphores.clear()
     _breakers.clear()
     _rate_gates.clear()
     _queue_wait_max_by_transaction.clear()

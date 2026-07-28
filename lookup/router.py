@@ -45,7 +45,12 @@ from core.event_loop_lag import get_event_loop_lag_ms
 from core.search import SEARCH_API_CALL_CAP_FIRED_STAT_KEY, resolve_positive_int_env
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
-from discogs.service import BREAKER_OPEN_STAT_KEY, DiscogsService
+from discogs.ratelimit import set_discogs_low_priority
+from discogs.service import (
+    BREAKER_OPEN_STAT_KEY,
+    DISCOGS_BULK_RESERVED_CAPPED_STAT_KEY,
+    DiscogsService,
+)
 from entity.release_resolution_cache import (
     RELEASE_RESOLUTION_CACHE_HIT_STAT_KEY,
     RELEASE_RESOLUTION_CACHE_MISS_STAT_KEY,
@@ -247,6 +252,9 @@ _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     # LML#755 Discogs saturation breaker: shed counter seeds to 0 so
     # breaker-open time is an alertable baseline series on the #683 surface.
     BREAKER_OPEN_STAT_KEY,
+    # LML#927 bulk sub-semaphore reservation: seeds to 0 so bulk-reservation
+    # pressure is an alertable baseline series on the same #683 surface.
+    DISCOGS_BULK_RESERVED_CAPPED_STAT_KEY,
     # LML#907 event-loop-lag gauge: seeded to 0 so the series is present even
     # when the sampler is off / unsampled (the stamp is skipped, leaving the 0).
     EVENT_LOOP_LAG_STAT_KEY,
@@ -506,6 +514,13 @@ async def handle_lookup(
         # cycle can form.
         caller_class = resolve_caller_class(x_caller_class)
         low_priority = is_low_priority_caller_class(caller_class)
+        # LML#927: propagate the same down-rank-only signal to the Discogs
+        # semaphore gate, deeper than the bulk-global permit above -- so a
+        # class-5 request that gets past admission control still can't
+        # occupy more than the reserved share of the shared 5-permit Discogs
+        # semaphore. Set before any permit is touched; the value propagates
+        # into `perform_lookup`'s task via the inherited context.
+        set_discogs_low_priority(low_priority)
 
         async with maybe_acquire_bulk_global_permit_or_reap(
             low_priority, http_request
@@ -835,6 +850,12 @@ async def handle_bulk_lookup(
     # and the same posture as the unconditional `bandcamp=None` pin below —
     # `allow_release_resolution_fallback` is caller-controlled since LML#920.
     set_suppress_streaming_warm(True)
+
+    # LML#927: every item on this route is always low priority at the
+    # Discogs semaphore gate too -- mirrors the unconditional bulk-global
+    # permit placement below (LML#716/#924); no `X-Caller-Class` value can
+    # escalate a bulk caller out of it (down-rank only, never up-rank).
+    set_discogs_low_priority(True)
 
     # One cache_stats context for the whole batch: the in-process caches are
     # shared, so aggregate counters reflect the batch's behavior — the property

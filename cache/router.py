@@ -52,6 +52,7 @@ from core.bulk_concurrency import (
     watch_disconnect,
 )
 from core.dependencies import get_discogs_service, get_musicbrainz_pg
+from discogs.ratelimit import set_discogs_low_priority
 from discogs.service import DiscogsService
 from entity.store import EntityStore
 from identity.dependencies import get_entity_store, require_entity_store
@@ -154,6 +155,11 @@ async def handle_refresh_for_identities(
 
     store = require_entity_store(entity_store)
     discogs = _require_discogs_service(discogs_service)
+
+    # LML#927: this route is part of the bulk family (shares the LML#716
+    # global permit with `/lookup/bulk` and identity bulk-resolve), so it is
+    # always low priority at the Discogs semaphore gate too.
+    set_discogs_low_priority(True)
 
     identity_ids = request.identity_ids
     logger.info("cache refresh start: size=%d", len(identity_ids))

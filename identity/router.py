@@ -33,6 +33,7 @@ from core.bulk_concurrency import (
     watch_disconnect,
 )
 from core.dependencies import discogs_pool_max_size
+from discogs.ratelimit import set_discogs_low_priority
 from entity.store import EntityStore, Identity
 from generated.api_models import (
     BulkResolveInput,
@@ -226,6 +227,12 @@ async def bulk_resolve_libraries(
     )
 
     store = require_entity_store(entity_store)
+
+    # LML#927: this route is part of the bulk family (shares the LML#716
+    # global permit with `/lookup/bulk` and cache refresh), so it is always
+    # low priority at the Discogs semaphore gate too -- mirrors the
+    # unconditional placement in `lookup.router.handle_bulk_lookup`.
+    set_discogs_low_priority(True)
 
     # Entry signal (LML#430, sibling-of-#371). Fires before the per-input PG
     # loop, so a handler that hangs inside the loop still leaves a trace —

@@ -224,6 +224,32 @@ class Settings(BaseSettings):
     discogs_max_concurrent: int = Field(
         default=5, description="Max concurrent Discogs API requests"
     )
+
+    @property
+    def discogs_bulk_max_concurrent(self) -> int:
+        """Size of the LML#927 per-event-loop bulk Discogs sub-semaphore.
+
+        Read from ``LML_DISCOGS_BULK_MAX_CONCURRENT`` (default 2) via the
+        shared ``resolve_positive_int_env`` helper rather than a plain
+        pydantic ``Field`` — an operator typo must WARN + fall back to the
+        default rather than fail Settings construction, and a `0` would
+        deadlock every low-priority Discogs call forever. Low-priority calls
+        (``discogs.ratelimit.is_discogs_low_priority()``) acquire this
+        semaphore BEFORE (outer) the shared ``discogs_max_concurrent``-permit
+        semaphore (inner), reserving ``discogs_max_concurrent -
+        discogs_bulk_max_concurrent`` permits for interactive callers -- the
+        durable, code-level replacement for the LML#924 env-only interim
+        (``LML_BULK_GLOBAL_MAX_CONCURRENT``, an entry-level admission cap).
+        Read per-call, not cached, so tests can monkeypatch the env var
+        without reaching into Settings state. Do NOT raise
+        ``DISCOGS_MAX_CONCURRENT`` to compensate for a low reservation here --
+        that relocates the collision onto Discogs' 60/min quota instead of
+        reserving concurrency (the #924 lesson).
+        """
+        from core.search import resolve_positive_int_env
+
+        return resolve_positive_int_env("LML_DISCOGS_BULK_MAX_CONCURRENT", 2)
+
     discogs_max_retries: int = Field(
         default=5,
         description=(
