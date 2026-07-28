@@ -52,6 +52,7 @@ from entity.store import EntityStore
 from generated.api_models import CacheStats
 from identity.dependencies import get_entity_store
 from library.db import LibraryDB
+from lookup.caller_reason import record_caller_reason_tag
 from lookup.endpoint_family import (
     ENDPOINT_FAMILY_LOOKUP,
     ENDPOINT_FAMILY_LOOKUP_BULK,
@@ -438,6 +439,18 @@ async def handle_lookup(
             "times out. Non-positive values fall back to the env default."
         ),
     ),
+    x_caller_reason: str | None = Header(
+        default=None,
+        alias="X-Caller-Reason",
+        description=(
+            "Optional caller-supplied traffic-class label forwarded by "
+            "Backend-Service (BS#1843), e.g. proxy-library-search or "
+            "catalog-popularity-freetext-resolve (LML#931). Purely "
+            "observational: tagged onto the Sentry transaction and the "
+            "PostHog completion event. Absent on callers that predate "
+            "BS#1843 -- treated as a safe no-op, never fabricated."
+        ),
+    ),
 ):
     """Process a lookup request."""
     # Pre-declare LML-specific cache-stats keys so PostHog/Sentry payload shapes
@@ -450,6 +463,7 @@ async def handle_lookup(
     _record_lml_flag_tags()
     _record_event_loop_lag()
     record_endpoint_family_tag(ENDPOINT_FAMILY_LOOKUP)
+    record_caller_reason_tag(x_caller_reason)
     if skip_cache:
         set_skip_cache(True)
 
@@ -617,6 +631,7 @@ async def handle_lookup(
                         1 for r in results if r.reconciled_identity is not None
                     ),
                     "endpoint_family": ENDPOINT_FAMILY_LOOKUP,
+                    **({"caller_reason": x_caller_reason} if x_caller_reason is not None else {}),
                 },
             )
 
@@ -709,6 +724,18 @@ async def handle_bulk_lookup(
             "`LML#345 follow-up will redefine this as a batch-level budget."
         ),
     ),
+    x_caller_reason: str | None = Header(
+        default=None,
+        alias="X-Caller-Reason",
+        description=(
+            "Optional caller-supplied traffic-class label forwarded by "
+            "Backend-Service (BS#1843), e.g. proxy-library-search or "
+            "catalog-popularity-freetext-resolve (LML#931). Purely "
+            "observational: tagged onto the Sentry transaction and the "
+            "PostHog completion event. Absent on callers that predate "
+            "BS#1843 -- treated as a safe no-op, never fabricated."
+        ),
+    ),
 ) -> BulkLookupResponse:
     """Bulk lookup. See route docstring for protocol."""
     # Shared bulk envelope (LML#767): raw-JSON parse, ClientDisconnect -> 400,
@@ -753,6 +780,7 @@ async def handle_bulk_lookup(
     _record_lml_flag_tags()
     _record_event_loop_lag()
     record_endpoint_family_tag(ENDPOINT_FAMILY_LOOKUP_BULK)
+    record_caller_reason_tag(x_caller_reason)
 
     max_concurrent = max_concurrency_from_env(_BULK_LOOKUP_DEFAULT_CONCURRENCY)
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -935,6 +963,7 @@ async def handle_bulk_lookup(
                     "error_count": counts["error"],
                     "max_concurrent": max_concurrent,
                     "endpoint_family": ENDPOINT_FAMILY_LOOKUP_BULK,
+                    **({"caller_reason": x_caller_reason} if x_caller_reason is not None else {}),
                 },
             )
 

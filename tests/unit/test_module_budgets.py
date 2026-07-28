@@ -25,6 +25,7 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/__init__.py": 50,
     "lookup/artist_resolution.py": 550,
     "lookup/artwork.py": 500,
+    "lookup/caller_reason.py": 100,
     "lookup/candidate_memo.py": 150,
     "lookup/concurrency.py": 200,
     "lookup/endpoint_family.py": 100,
