@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -22,6 +21,8 @@ import aiosqlite
 import httpx
 from dotenv import load_dotenv
 from rapidfuzz import fuzz
+
+from clients.streaming.spotify import SpotifyClient
 
 load_dotenv()
 
@@ -33,33 +34,18 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 SQLITE_PATH = "streaming_availability.db"
-SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 
 
-class SpotifyValidator:
-    def __init__(self) -> None:
-        self._client_id = os.environ["SPOTIFY_CLIENT_ID"]
-        self._client_secret = os.environ["SPOTIFY_CLIENT_SECRET"]
-        self._token: str | None = None
-        self._semaphore = asyncio.Semaphore(3)
+class SpotifyValidator(SpotifyClient):
+    """Adds single-resource validation lookups on top of the canonical client's token/init.
 
-    async def _get_token(self, client: httpx.AsyncClient) -> str:
-        if self._token:
-            return self._token
-        creds = base64.b64encode(f"{self._client_id}:{self._client_secret}".encode()).decode()
-        resp = await client.post(
-            SPOTIFY_TOKEN_URL,
-            headers={"Authorization": f"Basic {creds}"},
-            data={"grant_type": "client_credentials"},
-        )
-        resp.raise_for_status()
-        self._token = resp.json()["access_token"]
-        return self._token
+    Token acquisition and client-credentials init are inherited from
+    ``clients.streaming.spotify.SpotifyClient`` (LML dedup) — only
+    ``validate_url``, which the canonical client doesn't expose, is
+    script-specific.
+    """
 
-    async def validate_url(
-        self, client: httpx.AsyncClient, url: str, expected_artist: str, expected_title: str
-    ) -> tuple:
+    async def validate_url(self, url: str, expected_artist: str, expected_title: str) -> tuple:
         """Returns (is_valid, actual_title) or (None, reason) for errors."""
         match = re.search(r"/(album|track|artist)/([A-Za-z0-9]+)", url)
         if not match:
@@ -71,17 +57,18 @@ class SpotifyValidator:
 
         async with self._semaphore:
             try:
-                token = await self._get_token(client)
-                resp = await client.get(
-                    f"{SPOTIFY_API_BASE}/{resource_type}s/{resource_id}",
+                http = await self._get_client()
+                token = await self._ensure_token()
+                resp = await http.get(
+                    f"{self.API_BASE}/{resource_type}s/{resource_id}",
                     headers={"Authorization": f"Bearer {token}"},
                     timeout=10.0,
                 )
                 if resp.status_code == 401:
-                    self._token = None
-                    token = await self._get_token(client)
-                    resp = await client.get(
-                        f"{SPOTIFY_API_BASE}/{resource_type}s/{resource_id}",
+                    self._access_token = None
+                    token = await self._ensure_token()
+                    resp = await http.get(
+                        f"{self.API_BASE}/{resource_type}s/{resource_id}",
                         headers={"Authorization": f"Bearer {token}"},
                         timeout=10.0,
                     )
@@ -142,13 +129,15 @@ async def main(args: argparse.Namespace) -> None:
 
     log.info(f"Spotify URLs to validate: {len(albums):,}")
 
-    validator = SpotifyValidator()
+    client_id = os.environ["SPOTIFY_CLIENT_ID"]
+    client_secret = os.environ["SPOTIFY_CLIENT_SECRET"]
+    validator = SpotifyValidator(client_id, client_secret)
     valid = 0
     invalid = 0
     skipped = 0
     false_positives = []
 
-    async with httpx.AsyncClient() as client:
+    try:
         batch_size = 3  # match semaphore to avoid bursts
         for batch_start in range(0, len(albums), batch_size):
             batch = albums[batch_start : batch_start + batch_size]
@@ -160,7 +149,7 @@ async def main(args: argparse.Namespace) -> None:
                     artist,
                     title,
                     url,
-                    await validator.validate_url(client, url, artist, title),
+                    await validator.validate_url(url, artist, title),
                 )
 
             results = await asyncio.gather(
@@ -205,6 +194,8 @@ async def main(args: argparse.Namespace) -> None:
                 log.info(
                     f"  {done:,}/{len(albums):,}: {valid} valid, {invalid} invalid, {skipped} skipped"
                 )
+    finally:
+        await validator.close()
 
     checked = valid + invalid
     rate = invalid / checked * 100 if checked else 0

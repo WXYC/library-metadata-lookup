@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -20,9 +19,10 @@ import re
 
 import aiosqlite
 import asyncpg
-import httpx
 from dotenv import load_dotenv
 from rapidfuzz import fuzz
+
+from clients.streaming.spotify import SpotifyClient as CanonicalSpotifyClient
 
 load_dotenv()
 
@@ -36,48 +36,36 @@ log = logging.getLogger(__name__)
 SQLITE_PATH = "streaming_availability.db"
 WIKIDATA_URL = "postgresql://jake@localhost/wikidata"
 DISCOGS_URL = "postgresql://jake@localhost/discogs"
-SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 
 
-class SpotifyClient:
-    def __init__(self) -> None:
-        self._client_id = os.environ["SPOTIFY_CLIENT_ID"]
-        self._client_secret = os.environ["SPOTIFY_CLIENT_SECRET"]
-        self._token: str | None = None
-        self._semaphore = asyncio.Semaphore(3)
+class ArtistCatalogClient(CanonicalSpotifyClient):
+    """Adds full-catalog pagination on top of the canonical client's token/init.
 
-    async def _get_token(self, client: httpx.AsyncClient) -> str:
-        if self._token:
-            return self._token
-        creds = base64.b64encode(f"{self._client_id}:{self._client_secret}".encode()).decode()
-        resp = await client.post(
-            SPOTIFY_TOKEN_URL,
-            headers={"Authorization": f"Basic {creds}"},
-            data={"grant_type": "client_credentials"},
-        )
-        resp.raise_for_status()
-        self._token = resp.json()["access_token"]
-        return self._token
+    Token acquisition and client-credentials init are inherited from
+    ``clients.streaming.spotify.SpotifyClient`` (LML dedup) — only the
+    artist-albums pagination, which the canonical client doesn't expose, is
+    script-specific.
+    """
 
-    async def get_artist_albums(self, client: httpx.AsyncClient, artist_id: str) -> list[dict]:
+    async def get_artist_albums(self, artist_id: str) -> list[dict]:
         """Get all albums for a Spotify artist."""
         async with self._semaphore:
-            token = await self._get_token(client)
+            http = await self._get_client()
+            token = await self._ensure_token()
             albums = []
-            url = f"{SPOTIFY_API_BASE}/artists/{artist_id}/albums"
+            url = f"{self.API_BASE}/artists/{artist_id}/albums"
             params = {"limit": 50, "include_groups": "album,single,compilation"}
 
             while url:
-                resp = await client.get(
+                resp = await http.get(
                     url,
                     headers={"Authorization": f"Bearer {token}"},
                     params=params,
                     timeout=10.0,
                 )
                 if resp.status_code == 401:
-                    self._token = None
-                    token = await self._get_token(client)
+                    self._access_token = None
+                    token = await self._ensure_token()
                     continue
                 if resp.status_code == 429:
                     retry = int(resp.headers.get("Retry-After", "5"))
@@ -164,14 +152,16 @@ async def main(args: argparse.Namespace) -> None:
         return
 
     # Pull catalogs and match
-    spotify = SpotifyClient()
+    client_id = os.environ["SPOTIFY_CLIENT_ID"]
+    client_secret = os.environ["SPOTIFY_CLIENT_SECRET"]
+    spotify = ArtistCatalogClient(client_id, client_secret)
     found = 0
     results = []
 
-    async with httpx.AsyncClient() as client:
+    try:
         for i, (spotify_id, albs) in enumerate(artist_albums.items()):
             try:
-                catalog = await spotify.get_artist_albums(client, spotify_id)
+                catalog = await spotify.get_artist_albums(spotify_id)
             except Exception as e:
                 log.warning(f"Failed to fetch {spotify_id}: {e}")
                 continue
@@ -202,6 +192,8 @@ async def main(args: argparse.Namespace) -> None:
 
             if (i + 1) % 100 == 0 or i + 1 == len(artist_albums):
                 log.info(f"  {i + 1}/{len(artist_albums)} artists, {found} albums matched")
+    finally:
+        await spotify.close()
 
     log.info(f"Total matched: {found}")
 
