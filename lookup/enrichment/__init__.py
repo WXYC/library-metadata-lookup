@@ -43,6 +43,7 @@ from lookup.artist_resolution import (
 # that patches against the submodule silently miss.
 from lookup.enrichment import background, item, top1
 from lookup.enrichment.context import EnrichmentContext
+from lookup.spine_deadline import SpineDeadline
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,7 @@ async def enrich_artwork_results(
     entity_store: EntityStore | None = None,
     discogs_cache_pg: PgSource | None = None,
     found_on_compilation: bool = False,
+    spine_deadline: SpineDeadline | None = None,
 ) -> list[tuple[LibraryItem, DiscogsSearchResult | None]]:
     """Enrich artwork results with release year, artist details, and streaming links.
 
@@ -217,6 +219,7 @@ async def enrich_artwork_results(
         artist_identity_split_enabled=_artist_identity_split_gate_enabled(),
         extended=extended,
         found_on_compilation=found_on_compilation,
+        spine_deadline=spine_deadline,
     )
 
     # LML#507: gate the once-per-request top-1 prefetch on whether the

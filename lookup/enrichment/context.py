@@ -34,6 +34,7 @@ from discogs.service import DiscogsService
 from entity.sources import PgSource, PgSourceProtocol
 from entity.store import EntityStore
 from library.db import LibraryDB
+from lookup.spine_deadline import SpineDeadline
 
 
 @dataclass(frozen=True)
@@ -95,3 +96,10 @@ class EnrichmentContext:
 
     found_on_compilation: bool
     """True when TRACK_ON_COMPILATION track-validated the surfaced release (LML#684)."""
+
+    spine_deadline: SpineDeadline | None = None
+    """Request-scoped caller deadline (LML#930). When present, the per-item Apple
+    Music probe clamps its fixed 4s ``wait_for`` to the remaining budget
+    (``clamp_probe_timeout_s``) so a caller with little budget left doesn't wait
+    the full ceiling on one item. ``None`` (e.g. a direct ``enrich_artwork_results``
+    caller that predates the deadline) leaves the probe at its unbounded ceiling."""

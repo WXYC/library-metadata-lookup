@@ -113,6 +113,27 @@ class SpineDeadline:
         """Wall-clock milliseconds elapsed since spine admission."""
         return (time.monotonic() - self.start) * 1000.0
 
+    def remaining(self) -> tuple[float, str]:
+        """Return ``(remaining_ms, limit_marker)`` under the binding limit — signed.
+
+        Like :meth:`step_timeout` but **not** floored and in milliseconds, so a
+        caller can detect an already-exhausted deadline (``remaining_ms <= 0``)
+        to shed the enrichment tail *between* steps rather than starting another
+        probe (LML#930). Reads the hard-cap remaining when the caller sent no
+        budget header, so a headerless request's tail is bounded only by the
+        universal hard cap — the same header-gated posture the empty-state
+        cutoff and :meth:`step_timeout` already have.
+        """
+        elapsed = self.elapsed_ms()
+        remaining_ms = self.hard_cap_ms - elapsed
+        limit = LIMIT_HARD_CAP
+        if self.effective_budget_ms is not None:
+            budget_remaining_ms = self.effective_budget_ms - elapsed
+            if budget_remaining_ms < remaining_ms:
+                remaining_ms = budget_remaining_ms
+                limit = LIMIT_CALLER_BUDGET
+        return remaining_ms, limit
+
     def step_timeout(self) -> tuple[float, str]:
         """Return ``(timeout_seconds, limit_marker)`` for the next spine step.
 
@@ -121,16 +142,38 @@ class SpineDeadline:
         ``limit_marker`` names the binding limit (:data:`LIMIT_HARD_CAP` /
         :data:`LIMIT_CALLER_BUDGET`) so a trip can be attributed.
         """
-        elapsed = self.elapsed_ms()
-        hard_remaining_s = (self.hard_cap_ms - elapsed) / 1000.0
-        timeout_s = hard_remaining_s
-        limit = LIMIT_HARD_CAP
-        if self.effective_budget_ms is not None:
-            budget_remaining_s = (self.effective_budget_ms - elapsed) / 1000.0
-            if budget_remaining_s < hard_remaining_s:
-                timeout_s = budget_remaining_s
-                limit = LIMIT_CALLER_BUDGET
-        return max(_STEP_TIMEOUT_FLOOR_S, timeout_s), limit
+        remaining_ms, limit = self.remaining()
+        return max(_STEP_TIMEOUT_FLOOR_S, remaining_ms / 1000.0), limit
+
+    def tail_exhausted(self) -> tuple[bool, float, str]:
+        """Return ``(exhausted, remaining_ms, limit)`` for a between-tail-step gate (LML#930).
+
+        ``exhausted`` is True once the remaining time under the binding limit has
+        fallen to the step floor — the same floor :meth:`step_timeout` clamps a
+        ``wait_for`` to — so shedding the enrichment tail here and letting a
+        started step's ``wait_for`` trip converge to the same end state. Because
+        :meth:`remaining` reads the hard-cap remaining when the caller sent no
+        budget header, a headerless request's tail is shed only if the universal
+        25s ceiling is hit, never by a (nonexistent) caller budget.
+        """
+        remaining_ms, limit = self.remaining()
+        return remaining_ms <= _STEP_TIMEOUT_FLOOR_S * 1000.0, remaining_ms, limit
+
+    def clamp_probe_timeout_s(self, base_timeout_s: float) -> float:
+        """Clamp a fixed per-probe wall-clock ceiling to the remaining spine budget.
+
+        The per-item Apple Music probe (``lookup/enrichment/item.py``) uses a
+        fixed 4s ``wait_for`` regardless of how much caller budget is left — the
+        single biggest tail-overrun source (LML#930). Passing the probe
+        ``min(base, remaining)`` keeps a caller with 300ms left from waiting 4s
+        on one item. Floored at :data:`_STEP_TIMEOUT_FLOOR_S` so an all-but-
+        exhausted budget still gives the probe a token window rather than
+        ``wait_for(0)`` (which fires instantly). With no caller budget the
+        remaining is the 25s hard cap, so ``min`` returns ``base`` unchanged —
+        headerless probes are never shortened.
+        """
+        remaining_ms, _ = self.remaining()
+        return max(_STEP_TIMEOUT_FLOOR_S, min(base_timeout_s, remaining_ms / 1000.0))
 
 
 async def run_within_spine_deadline[T](
