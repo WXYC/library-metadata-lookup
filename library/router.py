@@ -7,6 +7,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from core.dependencies import get_library_db
 from library.db import LibraryDB
 from library.models import LibrarySearchResponse
+from lookup.endpoint_family import (
+    ENDPOINT_FAMILY_LIBRARY_SEARCH,
+    record_endpoint_family_tag,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,15 @@ async def search_library(
     db: LibraryDB = Depends(get_library_db),
 ):
     """Search the library catalog."""
+    # LML#929: label this request's Sentry transaction with the local-catalog
+    # traffic class so the #931 observability residual can slice protected-search
+    # latency during a /lookup/bulk flood. Emitted at handler entry so every
+    # search request (including the 400 below) carries the label. This path
+    # invokes zero Discogs/Apple/streaming/enrichment code (guarded by
+    # tests/unit/test_library_router.py) — the label is the only cross-module
+    # touch, and record_endpoint_family_tag swallows its own errors.
+    record_endpoint_family_tag(ENDPOINT_FAMILY_LIBRARY_SEARCH)
+
     if not q and not artist and not title:
         raise HTTPException(
             status_code=400,
