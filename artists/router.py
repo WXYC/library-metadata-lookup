@@ -50,7 +50,7 @@ from generated.api_models import (
     ArtistSearchAliasesBulkRequest,
     ArtistSearchAliasesBulkResponse,
 )
-from identity.dependencies import get_entity_store
+from identity.dependencies import get_entity_store, require_entity_store
 
 if TYPE_CHECKING:
     from posthog import Posthog
@@ -101,10 +101,6 @@ _GENRES_ROUTE_PATH = "/api/v1/artists/genres/bulk"
 # inside Railway's ~5-minute request-timeout ceiling. Callers page.
 _GENRES_INPUT_CAP = 25
 
-_ENTITY_STORE_UNAVAILABLE_DETAIL = (
-    "Entity store is not available. Ensure DATABASE_URL_DISCOGS is configured "
-    "and the entity schema has been applied."
-)
 _DISCOGS_CACHE_UNAVAILABLE_DETAIL = (
     "Discogs cache is not available. Ensure DATABASE_URL_DISCOGS is configured."
 )
@@ -156,8 +152,7 @@ async def search_aliases_bulk(
         http_request, ArtistSearchAliasesBulkRequest, _BULK_INPUT_CAP, field="names"
     )
 
-    if entity_store is None:
-        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL)
+    entity_store = require_entity_store(entity_store)
     if discogs_cache is None:
         raise HTTPException(status_code=503, detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL)
 
@@ -311,8 +306,7 @@ async def resolve_bulk(
         http_request, ArtistResolveBulkRequest, _RESOLVE_INPUT_CAP, field="names"
     )
 
-    if entity_store is None:
-        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL)
+    entity_store = require_entity_store(entity_store)
     if discogs_cache is None:
         raise HTTPException(status_code=503, detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL)
 

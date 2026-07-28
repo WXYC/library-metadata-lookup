@@ -258,13 +258,11 @@ class TestServiceUnavailable:
 
     @pytest.mark.asyncio
     async def test_503_when_entity_store_none(self, make_app):
-        from artists.router import _ENTITY_STORE_UNAVAILABLE_DETAIL
-
         ctx, app = make_app(entity_store=None)
         with ctx:
             resp = await _post(app, {"names": ["Wishy"]})
         assert resp.status_code == 503
-        assert resp.json()["detail"] == _ENTITY_STORE_UNAVAILABLE_DETAIL
+        assert "entity store" in resp.json()["detail"].lower()
 
     @pytest.mark.asyncio
     async def test_503_when_discogs_cache_none(self, make_app):

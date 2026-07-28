@@ -299,9 +299,7 @@ class TestServiceUnavailable:
                 )
 
         assert resp.status_code == 503
-        from artists.router import _ENTITY_STORE_UNAVAILABLE_DETAIL
-
-        assert resp.json()["detail"] == _ENTITY_STORE_UNAVAILABLE_DETAIL
+        assert "entity store" in resp.json()["detail"].lower()
 
     @pytest.mark.asyncio
     async def test_503_when_discogs_cache_none(self, mock_settings, mock_entity_store):
@@ -335,6 +333,17 @@ class TestServiceUnavailable:
         from artists.router import _DISCOGS_CACHE_UNAVAILABLE_DETAIL
 
         assert resp.json()["detail"] == _DISCOGS_CACHE_UNAVAILABLE_DETAIL
+
+
+class TestEntityStoreDetailConsolidation:
+    """The entity-store-unavailable 503 detail lives only in
+    `identity.dependencies` (WXYC/library-metadata-lookup#960/#961); this
+    router must not carry its own copy that could silently drift from it."""
+
+    def test_no_local_detail_redefinition(self):
+        import artists.router as artists_router
+
+        assert not hasattr(artists_router, "_ENTITY_STORE_UNAVAILABLE_DETAIL")
 
 
 class TestDuplicateInputDedup:
