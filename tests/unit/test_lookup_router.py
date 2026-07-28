@@ -1,5 +1,6 @@
 """Unit tests for lookup/router.py."""
 
+import contextlib
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -1055,3 +1056,100 @@ class TestHandleLookup:
         library_item = resp.json()["results"][0]["library_item"]
         assert library_item["call_number"] == "Rock CD S 1/1"
         assert library_item["library_url"] == "http://www.wxyc.info/wxycdb/libraryRelease?id=10"
+
+
+class TestCallerClassLowPriorityLane:
+    """LML#928: ``X-Caller-Class`` routes a single ``/lookup`` request onto
+    the low-priority lane (the LML#716/#924 process-global bulk permit) when
+    -- and only when -- the caller declares class 5 (batch/cron/backfill).
+
+    Patches ``lookup.router.maybe_acquire_bulk_global_permit`` (the exact
+    name ``handle_lookup`` calls) with a spy that records the boolean
+    condition it was entered with, so this test pins the router's
+    class→condition wiring in isolation from the semaphore itself -- which
+    ``test_caller_class.py`` pins directly. Together the two prove the full
+    invariant: class 5 -> low-priority lane; classes 1-4, absent, and invalid
+    values -> today's interactive-only behavior, unchanged.
+    """
+
+    @staticmethod
+    def _fake_maybe_acquire(calls: list[bool]):
+        @contextlib.asynccontextmanager
+        async def _fake(condition: bool):
+            calls.append(condition)
+            yield
+
+        return _fake
+
+    @pytest.mark.asyncio
+    async def test_class_five_enters_the_low_priority_lane(self, app_client):
+        response = LookupResponse(results=[], search_type="direct")
+        calls: list[bool] = []
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock, return_value=response),
+            patch(
+                "lookup.router.maybe_acquire_bulk_global_permit",
+                self._fake_maybe_acquire(calls),
+            ),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/api/v1/lookup",
+                    json=LOOKUP_BODY,
+                    headers={"X-Caller-Class": "5"},
+                )
+
+        assert resp.status_code == 200
+        assert calls == [True]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {},
+            {"X-Caller-Class": "1"},
+            {"X-Caller-Class": "2"},
+            {"X-Caller-Class": "3"},
+            {"X-Caller-Class": "4"},
+            {"X-Caller-Class": "0"},
+            {"X-Caller-Class": "6"},
+            {"X-Caller-Class": "not-a-class"},
+        ],
+        ids=[
+            "absent",
+            "class-1",
+            "class-2",
+            "class-3",
+            "class-4",
+            "out-of-range-low",
+            "out-of-range-high",
+            "non-numeric",
+        ],
+    )
+    async def test_non_class_five_stays_on_interactive_lane(self, app_client, headers):
+        """Absent header, classes 1-4, and malformed/out-of-range values must
+        all behave EXACTLY as origin/main does today: no low-priority-lane
+        entry. This is also the anti-up-rank guard -- an untrusted or
+        misconfigured caller cannot use the header to escape today's
+        placement in either direction.
+        """
+        response = LookupResponse(results=[], search_type="direct")
+        calls: list[bool] = []
+
+        with (
+            patch("lookup.router.perform_lookup", new_callable=AsyncMock, return_value=response),
+            patch(
+                "lookup.router.maybe_acquire_bulk_global_permit",
+                self._fake_maybe_acquire(calls),
+            ),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as client:
+                resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY, headers=headers)
+
+        assert resp.status_code == 200
+        assert calls == [False]

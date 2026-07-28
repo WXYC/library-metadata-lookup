@@ -26,6 +26,19 @@ The pieces:
   ``CancelledError``. Required because cancellation is asynchronous; merely
   calling ``.cancel()`` doesn't free the permits until the task observes the
   cancel and unwinds.
+- ``resolve_caller_class(raw)`` / ``is_low_priority_caller_class(caller_class)``
+  / ``maybe_acquire_bulk_global_permit(condition)`` (LML#928) — generalizes
+  the ``/lookup/bulk`` drain's implicit low-priority placement into an
+  explicit, caller-declared policy. ``resolve_caller_class`` parses the
+  ``X-Caller-Class`` header (1-5, forwarded by Backend-Service per BS#1843),
+  tolerating garbage as ``None``; ``is_low_priority_caller_class`` is the
+  down-rank-only predicate (True only for class 5); and
+  ``maybe_acquire_bulk_global_permit`` lets a single ``/lookup`` request
+  conditionally join the SAME ``acquire_bulk_global_permit`` budget bulk
+  items use, so a class-5 caller shares the low-priority lane's budget
+  rather than a lookalike. The Discogs-semaphore-level priority reservation
+  (reserving headroom at the 5-permit gate itself, superseding the #924
+  interim) is a separate, still-open slice — LML#927.
 
 The per-request env knob (default 10) is shared between the endpoints
 intentionally — they have the same outer/inner gate shape and similar
@@ -185,6 +198,85 @@ async def acquire_bulk_global_permit():
         yield
 
 
+_CALLER_CLASS_MIN = 1
+_CALLER_CLASS_MAX = 5
+
+LOW_PRIORITY_CALLER_CLASS = 5
+"""The one ``X-Caller-Class`` value (LML#928) that routes onto the
+low-priority lane. Batch/cron/backfill callers (Backend-Service's
+caller→class policy, ``shared/lml-client/src/policy.ts``) declare this class;
+everything else -- 1-4, and any absent/invalid value -- leaves a caller's
+existing lane placement untouched. See :func:`is_low_priority_caller_class`."""
+
+
+def resolve_caller_class(raw: str | None) -> int | None:
+    """Parse the ``X-Caller-Class`` header (LML#928), tolerating garbage.
+
+    Valid values are the integers 1-5 (Backend-Service's caller→class policy,
+    forwarded per BS#1843). Anything else -- absent, non-numeric, or out of
+    range -- resolves to ``None``, which callers must treat identically to
+    "the caller didn't send a class": today's implicit lane placement, never
+    a validation error. A malformed classification header must not 422 an
+    otherwise well-formed, authenticated request -- the same "safe no-op"
+    contract an absent header gets.
+
+    Args:
+        raw: The raw ``X-Caller-Class`` header value, or None if absent.
+
+    Returns:
+        The parsed class (1-5), or None when absent/invalid.
+    """
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid X-Caller-Class=%r; ignoring (today's lane placement applies)", raw)
+        return None
+    if value < _CALLER_CLASS_MIN or value > _CALLER_CLASS_MAX:
+        logger.warning(
+            "Out-of-range X-Caller-Class=%d; ignoring (today's lane placement applies)", value
+        )
+        return None
+    return value
+
+
+def is_low_priority_caller_class(caller_class: int | None) -> bool:
+    """True when the resolved class selects the low-priority lane (LML#928).
+
+    Only class 5 (batch/cron/backfill) qualifies. This is a DOWN-rank-only
+    predicate: classes 1-4 and ``None`` all leave a caller's existing lane
+    placement untouched -- there is no "up-rank" branch here or at any call
+    site. ``X-Caller-Class`` is read only on the authenticated
+    Backend-Service-to-LML channel (the ``lookup`` router's
+    ``require_lml_key`` dependency gates every request before a handler body
+    runs) and is never consulted to grant a protected/interactive lane beyond
+    a caller's existing entitlement -- see the LML#928 security review.
+    """
+    return caller_class == LOW_PRIORITY_CALLER_CLASS
+
+
+@contextlib.asynccontextmanager
+async def maybe_acquire_bulk_global_permit(condition: bool):
+    """Conditionally hold the LML#716/#924 low-priority global permit (LML#928).
+
+    ``async with maybe_acquire_bulk_global_permit(is_low_priority_caller_class(caller_class)):``
+    is a no-op context when ``condition`` is False, so a call site can route
+    onto the low-priority lane for exactly one branch (a class-5 caller)
+    without duplicating its body for the common (unaffected) case. When
+    ``condition`` is True it delegates to :func:`acquire_bulk_global_permit`
+    -- the identical process-global semaphore ``/lookup/bulk`` items already
+    share -- so a class-5 single ``/lookup`` request draws from the SAME
+    ``LML_BULK_GLOBAL_MAX_CONCURRENT`` budget as a bulk drain, rather than a
+    lookalike budget that would let batch traffic double its effective quota.
+    """
+    if condition:
+        async with acquire_bulk_global_permit():
+            yield
+    else:
+        yield
+
+
 async def cancel_and_drain(future: asyncio.Future[Any]) -> None:
     """Cancel a future and swallow the resulting ``CancelledError``.
 
@@ -200,8 +292,12 @@ async def cancel_and_drain(future: asyncio.Future[Any]) -> None:
 
 
 __all__ = [
+    "LOW_PRIORITY_CALLER_CLASS",
     "acquire_bulk_global_permit",
     "cancel_and_drain",
+    "is_low_priority_caller_class",
+    "maybe_acquire_bulk_global_permit",
     "max_concurrency_from_env",
+    "resolve_caller_class",
     "watch_disconnect",
 ]
