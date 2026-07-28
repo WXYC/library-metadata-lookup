@@ -93,6 +93,13 @@ def limit_results(results: list) -> list:
     return results[:MAX_SEARCH_RESULTS]
 
 
+# The delimiter the discogs-etl / wxyc-catalog library.db build uses to join
+# multiple cross-reference aliases into the single ``cross_reference_names``
+# column (WXYC/discogs-etl#334). Producer/consumer contract: if the ETL ever
+# changes this separator, this constant must change in lockstep.
+CROSS_REFERENCE_NAMES_SEPARATOR = " | "
+
+
 def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     """Check if a library item matches the given artist name.
 
@@ -117,7 +124,7 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
 
     candidates = [item.artist, item.alternate_artist_name]
     if item.cross_reference_names:
-        candidates.extend(item.cross_reference_names.split(" | "))
+        candidates.extend(item.cross_reference_names.split(CROSS_REFERENCE_NAMES_SEPARATOR))
 
     for candidate in candidates:
         if not candidate:
