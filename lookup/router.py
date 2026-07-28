@@ -497,9 +497,13 @@ async def handle_lookup(
         # `LML_LOOKUP_MAX_CONCURRENT` semaphore below, so a class-5 request
         # parked on a saturated bulk budget never pins an interactive slot
         # while it waits (the #951 review's priority-inversion finding).
-        # Deadlock-free: nothing holding the bulk-global permit ever waits on
-        # the lookup semaphore, so acquiring strictly in this order can never
-        # form a cycle with the reverse order.
+        # Deadlock-free: acquisition is strictly ordered bulk-global permit ->
+        # interactive lookup semaphore and never the reverse. The class-5 path
+        # deliberately holds the bulk permit while parked on the lookup
+        # semaphore -- that is the intended forward edge, not a cycle. Safety
+        # comes from the reverse never happening: nothing that already holds the
+        # lookup semaphore ever waits on the bulk-global permit, so no acquire
+        # cycle can form.
         caller_class = resolve_caller_class(x_caller_class)
         low_priority = is_low_priority_caller_class(caller_class)
 
