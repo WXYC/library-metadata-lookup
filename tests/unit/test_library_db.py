@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from library.db import LibraryDB
+from library.db import LibraryDB, _to_fts_match_query
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -364,6 +364,74 @@ class TestLibraryDBSearch:
 
         results = await db.search(query="nothing", fallback_to_like=False, fallback_to_fuzzy=False)
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# _to_fts_match_query (LML#972)
+# ---------------------------------------------------------------------------
+
+
+class TestToFtsMatchQuery:
+    """Pure helper: quotes each whitespace-separated term as an FTS5 string
+    literal so metacharacters (. " * : ( ) etc.) are treated as literal
+    content rather than query syntax."""
+
+    def test_single_term_gets_quoted(self):
+        assert _to_fts_match_query("M.I.A.") == '"M.I.A."'
+
+    def test_multiple_terms_each_quoted(self):
+        assert _to_fts_match_query("J. Mascis") == '"J." "Mascis"'
+
+    def test_embedded_quote_is_doubled(self):
+        assert _to_fts_match_query('a "quoted" thing') == '"a" """quoted""" "thing"'
+
+    def test_other_metacharacters_pass_through_inside_quotes(self):
+        assert _to_fts_match_query("wild*card") == '"wild*card"'
+        assert _to_fts_match_query("colon:test") == '"colon:test"'
+        assert _to_fts_match_query("(paren)") == '"(paren)"'
+
+    def test_clean_multiword_query_quoted_per_term(self):
+        assert _to_fts_match_query("Stereolab Dots Loops") == '"Stereolab" "Dots" "Loops"'
+
+    def test_empty_query_yields_empty_string(self):
+        assert _to_fts_match_query("") == ""
+
+    def test_whitespace_only_query_yields_empty_string(self):
+        assert _to_fts_match_query("   ") == ""
+        assert _to_fts_match_query("\t\n") == ""
+
+
+class TestSearchEmptyMatchQueryGuard:
+    """LML#972: an empty/all-whitespace query must never reach `MATCH ''`
+
+    (also a syntax error: `fts5: syntax error near ""`). It must be guarded
+    so the FTS branch never executes `MATCH ''` at all. For a whitespace-only
+    query, ``_fallback_like_search``/``_fuzzy_search`` also find no
+    significant words and short-circuit to ``[]`` before touching the
+    database (see their own ``if not significant_words / words: return []``
+    guards) -- so the whole call must be a no-op that returns a list without
+    ever calling ``_conn.execute``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_whitespace_query_never_calls_execute(self):
+        db = LibraryDB()
+        db._conn = AsyncMock()
+
+        results = await db.search(query="   ")
+
+        assert results == []
+        db._conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tabs_and_newlines_only_query_never_calls_execute(self):
+        db = LibraryDB()
+        db._conn = AsyncMock()
+
+        results = await db.search(query="\t\n")
+
+        assert results == []
+        db._conn.execute.assert_not_called()
 
 
 class TestSearchFallbackLogLevels:

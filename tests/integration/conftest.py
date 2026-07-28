@@ -375,6 +375,11 @@ SEED_ITEMS = [
     # re-search, so the found_on_compilation result must trust-bind the carried
     # (already-validated) release instead of dropping its artwork.
     (70001, "Orcutt-Shelley-Miller", "Bill Orcutt", "OR", 1, 1, "Jazz", "Vinyl"),
+    # Punctuated/initials artist name (LML#972). Unescaped, "M.I.A." raises
+    # `fts5: syntax error near "."` in MATCH and silently degrades to the
+    # LIKE-AND fallback, which then requires "kala" and "m" and "i" and "a"
+    # to all co-occur on one row -- a search for "M.I.A." never surfaces it.
+    (80001, "Kala", "M.I.A.", "M", 1, 1, "Electronic", "CD"),
 ]
 
 

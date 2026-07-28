@@ -63,6 +63,30 @@ LIBRARY_FTS_CREATE_SQL = f"""
     )
 """
 
+
+def _to_fts_match_query(query: str) -> str:
+    """Quote each whitespace-separated term as an FTS5 string literal.
+
+    FTS5 metacharacters (``.`` ``"`` ``*`` ``:`` ``(`` ``)`` etc.) inside a
+    double-quoted term are treated as literal content, not query syntax, so
+    punctuated/initials artist names ("M.I.A.", "J. Mascis") tokenize
+    instead of raising ``fts5: syntax error``. Joining the quoted terms with
+    spaces preserves the implicit AND-across-terms semantics of an
+    unescaped multi-word MATCH query, so clean queries are unaffected.
+
+    This is a query-parse fix only -- it does not touch the on-disk
+    tokenizer (:data:`LIBRARY_FTS_TOKENIZER`), which must stay byte-identical
+    to discogs-etl's ``export_to_sqlite.py``.
+
+    Returns ``""`` when the query has no terms (empty or all-whitespace) --
+    the caller must treat that as "no FTS query" and route to the LIKE/fuzzy
+    fallback chain instead of executing ``MATCH ''``, which is itself an
+    ``fts5: syntax error``.
+    """
+    terms = query.split()
+    return " ".join('"' + t.replace('"', '""') + '"' for t in terms)
+
+
 # Module-level caches for library search results.
 # Lazy-initialized from settings. Cleared when the database is closed/replaced.
 _artist_cache: TTLCache | None = None
@@ -237,7 +261,12 @@ class LibraryDB:
     ) -> list[LibraryItem]:
         assert self._conn is not None  # Caller validates
         if query:
-            # Full-text search using FTS5
+            # Full-text search using FTS5. Query terms are quoted as FTS5
+            # string literals (see _to_fts_match_query) so metacharacters
+            # (. " * : ( ) etc.) in punctuated/initials artist names are
+            # treated as literal content instead of raising
+            # `fts5: syntax error`.
+            match_query = _to_fts_match_query(query)
             sql = f"""
                 SELECT {self._select_columns("l")}
                 FROM library l
@@ -246,8 +275,15 @@ class LibraryDB:
                 LIMIT ?
             """
             try:
-                cursor = await self._conn.execute(sql, (query, limit))
-                rows = await cursor.fetchall()
+                if match_query:
+                    cursor = await self._conn.execute(sql, (match_query, limit))
+                    rows = await cursor.fetchall()
+                else:
+                    # An empty/all-whitespace query quotes down to "", and
+                    # `MATCH ''` is itself an fts5 syntax error. Skip the FTS
+                    # execute entirely and treat it as "no FTS results" so we
+                    # fall straight through to the LIKE/fuzzy chain below.
+                    rows = []
 
                 # If no results and fallback enabled, try LIKE search
                 if not rows and fallback_to_like:
