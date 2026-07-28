@@ -474,6 +474,31 @@ class Settings(BaseSettings):
             "source-stamped rows + flip False. See WXYC/library-metadata-lookup#850."
         ),
     )
+    lml_track_on_compilation_scope_guard: bool = Field(
+        default=False,
+        description=(
+            "When True, TRACK_ON_COMPILATION's >=80 title-ratio compilation "
+            "carve-out (process_release's strict branch and its "
+            "_fallback_row_acceptable fallback -- both route through the shared "
+            "_title_ratio_carveout_admits) additionally rejects a library row "
+            "whose title asserts a significant word the *validated* Discogs "
+            "release's title doesn't have (LML#973's extra-scope guard), fixing "
+            "the WXYC library row 58775 false positive (LML#959: a title-ratio "
+            "match alone can't tell 'same comp, shortened title' from 'different "
+            "comp, similar title'). When False (default), the pre-#973 ratio-only "
+            "carve-out behavior holds byte-for-byte -- merging this flag changes "
+            "no prod behavior. The guard is a deliberately blunt, title-text-only "
+            "heuristic that also drops some genuine divergent-title compilation "
+            "hits (a library title that *substitutes* a word the Discogs title "
+            "doesn't share, e.g. 'Edition' -> 'Collection', reads as asserting "
+            "new scope -- see the xfail'd regression in "
+            "tests/unit/test_orchestrator_gaps.py); do not flip True until the "
+            "LML#973 Tier-2 prod recall measurement quantifies that cost against "
+            "real TRACK_ON_COMPILATION traffic. Fully reversible: flip False in "
+            "Railway to instantly revert to the ratio-only carve-out. See "
+            "WXYC/library-metadata-lookup#973 and #959."
+        ),
+    )
     lml_emit_server_timing: bool = Field(
         default=True,
         description=(

@@ -11,6 +11,14 @@ pressing does not carry the track -- it was admitted because its title
 fuzz-matches (ratio 87) a *different* Discogs compilation ("Greatest Hits Of
 The 50's", release 605487) that Discogs validated the track on.
 
+Reversibility (LML#974 code-review follow-up): the extra-scope guard added by
+this fix is gated behind ``LML_TRACK_ON_COMPILATION_SCOPE_GUARD``, default
+OFF. With the flag off, both carve-out sites are byte-for-byte the pre-#973
+ratio-only behavior -- merging this change alone does not touch prod. The
+DROP/KEEP fixtures below explicitly turn the flag on (via the
+``scope_guard_enabled`` fixture) to exercise the new gated behavior;
+``TestScopeGuardFlagGating`` pins the flag-off/flag-on split itself.
+
 Fixture provenance:
 
 - Library row 58775 and its title/artist, plus the validated Discogs release
@@ -30,18 +38,60 @@ Fixture provenance:
   chosen to plausibly represent the DJ card-catalog shorthand pattern
   (dropping a subtitle, a format tag, or a leading article) that a naive
   floor-raise would break. They are not sourced from any real WXYC row.
+
+Known, deliberately out-of-scope leak (see ``tests/unit/test_orchestrator_gaps.py
+::TestSearchCompilationsForTrack::test_validates_only_library_matching_releases``,
+marked ``xfail``): a library title that *substitutes* a word the Discogs
+title doesn't share (e.g. "Edition" -> "Collection") reads as asserting new
+scope and is wrongly dropped when the guard is on. That's a real recall
+regression from this guard, inherent to a title-text-only heuristic (#959's
+options analysis) -- not fixed here, tracked for #959 options 2/3.
 """
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from discogs.models import ReleaseInfo, TrackReleasesResponse
 from lookup.strategies.track_on_compilation import search_compilations_for_track
+from lookup.strategies.track_on_compilation_carveout import (
+    _library_title_claims_extra_scope,
+    _significant_title_words,
+)
 from services.parser import ParsedRequest
 from tests.factories import make_library_item
+
+_FLAG_ENV_VAR = "LML_TRACK_ON_COMPILATION_SCOPE_GUARD"
+
+
+@pytest.fixture
+def scope_guard_enabled(monkeypatch):
+    """Turn on the LML#974 kill switch for a test. The guard defaults OFF in
+    prod (see ``config/settings.py``); every DROP/KEEP fixture in this module
+    that exercises the extra-scope guard itself needs it explicitly on, since
+    with it off both carve-out sites fall back to the pre-#973 ratio-only
+    verdict (see ``TestScopeGuardFlagGating`` for the off-by-default pin).
+    """
+    monkeypatch.setenv(_FLAG_ENV_VAR, "true")
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def scope_guard_disabled(monkeypatch):
+    """Explicitly force the flag off, independent of ambient environment."""
+    monkeypatch.setenv(_FLAG_ENV_VAR, "false")
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 def _empty_response() -> TrackReleasesResponse:
@@ -96,6 +146,24 @@ def _service(releases: list[ReleaseInfo]) -> AsyncMock:
     return service
 
 
+def _58775_fixture() -> tuple[dict, ReleaseInfo]:
+    """The real #959/#973 repro pairing, shared by several tests below."""
+    item_58775 = make_library_item(
+        id=58775,
+        artist="Various Artists - Rock - G",
+        title="Greatest hits of the 50s & 60s",
+        format="vinyl",
+    )
+    release = ReleaseInfo(
+        album="Greatest Hits Of The 50's",
+        artist="Various",
+        release_id=605487,
+        release_url="https://www.discogs.com/release/605487",
+        is_compilation=True,
+    )
+    return {"Greatest Hits Of The 50's": [item_58775]}, release
+
+
 @pytest.mark.asyncio
 class TestStrictBranchTitleCarveout:
     """Covers ``process_release``'s strict branch (track_on_compilation.py
@@ -104,23 +172,11 @@ class TestStrictBranchTitleCarveout:
     False and only the strict branch runs.
     """
 
-    async def test_drops_wrong_pressing_58775(self):
-        """Must-DROP: row 58775's title merely fuzz-matches the release
-        Discogs validated the track on -- it is not that release."""
-        item_58775 = make_library_item(
-            id=58775,
-            artist="Various Artists - Rock - G",
-            title="Greatest hits of the 50s & 60s",
-            format="vinyl",
-        )
-        release = ReleaseInfo(
-            album="Greatest Hits Of The 50's",
-            artist="Various",
-            release_id=605487,
-            release_url="https://www.discogs.com/release/605487",
-            is_compilation=True,
-        )
-        db = _db_mock({"Greatest Hits Of The 50's": [item_58775]})
+    async def test_drops_wrong_pressing_58775(self, scope_guard_enabled):
+        """Must-DROP (flag on): row 58775's title merely fuzz-matches the
+        release Discogs validated the track on -- it is not that release."""
+        by_query, release = _58775_fixture()
+        db = _db_mock(by_query)
         service = _service([release])
 
         parsed = ParsedRequest(
@@ -154,20 +210,51 @@ class TestStrictBranchTitleCarveout:
             f"{[(r.id, r.title) for r in results]}"
         )
 
-    async def test_keeps_genuine_same_query_hits_50963_and_8865(self):
-        """Must-KEEP: two other library rows for the SAME query that
+    async def test_reject_log_names_the_scope_guard_reason(self, scope_guard_enabled, caplog):
+        """LML#974 item 5: a scope-guard reject must be greppable and
+        distinguishable from an ordinary below-floor reject -- pre-fix, the
+        strict branch's debug log printed only the (passing-looking, >= 80)
+        title_score with no indication *why* the row was still rejected.
+        """
+        by_query, release = _58775_fixture()
+        db = _db_mock(by_query)
+        service = _service([release])
+
+        parsed = ParsedRequest(
+            artist="The Flamingos",
+            song="I Only Have Eyes for You",
+            raw_message="I Only Have Eyes for You by The Flamingos",
+        )
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="lookup.strategies.track_on_compilation"),
+            patch(
+                "lookup.strategies.track_on_compilation.lookup_releases_by_track",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "lookup.strategies.track_on_compilation._resolve_nonlibrary_release",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            await search_compilations_for_track(db, parsed, discogs_service=service)
+
+        assert any("reason=extra_scope" in r.message for r in caplog.records), (
+            "Expected a debug log line naming the extra_scope reject reason so a "
+            f"human can grep Tier-2 recall impact. Got: {[r.message for r in caplog.records]}"
+        )
+
+    async def test_keeps_genuine_same_query_hits_50963_and_8865(self, scope_guard_enabled):
+        """Must-KEEP (flag on): two other library rows for the SAME query that
         genuinely bind to a validated release carrying the track.
 
         Ids 50963/8865 are named in #973; titles/releases here are
         synthetic placeholders (see module docstring) standing in for
         "another real pressing of a Flamingos 50s-doo-wop compilation".
         """
-        item_58775 = make_library_item(
-            id=58775,
-            artist="Various Artists - Rock - G",
-            title="Greatest hits of the 50s & 60s",
-            format="vinyl",
-        )
+        by_query, release_58775 = _58775_fixture()
         item_50963 = make_library_item(
             id=50963,
             artist="Various Artists - Rock - S",
@@ -181,13 +268,7 @@ class TestStrictBranchTitleCarveout:
             format="CD",
         )
         releases = [
-            ReleaseInfo(
-                album="Greatest Hits Of The 50's",
-                artist="Various",
-                release_id=605487,
-                release_url="https://www.discogs.com/release/605487",
-                is_compilation=True,
-            ),
+            release_58775,
             ReleaseInfo(
                 album="Rockin' Fifties Doo Wop",
                 artist="Various",
@@ -203,13 +284,9 @@ class TestStrictBranchTitleCarveout:
                 is_compilation=True,
             ),
         ]
-        db = _db_mock(
-            {
-                "Greatest Hits Of The 50's": [item_58775],
-                "Rockin' Fifties Doo Wop": [item_50963],
-                "Doo Wop Classics of the Fifties": [item_8865],
-            }
-        )
+        by_query["Rockin' Fifties Doo Wop"] = [item_50963]
+        by_query["Doo Wop Classics of the Fifties"] = [item_8865]
+        db = _db_mock(by_query)
         service = _service(releases)
 
         parsed = ParsedRequest(
@@ -260,10 +337,10 @@ class TestStrictBranchTitleCarveout:
         ],
     )
     async def test_keeps_divergent_title_recall_class(
-        self, release_album, library_title, library_id
+        self, release_album, library_title, library_id, scope_guard_enabled
     ):
-        """Must-KEEP (recall-risk class): the library's card-catalog title
-        differs from the Discogs release title's exact text (dropped
+        """Must-KEEP (flag on, recall-risk class): the library's card-catalog
+        title differs from the Discogs release title's exact text (dropped
         punctuation, a subtitle tag, or a leading article) but the row
         genuinely carries the track -- the exact shape a naive floor-raise
         would break, since it only *omits* words from the Discogs title
@@ -308,12 +385,15 @@ class TestStrictBranchTitleCarveout:
             f"Got: {[(r.id, r.title) for r in results]}"
         )
 
-    async def test_717_guard_intact_wrong_artist_non_compilation_row_still_rejected(self):
-        """Regression guard for #717: a coincidental wrong-artist row on a
-        NON-compilation release must still be rejected regardless of how
-        close its title fuzz-matches -- the ``is_compilation_artist`` /
-        ``discogs_is_compilation`` gate that protects #717 sits in front of
-        (and is untouched by) the #973 title-scope guard.
+    async def test_717_guard_intact_wrong_artist_non_compilation_row_still_rejected(
+        self, scope_guard_enabled
+    ):
+        """Regression guard for #717 (flag on): a coincidental wrong-artist
+        row on a NON-compilation release must still be rejected regardless
+        of how close its title fuzz-matches -- the ``is_compilation_artist``
+        / ``discogs_is_compilation`` gate that protects #717 sits in front
+        of (and is untouched by) the #973 title-scope guard, even with the
+        guard enabled.
         """
         wrong_artist_item = make_library_item(
             id=70229,
@@ -365,19 +445,7 @@ class TestFallbackBranchTitleCarveout:
     requires be handled consistently with the strict branch above.
     """
 
-    async def test_drops_wrong_pressing_58775_via_fallback(self):
-        """Same wrong-pressing collision as the strict-branch case, but
-        reached through the album-title fallback (query supplies
-        ``album=`` matching the Discogs comp exactly, driving Wave A/B to
-        empty and the fallback to fire)."""
-        item_58775 = make_library_item(
-            id=58775,
-            artist="Various Artists - Rock - G",
-            title="Greatest hits of the 50s & 60s",
-            format="vinyl",
-        )
-        db = _db_mock({"Greatest Hits Of The 50's": [item_58775]})
-
+    def _fallback_service(self) -> AsyncMock:
         service = AsyncMock()
         service.cache_service = AsyncMock()
         service.cache_service.search_artists_by_name = AsyncMock(return_value=[])
@@ -399,13 +467,30 @@ class TestFallbackBranchTitleCarveout:
             )
         )
         service.validate_track_on_release = AsyncMock(return_value=True)
+        return service
 
-        parsed = ParsedRequest(
+    def _fallback_parsed(self) -> ParsedRequest:
+        return ParsedRequest(
             artist="The Flamingos",
             album="Greatest Hits Of The 50's",
             song="I Only Have Eyes for You",
             raw_message="The Flamingos - I Only Have Eyes for You",
         )
+
+    async def test_drops_wrong_pressing_58775_via_fallback(self, scope_guard_enabled):
+        """Same wrong-pressing collision as the strict-branch case, but
+        reached through the album-title fallback (query supplies
+        ``album=`` matching the Discogs comp exactly, driving Wave A/B to
+        empty and the fallback to fire)."""
+        item_58775 = make_library_item(
+            id=58775,
+            artist="Various Artists - Rock - G",
+            title="Greatest hits of the 50s & 60s",
+            format="vinyl",
+        )
+        db = _db_mock({"Greatest Hits Of The 50's": [item_58775]})
+        service = self._fallback_service()
+        parsed = self._fallback_parsed()
 
         with (
             patch(
@@ -426,4 +511,144 @@ class TestFallbackBranchTitleCarveout:
         assert not any(r.id == 58775 for r in results), (
             "Library row 58775 must not surface via the album-title fallback "
             f"either. Got: {[(r.id, r.title) for r in results]}"
+        )
+
+    async def test_fallback_reject_log_names_the_scope_guard_reason(
+        self, scope_guard_enabled, caplog
+    ):
+        """LML#974 item 5: pre-fix, ``_fallback_row_acceptable`` logged
+        nothing at all on a compilation-carve-out reject. A human sizing
+        Tier-2 recall impact needs this site's rejects greppable too."""
+        item_58775 = make_library_item(
+            id=58775,
+            artist="Various Artists - Rock - G",
+            title="Greatest hits of the 50s & 60s",
+            format="vinyl",
+        )
+        db = _db_mock({"Greatest Hits Of The 50's": [item_58775]})
+        service = self._fallback_service()
+        parsed = self._fallback_parsed()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="lookup.strategies.track_on_compilation"),
+            patch(
+                "lookup.strategies.track_on_compilation.lookup_releases_by_track",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "lookup.strategies.track_on_compilation._resolve_nonlibrary_release",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            await search_compilations_for_track(db, parsed, discogs_service=service)
+
+        assert any("reason=extra_scope" in r.message for r in caplog.records), (
+            "Expected the fallback branch to also log a greppable extra_scope "
+            f"reject reason. Got: {[r.message for r in caplog.records]}"
+        )
+
+
+@pytest.mark.asyncio
+class TestScopeGuardFlagGating:
+    """LML#974 item 4: the extra-scope guard must be reversible in prod --
+    default OFF, so merging #973/#974 changes no prod behavior until a human
+    deliberately flips ``LML_TRACK_ON_COMPILATION_SCOPE_GUARD`` on after the
+    Tier-2 recall measurement.
+    """
+
+    async def test_flag_off_admits_58775_old_behavior(self, scope_guard_disabled):
+        """With the flag off, the pre-#973 ratio-only carve-out holds
+        byte-for-byte: row 58775 is (wrongly, but unchanged-from-``main``)
+        admitted."""
+        by_query, release = _58775_fixture()
+        db = _db_mock(by_query)
+        service = _service([release])
+
+        parsed = ParsedRequest(
+            artist="The Flamingos",
+            song="I Only Have Eyes for You",
+            raw_message="I Only Have Eyes for You by The Flamingos",
+        )
+
+        with patch(
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            results, _titles = await search_compilations_for_track(
+                db, parsed, discogs_service=service
+            )
+
+        assert any(r.id == 58775 for r in results), (
+            "With the scope guard off, row 58775 must still be admitted -- the "
+            "pre-#973 ratio-only carve-out (ratio ~87 >= 80) is unchanged. Got: "
+            f"{[(r.id, r.title) for r in results]}"
+        )
+
+
+class TestSignificantTitleWordsEncoding:
+    """LML#974 code-review findings 2/3: the significant-word extraction must
+    treat differently-*encoded* but semantically identical titles the same
+    way -- an apostrophe style or an accent shouldn't flip the carve-out's
+    verdict.
+    """
+
+    def test_curly_apostrophe_tokenizes_like_straight_apostrophe(self):
+        """Finding 2: ``title.replace("'", "")`` only strips the ASCII
+        apostrophe (U+0027). A typographic/"curly" apostrophe (U+2019) is
+        untouched by that replace, so it survives to the punctuation-
+        stripping regex, which -- being non-word -- splits "50’s" into
+        the throwaway tokens "50" and "s" instead of the single significant
+        token "50s" the straight-apostrophe spelling produces.
+        """
+        straight = _significant_title_words("Greatest Hits Of The 50's")
+        curly = _significant_title_words("Greatest Hits Of The 50’s")
+
+        assert straight == {"greatest", "hits", "50s"}
+        assert curly == straight, (
+            f"Curly-apostrophe significant words {curly} must match the "
+            f"straight-apostrophe spelling {straight} -- same title, "
+            "different apostrophe encoding only."
+        )
+
+    def test_curly_apostrophe_does_not_flip_scope_verdict(self):
+        """The concrete verdict-flip the code review called out: the exact
+        same semantic pair ("Hits Of The 50's" vs "Hits Of The 50s") must
+        not flip from ADMIT to DROP just because the apostrophe on the
+        Discogs side happens to be typographic rather than ASCII.
+        """
+        straight_claims_extra = _library_title_claims_extra_scope(
+            "Hits Of The 50's", "Hits Of The 50s"
+        )
+        curly_claims_extra = _library_title_claims_extra_scope(
+            "Hits Of The 50’s", "Hits Of The 50s"
+        )
+
+        assert not straight_claims_extra
+        assert curly_claims_extra == straight_claims_extra, (
+            "A typographic apostrophe on the Discogs side must not claim extra "
+            "scope when the straight-apostrophe spelling of the same title doesn't."
+        )
+
+    def test_diacritics_normalize_to_ascii_equivalent(self):
+        """Finding 3: the hand-rolled ``.lower()`` + punctuation-split doesn't
+        strip diacritics, so "Café" and "Cafe" read as different significant
+        words ("café" vs "cafe") even though they're the same word -- relevant
+        to the org's active mojibake-prevention workstream. Compose the
+        existing ``to_match_form`` normalizer (already used elsewhere in this
+        module) instead of hand-rolling lowercasing.
+        """
+        accented = _significant_title_words("Café del Mar Collection")
+        plain = _significant_title_words("Cafe del Mar Collection")
+
+        assert accented == plain, (
+            f"Accented significant words {accented} must match the ASCII "
+            f"equivalent {plain} -- same words, diacritics only."
+        )
+
+    def test_diacritics_do_not_flip_scope_verdict(self):
+        assert not _library_title_claims_extra_scope(
+            "Café del Mar Collection", "Cafe del Mar Collection"
         )

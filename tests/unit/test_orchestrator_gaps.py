@@ -919,86 +919,121 @@ class TestSearchCompilationsForTrack:
         )
 
     @pytest.mark.asyncio
-    async def test_validates_only_library_matching_releases(self):
+    @pytest.mark.xfail(
+        reason=(
+            "LML#974 known regression: the LML#973 extra-scope guard (gated "
+            "behind LML_TRACK_ON_COMPILATION_SCOPE_GUARD, enabled here to "
+            "exercise it) drops this row because the library title "
+            "*substitutes* a word the Discogs title doesn't share "
+            "('Edition' -> 'Collection') rather than merely omitting one -- "
+            "that reads as the library asserting new scope, even though "
+            "it's the same release just re-worded. This is a real recall "
+            "regression from the guard, inherent to a title-text-only "
+            "heuristic (see #959's options analysis); it is deliberately "
+            "NOT fixed by LML#974's items 2/3 (those are encoding bugs -- "
+            "apostrophe style and diacritics -- not this semantic-"
+            "substitution class) and is tracked as future precision work "
+            "under #959 options 2/3, not attempted here. Kept `strict=True` "
+            "so this starts failing loudly (XPASS) if a future change "
+            "closes the gap, rather than silently going stale."
+        ),
+        strict=True,
+    )
+    async def test_validates_only_library_matching_releases(self, monkeypatch):
         """Only calls validate_track_on_release for releases found in the library.
 
         When Discogs returns 10 releases but only 1 matches the library, we should
         make 1 validation API call (not 10). This tests the library-first approach
         where we search the library before validating each Discogs release.
+
+        The library title below ("...Collection") is the ORIGINAL substitution
+        pair this fixture used before LML#974's code review flagged that an
+        earlier LML#973 edit had silently swapped it for a pure-subset variant
+        ("...Edition") to dodge the new guard -- masking the suite's only
+        witness to this recall regression. Restored here, with the guard
+        explicitly enabled, so the regression stays visible (via the `xfail`
+        above) rather than hidden.
         """
-        db = AsyncMock()
-        db.exact_title = AsyncMock(return_value=[])
-        comp = _item(
-            id=46602,
-            artist="Various Artists",
-            title="Trax Records 20th Anniversary Edition",
-        )
+        monkeypatch.setenv("LML_TRACK_ON_COMPILATION_SCOPE_GUARD", "true")
+        from config.settings import get_settings
 
-        # Route by query content: only "Trax Records" matches the library.
-        # With asyncio.gather, album searches run concurrently so we can't
-        # rely on sequential side_effect ordering.
-        _keyword_search_done = False
+        get_settings.cache_clear()
+        try:
+            db = AsyncMock()
+            db.exact_title = AsyncMock(return_value=[])
+            comp = _item(
+                id=46602,
+                artist="Various Artists",
+                title="Trax Records 20th Anniversary Collection",
+            )
 
-        async def route_search(query, **kwargs):
-            nonlocal _keyword_search_done
-            if not _keyword_search_done:
-                _keyword_search_done = True
+            # Route by query content: only "Trax Records" matches the library.
+            # With asyncio.gather, album searches run concurrently so we can't
+            # rely on sequential side_effect ordering.
+            _keyword_search_done = False
+
+            async def route_search(query, **kwargs):
+                nonlocal _keyword_search_done
+                if not _keyword_search_done:
+                    _keyword_search_done = True
+                    return []
+                if "trax" in query.lower():
+                    return [comp]
                 return []
-            if "trax" in query.lower():
-                return [comp]
-            return []
 
-        db.search = AsyncMock(side_effect=route_search)
+            db.search = AsyncMock(side_effect=route_search)
 
-        mock_discogs = AsyncMock()
-        from discogs.models import ReleaseInfo, TrackReleasesResponse
+            mock_discogs = AsyncMock()
+            from discogs.models import ReleaseInfo, TrackReleasesResponse
 
-        releases = [
-            ReleaseInfo(
-                album="Trax Records: The 20th Anniversary Edition",
-                artist="Various Artists",
-                release_id=1001,
-                release_url="https://www.discogs.com/release/1001",
-                is_compilation=True,
-            ),
-        ] + [
-            ReleaseInfo(
-                album=f"Album {i}",
-                artist="Various Artists",
-                release_id=1000 + i,
-                release_url=f"https://www.discogs.com/release/{1000 + i}",
-                is_compilation=True,
+            releases = [
+                ReleaseInfo(
+                    album="Trax Records: The 20th Anniversary Edition",
+                    artist="Various Artists",
+                    release_id=1001,
+                    release_url="https://www.discogs.com/release/1001",
+                    is_compilation=True,
+                ),
+            ] + [
+                ReleaseInfo(
+                    album=f"Album {i}",
+                    artist="Various Artists",
+                    release_id=1000 + i,
+                    release_url=f"https://www.discogs.com/release/{1000 + i}",
+                    is_compilation=True,
+                )
+                for i in range(2, 6)
+            ]
+
+            mock_discogs.search_releases_by_track = AsyncMock(
+                return_value=TrackReleasesResponse(
+                    track="No Way Back",
+                    artist="Adonis",
+                    releases=releases,
+                    total=len(releases),
+                )
             )
-            for i in range(2, 6)
-        ]
+            mock_discogs.validate_track_on_release = AsyncMock(return_value=True)
 
-        mock_discogs.search_releases_by_track = AsyncMock(
-            return_value=TrackReleasesResponse(
-                track="No Way Back",
+            parsed = ParsedRequest(
                 artist="Adonis",
-                releases=releases,
-                total=len(releases),
+                song="No Way Back",
+                raw_message="No Way Back by Adonis",
             )
-        )
-        mock_discogs.validate_track_on_release = AsyncMock(return_value=True)
 
-        parsed = ParsedRequest(
-            artist="Adonis",
-            song="No Way Back",
-            raw_message="No Way Back by Adonis",
-        )
+            results, discogs_titles = await search_compilations_for_track(db, parsed, mock_discogs)
 
-        results, discogs_titles = await search_compilations_for_track(db, parsed, mock_discogs)
-
-        assert len(results) == 1
-        assert results[0].id == 46602
-        # Key assertion: validate was called only for the library-matching release
-        assert mock_discogs.validate_track_on_release.call_count == 1
-        assert mock_discogs.validate_track_on_release.call_args[0] == (
-            1001,
-            "No Way Back",
-            "Adonis",
-        )
+            assert len(results) == 1
+            assert results[0].id == 46602
+            # Key assertion: validate was called only for the library-matching release
+            assert mock_discogs.validate_track_on_release.call_count == 1
+            assert mock_discogs.validate_track_on_release.call_args[0] == (
+                1001,
+                "No Way Back",
+                "Adonis",
+            )
+        finally:
+            get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------

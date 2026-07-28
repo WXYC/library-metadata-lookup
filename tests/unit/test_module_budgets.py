@@ -58,6 +58,12 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/strategies/song_as_track.py": 150,
     "lookup/strategies/swapped_interpretation.py": 300,
     "lookup/strategies/track_on_compilation.py": 850,
+    # New file (LML#974): extracted from track_on_compilation.py to keep that
+    # module under its own ceiling once the #973 extra-scope guard + #974's
+    # apostrophe/diacritics fixes and reversibility flag landed. Calibrated
+    # per this module's own formula: smallest multiple of 50 at or above
+    # 1.3x the file's 163-line measured size.
+    "lookup/strategies/track_on_compilation_carveout.py": 250,
     "lookup/strategies/track_release_matching.py": 550,
     "lookup/strategies/va_rescue.py": 300,
     "lookup/streaming_url_postprocess.py": 750,
