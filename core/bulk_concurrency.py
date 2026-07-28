@@ -46,8 +46,12 @@ The pieces:
   does. Raises ``ClientDisconnectedWhileQueuedError`` if the client departs before
   the permit is granted; the permit is never held in that case. The
   Discogs-semaphore-level priority reservation (reserving headroom at the
-  5-permit gate itself, superseding the #924 interim) is a separate,
-  still-open slice — LML#927.
+  5-permit gate itself, superseding the #924 interim) is a separate slice —
+  LML#927, which has since shipped as the ``LML_DISCOGS_BULK_MAX_CONCURRENT``
+  sub-semaphore in ``discogs/ratelimit.py`` plus a request-scoped low-priority
+  ``ContextVar`` set at the same handler boundaries this module's
+  ``is_low_priority_caller_class`` / bulk-family callers already set the
+  bulk-global permit from.
 
 The per-request env knob (default 10) is shared between the endpoints
 intentionally — they have the same outer/inner gate shape and similar
