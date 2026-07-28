@@ -27,18 +27,27 @@ The pieces:
   calling ``.cancel()`` doesn't free the permits until the task observes the
   cancel and unwinds.
 - ``resolve_caller_class(raw)`` / ``is_low_priority_caller_class(caller_class)``
-  / ``maybe_acquire_bulk_global_permit(condition)`` (LML#928) — generalizes
-  the ``/lookup/bulk`` drain's implicit low-priority placement into an
-  explicit, caller-declared policy. ``resolve_caller_class`` parses the
-  ``X-Caller-Class`` header (1-5, forwarded by Backend-Service per BS#1843),
-  tolerating garbage as ``None``; ``is_low_priority_caller_class`` is the
-  down-rank-only predicate (True only for class 5); and
-  ``maybe_acquire_bulk_global_permit`` lets a single ``/lookup`` request
-  conditionally join the SAME ``acquire_bulk_global_permit`` budget bulk
-  items use, so a class-5 caller shares the low-priority lane's budget
-  rather than a lookalike. The Discogs-semaphore-level priority reservation
-  (reserving headroom at the 5-permit gate itself, superseding the #924
-  interim) is a separate, still-open slice — LML#927.
+  (LML#928) — generalizes the ``/lookup/bulk`` drain's implicit low-priority
+  placement into an explicit, caller-declared policy. ``resolve_caller_class``
+  parses the ``X-Caller-Class`` header (1-5, forwarded by Backend-Service per
+  BS#1843), tolerating garbage as ``None``; ``is_low_priority_caller_class``
+  is the down-rank-only predicate (True only for class 5).
+- ``acquire_bulk_global_permit_or_reap(request)`` /
+  ``maybe_acquire_bulk_global_permit_or_reap(condition, request)`` (LML#953,
+  replacing LML#928's ``maybe_acquire_bulk_global_permit``) — lets a single
+  ``/lookup`` request conditionally join the SAME ``acquire_bulk_global_permit``
+  budget bulk items use, so a class-5 caller shares the low-priority lane's
+  budget rather than a lookalike. Unlike the plain ``acquire_bulk_global_permit``
+  bulk items use (which rely on their batch's own outer disconnect sentinel),
+  a single ``/lookup`` request has no such outer race, so this variant races
+  the wait itself against ``watch_disconnect`` and yields the measured queue
+  wait in ms (0.0 if uncontended) so the caller can debit it from
+  ``X-Caller-Budget-Ms`` the same way the interactive in-flight cap already
+  does. Raises ``ClientDisconnectedWhileQueuedError`` if the client departs before
+  the permit is granted; the permit is never held in that case. The
+  Discogs-semaphore-level priority reservation (reserving headroom at the
+  5-permit gate itself, superseding the #924 interim) is a separate,
+  still-open slice — LML#927.
 
 The per-request env knob (default 10) is shared between the endpoints
 intentionally — they have the same outer/inner gate shape and similar
@@ -256,25 +265,105 @@ def is_low_priority_caller_class(caller_class: int | None) -> bool:
     return caller_class == LOW_PRIORITY_CALLER_CLASS
 
 
-@contextlib.asynccontextmanager
-async def maybe_acquire_bulk_global_permit(condition: bool):
-    """Conditionally hold the LML#716/#924 low-priority global permit (LML#928).
+class ClientDisconnectedWhileQueuedError(Exception):
+    """Raised by :func:`acquire_bulk_global_permit_or_reap` (and its
+    conditional wrapper) when the client disconnects before the global
+    permit is granted.
 
-    ``async with maybe_acquire_bulk_global_permit(is_low_priority_caller_class(caller_class)):``
-    is a no-op context when ``condition`` is False, so a call site can route
-    onto the low-priority lane for exactly one branch (a class-5 caller)
-    without duplicating its body for the common (unaffected) case. When
-    ``condition`` is True it delegates to :func:`acquire_bulk_global_permit`
-    -- the identical process-global semaphore ``/lookup/bulk`` items already
-    share -- so a class-5 single ``/lookup`` request draws from the SAME
+    The permit was never taken -- the caller should treat this as a reap
+    signal (the LML#715 in-flight-cap pattern) and short-circuit, e.g. with a
+    499, without running any further work for the departed caller.
+    """
+
+
+@contextlib.asynccontextmanager
+async def acquire_bulk_global_permit_or_reap(request: Request):
+    """Acquire the LML#716/#924 global bulk-item permit, racing a saturated
+    wait against client disconnect (LML#953).
+
+    Mirrors the #706/#715 in-flight-cap pattern ``lookup.router.handle_lookup``
+    uses for the interactive semaphore: a caller that departs while parked on
+    a saturated budget must not later run a lookup nobody reads. Unlike
+    :func:`acquire_bulk_global_permit` (used by every batched bulk-family
+    dispatcher, which already race a DIFFERENT outer-scope disconnect
+    sentinel around the whole batch), a single class-5 ``/lookup`` request
+    has no such outer race, so it needs its own.
+
+    Yields the measured queue wait in milliseconds (``0.0`` when the permit
+    was free on arrival, mirroring :func:`acquire_bulk_global_permit`'s own
+    ``capped_on_arrival`` convention). Raises
+    :class:`ClientDisconnectedWhileQueuedError` when the client disconnects before
+    the permit is granted -- the permit is never held in that case.
+
+    Only one ``watch_disconnect(request)`` reader may be active on a given
+    request at a time (the ASGI receive channel has no fan-out), so callers
+    must not hold this open concurrently with another disconnect sentinel on
+    the same request -- sequence them instead, same as the interactive cap
+    does when it starts its own sentinel only after this one is drained.
+    """
+    semaphore = _get_bulk_global_semaphore()
+    capped_on_arrival = semaphore.locked()
+    wait_start = time.perf_counter()
+    acquire_future = asyncio.ensure_future(semaphore.acquire())
+    sentinel_task = asyncio.create_task(
+        watch_disconnect(request), name="lml.lookup.bulk_global_disconnect_sentinel"
+    )
+    # Same guaranteed-release shape as the interactive cap below: track
+    # "did we end up holding a permit" explicitly and release exactly once,
+    # in the `finally`, whatever path leaves this context.
+    permit_held = False
+    try:
+        try:
+            done, _pending = await asyncio.wait(
+                {acquire_future, sentinel_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            await cancel_and_drain(acquire_future)
+            permit_held = acquire_future.done() and not acquire_future.cancelled()
+            await cancel_and_drain(sentinel_task)
+            raise
+
+        if sentinel_task in done and not acquire_future.done():
+            # Client departed while queued. Free the never-taken slot and
+            # signal the caller to reap -- nobody reads the eventual result.
+            await cancel_and_drain(acquire_future)
+            raise ClientDisconnectedWhileQueuedError()
+
+        permit_held = True
+        await cancel_and_drain(sentinel_task)
+        wait_ms = 0.0
+        if capped_on_arrival:
+            wait_ms = (time.perf_counter() - wait_start) * 1000.0
+            _project_global_capped(wait_ms)
+        yield wait_ms
+    finally:
+        if permit_held:
+            semaphore.release()
+
+
+@contextlib.asynccontextmanager
+async def maybe_acquire_bulk_global_permit_or_reap(condition: bool, request: Request):
+    """Conditionally hold the low-priority global permit, disconnect-aware (LML#953).
+
+    ``async with maybe_acquire_bulk_global_permit_or_reap(condition, http_request):`` is a
+    no-op context when ``condition`` is False (yields ``0.0`` and never
+    touches the semaphore or spawns a disconnect sentinel), so a call site
+    can route onto the low-priority lane for exactly one branch (a class-5
+    caller) without duplicating its body for the common (unaffected) case.
+    When ``condition`` is True it delegates to
+    :func:`acquire_bulk_global_permit_or_reap` -- the identical
+    process-global semaphore ``/lookup/bulk`` items already share -- so a
+    class-5 single ``/lookup`` request draws from the SAME
     ``LML_BULK_GLOBAL_MAX_CONCURRENT`` budget as a bulk drain, rather than a
-    lookalike budget that would let batch traffic double its effective quota.
+    lookalike budget that would let batch traffic double its effective
+    quota. Replaces LML#928's ``maybe_acquire_bulk_global_permit``, which had
+    no disconnect awareness and no wait measurement.
     """
     if condition:
-        async with acquire_bulk_global_permit():
-            yield
+        async with acquire_bulk_global_permit_or_reap(request) as wait_ms:
+            yield wait_ms
     else:
-        yield
+        yield 0.0
 
 
 async def cancel_and_drain(future: asyncio.Future[Any]) -> None:
@@ -293,10 +382,12 @@ async def cancel_and_drain(future: asyncio.Future[Any]) -> None:
 
 __all__ = [
     "LOW_PRIORITY_CALLER_CLASS",
+    "ClientDisconnectedWhileQueuedError",
     "acquire_bulk_global_permit",
+    "acquire_bulk_global_permit_or_reap",
     "cancel_and_drain",
     "is_low_priority_caller_class",
-    "maybe_acquire_bulk_global_permit",
+    "maybe_acquire_bulk_global_permit_or_reap",
     "max_concurrency_from_env",
     "resolve_caller_class",
     "watch_disconnect",

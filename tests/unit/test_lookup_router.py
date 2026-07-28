@@ -1059,25 +1059,29 @@ class TestHandleLookup:
 
 
 class TestCallerClassLowPriorityLane:
-    """LML#928: ``X-Caller-Class`` routes a single ``/lookup`` request onto
-    the low-priority lane (the LML#716/#924 process-global bulk permit) when
-    -- and only when -- the caller declares class 5 (batch/cron/backfill).
+    """LML#928/#953: ``X-Caller-Class`` routes a single ``/lookup`` request
+    onto the low-priority lane (the LML#716/#924 process-global bulk permit)
+    when -- and only when -- the caller declares class 5 (batch/cron/backfill).
 
-    Patches ``lookup.router.maybe_acquire_bulk_global_permit`` (the exact
-    name ``handle_lookup`` calls) with a spy that records the boolean
+    Patches ``lookup.router.maybe_acquire_bulk_global_permit_or_reap`` (the
+    exact name ``handle_lookup`` calls) with a spy that records the boolean
     condition it was entered with, so this test pins the router's
     class→condition wiring in isolation from the semaphore itself -- which
     ``test_caller_class.py`` pins directly. Together the two prove the full
     invariant: class 5 -> low-priority lane; classes 1-4, absent, and invalid
-    values -> today's interactive-only behavior, unchanged.
+    values -> today's interactive-only behavior, unchanged. LML#953 replaced
+    the underlying primitive (now disconnect-aware and acquired BEFORE the
+    interactive semaphore, not just around ``perform_lookup``) but this
+    class→condition invariant is unchanged, so the fake still just records
+    the condition and yields immediately.
     """
 
     @staticmethod
     def _fake_maybe_acquire(calls: list[bool]):
         @contextlib.asynccontextmanager
-        async def _fake(condition: bool):
+        async def _fake(condition: bool, request):
             calls.append(condition)
-            yield
+            yield 0.0
 
         return _fake
 
@@ -1089,7 +1093,7 @@ class TestCallerClassLowPriorityLane:
         with (
             patch("lookup.router.perform_lookup", new_callable=AsyncMock, return_value=response),
             patch(
-                "lookup.router.maybe_acquire_bulk_global_permit",
+                "lookup.router.maybe_acquire_bulk_global_permit_or_reap",
                 self._fake_maybe_acquire(calls),
             ),
         ):
@@ -1142,7 +1146,7 @@ class TestCallerClassLowPriorityLane:
         with (
             patch("lookup.router.perform_lookup", new_callable=AsyncMock, return_value=response),
             patch(
-                "lookup.router.maybe_acquire_bulk_global_permit",
+                "lookup.router.maybe_acquire_bulk_global_permit_or_reap",
                 self._fake_maybe_acquire(calls),
             ),
         ):

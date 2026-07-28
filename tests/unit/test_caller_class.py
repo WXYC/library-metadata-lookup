@@ -19,15 +19,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from unittest.mock import patch
 
 import pytest
 
 from core.bulk_concurrency import (
     LOW_PRIORITY_CALLER_CLASS,
+    ClientDisconnectedWhileQueuedError,
     is_low_priority_caller_class,
-    maybe_acquire_bulk_global_permit,
+    maybe_acquire_bulk_global_permit_or_reap,
     resolve_caller_class,
 )
+
+
+async def _never_disconnects(_request) -> None:
+    """A ``watch_disconnect`` replacement that never observes a disconnect.
+
+    Every test below that doesn't specifically exercise the disconnect race
+    patches this in, so the fake ``request`` object it's paired with (never a
+    real ASGI ``Request``) is never actually touched.
+    """
+    await asyncio.Event().wait()
 
 
 class TestResolveCallerClass:
@@ -82,11 +94,16 @@ class TestIsLowPriorityCallerClass:
         assert LOW_PRIORITY_CALLER_CLASS == 5
 
 
-class TestMaybeAcquireBulkGlobalPermit:
-    """``maybe_acquire_bulk_global_permit`` must gate the REAL LML#716/#924
-    global bulk semaphore -- the identical one ``/lookup/bulk`` items use --
-    not a lookalike, so the class-5 low-priority lane genuinely shares the
-    same budget as bulk drains."""
+class TestMaybeAcquireBulkGlobalPermitOrReap:
+    """``maybe_acquire_bulk_global_permit_or_reap`` (LML#953) must gate the
+    REAL LML#716/#924 global bulk semaphore -- the identical one
+    ``/lookup/bulk`` items use -- not a lookalike, so the class-5
+    low-priority lane genuinely shares the same budget as bulk drains. Unlike
+    its LML#928 predecessor (``maybe_acquire_bulk_global_permit``, removed),
+    it also races a saturated wait against client disconnect and reports the
+    measured wait, so a single ``/lookup`` request can debit it from the
+    caller budget the same way the interactive in-flight cap already does.
+    """
 
     @pytest.mark.asyncio
     async def test_false_condition_does_not_touch_the_semaphore(self, monkeypatch):
@@ -100,18 +117,38 @@ class TestMaybeAcquireBulkGlobalPermit:
         async with acquire_bulk_global_permit():
             # The single permit is held here; a real acquire would hang.
             async with asyncio.timeout(0.2):
-                async with maybe_acquire_bulk_global_permit(False):
-                    pass
+                async with maybe_acquire_bulk_global_permit_or_reap(False, object()) as wait_ms:
+                    assert wait_ms == 0.0
+
+    @pytest.mark.asyncio
+    async def test_false_condition_never_watches_for_disconnect(self, monkeypatch):
+        """A False condition must not spawn a disconnect sentinel at all --
+        the common (non-class-5) path stays exactly as cheap as before."""
+        from core import bulk_concurrency as bc
+
+        watched: list[object] = []
+
+        async def _tracking_watch(request):
+            watched.append(request)
+            await asyncio.sleep(10)
+
+        with patch.object(bc, "watch_disconnect", _tracking_watch):
+            async with maybe_acquire_bulk_global_permit_or_reap(False, object()):
+                pass
+
+        assert watched == []
 
     @pytest.mark.asyncio
     async def test_true_condition_holds_the_real_global_permit(self, monkeypatch):
         """Condition True must route through the SAME semaphore bulk items use.
 
         Budget of 1: a concurrent direct `acquire_bulk_global_permit()` call
-        must queue behind the `maybe_acquire_bulk_global_permit(True)` holder,
-        proving it's the identical process-global semaphore, not a lookalike.
+        must queue behind the `maybe_acquire_bulk_global_permit_or_reap(True, ...)`
+        holder, proving it's the identical process-global semaphore, not a
+        lookalike.
         """
         monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "1")
+        from core import bulk_concurrency as bc
         from core.bulk_concurrency import acquire_bulk_global_permit
 
         entered_second = asyncio.Event()
@@ -120,11 +157,114 @@ class TestMaybeAcquireBulkGlobalPermit:
             async with acquire_bulk_global_permit():
                 entered_second.set()
 
-        async with maybe_acquire_bulk_global_permit(True):
-            second = asyncio.create_task(_second_holder())
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-            assert not entered_second.is_set(), "second holder should queue behind the first"
+        with patch.object(bc, "watch_disconnect", _never_disconnects):
+            async with maybe_acquire_bulk_global_permit_or_reap(True, object()) as wait_ms:
+                assert wait_ms == 0.0, "uncontended acquire must report zero wait"
+                second = asyncio.create_task(_second_holder())
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                assert not entered_second.is_set(), "second holder should queue behind the first"
 
-        await asyncio.wait_for(second, timeout=1.0)
+            await asyncio.wait_for(second, timeout=1.0)
         assert entered_second.is_set()
+
+    @pytest.mark.asyncio
+    async def test_true_condition_reports_measured_wait_when_capped(self, monkeypatch):
+        monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "1")
+        from core import bulk_concurrency as bc
+        from core.bulk_concurrency import _get_bulk_global_semaphore, acquire_bulk_global_permit
+
+        release = asyncio.Event()
+
+        async def _holder():
+            async with acquire_bulk_global_permit():
+                await release.wait()
+
+        holder = asyncio.create_task(_holder())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        wait_ms_holder: list[float] = []
+
+        async def _second():
+            async with maybe_acquire_bulk_global_permit_or_reap(True, object()) as wait_ms:
+                wait_ms_holder.append(wait_ms)
+
+        with patch.object(bc, "watch_disconnect", _never_disconnects):
+            second = asyncio.create_task(_second())
+            for _ in range(100):
+                if getattr(_get_bulk_global_semaphore(), "_waiters", None):
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                pytest.fail("second holder never parked on the global permit")
+
+            await asyncio.sleep(0.05)
+            release.set()
+            await asyncio.gather(holder, second)
+
+        assert wait_ms_holder[0] >= 40
+
+    @pytest.mark.asyncio
+    async def test_disconnect_while_parked_raises_and_frees_the_permit(self, monkeypatch):
+        """A client that disconnects while parked on a saturated budget must
+        never take the permit -- the exception signals the caller to reap
+        the request (LML#953), mirroring the #706/#715 in-flight-cap pattern.
+        """
+        monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "1")
+        from core import bulk_concurrency as bc
+        from core.bulk_concurrency import _get_bulk_global_semaphore, acquire_bulk_global_permit
+
+        release = asyncio.Event()
+
+        async def _holder():
+            async with acquire_bulk_global_permit():
+                await release.wait()
+
+        holder = asyncio.create_task(_holder())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        async def _disconnect_after_parked(_request):
+            for _ in range(100):
+                if getattr(_get_bulk_global_semaphore(), "_waiters", None):
+                    return
+                await asyncio.sleep(0.001)
+            pytest.fail("second holder never parked on the global permit")
+
+        entered = False
+        with patch.object(bc, "watch_disconnect", _disconnect_after_parked):
+            with pytest.raises(ClientDisconnectedWhileQueuedError):
+                async with maybe_acquire_bulk_global_permit_or_reap(True, object()):
+                    entered = True
+
+        assert not entered, "the guarded block must never run for a reaped request"
+
+        release.set()
+        await asyncio.wait_for(holder, timeout=1.0)
+
+        # The permit was never taken by the reaped waiter: the semaphore
+        # accepts a fresh acquire immediately once the original holder frees
+        # it, with no stranded slot.
+        async with asyncio.timeout(0.2):
+            async with acquire_bulk_global_permit():
+                pass
+
+    @pytest.mark.asyncio
+    async def test_uncontended_disconnect_after_grant_does_not_reap(self, monkeypatch):
+        """A disconnect signalled AFTER an uncontended acquire must not reap --
+        mirrors the interactive cap's "permit holder unaffected" contract.
+        """
+        monkeypatch.setenv("LML_BULK_GLOBAL_MAX_CONCURRENT", "4")
+        from core import bulk_concurrency as bc
+
+        async def _disconnect_soon(_request):
+            await asyncio.sleep(0.05)
+
+        entered = False
+        with patch.object(bc, "watch_disconnect", _disconnect_soon):
+            async with maybe_acquire_bulk_global_permit_or_reap(True, object()):
+                entered = True
+                await asyncio.sleep(0.1)
+
+        assert entered
