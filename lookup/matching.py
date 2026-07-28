@@ -96,7 +96,14 @@ def limit_results(results: list) -> list:
 def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     """Check if a library item matches the given artist name.
 
-    Compares against both ``item.artist`` and ``item.alternate_artist_name``.
+    Compares against ``item.artist``, ``item.alternate_artist_name``, and
+    each ``" | "``-split value of ``item.cross_reference_names`` — the
+    cataloger-recorded WXYC LIBRARY_CODE_CROSS_REFERENCE aliases (e.g. a
+    release filed under a band name, like "Burning Star Core", carries a
+    link to a member's personal name, "C. Spencer Yeh"; see
+    WXYC/discogs-etl#334). ``cross_reference_names`` is optional and absent
+    on library.db files predating that column.
+
     Tolerates a leading-article asymmetry between query and catalog —
     library catalogers commonly file "The Black Dog" as "Black Dog
     Productions" while user input and Discogs credits keep the article,
@@ -108,7 +115,11 @@ def artist_matches_item(item: LibraryItem, artist: str) -> bool:
     artist_normalized = normalize_for_comparison(artist)
     artist_no_article = strip_leading_article(artist_normalized)
 
-    for candidate in (item.artist, item.alternate_artist_name):
+    candidates = [item.artist, item.alternate_artist_name]
+    if item.cross_reference_names:
+        candidates.extend(item.cross_reference_names.split(" | "))
+
+    for candidate in candidates:
         if not candidate:
             continue
         cand_normalized = normalize_for_comparison(candidate)

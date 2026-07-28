@@ -30,6 +30,11 @@ class LibraryItem(BaseModel):
     format: str | None = None
     alternate_artist_name: str | None = None
     label: str | None = None
+    # Pipe-joined (" | ") PRESENTATION_NAMEs of any WXYC catalog LIBRARY_CODEs
+    # cataloger-cross-referenced to this row's own code (e.g. a release filed
+    # under a band name carries a member's personal name). Optional column;
+    # absent from library.db files predating WXYC/discogs-etl#334.
+    cross_reference_names: str | None = None
     on_streaming: bool | None = None
 
     @property

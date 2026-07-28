@@ -264,6 +264,74 @@ class TestArtistMatchesItem:
         item = make_library_item(id=1, artist="The Microphones", title="The Glow Pt. 2")
         assert artist_matches_item(item, "The Black Dog") is False
 
+    # ------------------------------------------------------------------
+    # cross_reference_names (WXYC/discogs-etl#334) -- catalog-recorded
+    # LIBRARY_CODE_CROSS_REFERENCE aliases, pipe-joined (" | ").
+    #
+    # Worked example: library.db row 57833 is filed under the band name
+    # "Burning Star Core" with alternate_artist_name "C.S. Yeh" -- neither
+    # prefix-matches a DJ typing the member's full personal name "C. Spencer
+    # Yeh". The catalog's cross-reference table links the two codes, so
+    # library.db now carries that link as cross_reference_names, and
+    # artist_matches_item must consult it with the same strict,
+    # leading-article-tolerant prefix rule as artist/alternate_artist_name.
+    # ------------------------------------------------------------------
+
+    def test_cross_reference_name_matches(self):
+        item = make_library_item(
+            id=57833,
+            artist="Burning Star Core",
+            title='"In The Blink of an Eye" 7-inch',
+            alternate_artist_name="C.S. Yeh",
+            cross_reference_names="C. Spencer Yeh",
+        )
+        assert artist_matches_item(item, "C. Spencer Yeh") is True
+
+    def test_cross_reference_name_prefix_matches(self):
+        item = make_library_item(
+            id=57833,
+            artist="Burning Star Core",
+            title='"In The Blink of an Eye" 7-inch',
+            cross_reference_names="C. Spencer Yeh",
+        )
+        assert artist_matches_item(item, "C. Spencer") is True
+
+    def test_cross_reference_names_multiple_pipe_joined(self):
+        """Multiple cross-referenced codes are pipe-joined; any one must match."""
+        item = make_library_item(
+            id=1,
+            artist="Return to Forever",
+            title="Live",
+            cross_reference_names="Chick Corea (Return to Forever) | Elf Power",
+        )
+        assert artist_matches_item(item, "Elf Power") is True
+        assert artist_matches_item(item, "Chick Corea (Return to Forever)") is True
+
+    def test_cross_reference_names_absent_falls_back_to_no_match(self):
+        """No cross_reference_names means only artist/alternate_artist_name are checked."""
+        item = make_library_item(id=1, artist="Burning Star Core", title="Album")
+        assert artist_matches_item(item, "C. Spencer Yeh") is False
+
+    def test_cross_reference_names_leading_article_tolerance(self):
+        """The leading-article tolerance rule also applies to cross_reference_names."""
+        item = make_library_item(
+            id=1,
+            artist="Black Dog Productions",
+            title="Spanners",
+            cross_reference_names="Black Dog",
+        )
+        assert artist_matches_item(item, "The Black Dog") is True
+
+    def test_cross_reference_names_does_not_create_false_positive(self):
+        """An unrelated typed artist must not match via cross_reference_names."""
+        item = make_library_item(
+            id=57833,
+            artist="Burning Star Core",
+            title='"In The Blink of an Eye" 7-inch',
+            cross_reference_names="C. Spencer Yeh",
+        )
+        assert artist_matches_item(item, "Stereolab") is False
+
 
 # ---------------------------------------------------------------------------
 # Tests: build_context_message
@@ -829,6 +897,42 @@ class TestSearchLibraryWithFallback:
         )
         assert len(results) == 1
         assert results[0].title == "DJ Kicks: Honey Dijon"
+
+    @pytest.mark.asyncio
+    async def test_artist_only_surfaces_row_via_cross_reference_name(self, mock_library_db):
+        """WXYC/discogs-etl#334 end-to-end: an artist-only lookup for the
+        cataloger-cross-referenced personal name "C. Spencer Yeh" keeps the
+        library.db row 57833-shaped candidate (filed under the band name
+        "Burning Star Core") that the artist-only fallback search surfaces.
+
+        db.search is mocked (retrieval is not under test here -- library_fts
+        does not index cross_reference_names, see
+        tests/integration/test_cross_reference_names.py); what changed is
+        that the subsequent artist_matches_item filter, applied by
+        search_library_with_fallback's artist-only branch, now accepts this
+        candidate via its cross_reference_names instead of dropping it.
+        """
+        item = make_library_item(
+            id=57833,
+            artist="Burning Star Core",
+            title='"In The Blink of an Eye" 7-inch',
+            alternate_artist_name="C.S. Yeh",
+            cross_reference_names="C. Spencer Yeh",
+        )
+        mock_library_db.search.return_value = [item]
+
+        parsed = ParsedRequest(
+            artist="C. Spencer Yeh",
+            raw_message="C. Spencer Yeh - In the Blink of an Eye",
+            is_request=True,
+            message_type=MessageType.REQUEST,
+        )
+
+        results, fallback = await search_library_with_fallback(mock_library_db, parsed, [])
+
+        assert fallback is True
+        assert len(results) == 1
+        assert results[0].id == 57833
 
 
 # ---------------------------------------------------------------------------
