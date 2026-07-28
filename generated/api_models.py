@@ -1229,6 +1229,12 @@ class SearchType(StrEnum):
     none = "none"
 
 
+class DegradedReason(StrEnum):
+    deadline_exceeded = "deadline_exceeded"
+    cache_only = "cache_only"
+    upstream_unavailable = "upstream_unavailable"
+
+
 class IdentitySource(StrEnum):
     discogs = "discogs"
     musicbrainz = "musicbrainz"
@@ -2507,6 +2513,14 @@ class LookupResponse(BaseModel):
     timeout: bool | None = Field(
         False,
         description="True when LML's server-side hard cap fired and the search pipeline was abandoned mid-execution (LML#370). `results` may be partial or empty in that case. Callers can use this to distinguish \"no match\" (empty `results`, `timeout: false`) from \"ran out of time\" (`results` may be empty, `timeout: true`). The hard cap is an internal LML safety floor independent of the caller's `X-Caller-Budget-Ms` header; see LML#338 / LML#340 / LML#370 for the cascade-budget design. Backend also forwards two sibling informal headers on the same `/lookup` and `/lookup/bulk` requests, both prose-referenced here rather than formal parameters (matching `X-Caller-Budget-Ms`'s own precedent): `X-Caller-Class` (the resolved BS→LML traffic class, an integer 1-5 per Backend-Service's per-caller policy, BS#1826) and `X-Caller-Reason` (the `caller` label string itself, e.g. `proxy-library-search` or `catalog-popularity-freetext-resolve`). Both are sent only when Backend has a registered caller for the request and are otherwise omitted; sending them is inert until LML reads them (LML#928 for `X-Caller-Class`-driven lane routing, LML#931 for `X-Caller-Reason` caller telemetry) — see BS#1843.\n",
+    )
+    degraded: bool | None = Field(
+        False,
+        description="True when LML returned partial or cache-only data because it intentionally shed the enrichment tail — under a caller deadline, admission-control pressure, or an unavailable upstream (LML#930). Distinguishes a degraded/cache-only result from a full success (`degraded: false`) and from a genuine no-match (empty `results`, `degraded: false`, `timeout: false`). Distinct from `timeout`, which signals the internal hard cap fired and the pipeline was abandoned mid-execution; `degraded` is a deliberate shed-the-tail outcome where the returned data is trustworthy but incomplete. Default false, so existing consumers see a byte-identical response.\n",
+    )
+    degraded_reason: DegradedReason | None = Field(
+        None,
+        description="Why the response was degraded. Present only when `degraded: true`; omitted otherwise. Non-exhaustive — LML may add reasons in a later minor version. The Swift and Kotlin codegen decode an unknown value into an `unknownDefault` case and TypeScript consumers see a widened string-literal union, but the Python (datamodel-codegen → pydantic) consumers use strict enums and must regenerate against the new `@wxyc/shared` minor before LML emits a newly added reason. `deadline_exceeded` — the caller's budget or LML's spine deadline elapsed and the enrichment tail was skipped; `cache_only` — LML served cached data without refreshing from upstream; `upstream_unavailable` — an upstream (Discogs, streaming providers) was rate limited or down and its contribution was omitted. Set by LML#930's caller-deadline / admission path; read by LML#931 (`degraded-mode-result` telemetry) and wxyc-canary#82.\n",
     )
 
 
