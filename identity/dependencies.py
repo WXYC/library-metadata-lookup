@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from fastapi import Depends
+from fastapi import Depends, HTTPException
 
 from config.settings import Settings, get_settings
 from core.bulk_body import TRANSIENT_PG_ERRORS
@@ -12,6 +12,13 @@ from entity.sources import PgSource
 from entity.store import EntityStore
 
 logger = logging.getLogger(__name__)
+
+# Shared across every router that depends on `get_entity_store` (cache/router.py,
+# identity/router.py, ...) — previously duplicated verbatim in each router module.
+_ENTITY_STORE_UNAVAILABLE_DETAIL = (
+    "Entity store is not available. Ensure DATABASE_URL_DISCOGS is configured "
+    "and the entity schema has been applied."
+)
 
 _entity_store: EntityStore | None = None
 _entity_probe_failed: bool = False
@@ -96,6 +103,19 @@ async def get_entity_store(
         _entity_store = EntityStore(pg)
         logger.info("Entity store initialized")
         return _entity_store
+
+
+def require_entity_store(store: EntityStore | None) -> EntityStore:
+    """Raise 503 if the entity store is not available.
+
+    Shared guard for router handlers that take ``get_entity_store``'s
+    ``EntityStore | None`` result and need the non-optional store or a 503.
+    Previously duplicated verbatim as a private ``_require_entity_store``
+    helper in both ``cache/router.py`` and ``identity/router.py``.
+    """
+    if store is None:
+        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
+    return store
 
 
 async def close_entity_store() -> None:

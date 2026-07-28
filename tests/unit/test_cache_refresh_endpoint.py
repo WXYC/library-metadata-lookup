@@ -93,6 +93,33 @@ class TestCacheRefreshGlobalBound:
         )
 
 
+class TestCacheRefreshEntityStoreUnavailable:
+    @pytest.mark.asyncio
+    async def test_returns_503_when_entity_store_unavailable(self, mock_settings):
+        """POST /api/v1/cache/refresh-for-identities returns 503 when the
+        entity store is not configured (mirrors the `/identity/*` posture)."""
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service
+        from identity.dependencies import get_entity_store
+        from main import app
+
+        with override_deps(
+            app,
+            {
+                get_settings: mock_settings,
+                get_entity_store: None,
+                get_discogs_service: AsyncMock(),
+            },
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/api/v1/cache/refresh-for-identities", json={"identity_ids": [42]}
+                )
+
+        assert resp.status_code == 503
+        assert "entity store" in resp.json()["detail"].lower()
+
+
 class TestCacheRefreshFamilyAlignment:
     """LML#767: the cache-refresh route joins the shared envelope + transient
     tuple. InterfaceError -> 503, ClientDisconnect -> 400, absent batch field

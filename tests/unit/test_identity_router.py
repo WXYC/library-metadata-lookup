@@ -212,6 +212,57 @@ class TestEntityStoreUnavailable:
         assert "entity store" in resp.json()["detail"].lower()
 
     @pytest.mark.asyncio
+    async def test_bulk_returns_503_when_store_unavailable(self, mock_settings):
+        """POST /identity/bulk returns 503 when entity store is not configured."""
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from identity.dependencies import get_entity_store
+        from main import app
+
+        with override_deps(
+            app,
+            {
+                get_library_db: AsyncMock(),
+                get_discogs_service: None,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+                get_entity_store: None,
+            },
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.post("/identity/bulk", json={"names": ["Stereolab"]})
+
+        assert resp.status_code == 503
+        assert "entity store" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_release_identity_resolve_returns_503_when_store_unavailable(self, mock_settings):
+        """POST /api/v1/identity/resolve returns 503 when entity store is not configured."""
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from identity.dependencies import get_entity_store
+        from main import app
+
+        with override_deps(
+            app,
+            {
+                get_library_db: AsyncMock(),
+                get_discogs_service: None,
+                get_posthog_client: None,
+                get_settings: mock_settings,
+                get_entity_store: None,
+            },
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/api/v1/identity/resolve",
+                    json={"kind": "release", "source": "discogs_release", "external_id": "12345"},
+                )
+
+        assert resp.status_code == 503
+        assert "entity store" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
     async def test_resolve_returns_503_when_pg_raises_undefined_table(
         self, app_client, mock_entity_store
     ):
