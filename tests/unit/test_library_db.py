@@ -1128,6 +1128,147 @@ class TestLabelColumn:
 
 
 # ---------------------------------------------------------------------------
+# cross_reference_names column (WXYC/discogs-etl#334)
+# ---------------------------------------------------------------------------
+
+
+class TestCrossReferenceNamesColumn:
+    """Tests for cross_reference_names column detection and queries."""
+
+    @pytest.mark.asyncio
+    async def test_connect_detects_cross_reference_names_column(self, tmp_path):
+        """connect() should detect the cross_reference_names column and set flag."""
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT,
+                alternate_artist_name TEXT,
+                label TEXT,
+                cross_reference_names TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist, alternate_artist_name,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        assert db._has_cross_reference_names is True
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_connect_without_cross_reference_names_column(self, tmp_path):
+        """connect() should set flag to False when cross_reference_names is absent.
+
+        Back-compat: a library.db predating WXYC/discogs-etl#334 must still load.
+        """
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        assert db._has_cross_reference_names is False
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_search_returns_cross_reference_names_when_present(self, tmp_path):
+        """Search results should include cross_reference_names data when the column exists."""
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT,
+                alternate_artist_name TEXT,
+                cross_reference_names TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist, alternate_artist_name,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.execute(
+            "INSERT INTO library VALUES "
+            "(57833, '\"In The Blink of an Eye\" 7-inch', 'Burning Star Core', 'BU', "
+            "110, 6, 'Rock', 'vinyl - 7\"', 'C.S. Yeh', 'C. Spencer Yeh')"
+        )
+        conn.execute(
+            "INSERT INTO library_fts(rowid, title, artist, alternate_artist_name) "
+            "VALUES (57833, 'In The Blink of an Eye', 'Burning Star Core', 'C.S. Yeh')"
+        )
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+        results = await db.search(artist="Burning Star Core")
+        assert len(results) == 1
+        assert results[0].cross_reference_names == "C. Spencer Yeh"
+        await db.close()
+
+    def test_select_columns_includes_cross_reference_names(self):
+        db = LibraryDB()
+        db._has_alternate_artist = True
+        db._has_cross_reference_names = True
+        cols = db._select_columns()
+        assert "cross_reference_names" in cols
+
+    def test_select_columns_excludes_cross_reference_names(self):
+        db = LibraryDB()
+        db._has_alternate_artist = True
+        db._has_cross_reference_names = False
+        cols = db._select_columns()
+        assert "cross_reference_names" not in cols
+
+
+# ---------------------------------------------------------------------------
 # compilation_track_artist table
 # ---------------------------------------------------------------------------
 

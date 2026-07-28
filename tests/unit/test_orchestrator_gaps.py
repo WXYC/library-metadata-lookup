@@ -586,6 +586,47 @@ class TestSearchCompilationsForTrack:
         assert len(results) >= 1
 
     @pytest.mark.asyncio
+    async def test_keyword_search_surfaces_row_via_cross_reference_name(self):
+        """WXYC/discogs-etl#334 end-to-end: the keyword-search branch's artist
+        filter (``artist_matches_item(item, lib_artist)``) now accepts a
+        library.db row 57833-shaped candidate -- filed under the band name
+        "Burning Star Core" -- for a typed personal name "C. Spencer Yeh",
+        via the row's cross_reference_names.
+
+        db.search is mocked (retrieval is not under test here); what changed
+        is that the keyword-search branch's artist filter, at
+        lookup/strategies/track_on_compilation.py, now keeps this candidate
+        instead of dropping it as neither-artist-nor-alternate-matches.
+        """
+        db = AsyncMock()
+        db.exact_title = AsyncMock(return_value=[])
+        item = _item(
+            id=57833,
+            artist="Burning Star Core",
+            title='"In The Blink of an Eye" 7-inch',
+            alternate_artist_name="C.S. Yeh",
+            cross_reference_names="C. Spencer Yeh",
+        )
+        db.search = AsyncMock(return_value=[item])
+
+        parsed = ParsedRequest(
+            artist="C. Spencer Yeh",
+            song="In the Blink of an Eye",
+            raw_message="C. Spencer Yeh - In the Blink of an Eye",
+        )
+
+        with patch(
+            "lookup.strategies.track_on_compilation.lookup_releases_by_track",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            results, _ = await search_compilations_for_track(db, parsed)
+
+        assert any(r.id == 57833 for r in results), (
+            f"Expected row 57833 (via cross_reference_names) in {[r.id for r in results]}"
+        )
+
+    @pytest.mark.asyncio
     async def test_discogs_cross_reference(self):
         """Finds track on a compilation via Discogs cross-reference."""
         db = AsyncMock()
