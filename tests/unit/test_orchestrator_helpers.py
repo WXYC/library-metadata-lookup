@@ -2296,18 +2296,28 @@ class TestFetchArtworkRowlessBindKillSwitch:
 
 
 class TestFetchArtworkFoundOnCompilation:
-    """LML#684: a ``found_on_compilation`` in-library result carries a validated
-    ``ResolvedRelease`` on the seam. When the artist-floor re-search rejects the
-    candidate — the systematic failure for a *non*-Various-Artists trio /
-    collaboration credit (e.g. library row filed under "Bill Orcutt" vs the
-    Discogs trio credit on "Orcutt Shelley Miller", release 34993109) — the
-    carried release must still surface its artwork.
+    """LML#684 (widened): a ``found_on_compilation`` in-library result carries a
+    validated ``ResolvedRelease`` on the seam, and that release is preferred over
+    the artist-floor re-search for artwork binding.
+
+    Two failure modes the carried bind covers:
+
+    - The floor re-search *rejects* every candidate — the systematic failure for
+      a *non*-Various-Artists trio / collaboration credit (library row filed
+      under "Bill Orcutt" vs the Discogs trio credit on "Orcutt Shelley Miller",
+      release 34993109). Without the bind the row surfaces with no artwork.
+    - The floor re-search *clears on the wrong release* — for a generic V/A comp
+      title the floor (title+artist similarity only, never track-validated) can
+      bind a *same-titled* release that does not carry the track. This is the
+      prod divergence (LML#956) where "Greatest hits of the 50s & 60s"
+      bound Plaza House's 13332759 instead of the validated 605487.
 
     The carried release was already validated by ``validate_release_for_track``
-    during ``search_compilations_for_track``, so trust-binding it costs no extra
-    Discogs fan-out (unlike the ``lml_resolve_compilation_release`` lazy
-    ``resolve_release_for_track`` fallback). The bind is therefore independent of
-    that flag — these tests run with it at its default (off).
+    during ``search_compilations_for_track``, so it is strictly more trustworthy
+    than the floor pick and binding it costs no extra Discogs fan-out (unlike the
+    ``lml_resolve_compilation_release`` lazy ``resolve_release_for_track``
+    fallback). The bind is therefore independent of that flag — these tests run
+    with it at its default (off).
     """
 
     def _trio_inputs(self):
@@ -2381,12 +2391,21 @@ class TestFetchArtworkFoundOnCompilation:
         svc.get_release.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_floor_match_preferred_over_carried_bind(self):
-        """When the floor re-search DOES clear (the Various-Artists case that
-        already works), the floor result is used as before — the #684 bind is a
-        fallback for the rejection case only, not a replacement for the floor."""
+    async def test_carried_validated_release_preferred_over_floor_match(self):
+        """The carried release wins even when the floor re-search clears.
+
+        The floor re-search is only a title+artist similarity match (never
+        track-validated), so for a generic V/A comp title it can clear the floor
+        on a *same-titled* release that does NOT carry the track — the prod
+        divergence where "Greatest hits of the 50s & 60s" bound Plaza House's
+        13332759 instead of the validated 605487. The carried release WAS
+        track-validated in search_compilations_for_track, so it must win over the
+        unvalidated floor pick, not merely serve as a fallback when the floor
+        rejects. Binding the carried release also skips the re-search entirely.
+        """
         item, discogs_titles, svc = self._trio_inputs()
-        # This time the floor search returns a clean, matching candidate.
+        # Even when the floor search returns a clean, matching candidate, the
+        # validated carried release (34993109) is preferred over it (111).
         svc.search = AsyncMock(
             return_value=DiscogsSearchResponse(
                 results=[
@@ -2411,10 +2430,11 @@ class TestFetchArtworkFoundOnCompilation:
 
         bound = results[0][1]
         assert bound is not None
-        assert bound.release_id == 111
-        assert bound.artwork_url == "https://i.discogs.com/floor.jpg"
-        # Floor cleared, so the carried-release trust-bind never fired.
-        svc.get_release.assert_not_awaited()
+        assert bound.release_id == 34993109
+        assert bound.artwork_url == "https://i.discogs.com/osm.jpg"
+        # The carried release binds before the re-search, so the floor never runs.
+        svc.search.assert_not_awaited()
+        svc.get_release.assert_awaited()
 
 
 class TestFetchArtworkFallback:

@@ -246,6 +246,27 @@ async def fetch_artwork_for_items(
                     discogs_service, resolved, item, album=request_album
                 )
 
+            # Found-on-compilation trust-bind (LML#684, widened): an in-library
+            # compilation row carries a release the strategy already resolved AND
+            # track-validated this same request (via validate_release_for_track in
+            # search_compilations_for_track). The title+artist re-search below
+            # scores candidates against the row's OWN title (album_variants
+            # appends item.title), so for a generic V/A comp title it can bind a
+            # *same-titled* release that does NOT carry the track — the prod
+            # divergence (LML#956) where "Greatest hits of the 50s & 60s" bound
+            # Plaza House's 13332759 instead of the validated 605487. The carried release is
+            # already validated and binding it costs no extra Discogs fan-out (only
+            # a cached get_release), so prefer it over the unvalidated title pick —
+            # not only when the search returns None (#684's original gate) but
+            # whenever a validated release is carried. Independent of
+            # lml_resolve_compilation_release (that flag was off at prod runtime).
+            # The row-less (id==0) carry-through is bound by the flag-gated
+            # bind_carried branch above, so it is excluded here.
+            if found_on_compilation and resolved is not None and item.id != ROWLESS_LIBRARY_ID:
+                return await _bind_resolved_release(
+                    discogs_service, resolved, item, album=request_album
+                )
+
             album = resolved.album_title if resolved is not None else item.title
 
             # Self-titled albums stored as "S/t" should use the artist name
@@ -308,24 +329,11 @@ async def fetch_artwork_for_items(
                 title_fn=lambda r: r.album,
             )
             if result is None:
-                # LML#684: a found-on-compilation in-library row carries a
-                # release the search strategy already resolved AND validated this
-                # same request (via validate_release_for_track in
-                # search_compilations_for_track). The artist-floor re-search above
-                # just rejected every candidate — the systematic failure for a
-                # *non*-Various-Artists trio / collaboration credit (the row is
-                # filed under one member, e.g. "Bill Orcutt", but Discogs credits
-                # the full trio on "Orcutt Shelley Miller", release 34993109).
-                # Trust-bind the carried, validated release for artwork rather than
-                # dropping it. Independent of lml_resolve_compilation_release:
-                # binding an already-carried release costs no extra Discogs fan-out
-                # (only a cached get_release), unlike the lazy fallback below. The
-                # row-less (id==0) carry-through is handled by the flag-gated
-                # bind_carried branch at the top, so it is excluded here.
-                if found_on_compilation and resolved is not None and item.id != ROWLESS_LIBRARY_ID:
-                    return await _bind_resolved_release(
-                        discogs_service, resolved, item, album=request_album
-                    )
+                # A found-on-compilation in-library row that carries a validated
+                # release is already trust-bound above (before this re-search), so
+                # only the resolved-is-None cases reach here. The lazy fallback
+                # below resolves a release when the seam carried none.
+                #
                 # Lazy release-resolution fallback (LML#604): the artist floor
                 # rejected every candidate — the systematic failure for a V/A
                 # compilation row filed under the track artist. When the flag is
