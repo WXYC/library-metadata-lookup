@@ -1880,6 +1880,23 @@ class CriticReviewItem(BaseModel):
     )
 
 
+class WxycReviewItem(BaseModel):
+    review: str = Field(..., description="The DJ review body")
+    artistBlurb: str | None = Field(
+        None, description="Reviewer-written artist background, when provided"
+    )
+    recommendedTracks: str | None = Field(
+        None,
+        description='Raw recommended-tracks text, including the form\'s "!"-rating notation',
+    )
+    buzzwords: str | None = Field(
+        None, description="Comma-separated descriptors chosen by the reviewer"
+    )
+    submittedDate: str | None = Field(
+        None, description='Form submission date when available (e.g. "2024-03-15")'
+    )
+
+
 class AlbumMetadataResponse(BaseModel):
     discogsReleaseId: int | None = Field(None, description="Discogs release ID")
     discogsUrl: str | None = Field(None, description="Discogs release page URL")
@@ -1900,6 +1917,10 @@ class AlbumMetadataResponse(BaseModel):
     criticReviews: list[CriticReviewItem] | None = Field(
         None,
         description="Attributed external critic-review snippets, each linking out to the original",
+    )
+    wxycReviews: list[WxycReviewItem] | None = Field(
+        None,
+        description="Consented WXYC DJ album reviews (social_consent = true) for this album. Reviewer identity is never included.",
     )
     spotifyUrl: str | None = Field(None, description="Spotify URL for the album or track")
     appleMusicUrl: str | None = Field(None, description="Apple Music URL for the album or track")
