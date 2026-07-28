@@ -150,6 +150,87 @@ def _log_album_title_fallback(
         logger.warning("Failed to project album_title_fallback onto Sentry transaction: %s", e)
 
 
+# LML#973: the compilation title-ratio carve-out floor. `process_release`'s
+# strict branch and `_fallback_row_acceptable` (its album-title-fallback
+# counterpart) both gate a Various-Artists library row admitted purely on
+# title fuzz through this one floor plus the scope guard below -- named once
+# at module scope so the two call sites can't drift the way a duplicated
+# ad hoc `title_score >= 80` literal did pre-#973.
+_COMPILATION_TITLE_RATIO_FLOOR = 80
+
+# Below this length a token can't carry independent meaning EXCEPT for the
+# compilation-title vocabulary this guard cares about -- decade tokens ("50s",
+# "60s") and edition markers ("vol") are exactly 3 characters, so the floor
+# here is one lower than the `len(w) > 3` threshold this module's own
+# keyword-search significance filter uses a few lines down in
+# `search_compilations_for_track`.
+_SIGNIFICANT_TITLE_WORD_MIN_LEN = 3
+
+
+def _significant_title_words(title: str) -> set[str]:
+    """Content-bearing words in a compilation title, for the #973 scope guard.
+
+    Strips apostrophes before tokenizing so "50's" and "50s" collapse to the
+    same token -- left alone, the apostrophe would otherwise split "50's"
+    into the throwaway tokens "50" and "s" -- then drops punctuation,
+    ``STOPWORDS``, and words too short to carry meaning on their own.
+    """
+    stripped = title.replace("'", "")
+    words = re.sub(r"[^\w\s]", " ", stripped.lower()).split()
+    return {w for w in words if len(w) >= _SIGNIFICANT_TITLE_WORD_MIN_LEN and w not in STOPWORDS}
+
+
+def _library_title_claims_extra_scope(release_album: str, library_title: str) -> bool:
+    """Does the library row's title assert content the *validated* Discogs
+    release title doesn't?
+
+    Root cause (LML#959): a title-ratio match alone can't tell "same comp,
+    filed under a shortened title" apart from "different comp, similarly
+    worded title" -- library row 58775 ("...50s & 60s") fuzz-matched the
+    Discogs release actually validated to carry the track ("...50's") at
+    ratio ~87, but the two are different pressings, and 58775's own copy
+    lacks the track. The ratio alone can't separate them (both same-comp
+    abbreviations and different-comp near-misses can land at any ratio
+    >= 80); what does is that the library title adds a *new* significant
+    word ("60s") the validated release's title doesn't have -- it asserts
+    scope beyond what was actually validated.
+
+    Deliberately asymmetric: a library title that only *omits* words the
+    Discogs title has (the far more common card-catalog pattern -- dropping
+    a subtitle, an edition tag, a leading article) is unaffected, since it
+    doesn't claim anything the validation didn't cover. Only new words on
+    the library side trip this guard.
+
+    A blunt, title-text-only heuristic (see #959's options analysis): it
+    won't catch every wrong-pressing collision, and a word-level
+    abbreviation that isn't a shared token (e.g. "Volume" -> "Vol") can
+    misread as a "new" word. The precision follow-ups -- #959 option 2's
+    track/artist-credit gate (blocked on discogs-etl#332) and option 3's
+    structural per-row release map -- are what close that gap; #973 is
+    "tighten the carve-out" only, by design.
+    """
+    extra = _significant_title_words(library_title) - _significant_title_words(release_album)
+    return bool(extra)
+
+
+def _title_ratio_carveout_admits(release_album: str, library_title: str) -> tuple[bool, float]:
+    """Shared verdict for the two `>= 80` title-ratio compilation carve-out
+    sites (`process_release`'s strict branch and `_fallback_row_acceptable`).
+    One function so LML#973's fix can't drift between the two call sites.
+
+    Returns ``(admitted, title_score)`` -- callers keep the score for their
+    own debug logging.
+    """
+    from rapidfuzz import fuzz as _fuzz
+
+    title_score = _fuzz.ratio(release_album.lower(), library_title.lower())
+    if title_score < _COMPILATION_TITLE_RATIO_FLOOR:
+        return False, title_score
+    if _library_title_claims_extra_scope(release_album, library_title):
+        return False, title_score
+    return True, title_score
+
+
 async def search_compilations_for_track(
     db: LibraryDB,
     parsed: ParsedRequest,
@@ -485,18 +566,17 @@ async def search_compilations_for_track(
                 matches = await search_album_fuzzy(db, f"Various {release_album}")
 
             if matches and lib_artist and not skip_artist_match_filter:
-                from rapidfuzz import fuzz as _fuzz
-
                 filtered_matches = []
                 discogs_is_compilation = release_info.is_compilation
-                release_album_lower = release_album.lower()
 
                 for match in matches:
                     if artist_matches_item(match, lib_artist):
                         filtered_matches.append(match)
                     elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
-                        title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
-                        if title_score >= 80:
+                        admitted, title_score = _title_ratio_carveout_admits(
+                            release_album, match.title or ""
+                        )
+                        if admitted:
                             filtered_matches.append(match)
                         else:
                             logger.debug(
@@ -514,19 +594,21 @@ async def search_compilations_for_track(
 
                 lib_artist_norm = normalize_for_comparison(lib_artist)
                 discogs_is_compilation = release_info.is_compilation
-                release_album_lower = release_album.lower()
 
                 def _fallback_row_acceptable(match: LibraryItem) -> bool:
                     # Legitimate Various-Artists compilation rows share no artist
                     # tokens with a typed solo/track artist, so the fuzzy floor
                     # would wrongly drop them. Keep them on a title match instead,
-                    # mirroring the strict branch's compilation carve-out above.
-                    # ``is_compilation_artist`` is False for coincidental
-                    # wrong-artist collisions (e.g. "Galaxy 2 Galaxy"), so this
-                    # does not re-open the #717 bug.
+                    # via the SAME shared carve-out the strict branch above uses
+                    # (LML#973 -- ratio floor plus the extra-scope guard), so the
+                    # two sites can't drift apart. ``is_compilation_artist`` is
+                    # False for coincidental wrong-artist collisions (e.g.
+                    # "Galaxy 2 Galaxy"), so this does not re-open the #717 bug.
                     if discogs_is_compilation and is_compilation_artist(match.artist or ""):
-                        title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
-                        return title_score >= 80
+                        admitted, _title_score = _title_ratio_carveout_admits(
+                            release_album, match.title or ""
+                        )
+                        return admitted
                     return (
                         max(
                             _fuzz.token_set_ratio(

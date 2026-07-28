@@ -931,7 +931,7 @@ class TestSearchCompilationsForTrack:
         comp = _item(
             id=46602,
             artist="Various Artists",
-            title="Trax Records 20th Anniversary Collection",
+            title="Trax Records 20th Anniversary Edition",
         )
 
         # Route by query content: only "Trax Records" matches the library.
