@@ -12,8 +12,10 @@ is a plain Sentry tag, not a ``cache_stats`` key — string-valued, and the #907
 ``cache_stats`` seam (``_LML_CACHE_STATS_EXTRA_KEYS`` in ``lookup/router.py``)
 is numeric-only (``dict[str, float]`` via ``CacheStatsRecorder.record()``), so
 it rides the sibling per-request Sentry-tag / PostHog-freeform-dict channel
-instead. Forward-compatible: LML#929 is expected to add ``"library_search"``
-as a third value; no rework needed here.
+instead. LML#929 added the third value ``"library_search"`` — emitted from
+``library/router.py``'s ``search_library`` handler (the local-catalog search
+path, which invokes zero Discogs/Apple/streaming/enrichment code) so the #931
+observability residual can slice the protected-search traffic class.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 ENDPOINT_FAMILY_LOOKUP = "lookup"
 ENDPOINT_FAMILY_LOOKUP_BULK = "lookup_bulk"
+ENDPOINT_FAMILY_LIBRARY_SEARCH = "library_search"
 
 
 def record_endpoint_family_tag(endpoint_family: str) -> None:
