@@ -1,10 +1,11 @@
 """Apple Music URL ID extraction.
 
-Hoisted out of ``release/orchestrator.py`` so the lookup orchestrator can
-extract the album_id from a freshly-resolved Apple Music URL without
-importing a ``_``-prefixed private symbol across modules. The regex and
-helper move together unchanged; ``release.orchestrator`` keeps thin
-backwards-compatible aliases so existing call sites continue to work.
+Originally hoisted out of ``release/orchestrator.py`` so the lookup
+orchestrator can extract the album_id from a freshly-resolved Apple Music
+URL without importing a ``_``-prefixed private symbol across modules.
+``release/orchestrator.py`` (and the release-resolve endpoint it served) was
+later removed entirely (WXYC/wiki#87); this parser is unaffected since
+``lookup/streaming_url_postprocess.py`` imports it directly.
 """
 
 from __future__ import annotations

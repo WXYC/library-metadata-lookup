@@ -1,7 +1,9 @@
 """Parse Discogs and Bandcamp URLs into a (source, identifier) tuple.
 
-Used by the ``POST /api/v1/releases/resolve`` endpoint to dispatch a pasted URL
-to the right resolver.
+Used by ``identity/release_validation.py`` to validate a Bandcamp
+``external_id`` on ``POST /api/v1/identity/resolve``. Originally also backed
+the ``POST /api/v1/releases/resolve`` endpoint's URL dispatch, but that
+endpoint was removed (WXYC/wiki#87).
 
 The identifier shape depends on source:
 

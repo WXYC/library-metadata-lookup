@@ -8,7 +8,8 @@ extractor is this function.
 
 This is intentionally *stricter* than the loose
 ``release.orchestrator._spotify_album_id_from_url`` (regex ``[A-Za-z0-9]+``)
-that feeds the release-resolve endpoint's identifier merge. The cache/mint
+that fed the release-resolve endpoint's identifier merge before that
+endpoint was removed (WXYC/wiki#87). The cache/mint
 path keys the entity graph on the extracted ID, so the parser enforces the
 canonical 22-char base62 Spotify album-ID shape and surfaces a malformed ID
 as ``None`` — the post-process then skips the mint (the same defense-in-depth

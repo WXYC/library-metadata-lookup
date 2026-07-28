@@ -1,4 +1,4 @@
-"""Tests for the Discogs/Bandcamp URL parser used by /api/v1/releases/resolve."""
+"""Tests for the Discogs/Bandcamp URL parser used by identity/release_validation.py."""
 
 from __future__ import annotations
 
