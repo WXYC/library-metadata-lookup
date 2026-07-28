@@ -23,11 +23,12 @@ from clients.streaming.spotify import SpotifyClient
 from config.settings import get_settings
 from core.bulk_body import parse_bulk_body
 from core.bulk_concurrency import (
+    ClientDisconnectedWhileQueuedError,
     acquire_bulk_global_permit,
     cancel_and_drain,
     is_low_priority_caller_class,
     max_concurrency_from_env,
-    maybe_acquire_bulk_global_permit,
+    maybe_acquire_bulk_global_permit_or_reap,
     resolve_caller_class,
     watch_disconnect,
 )
@@ -486,117 +487,134 @@ async def handle_lookup(
         set_skip_cache(True)
 
     try:
-        # LML#706 PR3: bound in-flight lookups process-wide. On this repo's
-        # Python (>=3.12) the `locked()` pre-check is EXACT, not racy: there is
-        # no await between the check and the acquire (one event-loop slice),
-        # and 3.12's `locked()` returns True when the value is exhausted OR
-        # waiters exist — the same predicate `acquire()` uses to decide whether
-        # to park. So `capped_on_arrival` ⇔ this request actually queued.
-        semaphore = _get_lookup_semaphore()
-        capped_on_arrival = semaphore.locked()
-        wait_start = time.perf_counter()
+        # LML#928/#953: class 5 (batch/cron/backfill) additionally routes this
+        # request onto the low-priority lane -- the same LML#716/#924
+        # process-global bulk permit `/lookup/bulk` items already share.
+        # Down-rank only: classes 1-4, absent, and invalid values resolve to a
+        # no-op (today's interactive-only behavior, unchanged). Resolved here,
+        # before ANY permit is touched -- LML#953 requires the bulk-global
+        # wait to happen BEFORE (outside) the interactive
+        # `LML_LOOKUP_MAX_CONCURRENT` semaphore below, so a class-5 request
+        # parked on a saturated bulk budget never pins an interactive slot
+        # while it waits (the #951 review's priority-inversion finding).
+        # Deadlock-free: nothing holding the bulk-global permit ever waits on
+        # the lookup semaphore, so acquiring strictly in this order can never
+        # form a cycle with the reverse order.
+        caller_class = resolve_caller_class(x_caller_class)
+        low_priority = is_low_priority_caller_class(caller_class)
 
-        # LML#715: reap callers that disconnect WHILE QUEUED. Starlette runs a
-        # non-streaming handler to completion after the client's socket closes,
-        # so a request whose caller already timed out and retried (the #706
-        # cold-storm shape) would otherwise keep its FIFO slot, later acquire a
-        # permit, and run a full cold lookup nobody receives — retry-amplified
-        # zombie work that spends the scarce cap. Race the permit acquire
-        # against the same `watch_disconnect` sentinel the /lookup/bulk and
-        # identity bulk-resolve paths use; on disconnect, cancel the acquire so
-        # the queue slot frees and no lookup runs. This guards the QUEUED phase
-        # ONLY — once the permit is held the sentinel is cancelled and
-        # perform_lookup runs to completion (a disconnect mid-lookup is not
-        # reaped; that phase already holds its resources).
-        #
-        # Cancelling `semaphore.acquire()` is permit-safe on this repo's Python
-        # (>=3.12): if the acquire is cancelled AFTER the permit was granted
-        # (the acquire/sentinel tie), Semaphore.acquire returns the permit and
-        # re-raises, so `cancel_and_drain` cannot strand a slot.
-        acquire_future = asyncio.ensure_future(semaphore.acquire())
-        sentinel_task = asyncio.create_task(
-            watch_disconnect(http_request), name="lml.lookup.disconnect_sentinel"
-        )
-        # A single guaranteed-release scope guards the permit from the moment it
-        # could be held. `cancel_and_drain` is a no-op on an already-done future,
-        # so it does NOT return a granted permit; and the sentinel cleanup on
-        # the success path can re-raise (a `receive()` error) before the lookup.
-        # Both are permit leaks on the process-global cap if release is tied to
-        # a narrower `try`. Track "did we end up holding a permit" explicitly and
-        # release it once in the outer `finally`, whatever path we leave by.
-        permit_held = False
-        try:
-            try:
-                done, _pending = await asyncio.wait(
-                    {acquire_future, sentinel_task}, return_when=asyncio.FIRST_COMPLETED
-                )
-            except BaseException:
-                # Handler cancellation can arrive with the acquire already
-                # granted (grant + cancel in the same loop cycle). Drain the
-                # acquire, then flag the granted permit so the outer `finally`
-                # releases it — a still-pending acquire drains as CANCELLED and
-                # never took a permit, so it stays False.
-                await cancel_and_drain(acquire_future)
-                permit_held = acquire_future.done() and not acquire_future.cancelled()
-                await cancel_and_drain(sentinel_task)
-                raise
+        async with maybe_acquire_bulk_global_permit_or_reap(
+            low_priority, http_request
+        ) as bulk_wait_ms:
+            # LML#706 PR3: bound in-flight lookups process-wide. On this repo's
+            # Python (>=3.12) the `locked()` pre-check is EXACT, not racy: there is
+            # no await between the check and the acquire (one event-loop slice),
+            # and 3.12's `locked()` returns True when the value is exhausted OR
+            # waiters exist — the same predicate `acquire()` uses to decide whether
+            # to park. So `capped_on_arrival` ⇔ this request actually queued.
+            semaphore = _get_lookup_semaphore()
+            capped_on_arrival = semaphore.locked()
+            wait_start = time.perf_counter()
 
-            # Tie broken toward "acquired": if both completed, the acquire holds
-            # a permit, so proceed rather than reap. `acquire_future.done()` is
-            # exact here — no await separates the wait() return from this check,
-            # so the single event loop cannot flip the state underneath us.
-            if sentinel_task in done and not acquire_future.done():
-                # Client departed while queued. Free the never-taken slot and
-                # short-circuit; nobody reads the body. The tag mirrors the bulk
-                # path so `lml.client_aborted:true` surfaces reaped requests in
-                # the Sentry trace explorer.
-                await cancel_and_drain(acquire_future)
-                sentry_sdk.set_tag("lml.client_aborted", "true")
-                logger.warning(
-                    "lookup reaped: client disconnected while queued on the in-flight cap"
-                )
-                http_response.status_code = 499
-                return LookupResponse(results=[], search_type="none")
-
-            # Permit held from here — the outer `finally` owns its release, so a
-            # raising sentinel drain (below) or perform_lookup error can't strand
-            # it.
-            permit_held = True
-            # Stop watching for disconnect; the permit-held phase is not reaped.
-            await cancel_and_drain(sentinel_task)
-            # `queue_wait` Server-Timing leg (LML#907 follow-up): always
-            # computed (0.0 when uncontended) so it always renders via `extra`
-            # below; `total` (built after this point) never includes it.
-            queue_wait_ms = 0.0
-            if capped_on_arrival:
-                queue_wait_ms = (time.perf_counter() - wait_start) * 1000.0
-                _project_inflight_capped(queue_wait_ms)
-                # Debit the queue wait from the caller's budget so the A8 /
-                # LML#345 contract ("LML returns slightly before the caller
-                # times out") holds under saturation — the pipeline's budget
-                # clock only starts inside perform_lookup. Floor at 1: the
-                # budget resolver treats non-positive as "unset → env
-                # default", which would hand the MOST delayed caller the
-                # LARGEST budget. A 1ms budget short-circuits the pipeline
-                # almost immediately — the cheap outcome the (likely already
-                # timed-out) caller would want.
-                if x_caller_budget_ms is not None and x_caller_budget_ms > 0:
-                    x_caller_budget_ms = max(1, x_caller_budget_ms - int(queue_wait_ms))
-            # Constructed inside the permit so telemetry's total-duration
-            # series keeps meaning "lookup work", not "queue wait + work" —
-            # the wait is reported separately via the Sentry measurement.
-            telemetry = RequestTelemetry(
-                api_call_keys=["discogs"],
-                distinct_id="library-metadata-lookup-service",
-                event_prefix="lookup",
+            # LML#715: reap callers that disconnect WHILE QUEUED. Starlette runs a
+            # non-streaming handler to completion after the client's socket closes,
+            # so a request whose caller already timed out and retried (the #706
+            # cold-storm shape) would otherwise keep its FIFO slot, later acquire a
+            # permit, and run a full cold lookup nobody receives — retry-amplified
+            # zombie work that spends the scarce cap. Race the permit acquire
+            # against the same `watch_disconnect` sentinel the /lookup/bulk and
+            # identity bulk-resolve paths use; on disconnect, cancel the acquire so
+            # the queue slot frees and no lookup runs. This guards the QUEUED phase
+            # ONLY — once the permit is held the sentinel is cancelled and
+            # perform_lookup runs to completion (a disconnect mid-lookup is not
+            # reaped; that phase already holds its resources).
+            #
+            # Cancelling `semaphore.acquire()` is permit-safe on this repo's Python
+            # (>=3.12): if the acquire is cancelled AFTER the permit was granted
+            # (the acquire/sentinel tie), Semaphore.acquire returns the permit and
+            # re-raises, so `cancel_and_drain` cannot strand a slot.
+            acquire_future = asyncio.ensure_future(semaphore.acquire())
+            sentinel_task = asyncio.create_task(
+                watch_disconnect(http_request), name="lml.lookup.disconnect_sentinel"
             )
-            # LML#928: class 5 (batch/cron/backfill) additionally routes this
-            # request onto the low-priority lane -- the same LML#716/#924
-            # process-global bulk permit `/lookup/bulk` items already share.
-            # Down-rank only: classes 1-4, absent, and invalid values resolve
-            # to a no-op here (today's interactive-only behavior, unchanged).
-            caller_class = resolve_caller_class(x_caller_class)
-            async with maybe_acquire_bulk_global_permit(is_low_priority_caller_class(caller_class)):
+            # A single guaranteed-release scope guards the permit from the moment it
+            # could be held. `cancel_and_drain` is a no-op on an already-done future,
+            # so it does NOT return a granted permit; and the sentinel cleanup on
+            # the success path can re-raise (a `receive()` error) before the lookup.
+            # Both are permit leaks on the process-global cap if release is tied to
+            # a narrower `try`. Track "did we end up holding a permit" explicitly and
+            # release it once in the outer `finally`, whatever path we leave by.
+            permit_held = False
+            try:
+                try:
+                    done, _pending = await asyncio.wait(
+                        {acquire_future, sentinel_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                except BaseException:
+                    # Handler cancellation can arrive with the acquire already
+                    # granted (grant + cancel in the same loop cycle). Drain the
+                    # acquire, then flag the granted permit so the outer `finally`
+                    # releases it — a still-pending acquire drains as CANCELLED and
+                    # never took a permit, so it stays False.
+                    await cancel_and_drain(acquire_future)
+                    permit_held = acquire_future.done() and not acquire_future.cancelled()
+                    await cancel_and_drain(sentinel_task)
+                    raise
+
+                # Tie broken toward "acquired": if both completed, the acquire holds
+                # a permit, so proceed rather than reap. `acquire_future.done()` is
+                # exact here — no await separates the wait() return from this check,
+                # so the single event loop cannot flip the state underneath us.
+                if sentinel_task in done and not acquire_future.done():
+                    # Client departed while queued. Free the never-taken slot and
+                    # short-circuit; nobody reads the body. The tag mirrors the bulk
+                    # path so `lml.client_aborted:true` surfaces reaped requests in
+                    # the Sentry trace explorer.
+                    await cancel_and_drain(acquire_future)
+                    sentry_sdk.set_tag("lml.client_aborted", "true")
+                    logger.warning(
+                        "lookup reaped: client disconnected while queued on the in-flight cap"
+                    )
+                    http_response.status_code = 499
+                    return LookupResponse(results=[], search_type="none")
+
+                # Permit held from here — the outer `finally` owns its release, so a
+                # raising sentinel drain (below) or perform_lookup error can't strand
+                # it.
+                permit_held = True
+                # Stop watching for disconnect; the permit-held phase is not reaped.
+                await cancel_and_drain(sentinel_task)
+                # `queue_wait` Server-Timing leg (LML#907 follow-up, extended by
+                # LML#953): the sum of BOTH gates' measured wait -- the
+                # bulk-global wait (`bulk_wait_ms`, 0.0 unless this is a capped
+                # class-5 request) plus this semaphore's own wait -- always
+                # computed (0.0 when uncontended on both) so it always renders
+                # via `extra` below; `total` (built after this point) never
+                # includes it.
+                queue_wait_ms = bulk_wait_ms
+                if capped_on_arrival:
+                    interactive_wait_ms = (time.perf_counter() - wait_start) * 1000.0
+                    _project_inflight_capped(interactive_wait_ms)
+                    queue_wait_ms += interactive_wait_ms
+                # Debit the TOTAL queue wait (bulk-global + interactive) from the
+                # caller's budget so the A8 / LML#345 contract ("LML returns
+                # slightly before the caller times out") holds under saturation
+                # on EITHER gate — the pipeline's budget clock only starts
+                # inside perform_lookup. Floor at 1: the budget resolver treats
+                # non-positive as "unset → env default", which would hand the
+                # MOST delayed caller the LARGEST budget. A 1ms budget
+                # short-circuits the pipeline almost immediately — the cheap
+                # outcome the (likely already timed-out) caller would want.
+                if queue_wait_ms > 0 and x_caller_budget_ms is not None and x_caller_budget_ms > 0:
+                    x_caller_budget_ms = max(1, x_caller_budget_ms - int(queue_wait_ms))
+                # Constructed inside the permit so telemetry's total-duration
+                # series keeps meaning "lookup work", not "queue wait + work" —
+                # the wait is reported separately via the Sentry measurement.
+                telemetry = RequestTelemetry(
+                    api_call_keys=["discogs"],
+                    distinct_id="library-metadata-lookup-service",
+                    event_prefix="lookup",
+                )
                 response = await perform_lookup(
                     request=request,
                     db=db,
@@ -611,9 +629,9 @@ async def handle_lookup(
                     discogs_cache_pg=discogs_cache_pg,
                     caller_budget_ms=x_caller_budget_ms,
                 )
-        finally:
-            if permit_held:
-                semaphore.release()
+            finally:
+                if permit_held:
+                    semaphore.release()
 
         # Attach cache stats. wxyc-shared#86 has shipped the typed CacheStats
         # Pydantic model, so the response field is no longer dict-shaped —
@@ -664,6 +682,15 @@ async def handle_lookup(
 
     except HTTPException:
         raise
+    except ClientDisconnectedWhileQueuedError:
+        # LML#953: client departed while parked on a saturated bulk-global
+        # budget -- mirrors the in-flight cap's own reap branch above (the
+        # tag/log/499 shape), just for the OUTER gate instead of the inner
+        # one. The permit was never taken; nobody reads the body.
+        sentry_sdk.set_tag("lml.client_aborted", "true")
+        logger.warning("lookup reaped: client disconnected while queued on the bulk-global permit")
+        http_response.status_code = 499
+        return LookupResponse(results=[], search_type="none")
     except Exception as e:
         logger.error(f"Lookup failed: {e}")
         raise HTTPException(status_code=500, detail="Internal server error") from e
