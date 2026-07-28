@@ -43,6 +43,79 @@ class TestFTS5Search:
         assert results == []
 
 
+class TestFTS5PunctuationEscaping:
+    """LML#972: FTS5 metacharacters in a query (``.``, ``"``, ``*``, ``:``, ``(``, ``)``)
+
+    must not raise ``fts5: syntax error`` and silently degrade to the LIKE-AND
+    fallback -- that fallback requires every significant token to co-occur on
+    one row, which drops real matches like "M.I.A." (whose album is "Kala",
+    sharing no token with the artist query).
+    """
+
+    @pytest.mark.asyncio
+    async def test_punctuated_artist_name_matches_via_fts(self, library_db):
+        """A query for 'M.I.A.' finds the seeded row via a real FTS match.
+
+        Before the fix: MATCH 'M.I.A.' raises `fts5: syntax error near "."`,
+        caught by the broad except and degraded to LIKE-AND, which requires
+        "kala" AND "m" AND "i" AND "a" to all appear on one row -- so it
+        returns []. After the fix, the escaped MATCH tokenizes "M.I.A." into
+        `m i a`, which the FTS index actually contains for this row.
+
+        ``fallback_to_fuzzy=False`` isolates the FTS/LIKE path being fixed
+        here: with the default ``fallback_to_fuzzy=True``, this tiny seed
+        corpus lets the *fuzzy* fallback's permissive single-character-prefix
+        LIKE scan (``LIKE '%m%'``, then rapidfuzz-scored) coincidentally
+        catch "M.I.A." too, which would mask the FTS regression this test
+        exists to catch.
+        """
+        results = await library_db.search(query="M.I.A.", fallback_to_fuzzy=False)
+        assert any(r.artist == "M.I.A." for r in results), results
+
+    @pytest.mark.asyncio
+    async def test_punctuated_artist_name_matches_with_default_fallback_chain(self, library_db):
+        """Same query through the full default fallback chain (fuzzy included)."""
+        results = await library_db.search(query="M.I.A.")
+        assert any(r.artist == "M.I.A." for r in results), results
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "M.I.A.",
+            'a "quoted" thing',
+            "wild*card",
+            "colon:test",
+            "(paren)",
+            "St. Vincent",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_metacharacter_queries_do_not_raise(self, library_db, query):
+        """None of the FTS5 metacharacter class should raise; all return a list."""
+        results = await library_db.search(query=query)
+        assert isinstance(results, list)
+
+    @pytest.mark.parametrize("query", ["", "   ", "\t\n"])
+    @pytest.mark.asyncio
+    async def test_empty_or_whitespace_query_guarded(self, library_db, query):
+        """An empty/all-whitespace query must never reach `MATCH ''` (also a syntax error).
+
+        It should be guarded and routed straight to the LIKE/fuzzy fallback
+        chain instead, returning a (possibly empty) list without raising.
+        """
+        results = await library_db.search(query=query)
+        assert isinstance(results, list)
+
+    @pytest.mark.asyncio
+    async def test_clean_multiword_query_unaffected(self, library_db):
+        """Escaping is equivalence-preserving: a clean multi-word query still
+        returns the same rows as before the fix (same rows as
+        ``test_combined_artist_album``)."""
+        results = await library_db.search(query="Stereolab Dots Loops")
+        assert len(results) >= 1
+        assert any(r.title == "Dots and Loops" for r in results)
+
+
 class TestFilteredSearch:
     @pytest.mark.asyncio
     async def test_artist_filter(self, library_db):
