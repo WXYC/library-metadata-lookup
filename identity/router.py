@@ -43,7 +43,7 @@ from generated.api_models import (
     ReleaseIdentityResolveResponse,
 )
 from identity.bulk_resolve import compilation_result, compose_for_identity
-from identity.dependencies import get_entity_store
+from identity.dependencies import get_entity_store, require_entity_store
 from identity.models import (
     BulkIdentityRequest,
     BulkIdentityResponse,
@@ -109,13 +109,6 @@ _ENTITY_STORE_UNAVAILABLE_DETAIL = (
 )
 
 
-def _require_entity_store(store: EntityStore | None) -> EntityStore:
-    """Raise 503 if the entity store is not available."""
-    if store is None:
-        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
-    return store
-
-
 @router.get(
     "/resolve",
     response_model=IdentityResponse,
@@ -131,7 +124,7 @@ async def resolve_identity(
     entity_store: EntityStore | None = Depends(get_entity_store),
 ) -> IdentityResponse:
     """Look up a single artist name in the entity identity store."""
-    store = _require_entity_store(entity_store)
+    store = require_entity_store(entity_store)
     try:
         identity = await store.get_identity(name)
     except TRANSIENT_PG_ERRORS:
@@ -160,7 +153,7 @@ async def bulk_resolve_identities(
     Returns resolved identities and a list of names that could not be found.
     Designed for batch consumers like semantic-index (20-30K artists).
     """
-    store = _require_entity_store(entity_store)
+    store = require_entity_store(entity_store)
 
     identities: list[IdentityResponse] = []
     unresolved: list[str] = []
@@ -232,7 +225,7 @@ async def bulk_resolve_libraries(
         http_request, BulkResolveLibrariesRequest, _BULK_RESOLVE_INPUT_CAP, field="inputs"
     )
 
-    store = _require_entity_store(entity_store)
+    store = require_entity_store(entity_store)
 
     # Entry signal (LML#430, sibling-of-#371). Fires before the per-input PG
     # loop, so a handler that hangs inside the loop still leaves a trace —
@@ -454,7 +447,7 @@ async def resolve_release_identity(
     trace; the exit log fires after the span closes so its timestamp reflects
     span completion.
     """
-    store = _require_entity_store(entity_store)
+    store = require_entity_store(entity_store)
 
     try:
         canonical_external_id = validate_and_canonicalize_external_id(

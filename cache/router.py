@@ -54,7 +54,7 @@ from core.bulk_concurrency import (
 from core.dependencies import get_discogs_service, get_musicbrainz_pg
 from discogs.service import DiscogsService
 from entity.store import EntityStore
-from identity.dependencies import get_entity_store
+from identity.dependencies import get_entity_store, require_entity_store
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
@@ -93,21 +93,10 @@ _REFRESH_DEFAULT_CONCURRENCY = 10
 
 _REFRESH_ROUTE = "/api/v1/cache/refresh-for-identities"
 
-_ENTITY_STORE_UNAVAILABLE_DETAIL = (
-    "Entity store is not available. Ensure DATABASE_URL_DISCOGS is configured "
-    "and the entity schema has been applied."
-)
-
 _DISCOGS_SERVICE_UNAVAILABLE_DETAIL = (
     "Discogs service is not available. Ensure DISCOGS_TOKEN (or "
     "DISCOGS_API_KEY / DISCOGS_API_SECRET) is configured."
 )
-
-
-def _require_entity_store(store: EntityStore | None) -> EntityStore:
-    if store is None:
-        raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
-    return store
 
 
 def _require_discogs_service(service: DiscogsService | None) -> DiscogsService:
@@ -163,7 +152,7 @@ async def handle_refresh_for_identities(
         cap_status=400,
     )
 
-    store = _require_entity_store(entity_store)
+    store = require_entity_store(entity_store)
     discogs = _require_discogs_service(discogs_service)
 
     identity_ids = request.identity_ids
