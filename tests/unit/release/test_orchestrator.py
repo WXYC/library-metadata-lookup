@@ -13,7 +13,7 @@ from generated.api_models import (
 from release.apple_music_url_parser import apple_album_id_from_url
 from release.models import ReleaseResolveRequest
 from release.orchestrator import (
-    _ResolverDependencies,
+    ResolverDependencies,
     _spotify_album_id_from_url,
     resolve_release,
 )
@@ -29,8 +29,8 @@ def _deps(
     apple_music=None,
     entity_store=None,
 ):
-    """Build a _ResolverDependencies with sensible defaults for tests."""
-    return _ResolverDependencies(
+    """Build a ResolverDependencies with sensible defaults for tests."""
+    return ResolverDependencies(
         discogs=discogs or AsyncMock(),
         bandcamp=bandcamp or MagicMock(),
         spotify=spotify,

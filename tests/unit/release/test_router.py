@@ -12,7 +12,7 @@ from generated.api_models import (
     DiscogsReleaseMetadata,
 )
 from release.dependencies import get_resolver_dependencies
-from release.orchestrator import _ResolverDependencies
+from release.orchestrator import ResolverDependencies
 from streaming.models import SourceMatch, StreamingCheckResponse, StreamingCheckSources
 from tests.unit.conftest import override_deps
 
@@ -33,10 +33,10 @@ def _release(**overrides) -> DiscogsReleaseMetadata:
 
 
 def _deps_with_discogs(release):
-    """Build a _ResolverDependencies whose Discogs service returns the given release."""
+    """Build a ResolverDependencies whose Discogs service returns the given release."""
     discogs = AsyncMock()
     discogs.get_release.return_value = release
-    return _ResolverDependencies(
+    return ResolverDependencies(
         discogs=discogs,
         bandcamp=MagicMock(),
         spotify=None,

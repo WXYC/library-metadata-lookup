@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends
 
 from release.dependencies import get_resolver_dependencies
 from release.models import ReleaseResolveRequest, ReleaseResolveResponse
-from release.orchestrator import _ResolverDependencies, resolve_release
+from release.orchestrator import ResolverDependencies, resolve_release
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ router = APIRouter(tags=["release"])
 )
 async def handle_resolve(
     request: ReleaseResolveRequest,
-    deps: _ResolverDependencies = Depends(get_resolver_dependencies),
+    deps: ResolverDependencies = Depends(get_resolver_dependencies),
 ) -> ReleaseResolveResponse:
     """Resolve and return. Errors are converted to warnings inside the orchestrator."""
     return await resolve_release(request, deps)

@@ -56,7 +56,7 @@ from streaming.orchestrator import check_streaming_availability
 logger = logging.getLogger(__name__)
 
 
-class _ResolverDependencies:
+class ResolverDependencies:
     """Bundle the I/O dependencies the orchestrator needs.
 
     Kept as a private class so the FastAPI router (and the tests) can build
@@ -84,7 +84,7 @@ class _ResolverDependencies:
 
 async def resolve_release(
     request: ReleaseResolveRequest,
-    deps: _ResolverDependencies,
+    deps: ResolverDependencies,
 ) -> ReleaseResolveResponse:
     """Resolve a paste-URL or (source, id) into the prefill payload."""
     parsed = _resolve_to_parsed_url(request)
@@ -165,7 +165,7 @@ def _resolve_to_parsed_url(request: ReleaseResolveRequest) -> ParsedUrl | None:
 async def _check_streaming(
     canonical: CanonicalRelease | None,
     parsed: ParsedUrl,
-    deps: _ResolverDependencies,
+    deps: ResolverDependencies,
     warnings: list[str],
 ) -> StreamingCheckResponse | None:
     """Run the streaming-availability fan-out.

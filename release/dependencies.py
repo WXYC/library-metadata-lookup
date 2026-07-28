@@ -12,7 +12,7 @@ from core.dependencies import get_discogs_service
 from discogs.service import DiscogsService
 from entity.store import EntityStore
 from identity.dependencies import get_entity_store
-from release.orchestrator import _ResolverDependencies
+from release.orchestrator import ResolverDependencies
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
@@ -28,14 +28,14 @@ def get_resolver_dependencies(
     deezer: DeezerClient = Depends(get_deezer_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     entity_store: EntityStore | None = Depends(get_entity_store),
-) -> _ResolverDependencies:
+) -> ResolverDependencies:
     """Bundle the I/O clients the resolver orchestrator needs.
 
     Reuses existing DI providers so the lifecycle (close on shutdown) is
     already wired in main.py. Spotify and the entity store are optional and
     may be None; the orchestrator handles that correctly.
     """
-    return _ResolverDependencies(
+    return ResolverDependencies(
         discogs=discogs,
         bandcamp=bandcamp,
         spotify=spotify,
