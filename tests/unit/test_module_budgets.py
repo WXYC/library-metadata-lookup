@@ -61,6 +61,7 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/strategies/track_release_matching.py": 550,
     "lookup/strategies/va_rescue.py": 300,
     "lookup/streaming_url_postprocess.py": 750,
+    "lookup/tail_deadline.py": 150,
     "lookup/timeouts.py": 100,
     "lookup/validation.py": 300,
 }

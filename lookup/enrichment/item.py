@@ -271,11 +271,22 @@ async def enrich_one(
         and not skip_happy_probe
         and not track_cache_hit
     ):
+        # LML#930: clamp the per-item Apple probe's fixed 4s ceiling to the
+        # remaining caller budget so one slow item can't burn the whole tail
+        # past the caller's window. With no deadline (a direct
+        # ``enrich_artwork_results`` caller) or no caller-budget header, this
+        # returns the unbounded ceiling unchanged.
+        base_apple_timeout_s = apple_music_lookup_timeout_s()
+        apple_probe_timeout_s = (
+            ctx.spine_deadline.clamp_probe_timeout_s(base_apple_timeout_s)
+            if ctx.spine_deadline is not None
+            else base_apple_timeout_s
+        )
         try:
             if library_row_acceptable:
                 apple_music_url = await asyncio.wait_for(
                     ctx.apple_music.find_track_url(row_artist, search_term, album=ctx.album),
-                    timeout=apple_music_lookup_timeout_s(),
+                    timeout=apple_probe_timeout_s,
                 )
                 # L1 write-back: persist a freshly-resolved track deep-link so
                 # the next lookup of this ``(artist, album, song)`` is a HIT.
@@ -295,7 +306,7 @@ async def enrich_one(
             else:
                 probe_match = await asyncio.wait_for(
                     ctx.apple_music.find_track_metadata(row_artist, search_term, album=ctx.album),
-                    timeout=apple_music_lookup_timeout_s(),
+                    timeout=apple_probe_timeout_s,
                 )
                 if probe_match is not None:
                     apple_music_url = probe_match.url

@@ -17,6 +17,7 @@ import pytest
 
 from discogs.models import DiscogsSearchResponse
 from generated.api_models import (
+    DegradedReason,
     DiscogsReleaseInfo,
     DiscogsTrackReleasesResponse,
     TrackMatchSource,
@@ -24,6 +25,7 @@ from generated.api_models import (
 from library.models import LibraryItem
 from lookup.models import LookupRequest, LookupResponse
 from lookup.orchestrator import LookupState, perform_lookup
+from lookup.spine_deadline import LIMIT_CALLER_BUDGET, SpineDeadline
 from tests.conftest import make_lml_telemetry
 from tests.factories import make_discogs_result, make_library_item
 
@@ -193,6 +195,75 @@ class TestPerformLookupBasic:
         assert isinstance(response, LookupResponse)
         assert len(response.results) == 1
         assert response.results[0].library_item.artist == "Queen"
+        # LML#930: a saturation-breaker shed is now marked degraded on the wire
+        # with the upstream_unavailable reason (distinct from a deadline shed).
+        assert response.degraded is True
+        assert response.degraded_reason == DegradedReason.upstream_unavailable
+
+    @pytest.mark.asyncio
+    async def test_tail_shed_on_caller_deadline_degrades_deadline_exceeded(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """LML#930: when the spine deadline is exhausted by the time the tail
+        would run, the enrichment tail is shed and the response is marked
+        degraded(deadline_exceeded) — the library match survives, the
+        live-Discogs/Apple tail steps never run, and it is NOT a 500 or an empty
+        timeout. ``SpineDeadline.tail_exhausted`` is forced True so step 2 (which
+        uses the real, un-exhausted ``step_timeout``) still completes and we
+        isolate the between-tail-step gate."""
+        mock_library_db.search.return_value = [queen_item]
+
+        request = LookupRequest(
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="Play A Night at the Opera by Queen",
+        )
+
+        miss_probe = AsyncMock()
+        enrich = AsyncMock()
+        with (
+            patch.object(
+                SpineDeadline,
+                "tail_exhausted",
+                return_value=(True, -50.0, LIMIT_CALLER_BUDGET),
+            ),
+            patch("lookup.orchestrator._step_library_miss_probe", miss_probe),
+            patch("lookup.orchestrator._step_enrich_metadata", enrich),
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert isinstance(response, LookupResponse)
+        assert response.degraded is True
+        assert response.degraded_reason == DegradedReason.deadline_exceeded
+        # Search results survive the shed.
+        assert len(response.results) == 1
+        assert response.results[0].library_item.artist == "Queen"
+        # The gate fired before the first tail step, so no tail work ran.
+        miss_probe.assert_not_awaited()
+        enrich.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_success_path_not_degraded(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """LML#930: a normal lookup (deadline not exhausted, no shed) reports
+        degraded=False / degraded_reason=None — byte-identical to pre-#930 for
+        existing consumers."""
+        mock_library_db.search.return_value = [queen_item]
+
+        request = LookupRequest(
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="Play A Night at the Opera by Queen",
+        )
+
+        response = await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)
+
+        assert isinstance(response, LookupResponse)
+        assert response.degraded is False
+        assert response.degraded_reason is None
 
     @pytest.mark.asyncio
     async def test_no_results_returns_empty(self, mock_library_db, mock_discogs_service, telemetry):

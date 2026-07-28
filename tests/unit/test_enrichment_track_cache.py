@@ -21,6 +21,8 @@ The album-keyed ``lml_cache.album_streaming_url_cache`` is NEVER written by L1
 
 from __future__ import annotations
 
+import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -31,6 +33,8 @@ from discogs.models import ReleaseMetadataResponse
 from entity.sources import PgSource
 from entity.track_streaming_url_cache import APPLE_MUSIC_TRACK_SERVICE
 from lookup.enrichment import enrich_artwork_results
+from lookup.spine_deadline import SpineDeadline
+from lookup.timeouts import apple_music_lookup_timeout_s
 from tests.factories import make_discogs_result, make_library_item
 
 # Jessica Pratt happy-path fixture: artwork present + album == row title, so
@@ -127,6 +131,74 @@ class TestL1TrackCache:
         assert kwargs["service"] == APPLE_MUSIC_TRACK_SERVICE
         assert kwargs["song"] == _SONG
         assert kwargs["url"] == _TRACK_URL
+
+    async def test_apple_probe_wait_for_uses_clamped_deadline_timeout(self):
+        """LML#930: on a live probe the wait_for timeout comes from
+        ``SpineDeadline.clamp_probe_timeout_s(base)`` — a caller with little
+        budget left doesn't wait the full 4s ceiling on one item. Proven with a
+        sentinel clamp return threaded through to the probe's ``wait_for``."""
+        item, artwork, apple_music = _happy_inputs()
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)  # miss -> live probe
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+
+        deadline = SpineDeadline(
+            start=time.monotonic(),
+            hard_cap_ms=25000,
+            caller_budget_ms=700,
+            effective_budget_ms=500,
+        )
+        captured_timeouts: list[float] = []
+        real_wait_for = asyncio.wait_for
+
+        async def _capture(coro, timeout):
+            captured_timeouts.append(timeout)
+            return await real_wait_for(coro, timeout)
+
+        with (
+            patch("lookup.enrichment.item.get_settings", return_value=_flags()),
+            patch("lookup.enrichment.item.set_cached_track_streaming_url", new=AsyncMock()),
+            patch.object(SpineDeadline, "clamp_probe_timeout_s", return_value=0.123) as clamp,
+            patch("asyncio.wait_for", side_effect=_capture),
+        ):
+            results = await enrich_artwork_results(
+                [(item, artwork)],
+                _happy_discogs_service(),
+                song=_SONG,
+                album=_ALBUM,
+                artist=_ARTIST,
+                apple_music=apple_music,
+                discogs_cache_pg=pg,
+                spine_deadline=deadline,
+            )
+
+        _, enriched = results[0]
+        assert enriched.apple_music_url == _TRACK_URL
+        # item.py invoked the clamp with the unbounded base ceiling...
+        clamp.assert_called_once()
+        assert clamp.call_args.args[0] == pytest.approx(apple_music_lookup_timeout_s())
+        # ...and its clamped result was the timeout handed to the probe's wait_for.
+        assert 0.123 in captured_timeouts
+
+    async def test_apple_probe_unclamped_without_spine_deadline(self):
+        """LML#930: with no deadline on the context (a direct
+        ``enrich_artwork_results`` caller), the probe keeps its unbounded 4s
+        ceiling — ``clamp_probe_timeout_s`` is never consulted."""
+        item, artwork, apple_music = _happy_inputs()
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+
+        with (
+            patch("lookup.enrichment.item.get_settings", return_value=_flags()),
+            patch("lookup.enrichment.item.set_cached_track_streaming_url", new=AsyncMock()),
+            patch.object(SpineDeadline, "clamp_probe_timeout_s") as clamp,
+        ):
+            results = await _run(apple_music, pg, item, artwork, _happy_discogs_service())
+
+        _, enriched = results[0]
+        assert enriched.apple_music_url == _TRACK_URL
+        clamp.assert_not_called()
 
     async def test_live_miss_returning_none_does_not_persist_null(self):
         item, artwork, apple_music = _happy_inputs()

@@ -14,6 +14,7 @@ the spine-scoped helpers (``resolve_albums_for_track``,
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
@@ -45,6 +46,7 @@ from entity.library_release_override import get_library_release_overrides
 from entity.sources import PgSource, PgSourceProtocol
 from entity.store import EntityStore, Identity
 from generated.api_models import (
+    DegradedReason,
     LibraryCatalogItem,
     ReconciledIdentity,
 )
@@ -81,6 +83,7 @@ from lookup.strategies.song_as_artist import search_song_as_artist
 from lookup.strategies.song_as_track import search_song_as_track
 from lookup.strategies.swapped_interpretation import search_with_alternative_interpretation
 from lookup.strategies.track_on_compilation import search_compilations_for_track
+from lookup.tail_deadline import should_shed_tail
 from lookup.validation import (
     filter_results_by_track_validation,
     find_library_albums_with_cached_track,
@@ -846,6 +849,7 @@ async def _step_enrich_metadata(
                 entity_store=services.entity_store,
                 discogs_cache_pg=services.discogs_cache_pg,
                 found_on_compilation=state.found_on_compilation,
+                spine_deadline=services.spine_deadline,
             )
 
 
@@ -1131,19 +1135,37 @@ async def perform_lookup(
     # library + already-cached legs produced, NOT 500. A shed is "couldn't ask",
     # never a fatal error. We keep the library results found so far and skip the
     # live-Discogs-dependent enrichment tail.
+    #
+    # LML#930 layers a second, orthogonal shed onto the same tail: the caller
+    # *deadline*. Between each tail step we check the spine deadline; if the
+    # caller's budget (or the universal hard cap) is exhausted, we stop grinding
+    # live-Discogs/Apple enrichment past the window the caller can use and return
+    # the search results already found, marked degraded(deadline_exceeded).
+    # Headerless requests read the 25s hard-cap remaining, so their tail is
+    # unshed — same posture as the empty-state cutoff. The two sheds compose:
+    # saturation is "couldn't ask", deadline is "ran out of time to ask".
+    tail_steps: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = (
+        ("library_miss_probe", partial(_step_library_miss_probe, parsed, state, services)),
+        ("validate_tracks", partial(_step_validate_tracks, parsed, search_state, state, services)),
+        ("populate_streaming_status", partial(_step_populate_streaming_status, state, services)),
+        ("fetch_artwork", partial(_step_fetch_artwork, parsed, state, services)),
+        ("enrich_metadata", partial(_step_enrich_metadata, parsed, state, services)),
+    )
     try:
-        await _step_library_miss_probe(parsed, state, services)
-        await _step_validate_tracks(parsed, search_state, state, services)
-        await _step_populate_streaming_status(state, services)
-        await _step_fetch_artwork(parsed, state, services)
-        await _step_enrich_metadata(parsed, state, services)
+        for step_name, run_step in tail_steps:
+            reason = should_shed_tail(services.spine_deadline, step_name, request.raw_message)
+            if reason is not None:
+                return _build_degraded_response(state, search_state, degraded_reason=reason)
+            await run_step()
     except DiscogsBreakerOpenError:
         logger.info(
             "Discogs saturation breaker shed the enrichment tail; "
             "returning cache-only lookup for %r",
             request.raw_message,
         )
-        return _build_degraded_response(state, search_state)
+        return _build_degraded_response(
+            state, search_state, degraded_reason=DegradedReason.upstream_unavailable
+        )
 
     _step_project_trace_attrs(state, services)
 
@@ -1155,6 +1177,15 @@ async def perform_lookup(
         has_results=state.has_results,
     )
 
+    # LML#930: identity resolution is the last live-Discogs/EntityStore tail leg —
+    # shed it too if the caller deadline is exhausted by now (the returned
+    # degraded response binds each row with reconciled_identity=None, exactly as
+    # the breaker-shed path already does).
+    identity_reason = should_shed_tail(
+        services.spine_deadline, "resolve_identities", request.raw_message
+    )
+    if identity_reason is not None:
+        return _build_degraded_response(state, search_state, degraded_reason=identity_reason)
     try:
         identities_by_artist = await _step_resolve_result_identities(state, services)
     except DiscogsBreakerOpenError:
@@ -1163,7 +1194,9 @@ async def perform_lookup(
             "returning cache-only lookup for %r",
             request.raw_message,
         )
-        return _build_degraded_response(state, search_state)
+        return _build_degraded_response(
+            state, search_state, degraded_reason=DegradedReason.upstream_unavailable
+        )
 
     result_items = _build_result_items(state, search_state, identities_by_artist)
     external_source = await _step_external_cache_fallback(parsed, result_items, services)
@@ -1177,6 +1210,7 @@ async def perform_lookup(
         corrected_artist=state.corrected_artist,
         external_source=external_source,
         timeout=search_state.timed_out,
+        degraded=False,
     )
 
 
@@ -1203,8 +1237,13 @@ def _build_timed_out_response(state: LookupState) -> LookupResponse:
     )
 
 
-def _build_degraded_response(state: LookupState, search_state: SearchState) -> LookupResponse:
-    """Build a cache-only ``LookupResponse`` after a Discogs-breaker shed (R2-2).
+def _build_degraded_response(
+    state: LookupState,
+    search_state: SearchState,
+    *,
+    degraded_reason: DegradedReason,
+) -> LookupResponse:
+    """Build a degraded ``LookupResponse`` after the tail was shed (LML#755 / LML#930).
 
     Returns the library rows accumulated so far with **no** live-Discogs
     enrichment (artwork/streaming/identity resolution shed) and no context
@@ -1212,7 +1251,18 @@ def _build_degraded_response(state: LookupState, search_state: SearchState) -> L
     ``_build_result_items`` binds each row with ``reconciled_identity=None``.
     ``timeout`` is left as the search pipeline reported it. This degrades the
     hot path to fast, partial metadata instead of a 500.
+
+    ``degraded_reason`` names *why* the tail was shed — ``upstream_unavailable``
+    for a Discogs saturation-breaker shed (LML#755), ``deadline_exceeded`` for a
+    caller-deadline shed (LML#930) — and is surfaced both on the wire
+    (``degraded=True`` + ``degraded_reason``) and as the filterable
+    ``lml.degraded_reason`` Sentry tag so the canary (wxyc-canary#82) and LML#931
+    can slice degraded-mode rate by cause without decoding response bodies.
     """
+    try:
+        sentry_sdk.set_tag("lml.degraded_reason", degraded_reason.value)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Failed to project degraded_reason onto Sentry transaction: %s", e)
     result_items = _build_result_items(state, search_state, {})
     return LookupResponse(
         results=result_items,
@@ -1223,4 +1273,6 @@ def _build_degraded_response(state: LookupState, search_state: SearchState) -> L
         corrected_artist=state.corrected_artist,
         external_source=None,
         timeout=search_state.timed_out,
+        degraded=True,
+        degraded_reason=degraded_reason,
     )

@@ -131,6 +131,158 @@ class TestSpineDeadlineConstruction:
 
 
 # ---------------------------------------------------------------------------
+# SpineDeadline.remaining / tail_exhausted / clamp_probe_timeout_s (LML#930)
+# ---------------------------------------------------------------------------
+
+
+class TestSpineDeadlineRemaining:
+    """The signed, un-floored remaining-budget query the tail gate reads."""
+
+    def test_remaining_goes_negative_past_budget(self):
+        """Unlike step_timeout (floored at 0.01s), remaining is signed so an
+        exhausted deadline reports how far *past* budget it is."""
+        deadline = SpineDeadline(
+            start=time.monotonic() - 1.0,  # 1s elapsed
+            hard_cap_ms=25000,
+            caller_budget_ms=500,
+            effective_budget_ms=300,
+        )
+        remaining_ms, limit = deadline.remaining()
+        assert remaining_ms < 0  # ~ 300 - 1000 = -700ms
+        assert remaining_ms == pytest.approx(-700, abs=50)
+        assert limit == LIMIT_CALLER_BUDGET
+
+    def test_remaining_reads_hard_cap_without_header(self):
+        """No caller budget → remaining tracks the hard-cap ceiling."""
+        deadline = SpineDeadline(
+            start=time.monotonic(),
+            hard_cap_ms=25000,
+            caller_budget_ms=None,
+            effective_budget_ms=None,
+        )
+        remaining_ms, limit = deadline.remaining()
+        assert remaining_ms == pytest.approx(25000, abs=50)
+        assert limit == LIMIT_HARD_CAP
+
+    def test_remaining_budget_binds_when_tighter_than_hard_cap(self):
+        deadline = SpineDeadline(
+            start=time.monotonic(),
+            hard_cap_ms=25000,
+            caller_budget_ms=800,
+            effective_budget_ms=600,
+        )
+        remaining_ms, limit = deadline.remaining()
+        assert remaining_ms == pytest.approx(600, abs=50)
+        assert limit == LIMIT_CALLER_BUDGET
+
+
+class TestTailExhausted:
+    """The between-tail-step shed gate (LML#930)."""
+
+    def test_fresh_budget_not_exhausted(self):
+        deadline = SpineDeadline(
+            start=time.monotonic(),
+            hard_cap_ms=25000,
+            caller_budget_ms=4000,
+            effective_budget_ms=3800,
+        )
+        exhausted, remaining_ms, limit = deadline.tail_exhausted()
+        assert exhausted is False
+        assert remaining_ms > 0
+        assert limit == LIMIT_CALLER_BUDGET
+
+    def test_past_budget_exhausted(self):
+        deadline = SpineDeadline(
+            start=time.monotonic() - 10.0,  # long past any caller budget
+            hard_cap_ms=25000,
+            caller_budget_ms=500,
+            effective_budget_ms=300,
+        )
+        exhausted, remaining_ms, limit = deadline.tail_exhausted()
+        assert exhausted is True
+        assert remaining_ms < 0
+        assert limit == LIMIT_CALLER_BUDGET
+
+    def test_headerless_not_exhausted_within_hard_cap(self):
+        """No budget header + inside the 25s ceiling → tail runs (unshed)."""
+        deadline = SpineDeadline(
+            start=time.monotonic(),
+            hard_cap_ms=25000,
+            caller_budget_ms=None,
+            effective_budget_ms=None,
+        )
+        exhausted, _remaining_ms, limit = deadline.tail_exhausted()
+        assert exhausted is False
+        assert limit == LIMIT_HARD_CAP
+
+    def test_headerless_exhausted_when_hard_cap_blown(self):
+        """No budget header but the universal hard cap is blown → tail sheds."""
+        deadline = SpineDeadline(
+            start=time.monotonic() - 10.0,
+            hard_cap_ms=150,
+            caller_budget_ms=None,
+            effective_budget_ms=None,
+        )
+        exhausted, _remaining_ms, limit = deadline.tail_exhausted()
+        assert exhausted is True
+        assert limit == LIMIT_HARD_CAP
+
+    def test_sub_floor_budget_is_exhausted(self):
+        """A remaining budget at/under the 0.01s step floor sheds immediately —
+        the same floor step_timeout clamps a started step's wait_for to."""
+        deadline = SpineDeadline(
+            start=time.monotonic(),
+            hard_cap_ms=25000,
+            caller_budget_ms=6,
+            effective_budget_ms=6,  # < 10ms floor
+        )
+        exhausted, remaining_ms, _limit = deadline.tail_exhausted()
+        assert exhausted is True
+        assert remaining_ms <= 10.0
+
+
+class TestClampProbeTimeout:
+    """The per-item Apple-probe wait_for clamp (LML#930, fork-2 'clamp hot I/O')."""
+
+    def test_no_reduction_when_budget_ample(self):
+        deadline = SpineDeadline(
+            start=time.monotonic(),
+            hard_cap_ms=25000,
+            caller_budget_ms=5200,
+            effective_budget_ms=5000,  # 5s > 4s base
+        )
+        assert deadline.clamp_probe_timeout_s(4.0) == pytest.approx(4.0, abs=0.05)
+
+    def test_clamps_to_remaining_when_tight(self):
+        deadline = SpineDeadline(
+            start=time.monotonic(),
+            hard_cap_ms=25000,
+            caller_budget_ms=700,
+            effective_budget_ms=500,  # 0.5s < 4s base
+        )
+        clamped = deadline.clamp_probe_timeout_s(4.0)
+        assert 0.4 < clamped <= 0.5
+
+    def test_floored_when_exhausted(self):
+        deadline = SpineDeadline(
+            start=time.monotonic() - 10.0,
+            hard_cap_ms=25000,
+            caller_budget_ms=500,
+            effective_budget_ms=300,  # remaining negative
+        )
+        assert deadline.clamp_probe_timeout_s(4.0) == pytest.approx(0.01)
+
+    def test_headerless_returns_base_unchanged(self):
+        deadline = SpineDeadline(
+            start=time.monotonic(),
+            hard_cap_ms=25000,
+            caller_budget_ms=None,
+            effective_budget_ms=None,  # remaining = 25s hard cap
+        )
+        assert deadline.clamp_probe_timeout_s(4.0) == pytest.approx(4.0, abs=0.05)
+
+
+# ---------------------------------------------------------------------------
 # run_within_spine_deadline
 # ---------------------------------------------------------------------------
 
