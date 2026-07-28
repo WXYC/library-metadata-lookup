@@ -98,9 +98,12 @@ class TestCrossReferenceNamesIntegration:
     async def test_filter_results_by_artist_matches_cross_reference_name(
         self, db_with_cross_reference
     ):
-        """A title-retrieved candidate set, filtered by the typed personal name
-        'C. Spencer Yeh', keeps only the cross-referenced row (57833) -- not its
-        cross-reference-less sibling (57834)."""
+        """A title-retrieved candidate (row 57833) passes filter_results_by_artist
+        for the typed personal name 'C. Spencer Yeh' via its cross_reference_names,
+        even though neither its primary artist ('Burning Star Core') nor its
+        alternate_artist_name matches that name. (Sibling 57834 is excluded upstream
+        by the title query, so it is not the negative control here; the primary-name
+        path is covered by test_search_by_primary_artist_still_finds_both_releases.)"""
         db = db_with_cross_reference
 
         results = await db.search(query="Blink of an Eye")
