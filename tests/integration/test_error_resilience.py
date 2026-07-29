@@ -315,7 +315,11 @@ class TestSourceTransportFailures:
         pg = PgSource("postgresql://bogus_user:bad_pass@localhost:5433/postgres")
         try:
             await pg.fetchall("SELECT 1")
-        except asyncpg.InvalidPasswordError:
+        except (asyncpg.InvalidPasswordError, asyncpg.InvalidAuthorizationSpecificationError):
+            # Both are genuine auth rejections: a live server on 5433 with
+            # password auth enabled raises the former; a live server without
+            # the bogus role at all (the common local Discogs-dump Postgres
+            # setup) raises "role does not exist" as the latter.
             pass  # expected
         except OSError:
             pytest.skip("PostgreSQL not running on port 5433")

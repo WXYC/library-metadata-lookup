@@ -1843,6 +1843,10 @@ class TestEnrichArtworkResultsWithAppleMusicClient:
         # explorer can filter for it.
         transaction.set_data.assert_any_call("apple_music.find_track_url.timeout", True)
 
+        # AND the disambiguating `.method` key is projected too, so a refactor
+        # that drops it (leaving only the legacy key) fails this test.
+        transaction.set_data.assert_any_call("apple_music.timeout.method", "find_track_metadata")
+
     @pytest.mark.asyncio
     async def test_apple_music_find_track_url_timeout_survives_no_active_transaction(
         self,
