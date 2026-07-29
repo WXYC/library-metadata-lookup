@@ -654,6 +654,84 @@ _TABLES = (
     "streaming_coverage_baseline",
 )
 
+# Guard-column classification (LML#891). Every column across the four CREATE
+# TABLE statements above must appear in exactly one bucket here — that
+# totality is enforced by tests/unit/test_streaming_catalog_schema.py, which
+# parses the column names straight out of the DDL. Nothing else forces an
+# author adding or renaming a column to decide whether it needs a no-regress
+# clause, so without this net the guard functions above one-column-at-a-time
+# stop covering what the tables actually carry.
+#
+# The four GUARDED_* buckets are cross-checked against the guard-function
+# bodies (_DDL_GUARD_ALBUM_FN et al.): a column classified guarded must be
+# referenced by its table's guard function, so "classify it guarded" can't be
+# satisfied without also writing the clause that actually protects it.
+# UNGUARDED_DELIBERATE is for columns the guards intentionally leave freely
+# correctable — display copy, provenance arrays/flags, and bookkeeping
+# timestamps like ``checked_at``/``created_at``/``updated_at``.
+GUARDED_URL = frozenset(
+    {
+        "url",
+        "slug",
+        "spotify_url",
+        "deezer_url",
+    }
+)
+GUARDED_STATUS = frozenset(
+    {
+        "discogs_status",
+        "status",
+        "resolution_status",
+    }
+)
+GUARDED_IDENTITY = frozenset(
+    {
+        "id",
+        "normalized_artist",
+        "normalized_title",
+        "album_id",
+        "service",
+        "artist",
+        "title",
+        "metric",
+    }
+)
+GUARDED_METADATA = frozenset(
+    {
+        "discogs_release_id",
+        "discogs_artist",
+        "discogs_title",
+        "service_item_id",
+        "matched_artist",
+        "matched_title",
+        "confidence",
+        "resolved_via",
+        "resolved_album_id",
+        "resolved_release_id",
+        "spotify_confidence",
+        "deezer_confidence",
+        "value",
+    }
+)
+UNGUARDED_DELIBERATE = frozenset(
+    {
+        "display_artist",
+        "display_title",
+        "library_ids",
+        "formats",
+        "genre",
+        "label",
+        "is_compilation",
+        "is_single",
+        "created_at",
+        "checked_at",
+        "position",
+        "source",
+        "source_type",
+        "updated_at",
+    }
+)
+
 # Ordered: schema first, parents before children (FKs), tables before their
 # widen block/indexes/triggers. Kept as a module constant so the bootstrap
 # and the unit parity tests reference one list; the .sql reference mirrors

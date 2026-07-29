@@ -38,13 +38,105 @@ import pytest
 
 from entity.streaming_catalog import (
     _BOOTSTRAP_ADVISORY_LOCK_KEY,
+    _DDL_ALBUM,
+    _DDL_ALBUM_SERVICE,
+    _DDL_COVERAGE_BASELINE,
+    _DDL_GUARD_ALBUM_FN,
+    _DDL_GUARD_ALBUM_SERVICE_FN,
+    _DDL_GUARD_BASELINE_FN,
+    _DDL_GUARD_TRACK_RESULT_FN,
     _DDL_STATEMENTS,
+    _DDL_TRACK_RESULT,
     _SERVICES,
     _TABLES,
     ALLOW_URL_REMOVAL_GUC,
+    GUARDED_IDENTITY,
+    GUARDED_METADATA,
+    GUARDED_STATUS,
+    GUARDED_URL,
+    UNGUARDED_DELIBERATE,
     set_up_streaming_catalog_schema,
 )
 from tests.unit.conftest import normalize_sql as _normalize_sql
+
+# (create-table DDL, its table's no-regress guard-function body) pairs — the
+# guarded buckets below are asserted against the guard body, not just
+# hand-copied, so a column that gets classified guarded without a matching
+# guard-function clause fails loudly instead of silently trusting the author.
+_TABLE_DDL_AND_GUARD_FN = (
+    (_DDL_ALBUM, _DDL_GUARD_ALBUM_FN),
+    (_DDL_ALBUM_SERVICE, _DDL_GUARD_ALBUM_SERVICE_FN),
+    (_DDL_TRACK_RESULT, _DDL_GUARD_TRACK_RESULT_FN),
+    (_DDL_COVERAGE_BASELINE, _DDL_GUARD_BASELINE_FN),
+)
+
+# The column-name line shape inside a CREATE TABLE statement: leading
+# four-space indent, then a lowercase-leading identifier. Constraint/key
+# clauses (``CONSTRAINT``, ``UNIQUE``, ``PRIMARY KEY``) start uppercase, so
+# this shape naturally excludes them without a keyword blocklist.
+_COLUMN_LINE = re.compile(r"^    ([a-z][a-z0-9_]*) ", re.MULTILINE)
+
+
+def _columns(ddl: str) -> list[str]:
+    return _COLUMN_LINE.findall(ddl)
+
+
+class TestGuardColumnClassification:
+    """Totality net for LML#891: every column across the four catalog tables
+    must be classified exactly once, and every guarded classification must be
+    backed by an actual guard-function clause — closing the gap where PR D/E
+    (or any later change) adds a column that nothing forces an author to
+    triage into a guard bucket."""
+
+    def test_every_column_is_classified_exactly_once(self):
+        buckets = (
+            GUARDED_URL,
+            GUARDED_STATUS,
+            GUARDED_IDENTITY,
+            GUARDED_METADATA,
+            UNGUARDED_DELIBERATE,
+        )
+        for ddl, _guard_fn in _TABLE_DDL_AND_GUARD_FN:
+            for column in _columns(ddl):
+                hits = [bucket for bucket in buckets if column in bucket]
+                assert hits, (
+                    f"column {column!r} in {ddl.splitlines()[0]!r} is not classified in any "
+                    "guard bucket — add it to GUARDED_URL/GUARDED_STATUS/GUARDED_IDENTITY/"
+                    "GUARDED_METADATA (if a guard function polices it) or "
+                    "UNGUARDED_DELIBERATE (if the guards deliberately leave it correctable)"
+                )
+                assert len(hits) == 1, (
+                    f"column {column!r} is classified in more than one bucket: {hits}"
+                )
+
+    def test_guarded_columns_are_backed_by_the_guard_function_body(self):
+        guarded = GUARDED_URL | GUARDED_STATUS | GUARDED_IDENTITY | GUARDED_METADATA
+        for ddl, guard_fn in _TABLE_DDL_AND_GUARD_FN:
+            for column in _columns(ddl):
+                if column not in guarded:
+                    continue
+                assert re.search(rf"\b{re.escape(column)}\b", guard_fn), (
+                    f"{column!r} is classified as guarded but "
+                    f"{guard_fn.splitlines()[1]!r} never references it — either the "
+                    "classification is wrong or the guard function is missing a clause"
+                )
+
+    def test_no_classified_column_is_absent_from_every_table(self):
+        # The reverse-direction net: a bucket entry that doesn't correspond to
+        # any real column is dead weight that would mask a rename silently
+        # slipping the totality check (the renamed column would need a NEW
+        # entry, and the stale one would go unnoticed forever).
+        all_columns = {column for ddl, _ in _TABLE_DDL_AND_GUARD_FN for column in _columns(ddl)}
+        for bucket in (
+            GUARDED_URL,
+            GUARDED_STATUS,
+            GUARDED_IDENTITY,
+            GUARDED_METADATA,
+            UNGUARDED_DELIBERATE,
+        ):
+            stale = bucket - all_columns
+            assert not stale, f"classified but no longer a real column: {stale}"
+
 
 _SQL_REFERENCE = Path(__file__).resolve().parent.parent.parent / "entity" / "streaming_catalog.sql"
 
