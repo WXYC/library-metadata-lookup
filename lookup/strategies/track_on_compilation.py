@@ -22,7 +22,7 @@ import re
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
 
 import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
@@ -46,7 +46,7 @@ from lookup.artist_resolution import (
     _log_resolver_pre_pass,
     resolve_canonical_artist,
 )
-from lookup.candidate_memo import TrackCandidateMemo
+from lookup.candidate_memo import TrackCandidateMemo, TrackCandidateSet
 from lookup.concurrency import _chunked_gather
 from lookup.matching import (
     _FALLBACK_ARTIST_SIMILARITY_FLOOR,
@@ -102,14 +102,20 @@ class TrackOnCompilation:
 
 
 _ProbeResult = TrackReleasesResponse | tuple[TrackReleasesResponse | None, str | None]
-"""Heterogeneous return type for the gathered probes in ``search_compilations_for_track``.
+"""Heterogeneous gather result: artist-scoped probes return
+``TrackReleasesResponse``; the album-title probe returns ``(response, error)``."""
 
-The two artist-scoped probes return ``TrackReleasesResponse`` directly; the
-optional album-title probe returns ``tuple[TrackReleasesResponse | None,
-str | None]`` (response, error_str) via its catch-and-return wrapper. The
-gather sees the union; element-by-element narrowing happens via isinstance
-asserts at the call site.
-"""
+
+class ReleaseProcessor(Protocol):
+    """Per-release worker ``_make_release_processor`` builds, ``partial()``-rebindable."""
+
+    async def __call__(
+        self,
+        release_info: ReleaseInfo,
+        *,
+        skip_self_named_album: bool = ...,
+        skip_artist_match_filter: bool = ...,
+    ) -> list[tuple[LibraryItem, "ResolvedRelease"]]: ...
 
 
 def _log_album_title_fallback(
@@ -187,6 +193,570 @@ def _row_identity_in_variations(item: LibraryItem, normalized_variations: set[st
     )
 
 
+async def _search_by_keyword(
+    db: LibraryDB, lib_artist: str | None, parsed: ParsedRequest
+) -> list[LibraryItem]:
+    """Phase: direct keyword search, artist-filtered — a last-resort source
+    used only if the Discogs probe pass finds nothing; never blocks it."""
+    try:
+        artist_words = re.sub(r"[^\w\s]", " ", lib_artist.lower()).split() if lib_artist else []
+        song_words = re.sub(r"[^\w\s]", " ", parsed.song.lower()).split() if parsed.song else []
+
+        sig_artist = [w for w in artist_words if len(w) > 3 and w not in STOPWORDS]
+        sig_song = [w for w in song_words if len(w) > 3 and w not in STOPWORDS]
+
+        query_words = sig_artist[:2] + sig_song[:2]
+        if not query_words:
+            return []
+
+        keyword_query = " ".join(query_words)
+        logger.info(f"Trying direct keyword search: '{keyword_query}'")
+        keyword_results = await db.search(query=keyword_query, limit=_FETCH_LIMIT)
+        if not keyword_results:
+            return []
+
+        filtered_results = []
+        for item in keyword_results:
+            if lib_artist and artist_matches_item(item, lib_artist):
+                filtered_results.append(item)
+            elif is_compilation_artist(item.artist or ""):
+                filtered_results.append(item)
+
+        if filtered_results:
+            logger.info(
+                f"Found {len(filtered_results)} matches via keyword search (after artist filter)"
+            )
+        return filtered_results
+    except Exception as e:
+        logger.warning(f"Keyword search failed: {e}")
+        return []
+
+
+async def _album_title_probe_safe(
+    discogs_service: DiscogsService, album: str
+) -> tuple[TrackReleasesResponse | None, str | None]:
+    """Catch-and-return wrapper so a Discogs failure here doesn't take down
+    the artist-scoped probes in the same gather (error logged by the caller
+    via ``_log_album_title_fallback``)."""
+    try:
+        resp = await discogs_service.search_releases_by_album_title(album)
+        return resp, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+async def _probes_from_memo_seed(
+    memo_seed: TrackCandidateSet,
+    discogs_service: DiscogsService,
+    song_search: str,
+    artist_for_probes: str | None,
+    parsed: ParsedRequest,
+    album_fallback_should_fire: bool,
+) -> tuple[list[ReleaseInfo], TrackReleasesResponse | None, str | None]:
+    """LML#867: Wave A came free from ``memo_seed`` (caller proved it's at
+    least as wide as a fresh Wave A). Only Wave B still fires, and only when
+    the seed lacks a true-V/A comp — what ``merge_wave_b_compilations``
+    would discard anyway (same ``has_va_compilation`` predicate)."""
+    wave_a_releases = list(memo_seed.releases)
+    seed_has_va = has_va_compilation(wave_a_releases)
+
+    tail_probes: list[Coroutine[Any, Any, _ProbeResult]] = []
+    wave_b_index: int | None = None
+    if not seed_has_va:
+        wave_b_index = len(tail_probes)
+        tail_probes.append(
+            discogs_service.search_releases_by_track(
+                song_search, artist_for_probes, artist_as_keyword=True
+            )
+        )
+    album_probe_index: int | None = None
+    if album_fallback_should_fire:
+        assert parsed.album is not None  # narrow for type-checker
+        album_probe_index = len(tail_probes)
+        tail_probes.append(_album_title_probe_safe(discogs_service, parsed.album))
+
+    gathered_tail = await asyncio.gather(*tail_probes) if tail_probes else []
+
+    wave_b_releases: list[ReleaseInfo] = []
+    if wave_b_index is not None:
+        va_response = gathered_tail[wave_b_index]
+        assert isinstance(va_response, TrackReleasesResponse)
+        wave_b_releases = list(va_response.releases or [])
+
+    album_fallback_response: TrackReleasesResponse | None = None
+    album_fallback_error: str | None = None
+    if album_probe_index is not None:
+        probe_tuple = gathered_tail[album_probe_index]
+        assert isinstance(probe_tuple, tuple)
+        album_fallback_response, album_fallback_error = probe_tuple
+
+    raw_releases = merge_wave_b_compilations(wave_a_releases, wave_b_releases)
+    return raw_releases, album_fallback_response, album_fallback_error
+
+
+async def _probes_fresh_gather(
+    discogs_service: DiscogsService,
+    song_search: str,
+    artist_for_probes: str | None,
+    parsed: ParsedRequest,
+    album_fallback_should_fire: bool,
+) -> tuple[list[ReleaseInfo], TrackReleasesResponse | None, str | None]:
+    """Pre-#867 parallel gather: Wave A (artist-scoped, PG cache CTE), Wave B
+    (``artist_as_keyword=True``, API-only — LML#817 finding C2), and the
+    album-title probe (#339), fired together so cold-cache wall time is
+    ``max(A, B, C)``."""
+    probes: list[Coroutine[Any, Any, _ProbeResult]] = [
+        discogs_service.search_releases_by_track(
+            song_search, artist_for_probes, limit=WAVE_A_SEARCH_LIMIT
+        ),
+        discogs_service.search_releases_by_track(
+            song_search, artist_for_probes, artist_as_keyword=True
+        ),
+    ]
+    if album_fallback_should_fire:
+        assert parsed.album is not None  # narrow for type-checker
+        probes.append(_album_title_probe_safe(discogs_service, parsed.album))
+
+    gathered = await asyncio.gather(*probes)
+    # gathered[0] / gathered[1] are TrackReleasesResponse by construction
+    # (the order matches the `probes` list above); narrow via assert.
+    assert isinstance(gathered[0], TrackReleasesResponse)
+    assert isinstance(gathered[1], TrackReleasesResponse)
+    response, va_response = gathered[0], gathered[1]
+
+    album_fallback_response: TrackReleasesResponse | None = None
+    album_fallback_error: str | None = None
+    if album_fallback_should_fire:
+        probe_tuple = gathered[2]
+        assert isinstance(probe_tuple, tuple)
+        album_fallback_response, album_fallback_error = probe_tuple
+
+    # Merge Wave B's V/A compilations into Wave A unless Wave A already
+    # surfaced a true-V/A hit (WXYC#527).
+    raw_releases = merge_wave_b_compilations(
+        list(response.releases or []), list(va_response.releases or [])
+    )
+    return raw_releases, album_fallback_response, album_fallback_error
+
+
+@dataclass
+class _ProbeBundle:
+    """Output of ``_run_discogs_probes``: the merged candidate releases plus the
+    speculative album-title probe's outcome, ready for the caller to consume."""
+
+    song_search: str
+    raw_releases: list[ReleaseInfo]
+    album_fallback_should_fire: bool
+    album_fallback_response: TrackReleasesResponse | None
+    album_fallback_error: str | None
+
+
+async def _resolve_artist_for_probes(
+    parsed: ParsedRequest, discogs_service: DiscogsService | None
+) -> tuple[str, ResolverOutcome]:
+    """Phase: resolver pre-pass. When the inbound artist string trigram-matches
+    a canonical Discogs name with confidence >= the floor, use the canonical
+    form for both Discogs probes. Gated by ``lml_resolve_artist_canonical`` —
+    the flag controls *both* the trigram lookup and the swap, so the
+    default-off path pays no PG cost. See WXYC/library-metadata-lookup#343
+    Option 2."""
+    assert parsed.artist is not None  # guaranteed by the caller's gate
+    if not bool(get_settings().lml_resolve_artist_canonical):
+        outcome = ResolverOutcome(
+            original=parsed.artist or "",
+            canonical=parsed.artist or "",
+            score=0.0,
+            swapped=False,
+        )
+        return parsed.artist, outcome
+
+    cache_service = getattr(discogs_service, "cache_service", None)
+    outcome = await resolve_canonical_artist(parsed.artist, cache_service=cache_service)
+    _log_resolver_pre_pass(outcome, actual_swap=outcome.swapped)
+    artist_for_probes = outcome.canonical if outcome.swapped else parsed.artist
+    return artist_for_probes, outcome
+
+
+async def _run_discogs_probes(
+    parsed: ParsedRequest,
+    discogs_service: DiscogsService | None,
+    candidate_memo: TrackCandidateMemo | None,
+) -> _ProbeBundle:
+    """Phase: candidate discovery via Discogs. Resolver pre-pass
+    (``_resolve_artist_for_probes``) -> Wave A/Wave B artist-scoped probes
+    (reused from ``candidate_memo`` when LML#867's recall guard clears, else
+    freshly gathered) -> the optional speculative album-title probe (#339),
+    all in parallel so a cold cache pays ``max()`` rather than the sum.
+    Two-channel seam (#626): probes use ``parsed.artist``, not the caller's
+    library-side ``lib_artist``."""
+    assert parsed.song is not None and parsed.artist is not None  # guaranteed by the caller's gate
+
+    # Widen the Discogs query to include a parenthetical remix/mix/version/edit
+    # tag when the raw request actually typed one, so e.g. "Song (Extended
+    # Mix)" searches Discogs as the full title rather than just "Song".
+    raw_lower = parsed.raw_message.lower()
+    song_search = parsed.song
+    remix_match = re.search(r"\((.*?(?:remix|mix|version|edit).*?)\)", raw_lower, re.IGNORECASE)
+    if remix_match and parsed.song.lower() in raw_lower:
+        song_search = f"{parsed.song} ({remix_match.group(1)})"
+        logger.info(f"Using full track name with version info: '{song_search}'")
+
+    artist_for_probes, outcome = await _resolve_artist_for_probes(parsed, discogs_service)
+
+    # The album-title fallback's preconditions (`parsed.album` set, no
+    # resolver swap) are decidable here, so its probe joins the same
+    # `asyncio.gather` as the two artist-scoped probes (WXYC/library-
+    # metadata-lookup#339).
+    album_fallback_should_fire = (
+        discogs_service is not None and bool(parsed.album) and not outcome.swapped
+    )
+
+    # LML#867: reuse step 2's artist-filtered candidates as Wave A's seed when
+    # the memo holds this exact query. Recall guard: reuse only when the seed
+    # was fetched at least as wide as a fresh Wave A would search — a
+    # narrower seed can be a strict subset, so on a too-narrow seed we fall
+    # through to the fresh gather below.
+    memo_seed = (
+        candidate_memo.get(song_search, artist_for_probes) if candidate_memo is not None else None
+    )
+    if memo_seed is not None and memo_seed.search_limit < WAVE_A_SEARCH_LIMIT:
+        memo_seed = None
+
+    if discogs_service and memo_seed is not None:
+        raw_releases, album_fallback_response, album_fallback_error = await _probes_from_memo_seed(
+            memo_seed,
+            discogs_service,
+            song_search,
+            artist_for_probes,
+            parsed,
+            album_fallback_should_fire,
+        )
+    elif discogs_service:
+        raw_releases, album_fallback_response, album_fallback_error = await _probes_fresh_gather(
+            discogs_service, song_search, artist_for_probes, parsed, album_fallback_should_fire
+        )
+    else:
+        # No injected service — fall back to lookup helper (validates all).
+        tuples = await lookup_releases_by_track(song_search, parsed.artist, service=None)
+        raw_releases = [
+            ReleaseInfo(
+                album=album,
+                artist=artist,
+                release_id=0,
+                release_url="",
+                is_compilation=is_compilation_artist(artist),
+            )
+            for artist, album in tuples
+        ]
+        album_fallback_response, album_fallback_error = None, None
+
+    return _ProbeBundle(
+        song_search=song_search,
+        raw_releases=raw_releases,
+        album_fallback_should_fire=album_fallback_should_fire,
+        album_fallback_response=album_fallback_response,
+        album_fallback_error=album_fallback_error,
+    )
+
+
+async def _filter_release_matches(
+    matches: list[LibraryItem],
+    lib_artist: str,
+    release_info: ReleaseInfo,
+    discogs_service: DiscogsService | None,
+    *,
+    strict: bool,
+) -> list[LibraryItem]:
+    """Artist-verification phase. ``strict=True``: a row passes on a direct
+    artist-prefix match, a title-matched Various-Artists row, or — LML#971
+    identity bridge, flag-gated, non-compilation only — a resolved Discogs
+    name-variation. ``strict=False`` (album-title fallback, where trio rows
+    won't prefix-match): a lenient similarity backstop
+    (``_FALLBACK_ARTIST_SIMILARITY_FLOOR``) instead. Either way,
+    ``validate_release_for_track`` downstream remains the safety belt."""
+    from rapidfuzz import fuzz as _fuzz
+
+    discogs_is_compilation = release_info.is_compilation
+    release_album_lower = release_info.album.lower()
+
+    if not strict:
+        lib_artist_norm = normalize_for_comparison(lib_artist)
+
+        def _fallback_row_acceptable(match: LibraryItem) -> bool:
+            if discogs_is_compilation and is_compilation_artist(match.artist or ""):
+                return _fuzz.ratio(release_album_lower, (match.title or "").lower()) >= 80
+            return (
+                max(
+                    _fuzz.token_set_ratio(
+                        lib_artist_norm, normalize_for_comparison(match.artist or "")
+                    ),
+                    _fuzz.token_set_ratio(
+                        lib_artist_norm, normalize_for_comparison(match.alternate_artist_name or "")
+                    ),
+                )
+                >= _FALLBACK_ARTIST_SIMILARITY_FLOOR
+            )
+
+        return [match for match in matches if _fallback_row_acceptable(match)]
+
+    bridge_enabled = get_settings().lml_resolve_artist_variations and not discogs_is_compilation
+    release_variations: set[str] | None = None
+    filtered_matches = []
+    for match in matches:
+        if artist_matches_item(match, lib_artist):
+            filtered_matches.append(match)
+        elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
+            title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
+            if title_score >= 80:
+                filtered_matches.append(match)
+            else:
+                logger.debug(
+                    f"Rejected '{match.title}' for '{release_info.album}' "
+                    f"(title_score={title_score:.0f})"
+                )
+        elif bridge_enabled:
+            if release_variations is None:
+                release_variations = await _fetch_release_artist_variations(
+                    discogs_service, release_info.release_id
+                )
+            if _row_identity_in_variations(match, release_variations):
+                filtered_matches.append(match)
+    return filtered_matches
+
+
+def _make_release_processor(
+    db: LibraryDB,
+    parsed: ParsedRequest,
+    lib_artist: str | None,
+    discogs_service: DiscogsService | None,
+    song_search: str,
+) -> ReleaseProcessor:
+    """Build the per-release worker (library search -> artist verification ->
+    tracklist validation), closed over context shared by both passes."""
+
+    async def process_release(
+        release_info: ReleaseInfo,
+        *,
+        skip_self_named_album: bool = True,
+        skip_artist_match_filter: bool = False,
+    ) -> list[tuple[LibraryItem, ResolvedRelease]]:
+        """Process one Discogs release: library search, filter, validate.
+
+        ``skip_self_named_album`` defaults True to preserve existing behavior
+        for callers that arrived via artist-scoped probes. The album-title
+        fallback (WXYC/library-metadata-lookup#319) passes False because the
+        trio-collaboration case has ``album == artist`` by design.
+
+        ``skip_artist_match_filter`` defaults False. When True, the
+        library-side ``artist_matches_item`` prefix-filter is skipped and
+        artist gating is deferred to ``validate_track_on_release``'s fuzzy
+        ``rapidfuzz.token_set_ratio`` (PR #236). The fallback path passes
+        True because the library row's artist string for trio/collaborative
+        releases (e.g. ``"Orcutt, Bill / Shelley, Chris / Miller, Mette"``)
+        won't prefix-match a user-typed ``"Orcutt Shelley Miller"``, but the
+        fuzzy validator on the Discogs side does accept it.
+        """
+        release_album = release_info.album
+
+        if skip_self_named_album and parsed.artist:
+            album_clean = release_album.lower().replace('"', "").replace("'", "").strip()
+            artist_clean = parsed.artist.lower().replace('"', "").replace("'", "").strip()
+            if album_clean == artist_clean:
+                logger.debug(f"Skipping '{release_album}' - appears to be artist name, not album")
+                return []
+
+        if len(release_album.strip()) < 3:
+            return []
+
+        matches = await search_album_fuzzy(db, release_album)
+
+        # If album-only search failed for a compilation, retry with "Various"
+        # to help FTS5 match entries stored as "Various Artists - ..."
+        if not matches and release_info.is_compilation:
+            matches = await search_album_fuzzy(db, f"Various {release_album}")
+
+        if matches and lib_artist:
+            matches = await _filter_release_matches(
+                matches,
+                lib_artist,
+                release_info,
+                discogs_service,
+                strict=not skip_artist_match_filter,
+            )
+
+        if not matches:
+            return []
+
+        # Validate that the track actually exists on this release.
+        # Deferred until after library matching so we only validate
+        # releases we might actually return — saving API calls (LML#536).
+        if discogs_service and release_info.release_id and parsed.artist:
+            is_valid = await validate_release_for_track(
+                discogs_service,
+                release_info.release_id,
+                song_search,
+                parsed.artist,
+                source="compilation_inline",
+            )
+            if not is_valid:
+                logger.info(f"Skipping '{release_album}' - track/artist not validated on release")
+                return []
+
+        logger.info(
+            f"Found '{parsed.song}' in library on '{matches[0].title}' "
+            f"(matched from Discogs: '{release_album}')"
+        )
+        resolved = ResolvedRelease(
+            release_id=release_info.release_id,
+            release_url=release_info.release_url,
+            is_compilation=bool(release_info.is_compilation),
+            album_title=release_album,
+        )
+        return [(match, resolved) for match in matches]
+
+    return process_release
+
+
+async def _collect_release_matches(
+    raw_releases: list[ReleaseInfo],
+    process_release: ReleaseProcessor,
+    *,
+    results: list[LibraryItem],
+    seen_ids: set[int],
+    discogs_titles: dict[int, ResolvedRelease],
+    rank_carried: bool,
+) -> None:
+    """Chunked dispatch + accumulate, shared by the primary Discogs-probe pass
+    and the album-title fallback pass. Chunking bounds the per-request
+    validate budget once the response cap is hit (LML#536). Mutates
+    ``results``/``seen_ids``/``discogs_titles`` in place; the latter binds
+    each match's best ``ResolvedRelease`` (LML#604 #2) — ``rank_carried`` on
+    ranks title-best across releases, off keeps first-seen."""
+    async for _, release_matches in _chunked_gather(
+        raw_releases, process_release, MAX_SEARCH_RESULTS
+    ):
+        for match, resolved in release_matches:
+            if match.id not in seen_ids:
+                results.append(match)
+                seen_ids.add(match.id)
+            existing = discogs_titles.get(match.id)
+            if existing is None:
+                discogs_titles[match.id] = resolved
+            elif rank_carried:
+                discogs_titles[match.id] = rank_resolved_releases(
+                    [existing, resolved], match.title
+                )[0]
+        if len(results) >= MAX_SEARCH_RESULTS:
+            break
+
+
+async def _apply_album_title_fallback(
+    *,
+    parsed: ParsedRequest,
+    process_release: ReleaseProcessor,
+    album_fallback_should_fire: bool,
+    album_fallback_response: TrackReleasesResponse | None,
+    album_fallback_error: str | None,
+    results: list[LibraryItem],
+    seen_ids: set[int],
+    discogs_titles: dict[int, ResolvedRelease],
+    rank_carried: bool,
+) -> bool:
+    """Album-title fallback (#319 + #237): consume the speculative title-only
+    probe fired in ``_run_discogs_probes`` (#339), with the trio-aware kwargs
+    (no self-named-album guard, no library-side artist filter). Gate is
+    ``not results`` — conservative, backfilling the zero-results case rather
+    than augmenting partial ones. A probe failure only logs, never raises.
+    Returns True when the fallback surfaced candidates (``discogs_found_releases``).
+    """
+    if not album_fallback_should_fire:
+        return False
+
+    pre_fallback_results_count = len(results)
+    # `album_fallback_should_fire` implies `parsed.album is not None` (see the
+    # precondition in `_run_discogs_probes`); each branch below re-asserts to
+    # narrow the type locally for the type-checker.
+    if album_fallback_error is not None:
+        assert parsed.album is not None
+        _log_album_title_fallback(
+            album=parsed.album,
+            n_candidates=0,
+            surfaced_library_match=False,
+            error=album_fallback_error,
+        )
+        return False
+
+    if results or album_fallback_response is None:
+        return False
+
+    assert parsed.album is not None
+    fallback_releases = list(album_fallback_response.releases or [])
+    if fallback_releases:
+        logger.info(
+            f"Album-title fallback returned {len(fallback_releases)} candidates "
+            f"for '{parsed.album}'"
+        )
+
+    fallback_worker = partial(
+        process_release, skip_self_named_album=False, skip_artist_match_filter=True
+    )
+    await _collect_release_matches(
+        fallback_releases,
+        fallback_worker,
+        results=results,
+        seen_ids=seen_ids,
+        discogs_titles=discogs_titles,
+        rank_carried=rank_carried,
+    )
+    _log_album_title_fallback(
+        album=parsed.album,
+        n_candidates=len(fallback_releases),
+        surfaced_library_match=len(results) > pre_fallback_results_count,
+    )
+    return bool(fallback_releases)
+
+
+async def _carry_through_nonlibrary_release(
+    parsed: ParsedRequest,
+    discogs_service: DiscogsService | None,
+    pg: PgSource | None,
+    allow_release_resolution_fallback: bool,
+    results: list[LibraryItem],
+    discogs_titles: dict[int, ResolvedRelease],
+) -> LibraryItem | None:
+    """A1 carry-through (LML#628): resolve + validate off a non-library
+    release and surface it row-less. Keyed on typed ``parsed.artist`` (#626).
+    Off by default; LML#652's bulk kill switch skips /lookup/bulk. Mutates
+    ``discogs_titles`` in place on a hit; ``None`` otherwise."""
+    if (
+        results
+        or not get_settings().lml_resolve_nonlibrary_release
+        or not allow_release_resolution_fallback
+        or not parsed.song
+    ):
+        return None
+
+    resolved_nonlibrary = await _resolve_nonlibrary_release(
+        discogs_service,
+        pg,
+        song=parsed.song,
+        artist=parsed.artist or "",
+        album=parsed.album,
+        is_track=True,
+    )
+    if resolved_nonlibrary is None:
+        return None
+
+    rowless = _make_rowless_item(artist=parsed.artist or "", title=resolved_nonlibrary.album_title)
+    discogs_titles[ROWLESS_LIBRARY_ID] = resolved_nonlibrary
+    logger.info(
+        f"TRACK_ON_COMPILATION: surfacing row-less Discogs release "
+        f"{resolved_nonlibrary.release_id} ('{resolved_nonlibrary.album_title}') "
+        f"— validated, not in library"
+    )
+    return rowless
+
+
 async def search_compilations_for_track(
     db: LibraryDB,
     parsed: ParsedRequest,
@@ -202,525 +772,68 @@ async def search_compilations_for_track(
     :class:`~lookup.release_resolution.ResolvedRelease` it matched — the widened
     ``discogs_titles`` seam consumed by the artwork-binding step.
 
-    Two-channel seam (WXYC/library-metadata-lookup#626): the Discogs probes and
-    ``validate_release_for_track`` use the typed ``parsed.artist`` (via
-    ``artist_for_probes``); the library-side keyword search and the two
-    ``artist_matches_item`` match-backs use ``lib_artist`` (the correction when
-    present, else the typed name).
-
-    A1 carry-through (LML#628): when the whole search surfaces no library row and
-    ``lml_resolve_nonlibrary_release`` is on, the track's release is resolved +
-    validated (via :func:`_resolve_nonlibrary_release`, keyed on the typed
-    ``parsed.artist``) and surfaced row-less as ``LibraryItem(id=0)`` +
-    ``discogs_titles[0]``. ``pg`` threads the #632 cache; ``None`` resolves
-    uncached. ``allow_release_resolution_fallback`` is the bulk kill switch
-    (LML#652): ``False`` on /lookup/bulk suppresses that carry-through entirely
-    (no resolve, no cache write, no row-less item).
-
-    Candidate carry-through (LML#867): ``candidate_memo`` optionally carries step
-    2's artist-filtered track search (releases + verdicts, keyed by
-    ``(track, artist)``). On a hit for ``(song_search, artist_for_probes)`` — i.e.
-    when the consumer's query matches what step 2 already searched — Wave A's
-    ``artist=`` probe is reused from the memo instead of re-issued, so an
-    artist+song lookup fires the artist-filtered search once. The wider Wave B
-    probe (``artist_as_keyword=True``) is only skipped when the reused seed already
-    holds a true-V/A compilation, which is exactly the case
-    ``merge_wave_b_compilations`` discards Wave B — so the skip cannot narrow
-    recall. A memo miss (canonical-artist swap, remix-augmented title, or no memo)
-    falls through to the pre-#867 parallel Wave A + Wave B gather unchanged.
+    The body is a sequence of named phases sharing the request-scoped
+    ``results``/``seen_ids``/``discogs_titles`` accumulators:
+    ``_search_by_keyword`` (last-resort candidates) -> ``_run_discogs_probes``
+    (Wave A/B + album-title discovery, reusing ``candidate_memo`` per
+    LML#867) -> ``_make_release_processor``/``_collect_release_matches``
+    (tracklist cross-reference + artist verification) ->
+    ``_apply_album_title_fallback`` -> result shaping ->
+    ``_carry_through_nonlibrary_release`` (LML#628, gated by
+    ``lml_resolve_nonlibrary_release`` + ``allow_release_resolution_fallback``).
     """
     if not parsed.song or not parsed.artist:
         return [], {}
 
     logger.info(f"Searching for '{parsed.song}' on other releases (compilations, etc.)")
 
-    results = []
-    seen_ids = set()
+    results: list[LibraryItem] = []
+    seen_ids: set[int] = set()
     discogs_titles: dict[int, ResolvedRelease] = {}
     lib_artist = library_artist_for(parsed)
-
-    # Carried-release ranking (LML#604 deferred finding #2). When the flag is on,
-    # a library row matched by multiple releases binds the title-best one — the
-    # same ranking the lazy fallback applies — so both binding paths agree. When
-    # off, first-seen (Wave A / library-match order) wins, preserving pre-PR2
-    # behavior. The rank target is the matched library row's own title.
     rank_carried = get_settings().lml_resolve_compilation_release
 
-    def _record_resolved(match: LibraryItem, resolved: ResolvedRelease) -> None:
-        existing = discogs_titles.get(match.id)
-        if existing is None:
-            discogs_titles[match.id] = resolved
-        elif rank_carried:
-            discogs_titles[match.id] = rank_resolved_releases([existing, resolved], match.title)[0]
-
-    keyword_matches = []
-    try:
-        artist_words = re.sub(r"[^\w\s]", " ", lib_artist.lower()).split() if lib_artist else []
-        song_words = re.sub(r"[^\w\s]", " ", parsed.song.lower()).split() if parsed.song else []
-
-        sig_artist = [w for w in artist_words if len(w) > 3 and w not in STOPWORDS]
-        sig_song = [w for w in song_words if len(w) > 3 and w not in STOPWORDS]
-
-        query_words = sig_artist[:2] + sig_song[:2]
-
-        if query_words:
-            keyword_query = " ".join(query_words)
-            logger.info(f"Trying direct keyword search: '{keyword_query}'")
-            keyword_results = await db.search(query=keyword_query, limit=_FETCH_LIMIT)
-
-            if keyword_results:
-                filtered_results = []
-                for item in keyword_results:
-                    if lib_artist and artist_matches_item(item, lib_artist):
-                        filtered_results.append(item)
-                    elif is_compilation_artist(item.artist or ""):
-                        filtered_results.append(item)
-
-                if filtered_results:
-                    logger.info(
-                        f"Found {len(filtered_results)} matches via keyword search "
-                        f"(after artist filter)"
-                    )
-                    keyword_matches = filtered_results
-    except Exception as e:
-        logger.warning(f"Keyword search failed: {e}")
-        keyword_matches = []
+    keyword_matches = await _search_by_keyword(db, lib_artist, parsed)
 
     discogs_found_releases = False
-
     try:
-        raw_lower = parsed.raw_message.lower()
-        song_search = parsed.song
-
-        remix_match = re.search(r"\((.*?(?:remix|mix|version|edit).*?)\)", raw_lower, re.IGNORECASE)
-        if remix_match and parsed.song.lower() in raw_lower:
-            song_search = f"{parsed.song} ({remix_match.group(1)})"
-            logger.info(f"Using full track name with version info: '{song_search}'")
-
-        # Resolver pre-pass: when the inbound artist string trigram-matches a
-        # canonical Discogs name with confidence >= the floor, use the canonical
-        # form for both Discogs probes. Gated by ``lml_resolve_artist_canonical``
-        # — the flag controls *both* the trigram lookup and the swap, so the
-        # default-off path pays no PG cost. See WXYC/library-metadata-lookup#343
-        # Option 2.
-        enforce_swap = bool(get_settings().lml_resolve_artist_canonical)
-        if enforce_swap:
-            cache_service = getattr(discogs_service, "cache_service", None)
-            outcome = await resolve_canonical_artist(parsed.artist, cache_service=cache_service)
-            actual_swap = outcome.swapped
-            _log_resolver_pre_pass(outcome, actual_swap=actual_swap)
-            artist_for_probes = outcome.canonical if actual_swap else parsed.artist
-        else:
-            outcome = ResolverOutcome(
-                original=parsed.artist or "",
-                canonical=parsed.artist or "",
-                score=0.0,
-                swapped=False,
-            )
-            artist_for_probes = parsed.artist
-
-        # Get raw releases from Discogs without per-release validation.
-        # We search the library first and only validate releases that match,
-        # avoiding expensive API calls for releases not in our catalog.
-        raw_releases: list[ReleaseInfo] = []
-        # The album-title fallback's preconditions (`parsed.album` set, no
-        # resolver swap) are decidable here, so its probe joins the same
-        # `asyncio.gather` as the two artist-scoped probes (WXYC/library-
-        # metadata-lookup#339). Cold-cache wall time drops from A+B+C to
-        # max(A,B,C); the cost is one speculative API call when Wave A
-        # already succeeds — that call warms the cache.
-        album_fallback_should_fire = (
-            discogs_service is not None and bool(parsed.album) and not outcome.swapped
-        )
-        album_fallback_response: TrackReleasesResponse | None = None
-        album_fallback_error: str | None = None
-
-        async def _album_title_probe_safe() -> tuple[TrackReleasesResponse | None, str | None]:
-            """Catch-and-return wrapper so a Discogs failure on the album-title
-            probe doesn't take down the artist-scoped probes in the same gather.
-            Mirrors the existing fallback's try/except, which logs via
-            `_log_album_title_fallback(..., error=str(e))`."""
-            assert discogs_service is not None  # narrow for type-checker
-            assert parsed.album is not None
-            try:
-                resp = await discogs_service.search_releases_by_album_title(parsed.album)
-                return resp, None
-            except Exception as exc:
-                return None, str(exc)
-
-        # LML#867: reuse step 2's artist-filtered candidates as Wave A's seed when
-        # the memo holds this exact query. The key is the consumer's own probe
-        # params (``song_search``, ``artist_for_probes``) normalized via
-        # ``to_match_form``, so a remix-augmented title or a canonical-artist swap
-        # that genuinely changes the *normalized* query misses and re-searches;
-        # a swap that only re-cases or re-diacriticizes the name (an equivalent
-        # Discogs query) collapses to the same key and hits. The common
-        # no-swap/no-remix case hits.
-        memo_seed = (
-            candidate_memo.get(song_search, artist_for_probes)
-            if candidate_memo is not None
-            else None
-        )
-        # Recall guard: reuse the seed only when it was fetched at least as wide as
-        # a fresh Wave A would search (``WAVE_A_SEARCH_LIMIT``). A seed from a
-        # smaller page can be a strict subset — the keyword supplement inside
-        # ``search_releases_by_track`` scales its page with the limit, so a fresh
-        # wider Wave A can surface releases (a sole library pressing, and if not a
-        # V/A comp one Wave B's ``format=Compilation`` arm can't rescue) that a
-        # narrower seed missed. On a too-narrow seed, fall through to the fresh
-        # gather below; suppress the search only when reuse is a provable superset.
-        if memo_seed is not None and memo_seed.search_limit < WAVE_A_SEARCH_LIMIT:
-            memo_seed = None
-
-        if discogs_service and memo_seed is not None:
-            # Wave A came free from the memo (no second ``artist=`` search). The
-            # guard above ensured the seed was fetched at least as wide as a fresh
-            # Wave A (``search_limit >= WAVE_A_SEARCH_LIMIT``), so it is a superset
-            # of what a fresh Wave A would surface — reuse is provably non-narrowing.
-            # The recall-critical wider arm is the Wave B probe, preserved below.
-            wave_a_releases = list(memo_seed.releases)
-            # Skip the wider Wave B probe only when the seed already holds a
-            # true-V/A comp — ``merge_wave_b_compilations`` discards Wave B in
-            # exactly that case, so skipping its search is provably non-narrowing.
-            # An empty or non-V/A seed is "insufficient" for the compilation
-            # purpose, so the wider probe still fires (no recall narrowing).
-            # Uses the SAME ``has_va_compilation`` predicate the merge uses, so the
-            # skip can't drift from what the merge would discard.
-            seed_has_va = has_va_compilation(wave_a_releases)
-            tail_probes: list[Coroutine[Any, Any, _ProbeResult]] = []
-            wave_b_index: int | None = None
-            if not seed_has_va:
-                wave_b_index = len(tail_probes)
-                tail_probes.append(
-                    discogs_service.search_releases_by_track(
-                        song_search, artist_for_probes, artist_as_keyword=True
-                    )
-                )
-            album_probe_index: int | None = None
-            if album_fallback_should_fire:
-                album_probe_index = len(tail_probes)
-                tail_probes.append(_album_title_probe_safe())
-
-            gathered_tail = await asyncio.gather(*tail_probes) if tail_probes else []
-            wave_b_releases: list[ReleaseInfo] = []
-            if wave_b_index is not None:
-                va_response = gathered_tail[wave_b_index]
-                assert isinstance(va_response, TrackReleasesResponse)
-                wave_b_releases = list(va_response.releases or [])
-            if album_probe_index is not None:
-                probe_tuple = gathered_tail[album_probe_index]
-                assert isinstance(probe_tuple, tuple)
-                album_fallback_response, album_fallback_error = probe_tuple
-
-            raw_releases = merge_wave_b_compilations(wave_a_releases, wave_b_releases)
-        elif discogs_service:
-            # Two artist-scoped probes return TrackReleasesResponse; the optional
-            # album-title probe returns tuple[TrackReleasesResponse | None, str | None].
-            # _ProbeResult (module-scope alias) captures the heterogeneous shape.
-            #
-            # Wave A (artist-scoped) reads the PG cache CTE
-            # (``_SEARCH_BY_TRACK_ARTIST_SQL``); Wave B (``artist_as_keyword=True``)
-            # does NOT. ``DiscogsService.search_releases_by_track`` sets
-            # ``pg_read_hook=None`` for the keyword probe and hits the Discogs API
-            # ``format=Compilation`` search directly, so the #802 CTE
-            # ``rta.extra = 0`` guard governs Wave A only. A V/A comp whose
-            # performer is credited on the matching track via ``extra = 1``
-            # (guest/featured) still reaches ``merge_wave_b_compilations`` through
-            # Wave B's API arm, never pruned by that guard — LML#817 finding C2,
-            # reproduced-and-refuted and pinned by
-            # ``tests/integration/test_va_comp_wave_b_extra_credit.py``.
-            probes: list[Coroutine[Any, Any, _ProbeResult]] = [
-                discogs_service.search_releases_by_track(
-                    song_search, artist_for_probes, limit=WAVE_A_SEARCH_LIMIT
-                ),
-                discogs_service.search_releases_by_track(
-                    song_search, artist_for_probes, artist_as_keyword=True
-                ),
-            ]
-            if album_fallback_should_fire:
-                probes.append(_album_title_probe_safe())
-
-            gathered = await asyncio.gather(*probes)
-            # gathered[0] / gathered[1] are TrackReleasesResponse by construction
-            # (the order matches the `probes` list above); narrow via assert.
-            assert isinstance(gathered[0], TrackReleasesResponse)
-            assert isinstance(gathered[1], TrackReleasesResponse)
-            response, va_response = gathered[0], gathered[1]
-            if album_fallback_should_fire:
-                probe_tuple = gathered[2]
-                assert isinstance(probe_tuple, tuple)
-                album_fallback_response, album_fallback_error = probe_tuple
-
-            # Merge Wave B's V/A compilations into Wave A unless Wave A already
-            # surfaced a true-V/A hit (WXYC#527). The merge logic is owned by
-            # ``lookup.release_resolution.merge_wave_b_compilations`` so the
-            # release-resolution module and this strategy can't drift apart.
-            raw_releases = merge_wave_b_compilations(
-                list(response.releases or []), list(va_response.releases or [])
-            )
-        else:
-            # No injected service — fall back to lookup helper (validates all)
-            tuples = await lookup_releases_by_track(song_search, parsed.artist, service=None)
-            raw_releases = [
-                ReleaseInfo(
-                    album=album,
-                    artist=artist,
-                    release_id=0,
-                    release_url="",
-                    is_compilation=is_compilation_artist(artist),
-                )
-                for artist, album in tuples
-            ]
+        probes = await _run_discogs_probes(parsed, discogs_service, candidate_memo)
+        song_search = probes.song_search
+        raw_releases = probes.raw_releases
 
         logger.info(f"Found {len(raw_releases)} releases with '{song_search}' on Discogs")
         discogs_found_releases = len(raw_releases) > 0
 
-        async def process_release(
-            release_info: ReleaseInfo,
-            *,
-            skip_self_named_album: bool = True,
-            skip_artist_match_filter: bool = False,
-        ) -> list[tuple[LibraryItem, ResolvedRelease]]:
-            """Process one Discogs release: library search, filter, validate.
+        process_release = _make_release_processor(
+            db, parsed, lib_artist, discogs_service, song_search
+        )
 
-            ``skip_self_named_album`` defaults True to preserve existing behavior
-            for callers that arrived via artist-scoped probes. The album-title
-            fallback (WXYC/library-metadata-lookup#319) passes False because the
-            trio-collaboration case has ``album == artist`` by design.
+        await _collect_release_matches(
+            raw_releases,
+            process_release,
+            results=results,
+            seen_ids=seen_ids,
+            discogs_titles=discogs_titles,
+            rank_carried=rank_carried,
+        )
 
-            ``skip_artist_match_filter`` defaults False. When True, the
-            library-side ``artist_matches_item`` prefix-filter is skipped and
-            artist gating is deferred to ``validate_track_on_release``'s fuzzy
-            ``rapidfuzz.token_set_ratio`` (PR #236). The fallback path passes
-            True because the library row's artist string for trio/collaborative
-            releases (e.g. ``"Orcutt, Bill / Shelley, Chris / Miller, Mette"``)
-            won't prefix-match a user-typed ``"Orcutt Shelley Miller"``, but the
-            fuzzy validator on the Discogs side does accept it.
-            """
-            release_album = release_info.album
-
-            if skip_self_named_album:
-                album_clean = release_album.lower().replace('"', "").replace("'", "").strip()
-                if (
-                    parsed.artist
-                    and album_clean
-                    == parsed.artist.lower().replace('"', "").replace("'", "").strip()
-                ):
-                    logger.debug(
-                        f"Skipping '{release_album}' - appears to be artist name, not album"
-                    )
-                    return []
-
-            if len(release_album.strip()) < 3:
-                return []
-
-            matches = await search_album_fuzzy(db, release_album)
-
-            # If album-only search failed for a compilation, retry with "Various"
-            # to help FTS5 match entries stored as "Various Artists - ..."
-            if not matches and release_info.is_compilation:
-                matches = await search_album_fuzzy(db, f"Various {release_album}")
-
-            if matches and lib_artist and not skip_artist_match_filter:
-                from rapidfuzz import fuzz as _fuzz
-
-                filtered_matches = []
-                discogs_is_compilation = release_info.is_compilation
-                release_album_lower = release_album.lower()
-
-                # LML#971 identity bridge (flag-gated, default off): a library row
-                # filed under a band name / abbreviated alias (e.g. "Burning Star
-                # Core" / "C.S. Yeh") won't prefix-match the typed personal name
-                # ("C. Spencer Yeh"), but the resolved Discogs release's artist
-                # entity knows the alias as a name-variation. Scoped to
-                # NON-COMPILATION releases: a V/A release's extra=0 artist is the
-                # "Various" entity, whose variations carry no artist-identity signal
-                # and would bypass the title-score floor in the compilation branch
-                # above (e.g. a "VA"-filed row that is_compilation_artist misses).
-                # Resolved lazily via ``_fetch_release_artist_variations`` -- only a
-                # row that clears neither the typed-artist filter nor the
-                # compilation carve-out consults it, so a lookup whose rows all
-                # match directly pays no extra query. validate_release_for_track
-                # (typed artist) below remains the safety belt.
-                bridge_enabled = (
-                    get_settings().lml_resolve_artist_variations and not discogs_is_compilation
-                )
-                release_variations: set[str] | None = None
-
-                for match in matches:
-                    if artist_matches_item(match, lib_artist):
-                        filtered_matches.append(match)
-                    elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
-                        title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
-                        if title_score >= 80:
-                            filtered_matches.append(match)
-                        else:
-                            logger.debug(
-                                f"Rejected '{match.title}' for '{release_album}' "
-                                f"(title_score={title_score:.0f})"
-                            )
-                    elif bridge_enabled:
-                        if release_variations is None:
-                            release_variations = await _fetch_release_artist_variations(
-                                discogs_service, release_info.release_id
-                            )
-                        if _row_identity_in_variations(match, release_variations):
-                            filtered_matches.append(match)
-                matches = filtered_matches
-            elif matches and lib_artist and skip_artist_match_filter:
-                # The strict prefix filter above is deferred on this path, but
-                # ``validate_track_on_release`` only vets the Discogs release —
-                # not the surfaced library row. Apply a lenient library-side
-                # artist backstop so an album-title fuzz collision can't bind a
-                # wrong-artist row (see ``_FALLBACK_ARTIST_SIMILARITY_FLOOR``).
-                from rapidfuzz import fuzz as _fuzz
-
-                lib_artist_norm = normalize_for_comparison(lib_artist)
-                discogs_is_compilation = release_info.is_compilation
-                release_album_lower = release_album.lower()
-
-                def _fallback_row_acceptable(match: LibraryItem) -> bool:
-                    # Legitimate Various-Artists compilation rows share no artist
-                    # tokens with a typed solo/track artist, so the fuzzy floor
-                    # would wrongly drop them. Keep them on a title match instead,
-                    # mirroring the strict branch's compilation carve-out above.
-                    # ``is_compilation_artist`` is False for coincidental
-                    # wrong-artist collisions (e.g. "Galaxy 2 Galaxy"), so this
-                    # does not re-open the #717 bug.
-                    if discogs_is_compilation and is_compilation_artist(match.artist or ""):
-                        title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
-                        return title_score >= 80
-                    return (
-                        max(
-                            _fuzz.token_set_ratio(
-                                lib_artist_norm, normalize_for_comparison(match.artist or "")
-                            ),
-                            _fuzz.token_set_ratio(
-                                lib_artist_norm,
-                                normalize_for_comparison(match.alternate_artist_name or ""),
-                            ),
-                        )
-                        >= _FALLBACK_ARTIST_SIMILARITY_FLOOR
-                    )
-
-                matches = [match for match in matches if _fallback_row_acceptable(match)]
-
-            if not matches:
-                return []
-
-            # Validate that the track actually exists on this release.
-            # Deferred until after library matching so we only validate
-            # releases we might actually return — saving API calls (LML#536).
-            if discogs_service and release_info.release_id and parsed.artist:
-                is_valid = await validate_release_for_track(
-                    discogs_service,
-                    release_info.release_id,
-                    song_search,
-                    parsed.artist,
-                    source="compilation_inline",
-                )
-                if not is_valid:
-                    logger.info(
-                        f"Skipping '{release_album}' - track/artist not validated on release"
-                    )
-                    return []
-
-            logger.info(
-                f"Found '{parsed.song}' in library on '{matches[0].title}' "
-                f"(matched from Discogs: '{release_album}')"
-            )
-            resolved = ResolvedRelease(
-                release_id=release_info.release_id,
-                release_url=release_info.release_url,
-                is_compilation=bool(release_info.is_compilation),
-                album_title=release_album,
-            )
-            return [(match, resolved) for match in matches]
-
-        # Chunked dispatch so the per-request validate budget stays bounded
-        # once the response cap is hit. Without chunking, asyncio.gather
-        # would schedule (and pay for) every candidate's
-        # ``validate_track_on_release`` even after MAX_SEARCH_RESULTS
-        # matches had already landed — see LML#536 and the matching
-        # treatment in ``search_song_as_track``.
-        async for _, release_matches in _chunked_gather(
-            raw_releases, process_release, MAX_SEARCH_RESULTS
-        ):
-            for match, resolved in release_matches:
-                if match.id not in seen_ids:
-                    results.append(match)
-                    seen_ids.add(match.id)
-                _record_resolved(match, resolved)
-            if len(results) >= MAX_SEARCH_RESULTS:
-                break
-
-        # Album-title fallback (#319 + #237): when the artist-scoped probes
-        # produced no library results AND the request supplied an album AND
-        # the resolver pre-pass did not produce a high-confidence canonical,
-        # process the title-only Discogs candidates with the trio-aware
-        # kwargs (no self-named-album guard, no library-side artist filter —
-        # defer artist gating to validate_track_on_release).
-        #
-        # The probe itself was fired speculatively in the same `asyncio.gather`
-        # as the artist-scoped probes above (#339). When it returned results
-        # we already paid the Discogs API cost; here we just decide whether
-        # to *consume* those candidates, gated on `not results` from Wave A.
-        #
-        # Trade-off: the gate is ``not results`` rather than
-        # ``len(results) < MAX_SEARCH_RESULTS``. A partial initial pass (e.g.
-        # one valid match) suppresses the fallback entirely, even when more
-        # spots are available. Conservative-by-design — the fallback's
-        # purpose is to backfill the zero-results case, not augment partial
-        # ones. Revisit if measurements show partial-result requests would
-        # benefit from supplementation.
-        pre_fallback_results_count = len(results)
-        # `album_fallback_should_fire` implies `parsed.album is not None`
-        # (see the precondition where the flag is set); each branch below
-        # re-asserts to narrow the type locally for the type-checker.
-        if album_fallback_should_fire and album_fallback_error is not None:
-            # The probe ran but raised; mirror the pre-#339 behavior of
-            # logging via `_log_album_title_fallback(..., error=...)`.
-            assert parsed.album is not None
-            _log_album_title_fallback(
-                album=parsed.album,
-                n_candidates=0,
-                surfaced_library_match=False,
-                error=album_fallback_error,
-            )
-        elif album_fallback_should_fire and not results and album_fallback_response is not None:
-            assert parsed.album is not None
-            fallback_releases = list(album_fallback_response.releases or [])
-            if fallback_releases:
-                logger.info(
-                    f"Album-title fallback returned {len(fallback_releases)} candidates "
-                    f"for '{parsed.album}'"
-                )
-
-            fallback_worker = partial(
-                process_release,
-                skip_self_named_album=False,
-                skip_artist_match_filter=True,
-            )
-            async for _, release_matches in _chunked_gather(
-                fallback_releases, fallback_worker, MAX_SEARCH_RESULTS
-            ):
-                for match, resolved in release_matches:
-                    if match.id not in seen_ids:
-                        results.append(match)
-                        seen_ids.add(match.id)
-                    _record_resolved(match, resolved)
-                if len(results) >= MAX_SEARCH_RESULTS:
-                    break
-            if fallback_releases:
-                discogs_found_releases = True
-            _log_album_title_fallback(
-                album=parsed.album,
-                n_candidates=len(fallback_releases),
-                surfaced_library_match=len(results) > pre_fallback_results_count,
-            )
+        fallback_found_releases = await _apply_album_title_fallback(
+            parsed=parsed,
+            process_release=process_release,
+            album_fallback_should_fire=probes.album_fallback_should_fire,
+            album_fallback_response=probes.album_fallback_response,
+            album_fallback_error=probes.album_fallback_error,
+            results=results,
+            seen_ids=seen_ids,
+            discogs_titles=discogs_titles,
+            rank_carried=rank_carried,
+        )
+        discogs_found_releases = discogs_found_releases or fallback_found_releases
     except Exception as e:
         logger.warning(f"Failed to search for track on other releases: {e}")
 
+    # Last resort: when Discogs found nothing at all, surface the single best
+    # keyword-search hit instead of returning empty-handed.
     if not results and keyword_matches and not discogs_found_releases:
         logger.info("Discogs search found nothing, using keyword matches as fallback")
         for item in keyword_matches[:1]:
@@ -728,49 +841,15 @@ async def search_compilations_for_track(
                 results.append(item)
                 seen_ids.add(item.id)
 
+    # Prefer rows whose title contains the typed song verbatim (stable sort).
     if results and parsed.song:
         song_lower = parsed.song.lower()
-        results.sort(
-            key=lambda r: song_lower in (r.title or "").lower(),
-            reverse=True,
-        )
+        results.sort(key=lambda r: song_lower in (r.title or "").lower(), reverse=True)
 
-    # A1 carry-through (LML#628): the artist+keyword+album waves dropped every
-    # candidate on the library gate, but the track may still resolve + validate
-    # off a non-library release. Surface it row-less rather than empty. Keyed on
-    # the typed ``parsed.artist`` (NOT ``lib_artist`` / the canonical-swapped
-    # ``artist_for_probes``), consistent with the #626 two-channel decision and
-    # the #632 cache contract. Gated; off by default. LML#652: also gated on the
-    # bulk kill switch — /lookup/bulk passes ``allow_release_resolution_fallback
-    # =False`` so the backfill never pays the per-row resolve + #632 cache write
-    # (parity with #604's lazy fallback).
-    if (
-        not results
-        and get_settings().lml_resolve_nonlibrary_release
-        and allow_release_resolution_fallback
-        and parsed.song
-    ):
-        # Distinct name from the #604 ``resolved`` bound earlier in this function
-        # (a non-optional ``ResolvedRelease``) — the helper returns an Optional,
-        # and reusing the name trips a mypy assignment-type collision.
-        resolved_nonlibrary = await _resolve_nonlibrary_release(
-            discogs_service,
-            pg,
-            song=parsed.song,
-            artist=parsed.artist or "",
-            album=parsed.album,
-            is_track=True,
-        )
-        if resolved_nonlibrary is not None:
-            rowless = _make_rowless_item(
-                artist=parsed.artist or "", title=resolved_nonlibrary.album_title
-            )
-            discogs_titles[ROWLESS_LIBRARY_ID] = resolved_nonlibrary
-            logger.info(
-                f"TRACK_ON_COMPILATION: surfacing row-less Discogs release "
-                f"{resolved_nonlibrary.release_id} ('{resolved_nonlibrary.album_title}') "
-                f"— validated, not in library"
-            )
-            return [rowless], discogs_titles
+    rowless = await _carry_through_nonlibrary_release(
+        parsed, discogs_service, pg, allow_release_resolution_fallback, results, discogs_titles
+    )
+    if rowless is not None:
+        return [rowless], discogs_titles
 
     return limit_results(results), discogs_titles
