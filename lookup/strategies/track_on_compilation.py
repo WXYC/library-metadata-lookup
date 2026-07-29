@@ -74,6 +74,25 @@ from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
 
+_COMPILATION_TITLE_RATIO_FLOOR = 80
+_COMPILATION_TITLE_LENGTH_RATIO_FLOOR = 0.9
+"""LML#973: the compilation carve-out's ``fuzz.ratio`` floor alone can't tell
+"same comp, reformatted title" from "different comp, similarly-worded title" —
+e.g. "Greatest Hits Of The 50's" vs "Greatest hits of the 50s & 60s" clears
+``ratio >= 80`` (87.3) even though the second title names a different,
+track-less pressing. Requiring the shorter title to be at least 90% the
+length of the longer catches that case (length ratio 0.83) while a genuine
+reformatting — punctuation, an added "!", "Vol." vs "Vol" — stays
+length-comparable and still clears both floors."""
+
+
+def _compilation_title_length_ratio(a: str, b: str) -> float:
+    """``min(len)/max(len)`` of two titles, in [0, 1]; 0.0 if either is empty."""
+    if not a or not b:
+        return 0.0
+    return min(len(a), len(b)) / max(len(a), len(b))
+
+
 TrackOnCompilationExecute = Callable[
     [LibraryDB, ParsedRequest],
     Awaitable[tuple[list[LibraryItem], dict[int, ResolvedRelease]]],
@@ -484,7 +503,15 @@ async def _filter_release_matches(
 
         def _fallback_row_acceptable(match: LibraryItem) -> bool:
             if discogs_is_compilation and is_compilation_artist(match.artist or ""):
-                return _fuzz.ratio(release_album_lower, (match.title or "").lower()) >= 80
+                match_title_lower = (match.title or "").lower()
+                title_score = _fuzz.ratio(release_album_lower, match_title_lower)
+                length_ratio = _compilation_title_length_ratio(
+                    release_album_lower, match_title_lower
+                )
+                return (
+                    title_score >= _COMPILATION_TITLE_RATIO_FLOOR
+                    and length_ratio >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
+                )
             return (
                 max(
                     _fuzz.token_set_ratio(
@@ -506,13 +533,18 @@ async def _filter_release_matches(
         if artist_matches_item(match, lib_artist):
             filtered_matches.append(match)
         elif discogs_is_compilation and is_compilation_artist(match.artist or ""):
-            title_score = _fuzz.ratio(release_album_lower, (match.title or "").lower())
-            if title_score >= 80:
+            match_title_lower = (match.title or "").lower()
+            title_score = _fuzz.ratio(release_album_lower, match_title_lower)
+            length_ratio = _compilation_title_length_ratio(release_album_lower, match_title_lower)
+            if (
+                title_score >= _COMPILATION_TITLE_RATIO_FLOOR
+                and length_ratio >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
+            ):
                 filtered_matches.append(match)
             else:
                 logger.debug(
                     f"Rejected '{match.title}' for '{release_info.album}' "
-                    f"(title_score={title_score:.0f})"
+                    f"(title_score={title_score:.0f}, length_ratio={length_ratio:.2f})"
                 )
         elif bridge_enabled:
             if release_variations is None:
