@@ -13,13 +13,9 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
-# ``pg_pool`` (max_size=3) lives in conftest; ``DATABASE_URL`` is imported from
-# there for the ``monkeypatch.setenv("DATABASE_URL_DISCOGS", ...)`` wiring below.
-from tests.integration.conftest import (
-    DATABASE_URL,
-    ENTITY_IDENTITY_DDL,
-    skip_if_drop_targets_populated,
-)
+# ``pg_pool`` (max_size=3) and ``pg_app_client`` (the reconciled Family-C PG
+# client, LML#613) both live in conftest.
+from tests.integration.conftest import ENTITY_IDENTITY_DDL, skip_if_drop_targets_populated
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -74,42 +70,12 @@ async def set_up_entity_schema(pg_pool):
             await conn.execute("DROP SCHEMA IF EXISTS entity CASCADE")
 
 
-@pytest_asyncio.fixture
-async def app_client(monkeypatch):
-    """ASGI client with the LML app pointed at the test PG."""
-    from httpx import ASGITransport, AsyncClient
-
-    import core.dependencies as core_deps
-    import identity.dependencies as deps
-    from config.settings import get_settings
-
-    monkeypatch.setenv("DATABASE_URL_DISCOGS", DATABASE_URL)
-    get_settings.cache_clear()
-    deps._entity_store = None
-    deps._entity_probe_failed = False
-    # Post-WXYC#395 the entity store reuses ``core.dependencies.get_discogs_pool``.
-    # Clearing the entity-store singleton alone leaves the shared pool cached;
-    # the next ``get_entity_store`` would reuse it (which is fine within one
-    # test) but a parallel suite that toggles the DSN env var would race.
-    await core_deps.close_discogs_pool()
-
-    from main import app
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        yield ac
-
-    deps._entity_store = None
-    deps._entity_probe_failed = False
-    await core_deps.close_discogs_pool()
-    get_settings.cache_clear()
-
-
 @pytest.mark.pg
 class TestBulkResolveLibrariesEndpoint:
     @pytest.mark.asyncio
-    async def test_round_trip_single_artist_against_real_pg(self, app_client):
+    async def test_round_trip_single_artist_against_real_pg(self, pg_app_client):
         """End-to-end: seeded identity → composed single_artist verdict."""
-        resp = await app_client.post(
+        resp = await pg_app_client.post(
             "/api/v1/identity/bulk-resolve-libraries",
             json={
                 "inputs": [
@@ -135,9 +101,9 @@ class TestBulkResolveLibrariesEndpoint:
         assert len(result["provenance"]) == 2
 
     @pytest.mark.asyncio
-    async def test_input_order_preserved_across_mixed_kinds(self, app_client):
+    async def test_input_order_preserved_across_mixed_kinds(self, pg_app_client):
         """Response[i] corresponds to inputs[i] for compilation / hit / miss."""
-        resp = await app_client.post(
+        resp = await pg_app_client.post(
             "/api/v1/identity/bulk-resolve-libraries",
             json={
                 "inputs": [
@@ -160,7 +126,7 @@ class TestBulkResolveLibrariesEndpoint:
         ]
 
     @pytest.mark.asyncio
-    async def test_case_drift_resolves_via_lower_fall_through(self, app_client, pg_pool):
+    async def test_case_drift_resolves_via_lower_fall_through(self, pg_app_client, pg_pool):
         """Per #276: case drift between Backend input and verbatim-cased storage hits.
 
         Seeds verbatim mixed-case rows (the production shape per the #276
@@ -170,7 +136,7 @@ class TestBulkResolveLibrariesEndpoint:
         #275 ship: that PR canonicalized the input to lowercase and would
         have missed the verbatim-stored row entirely.
         """
-        resp = await app_client.post(
+        resp = await pg_app_client.post(
             "/api/v1/identity/bulk-resolve-libraries",
             json={
                 "inputs": [
@@ -186,7 +152,7 @@ class TestBulkResolveLibrariesEndpoint:
         assert results[1]["main"]["discogs_artist_id"] == 305253
 
     @pytest.mark.asyncio
-    async def test_canonical_lookup_collapses_divergence_vectors(self, app_client, pg_pool):
+    async def test_canonical_lookup_collapses_divergence_vectors(self, pg_app_client, pg_pool):
         """Per #274: diverged inputs resolve to the same canonical-form row.
 
         Seeds three identities in canonical form (lowercase, no diacritics,
@@ -205,7 +171,7 @@ class TestBulkResolveLibrariesEndpoint:
                 """
             )
 
-        resp = await app_client.post(
+        resp = await pg_app_client.post(
             "/api/v1/identity/bulk-resolve-libraries",
             json={
                 "inputs": [
@@ -226,7 +192,7 @@ class TestBulkResolveLibrariesEndpoint:
         assert results[2]["main"]["discogs_artist_id"] == 88888
 
     @pytest.mark.asyncio
-    async def test_all_three_legs_resolve_in_one_batch(self, app_client, pg_pool):
+    async def test_all_three_legs_resolve_in_one_batch(self, pg_app_client, pg_pool):
         """Mixed-shape stored rows + mixed-shape inputs all resolve in one call.
 
         Locks the full chain end-to-end. Seeds three rows in three different
@@ -255,7 +221,7 @@ class TestBulkResolveLibrariesEndpoint:
             # Note: 'Stereolab' is already seeded with discogs_artist_id=2154
             # by the schema fixture.
 
-        resp = await app_client.post(
+        resp = await pg_app_client.post(
             "/api/v1/identity/bulk-resolve-libraries",
             json={
                 "inputs": [
@@ -285,7 +251,7 @@ class TestBulkResolveLibrariesEndpoint:
         assert results[4]["main"] is None
 
     @pytest.mark.asyncio
-    async def test_leg_2_picks_lowest_id_when_two_rows_lower_match(self, app_client, pg_pool):
+    async def test_leg_2_picks_lowest_id_when_two_rows_lower_match(self, pg_app_client, pg_pool):
         """`library_name` is case-sensitive-UNIQUE; two case-variants can co-exist.
 
         Seed two rows whose lower-form is identical (``'Stereolab'`` already
@@ -302,7 +268,7 @@ class TestBulkResolveLibrariesEndpoint:
                 "VALUES ('stereolab', 99999)"
             )
 
-        resp = await app_client.post(
+        resp = await pg_app_client.post(
             "/api/v1/identity/bulk-resolve-libraries",
             json={
                 "inputs": [
@@ -319,12 +285,12 @@ class TestBulkResolveLibrariesEndpoint:
         assert result["main"]["discogs_artist_id"] == 2154
 
     @pytest.mark.asyncio
-    async def test_413_for_oversized_request(self, app_client):
+    async def test_413_for_oversized_request(self, pg_app_client):
         """1001 inputs → 413."""
         oversized = [
             {"library_id": i, "artist_name": f"Artist_{i}", "album_title": "x"} for i in range(1001)
         ]
-        resp = await app_client.post(
+        resp = await pg_app_client.post(
             "/api/v1/identity/bulk-resolve-libraries",
             json={"inputs": oversized},
         )

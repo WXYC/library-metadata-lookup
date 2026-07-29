@@ -261,6 +261,101 @@ async def pg_pool_large():
 
 
 # ---------------------------------------------------------------------------
+# PG-backed ASGI test client (Family C -- reconciled from 4 near-duplicate
+# per-file ``app_client`` fixtures, LML#613)
+# ---------------------------------------------------------------------------
+
+
+async def _pg_app_client(
+    monkeypatch,
+    *,
+    discogs_mock=None,
+    require_auth: bool = True,
+    close_service: bool = False,
+):
+    """Shared setup/teardown core for the PG-backed ``pg_app_client*`` fixtures below.
+
+    Mirrors what were four near-identical, all literally-named ``app_client``
+    fixtures local to ``test_bulk_resolve_libraries.py``, ``test_release_identity.py``,
+    ``test_cache_refresh_for_identities.py``, and ``test_search_aliases_bulk.py`` --
+    each shadowing the library_db-backed :func:`app_client` above within its
+    own module. ``discogs_mock`` overrides ``get_discogs_service`` (the
+    ``test_cache_refresh_for_identities`` variant); ``require_auth=False`` +
+    ``close_service=True`` reproduce the ``test_search_aliases_bulk`` variant's
+    extra ``LML_REQUIRE_AUTH=false`` env var and ``close_discogs_service()``
+    teardown (that one also tears down the service, not just the pool).
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    import core.dependencies as core_deps
+    import identity.dependencies as deps
+    from config.settings import get_settings
+
+    monkeypatch.setenv("DATABASE_URL_DISCOGS", DATABASE_URL)
+    if not require_auth:
+        monkeypatch.setenv("LML_REQUIRE_AUTH", "false")
+    get_settings.cache_clear()
+    deps._entity_store = None
+    deps._entity_probe_failed = False
+    await core_deps.close_discogs_pool()
+    if close_service:
+        await core_deps.close_discogs_service()
+
+    from main import app
+
+    if discogs_mock is not None:
+        from core.dependencies import get_discogs_service
+
+        app.dependency_overrides[get_discogs_service] = lambda: discogs_mock
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        yield ac
+
+    if discogs_mock is not None:
+        app.dependency_overrides.clear()
+    deps._entity_store = None
+    deps._entity_probe_failed = False
+    await core_deps.close_discogs_pool()
+    if close_service:
+        await core_deps.close_discogs_service()
+    get_settings.cache_clear()
+
+
+@pytest_asyncio.fixture
+async def pg_app_client(monkeypatch):
+    """PG-backed ASGI client: DSN env + entity-store singleton clear, no discogs override.
+
+    Backs ``test_bulk_resolve_libraries.py`` and ``test_release_identity.py`` --
+    the two Family-C fixtures whose bodies were byte-identical (LML#613).
+    """
+    async for client in _pg_app_client(monkeypatch):
+        yield client
+
+
+@pytest_asyncio.fixture
+async def pg_app_client_with_discogs(monkeypatch, discogs_mock):
+    """PG-backed ASGI client with ``get_discogs_service`` overridden to ``discogs_mock``.
+
+    Backs ``test_cache_refresh_for_identities.py`` (LML#613); ``discogs_mock``
+    stays the caller's own fixture so each module keeps its own mock defaults.
+    """
+    async for client in _pg_app_client(monkeypatch, discogs_mock=discogs_mock):
+        yield client
+
+
+@pytest_asyncio.fixture
+async def pg_app_client_no_auth(monkeypatch):
+    """PG-backed ASGI client with auth off and the discogs *service* singleton closed too.
+
+    Backs ``test_search_aliases_bulk.py`` (LML#613) -- the one Family-C
+    fixture that also flips ``LML_REQUIRE_AUTH`` off and tears down
+    ``close_discogs_service()`` (not just the pool) on both sides.
+    """
+    async for client in _pg_app_client(monkeypatch, require_auth=False, close_service=True):
+        yield client
+
+
+# ---------------------------------------------------------------------------
 # Seed data -- representative catalog items
 # ---------------------------------------------------------------------------
 

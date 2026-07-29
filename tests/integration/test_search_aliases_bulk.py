@@ -17,13 +17,9 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
-# ``pg_pool`` (max_size=3) lives in conftest; ``DATABASE_URL`` is imported from
-# there for the ``monkeypatch.setenv("DATABASE_URL_DISCOGS", ...)`` wiring below.
-from tests.integration.conftest import (
-    DATABASE_URL,
-    ENTITY_IDENTITY_DDL,
-    skip_if_drop_targets_populated,
-)
+# ``pg_pool`` (max_size=3) and ``pg_app_client_no_auth`` (the reconciled
+# Family-C PG client, LML#613) both live in conftest.
+from tests.integration.conftest import ENTITY_IDENTITY_DDL, skip_if_drop_targets_populated
 
 # The five public-schema discogs-cache tables this fixture drops and
 # recreates (the composer's read surface).
@@ -170,45 +166,12 @@ async def set_up_schemas(pg_pool):
             await conn.execute("DROP TABLE IF EXISTS artist CASCADE")
 
 
-@pytest_asyncio.fixture
-async def app_client(monkeypatch):
-    """ASGI client with the LML app pointed at the test PG, auth off."""
-    from httpx import ASGITransport, AsyncClient
-
-    import core.dependencies as core_deps
-    import identity.dependencies as deps
-    from config.settings import get_settings
-
-    monkeypatch.setenv("DATABASE_URL_DISCOGS", DATABASE_URL)
-    # Test posture mirrors `test_bulk_resolve_libraries.py`: leave
-    # `LML_REQUIRE_AUTH` off so we can assert the happy-path responses
-    # without provisioning a bearer. Auth enforcement is covered in
-    # `tests/unit/test_auth.py`.
-    monkeypatch.setenv("LML_REQUIRE_AUTH", "false")
-    get_settings.cache_clear()
-    deps._entity_store = None
-    deps._entity_probe_failed = False
-    await core_deps.close_discogs_pool()
-    await core_deps.close_discogs_service()
-
-    from main import app
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        yield ac
-
-    deps._entity_store = None
-    deps._entity_probe_failed = False
-    await core_deps.close_discogs_pool()
-    await core_deps.close_discogs_service()
-    get_settings.cache_clear()
-
-
 @pytest.mark.pg
 class TestSearchAliasesBulkEndpoint:
     @pytest.mark.asyncio
-    async def test_round_trip_emits_all_three_discogs_source_variants(self, app_client):
+    async def test_round_trip_emits_all_three_discogs_source_variants(self, pg_app_client_no_auth):
         """Stereolab returns one variant per source type and all three tags."""
-        resp = await app_client.post(
+        resp = await pg_app_client_no_auth.post(
             "/api/v1/artists/search-aliases/bulk",
             json={"names": ["Stereolab"]},
         )
@@ -235,9 +198,9 @@ class TestSearchAliasesBulkEndpoint:
         }
 
     @pytest.mark.asyncio
-    async def test_missing_identity_routed_to_missing_array(self, app_client):
+    async def test_missing_identity_routed_to_missing_array(self, pg_app_client_no_auth):
         """Names without an ``entity.identity`` row → in ``missing[]``, not ``artists[]``."""
-        resp = await app_client.post(
+        resp = await pg_app_client_no_auth.post(
             "/api/v1/artists/search-aliases/bulk",
             json={"names": ["Stereolab", "Nobody Knows"]},
         )
@@ -249,13 +212,15 @@ class TestSearchAliasesBulkEndpoint:
         assert data["missing"] == ["Nobody Knows"]
 
     @pytest.mark.asyncio
-    async def test_identity_without_discogs_id_yields_empty_sources_present(self, app_client):
+    async def test_identity_without_discogs_id_yields_empty_sources_present(
+        self, pg_app_client_no_auth
+    ):
         """Cat Power has NULL ``discogs_artist_id`` → empty variants AND empty sources_present.
 
         Reconcile contract: consumer must NOT delete cached rows for this
         artist because the composer never ran any source leg.
         """
-        resp = await app_client.post(
+        resp = await pg_app_client_no_auth.post(
             "/api/v1/artists/search-aliases/bulk",
             json={"names": ["Cat Power"]},
         )
@@ -265,14 +230,14 @@ class TestSearchAliasesBulkEndpoint:
         assert result["sources_present"] == []
 
     @pytest.mark.asyncio
-    async def test_discogs_cache_miss_keeps_sources_present_populated(self, app_client):
+    async def test_discogs_cache_miss_keeps_sources_present_populated(self, pg_app_client_no_auth):
         """Juana Molina has a Discogs id but no children in the cache.
 
         Composer ran the leg but found nothing — variants empty, but
         sources_present must list all three discogs_* tags. Consumer needs
         this to scope DELETE during reconcile.
         """
-        resp = await app_client.post(
+        resp = await pg_app_client_no_auth.post(
             "/api/v1/artists/search-aliases/bulk",
             json={"names": ["Juana Molina"]},
         )
@@ -286,24 +251,24 @@ class TestSearchAliasesBulkEndpoint:
         }
 
     @pytest.mark.asyncio
-    async def test_413_for_oversized_request(self, app_client):
+    async def test_413_for_oversized_request(self, pg_app_client_no_auth):
         """1001 names → 413 before any DB work."""
         oversized = [f"Artist_{i}" for i in range(1001)]
-        resp = await app_client.post(
+        resp = await pg_app_client_no_auth.post(
             "/api/v1/artists/search-aliases/bulk",
             json={"names": oversized},
         )
         assert resp.status_code == 413
 
     @pytest.mark.asyncio
-    async def test_case_drift_resolves_via_lower_fall_through(self, app_client):
+    async def test_case_drift_resolves_via_lower_fall_through(self, pg_app_client_no_auth):
         """Backend posts lowercase, storage is mixed-case → leg 2 resolves it.
 
         Mirrors the #276 fall-through contract: stored row ``'Stereolab'``,
         posted name ``'stereolab'`` — the composer's bulk variant of
         ``resolve_library_name`` finds the row via LOWER fall-through.
         """
-        resp = await app_client.post(
+        resp = await pg_app_client_no_auth.post(
             "/api/v1/artists/search-aliases/bulk",
             json={"names": ["stereolab"]},
         )
@@ -322,7 +287,7 @@ class TestSearchAliasesBulkEndpoint:
         }
 
     @pytest.mark.asyncio
-    async def test_case_variant_pair_both_resolve_against_real_pg(self, app_client):
+    async def test_case_variant_pair_both_resolve_against_real_pg(self, pg_app_client_no_auth):
         """Two case-variant inputs of the same stored row both resolve through real PG.
 
         End-to-end coverage for the leg-2 `DISTINCT ON (bind.name)` SQL.
@@ -333,7 +298,7 @@ class TestSearchAliasesBulkEndpoint:
         mapping via mocks; this test exercises the actual PG behavior so
         a future regression of the SQL is caught here.
         """
-        resp = await app_client.post(
+        resp = await pg_app_client_no_auth.post(
             "/api/v1/artists/search-aliases/bulk",
             json={"names": ["STEREOLAB", "stereolab"]},
         )

@@ -439,45 +439,13 @@ class TestGetReleaseIdentityProvenanceBulk:
         assert result[id_c] == [("bandcamp", "https://x.bandcamp.com/album/y")]
 
 
-@pytest_asyncio.fixture
-async def app_client(monkeypatch):
-    """ASGI client with the LML app pointed at the test PG.
-
-    Mirrors the fixture in ``tests/integration/test_bulk_resolve_libraries.py`` —
-    monkeypatch the DSN, clear the entity-store singleton, then build a fresh
-    app. ``LML_REQUIRE_AUTH`` stays off by default (matching the prod rollout
-    posture); the auth-required case is covered by its own test below.
-    """
-    from httpx import ASGITransport, AsyncClient
-
-    import core.dependencies as core_deps
-    import identity.dependencies as deps
-    from config.settings import get_settings
-
-    monkeypatch.setenv("DATABASE_URL_DISCOGS", DATABASE_URL)
-    get_settings.cache_clear()
-    deps._entity_store = None
-    deps._entity_probe_failed = False
-    await core_deps.close_discogs_pool()
-
-    from main import app
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        yield ac
-
-    deps._entity_store = None
-    deps._entity_probe_failed = False
-    await core_deps.close_discogs_pool()
-    get_settings.cache_clear()
-
-
 @pytest.mark.pg
 class TestReleaseIdentityResolveEndpoint:
     """End-to-end POST /api/v1/identity/resolve."""
 
     @pytest.mark.asyncio
-    async def test_first_call_mints(self, app_client):
-        resp = await app_client.post(
+    async def test_first_call_mints(self, pg_app_client):
+        resp = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={
                 "kind": "release",
@@ -493,8 +461,8 @@ class TestReleaseIdentityResolveEndpoint:
         assert body["identity_id"] > 0
 
     @pytest.mark.asyncio
-    async def test_second_call_is_idempotent(self, app_client):
-        first = await app_client.post(
+    async def test_second_call_is_idempotent(self, pg_app_client):
+        first = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={
                 "kind": "release",
@@ -502,7 +470,7 @@ class TestReleaseIdentityResolveEndpoint:
                 "external_id": "12345",
             },
         )
-        second = await app_client.post(
+        second = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={
                 "kind": "release",
@@ -516,9 +484,9 @@ class TestReleaseIdentityResolveEndpoint:
         assert second.json()["identity_id"] == first.json()["identity_id"]
 
     @pytest.mark.asyncio
-    async def test_bandcamp_round_trip(self, app_client):
+    async def test_bandcamp_round_trip(self, pg_app_client):
         url = "https://autechre.bandcamp.com/album/confield"
-        resp = await app_client.post(
+        resp = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={"kind": "release", "source": "bandcamp", "external_id": url},
         )
@@ -528,10 +496,10 @@ class TestReleaseIdentityResolveEndpoint:
         assert body["kind"] == "release"
 
     @pytest.mark.asyncio
-    async def test_bandcamp_url_canonicalisation_collapses_trailing_slash(self, app_client):
+    async def test_bandcamp_url_canonicalisation_collapses_trailing_slash(self, pg_app_client):
         # Trailing-slash variant must hit the same identity row as the
         # bare form — the validator canonicalises before mint.
-        bare = await app_client.post(
+        bare = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={
                 "kind": "release",
@@ -539,7 +507,7 @@ class TestReleaseIdentityResolveEndpoint:
                 "external_id": "https://autechre.bandcamp.com/album/confield",
             },
         )
-        trailing = await app_client.post(
+        trailing = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={
                 "kind": "release",
@@ -552,9 +520,9 @@ class TestReleaseIdentityResolveEndpoint:
         assert trailing.json()["identity_id"] == bare.json()["identity_id"]
 
     @pytest.mark.asyncio
-    async def test_apple_music_album_round_trip(self, app_client):
+    async def test_apple_music_album_round_trip(self, pg_app_client):
         album_id = "1234567890"
-        resp = await app_client.post(
+        resp = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={"kind": "release", "source": "apple_music_album", "external_id": album_id},
         )
@@ -564,15 +532,15 @@ class TestReleaseIdentityResolveEndpoint:
         assert body["kind"] == "release"
 
     @pytest.mark.asyncio
-    async def test_apple_music_album_round_trip_idempotent(self, app_client):
+    async def test_apple_music_album_round_trip_idempotent(self, pg_app_client):
         # Second resolve of the same album_id returns the same identity_id
         # with minted=False — same posture as the Bandcamp idempotency test.
         album_id = "9876543210"
-        first = await app_client.post(
+        first = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={"kind": "release", "source": "apple_music_album", "external_id": album_id},
         )
-        second = await app_client.post(
+        second = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={"kind": "release", "source": "apple_music_album", "external_id": album_id},
         )
@@ -596,9 +564,9 @@ class TestReleaseIdentityResolveEndpoint:
         ],
     )
     async def test_invalid_external_id_is_rejected_before_mint(
-        self, app_client, source, external_id, pg_source
+        self, pg_app_client, source, external_id, pg_source
     ):
-        resp = await app_client.post(
+        resp = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={"kind": "release", "source": source, "external_id": external_id},
         )
@@ -608,8 +576,8 @@ class TestReleaseIdentityResolveEndpoint:
         assert row["n"] == 0
 
     @pytest.mark.asyncio
-    async def test_unknown_source_rejected_by_pydantic(self, app_client):
-        resp = await app_client.post(
+    async def test_unknown_source_rejected_by_pydantic(self, pg_app_client):
+        resp = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={
                 "kind": "release",
@@ -620,8 +588,8 @@ class TestReleaseIdentityResolveEndpoint:
         assert resp.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_unknown_kind_rejected_by_pydantic(self, app_client):
-        resp = await app_client.post(
+    async def test_unknown_kind_rejected_by_pydantic(self, pg_app_client):
+        resp = await pg_app_client.post(
             "/api/v1/identity/resolve",
             json={
                 "kind": "artist",
@@ -632,7 +600,7 @@ class TestReleaseIdentityResolveEndpoint:
         assert resp.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_requires_auth_when_enabled(self, monkeypatch, app_client):
+    async def test_requires_auth_when_enabled(self, monkeypatch, pg_app_client):
         """With LML_REQUIRE_AUTH=true and no header, the endpoint returns 401."""
         from config.settings import get_settings
 
@@ -645,7 +613,7 @@ class TestReleaseIdentityResolveEndpoint:
         # cache entry it primed survives unless we clear it here.
         get_settings.cache_clear()
         try:
-            resp = await app_client.post(
+            resp = await pg_app_client.post(
                 "/api/v1/identity/resolve",
                 json={
                     "kind": "release",
