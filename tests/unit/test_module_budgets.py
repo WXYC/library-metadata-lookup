@@ -1,4 +1,4 @@
-"""Module-budget guardrail for the ``lookup/`` package (LML#731).
+"""Module-budget guardrail for ``lookup/`` and the pipeline's ``core/`` surface (LML#731, LML#751).
 
 The orchestrator decomposition (LML#722) took ``lookup/orchestrator.py`` from a
 4,485-line god module to a documented spine plus one module per concern. This
@@ -6,11 +6,24 @@ test is the regrowth guardrail: every ``lookup/**/*.py`` file carries an
 explicit per-file line ceiling, and any new file under ``lookup/`` must be
 given one deliberately before it can ship.
 
+LML#751 extended the perimeter to ``core/search.py``: with every ``lookup/``
+file capped, the strategy runner was the uncapped path of least resistance for
+new pipeline behavior. Rather than globbing all of ``core/`` (most of it isn't
+pipeline surface), out-of-package files are opted in explicitly via
+``EXTRA_BUDGET_FILES`` — a new ``core/`` module stays unguarded until someone
+deliberately adds it there, same as the docs/architecture.md key-files map.
+
 Calibration (2026-07-06, post-LML#731 respine): each ceiling is the smallest
 multiple of 50 at or above 1.3x the file's measured size (minimum 50) — about
 30% headroom for ordinary maintenance, not for a new concern. When a file hits
 its ceiling, the answer is to extract a module, not to append; raising a
 ceiling is a deliberate, reviewed decision, never a drive-by edit.
+
+Test files are outside this perimeter, deliberately: their size pressure comes
+from one-test-per-behavior granularity (already reviewed at PR time), not from
+the "everything lands in the file that already has everything" regrowth this
+guardrail targets, and a budget on test files would fight normal TDD growth
+instead of a real concern accumulating unnoticed.
 """
 
 from pathlib import Path
@@ -19,6 +32,11 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LOOKUP_ROOT = REPO_ROOT / "lookup"
+
+#: Files outside lookup/ that this guardrail also covers (LML#751). Opted in
+#: explicitly, one at a time — see the module docstring for why this isn't a
+#: second directory glob.
+EXTRA_BUDGET_FILES: tuple[str, ...] = ("core/search.py",)
 
 #: Repo-relative POSIX path -> maximum physical line count (``wc -l``).
 MODULE_BUDGETS: dict[str, int] = {
@@ -86,25 +104,37 @@ MODULE_BUDGETS: dict[str, int] = {
     # promotion moved in from the spine, carrying this file from 243 to ~395
     # lines. Smallest multiple of 50 at or above 1.3x the post-change size.
     "lookup/validation.py": 550,
+    # LML#751: strategy runner, SearchState, and budget/timeout machinery —
+    # the pipeline's other regrowth attractor once every lookup/ file was
+    # capped. 1033 measured lines (2026-07-29); smallest multiple of 50 at or
+    # above 1.3x that size.
+    "core/search.py": 1350,
 }
 
 
-def _lookup_files() -> list[str]:
-    """Every ``.py`` file under ``lookup/``, as a repo-relative POSIX path."""
+def _budgeted_files(extra: tuple[str, ...] = EXTRA_BUDGET_FILES) -> list[str]:
+    """Every file this guardrail covers: ``lookup/**/*.py`` plus ``extra``.
+
+    ``extra`` entries are dropped if the file no longer exists, same as
+    ``lookup/`` files — a renamed-away ``core/`` module falls out of the
+    fileset and its now-stale MODULE_BUDGETS entry gets caught by
+    ``test_no_stale_budget_entries`` instead of silently lingering.
+    """
     # Dot-prefixed components (Emacs lock files and the like) can never be valid
     # modules, so they are skipped; untracked non-dot scratch files deliberately
     # keep failing (pre-push signal).
-    return sorted(
+    lookup_files = (
         p.relative_to(REPO_ROOT).as_posix()
         for p in LOOKUP_ROOT.rglob("*.py")
         if not any(part.startswith(".") for part in p.relative_to(LOOKUP_ROOT).parts)
     )
+    existing_extra = (rel_path for rel_path in extra if (REPO_ROOT / rel_path).is_file())
+    return sorted({*lookup_files, *existing_extra})
 
 
-@pytest.mark.parametrize("rel_path", _lookup_files())
-def test_lookup_module_within_budget(rel_path: str) -> None:
-    """Each lookup/ module stays within its declared line ceiling."""
-    ceiling = MODULE_BUDGETS.get(rel_path)
+def _check_within_budget(rel_path: str, budgets: dict[str, int] = MODULE_BUDGETS) -> None:
+    """Fail loudly if ``rel_path`` has no budget entry, or is over its ceiling."""
+    ceiling = budgets.get(rel_path)
     if ceiling is None:
         pytest.fail(
             f"{rel_path} has no entry in MODULE_BUDGETS ({__file__}). "
@@ -115,17 +145,48 @@ def test_lookup_module_within_budget(rel_path: str) -> None:
     actual = (REPO_ROOT / rel_path).read_bytes().count(b"\n")
     assert actual <= ceiling, (
         f"{rel_path} is {actual} lines, over its {ceiling}-line budget. "
-        "Extract the growing concern into its own lookup/ module — see this "
-        "module's docstring for the ceiling policy and the key-files map in "
+        "Extract the growing concern into its own module — see this module's "
+        "docstring for the ceiling policy and the key-files map in "
         "docs/architecture.md for where each concern lives."
     )
 
 
+@pytest.mark.parametrize("rel_path", _budgeted_files())
+def test_module_within_budget(rel_path: str) -> None:
+    """Each covered module stays within its declared line ceiling."""
+    _check_within_budget(rel_path)
+
+
 def test_no_stale_budget_entries() -> None:
     """MODULE_BUDGETS lists only files that exist (keeps the table honest)."""
-    stale = sorted(set(MODULE_BUDGETS) - set(_lookup_files()))
+    stale = sorted(set(MODULE_BUDGETS) - set(_budgeted_files()))
     assert not stale, (
         f"MODULE_BUDGETS has entries for files that no longer exist: {stale}. "
         "Remove (or rename) them so the budget table stays an accurate map of "
-        "the lookup/ package."
+        "the covered files."
     )
+
+
+def test_extended_perimeter_missing_entry_fails_loudly() -> None:
+    """LML#751 probe: a file added to EXTRA_BUDGET_FILES without a budget entry
+    fails the same way an unbudgeted lookup/ file does — the missing-entry arm
+    covers the extended (out-of-package) perimeter, not just lookup/."""
+    with pytest.raises(pytest.fail.Exception, match="has no entry in MODULE_BUDGETS"):
+        _check_within_budget("core/search.py", budgets={})
+
+
+def test_extended_perimeter_stale_entry_detected() -> None:
+    """LML#751 probe: a MODULE_BUDGETS entry for an out-of-package file that no
+    longer exists is caught by the same stale-entry arm that guards lookup/,
+    proving the extended perimeter is covered end to end rather than only at
+    its one real entry."""
+    budgets_with_stale_entry = {**MODULE_BUDGETS, "core/does_not_exist_probe.py": 100}
+    stale = sorted(set(budgets_with_stale_entry) - set(_budgeted_files()))
+    assert stale == ["core/does_not_exist_probe.py"]
+
+
+def test_extended_perimeter_over_budget_detected() -> None:
+    """LML#751 probe: an out-of-package file over its declared ceiling fails
+    the same over-budget assertion lookup/ files get."""
+    with pytest.raises(AssertionError, match="over its .*-line budget"):
+        _check_within_budget("core/search.py", budgets={"core/search.py": 1})
