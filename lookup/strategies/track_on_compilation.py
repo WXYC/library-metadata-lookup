@@ -150,6 +150,43 @@ def _log_album_title_fallback(
         logger.warning("Failed to project album_title_fallback onto Sentry transaction: %s", e)
 
 
+async def _fetch_release_artist_variations(
+    discogs_service: DiscogsService | None, release_id: int
+) -> set[str]:
+    """Normalized name-variation set for a release's artist (LML#971 bridge).
+
+    Best-effort: no service, no release id, or *any* failure yields an empty set,
+    so an identity-bridge lookup can never degrade the strategy (the service
+    wrapper already turns a cache miss/outage into an empty set; this guards
+    anything else). Variations that normalize to empty are dropped, so a
+    degenerate variation (e.g. an ANV of ``"*"``) can't match a blank row.
+
+    Note: a multi-credit release returns the variations of *every* ``extra=0``
+    artist; artist-level scoping isn't possible from a bare ``release_id`` and the
+    typed-artist ``validate_release_for_track`` gate downstream is the belt.
+    """
+    if discogs_service is None or not release_id:
+        return set()
+    try:
+        variations = await discogs_service.get_release_artist_variations(release_id)
+    except Exception as exc:  # noqa: BLE001 - best-effort enrichment
+        logger.debug("identity-bridge variation lookup failed: %s", exc)
+        return set()
+    return {n for v in variations if (n := normalize_for_comparison(v))}
+
+
+def _row_identity_in_variations(item: LibraryItem, normalized_variations: set[str]) -> bool:
+    """True when the row's ``artist`` or ``alternate_artist_name`` is an EXACT
+    normalized member of ``normalized_variations`` -- exact membership, not a
+    prefix, so a bare variation like "Yeh" can't admit an unrelated longer row."""
+    if not normalized_variations:
+        return False
+    return any(
+        candidate and normalize_for_comparison(candidate) in normalized_variations
+        for candidate in (item.artist, item.alternate_artist_name)
+    )
+
+
 async def search_compilations_for_track(
     db: LibraryDB,
     parsed: ParsedRequest,
@@ -491,6 +528,25 @@ async def search_compilations_for_track(
                 discogs_is_compilation = release_info.is_compilation
                 release_album_lower = release_album.lower()
 
+                # LML#971 identity bridge (flag-gated, default off): a library row
+                # filed under a band name / abbreviated alias (e.g. "Burning Star
+                # Core" / "C.S. Yeh") won't prefix-match the typed personal name
+                # ("C. Spencer Yeh"), but the resolved Discogs release's artist
+                # entity knows the alias as a name-variation. Scoped to
+                # NON-COMPILATION releases: a V/A release's extra=0 artist is the
+                # "Various" entity, whose variations carry no artist-identity signal
+                # and would bypass the title-score floor in the compilation branch
+                # above (e.g. a "VA"-filed row that is_compilation_artist misses).
+                # Resolved lazily via ``_fetch_release_artist_variations`` -- only a
+                # row that clears neither the typed-artist filter nor the
+                # compilation carve-out consults it, so a lookup whose rows all
+                # match directly pays no extra query. validate_release_for_track
+                # (typed artist) below remains the safety belt.
+                bridge_enabled = (
+                    get_settings().lml_resolve_artist_variations and not discogs_is_compilation
+                )
+                release_variations: set[str] | None = None
+
                 for match in matches:
                     if artist_matches_item(match, lib_artist):
                         filtered_matches.append(match)
@@ -503,6 +559,13 @@ async def search_compilations_for_track(
                                 f"Rejected '{match.title}' for '{release_album}' "
                                 f"(title_score={title_score:.0f})"
                             )
+                    elif bridge_enabled:
+                        if release_variations is None:
+                            release_variations = await _fetch_release_artist_variations(
+                                discogs_service, release_info.release_id
+                            )
+                        if _row_identity_in_variations(match, release_variations):
+                            filtered_matches.append(match)
                 matches = filtered_matches
             elif matches and lib_artist and skip_artist_match_filter:
                 # The strict prefix filter above is deferred on this path, but
