@@ -26,6 +26,28 @@ Benchmarks PG cache vs Discogs API response times for `search()`. Useful for eva
 
 Loads `DISCOGS_TOKEN` and `DATABASE_URL_DISCOGS` from `.env` or the Railway CLI linked project.
 
+## Gate 0 Burst Harness (`scripts/gate0_burst.py`)
+
+The measurement mechanism for [LML#983](https://github.com/WXYC/library-metadata-lookup/issues/983) Gate 0: fires a concurrent `POST /api/v1/lookup` burst against a target host and reports p50/p95/p99 of the `lml_wall` and `event_loop_lag` `Server-Timing` legs, plus a warm/cold bimodality split — the direct signal for the cross-worker in-memory cache fragmentation the issue describes (each `UVICORN_WORKERS` process holds its own `TTLCache` heap with no cross-process sharing, so an identical query oscillates warm/cold depending on which worker the kernel hands the connection to). Run it once against `UVICORN_WORKERS=1` and once against `=3` on staging to decide whether the 3-worker burst headroom LML#747 bought is still needed now that #949/PR#899 removed its main p50 justification. Full human-supervised procedure (Railway CLI commands, the `DISCOGS_RATE_LIMIT` coupled-knob unwind, safe-burst-size guidance) is the [Gate 0 runbook in `docs/deployment.md`](deployment.md#gate-0-lml983-measuring-whether-uvicorn_workers3-is-still-needed).
+
+**Query set:** three representative WXYC queries, including the exact compilation-track query from the issue trace (`{"artist": "c spencer yeh", "song": "in the blink of an eye"}` — the Wave B `search_releases_by_track` path, which has no PG tier per LML#393 and is therefore the highest-value cold-worker probe) plus two ordinary artist+album lookups (`GATE0_QUERIES` in the script).
+
+**Safety.** Staging shares prod's Discogs token, LML#755 saturation breaker, and (as of this writing) a differently-keyed LML#841 rate bucket -- see the runbook's cautions. The harness itself refuses to run a burst against `/lookup` above a modest default `--concurrency`/`--total` ceiling without `--force`, and aborts mid-burst (stops issuing new requests, exits 2) the instant it observes a shed response: an HTTP 429/5xx, or a `200` body with `degraded: true` and `degraded_reason: "upstream_unavailable"` (the client-visible signal for a breaker shed or exhausted rate bucket -- `deadline_exceeded` is excluded, since that's a caller-budget shed unrelated to Discogs saturation). `--smoke` points the burst at `GET /health` instead -- zero Discogs risk, no API key required -- for validating the concurrency + header-parsing plumbing before ever touching the real query set.
+
+**Usage:**
+```bash
+# Plumbing smoke test (no Discogs risk, no auth) -- run this first
+python scripts/gate0_burst.py --host https://<staging-domain> --smoke
+
+# The real Gate 0 measurement (human-supervised; run once per worker count)
+LML_API_KEY=... python scripts/gate0_burst.py \
+  --host https://<staging-domain> --concurrency 3 --total 12 --warm --json
+```
+
+Options: `--host` (required), `--api-key` (default `$LML_API_KEY`), `--concurrency` (default 3), `--total` (default 12), `--warm`/`--no-warm` (sequential one-hit-per-query prewarm pass before the concurrent burst, default on -- mirrors the issue trace's "run 1" that warms exactly one worker), `--smoke` (target `/health` instead of `/lookup`), `--warm-threshold-ms` (warm/cold split point, default 500.0), `--timeout` (per-request seconds, default 10.0), `--force` (override the burst-size safety rail), `--json` (machine-readable output).
+
+If `server_timing_present` comes back `false` in the report, `LML_EMIT_SERVER_TIMING` (or the LML#907 `lml_event_loop_lag_gauge` flag) is likely off on the target -- the harness falls back to client-measured wall time only and warns loudly in the human-readable table.
+
 ## API Model Generation (`scripts/generate_api_models.sh`)
 
 Generates Pydantic v2 models from `wxyc-shared/api.yaml`. Uses a local sibling `wxyc-shared` directory if available, otherwise downloads from GitHub. The generated file (`generated/api_models.py`) is committed to git. Re-run after api.yaml changes.
