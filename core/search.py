@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import sentry_sdk
 
 from discogs.breaker import DiscogsBreakerOpenError
+from discogs.service import reset_retry_budget_deadline, set_retry_budget_deadline
 from generated.api_models import TrackMatchHint
 from library.models import LibraryItem
 from services.parser import ParsedRequest
@@ -840,137 +841,149 @@ async def _run_strategy_pipeline(
     # default) reproduces the pre-#865 step-3-entry clock exactly.
     start = time.monotonic() - pipeline_start_offset_ms / 1000.0
 
-    for idx, strategy in enumerate(strategies):
-        elapsed_ms = (time.monotonic() - start) * 1000
+    # LML#758: publish an absolute deadline for this pipeline's effective
+    # search budget so ``discogs.service._request_with_retry``'s 429 backoff
+    # can cap its sleep against the caller's remaining time instead of riding
+    # the retry loop's up-to-60s ceiling blind to it. Reset in the
+    # ``finally`` below so the deadline doesn't leak into whatever runs next
+    # in the same task after the pipeline returns, mirroring
+    # ``_cap_fire_count_var``'s set-at-entry/reset-in-finally propagation
+    # across the same ``strategy.attempt`` / ``asyncio.wait_for`` boundary.
+    deadline_token = set_retry_budget_deadline(start + budget_ms / 1000.0)
+    try:
+        for idx, strategy in enumerate(strategies):
+            elapsed_ms = (time.monotonic() - start) * 1000
 
-        # Hard cap (LML#370). Fires regardless of state.results — the safety
-        # floor that bounds cascade-exhaustion tail latency. Layered ABOVE
-        # the soft-budget gate so that when both would fire, we record the
-        # cap (the more severe condition) and skip the budget telemetry.
-        if elapsed_ms > hard_cap_ms:
-            state.timed_out = True
-            _log_hard_cap_fired(
-                elapsed_ms=elapsed_ms,
-                skipped=[s.name for s in strategies[idx:]],
-                hard_cap_ms=hard_cap_ms,
-            )
-            break
+            # Hard cap (LML#370). Fires regardless of state.results — the safety
+            # floor that bounds cascade-exhaustion tail latency. Layered ABOVE
+            # the soft-budget gate so that when both would fire, we record the
+            # cap (the more severe condition) and skip the budget telemetry.
+            if elapsed_ms > hard_cap_ms:
+                state.timed_out = True
+                _log_hard_cap_fired(
+                    elapsed_ms=elapsed_ms,
+                    skipped=[s.name for s in strategies[idx:]],
+                    hard_cap_ms=hard_cap_ms,
+                )
+                break
 
-        # Soft-budget gate (LML#340). Two clauses, both load-bearing:
-        #   1. elapsed_ms > budget — we've spent more time than the caller is
-        #      willing to wait.
-        #   2. state.results is non-empty — we have *something* to return.
-        # When the second clause is false we keep grinding: the user gets
-        # "nothing" either way, and the next strategy might surface results.
-        # The hard cap above catches the keep-grinding case when it grinds
-        # too long.
-        if elapsed_ms > budget_ms and state.results:
-            _log_search_budget_exceeded(
-                elapsed_ms=elapsed_ms,
-                skipped=[s.name for s in strategies[idx:]],
-                budget_ms=budget_ms,
-            )
-            break
+            # Soft-budget gate (LML#340). Two clauses, both load-bearing:
+            #   1. elapsed_ms > budget — we've spent more time than the caller is
+            #      willing to wait.
+            #   2. state.results is non-empty — we have *something* to return.
+            # When the second clause is false we keep grinding: the user gets
+            # "nothing" either way, and the next strategy might surface results.
+            # The hard cap above catches the keep-grinding case when it grinds
+            # too long.
+            if elapsed_ms > budget_ms and state.results:
+                _log_search_budget_exceeded(
+                    elapsed_ms=elapsed_ms,
+                    skipped=[s.name for s in strategies[idx:]],
+                    budget_ms=budget_ms,
+                )
+                break
 
-        # Caller-budget gate (LML#347 — Epic A no-results tail follow-up).
-        # An explicit X-Caller-Budget-Ms header is the caller saying "I will
-        # discard whatever arrives after my deadline." LML continuing past
-        # that deadline is wasted Discogs quota for an answer the caller
-        # already abandoned — see WXYC/library-metadata-lookup#337's
-        # Rita Villa / Fly Girlz tail (20+ s with empty results).
-        # Distinct from the env safety branch above: this gate fires when
-        # `state.results` is empty AND the caller opted in. Without a
-        # header, the safety branch above keeps the keep-grinding contract
-        # intact for warm-cache / write-path callers.
-        if caller_budget_ms is not None and elapsed_ms > budget_ms and not state.results:
-            state.timed_out = True
-            _log_search_budget_exceeded(
-                elapsed_ms=elapsed_ms,
-                skipped=[s.name for s in strategies[idx:]],
-                budget_ms=budget_ms,
-            )
-            break
+            # Caller-budget gate (LML#347 — Epic A no-results tail follow-up).
+            # An explicit X-Caller-Budget-Ms header is the caller saying "I will
+            # discard whatever arrives after my deadline." LML continuing past
+            # that deadline is wasted Discogs quota for an answer the caller
+            # already abandoned — see WXYC/library-metadata-lookup#337's
+            # Rita Villa / Fly Girlz tail (20+ s with empty results).
+            # Distinct from the env safety branch above: this gate fires when
+            # `state.results` is empty AND the caller opted in. Without a
+            # header, the safety branch above keeps the keep-grinding contract
+            # intact for warm-cache / write-path callers.
+            if caller_budget_ms is not None and elapsed_ms > budget_ms and not state.results:
+                state.timed_out = True
+                _log_search_budget_exceeded(
+                    elapsed_ms=elapsed_ms,
+                    skipped=[s.name for s in strategies[idx:]],
+                    budget_ms=budget_ms,
+                )
+                break
 
-        # Check if strategy should run.
-        if not strategy.should_attempt(parsed, state, raw_message):
-            continue
+            # Check if strategy should run.
+            if not strategy.should_attempt(parsed, state, raw_message):
+                continue
 
-        state.strategies_tried.append(strategy.name)
+            state.strategies_tried.append(strategy.name)
 
-        # Per-strategy ceiling. Caps the *currently-running* strategy at the
-        # remaining hard-cap budget, so a single slow Discogs cascade can't
-        # blow the loop-level gate (which only fires between strategies).
-        # The 0.01s floor avoids a degenerate wait_for(timeout=0) when
-        # elapsed_ms has just crossed hard_cap_ms due to scheduling jitter —
-        # the wait_for will TimeoutError immediately and the outer except
-        # records the strategy as timed out, same end state as a real cap fire.
-        remaining_budget_seconds = max(0.01, (hard_cap_ms - elapsed_ms) / 1000)
+            # Per-strategy ceiling. Caps the *currently-running* strategy at the
+            # remaining hard-cap budget, so a single slow Discogs cascade can't
+            # blow the loop-level gate (which only fires between strategies).
+            # The 0.01s floor avoids a degenerate wait_for(timeout=0) when
+            # elapsed_ms has just crossed hard_cap_ms due to scheduling jitter —
+            # the wait_for will TimeoutError immediately and the outer except
+            # records the strategy as timed out, same end state as a real cap fire.
+            remaining_budget_seconds = max(0.01, (hard_cap_ms - elapsed_ms) / 1000)
 
-        # Single try/except around the strategy invocation so the per-strategy
-        # wait_for ceiling fires uniformly. CancelledError → TimeoutError raised
-        # by wait_for propagates into in-flight asyncio.gather() probes inside
-        # the strategy, freeing the Discogs semaphore on cap-fire. The
-        # Outcome-returning contract (attempt cannot mutate state) makes a
-        # cancelled attempt a structural no-op against SearchState — no need
-        # for an await-then-commit discipline inside the strategy body.
-        strategy_cap_fire_baseline = cap_fire_counter[0]
-        try:
-            outcome = await asyncio.wait_for(
-                strategy.attempt(parsed, state, raw_message),
-                timeout=remaining_budget_seconds,
-            )
-        except TimeoutError:
-            state.timed_out = True
-            _log_hard_cap_fired(
-                elapsed_ms=(time.monotonic() - start) * 1000,
-                skipped=[s.name for s in strategies[idx + 1 :]],
-                hard_cap_ms=hard_cap_ms,
-            )
-            break
-        except DiscogsBreakerOpenError:
-            # LML#755 R2-2: the Discogs saturation breaker shed a live probe
-            # inside this strategy. A shed means "couldn't ask" — degrade to the
-            # same empty (cache-only) outcome a strategy miss produces, so the
-            # lookup returns library + already-cached results instead of 500ing.
-            # This is the ONE catch boundary for the shed on the search path: all
-            # strategies that fan out to Discogs are covered here, so no strategy
-            # needs its own catch. We ``continue`` (not ``break``) so a later
-            # strategy — which may hit only the cache — still runs.
-            logger.info(
-                "Discogs saturation breaker shed strategy %s; degrading to cache-only",
-                strategy.name,
-            )
-            outcome = Outcome.empty()
+            # Single try/except around the strategy invocation so the per-strategy
+            # wait_for ceiling fires uniformly. CancelledError → TimeoutError raised
+            # by wait_for propagates into in-flight asyncio.gather() probes inside
+            # the strategy, freeing the Discogs semaphore on cap-fire. The
+            # Outcome-returning contract (attempt cannot mutate state) makes a
+            # cancelled attempt a structural no-op against SearchState — no need
+            # for an await-then-commit discipline inside the strategy body.
+            strategy_cap_fire_baseline = cap_fire_counter[0]
+            try:
+                outcome = await asyncio.wait_for(
+                    strategy.attempt(parsed, state, raw_message),
+                    timeout=remaining_budget_seconds,
+                )
+            except TimeoutError:
+                state.timed_out = True
+                _log_hard_cap_fired(
+                    elapsed_ms=(time.monotonic() - start) * 1000,
+                    skipped=[s.name for s in strategies[idx + 1 :]],
+                    hard_cap_ms=hard_cap_ms,
+                )
+                break
+            except DiscogsBreakerOpenError:
+                # LML#755 R2-2: the Discogs saturation breaker shed a live probe
+                # inside this strategy. A shed means "couldn't ask" — degrade to the
+                # same empty (cache-only) outcome a strategy miss produces, so the
+                # lookup returns library + already-cached results instead of 500ing.
+                # This is the ONE catch boundary for the shed on the search path: all
+                # strategies that fan out to Discogs are covered here, so no strategy
+                # needs its own catch. We ``continue`` (not ``break``) so a later
+                # strategy — which may hit only the cache — still runs.
+                logger.info(
+                    "Discogs saturation breaker shed strategy %s; degrading to cache-only",
+                    strategy.name,
+                )
+                outcome = Outcome.empty()
 
-        # The one write site: every per-strategy ``SearchState`` mutation
-        # happens here, driven by the outcome's flags. See :func:`_apply`.
-        _apply(state, outcome)
+            # The one write site: every per-strategy ``SearchState`` mutation
+            # happens here, driven by the outcome's flags. See :func:`_apply`.
+            _apply(state, outcome)
 
-        # LML#543 cap-fire propagation. ``_chunked_gather`` bumps the per-task
-        # ``cap_fire_counter`` when it bails between chunks. We short-circuit
-        # the cascade exactly when the strategy fired the cap AND the natural-
-        # completion gate below would NOT have stopped us — so the artist-
-        # fallback shape (results + song_not_found) propagates, but a confirmed
-        # song match doesn't. See ``LML_SEARCH_MAX_API_CALLS`` in
-        # ``docs/env-vars.md`` for the full rationale.
-        if cap_fire_counter[0] > strategy_cap_fire_baseline and not (
-            state.results and not state.song_not_found
-        ):
-            state.timed_out = True
-            break
+            # LML#543 cap-fire propagation. ``_chunked_gather`` bumps the per-task
+            # ``cap_fire_counter`` when it bails between chunks. We short-circuit
+            # the cascade exactly when the strategy fired the cap AND the natural-
+            # completion gate below would NOT have stopped us — so the artist-
+            # fallback shape (results + song_not_found) propagates, but a confirmed
+            # song match doesn't. See ``LML_SEARCH_MAX_API_CALLS`` in
+            # ``docs/env-vars.md`` for the full rationale.
+            if cap_fire_counter[0] > strategy_cap_fire_baseline and not (
+                state.results and not state.song_not_found
+            ):
+                state.timed_out = True
+                break
 
-        # Stop when results are populated AND we're not still in the
-        # song-not-found cascade. The pre-#391 ``strategy.name !=
-        # TRACK_ON_COMPILATION`` clause collapsed away in step 1: every
-        # downstream strategy already gates on ``not state.results`` in its
-        # condition, so the name-check never changed the outcome. With the
-        # Outcome seam in place, the check simplifies to a pure state read —
-        # ``outcome.items`` would imply ``state.results`` here, so dropping
-        # the ``produced`` boolean from step 1 doesn't change semantics.
-        if state.results and not state.song_not_found:
-            break
+            # Stop when results are populated AND we're not still in the
+            # song-not-found cascade. The pre-#391 ``strategy.name !=
+            # TRACK_ON_COMPILATION`` clause collapsed away in step 1: every
+            # downstream strategy already gates on ``not state.results`` in its
+            # condition, so the name-check never changed the outcome. With the
+            # Outcome seam in place, the check simplifies to a pure state read —
+            # ``outcome.items`` would imply ``state.results`` here, so dropping
+            # the ``produced`` boolean from step 1 doesn't change semantics.
+            if state.results and not state.song_not_found:
+                break
 
-    return state
+        return state
+    finally:
+        reset_retry_budget_deadline(deadline_token)
 
 
 def get_search_type_from_state(state: SearchState) -> str:
