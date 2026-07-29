@@ -434,6 +434,26 @@ class Settings(BaseSettings):
             "See WXYC/library-metadata-lookup#971."
         ),
     )
+    lml_tighten_compilation_title_carveout: bool = Field(
+        default=True,
+        description=(
+            "When True, the TRACK_ON_COMPILATION compilation-artist title "
+            "carve-out (both the strict branch and the album-title fallback's "
+            "_fallback_row_acceptable) requires a library row's title to be "
+            "length-comparable to the Discogs release title "
+            "(min(len)/max(len) >= 0.9) in addition to clearing the existing "
+            "fuzz.ratio >= 80 floor. LML#973: the ratio floor alone can't tell "
+            "'same comp, reformatted title' from 'different comp, similarly-"
+            "worded title' -- e.g. 'Greatest Hits Of The 50's' vs 'Greatest "
+            "hits of the 50s & 60s' clears ratio >= 80 (87.3) despite naming a "
+            "different, track-less pressing. When False, the length guard is "
+            "skipped and the carve-out reverts to the pre-#973 ratio-floor-"
+            "only admission -- a kill switch to restore prior recall without "
+            "a redeploy if the guard costs more than it fixes in prod. "
+            "Default True (the #973 fix is active on merge). "
+            "See WXYC/library-metadata-lookup#973."
+        ),
+    )
     lml_resolve_nonlibrary_release: bool = Field(
         default=False,
         description=(
