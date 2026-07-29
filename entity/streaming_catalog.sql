@@ -137,23 +137,31 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album_service (
 
 -- Widen-only maintenance of the named service CHECK, so an already-created
 -- table (where CREATE TABLE IF NOT EXISTS is a no-op) picks up service values
--- added after its creation. Deparses the deployed constraint, extracts its
--- quoted literals, and rewrites only when the shipped set adds something —
--- merging, never narrowing (a rollback deploy must not abort the bootstrap
--- against rows using a newer service), and skipping the rewrite entirely on a
--- steady-state boot (stable constraint OID, no ACCESS EXCLUSIVE lock, no
--- re-validation scan). The rewrite emits the IN (...) form on purpose: PG
--- deparses IN as = ANY (ARRAY[...]) and the extraction reads quoted literals
--- from that deparse; an array-literal constant would deparse as ONE literal
--- and corrupt the next boot's extraction. When the constraint is ABSENT
--- (dropped out-of-band), the re-ADD folds in every service value already
--- live in the table, so a recovery boot can't brick on rows outside the
--- shipped set.
+-- added after its creation. Deparses the deployed constraint and
+-- distinguishes three states: PARSEABLE (matches the exact
+-- service = ANY (ARRAY[...]) shape this bootstrap emits; quoted literals are
+-- extracted with a quote-aware pattern -- handles an escaped quote inside a
+-- literal, e.g. 'o''brien' -- and round-tripped before being trusted, then
+-- merged only when the shipped set adds something, never narrowing, skipping
+-- the rewrite entirely on a steady-state boot); ABSENT (dropped out-of-band;
+-- the re-ADD folds in every service value already live in the table so a
+-- recovery boot can't brick on rows outside the shipped set); and
+-- FOREIGN-FORM (a hand-repaired regex CHECK, an array-literal constant, or
+-- anything the round-trip can't reproduce byte-for-byte -- policy is WARN
+-- AND SKIP: RAISE WARNING naming the unparsed deparse and leave the
+-- constraint untouched, never drop-and-rebuild or rebuild-from-live-rows,
+-- since a foreign form implies deliberate out-of-band operator action). The
+-- rewrite emits the IN (...) form on purpose: PG deparses IN as
+-- = ANY (ARRAY[...]) and the extraction reads quoted literals from that
+-- deparse; an array-literal constant would deparse as ONE literal and
+-- corrupt the next boot's extraction.
 
 DO $catalog_check$
 DECLARE
     existing_def text;
+    inner_array text;
     existing_services text[];
+    rebuilt_array text;
     code_services text[] := ARRAY[
         'spotify', 'deezer', 'apple_music', 'bandcamp', 'tidal', 'youtube_music', 'soundcloud'];
     merged_list text;
@@ -163,8 +171,25 @@ BEGIN
         WHERE conrelid = 'lml_cache.streaming_album_service'::regclass
             AND conname = 'streaming_album_service_valid';
     IF existing_def IS NOT NULL THEN
-        SELECT array_agg(m[1]) INTO existing_services
-            FROM regexp_matches(existing_def, '''([^'']+)''', 'g') AS m;
+        inner_array := substring(
+            existing_def FROM '^CHECK \(\(service = ANY \(ARRAY\[(.*)\]\)\)\)$'
+        );
+        IF inner_array IS NULL THEN
+            RAISE WARNING 'streaming_album_service_valid: deployed CHECK (%) is not in the '
+                'expected service = ANY (ARRAY[...]) shape this bootstrap can parse; '
+                'leaving it untouched (foreign-form policy: warn-and-skip)', existing_def;
+            RETURN;
+        END IF;
+        SELECT array_agg(replace(m[1], '''''', '''')) INTO existing_services
+            FROM regexp_matches(inner_array, '''((?:[^'']|'''')*)''', 'g') AS m;
+        SELECT string_agg(quote_literal(s) || '::text', ', ') INTO rebuilt_array
+            FROM unnest(existing_services) AS s;
+        IF rebuilt_array IS DISTINCT FROM inner_array THEN
+            RAISE WARNING 'streaming_album_service_valid: deployed CHECK (%) has literals this '
+                'bootstrap could not confidently round-trip; leaving it untouched '
+                '(foreign-form policy: warn-and-skip)', existing_def;
+            RETURN;
+        END IF;
         IF existing_services @> code_services THEN
             RETURN;
         END IF;
@@ -279,7 +304,7 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_coverage_baseline (
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_album()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $$
+AS $function$
 BEGIN
     IF current_setting('lml_cache.allow_url_removal', true) = 'on' THEN
         IF TG_OP = 'DELETE' THEN
@@ -322,10 +347,10 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$;
+$function$;
 
 CREATE OR REPLACE TRIGGER streaming_album_no_regress
-BEFORE UPDATE OR DELETE ON lml_cache.streaming_album
+BEFORE DELETE OR UPDATE ON lml_cache.streaming_album
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_album();
 
 -- Total status gate (IS DISTINCT FROM 'found'), not a demotion blocklist:
@@ -339,7 +364,7 @@ FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_album();
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_album_service()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $$
+AS $function$
 BEGIN
     IF current_setting('lml_cache.allow_url_removal', true) = 'on' THEN
         IF TG_OP = 'DELETE' THEN
@@ -394,10 +419,10 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$;
+$function$;
 
 CREATE OR REPLACE TRIGGER streaming_album_service_no_regress
-BEFORE UPDATE OR DELETE ON lml_cache.streaming_album_service
+BEFORE DELETE OR UPDATE ON lml_cache.streaming_album_service
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_album_service();
 
 -- Same total gate on the resolved pair; the lateral local_match <-> api_match
@@ -410,7 +435,7 @@ FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_album_service();
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_track_result()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $$
+AS $function$
 BEGIN
     IF current_setting('lml_cache.allow_url_removal', true) = 'on' THEN
         IF TG_OP = 'DELETE' THEN
@@ -462,10 +487,10 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$;
+$function$;
 
 CREATE OR REPLACE TRIGGER streaming_track_result_no_regress
-BEFORE UPDATE OR DELETE ON lml_cache.streaming_track_result
+BEFORE DELETE OR UPDATE ON lml_cache.streaming_track_result
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_track_result();
 
 -- Outside an opted-in transaction the floor only ratchets upward (equal is
@@ -478,7 +503,7 @@ FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_track_result();
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_coverage_baseline()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $$
+AS $function$
 BEGIN
     IF current_setting('lml_cache.allow_url_removal', true) = 'on' THEN
         IF TG_OP = 'DELETE' THEN
@@ -505,10 +530,10 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$;
+$function$;
 
 CREATE OR REPLACE TRIGGER streaming_coverage_baseline_no_regress
-BEFORE UPDATE OR DELETE ON lml_cache.streaming_coverage_baseline
+BEFORE DELETE OR UPDATE ON lml_cache.streaming_coverage_baseline
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_coverage_baseline();
 
 -- TRUNCATE never fires row-level triggers, so without these the row guards
@@ -521,7 +546,7 @@ FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_coverage_baseline();
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_truncate()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $$
+AS $function$
 BEGIN
     IF current_setting('lml_cache.allow_url_removal', true) = 'on' THEN
         RETURN NULL;
@@ -530,7 +555,7 @@ BEGIN
         'opt in via set_config(''lml_cache.allow_url_removal'', ''on'', true) in this transaction',
         TG_TABLE_NAME;
 END;
-$$;
+$function$;
 
 CREATE OR REPLACE TRIGGER streaming_album_no_truncate
 BEFORE TRUNCATE ON lml_cache.streaming_album

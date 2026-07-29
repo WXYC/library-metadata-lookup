@@ -78,6 +78,13 @@ class _FakeConnection:
             raise RuntimeError(f"injected failure on {fail_on!r}")
         return "CREATE"
 
+    async def fetchval(self, sql: str, *args: object) -> object:
+        # Backs the function/trigger steady-state drift check: keyed by the
+        # query's positional args (the qualified function name, or the
+        # (trigger, table) pair) so a test can simulate "already matches" per
+        # object without modeling the real pg_proc/pg_trigger catalogs.
+        return self._source.fetchval_responses.get(args)
+
 
 class _FakePgSource:
     """Records every statement the bootstrap issues and whether it ran inside
@@ -85,15 +92,23 @@ class _FakePgSource:
     other attribute access (pool-level ``execute``/``fetchone``) is an
     ``AttributeError``, which doubles as the only-one-connection assertion.
     ``fail_on`` injects a mid-boot failure on the first statement containing
-    that substring, for the error-propagation test."""
+    that substring, for the error-propagation test. ``fetchval_responses``
+    seeds the function/trigger drift-check's ``fetchval`` lookups; omitted
+    keys resolve to ``None`` (object doesn't exist live yet), matching a
+    from-scratch bootstrap where every CREATE OR REPLACE actually executes."""
 
-    def __init__(self, fail_on: str | None = None) -> None:
+    def __init__(
+        self,
+        fail_on: str | None = None,
+        fetchval_responses: dict[tuple[object, ...], object] | None = None,
+    ) -> None:
         self.executed: list[tuple[str, bool]] = []
         self.acquire_count = 0
         self.transaction_starts = 0
         self.transaction_ends = 0
         self.in_transaction = False
         self.fail_on = fail_on
+        self.fetchval_responses = fetchval_responses or {}
 
     @property
     def statements(self) -> list[str]:
@@ -326,7 +341,7 @@ class TestSetUpStreamingCatalogSchema:
     async def test_bootstrap_is_pure_ddl_after_the_preamble(self):
         # The bootstrap must never mutate rows. The sibling tests grep for
         # INSERT/UPDATE/DELETE substrings, but the guard-trigger DDL here
-        # legitimately contains "BEFORE UPDATE OR DELETE" — so assert on the
+        # legitimately contains "BEFORE DELETE OR UPDATE" — so assert on the
         # statement head instead: after the two-statement preamble (SET LOCAL
         # + advisory lock SELECT, both row-neutral), every statement is CREATE,
         # ALTER, the widen-only DO block (which only ever EXECUTEs an ALTER), or
@@ -344,3 +359,61 @@ class TestSetUpStreamingCatalogSchema:
             assert head in {"CREATE", "ALTER", "DO", "DROP"}, (
                 f"non-DDL statement in bootstrap: {sql[:80]!r}"
             )
+
+    async def test_first_boot_replaces_every_function_and_trigger(self):
+        # No live definitions yet (the default _FakePgSource fetchval_responses
+        # is empty, so every drift check resolves to "not unchanged") — a
+        # from-scratch bootstrap must still issue all 5 + 8 CREATE OR REPLACE
+        # statements, matching the pre-#890 behavior.
+        pg = _FakePgSource()
+
+        await set_up_streaming_catalog_schema(pg)
+
+        assert sum(s.startswith("CREATE OR REPLACE FUNCTION") for s in pg.statements) == 5
+        assert sum(s.startswith("CREATE OR REPLACE TRIGGER") for s in pg.statements) == 8
+
+    async def test_second_boot_skips_every_unchanged_function_and_trigger(self):
+        # Simulate a steady-state boot: fetchval echoes back exactly the
+        # definition each statement would create, so every drift check must
+        # find "unchanged" and the bootstrap must not re-issue any of the 5
+        # function or 8 trigger CREATE OR REPLACE statements (LML#890) — only
+        # the row-neutral CREATE/ALTER/DO/DROP statements still run every boot.
+        responses: dict[tuple[object, ...], object] = {}
+        for statement in _DDL_STATEMENTS:
+            fn_match = re.match(r"^CREATE OR REPLACE FUNCTION (\S+\(\))", statement)
+            if fn_match:
+                responses[(fn_match.group(1),)] = statement
+                continue
+            trg_match = re.match(
+                r"^CREATE OR REPLACE TRIGGER (\S+)\nBEFORE .*? ON (\S+)\n", statement
+            )
+            if trg_match:
+                trigger_name, table_name = trg_match.group(1), trg_match.group(2)
+                responses[(trigger_name, table_name)] = statement.replace(
+                    "CREATE OR REPLACE TRIGGER", "CREATE TRIGGER", 1
+                )
+        assert len(responses) == 13, "expected 5 functions + 8 triggers to be keyed"
+        pg = _FakePgSource(fetchval_responses=responses)
+
+        await set_up_streaming_catalog_schema(pg)
+
+        assert not any(s.startswith("CREATE OR REPLACE FUNCTION") for s in pg.statements)
+        assert not any(s.startswith("CREATE OR REPLACE TRIGGER") for s in pg.statements)
+        # Row-neutral DDL (tables, indexes, the widen block) still runs.
+        for table in _TABLES:
+            assert f"CREATE TABLE IF NOT EXISTS lml_cache.{table}" in "\n".join(pg.statements)
+
+    async def test_boot_still_replaces_a_function_whose_live_body_drifted(self):
+        # A drift check that finds a DIFFERENT live definition must not skip —
+        # only a byte-for-byte (normalized) match short-circuits the replace.
+        drifted = "CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_album() ... stale ..."
+        pg = _FakePgSource(fetchval_responses={("lml_cache.guard_streaming_album()",): drifted})
+
+        await set_up_streaming_catalog_schema(pg)
+
+        replaced = [
+            s
+            for s in pg.statements
+            if s.startswith("CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_album()")
+        ]
+        assert len(replaced) == 1
