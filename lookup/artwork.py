@@ -3,9 +3,9 @@
 Home of the Step-4 artwork fetch (``fetch_artwork_for_items`` — per-item
 Discogs search with the LML#478 80/80 fuzzy floor), the LML#604
 trust-and-bind of an already-validated ``ResolvedRelease``
-(``_bind_resolved_release``), and the release-cover → artist-image →
-label-image fallback cascade (``_resolve_fallback_artwork``). Extracted
-verbatim from ``lookup/orchestrator.py`` (LML#728).
+(``_bind_resolved_release``), and the release-cover → artist-image
+fallback cascade (``_resolve_fallback_artwork``). Extracted verbatim from
+``lookup/orchestrator.py`` (LML#728).
 """
 
 import asyncio
@@ -44,7 +44,13 @@ measurement's compilation handling provably-aligned with production."""
 
 
 async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id: int) -> str | None:
-    """Try the release's own cover (images[0]), then artist image, then label image.
+    """Try the release's own cover (images[0]), then artist image.
+
+    LML#687: the label-image rung was removed -- a label logo is essentially
+    never correct album art (the motivating case: Autechre's *Confield* had no
+    cover and returned the Warp Records logo as its artwork). A missing cover
+    now resolves to ``None`` after the artist-image rung rather than falling
+    all the way through to the release's label.
 
     Structurally invalid ids (``release_id <= 0``) short-circuit before the
     Discogs round-trip — the LML#401 synthesis pattern produces a
@@ -70,12 +76,6 @@ async def _resolve_fallback_artwork(discogs_service: DiscogsService, release_id:
         image = await discogs_service.get_artist_image(release.artist_id)
         if image:
             logger.info(f"Using artist image fallback for release {release_id}")
-            return image
-
-    if release.label_id:
-        image = await discogs_service.get_label_image(release.label_id)
-        if image:
-            logger.info(f"Using label image fallback for release {release_id}")
             return image
 
     return None

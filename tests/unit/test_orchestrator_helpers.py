@@ -2545,7 +2545,8 @@ class TestFetchArtworkFoundOnCompilation:
 
 
 class TestFetchArtworkFallback:
-    """Tests for artwork fallback to artist/label images."""
+    """Tests for artwork fallback to the artist image (LML#687: the label
+    image rung was removed -- a label logo is not album art)."""
 
     @pytest.mark.asyncio
     async def test_falls_back_to_artist_image(self, mock_discogs_service):
@@ -2578,8 +2579,10 @@ class TestFetchArtworkFallback:
         mock_discogs_service.get_artist_image.assert_called_once_with(77)
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_label_image(self, mock_discogs_service):
-        """When artist image also unavailable, fall back to label image."""
+    async def test_no_label_image_fallback(self, mock_discogs_service):
+        """When artist image is also unavailable, artwork_url resolves to None
+        rather than falling back to the label logo (LML#687) -- a label image
+        is essentially never correct album art."""
         items = [make_library_item(id=1, artist="Autechre", title="Confield")]
 
         mock_discogs_service.search.return_value = DiscogsSearchResponse(
@@ -2604,8 +2607,8 @@ class TestFetchArtworkFallback:
 
         assert len(results) == 1
         assert results[0][1] is not None
-        assert results[0][1].artwork_url == "https://i.discogs.com/label-logo.jpg"
-        mock_discogs_service.get_label_image.assert_called_once_with(233)
+        assert results[0][1].artwork_url is None
+        mock_discogs_service.get_label_image.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_fallback_when_artwork_exists(self, mock_discogs_service):
