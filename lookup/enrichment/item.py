@@ -313,12 +313,30 @@ async def enrich_one(
                     probe_artwork_url = probe_match.artwork_url
                     probe_release_year = probe_match.release_year
         except TimeoutError:
-            logger.warning(
-                "AppleMusicClient.%s timed out for %s - %s",
-                probe_method,
-                row_artist,
-                search_term,
-            )
+            # LML#930 PR2: a `wait_for` timeout self-inflicted by the deadline
+            # clamp above (`apple_probe_timeout_s < base_apple_timeout_s`) is
+            # NOT an Apple outage — it's the budget running out, and at a
+            # near-zero clamp (e.g. ~0.01s) it fires near-instantly on every
+            # row, flooding the log with a signal that reads as "Apple is
+            # down" when it's self-inflicted deadline pressure. Only a
+            # genuine unclamped (full-ceiling) timeout still WARNs.
+            deadline_clamped = apple_probe_timeout_s < base_apple_timeout_s
+            if deadline_clamped:
+                logger.debug(
+                    "AppleMusicClient.%s timed out for %s - %s "
+                    "(deadline-clamped to %.3fs, not an Apple outage)",
+                    probe_method,
+                    row_artist,
+                    search_term,
+                    apple_probe_timeout_s,
+                )
+            else:
+                logger.warning(
+                    "AppleMusicClient.%s timed out for %s - %s",
+                    probe_method,
+                    row_artist,
+                    search_term,
+                )
             # LML#462: project onto the active Sentry transaction so the
             # trace explorer can distinguish "Apple Music timed out" from
             # "Apple Music never ran" — the cancelled inner
@@ -326,12 +344,22 @@ async def enrich_one(
             # without this marker the timeout shape is queryably
             # indistinguishable from a no-op. The legacy key stays for
             # dashboard continuity; the ``.method`` key disambiguates
-            # synthesis-path timeouts from happy-path timeouts.
+            # synthesis-path timeouts from happy-path timeouts; the LML#930
+            # ``.deadline_clamped`` key disambiguates a self-inflicted
+            # deadline-clamped timeout from a genuine Apple-side one; the
+            # ``.probe_timeout_s`` key records the effective clamp magnitude so
+            # a DEBUG-demoted clamped timeout stays diagnosable — a value near
+            # the base ceiling is a likely genuine Apple slowness, a near-zero
+            # value is self-inflicted deadline pressure.
             try:
                 transaction = sentry_sdk.get_current_scope().transaction
                 if transaction is not None:
                     transaction.set_data("apple_music.find_track_url.timeout", True)
                     transaction.set_data("apple_music.timeout.method", probe_method)
+                    transaction.set_data("apple_music.timeout.deadline_clamped", deadline_clamped)
+                    transaction.set_data(
+                        "apple_music.timeout.probe_timeout_s", round(apple_probe_timeout_s, 3)
+                    )
             except Exception as e:
                 logger.warning(
                     "Failed to project apple_music timeout onto Sentry transaction: %s",
