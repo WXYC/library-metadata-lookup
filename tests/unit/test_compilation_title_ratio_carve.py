@@ -20,6 +20,11 @@ length-comparable and keep clearing the floor.
 Both carve-out sites in ``track_on_compilation.py`` apply the same two-part
 test: the strict branch inside ``process_release`` (:~555) and the album-title
 fallback's ``_fallback_row_acceptable`` (:~591).
+
+The length-comparability guard is gated behind
+``LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT`` (default True): a Railway flip to
+False restores the pre-#973 ratio-floor-only admission without a redeploy,
+in case the guard turns out to cost real recall in prod.
 """
 
 from __future__ import annotations
@@ -32,6 +37,20 @@ from discogs.models import ReleaseInfo, TrackReleasesResponse
 from lookup.strategies.track_on_compilation import search_compilations_for_track
 from services.parser import ParsedRequest
 from tests.factories import make_library_item
+
+
+@pytest.fixture
+def disable_tighten_compilation_title_carveout(monkeypatch):
+    """Kill switch off: sets LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT=false and
+    resets the settings lru-cache so the flag-off assertion is self-contained,
+    matching the pattern in tests/unit/test_cached_track_safety_net.py."""
+    monkeypatch.setenv("LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT", "false")
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
 
 _FLAMINGOS_PARSED = ParsedRequest(
     artist="The Flamingos",
@@ -115,6 +134,24 @@ class TestStrictBranchTitleRatioCarve:
         results, _titles = await _run(releases, matches_by_album)
 
         assert results == []
+
+    async def test_flag_off_restores_pre_973_admission(
+        self, disable_tighten_compilation_title_carveout
+    ):
+        """LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT=false is the kill switch: with
+        the length-comparability guard bypassed, row 58775 clears the bare
+        ratio-floor-only rule (87.3 >= 80) and is admitted again -- byte-for-byte
+        the pre-#973 behavior."""
+        releases = [_release(_WRONG_PRESSING_RELEASE_ID, _WRONG_PRESSING_RELEASE_ALBUM)]
+        matches_by_album = {
+            _WRONG_PRESSING_RELEASE_ALBUM: [
+                _va_row(_WRONG_PRESSING_LIBRARY_ID, _WRONG_PRESSING_LIBRARY_TITLE)
+            ]
+        }
+
+        results, _titles = await _run(releases, matches_by_album)
+
+        assert {r.id for r in results} == {_WRONG_PRESSING_LIBRARY_ID}
 
     async def test_genuine_same_titled_comps_are_kept(self):
         """Rows 50963 and 8865: genuine hits whose library title matches the
@@ -219,6 +256,19 @@ class TestFallbackBranchTitleRatioCarveParity:
         results, _titles = await self._run_fallback(releases, matches)
 
         assert results == []
+
+    async def test_flag_off_restores_pre_973_admission_via_fallback(
+        self, disable_tighten_compilation_title_carveout
+    ):
+        """Parity with the strict-branch kill switch: the fallback's
+        ``_fallback_row_acceptable`` also drops the length guard when
+        LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT=false, admitting row 58775."""
+        releases = [_release(_WRONG_PRESSING_RELEASE_ID, _WRONG_PRESSING_RELEASE_ALBUM)]
+        matches = [_va_row(_WRONG_PRESSING_LIBRARY_ID, _WRONG_PRESSING_LIBRARY_TITLE)]
+
+        results, _titles = await self._run_fallback(releases, matches)
+
+        assert {r.id for r in results} == {_WRONG_PRESSING_LIBRARY_ID}
 
     async def test_genuine_same_titled_comp_kept_via_fallback(self):
         releases = [_release(50001, "Doo Wop Classics")]

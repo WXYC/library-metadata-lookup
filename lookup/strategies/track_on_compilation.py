@@ -83,7 +83,9 @@ e.g. "Greatest Hits Of The 50's" vs "Greatest hits of the 50s & 60s" clears
 track-less pressing. Requiring the shorter title to be at least 90% the
 length of the longer catches that case (length ratio 0.83) while a genuine
 reformatting — punctuation, an added "!", "Vol." vs "Vol" — stays
-length-comparable and still clears both floors."""
+length-comparable and still clears both floors. Gated behind
+``LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT`` (default True); False restores
+the pre-#973 ratio-floor-only admission without a redeploy."""
 
 
 def _compilation_title_length_ratio(a: str, b: str) -> float:
@@ -91,6 +93,20 @@ def _compilation_title_length_ratio(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return min(len(a), len(b)) / max(len(a), len(b))
+
+
+def _compilation_title_carveout_admits(title_score: float, length_ratio: float) -> bool:
+    """Whether a compilation-artist row's title clears the carve-out's
+    admission test. Always requires the ``fuzz.ratio`` floor. When
+    ``LML_TIGHTEN_COMPILATION_TITLE_CARVEOUT`` is True (default), also
+    requires the LML#973 length-comparability guard; False is the kill
+    switch that restores the pre-#973 ratio-floor-only admission without a
+    redeploy."""
+    if title_score < _COMPILATION_TITLE_RATIO_FLOOR:
+        return False
+    if get_settings().lml_tighten_compilation_title_carveout:
+        return length_ratio >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
+    return True
 
 
 TrackOnCompilationExecute = Callable[
@@ -508,10 +524,7 @@ async def _filter_release_matches(
                 length_ratio = _compilation_title_length_ratio(
                     release_album_lower, match_title_lower
                 )
-                return (
-                    title_score >= _COMPILATION_TITLE_RATIO_FLOOR
-                    and length_ratio >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
-                )
+                return _compilation_title_carveout_admits(title_score, length_ratio)
             return (
                 max(
                     _fuzz.token_set_ratio(
@@ -536,10 +549,7 @@ async def _filter_release_matches(
             match_title_lower = (match.title or "").lower()
             title_score = _fuzz.ratio(release_album_lower, match_title_lower)
             length_ratio = _compilation_title_length_ratio(release_album_lower, match_title_lower)
-            if (
-                title_score >= _COMPILATION_TITLE_RATIO_FLOOR
-                and length_ratio >= _COMPILATION_TITLE_LENGTH_RATIO_FLOOR
-            ):
+            if _compilation_title_carveout_admits(title_score, length_ratio):
                 filtered_matches.append(match)
             else:
                 logger.debug(
