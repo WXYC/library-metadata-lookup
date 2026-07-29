@@ -684,6 +684,39 @@ class DiscogsCacheService:
             logger.error(f"Cache search failed: {e}")
             raise CacheUnavailableError(f"Cache search failed: {e}") from e
 
+    async def get_release_artist_variations(self, release_id: int) -> set[str]:
+        """Name-variation set of a release's release-level (``extra=0``) artist(s).
+
+        For the LML#971 identity bridge: a library row filed under a band name or
+        an abbreviated alias (e.g. "Burning Star Core" / "C.S. Yeh") won't
+        prefix-match a typed personal name ("C. Spencer Yeh"), but the resolved
+        Discogs release's artist entity knows the alias as a name-variation.
+        Returns the canonical ``artist.name`` plus every ``artist_name_variation``
+        for the release's ``extra=0`` artist id(s). Cache-only, read-only.
+
+        Raises:
+            CacheUnavailableError: if the database is unreachable.
+        """
+        try:
+            query = """
+                SELECT a.name AS name
+                FROM release_artist ra
+                JOIN artist a ON a.id = ra.artist_id
+                WHERE ra.release_id = $1 AND ra.extra = 0
+                UNION
+                SELECT anv.name AS name
+                FROM release_artist ra
+                JOIN artist_name_variation anv ON anv.artist_id = ra.artist_id
+                WHERE ra.release_id = $1 AND ra.extra = 0
+            """
+            rows = await self._bounded_fetch(query, release_id, op="get_release_artist_variations")
+            return {r["name"] for r in rows if r["name"]}
+        except CacheUnavailableError:
+            raise
+        except Exception as e:
+            logger.error(f"Cache get_release_artist_variations failed: {e}")
+            raise CacheUnavailableError(f"Cache get_release_artist_variations failed: {e}") from e
+
     @async_cached(_ARTIST_SEARCH_CACHE)
     async def search_artists_by_name(self, name: str, *, limit: int = 5) -> list[dict]:
         """Fuzzy-match an artist name against ``artist`` and ``artist_name_variation``.

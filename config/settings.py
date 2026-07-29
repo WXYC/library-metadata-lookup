@@ -419,6 +419,21 @@ class Settings(BaseSettings):
             "See WXYC/library-metadata-lookup#604."
         ),
     )
+    lml_resolve_artist_variations: bool = Field(
+        default=False,
+        description=(
+            "When True, TRACK_ON_COMPILATION admits a title-matched library row "
+            "whose artist/alternate_artist_name is an EXACT name-variation of the "
+            "resolved NON-COMPILATION Discogs release's artist entity -- bridging a "
+            "row filed under a band name or abbreviated alias (e.g. 'Burning Star "
+            "Core' / 'C.S. Yeh') to a typed personal name ('C. Spencer Yeh'). Exact "
+            "membership (not prefix), non-compilation releases only, gated by "
+            "validate_release_for_track on the typed artist. Best-effort + "
+            "fail-closed (a cache miss/outage yields no bridge). Default False; "
+            "roll staging -> prod like the sibling resolve flags. "
+            "See WXYC/library-metadata-lookup#971."
+        ),
+    )
     lml_resolve_nonlibrary_release: bool = Field(
         default=False,
         description=(

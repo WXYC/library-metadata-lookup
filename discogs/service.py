@@ -2046,6 +2046,27 @@ class DiscogsService:
         # ``T | None`` here is always bool in practice.
         return bool(validated)
 
+    async def get_release_artist_variations(self, release_id: int) -> set[str]:
+        """Cache-only name-variation set for a release's artist (LML#971 bridge).
+
+        Returns an empty set when no cache is configured or the cache is
+        unavailable -- a degrade, never a raise, so a lookup never fails over
+        this best-effort identity bridge.
+        """
+        from discogs.cache_service import CacheUnavailableError
+
+        cache = self.cache_service
+        if cache is None:
+            return set()
+        try:
+            return await cache.get_release_artist_variations(release_id)
+        except CacheUnavailableError:
+            logger.debug(
+                "get_release_artist_variations degraded (cache unavailable) for release %s",
+                release_id,
+            )
+            return set()
+
     async def get_track_credit_on_release(self, release_id: int, track: str) -> str | None:
         """Recover the per-track credit for ``track`` on a release (LML#660).
 
