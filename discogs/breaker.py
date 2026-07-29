@@ -35,14 +35,14 @@ State machine
 - ``HALF_OPEN`` — after the cool-down, a *single* trial request is admitted; a
   genuine 2xx with a healthy remaining CLOSES the breaker, a 429 (or a
   still-exhausted remaining) re-OPENS it for another cool-down. A 5xx trial is
-  **neutral** — it neither closes nor reopens (a Discogs upstream error is not a
-  rate-limit signal), so the breaker stays HALF_OPEN and the next admitted trial
-  decides. A trial that dies without any terminal outcome — request-layer
+  **neutral** for the *decision* — it never closes (a Discogs upstream error is
+  not a rate-limit signal) — but it IS resolved: like an aborted trial, it
+  re-OPENS for a fresh cool-down so the next admitted trial actually decides,
+  instead of leaving the slot occupied with nothing in flight (LML#791). A
+  trial that dies without any terminal outcome — request-layer
   ``RequestError``, cancellation, an unexpected raise — is **inconclusive**:
   the caller reports it via :meth:`record_aborted`, which re-OPENs for another
-  cool-down (LML#787; never CLOSE on a lost trial). Note that after a
-  5xx-resolved trial the slot stays occupied until the watchdog below fires —
-  prompt re-arm is tracked in LML#791.
+  cool-down (LML#787; never CLOSE on a lost trial).
 
 Aborted trials & the HALF_OPEN watchdog (LML#787)
 -------------------------------------------------
@@ -59,10 +59,9 @@ persist:
   fresh trial). Anything else (CLOSED-era caller, stale epoch, OPEN) is a
   no-op — an aborted request is not a saturation signal.
 - A **watchdog** in :meth:`allow_request` — belt-and-suspenders for slot
-  strandings ``record_aborted`` can't see: a trial coroutine lost without its
-  ``finally`` running, and the LML#791 shape (a trial *resolving* in a neutral
-  5xx leaves the slot occupied with nothing in flight). If HALF_OPEN persists
-  past ``max(cooldown_seconds × trial_watchdog_multiplier, 60s)``, the slot is
+  strandings the terminal ``record_*`` calls can't see: a trial coroutine lost
+  without its ``finally`` running. If HALF_OPEN persists past
+  ``max(cooldown_seconds × trial_watchdog_multiplier, 60s)``, the slot is
   presumed stranded and the breaker re-OPENs; the 60s floor keeps the watchdog
   alive under degenerate configs (zero cool-down, zero/negative multiplier)
   that would otherwise zero the threshold and re-admit the forever-latch. The
@@ -76,10 +75,11 @@ persist:
 
 So — given traffic (the watchdog runs inside ``allow_request``, so an idle
 service can sit HALF_OPEN longer, harmlessly: no callers, nothing shed) —
-HALF_OPEN is bounded at ``max(cooldown × multiplier, 60s)``, and the known
-unrecorded-exit paths resolve immediately via ``record_aborted``. The residual
-stall — a 5xx-resolved trial shedding until the watchdog fires instead of
-re-arming after one cool-down — is tracked in LML#791.
+HALF_OPEN is bounded at ``max(cooldown × multiplier, 60s)`` for the coroutine-
+lost shape, while both known unrecorded-exit-with-outcome paths — an abort
+(:meth:`record_aborted`) and a 5xx-resolved trial (:meth:`record_server_error`,
+LML#791) — resolve immediately, re-arming after a single cool-down instead of
+waiting out the watchdog.
 
 Epoch guard
 -----------
@@ -93,10 +93,12 @@ and the half-open transition only fires when that epoch matches the current one.
 5xx handling
 ------------
 A non-429 error response (``>= 500``) is neither a rate-limit failure nor a
-genuine success. :meth:`record_server_error` is a no-op for the state machine:
-it does *not* reset the consecutive-failure run (a 5xx mid-flood mustn't paper
-over the rate-limit signal) and does *not* close a HALF_OPEN trial. It counts
-toward opening only if a 5xx also carries an exhausted ``remaining`` floor.
+genuine success. :meth:`record_server_error` does *not* reset the
+consecutive-failure run (a 5xx mid-flood mustn't paper over the rate-limit
+signal) and does *not* close a HALF_OPEN trial. For a CLOSED-state caller it
+counts toward opening only if the 5xx also carries an exhausted ``remaining``
+floor; for the current HALF_OPEN trial (epoch match) it re-OPENS for a fresh
+cool-down — resolved-inconclusive, same as :meth:`record_aborted` (LML#791).
 
 Concurrency / worker scope
 --------------------------
@@ -352,9 +354,24 @@ class DiscogsCircuitBreaker:
 
         Does NOT reset the consecutive-failure run and does NOT close a HALF_OPEN
         trial: a Discogs upstream error is not a rate-limit signal, so it must
-        neither paper over an in-progress flood nor count as recovery. It only
-        opens if the 5xx also reports an at/below-floor ``remaining``.
+        neither paper over an in-progress flood nor count as recovery. If the
+        resolver IS the current HALF_OPEN trial (epoch match), the trial is
+        *resolved-inconclusive* — re-OPEN for a fresh cool-down (the same
+        transition :meth:`record_aborted` performs, and for the same reason:
+        nothing was learned, so a fresh trial should be promoted promptly
+        rather than stranding the slot until the LML#787 watchdog fires,
+        LML#791). A stale epoch (non-trial caller) remains a pure no-op here.
+        It only opens for a CLOSED-state caller if the 5xx also reports an
+        at/below-floor ``remaining``.
         """
+        if self._state is BreakerState.HALF_OPEN and epoch == self._epoch:
+            logger.warning(
+                "Discogs saturation breaker HALF_OPEN trial resolved 5xx (neutral); "
+                "re-opening for a fresh trial (LML#791)"
+            )
+            self._open()
+            return
+
         if self._at_or_below_floor(remaining):
             self._open()
 
