@@ -139,7 +139,9 @@ class TestServerErrorsNeutral:
 
     def test_5xx_does_not_close_half_open(self, clock):
         """FIX 5: a 5xx trial response must NOT close a HALF_OPEN breaker — only
-        a genuine 2xx with a healthy remaining proves recovery."""
+        a genuine 2xx with a healthy remaining proves recovery. LML#791: a
+        resolved (epoch-matching) trial re-OPENs for a fresh cool-down rather
+        than leaving the slot stranded — never CLOSED, either way."""
         breaker = _breaker(clock, cooldown_seconds=30.0)
         for _ in range(3):
             breaker.record_failure()
@@ -148,8 +150,50 @@ class TestServerErrorsNeutral:
         assert epoch is not None
         assert breaker.state is BreakerState.HALF_OPEN
         breaker.record_server_error(epoch=epoch)
-        # Still HALF_OPEN — the trial neither closed nor reopened on a 5xx.
+        # Re-OPENs (not CLOSED) — LML#791: the trial resolved inconclusively.
+        assert breaker.state is BreakerState.OPEN
+
+    def test_5xx_resolved_half_open_trial_reopens_and_promotes_a_fresh_trial(self, clock):
+        """LML#791: a HALF_OPEN trial resolving 5xx (epoch match) is treated the
+        same as an aborted trial — re-OPEN for a fresh cool-down so the next
+        trial is actually admissible, instead of stranding the slot until the
+        LML#787 watchdog fires ~20x later."""
+        breaker, epoch = _to_half_open(clock)
+        breaker.record_server_error(epoch=epoch)
+        assert breaker.state is BreakerState.OPEN
+        # One cool-down later, a fresh trial (new epoch) is admitted.
+        clock.advance(31.0)
+        fresh_epoch = breaker.allow_request()
+        assert fresh_epoch is not None
+        assert fresh_epoch != epoch
         assert breaker.state is BreakerState.HALF_OPEN
+
+    def test_stale_epoch_server_error_in_half_open_is_a_noop(self, clock):
+        """A 5xx landing from a superseded caller (stale epoch) must not
+        disturb the live trial — only the epoch-matching resolver decides."""
+        breaker = _breaker(clock, cooldown_seconds=30.0)
+        stale_epoch = breaker.allow_request()
+        for _ in range(3):
+            breaker.record_failure()
+        clock.advance(31.0)
+        trial_epoch = breaker.allow_request()
+        assert breaker.state is BreakerState.HALF_OPEN
+        breaker.record_server_error(epoch=stale_epoch)
+        # Undisturbed: the live trial can still resolve on its own.
+        assert breaker.state is BreakerState.HALF_OPEN
+        breaker.record_success(remaining=50, epoch=trial_epoch)
+        assert breaker.state is BreakerState.CLOSED
+
+    def test_closed_state_5xx_preserves_the_failure_run(self, clock):
+        """CLOSED-state 5xx must still not reset the consecutive-failure run
+        (existing FIX 5 property, unaffected by the HALF_OPEN change above)."""
+        breaker = _breaker(clock, failure_threshold=3)
+        breaker.record_failure()
+        breaker.record_failure()
+        breaker.record_server_error()
+        assert breaker.state is BreakerState.CLOSED
+        breaker.record_failure()
+        assert breaker.state is BreakerState.OPEN
 
 
 class TestOpenToHalfOpen:
@@ -346,18 +390,17 @@ class TestHalfOpenWatchdog:
     def test_watchdog_floor_applies_when_cooldown_is_zero(self, clock):
         """LML#787 review R1: ``cooldown_seconds=0`` is a permitted config
         (settings ``ge=0.0``), and ``cooldown × multiplier = 0`` must not
-        disable the watchdog — a 5xx-resolved trial (neutral: slot stays
-        occupied, LML#791) would then latch HALF_OPEN *forever*, the exact
-        #787 failure mode. The threshold is floored at 60s instead."""
+        disable the watchdog — an *aborted* trial's slot must not latch
+        HALF_OPEN forever, the exact #787 failure mode. The threshold is
+        floored at 60s instead. (LML#791 resolved the 5xx-resolved shape via a
+        prompt re-open instead of relying on this watchdog; the floor still
+        guards the abort/lost-coroutine shapes the watchdog exists for.)"""
         breaker = _breaker(clock, cooldown_seconds=0.0, trial_watchdog_multiplier=20.0)
         breaker.force_open()
         epoch = breaker.allow_request()  # zero cool-down: immediate promotion
         assert epoch is not None
         assert breaker.state is BreakerState.HALF_OPEN
-        # The trial resolves in a neutral 5xx: state no-op, slot still occupied.
-        breaker.record_server_error(epoch=epoch)
-        assert breaker.state is BreakerState.HALF_OPEN
-        # Under the 60s floor the trial is not presumed lost early...
+        # Under the 60s floor an unresolved trial is not presumed lost early...
         clock.advance(59.0)
         assert breaker.allow_request() is None
         assert breaker.state is BreakerState.HALF_OPEN
@@ -369,27 +412,6 @@ class TestHalfOpenWatchdog:
         fresh_epoch = breaker.allow_request()
         assert fresh_epoch is not None
         assert fresh_epoch != epoch
-        assert breaker.state is BreakerState.HALF_OPEN
-
-    def test_5xx_resolved_trial_stall_is_bounded_by_the_watchdog(self, clock):
-        """Pin the LML#791 stall bound: a trial resolving in a neutral 5xx
-        leaves HALF_OPEN with no in-flight trial and no admission path
-        (``record_server_error`` deliberately doesn't move the state — FIX 5),
-        so live calls shed until the watchdog presumes the slot stranded.
-        Prompt re-arm is LML#791; this pins that the stall is *bounded*."""
-        breaker, epoch = _to_half_open(clock, trial_watchdog_multiplier=20.0)
-        breaker.record_server_error(epoch=epoch)
-        assert breaker.state is BreakerState.HALF_OPEN
-        # Stalled: nothing is admitted while the slot is stranded...
-        clock.advance(599.0)
-        assert breaker.allow_request() is None
-        assert breaker.state is BreakerState.HALF_OPEN
-        # ...until the watchdog window (30s cooldown × 20 = 600s) elapses.
-        clock.advance(2.0)
-        assert breaker.allow_request() is None  # re-OPENs
-        assert breaker.state is BreakerState.OPEN
-        clock.advance(31.0)
-        assert breaker.allow_request() is not None
         assert breaker.state is BreakerState.HALF_OPEN
 
 
