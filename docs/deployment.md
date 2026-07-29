@@ -195,6 +195,49 @@ These are inherent to per-process state going per-replica — documented, accept
 2. Bump the replica count on the LML service.
 3. Add a `railway redeploy` step **after the daily library sync** so every replica boot-fetches the fresh `library.db` (closes the freshness-skew window above).
 
+### Gate 0 (LML#983): measuring whether `UVICORN_WORKERS=3` is still needed
+
+**Different axis, same knob-division arithmetic as the replica runbook above.** `UVICORN_WORKERS` (`entrypoint.sh`) spawns N processes *inside one container*, each with its own event loop, its own per-process Discogs limiter/semaphore/breaker, and — the LML#983 problem — its own in-memory `TTLCache` heap (`discogs/memory_cache.py`) with no cross-process sharing and no connection stickiness. Railway replica count (the section above) spawns N *separate containers*. They are different scaling levers, but they hit the exact same shared-budget constraint (one 60/min Discogs token) and divide the same knobs by the same N, so `entrypoint.sh`'s own comment points here rather than duplicating the arithmetic.
+
+LML#747 set `UVICORN_WORKERS=3` in prod for event-loop-starvation burst headroom, paired with `DISCOGS_RATE_LIMIT=16` (`floor(50/3)`, dividing the per-process limiter across 3 workers) and `DISCOGS_RATE_BUCKET_ENABLED=true` on staging (a separately-keyed `discogs-staging` PG bucket row — it does **not** coordinate with prod's own bucket state, see the caution below). LML#983 observed that this fragmentation makes a repeated identical `/lookup` query oscillate between a warm-worker hit (~67 ms) and a cold-worker miss (~2.4 s) purely depending on which of the 3 processes the kernel hands the connection to. #949/PR#899 (the synchronous PostHog-flush fix) since removed #747's main single-worker p50 tax, so Gate 0 asks: is the burst headroom `UVICORN_WORKERS=3` bought still worth paying the fragmentation cost for? If a single worker's burst p95 holds within budget, reverting to `UVICORN_WORKERS=1` eliminates the fragmentation with zero new infrastructure — no Solution A (shared L2 cache) required.
+
+The measurement mechanism is `scripts/gate0_burst.py` (see [`docs/scripts.md`](scripts.md#gate-0-burst-harness-scriptsgate0_burstpy)) — a turnkey, reproducible harness. **This runbook is the human-supervised procedure for running it; the script itself never flips a Railway variable.**
+
+#### Prerequisites and cautions
+
+- **Staging shares prod's Discogs token, breaker, and discogs-cache PG** — it is not a sandbox. A burst against the real `/lookup` query set issues live `/database/search` calls against the same 60/min external quota prod draws from. Run off-peak, keep the burst small (the harness's own safety rail refuses a burst above its modest default ceiling without `--force`), and stop immediately if the harness reports an abort (HTTP 429/5xx, or a `degraded: true` / `degraded_reason: "upstream_unavailable"` body).
+- **The internal Discogs-rate PG bucket (`DISCOGS_RATE_BUCKET_ENABLED`) does not coordinate staging and prod even when both have it on.** As of this writing staging is keyed `DISCOGS_RATE_BUCKET_KEY=discogs-staging` while prod does not set `DISCOGS_RATE_BUCKET_ENABLED` at all (defaults `false`, plain per-process limiter) — the two environments pace independently. What genuinely *is* shared is the external Discogs API's own `X-Discogs-Ratelimit-Remaining`, which the LML#755 breaker on **either** environment reads from the real, combined usage — so a staging burst can still starve prod's remaining budget and trip prod's breaker even though the two environments' internal bucket bookkeeping is disjoint. Check current values before running anything: `railway variable list --service library-metadata-lookup --environment staging --kv | grep DISCOGS_RATE_BUCKET`.
+- **`LML_EMIT_SERVER_TIMING` must be on for the target environment**, or the harness has no `lml_wall`/`event_loop_lag` legs to read and falls back to client-measured wall time only (it warns loudly when this happens — see [`docs/scripts.md`](scripts.md#gate-0-burst-harness-scriptsgate0_burstpy)).
+
+#### The coupled-knob unwind (read before flipping anything)
+
+`UVICORN_WORKERS` and `DISCOGS_RATE_LIMIT` are a paired knob, exactly like the replica knob-inventory table above, just with N = worker count instead of replica count. **Reverting `UVICORN_WORKERS` from 3 to 1 without also restoring `DISCOGS_RATE_LIMIT` throttles the single surviving worker to a third of its allowed Discogs budget** (`entrypoint.sh` lines 1-33 document the coupling: prod's `DISCOGS_RATE_LIMIT=16` is `floor(50/3)`, sized for 3 workers each running their own limiter under the shared 50-60/min token). If Gate 0's decision is "revert to N=1", the SAME change must:
+
+1. Set `UVICORN_WORKERS=1`.
+2. Restore `DISCOGS_RATE_LIMIT` to ~50 (undo the `floor(50/3)=16` division) — unless leaning on `DISCOGS_RATE_BUCKET_ENABLED=true` for the rate dimension, in which case confirm that flag and its `DISCOGS_RATE_BUCKET_KEY` are correctly set for the target environment first (prod does not have it on today — see the caution above).
+3. Re-check `DISCOGS_MAX_CONCURRENT` and `DISCOGS_BREAKER_REMAINING_FLOOR` against the stock N=1 defaults (5 and 3 respectively, `config/settings.py`) — at N=3 today these are sized down/up by the same per-worker-division arithmetic the replica knob table uses (e.g. staging currently runs `DISCOGS_MAX_CONCURRENT=1`, `DISCOGS_BREAKER_REMAINING_FLOOR=6` — both derived from N=3 via that table's formulas, not stock values).
+
+Doing (1) alone and leaving (2)/(3) at their N=3-sized values is the failure mode this section exists to prevent: a single worker silently capped at 16 Discogs req/min instead of its real ~50 share.
+
+#### Procedure
+
+1. **Discover the target.** LML lives in the `request-o-matic` Railway project (not its own project). Confirm the staging service/environment/domain: `railway status` (after `railway link` if not already linked), or explicitly `railway domain list --service library-metadata-lookup --environment staging`. Record current values before touching anything: `railway variable list --service library-metadata-lookup --environment staging --kv | grep -E "UVICORN_WORKERS|DISCOGS_RATE_LIMIT|DISCOGS_RATE_BUCKET|DISCOGS_MAX_CONCURRENT|DISCOGS_BREAKER_REMAINING_FLOOR|LML_EMIT_SERVER_TIMING"`.
+2. **Smoke-test the harness first**, zero Discogs risk: `python scripts/gate0_burst.py --host https://library-metadata-lookup-staging.up.railway.app --smoke`. Confirm it reports a non-empty `server_timing_present: true` and a sane `event_loop_lag_ms` series before going further — a `server_timing_present: false` here means `LML_EMIT_SERVER_TIMING` is off on staging and must be fixed first.
+3. **Baseline at today's config (`UVICORN_WORKERS=3`)**: `LML_API_KEY=... python scripts/gate0_burst.py --host https://library-metadata-lookup-staging.up.railway.app --concurrency 3 --total 12 --warm --json > gate0-n3.json`. Watch stderr for an abort; if it aborts, stop and report rather than retrying immediately (staging's Discogs budget needs to recover first).
+4. **Flip to `UVICORN_WORKERS=1`, applying the full coupled-knob unwind above**, e.g.: `railway variable set UVICORN_WORKERS=1 DISCOGS_RATE_LIMIT=50 --service library-metadata-lookup --environment staging` (adjust `DISCOGS_MAX_CONCURRENT`/`DISCOGS_BREAKER_REMAINING_FLOOR` per step 3 of the unwind if they were sized down for N=3 on staging). Wait for the redeploy to go live (`railway status`, or poll `/health`).
+5. **Re-run the identical burst against `UVICORN_WORKERS=1`**: same command as step 3, `> gate0-n1.json`.
+6. **Restore staging to its prior state** (the values recorded in step 1) once the comparison is recorded, so staging doesn't drift from prod's config between Gate 0 runs.
+7. **Compare and record.** "Within budget" for Gate 0 means: N=1 burst p95 (`lml_wall_ms.p95`) is not meaningfully worse than the current Backend/canary latency budget (~8s caller budget headroom per the #924/#927 sizing notes elsewhere in this doc), AND N=1 shows a materially smaller warm/cold split (`warm_count`/`cold_count`) than N=3 — the direct evidence the fragmentation is real and single-worker resolves it. Fill in the result table below and attach it to LML#983:
+
+   | Worker count | p50 (`lml_wall_ms`) | p95 | p99 | max `event_loop_lag_ms` | warm/cold split |
+   |---|---|---|---|---|---|
+   | 3 (baseline) | | | | | |
+   | 1 (Gate 0) | | | | | |
+
+   **Decision:** _(fill in — "N=1 holds within budget, reverting UVICORN_WORKERS=1 in prod" / "N=1 shows starvation, proceeding to Solution A")_
+
+8. **If the decision is "revert to N=1"**: apply the same coupled-knob unwind to **production** (not just staging), open a PR/note documenting the #747 reversal rationale per the LML#983 acceptance criteria, and close or update the issue. If the decision is "N=3 still needed": proceed to LML#983's Solution A (shared out-of-process L2 cache) instead — Gate 0's job is done either way once the table above is filled in.
+
 ## Health Check Behavior
 
 When `library.db` is missing (e.g., on first deploy before first upload):
