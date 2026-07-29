@@ -186,7 +186,7 @@ class TestUploadLibraryDB:
                     )
 
         assert resp.status_code == 400
-        assert "Invalid SQLite database" in resp.json()["detail"]
+        assert "Invalid SQLite database" in resp.json()["message"]
 
     @pytest.mark.asyncio
     async def test_sqlite_missing_library_table(self, tmp_path, admin_settings):
@@ -220,7 +220,7 @@ class TestUploadLibraryDB:
                     )
 
         assert resp.status_code == 400
-        assert "Invalid SQLite database" in resp.json()["detail"]
+        assert "Invalid SQLite database" in resp.json()["message"]
 
     @pytest.mark.asyncio
     async def test_missing_auth_header(self, admin_settings):
@@ -247,7 +247,7 @@ class TestUploadLibraryDB:
                 )
 
         assert resp.status_code == 401
-        assert resp.json()["detail"] == "Missing authorization"
+        assert resp.json()["message"] == "Missing authorization"
 
     @pytest.mark.asyncio
     async def test_wrong_bearer_token(self, admin_settings):
@@ -275,7 +275,7 @@ class TestUploadLibraryDB:
                 )
 
         assert resp.status_code == 403
-        assert resp.json()["detail"] == "Invalid token"
+        assert resp.json()["message"] == "Invalid token"
 
     @pytest.mark.asyncio
     async def test_no_admin_token_configured(self, no_token_settings):
@@ -764,7 +764,7 @@ class TestDownloadStreamingDB:
 
         resp = await self._get(app, admin_settings)
         assert resp.status_code == 401
-        assert resp.json()["detail"] == "Missing authorization"
+        assert resp.json()["message"] == "Missing authorization"
 
     @pytest.mark.asyncio
     async def test_malformed_auth_header(self, admin_settings):
@@ -773,7 +773,7 @@ class TestDownloadStreamingDB:
 
         resp = await self._get(app, admin_settings, headers={"Authorization": "test-secret-token"})
         assert resp.status_code == 403
-        assert resp.json()["detail"] == "Invalid token"
+        assert resp.json()["message"] == "Invalid token"
 
     @pytest.mark.asyncio
     async def test_wrong_bearer_token(self, admin_settings):
@@ -782,7 +782,7 @@ class TestDownloadStreamingDB:
 
         resp = await self._get(app, admin_settings, headers={"Authorization": "Bearer wrong-token"})
         assert resp.status_code == 403
-        assert resp.json()["detail"] == "Invalid token"
+        assert resp.json()["message"] == "Invalid token"
 
     @pytest.mark.asyncio
     async def test_no_admin_token_configured(self, no_token_settings):
@@ -807,7 +807,7 @@ class TestDownloadStreamingDB:
             app, admin_settings, headers={"Authorization": "Bearer test-secret-token"}
         )
         assert resp.status_code == 404
-        assert "streaming_availability.db" in resp.json()["detail"]
+        assert "streaming_availability.db" in resp.json()["message"]
 
     @pytest.mark.asyncio
     async def test_successful_download(self, admin_settings):

@@ -11,8 +11,12 @@ from typing import Any
 
 import sentry_sdk
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from wxyc_fastapi.observability import init_sentry, shutdown_posthog
 
 from artists.router import router as artists_router
@@ -30,6 +34,7 @@ from core.event_loop_lag import start_sampler, stop_sampler
 from core.logging import setup_logging
 from core.server_timing_middleware import LmlWallTimingMiddleware
 from discogs.router import router as discogs_router
+from generated.api_models import ApiErrorResponse
 from identity.dependencies import close_entity_store
 from identity.router import api_v1_router as identity_api_v1_router
 from identity.router import router as identity_router
@@ -505,6 +510,39 @@ app.add_middleware(
 # the window `lml_wall` is meant to measure — see
 # `core/server_timing_middleware.py` for what the leg measures and why.
 app.add_middleware(LmlWallTimingMiddleware)
+
+
+# LML#771: normalize every route's error body to wxyc-shared api.yaml's
+# ApiErrorResponse ({message, code?, details?}) instead of FastAPI's default
+# {detail}. DECISION LOCKED Option A (fix LML-side, no api.yaml change) — see
+# the issue for the rejected Option B. Registering a StarletteHTTPException
+# handler overrides FastAPI's default for every HTTPException app-wide, so
+# every route conforms without per-route edits. Wire status codes are
+# untouched; only the body shape changes.
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    if isinstance(exc.detail, str):
+        payload = ApiErrorResponse(message=exc.detail)
+    else:
+        # Structured detail (e.g. core/bulk_body.py's parse_bulk_body raises
+        # detail=e.errors(), a list) stays machine-readable under `details`
+        # rather than being stringified — flattening it would regress #767's
+        # structured-errors win.
+        payload = ApiErrorResponse(
+            message="Request failed", details={"detail": jsonable_encoder(exc.detail)}
+        )
+    return JSONResponse(status_code=exc.status_code, content=payload.model_dump(exclude_none=True))
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    payload = ApiErrorResponse(
+        message="Request validation failed",
+        details={"errors": jsonable_encoder(exc.errors())},
+    )
+    return JSONResponse(status_code=422, content=payload.model_dump(exclude_none=True))
 
 
 # Health and admin keep their own auth posture:

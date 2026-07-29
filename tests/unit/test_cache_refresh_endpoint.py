@@ -117,7 +117,7 @@ class TestCacheRefreshEntityStoreUnavailable:
                 )
 
         assert resp.status_code == 503
-        assert "entity store" in resp.json()["detail"].lower()
+        assert "entity store" in resp.json()["message"].lower()
 
 
 class TestCacheRefreshFamilyAlignment:
@@ -166,7 +166,7 @@ class TestCacheRefreshFamilyAlignment:
             )
 
         assert resp.status_code == 400
-        assert "disconnected" in resp.json()["detail"].lower()
+        assert "disconnected" in resp.json()["message"].lower()
         mock_entity_store.get_release_identity_provenance_bulk.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -182,7 +182,7 @@ class TestCacheRefreshFamilyAlignment:
             resp = await ac.post("/api/v1/cache/refresh-for-identities", json={})
 
         assert resp.status_code == 422
-        detail = resp.json()["detail"]
+        detail = resp.json()["details"]["detail"]
         assert isinstance(detail, list)
         assert detail[0]["loc"] == ["identity_ids"]
         assert detail[0]["type"] == "missing"

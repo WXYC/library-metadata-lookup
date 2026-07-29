@@ -591,7 +591,7 @@ class TestBulkLookupEndpoint:
                 )
 
         assert resp.status_code == 400
-        assert "malformed json" in resp.json()["detail"].lower()
+        assert "malformed json" in resp.json()["message"].lower()
         mock_lookup.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1317,7 +1317,7 @@ class TestBulkLookupFamilyAlignment:
                 )
 
         assert resp.status_code == 400
-        assert "disconnected" in resp.json()["detail"].lower()
+        assert "disconnected" in resp.json()["message"].lower()
         mock_lookup.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1332,7 +1332,7 @@ class TestBulkLookupFamilyAlignment:
                 resp = await ac.post("/api/v1/lookup/bulk", json={})
 
         assert resp.status_code == 422
-        detail = resp.json()["detail"]
+        detail = resp.json()["details"]["detail"]
         assert isinstance(detail, list)
         assert detail[0]["loc"] == ["items"]
         assert detail[0]["type"] == "missing"

@@ -102,6 +102,11 @@ async def test_exists_not_tombstone_returns_404_with_distinct_detail(client):
         headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
     )
     assert resp.status_code == 404
+    # This test mounts an isolated FastAPI() with only admin_router (not
+    # main.app), so the LML#771 ApiErrorResponse handlers registered on
+    # main.app don't apply here — the router itself still raises the same
+    # structured HTTPException; FastAPI's default `{"detail": ...}` shape is
+    # what's on the wire for this isolated app.
     body = resp.json()["detail"]
     assert body["detail"] == "row exists but is not a tombstone"
     assert body["id"] == 42

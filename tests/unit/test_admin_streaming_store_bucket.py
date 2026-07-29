@@ -150,7 +150,7 @@ class TestUploadBucketGuard:
 
         resp = await _upload(app, admin_settings, s3_store, upload)
         assert resp.status_code == 409
-        regs = resp.json()["detail"]["regressions"]
+        regs = resp.json()["details"]["detail"]["regressions"]
         assert any(r["metric"] == "apple_url" for r in regs)
         # The object in the bucket is left untouched.
         assert await _apple_count_in_store(s3_store, tmp_path) == 288
@@ -180,7 +180,7 @@ class TestUploadBucketGuard:
 
         resp = await _upload(app, admin_settings, s3_store, upload)
         assert resp.status_code == 409
-        detail = resp.json()["detail"]
+        detail = resp.json()["details"]["detail"]
         assert "error" in detail
         assert "regressions" not in detail
         # The corrupt object is left untouched.

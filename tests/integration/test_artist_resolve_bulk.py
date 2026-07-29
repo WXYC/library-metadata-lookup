@@ -407,7 +407,7 @@ class TestArtistResolveQualifierSemantics:
             "/api/v1/artists/resolve/bulk", json={"names": ["Wishy", "   "]}
         )
         assert resp.status_code == 422
-        assert "names[1]" in resp.json()["detail"]
+        assert "names[1]" in resp.json()["message"]
 
         read = await app_client.get("/identity/resolve", params={"name": "Wishy"})
         assert read.status_code == 404

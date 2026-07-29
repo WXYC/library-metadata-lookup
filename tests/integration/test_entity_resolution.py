@@ -519,7 +519,7 @@ class TestIdentityRouterEntityStoreUnavailable:
             resp = await ac.get("/identity/resolve", params={"name": "Stereolab"})
 
         assert resp.status_code == 503
-        assert "entity store" in resp.json()["detail"].lower()
+        assert "entity store" in resp.json()["message"].lower()
 
     @pytest.mark.asyncio
     async def test_bulk_returns_503_when_entity_schema_missing(self, app_with_pg_dsn):
