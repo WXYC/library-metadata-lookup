@@ -20,6 +20,7 @@ posture the Apple parser's ``\\d{6,}`` floor provides against
 from __future__ import annotations
 
 import re
+from urllib.parse import urlparse
 
 # Anchored on the Spotify host so a ``/album/<id>`` path on another domain
 # can't be mistaken for a Spotify album. ``//`` before the host and the
@@ -43,3 +44,22 @@ def spotify_album_id_from_url(url: str) -> str | None:
     """
     match = SPOTIFY_ALBUM_ID_RE.search(url)
     return match.group(1) if match else None
+
+
+def url_has_spotify_host(url: str) -> bool:
+    """True if ``url``'s host is ``spotify.com`` or a subdomain of it.
+
+    Deliberately looser than :func:`spotify_album_id_from_url` — a
+    field-name/host invariant check (LML#873) rather than an album-ID
+    extraction, so it accepts any Spotify path (track, artist, playlist),
+    not just the canonical album shape. Used to null out a mislabeled
+    ``spotify_url`` artifact (a Deezer/Apple/Bandcamp URL stored under that
+    field name) before it reaches a caller.
+    """
+    if not url:
+        return False
+    try:
+        host = urlparse(url).netloc.lower()
+    except ValueError:
+        return False
+    return host == "spotify.com" or host.endswith(".spotify.com")

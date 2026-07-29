@@ -51,7 +51,9 @@ from lookup.rowless import (
 )
 from lookup.streaming_url_postprocess import apply_streaming_url_postprocess
 from lookup.timeouts import apple_music_lookup_timeout_s
+from release.apple_music_url_parser import url_has_apple_music_host
 from release.musicbrainz_resolver import resolve_tracklist_via_musicbrainz
+from release.spotify_url_parser import url_has_spotify_host
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +205,18 @@ async def enrich_one(
             youtube_music_url = links.get("youtube_music_url")
             bandcamp_url = links.get("bandcamp_url")
             soundcloud_url = links.get("soundcloud_url")
+
+            # LML#873: the streaming-links reconciliation pipeline sometimes
+            # stores a non-Spotify (Deezer/Apple/Bandcamp) URL under the
+            # spotify_url column, and likewise a non-Apple URL under
+            # apple_music_url. Enforce the field-name/host invariant here,
+            # before either value can propagate to a response — a mismatched
+            # host is treated the same as "no override", not surfaced under
+            # the wrong field.
+            if spotify_url and not url_has_spotify_host(spotify_url):
+                spotify_url = None
+            if apple_music_override and not url_has_apple_music_host(apple_music_override):
+                apple_music_override = None
 
     # Apple Music probe. ``library_row_acceptable`` picks ``find_track_url``
     # (URL only — preserves LML#401 baseline); the synthesis path

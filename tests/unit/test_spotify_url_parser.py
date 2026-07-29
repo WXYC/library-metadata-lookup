@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from release.spotify_url_parser import spotify_album_id_from_url
+from release.spotify_url_parser import spotify_album_id_from_url, url_has_spotify_host
 
 # A canonical 22-char base62 Spotify album ID.
 _VALID_ID = "1A2GTWGt0LBTGQAyA3OKAf"
@@ -75,3 +75,30 @@ class TestSpotifyAlbumIdFromUrl:
         # surfaces as ``None`` so the post-process skips the mint rather
         # than minting a malformed external_id.
         assert spotify_album_id_from_url(f"https://open.spotify.com/album/{bad_id}") is None
+
+
+class TestUrlHasSpotifyHost:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://open.spotify.com/album/oyola-id",
+            "https://open.spotify.com/track/abc",
+            "http://spotify.com/album/abc",
+        ],
+    )
+    def test_true_for_spotify_hosts(self, url):
+        assert url_has_spotify_host(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.deezer.com/album/254381182",
+            "https://music.apple.com/us/album/oyola/222",
+            "https://autechre.bandcamp.com/album/confield",
+            "https://open.spotify.com.evil.test/album/abc",
+            "",
+            "not a url",
+        ],
+    )
+    def test_false_for_non_spotify_hosts(self, url):
+        assert url_has_spotify_host(url) is False

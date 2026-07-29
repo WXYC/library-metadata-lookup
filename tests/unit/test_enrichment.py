@@ -2098,6 +2098,143 @@ class TestStreamingLinksTitleGate:
         assert enriched.spotify_url == verified_spotify
 
 
+class TestStreamingLinksHostInvariant:
+    """LML#873: ``streaming_links.spotify_url`` / ``.apple_music_url`` are
+    artifact columns populated by the streaming-links reconciliation
+    pipeline (#218/#207) and can hold a non-Spotify (Deezer/Apple/Bandcamp)
+    or non-Apple URL despite the field name. Enrichment must never surface
+    such a mislabeled value under the wrong field — null it out instead,
+    mirroring the Backend-Service ingestion-boundary guard (BS#1712) at the
+    source so every LML consumer is protected, not just BS.
+    """
+
+    @pytest.mark.asyncio
+    async def test_nulls_spotify_url_when_host_is_not_spotify(self):
+        # Pinned reproduction: library release id=1580 stores a Deezer URL
+        # in the spotify_url column.
+        item = make_library_item(id=1580, artist="Stereolab", title="Aluminum Tunes")
+        artwork = make_discogs_result(release_id=1, artist="Stereolab", album="Aluminum Tunes")
+
+        deezer_url_in_spotify_column = "https://www.deezer.com/album/254381182"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": deezer_url_in_spotify_column,
+                "apple_music_url": None,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=1,
+            title="Aluminum Tunes",
+            artist="Stereolab",
+            year=1998,
+            artist_id=None,
+            release_url="https://discogs.com/release/1",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album="Aluminum Tunes",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.spotify_url != deezer_url_in_spotify_column
+        assert enriched.spotify_url is None
+
+    @pytest.mark.asyncio
+    async def test_nulls_apple_music_url_when_host_is_not_apple(self):
+        item = make_library_item(id=1581, artist="Cat Power", title="Moon Pix")
+        artwork = make_discogs_result(release_id=2, artist="Cat Power", album="Moon Pix")
+
+        deezer_url_in_apple_column = "https://www.deezer.com/album/1111111"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": None,
+                "apple_music_url": deezer_url_in_apple_column,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=2,
+            title="Moon Pix",
+            artist="Cat Power",
+            year=1998,
+            artist_id=None,
+            release_url="https://discogs.com/release/2",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album="Moon Pix",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.apple_music_url != deezer_url_in_apple_column
+
+    @pytest.mark.asyncio
+    async def test_keeps_genuine_spotify_and_apple_urls(self):
+        # Non-regression: a correctly-hosted URL in each column still
+        # propagates.
+        item = make_library_item(id=1582, artist="Sessa", title="Pequena Vertigem de Amor")
+        artwork = make_discogs_result(
+            release_id=3, artist="Sessa", album="Pequena Vertigem de Amor"
+        )
+
+        verified_spotify = "https://open.spotify.com/album/pequena-id"
+        verified_apple = "https://music.apple.com/us/album/pequena/333333"
+
+        library_db = AsyncMock()
+        library_db._has_streaming_links = True
+        library_db.get_streaming_links = AsyncMock(
+            return_value={
+                "spotify_url": verified_spotify,
+                "apple_music_url": verified_apple,
+                "youtube_music_url": None,
+                "bandcamp_url": None,
+                "soundcloud_url": None,
+            }
+        )
+
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=3,
+            title="Pequena Vertigem de Amor",
+            artist="Sessa",
+            year=2019,
+            artist_id=None,
+            release_url="https://discogs.com/release/3",
+        )
+
+        results = await enrich_artwork_results(
+            [(item, artwork)],
+            discogs_service,
+            album="Pequena Vertigem de Amor",
+            library_db=library_db,
+        )
+
+        _, enriched = results[0]
+        assert enriched.spotify_url == verified_spotify
+        assert enriched.apple_music_url == verified_apple
+
+
 class TestExternalArtworkProbe:
     """LML#487 / BS#1184: when the WXYC library catalog has no row whose title
     clears the LML#477 (PR #481) gate against the requested album, probe Apple
