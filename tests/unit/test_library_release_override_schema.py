@@ -27,32 +27,12 @@ from entity.library_release_override import (
     set_up_library_release_override_schema,
 )
 from entity.sources import PgSource
+from tests.unit.conftest import extract_create_table as _extract_create_table
+from tests.unit.conftest import strip_sql_comments as _strip_sql_comments
 
 _SQL_REFERENCE = (
     Path(__file__).resolve().parent.parent.parent / "entity" / "library_release_override.sql"
 )
-
-
-def _strip_sql_comments(sql: str) -> str:
-    """Drop ``--`` line comments and collapse incidental whitespace.
-
-    Lets the parity check compare the *shape* of the two DDL statements without
-    tripping on the explanatory comments the ``.sql`` reference carries inline.
-    Mirrors the helper in ``test_release_resolution_cache_schema.py``.
-    """
-    lines = []
-    for raw in sql.splitlines():
-        line = raw.split("--", 1)[0].rstrip()
-        if line.strip():
-            lines.append(line.strip())
-    return " ".join(lines)
-
-
-def _extract_create_table(ddl: str) -> str:
-    """Pull the single ``CREATE TABLE ...);`` statement out of the .sql file."""
-    start = ddl.index("CREATE TABLE")
-    end = ddl.index(";", start)
-    return _strip_sql_comments(ddl[start:end]).strip().rstrip(";")
 
 
 class TestCanonicalDDLReference:
