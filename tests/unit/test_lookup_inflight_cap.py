@@ -164,9 +164,10 @@ class TestInFlightCapBehavior:
         The first lookup blocks on an Event while the second request arrives;
         both return 200 once the gate opens and the lookup count is exactly 2.
         The mid-flight negative check (second not started while the permit is
-        held) is a bounded-window best-effort observation, not the load-bearing
-        assertion — the deterministic contract is queue-don't-shed: both
-        complete, neither errors.
+        held) waits for the deterministic ``_lookup_semaphore_has_waiters``
+        signal rather than a fixed sleep (LML#733) — a timing window sized for
+        an idle runner loses the race under full-suite CPU load, where the
+        second request can still be mid-scheduling when the window closes.
         """
         monkeypatch.setenv("LML_LOOKUP_MAX_CONCURRENT", "1")
 
@@ -188,9 +189,13 @@ class TestInFlightCapBehavior:
                 first = asyncio.create_task(ac.post("/api/v1/lookup", json=LOOKUP_BODY))
                 second = asyncio.create_task(ac.post("/api/v1/lookup", json=LOOKUP_BODY))
                 await _wait_until(lambda: started >= 1, message="first lookup to start")
-                # Best-effort window: with the only permit held, the second
-                # lookup must not have started.
-                await asyncio.sleep(0.02)
+                # Deterministic: wait for the second request to actually park
+                # on the cap before asserting it hasn't started — the only
+                # permit is held, so a parked second is the load-bearing state,
+                # not a fixed-duration guess at it.
+                await _wait_until(
+                    _lookup_semaphore_has_waiters, message="second request to park on the cap"
+                )
                 assert started == 1, f"cap=1 admitted {started} lookups concurrently"
 
                 gate.set()
