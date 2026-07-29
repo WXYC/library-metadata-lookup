@@ -247,7 +247,7 @@ class TestBodyParse:
         with ctx:
             resp = await _post(app, {"names": ["Wishy"]})
         assert resp.status_code == 400
-        assert "disconnected" in resp.json()["detail"]
+        assert "disconnected" in resp.json()["message"]
 
 
 class TestServiceUnavailable:
@@ -262,7 +262,7 @@ class TestServiceUnavailable:
         with ctx:
             resp = await _post(app, {"names": ["Wishy"]})
         assert resp.status_code == 503
-        assert "entity store" in resp.json()["detail"].lower()
+        assert "entity store" in resp.json()["message"].lower()
 
     @pytest.mark.asyncio
     async def test_503_when_discogs_cache_none(self, make_app):
@@ -272,7 +272,7 @@ class TestServiceUnavailable:
         with ctx:
             resp = await _post(app, {"names": ["Wishy"]})
         assert resp.status_code == 503
-        assert resp.json()["detail"] == _DISCOGS_CACHE_UNAVAILABLE_DETAIL
+        assert resp.json()["message"] == _DISCOGS_CACHE_UNAVAILABLE_DETAIL
 
 
 class TestErrorClassRouting:
@@ -292,7 +292,7 @@ class TestErrorClassRouting:
         assert resp.status_code == 503
         # The TRANSIENT-shaped detail, not the dependency-gate config hint —
         # the deps were wired; the query failed mid-flight.
-        assert resp.json()["detail"] == _DISCOGS_CACHE_QUERY_FAILED_DETAIL
+        assert resp.json()["message"] == _DISCOGS_CACHE_QUERY_FAILED_DETAIL
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -326,7 +326,7 @@ class TestErrorClassRouting:
             resp = await _post(app, {"names": ["Wishy"]})
 
         assert resp.status_code == 503
-        assert resp.json()["detail"] == _ENTITY_STORE_QUERY_FAILED_DETAIL
+        assert resp.json()["message"] == _ENTITY_STORE_QUERY_FAILED_DETAIL
 
     @pytest.mark.asyncio
     async def test_cancelled_error_logs_abort_and_propagates(
@@ -450,7 +450,7 @@ class TestInvalidNameErrorMapping:
             resp = await _post(app, {"names": ["Wishy", bad_name]})
 
         assert resp.status_code == 422
-        assert "names[1]" in resp.json()["detail"]
+        assert "names[1]" in resp.json()["message"]
         # Validation precedes every tier.
         mock_entity_store.bulk_resolve_library_names.assert_not_awaited()
 
@@ -465,7 +465,7 @@ class TestRouteEnvelopeGaps:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
                 resp = await ac.post(_ROUTE, json=["Wishy"])
         assert resp.status_code == 400
-        assert "JSON object" in resp.json()["detail"]
+        assert "JSON object" in resp.json()["message"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

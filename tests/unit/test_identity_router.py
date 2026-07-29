@@ -98,7 +98,7 @@ class TestResolveEndpoint:
             resp = await ac.get("/identity/resolve", params={"name": "Nonexistent"})
 
         assert resp.status_code == 404
-        assert "Nonexistent" in resp.json()["detail"]
+        assert "Nonexistent" in resp.json()["message"]
 
     @pytest.mark.asyncio
     async def test_resolve_missing_param(self, app_client):
@@ -209,7 +209,7 @@ class TestEntityStoreUnavailable:
                 resp = await ac.get("/identity/resolve", params={"name": "Stereolab"})
 
         assert resp.status_code == 503
-        assert "entity store" in resp.json()["detail"].lower()
+        assert "entity store" in resp.json()["message"].lower()
 
     @pytest.mark.asyncio
     async def test_bulk_returns_503_when_store_unavailable(self, mock_settings):
@@ -233,7 +233,7 @@ class TestEntityStoreUnavailable:
                 resp = await ac.post("/identity/bulk", json={"names": ["Stereolab"]})
 
         assert resp.status_code == 503
-        assert "entity store" in resp.json()["detail"].lower()
+        assert "entity store" in resp.json()["message"].lower()
 
     @pytest.mark.asyncio
     async def test_release_identity_resolve_returns_503_when_store_unavailable(self, mock_settings):
@@ -260,7 +260,7 @@ class TestEntityStoreUnavailable:
                 )
 
         assert resp.status_code == 503
-        assert "entity store" in resp.json()["detail"].lower()
+        assert "entity store" in resp.json()["message"].lower()
 
     @pytest.mark.asyncio
     async def test_resolve_returns_503_when_pg_raises_undefined_table(
@@ -277,7 +277,7 @@ class TestEntityStoreUnavailable:
             resp = await ac.get("/identity/resolve", params={"name": "Stereolab"})
 
         assert resp.status_code == 503
-        assert "entity store" in resp.json()["detail"].lower()
+        assert "entity store" in resp.json()["message"].lower()
 
     @pytest.mark.asyncio
     async def test_resolve_returns_503_when_pg_unreachable(self, app_client, mock_entity_store):
@@ -317,7 +317,7 @@ class TestEntityStoreUnavailable:
             )
 
         assert resp.status_code == 503
-        assert "entity store" in resp.json()["detail"].lower()
+        assert "entity store" in resp.json()["message"].lower()
 
 
 class TestInterfaceErrorMapping:

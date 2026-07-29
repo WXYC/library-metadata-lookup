@@ -408,7 +408,7 @@ class TestEntityStoreGracefulDegradation:
             "/identity/resolve", params={"name": "Stereolab"}
         )
         assert resp.status_code == 503
-        assert "not available" in resp.json()["detail"].lower()
+        assert "not available" in resp.json()["message"].lower()
 
     @pytest.mark.asyncio
     async def test_bulk_returns_503_when_entity_store_unavailable(self, app_client_no_entity_store):

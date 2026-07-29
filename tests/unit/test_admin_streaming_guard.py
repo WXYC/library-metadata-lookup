@@ -348,7 +348,7 @@ class TestUploadStreamingGuard:
 
         resp = await self._upload(app, admin_settings, upload)
         assert resp.status_code == 409
-        regs = resp.json()["detail"]["regressions"]
+        regs = resp.json()["details"]["detail"]["regressions"]
         assert any(r["metric"] == "apple_url" for r in regs)
         # On-disk file is untouched.
         assert vol.read_bytes() == before
@@ -377,7 +377,7 @@ class TestUploadStreamingGuard:
 
         resp = await self._upload(app, admin_settings, upload)
         assert resp.status_code == 409
-        regs = resp.json()["detail"]["regressions"]
+        regs = resp.json()["details"]["detail"]["regressions"]
         assert any(r["metric"] == "track_results" for r in regs)
 
     @pytest.mark.asyncio
@@ -457,7 +457,7 @@ class TestUploadStreamingGuard:
 
         resp = await self._upload(app, admin_settings, upload)
         assert resp.status_code == 409
-        detail = resp.json()["detail"]
+        detail = resp.json()["details"]["detail"]
         assert "error" in detail
         assert "regressions" not in detail
 

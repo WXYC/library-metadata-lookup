@@ -348,7 +348,7 @@ async def test_telemetry_failure_on_error_path_preserves_500(telemetry_app_clien
             )
 
     assert resp.status_code == 500
-    assert resp.json()["detail"] == "Streaming check failed"
+    assert resp.json()["message"] == "Streaming check failed"
 
 
 @pytest.mark.asyncio

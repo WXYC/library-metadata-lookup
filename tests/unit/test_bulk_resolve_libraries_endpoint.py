@@ -1137,7 +1137,7 @@ class TestBulkResolveFamilyAlignment:
             )
 
         assert resp.status_code == 400
-        assert "disconnected" in resp.json()["detail"].lower()
+        assert "disconnected" in resp.json()["message"].lower()
         mock_entity_store.resolve_library_name.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1151,7 +1151,7 @@ class TestBulkResolveFamilyAlignment:
             resp = await ac.post("/api/v1/identity/bulk-resolve-libraries", json={})
 
         assert resp.status_code == 422
-        detail = resp.json()["detail"]
+        detail = resp.json()["details"]["detail"]
         assert isinstance(detail, list)
         assert detail[0]["loc"] == ["inputs"]
         assert detail[0]["type"] == "missing"
