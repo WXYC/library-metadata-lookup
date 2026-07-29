@@ -50,6 +50,7 @@ from wxyc_etl.text import to_match_form as normalize_for_comparison
 from clients.streaming.base import BaseStreamingClient
 from clients.streaming.matching import (
     SCORE_MATCH_ACCEPTANCE_FLOOR,
+    album_subset_is_degenerate,
     find_best_source_match,
     record_match_telemetry,
     title_subset_is_degenerate,
@@ -473,6 +474,7 @@ class AppleMusicClient(BaseStreamingClient):
             norm_song=norm_song,
             norm_album=norm_album,
             raw_song=song,
+            raw_album=album,
         )
 
         # LML#782: album-title divergence. The WXYC catalog album and
@@ -505,6 +507,7 @@ class AppleMusicClient(BaseStreamingClient):
                 norm_song=norm_song,
                 norm_album=None,
                 raw_song=song,
+                raw_album=None,
             )
             album_fallback = True
 
@@ -564,20 +567,23 @@ def _select_best_track_candidate(
     norm_song: str,
     norm_album: str | None,
     raw_song: str,
+    raw_album: str | None,
 ) -> tuple[dict | None, tuple[float, float]]:
     """One scoring pass over a ``search_song`` response.
 
     Applies the 80/80(/80) ``token_set_ratio`` floor per axis plus the
-    LML#719 degenerate-subset guard on the title axis, and picks the
-    highest-combined-score candidate — PREFERRING floor-clearers that
-    carry ``attributes.artwork`` over higher-scoring ones that lack it
-    (see ``find_track_metadata``'s docstring for why).
+    LML#719 degenerate-subset guard on the title axis and its LML#721
+    sibling on the album axis, and picks the highest-combined-score
+    candidate — PREFERRING floor-clearers that carry ``attributes.artwork``
+    over higher-scoring ones that lack it (see ``find_track_metadata``'s
+    docstring for why).
 
     Extracted from ``find_track_metadata`` so the LML#782 album-less
     fallback can re-score the same in-memory response with
     ``norm_album=None`` instead of paying a second Apple Music call.
-    ``raw_song`` is the un-normalized request title — the LML#719 guard
-    does its own normalization internally.
+    ``raw_song`` is the un-normalized request title and ``raw_album`` the
+    un-normalized request album (``None`` when the album axis is dropped) —
+    the LML#719/#721 guards do their own normalization internally.
 
     Returns ``(best, (artist_score, track_score))`` — the chosen record
     (or ``None`` when nothing clears) plus its per-axis scores, stashed
@@ -633,6 +639,16 @@ def _select_best_track_candidate(
                 norm_album, normalize_for_comparison(attrs.get("albumName") or "")
             )
             if album_score < _APPLE_MUSIC_MATCH_FLOOR:
+                continue
+            # LML#721: sibling of the LML#719 title guard above. The album
+            # axis is a third AND-gate on top of artist+title, so this
+            # can't by itself cause a false ACCEPT — but an unguarded
+            # token_set_ratio clear here would falsely mark a wrong-album
+            # candidate as album_verified=True (carrying that album's
+            # artwork/year) instead of letting it fall through to the
+            # LML#782 album-less fallback, which is the correct outcome
+            # for a candidate whose album doesn't really agree.
+            if album_subset_is_degenerate(raw_album or "", attrs.get("albumName") or ""):
                 continue
             combined = (artist_score + track_score + album_score) / 3
         else:

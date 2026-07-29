@@ -1156,6 +1156,101 @@ class TestFindTrackMetadataTitleSubsetInflation:
         assert match.url == "https://music.apple.com/us/song/little-fury-things/321"
 
 
+class TestFindTrackMetadataAlbumSubsetInflation:
+    """LML#721: the album axis inside ``find_track_metadata`` shares the same
+    ``token_set_ratio`` subset-inflation weakness #719 fixed on the title axis.
+
+    A short generic query album (``Live``) is a token-subset of a long
+    unrelated candidate album (``Live at the Apollo, Vol. 2``), so
+    ``token_set_ratio`` scores it 100 with no real album agreement. Because
+    the album axis is a third AND-gate on top of artist+title, this can't by
+    itself cause a false ACCEPT — but it does let a wrong-album candidate be
+    treated as ``album_verified=True`` (carrying that album's artwork/year)
+    instead of falling through to the LML#782 album-less fallback, which is
+    exactly the wrong-album leak LML#487 exists to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_subset_inflated_album_does_not_verify_wrong_album(self, es256_keypair):
+        """Production-shape repro (LML#721 table): querying ``album='Live'``
+        against a candidate whose real album is ``'Live at the Apollo, Vol.
+        2'`` clears the 80 floor via pure subset-inflation
+        (``token_set_ratio('live', 'live at the apollo, vol. 2') == 100``)
+        even though the two albums share no real signal
+        (``token_sort_ratio`` == 26.7). The guard must reject the album axis
+        here, sending the candidate through the album-less fallback instead
+        of surfacing it as album-verified with that album's artwork/year."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response(
+                [_make_song_data_full(album_name="Live at the Apollo, Vol. 2")]
+            )
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Live"
+        )
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/hebebeb-zrag/9"
+        assert match.album_verified is False
+        assert match.artwork_url is None
+        assert match.release_year is None
+
+    @pytest.mark.asyncio
+    async def test_retains_legitimate_album_reissue_suffix_subset(self, es256_keypair):
+        """No-regression: a candidate album that differs only by a
+        recognized reissue suffix (``Tzenni`` vs ``Tzenni (Deluxe Edition)``)
+        is a legitimate subset — the suffix is stripped before scoring, so
+        ``token_sort_ratio`` still agrees at 100. The guard must not reject
+        it (mirrors ``test_accepts_album_reissue_variant``)."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response(
+                [_make_song_data_full(album_name="Tzenni (Deluxe Edition)")]
+            )
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Noura Mint Seymali", "Hebebeb (Zrag)", album="Tzenni"
+        )
+        assert match is not None
+        assert match.album_verified is True
+
+    @pytest.mark.asyncio
+    async def test_retains_legitimate_canonical_title_extension_subset(self, es256_keypair):
+        """No-regression: the reordered-shortform shape
+        (``test_accepts_album_with_extra_tokens_in_canonical_title``) still
+        resolves a URL — even though its ``token_sort_ratio`` (61.5) also
+        falls under 80, so the guard rejects the constrained pass, the
+        LML#782 album-less fallback re-scores the same response and
+        surfaces the same URL. Pins the guard's actual effect on this shape:
+        the URL still resolves, just no longer ``album_verified``."""
+        client = _client(es256_keypair)
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(
+            return_value=_songs_response(
+                [
+                    _make_song_data_full(
+                        name="Glósóli",
+                        artist_name="Sigur Rós",
+                        album_name="Með suð í eyrum við spilum endalaust",
+                        url="https://music.apple.com/us/song/glosoli/902",
+                    )
+                ]
+            )
+        )
+        client._http = mock_http
+
+        match = await client.find_track_metadata("Sigur Rós", "Glósóli", album="Eyrum Spilum Suð")
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/glosoli/902"
+        assert match.album_verified is False
+
+
 class TestFindTrackMetadataEmits:
     """LML#592: the Apple track probe (``token_set_ratio``) emits match
     telemetry for the winner under ``surface="track"``.
