@@ -52,6 +52,7 @@ from wxyc_etl.text import split_artist_name
 # on the column side (deployed in WXYC/discogs-etl#195).
 from wxyc_etl.text import to_identity_match_form as normalize_artist_name
 
+from discogs.cache_service import _SET_PG_TRGM_FLOOR_SQL
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -107,17 +108,18 @@ WHERE wxyc_identity_match_artist(nv.name) = ANY($1)\
 # similarity; the caller applies the acceptance threshold in Python so it stays
 # trivially tunable (and so the score is available to record as confidence).
 # Note: the ``%`` operator pre-filters to rows above pg_trgm's session
-# ``similarity_threshold`` (``show_limit()``, default 0.3) before the Python
-# ``trigram_threshold`` is applied. Two hazards: a ``trigram_threshold``
-# configured below the floor silently drops candidates in the gap (the shipped
-# 0.85 default and the issue's tuning band sit well above 0.3, so that
-# direction never bites in practice), and — unguarded here — a GUC raised
-# ABOVE ``trigram_threshold`` at server/database/role scope would silently
-# drop candidates in [``trigram_threshold``, GUC) with no error. The #759
-# sibling (``discogs/cache_service.py:artist_trigram_candidates``) pins the
-# floor with ``SET LOCAL`` in its own transaction; pinning this leg the same
-# way is deliberately deferred (this script is behavior-frozen under #759) —
-# tracked in WXYC/library-metadata-lookup#763.
+# ``similarity_threshold`` GUC before the Python ``trigram_threshold`` is
+# applied. The GUC is settable at server/database/role scope, so without a
+# pin a DBA tuning the shared discogs-cache for another workload could raise
+# it above ``trigram_threshold`` and silently drop candidates in
+# [``trigram_threshold``, GUC) with no error. ``_trigram_match`` pins it to
+# ``_PG_TRGM_FLOOR`` (0.3) with ``SET LOCAL`` in its own transaction before
+# the fetch — same posture as the #759 sibling
+# (``discogs/cache_service.py:artist_trigram_candidates``), whose
+# ``_SET_PG_TRGM_FLOOR_SQL`` this module imports rather than re-declaring the
+# floor as a third literal (WXYC/library-metadata-lookup#763). The shipped
+# 0.85 ``trigram_threshold`` default sits well above the 0.3 floor, so the
+# threshold-below-floor direction still never bites in practice.
 _TRIGRAM_FALLBACK_SQL = """\
 SELECT ra.artist_id, ra.artist_name,
        similarity(lower(f_unaccent(ra.artist_name)), lower(f_unaccent($1))) AS score
@@ -431,12 +433,23 @@ class DiscogsReconciler:
         applied here (not in SQL) so it stays trivially tunable and the score is
         available to record as the match confidence.
 
+        The query runs in its own transaction with ``SET LOCAL
+        pg_trgm.similarity_threshold = 0.3`` (``_PG_TRGM_FLOOR``): the GUC is
+        settable at server/database/role scope, so without the pin a DBA
+        tuning the shared discogs-cache could raise the ``%`` pre-filter
+        floor above ``self._trigram_threshold`` and silently drop candidates
+        in the gap. ``SET LOCAL`` reverts at transaction end — no session
+        pollution on the pooled connection. Same posture as the #759 sibling,
+        ``discogs/cache_service.py:artist_trigram_candidates``.
+
         Args:
             name: Original canonical artist name. The SQL applies
                 ``lower(f_unaccent(...))`` on this input side, mirroring
                 ``discogs/cache_service.py:search_artists_by_name``.
         """
-        rows = await self._pg.fetchall(_TRIGRAM_FALLBACK_SQL, name)
+        async with self._pg.acquire() as conn, conn.transaction():
+            await conn.execute(_SET_PG_TRGM_FLOOR_SQL)
+            rows = await conn.fetch(_TRIGRAM_FALLBACK_SQL, name)
         if not rows:
             return None
         top = rows[0]

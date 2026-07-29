@@ -1,18 +1,36 @@
 """Unit tests for Discogs batch reconciliation."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from scripts.entity_resolution.discogs import DiscogsReconciler
+from tests.unit.conftest import make_mock_conn
 
 
 @pytest.fixture
 def mock_pg():
-    """Mock PgSource for discogs-cache queries."""
+    """Mock PgSource for discogs-cache queries.
+
+    Also wires ``acquire()`` -> a transaction-capable mock connection (via
+    the shared ``make_mock_conn`` helper) so Stage 6's ``SET LOCAL``-pinned
+    transaction (WXYC/library-metadata-lookup#763) can be exercised. Tests
+    read/set the trigram row(s) via ``mock_pg._mock_conn.fetch``, not
+    ``mock_pg.fetchall`` — Stage 6 no longer goes through the pool-level
+    ``fetchall``.
+    """
     pg = AsyncMock()
     pg.fetchall = AsyncMock(return_value=[])
     pg.fetch_with_unnest = AsyncMock(return_value=[])
+
+    conn = make_mock_conn()
+    conn.fetch = AsyncMock(return_value=[])
+
+    acq_ctx = MagicMock()
+    acq_ctx.__aenter__ = AsyncMock(return_value=conn)
+    acq_ctx.__aexit__ = AsyncMock(return_value=False)
+    pg.acquire = MagicMock(return_value=acq_ctx)
+    pg._mock_conn = conn
     return pg
 
 
@@ -491,10 +509,13 @@ class TestTrigramFallbackStage:
                 [],  # Stage 2 member — miss
                 [],  # Stage 3 alias — miss
                 [],  # Stage 4 name_variation — miss
-                # Stage 5 yields no variants for this name, so no inner SQL runs;
-                # Stage 6 trigram returns the best candidate at 0.88.
-                [{"artist_id": 321, "artist_name": "stereolab", "score": 0.88}],
+                # Stage 5 yields no variants for this name, so no inner SQL runs.
             ]
+        )
+        # Stage 6 trigram runs on its own SET LOCAL transaction (#763) and
+        # returns the best candidate at 0.88.
+        mock_pg._mock_conn.fetch = AsyncMock(
+            return_value=[{"artist_id": 321, "artist_name": "stereolab", "score": 0.88}]
         )
         results = await reconciler.reconcile_batch(["Sterolab"])  # typo: missing 'e'
         assert "Sterolab" in results
@@ -517,8 +538,10 @@ class TestTrigramFallbackStage:
                 [],  # Stage 2
                 [],  # Stage 3
                 [],  # Stage 4
-                [{"artist_id": 999, "artist_name": "hot 8 brass band", "score": 0.80}],
             ]
+        )
+        mock_pg._mock_conn.fetch = AsyncMock(
+            return_value=[{"artist_id": 999, "artist_name": "hot 8 brass band", "score": 0.80}]
         )
         results = await reconciler.reconcile_batch(["Hot 8"])
         assert results == {}
@@ -526,8 +549,9 @@ class TestTrigramFallbackStage:
     @pytest.mark.asyncio
     async def test_exact_threshold_boundary_matches(self, reconciler, mock_pg):
         """Similarity exactly at 0.85 matches — the comparison is ``>=``, not ``>``."""
-        mock_pg.fetchall = AsyncMock(
-            side_effect=[[], [], [], [], [{"artist_id": 77, "artist_name": "yy", "score": 0.85}]]
+        mock_pg.fetchall = AsyncMock(side_effect=[[], [], [], []])
+        mock_pg._mock_conn.fetch = AsyncMock(
+            return_value=[{"artist_id": 77, "artist_name": "yy", "score": 0.85}]
         )
         results = await reconciler.reconcile_batch(["Xx"])
         assert "Xx" in results
@@ -538,6 +562,7 @@ class TestTrigramFallbackStage:
     async def test_empty_trigram_result_keeps_no_match(self, reconciler, mock_pg):
         """No ``%`` candidate at all (empty rowset) leaves the canonical unresolved."""
         mock_pg.fetchall = AsyncMock(return_value=[])
+        mock_pg._mock_conn.fetch = AsyncMock(return_value=[])
         results = await reconciler.reconcile_batch(["Sterolab"])
         assert results == {}
 
@@ -553,8 +578,9 @@ class TestTrigramFallbackStage:
     async def test_threshold_is_configurable(self, mock_pg):
         """A reconciler built with a higher threshold rejects a sub-threshold rescue."""
         reconciler = DiscogsReconciler(mock_pg, trigram_threshold=0.90)
-        mock_pg.fetchall = AsyncMock(
-            side_effect=[[], [], [], [], [{"artist_id": 5, "artist_name": "yy", "score": 0.88}]]
+        mock_pg.fetchall = AsyncMock(side_effect=[[], [], [], []])
+        mock_pg._mock_conn.fetch = AsyncMock(
+            return_value=[{"artist_id": 5, "artist_name": "yy", "score": 0.88}]
         )
         results = await reconciler.reconcile_batch(["Yy"])
         assert results == {}  # 0.88 < 0.90
@@ -569,9 +595,10 @@ class TestTrigramFallbackStage:
         """The trigram query is issued with the original canonical (SQL applies
         ``lower(f_unaccent(...))``) and uses the ``similarity()`` function plus
         the ``%`` trigram operator so the existing GIN index applies."""
-        mock_pg.fetchall = AsyncMock(side_effect=[[], [], [], [], []])
+        mock_pg.fetchall = AsyncMock(side_effect=[[], [], [], []])
+        mock_pg._mock_conn.fetch = AsyncMock(return_value=[])
         await reconciler.reconcile_batch(["Sterolab"])
-        last_call = mock_pg.fetchall.await_args_list[-1].args
+        last_call = mock_pg._mock_conn.fetch.await_args_list[-1].args
         sql_arg, name_arg = last_call
         assert "similarity(" in sql_arg, "Trigram stage must compute pg_trgm similarity()."
         assert " % " in sql_arg, "Trigram stage must use the % operator to hit the GIN index."
@@ -579,3 +606,39 @@ class TestTrigramFallbackStage:
             "Trigram stage must pass the original canonical name; the SQL applies "
             "lower(f_unaccent(...)) on the input side, mirroring search_artists_by_name."
         )
+
+    @pytest.mark.asyncio
+    async def test_pins_session_similarity_floor_in_transaction(self, reconciler, mock_pg):
+        """``pg_trgm.similarity_threshold`` is a GUC settable at server/
+        database/role scope (WXYC/library-metadata-lookup#763), so the
+        module's 0.3-floor assumption is falsifiable by a DBA tuning the
+        shared discogs-cache — the Stage 6 query must pin it with ``SET
+        LOCAL`` inside its own transaction, BEFORE the fetch.
+
+        The ordering is the contract: ``SET LOCAL`` outside a transaction is
+        a WARNING no-op on real PostgreSQL, and the pg integration tests
+        can't catch a hoist because the server default equals the pin — so
+        this test records the event sequence explicitly. Mirrors
+        ``test_pins_session_similarity_floor_in_transaction`` in
+        ``tests/unit/test_cache_service.py`` (the #759 sibling).
+        """
+        conn = mock_pg._mock_conn
+        events: list[str] = []
+        tx_ctx = conn._mock_tx_ctx
+        tx_ctx.__aenter__ = AsyncMock(side_effect=lambda: events.append("tx_enter") or tx_ctx)
+        tx_ctx.__aexit__ = AsyncMock(side_effect=lambda *a: events.append("tx_exit") or False)
+
+        async def record_execute(sql, *args):
+            if "similarity_threshold" in sql:
+                assert "SET LOCAL" in sql
+                events.append("set_local")
+
+        async def record_fetch(*args):
+            events.append("fetch")
+            return []
+
+        conn.execute = AsyncMock(side_effect=record_execute)
+        conn.fetch = AsyncMock(side_effect=record_fetch)
+        hit = await reconciler._trigram_match("Sterolab")
+        assert hit is None
+        assert events == ["tx_enter", "set_local", "fetch", "tx_exit"]
