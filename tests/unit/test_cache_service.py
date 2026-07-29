@@ -12,6 +12,7 @@ from discogs.cache_service import (
     _SEARCH_BY_TRACK_ARTIST_SQL,
     _SEARCH_BY_TRACK_SQL,
     ArtistEqualityCandidates,
+    CacheSchemaSkewError,
     CacheUnavailableError,
     DiscogsCacheService,
 )
@@ -1641,6 +1642,23 @@ class TestValidateTrackOnRelease:
         mock_asyncpg_pool.fetchval = AsyncMock(side_effect=Exception("db error"))
         with pytest.raises(CacheUnavailableError):
             await cache_service.validate_track_on_release(1, "Song", "Artist")
+
+    @pytest.mark.asyncio
+    async def test_undefined_column_raises_schema_skew_not_cache_unavailable(
+        self, cache_service, mock_asyncpg_pool
+    ):
+        """LML#476: a class-42 programming error (schema skew) must be bounded
+
+        to this one method — ``CacheSchemaSkewError``, not
+        ``CacheUnavailableError`` — so the fallthrough seam's cool-down never
+        arms for it.
+        """
+        mock_asyncpg_pool.fetchval = AsyncMock(
+            side_effect=asyncpg.exceptions.UndefinedColumnError('column "extra" does not exist')
+        )
+        with pytest.raises(CacheSchemaSkewError) as exc_info:
+            await cache_service.validate_track_on_release(1, "Song", "Artist")
+        assert isinstance(exc_info.value.__cause__, asyncpg.exceptions.UndefinedColumnError)
 
     @pytest.mark.asyncio
     async def test_per_track_credits_fall_back_to_release_artist(

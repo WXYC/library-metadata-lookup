@@ -28,6 +28,7 @@ import asyncpg.exceptions
 import pytest
 
 from discogs.fallthrough import (
+    _ARMING_EXCEPTIONS,
     _COOL_DOWN_SECONDS,
     _reset_cool_down_for_tests,
     fallthrough,
@@ -440,6 +441,34 @@ class TestCoolDown:
         pg_read_b = AsyncMock(return_value="from-pg")
         result_b = await fallthrough(
             label="get_thing",
+            pg_read=pg_read_b,
+            api_fetch=AsyncMock(return_value="should-not-be-called"),
+        )
+        assert result_b == "from-pg"
+        pg_read_b.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cache_schema_skew_error_does_not_arm_cool_down(self):
+        """LML#476: schema skew on one method must not poison every other
+
+        method's cache reads. ``CacheSchemaSkewError`` is deliberately absent
+        from ``_ARMING_EXCEPTIONS`` — it propagates (bounding the fallthrough
+        to the API leg for this one call) without touching the process-wide
+        cool-down.
+        """
+        from discogs.cache_service import CacheSchemaSkewError
+
+        assert CacheSchemaSkewError not in _ARMING_EXCEPTIONS
+
+        pg_read_a = AsyncMock(side_effect=CacheSchemaSkewError("column does not exist"))
+        api_fetch_a = AsyncMock(return_value="api-1")
+        await fallthrough(label="get_thing", pg_read=pg_read_a, api_fetch=api_fetch_a)
+
+        # A second, unrelated cache method still reads from cache in the same
+        # process — the cool-down was never armed.
+        pg_read_b = AsyncMock(return_value="from-pg")
+        result_b = await fallthrough(
+            label="get_other_thing",
             pg_read=pg_read_b,
             api_fetch=AsyncMock(return_value="should-not-be-called"),
         )
