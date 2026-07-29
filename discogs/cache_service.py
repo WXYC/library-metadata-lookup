@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, field, fields
+from typing import NoReturn
 
 import asyncpg
 from rapidfuzz import fuzz
@@ -42,6 +43,50 @@ class CacheUnavailableError(Exception):
     """Raised when the PostgreSQL cache is unreachable."""
 
     pass
+
+
+class CacheSchemaSkewError(Exception):
+    """Raised when a cache query references a column/table/function the live
+
+    schema doesn't have (yet) — e.g. a deploy that lands a column-referring
+    query before the discogs-cache alembic migration runs in a given
+    environment (LML#476). Deliberately kept out of
+    ``discogs.fallthrough._ARMING_EXCEPTIONS``: a schema-skew window on one
+    method must not poison L2 (PG cache) reads for every other method for the
+    cool-down window — the failure stays bounded to the one call, which falls
+    through to the API leg.
+    """
+
+    pass
+
+
+# The class-42 "undefined object" family (asyncpg groups these under
+# ``SyntaxOrAccessError``): a programming-error/schema-skew signal, distinct
+# from connectivity failures. Pinned here (mirroring
+# ``fallthrough._ARMING_EXCEPTIONS``) so classification doesn't silently drift.
+_SCHEMA_SKEW_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    asyncpg.exceptions.UndefinedColumnError,
+    asyncpg.exceptions.UndefinedTableError,
+    asyncpg.exceptions.UndefinedFunctionError,
+)
+
+
+def _classify_cache_error(op: str, e: Exception) -> NoReturn:
+    """Raise the right cache exception for ``e``, one per method's catch-all.
+
+    Class-42 undefined-object errors (schema skew) raise
+    ``CacheSchemaSkewError``, which does not arm the fallthrough seam's
+    cool-down — bounding the failure to this one method. Everything else
+    (connectivity failures, unknown errors) keeps raising
+    ``CacheUnavailableError``, which stays in ``_ARMING_EXCEPTIONS`` (fail-safe
+    default preserved). ``op`` names the calling method for the log + error
+    message, matching each site's existing message shape.
+    """
+    if isinstance(e, _SCHEMA_SKEW_EXCEPTIONS):
+        logger.error(f"Cache {op} hit a schema-skew error (not arming cool-down): {e}")
+        raise CacheSchemaSkewError(f"Cache {op} failed: {e}") from e
+    logger.error(f"Cache {op} failed: {e}")
+    raise CacheUnavailableError(f"Cache {op} failed: {e}") from e
 
 
 @dataclass
@@ -681,8 +726,7 @@ class DiscogsCacheService:
             # (don't re-wrap into the generic message below).
             raise
         except Exception as e:
-            logger.error(f"Cache search failed: {e}")
-            raise CacheUnavailableError(f"Cache search failed: {e}") from e
+            _classify_cache_error("search", e)
 
     async def get_release_artist_variations(self, release_id: int) -> set[str]:
         """Name-variation set of a release's release-level (``extra=0``) artist(s).
@@ -714,8 +758,7 @@ class DiscogsCacheService:
         except CacheUnavailableError:
             raise
         except Exception as e:
-            logger.error(f"Cache get_release_artist_variations failed: {e}")
-            raise CacheUnavailableError(f"Cache get_release_artist_variations failed: {e}") from e
+            _classify_cache_error("get_release_artist_variations", e)
 
     @async_cached(_ARTIST_SEARCH_CACHE)
     async def search_artists_by_name(self, name: str, *, limit: int = 5) -> list[dict]:
@@ -767,8 +810,7 @@ class DiscogsCacheService:
         except CacheUnavailableError:
             raise
         except Exception as e:
-            logger.error(f"Cache search_artists_by_name failed: {e}")
-            raise CacheUnavailableError(f"Cache search_artists_by_name failed: {e}") from e
+            _classify_cache_error("search_artists_by_name", e)
 
     async def aggregate_artist_genre_style(
         self,
@@ -832,8 +874,7 @@ class DiscogsCacheService:
                 self.pool.fetch(style_query, param),
             )
         except Exception as e:
-            logger.error(f"Cache aggregate_artist_genre_style failed: {e}")
-            raise CacheUnavailableError(f"Cache aggregate_artist_genre_style failed: {e}") from e
+            _classify_cache_error("aggregate_artist_genre_style", e)
 
         genre_counts = {row["name"]: row["n"] for row in genre_rows}
         style_counts = {row["name"]: row["n"] for row in style_rows}
@@ -884,8 +925,7 @@ class DiscogsCacheService:
                 getattr(results[row["form"]], row["leg"]).update(row["artist_ids"])
             return results
         except Exception as e:
-            logger.error(f"Cache artist_equality_candidates failed: {e}")
-            raise CacheUnavailableError(f"Cache artist_equality_candidates failed: {e}") from e
+            _classify_cache_error("artist_equality_candidates", e)
 
     async def artist_trigram_candidates(
         self,
@@ -960,8 +1000,7 @@ class DiscogsCacheService:
         except CacheUnavailableError:
             raise
         except Exception as e:
-            logger.error(f"Cache artist_trigram_candidates failed: {e}")
-            raise CacheUnavailableError(f"Cache artist_trigram_candidates failed: {e}") from e
+            _classify_cache_error("artist_trigram_candidates", e)
 
     async def search_releases_by_title(self, title: str, *, limit: int = 5) -> list[dict]:
         """Fuzzy-match an album/release title against ``release.title``.
@@ -1008,8 +1047,7 @@ class DiscogsCacheService:
         except CacheUnavailableError:
             raise
         except Exception as e:
-            logger.error(f"Cache search_releases_by_title failed: {e}")
-            raise CacheUnavailableError(f"Cache search_releases_by_title failed: {e}") from e
+            _classify_cache_error("search_releases_by_title", e)
 
     async def search_tracks_by_title(self, title: str, *, limit: int = 5) -> list[dict]:
         """Fuzzy-match a track title against ``release_track.title``.
@@ -1057,8 +1095,7 @@ class DiscogsCacheService:
         except CacheUnavailableError:
             raise
         except Exception as e:
-            logger.error(f"Cache search_tracks_by_title failed: {e}")
-            raise CacheUnavailableError(f"Cache search_tracks_by_title failed: {e}") from e
+            _classify_cache_error("search_tracks_by_title", e)
 
     async def autocomplete_tracks(
         self, artist: str, q: str, *, release: str | None = None, limit: int = 20
@@ -1113,8 +1150,7 @@ class DiscogsCacheService:
         except CacheUnavailableError:
             raise
         except Exception as e:
-            logger.error(f"Cache autocomplete_tracks failed: {e}")
-            raise CacheUnavailableError(f"Cache autocomplete_tracks failed: {e}") from e
+            _classify_cache_error("autocomplete_tracks", e)
 
     async def get_release(self, release_id: int) -> ReleaseMetadataResponse | None:
         """Get full release metadata by ID.
@@ -1131,8 +1167,7 @@ class DiscogsCacheService:
         try:
             return await self._hydrate_release(release_id)
         except Exception as e:
-            logger.error(f"Cache get_release failed: {e}")
-            raise CacheUnavailableError(f"Cache get_release failed: {e}") from e
+            _classify_cache_error("get_release", e)
 
     async def get_release_lean(self, release_id: int) -> ReleaseMetadataResponse | None:
         """Lean ``/lookup``-only release hydration (LML#894 L4a; LML#895 L4c).
@@ -1164,8 +1199,7 @@ class DiscogsCacheService:
         try:
             return await self._hydrate_release_lean(release_id)
         except Exception as e:
-            logger.error(f"Cache get_release_lean failed: {e}")
-            raise CacheUnavailableError(f"Cache get_release_lean failed: {e}") from e
+            _classify_cache_error("get_release_lean", e)
 
     # ``json_agg`` single-round-trip release hydration for the lean ``/lookup``
     # path (LML#895 L4c). Each correlated subquery aggregates one child table
@@ -1903,8 +1937,7 @@ class DiscogsCacheService:
                 logger.debug(f"Cached release {release.release_id}: {release.title}")
 
         except Exception as e:
-            logger.error(f"Cache write_release failed: {e}")
-            raise CacheUnavailableError(f"Cache write_release failed: {e}") from e
+            _classify_cache_error("write_release", e)
 
     # LML#784: retrieval and ranking stay per-credit (the trigram WHERE and the
     # similarity score both look at the single ``ra.artist_name`` that matched),
@@ -2039,8 +2072,7 @@ class DiscogsCacheService:
             # Timeout already degraded by ``_bounded_fetch`` — re-raise unchanged.
             raise
         except Exception as e:
-            logger.error(f"Cache search_releases failed: {e}")
-            raise CacheUnavailableError(f"Cache search_releases failed: {e}") from e
+            _classify_cache_error("search_releases", e)
 
     async def get_artist_details(self, artist_id: int) -> ArtistDetails | None:
         """Get full artist details by ID.
@@ -2057,8 +2089,7 @@ class DiscogsCacheService:
         try:
             return await self._hydrate_artist_details(artist_id)
         except Exception as e:
-            logger.error(f"Cache get_artist_details failed: {e}")
-            raise CacheUnavailableError(f"Cache get_artist_details failed: {e}") from e
+            _classify_cache_error("get_artist_details", e)
 
     # ``json_agg`` single-round-trip artist hydration for the lean ``/lookup``
     # path (LML#895 L4c). Only ``artist_url`` (the Wikipedia bio link) is
@@ -2100,8 +2131,7 @@ class DiscogsCacheService:
         try:
             return await self._hydrate_artist_details_lean(artist_id)
         except Exception as e:
-            logger.error(f"Cache get_artist_details_lean failed: {e}")
-            raise CacheUnavailableError(f"Cache get_artist_details_lean failed: {e}") from e
+            _classify_cache_error("get_artist_details_lean", e)
 
     async def _hydrate_artist_details_lean(self, artist_id: int) -> ArtistDetails | None:
         """L4c single-burst hydration backing :meth:`get_artist_details_lean`.
@@ -2320,8 +2350,7 @@ class DiscogsCacheService:
             return result
 
         except Exception as e:
-            logger.error(f"Cache get_artist_details_bulk failed: {e}")
-            raise CacheUnavailableError(f"Cache get_artist_details_bulk failed: {e}") from e
+            _classify_cache_error("get_artist_details_bulk", e)
 
     async def write_artist_details(self, details: ArtistDetails) -> None:
         """Write or update artist details in the cache.
@@ -2436,8 +2465,7 @@ class DiscogsCacheService:
                 logger.debug(f"Cached artist {details.artist_id}: {details.name}")
 
         except Exception as e:
-            logger.error(f"Cache write_artist_details failed: {e}")
-            raise CacheUnavailableError(f"Cache write_artist_details failed: {e}") from e
+            _classify_cache_error("write_artist_details", e)
 
     async def delete_tombstone(self, entity_type: str, entity_id: int) -> str:
         """Delete a tombstoned row so the next API call re-fetches it.
@@ -2479,8 +2507,7 @@ class DiscogsCacheService:
             logger.info("Tombstone deleted: %s/%s", entity_type, entity_id)
             return "deleted"
         except Exception as e:
-            logger.error("Cache delete_tombstone failed: %s", e)
-            raise CacheUnavailableError(f"Cache delete_tombstone failed: {e}") from e
+            _classify_cache_error("delete_tombstone", e)
 
     async def validate_track_on_release(
         self, release_id: int, track: str, artist: str
@@ -2603,5 +2630,4 @@ class DiscogsCacheService:
             return False
 
         except Exception as e:
-            logger.error(f"Cache validate_track_on_release failed: {e}")
-            raise CacheUnavailableError(f"Cache validate_track_on_release failed: {e}") from e
+            _classify_cache_error("validate_track_on_release", e)
