@@ -38,6 +38,7 @@ from core.search import (
     resolve_search_hard_timeout_ms,
     song_not_found_with_artist_and_song,
 )
+from discogs.service import _retry_budget_deadline_var
 from generated.api_models import TrackMatchHint, TrackMatchSource
 from lookup.strategies import build_strategies
 from services.parser import ParsedRequest
@@ -1681,3 +1682,181 @@ class TestCallerBudget:
         # stayed empty, and the second strategy surfaced the late hit.
         assert state.results == [late_hit]
         assert state.timed_out is False
+
+
+class TestRetryBudgetDeadlineWiring:
+    """LML#758 follow-up: the retry-deadline ContextVar wiring itself.
+
+    ``tests/unit/test_discogs_retry_budget_deadline.py`` exercises
+    ``_request_with_retry`` against a manually-set ContextVar -- it never
+    calls ``execute_search_pipeline``, so it can't catch a regression where
+    the pipeline stops setting (or stops resetting) the deadline. These
+    tests drive the wiring at the seam: an attempt captures
+    ``discogs.service._retry_budget_deadline_var.get()`` from *inside* the
+    strategy call, which is the only vantage point that observes the value
+    the retry loop would actually see.
+
+    Also pins the fix for the #758 review finding that arming the deadline
+    from the *default* env budget (rather than only an explicit caller
+    budget/deadline) silently re-imposes the ~4s soft budget on the 429
+    retry sleep for no-header callers, eroding the pre-#758 "keep grinding
+    to the hard cap on empty results" contract (LML#340/#347).
+    """
+
+    @pytest.mark.asyncio
+    async def test_deadline_armed_when_caller_budget_present(self, monkeypatch):
+        """A caller-supplied budget arms the retry deadline for the duration
+        of the pipeline call, and the ContextVar is back to ``None`` once
+        the pipeline returns (leak guard)."""
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+
+        captured: list[float | None] = []
+
+        async def capture_and_return(*args, **kwargs):
+            captured.append(_retry_budget_deadline_var.get())
+            return ([], False)
+
+        search_lib = AsyncMock(side_effect=capture_and_return)
+        search_alt = AsyncMock(return_value=([], None, {}))
+        search_comp = AsyncMock(return_value=([], {}))
+
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Stereolab",
+            song="Miss Modular",
+            raw_message="Stereolab - Miss Modular",
+        )
+
+        assert _retry_budget_deadline_var.get() is None
+
+        await execute_search_pipeline(
+            parsed,
+            "Stereolab - Miss Modular",
+            strategies,
+            song_not_found=True,
+            caller_budget_ms=3000,
+        )
+
+        assert captured, "search_lib strategy never ran"
+        assert captured[0] is not None
+        # Reset in the pipeline's finally -- no leak into whatever runs next
+        # in the same task.
+        assert _retry_budget_deadline_var.get() is None
+
+    @pytest.mark.asyncio
+    async def test_deadline_not_armed_without_caller_budget(self, monkeypatch):
+        """Without a caller-supplied budget, the retry deadline stays
+        ``None`` -- the default ~4s soft budget must NOT cap the 429 retry
+        sleep, or a no-header warm-cache/write-path caller degrades to
+        cache-only early instead of grinding to the hard cap (the pre-#758
+        contract)."""
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+
+        captured: list[float | None] = []
+
+        async def capture_and_return(*args, **kwargs):
+            captured.append(_retry_budget_deadline_var.get())
+            return ([], False)
+
+        search_lib = AsyncMock(side_effect=capture_and_return)
+        search_alt = AsyncMock(return_value=([], None, {}))
+        search_comp = AsyncMock(return_value=([], {}))
+
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Stereolab",
+            song="Miss Modular",
+            raw_message="Stereolab - Miss Modular",
+        )
+
+        await execute_search_pipeline(
+            parsed,
+            "Stereolab - Miss Modular",
+            strategies,
+            song_not_found=True,
+            # caller_budget_ms not passed.
+        )
+
+        assert captured, "search_lib strategy never ran"
+        assert captured[0] is None
+        assert _retry_budget_deadline_var.get() is None
+
+    @pytest.mark.asyncio
+    async def test_deadline_reset_even_when_a_strategy_raises(self, monkeypatch):
+        """The reset-in-``finally`` must fire even when a strategy raises an
+        exception the pipeline doesn't catch (anything other than
+        ``TimeoutError``/``DiscogsBreakerOpenError``) -- otherwise a crashed
+        request would leak a stale deadline into whatever runs next on the
+        same task (LML#758 leak-guard, mirroring ``_cap_fire_count_var``)."""
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+
+        search_lib = AsyncMock(side_effect=RuntimeError("boom"))
+        search_alt = AsyncMock(return_value=([], None, {}))
+        search_comp = AsyncMock(return_value=([], {}))
+
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Stereolab",
+            song="Miss Modular",
+            raw_message="Stereolab - Miss Modular",
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await execute_search_pipeline(
+                parsed,
+                "Stereolab - Miss Modular",
+                strategies,
+                song_not_found=True,
+                caller_budget_ms=3000,
+            )
+
+        assert _retry_budget_deadline_var.get() is None
+
+    @pytest.mark.asyncio
+    async def test_removing_the_deadline_wiring_would_fail_this_test(self, monkeypatch):
+        """Direct pin on the exact deadline value the pipeline arms, so
+        deleting the ``set_retry_budget_deadline(...)`` call (or wiring it
+        to the wrong budget) fails this test instead of passing silently.
+        """
+        monkeypatch.delenv("LML_SEARCH_BUDGET_MS", raising=False)
+
+        captured: list[float | None] = []
+        observed_monotonic: list[float] = []
+
+        async def capture_and_return(*args, **kwargs):
+            observed_monotonic.append(time.monotonic())
+            captured.append(_retry_budget_deadline_var.get())
+            return ([], False)
+
+        search_lib = AsyncMock(side_effect=capture_and_return)
+        search_alt = AsyncMock(return_value=([], None, {}))
+        search_comp = AsyncMock(return_value=([], {}))
+
+        strategies = _build_test_strategies(search_lib, search_alt, search_comp)
+
+        parsed = ParsedRequest(
+            artist="Stereolab",
+            song="Miss Modular",
+            raw_message="Stereolab - Miss Modular",
+        )
+
+        # caller_budget_ms = 3000 -> effective budget = 3000 - TRANSPORT_OVERHEAD_MS.
+        await execute_search_pipeline(
+            parsed,
+            "Stereolab - Miss Modular",
+            strategies,
+            song_not_found=True,
+            caller_budget_ms=3000,
+        )
+
+        assert captured[0] is not None
+        expected_budget_seconds = (3000 - TRANSPORT_OVERHEAD_MS) / 1000.0
+        # The deadline is an absolute monotonic instant ~budget-seconds ahead
+        # of when the strategy ran; allow generous slack for test overhead
+        # without weakening the assertion into a tautology.
+        assert captured[0] == pytest.approx(
+            observed_monotonic[0] + expected_budget_seconds, abs=0.5
+        )

@@ -94,8 +94,12 @@ _MAX_RETRY_DELAY_SECONDS = 60.0
 # retry-backoff sleep against the caller's remaining time instead of riding
 # the retry loop's up-to-60s ceiling blind to it. ``None`` when no pipeline
 # deadline is active -- the four API-only Discogs seam methods that bypass
-# the search pipeline, and any direct-call unit test -- so the retry loop
-# falls back to the pre-#758 attempt-count-only bound.
+# the search pipeline, any direct-call unit test, AND a pipeline run whose
+# caller never supplied a budget (the deadline is only armed from an actual
+# caller-supplied budget, not the default env soft budget -- see the
+# gating comment at ``core.search._run_strategy_pipeline``'s
+# ``set_retry_budget_deadline`` call) -- so the retry loop falls back to the
+# pre-#758 attempt-count-only bound.
 _retry_budget_deadline_var: ContextVar[float | None] = ContextVar(
     "lml_discogs_retry_budget_deadline", default=None
 )
