@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException
 from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
 
@@ -13,6 +16,7 @@ from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.deezer import DeezerClient
 from clients.streaming.spotify import SpotifyClient
 from core.dependencies import get_streaming_posthog_client
+from core.search import resolve_positive_int_env
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
@@ -43,6 +47,76 @@ router = APIRouter(tags=["streaming"])
 # ``api_call_keys`` (stable ``api_calls`` shape, all zero until LML#641
 # instruments the clients) and as the verdict-iteration order.
 _STREAMING_SERVICES: tuple[str, ...] = tuple(StreamingCheckSources.model_fields)
+
+# Process-wide cap on concurrent `/api/v1/streaming-check` requests (LML#753).
+# Each request fans out four external streaming-service calls in one gather
+# (`check_streaming_availability`), so N concurrent requests hold 4xN in-flight
+# external HTTP calls on the shared event loop with no cross-request bound.
+# This endpoint borrows no asyncpg pool connection (no `pool.acquire`, no
+# `lml_cache` writes -- persistence is the caller's job, the LML#376 "treat
+# `None` as do-not-persist" verdict contract), so it is deliberately NOT folded
+# into the LML#716 bulk-family pool-derived budget -- that would queue
+# flowsheet adds behind pool-bound bulk-drain work they don't share. One
+# budget per contended resource: this cap protects loop time + sockets, not
+# the discogs-cache pool. Excess requests QUEUE on the semaphore -- no
+# 429/503 shedding; callers (tubafrenzy / Backend-Service) see latency, never
+# a new error mode. Default 8 is a literal, not pool-derived (there is no pool
+# to derive it from): organic flowsheet-add peaks are single-digit concurrent,
+# and 8 leaves headroom above that without letting a caller storm (the
+# 2026-07-06 flowsheet-backfill-flood shape) occupy the loop unbounded.
+# Per-worker caveat: if LML#747 (`UVICORN_WORKERS > 1`) ships, this becomes a
+# per-worker bound -- same caveat `LML_LOOKUP_MAX_CONCURRENT` and
+# `LML_BULK_GLOBAL_MAX_CONCURRENT` carry.
+_STREAMING_CHECK_MAX_CONCURRENT_ENV_VAR = "LML_STREAMING_CHECK_MAX_CONCURRENT"
+_STREAMING_CHECK_MAX_CONCURRENT_DEFAULT = 8
+
+_streaming_check_semaphore: asyncio.Semaphore | None = None
+"""Lazily constructed on the first request -- mirrors `lookup.router.
+_lookup_semaphore` (LML#706 PR3): not a loop constraint (3.10+ binds a
+semaphore's loop only at the first contended acquire), but so the env is read
+at request time (the no-redeploy Railway lever) and tests can reset the global
+between event loops (the suite-wide autouse fixture in `tests/conftest.py`)."""
+
+
+def _get_streaming_check_semaphore() -> asyncio.Semaphore:
+    """Lazily build the process-global `/streaming-check` in-flight semaphore.
+
+    Sized from `LML_STREAMING_CHECK_MAX_CONCURRENT` (read once, at first
+    construction; unparseable/zero/negative values WARN and fall back to the
+    literal default -- a 0 cap would deadlock every request).
+    """
+    global _streaming_check_semaphore
+    if _streaming_check_semaphore is None:
+        cap = resolve_positive_int_env(
+            _STREAMING_CHECK_MAX_CONCURRENT_ENV_VAR, _STREAMING_CHECK_MAX_CONCURRENT_DEFAULT
+        )
+        _streaming_check_semaphore = asyncio.Semaphore(cap)
+    return _streaming_check_semaphore
+
+
+def _project_inflight_capped(wait_ms: float) -> None:
+    """Project cap engagement onto Sentry for a request that queued.
+
+    Two channels, mirroring `lookup.router._project_inflight_capped` (the
+    LML#683 lesson: `set_data` alone reads back as "Unknown attribute" in the
+    spans dataset, so it can't back a query or an alert):
+
+    * `sentry_sdk.set_tag("lml.streaming_check.inflight_capped", "true")` --
+      the filterable engagement flag, set only on requests that found the cap
+      saturated.
+    * `set_measurement("lml.streaming_check.inflight_wait_ms", ...)` -- the
+      quantitative series (p95 queue wait) that decides whether the default
+      cap is tuned right.
+
+    Observability must not break the request path; failures log and continue.
+    """
+    try:
+        sentry_sdk.set_tag("lml.streaming_check.inflight_capped", "true")
+        scope = sentry_sdk.get_current_scope()
+        if scope.transaction is not None:
+            scope.transaction.set_measurement("lml.streaming_check.inflight_wait_ms", wait_ms)
+    except Exception as e:
+        logger.warning("Failed to project inflight_capped onto Sentry transaction: %s", e)
 
 
 def _summary_properties(
@@ -157,24 +231,37 @@ async def handle_streaming_check(
         event_prefix="streaming_check",
     )
 
-    try:
-        with telemetry.track_step("availability"):
-            response = await check_streaming_availability(
-                request.artist,
-                request.title,
-                spotify=spotify,
-                deezer=deezer,
-                apple_music=apple_music,
-                bandcamp=bandcamp,
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Streaming check failed for %s - %s", request.artist, request.title)
-        # Report the total failure before raising. The emit is itself swallowed,
-        # so it can neither suppress nor alter the 500 (LML#639).
-        _emit_summary(posthog_client, telemetry, None, error_type=type(e).__name__)
-        raise HTTPException(status_code=500, detail="Streaming check failed") from e
+    # LML#753: bound in-flight `/streaming-check` requests process-wide. The
+    # `locked()` pre-check is exact on this repo's Python (>=3.12) -- no await
+    # separates it from the `async with` acquire below, and `locked()` returns
+    # True when the value is exhausted OR waiters exist, the same predicate
+    # `acquire()` uses to decide whether to park.
+    semaphore = _get_streaming_check_semaphore()
+    capped_on_arrival = semaphore.locked()
+    wait_start = time.perf_counter()
+
+    async with semaphore:
+        if capped_on_arrival:
+            _project_inflight_capped((time.perf_counter() - wait_start) * 1000.0)
+
+        try:
+            with telemetry.track_step("availability"):
+                response = await check_streaming_availability(
+                    request.artist,
+                    request.title,
+                    spotify=spotify,
+                    deezer=deezer,
+                    apple_music=apple_music,
+                    bandcamp=bandcamp,
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("Streaming check failed for %s - %s", request.artist, request.title)
+            # Report the total failure before raising. The emit is itself
+            # swallowed, so it can neither suppress nor alter the 500 (LML#639).
+            _emit_summary(posthog_client, telemetry, None, error_type=type(e).__name__)
+            raise HTTPException(status_code=500, detail="Streaming check failed") from e
 
     _emit_summary(posthog_client, telemetry, response)
     return response

@@ -156,6 +156,26 @@ def _reset_lookup_inflight_cap():
 
 
 @pytest.fixture(autouse=True)
+def _reset_streaming_check_inflight_cap():
+    """Suite-wide reset of the LML#753 ``/streaming-check`` in-flight semaphore.
+
+    Sibling of ``_reset_lookup_inflight_cap`` above, same two failure modes:
+    ``streaming.router._streaming_check_semaphore`` is a process-global lazily
+    built by the FIRST test in the session that POSTs ``/api/v1/streaming-check``,
+    which would otherwise (a) freeze that test's
+    ``LML_STREAMING_CHECK_MAX_CONCURRENT`` snapshot for the rest of the session
+    and (b) bind to that test's event loop at the first contended acquire,
+    surfacing as order-dependent ``RuntimeError(... bound to a different event
+    loop)`` in unrelated files under pytest-asyncio's function-scoped loops.
+    """
+    from streaming import router as _streaming_router
+
+    _streaming_router._streaming_check_semaphore = None
+    yield
+    _streaming_router._streaming_check_semaphore = None
+
+
+@pytest.fixture(autouse=True)
 def _reset_discogs_pool_singleton():
     """Suite-wide reset of the discogs-cache ``async_singleton`` lock (LML#706).
 
