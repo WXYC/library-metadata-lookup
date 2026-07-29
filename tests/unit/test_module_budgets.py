@@ -68,7 +68,14 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/strategies/song_as_artist.py": 250,
     "lookup/strategies/song_as_track.py": 150,
     "lookup/strategies/swapped_interpretation.py": 300,
-    "lookup/strategies/track_on_compilation.py": 850,
+    # Recalibrated 2026-07-29 (LML#752): the 443-line
+    # ``search_compilations_for_track`` was decomposed into named phase
+    # helpers (candidate discovery, tracklist cross-reference, artist
+    # verification, result shaping), each carrying its own docstring — the
+    # decomposition itself grew the file to 854 lines even though no
+    # function now exceeds ~100 lines. Same formula as every other entry:
+    # smallest multiple of 50 at or above 1.3x the post-change size.
+    "lookup/strategies/track_on_compilation.py": 1150,
     "lookup/strategies/track_release_matching.py": 550,
     "lookup/strategies/va_rescue.py": 300,
     "lookup/streaming_url_postprocess.py": 750,
