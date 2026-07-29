@@ -495,7 +495,9 @@ class Settings(BaseSettings):
             "tests/unit/test_orchestrator_gaps.py); do not flip True until the "
             "LML#973 Tier-2 prod recall measurement quantifies that cost against "
             "real TRACK_ON_COMPILATION traffic. Fully reversible: flip False in "
-            "Railway to instantly revert to the ratio-only carve-out. See "
+            "Railway to revert to the ratio-only carve-out; the change lands on "
+            "the next deploy (get_settings() is @lru_cache'd, so a var flip takes "
+            "effect on process restart, not instantly). See "
             "WXYC/library-metadata-lookup#973 and #959."
         ),
     )
