@@ -13,7 +13,6 @@ used to run them inline). Extracted verbatim from ``lookup/orchestrator.py``
 (LML#728, LML#750).
 """
 
-import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -25,6 +24,7 @@ from discogs.models import DiscogsSearchRequest
 from discogs.service import DiscogsService
 from library.db import LibraryDB
 from library.models import LibraryItem
+from lookup.concurrency import _chunked_gather
 from lookup.matching import (
     MAX_SEARCH_RESULTS,
     album_title_acceptable,
@@ -62,13 +62,23 @@ async def filter_results_by_track_validation(
 ) -> list[LibraryItem] | None:
     """Filter fallback results to only albums that contain the requested track.
 
+    Bounded via :func:`_chunked_gather` (LML#808): probes dispatch
+    ``MAX_SEARCH_RESULTS`` at a time, subject to the shared per-invocation
+    ``LML_SEARCH_MAX_API_CALLS`` cap, so a wide fallback candidate list (e.g.
+    the artist-only fallback, widened by LML#808 to survive past the
+    response-size truncation) can't fan out into an unbounded Discogs probe
+    burst. A breaker shed (:class:`DiscogsBreakerOpenError`) stops dispatching
+    further chunks — the row that was already in flight when the breaker
+    opened is kept (per the R2-4 policy below), but no more probes go out
+    once the breaker is known to be open.
+
     Returns:
         Filtered list, or None if validation isn't possible.
     """
     if not discogs_service or not song or not artist or not results:
         return None
 
-    async def validate_one(item: LibraryItem) -> LibraryItem | None:
+    async def validate_one(item: LibraryItem) -> tuple[LibraryItem | None, bool]:
         try:
             # Self-titled albums stored as "S/t" should use the artist name
             album_for_search = item.artist if is_self_titled(item.title or "") else item.title
@@ -77,7 +87,7 @@ async def filter_results_by_track_validation(
             )
             if response is None or not response.results:
                 # None = degraded Discogs call (LML#918); treat like no results.
-                return None
+                return None, False
 
             best_result = response.results[0]
             if best_result.release_id:
@@ -92,7 +102,7 @@ async def filter_results_by_track_validation(
                         f"Track validation: Discogs returned '{best_result.album}' "
                         f"for library item '{item.title}' — album mismatch, skipping"
                     )
-                    return None
+                    return None, False
 
                 is_valid = await validate_release_for_track(
                     discogs_service, best_result.release_id, song, artist, source="step_3b"
@@ -102,7 +112,7 @@ async def filter_results_by_track_validation(
                         f"Track validation: '{song}' confirmed on '{item.title}' "
                         f"(release {best_result.release_id})"
                     )
-                    return item
+                    return item, False
         except DiscogsBreakerOpenError:
             # LML#755 R2-4: the Discogs saturation breaker shed a live probe
             # (search or validate). A shed is "couldn't ask", NOT "confirmed not
@@ -111,17 +121,42 @@ async def filter_results_by_track_validation(
             # so the user still gets their match, validation pending, during a
             # flood. Genuine validation errors still fall through to the broad
             # ``except`` below and drop the row as before.
+            #
+            # LML#808: also signal the shed back to the caller so it stops
+            # dispatching further ``_chunked_gather`` chunks — the breaker is
+            # open, so more probes would just shed too.
             logger.info(
                 "Track validation shed by Discogs breaker for '%s'; keeping row unvalidated",
                 item.title,
             )
-            return item
+            return item, True
         except Exception as e:
             logger.warning(f"Track validation failed for '{item.title}': {e}")
-        return None
+        return None, False
 
-    validation_results = await asyncio.gather(*[validate_one(item) for item in results])
-    validated = [r for r in validation_results if r is not None]
+    validated: list[LibraryItem] = []
+    breaker_shed = False
+    dispatched = 0
+    async for _item, (validated_item, shed) in _chunked_gather(
+        results, validate_one, MAX_SEARCH_RESULTS
+    ):
+        dispatched += 1
+        if validated_item is not None:
+            validated.append(validated_item)
+        breaker_shed = breaker_shed or shed
+        if len(validated) >= MAX_SEARCH_RESULTS:
+            break
+        # Chunk-granular stop (mirrors ``_chunked_gather``'s own between-chunks
+        # gate): let the in-flight chunk finish — those probes already went
+        # out — but don't let a later chunk dispatch once the breaker's open.
+        if breaker_shed and dispatched % MAX_SEARCH_RESULTS == 0:
+            logger.info(
+                "Track validation: Discogs breaker open, stopping fan-out "
+                "after %d of %d candidates",
+                dispatched,
+                len(results),
+            )
+            break
 
     if validated:
         logger.info(
