@@ -29,7 +29,6 @@ import pytest
 import pytest_asyncio
 
 from clients.streaming.base import BaseStreamingClient
-from entity.sources import PgSource
 from entity.streaming_url_cache import (
     get_cached_streaming_url,
     resolve_streaming_url_with_cache,
@@ -61,12 +60,6 @@ async def pg_pool(pg_pool_large):
     re-typing every request.
     """
     yield pg_pool_large
-
-
-@pytest_asyncio.fixture
-async def pg_source(pg_pool):
-    """A ``PgSource`` borrowing the test pool (no-op close)."""
-    return PgSource(pool=pg_pool)
 
 
 @pytest_asyncio.fixture(autouse=True)

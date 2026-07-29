@@ -15,6 +15,7 @@ import pytest_asyncio
 
 from config.settings import Settings
 from discogs.models import DiscogsSearchResponse
+from entity.sources import PgSource
 from entity.streaming_catalog import ALLOW_URL_REMOVAL_GUC
 from library.db import LibraryDB
 from tests.factories import make_discogs_result
@@ -258,6 +259,23 @@ async def pg_pool_large():
     """
     async for pool in _make_pg_pool(max_size=4):
         yield pool
+
+
+@pytest_asyncio.fixture
+async def pg_source(pg_pool) -> PgSource:
+    """A ``PgSource`` borrowing the test pool (no-op close).
+
+    Shared by every DAO/bootstrap-level integration test in this directory
+    that needs a real ``PgSource`` -- see WXYC/library-metadata-lookup#892
+    (10 near-identical per-file copies consolidated here).
+    """
+    return PgSource(pool=pg_pool)
+
+
+@pytest_asyncio.fixture
+async def pg_source_large(pg_pool_large) -> PgSource:
+    """A ``PgSource`` borrowing the large test pool (headroom for the gather)."""
+    return PgSource(pool=pg_pool_large)
 
 
 # ---------------------------------------------------------------------------

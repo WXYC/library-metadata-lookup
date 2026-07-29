@@ -26,16 +26,8 @@ import asyncio
 import pytest
 import pytest_asyncio
 
-from entity.sources import PgSource
 from entity.store import EntityStore
-
-# ``DATABASE_URL`` (and the conftest ``pg_pool_large``) come from conftest;
-# imported here for the ``source._dsn`` wiring and ``monkeypatch.setenv`` below.
-from tests.integration.conftest import (
-    DATABASE_URL,
-    ENTITY_IDENTITY_DDL,
-    skip_if_drop_targets_populated,
-)
+from tests.integration.conftest import ENTITY_IDENTITY_DDL, skip_if_drop_targets_populated
 
 
 @pytest_asyncio.fixture
@@ -47,14 +39,6 @@ async def pg_pool(pg_pool_large):
     re-typing every request.
     """
     yield pg_pool_large
-
-
-@pytest_asyncio.fixture
-async def pg_source(pg_pool):
-    source = PgSource.__new__(PgSource)
-    source._dsn = DATABASE_URL
-    source._pool = pg_pool
-    return source
 
 
 @pytest_asyncio.fixture(autouse=True)

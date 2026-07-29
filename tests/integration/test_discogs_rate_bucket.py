@@ -40,13 +40,7 @@ _TINY_REFILL = 0.001
 
 
 @pytest_asyncio.fixture
-async def pg_source(pg_pool_large) -> PgSource:
-    """A ``PgSource`` borrowing the large test pool (headroom for the gather)."""
-    return PgSource(pool=pg_pool_large)
-
-
-@pytest_asyncio.fixture
-async def bucket_key(pg_source) -> AsyncIterator[str]:
+async def bucket_key(pg_source_large) -> AsyncIterator[str]:
     """A unique bucket key per test, torn down afterwards.
 
     Isolates each test from every other and from any real seeded ``'discogs'``
@@ -54,18 +48,22 @@ async def bucket_key(pg_source) -> AsyncIterator[str]:
     """
     key = f"test_{uuid.uuid4().hex[:12]}"
     yield key
-    await pg_source.execute("DELETE FROM lml_cache.discogs_rate_bucket WHERE bucket_key = $1", key)
-
-
-async def _seed(pg_source: PgSource, key: str, *, capacity: float, refill: float) -> PgTokenBucket:
-    await set_up_discogs_rate_bucket_schema(
-        pg_source, bucket_key=key, capacity=capacity, refill_per_sec=refill
+    await pg_source_large.execute(
+        "DELETE FROM lml_cache.discogs_rate_bucket WHERE bucket_key = $1", key
     )
-    return PgTokenBucket(pg_source, bucket_key=key)
 
 
-async def _row(pg_source: PgSource, key: str) -> dict[str, Any]:
-    row = await pg_source.fetchone(
+async def _seed(
+    pg_source_large: PgSource, key: str, *, capacity: float, refill: float
+) -> PgTokenBucket:
+    await set_up_discogs_rate_bucket_schema(
+        pg_source_large, bucket_key=key, capacity=capacity, refill_per_sec=refill
+    )
+    return PgTokenBucket(pg_source_large, bucket_key=key)
+
+
+async def _row(pg_source_large: PgSource, key: str) -> dict[str, Any]:
+    row = await pg_source_large.fetchone(
         "SELECT tokens, capacity, refill_per_sec "
         "FROM lml_cache.discogs_rate_bucket WHERE bucket_key = $1",
         key,
@@ -74,55 +72,55 @@ async def _row(pg_source: PgSource, key: str) -> dict[str, Any]:
     return row
 
 
-async def test_schema_bootstrap_is_idempotent(pg_source, bucket_key):
+async def test_schema_bootstrap_is_idempotent(pg_source_large, bucket_key):
     """Running the bootstrap twice leaves exactly one row seeded from settings."""
     await set_up_discogs_rate_bucket_schema(
-        pg_source, bucket_key=bucket_key, capacity=5, refill_per_sec=_TINY_REFILL
+        pg_source_large, bucket_key=bucket_key, capacity=5, refill_per_sec=_TINY_REFILL
     )
     await set_up_discogs_rate_bucket_schema(
-        pg_source, bucket_key=bucket_key, capacity=5, refill_per_sec=_TINY_REFILL
+        pg_source_large, bucket_key=bucket_key, capacity=5, refill_per_sec=_TINY_REFILL
     )
-    count = await pg_source.fetchone(
+    count = await pg_source_large.fetchone(
         "SELECT count(*) AS n FROM lml_cache.discogs_rate_bucket WHERE bucket_key = $1",
         bucket_key,
     )
     assert count["n"] == 1
-    row = await _row(pg_source, bucket_key)
+    row = await _row(pg_source_large, bucket_key)
     assert row["capacity"] == 5
     assert row["refill_per_sec"] == pytest.approx(_TINY_REFILL)
     # Seeded full.
     assert row["tokens"] == pytest.approx(5, abs=0.01)
 
 
-async def test_reseed_does_not_clobber_existing_capacity(pg_source, bucket_key):
+async def test_reseed_does_not_clobber_existing_capacity(pg_source_large, bucket_key):
     """ON CONFLICT DO NOTHING: a second bootstrap with a different budget is a no-op.
 
     Prod owns the budget value; a staging boot with a different ``discogs_rate_limit``
     must not oscillate the shared row (plan §Risks).
     """
     await set_up_discogs_rate_bucket_schema(
-        pg_source, bucket_key=bucket_key, capacity=5, refill_per_sec=_TINY_REFILL
+        pg_source_large, bucket_key=bucket_key, capacity=5, refill_per_sec=_TINY_REFILL
     )
     await set_up_discogs_rate_bucket_schema(
-        pg_source, bucket_key=bucket_key, capacity=99, refill_per_sec=1.0
+        pg_source_large, bucket_key=bucket_key, capacity=99, refill_per_sec=1.0
     )
-    row = await _row(pg_source, bucket_key)
+    row = await _row(pg_source_large, bucket_key)
     assert row["capacity"] == 5
 
 
-async def test_try_acquire_spends_one_token(pg_source, bucket_key):
-    bucket = await _seed(pg_source, bucket_key, capacity=5, refill=_TINY_REFILL)
+async def test_try_acquire_spends_one_token(pg_source_large, bucket_key):
+    bucket = await _seed(pg_source_large, bucket_key, capacity=5, refill=_TINY_REFILL)
     res = await bucket.try_acquire()
     assert isinstance(res, TokenAcquisition)
     assert res.allowed is True
     assert res.retry_after_s == pytest.approx(0.0)
-    row = await _row(pg_source, bucket_key)
+    row = await _row(pg_source_large, bucket_key)
     # One token spent (minus negligible refill).
     assert 3.9 < row["tokens"] < 5.0
 
 
-async def test_burst_exhausts_then_denies_with_retry_after(pg_source, bucket_key):
-    bucket = await _seed(pg_source, bucket_key, capacity=3, refill=_TINY_REFILL)
+async def test_burst_exhausts_then_denies_with_retry_after(pg_source_large, bucket_key):
+    bucket = await _seed(pg_source_large, bucket_key, capacity=3, refill=_TINY_REFILL)
     for _ in range(3):
         assert (await bucket.try_acquire()).allowed is True
     denied = await bucket.try_acquire()
@@ -130,7 +128,7 @@ async def test_burst_exhausts_then_denies_with_retry_after(pg_source, bucket_key
     assert denied.retry_after_s > 0.0
 
 
-async def test_stays_drained_immediately_after_burst(pg_source, bucket_key):
+async def test_stays_drained_immediately_after_burst(pg_source_large, bucket_key):
     """No meaningful refill happens between two back-to-back acquires.
 
     Uses ``_TINY_REFILL`` (like the concurrency tests below) so the "still
@@ -138,12 +136,12 @@ async def test_stays_drained_immediately_after_burst(pg_source, bucket_key):
     latency -- see ``test_tokens_refill_over_time`` for the fast-refill,
     accrual-over-a-real-sleep counterpart.
     """
-    bucket = await _seed(pg_source, bucket_key, capacity=1, refill=_TINY_REFILL)
+    bucket = await _seed(pg_source_large, bucket_key, capacity=1, refill=_TINY_REFILL)
     assert (await bucket.try_acquire()).allowed is True
     assert (await bucket.try_acquire()).allowed is False  # drained
 
 
-async def test_tokens_refill_over_time(pg_source, bucket_key):
+async def test_tokens_refill_over_time(pg_source_large, bucket_key):
     """A token becomes available again once enough wall-clock time has passed.
 
     Fast refill (100/s => a token every 10ms), capacity 1. Deliberately does
@@ -153,46 +151,46 @@ async def test_tokens_refill_over_time(pg_source, bucket_key):
     is racy against the fast refill rate (LML#934). The 50ms sleep here is
     far larger than any round-trip jitter, so it stays deterministic.
     """
-    bucket = await _seed(pg_source, bucket_key, capacity=1, refill=100.0)
+    bucket = await _seed(pg_source_large, bucket_key, capacity=1, refill=100.0)
     assert (await bucket.try_acquire()).allowed is True  # drains the seeded token
     await asyncio.sleep(0.05)  # 0.05 * 100 = 5 tokens accrue, capped at capacity 1
     assert (await bucket.try_acquire()).allowed is True
 
 
-async def test_concurrent_acquires_never_over_issue(pg_source, bucket_key):
+async def test_concurrent_acquires_never_over_issue(pg_source_large, bucket_key):
     """The core invariant: N concurrent try_acquire against one row yield exactly
     ``capacity`` allows — the FOR UPDATE serialization makes refill/spend atomic."""
     capacity = 5
-    bucket = await _seed(pg_source, bucket_key, capacity=capacity, refill=_TINY_REFILL)
+    bucket = await _seed(pg_source_large, bucket_key, capacity=capacity, refill=_TINY_REFILL)
     results = await asyncio.gather(*(bucket.try_acquire() for _ in range(capacity + 10)))
     allowed = [r for r in results if r.allowed]
     assert len(allowed) == capacity
 
 
-async def test_two_instances_share_one_row(pg_source, bucket_key):
+async def test_two_instances_share_one_row(pg_source_large, bucket_key):
     """Two independent PgTokenBucket instances (staging + prod) are collectively
     bounded by ``capacity`` — enforcement is on the row, not the instance."""
     capacity = 4
     await set_up_discogs_rate_bucket_schema(
-        pg_source, bucket_key=bucket_key, capacity=capacity, refill_per_sec=_TINY_REFILL
+        pg_source_large, bucket_key=bucket_key, capacity=capacity, refill_per_sec=_TINY_REFILL
     )
-    prod = PgTokenBucket(pg_source, bucket_key=bucket_key)
-    staging = PgTokenBucket(pg_source, bucket_key=bucket_key)
+    prod = PgTokenBucket(pg_source_large, bucket_key=bucket_key)
+    staging = PgTokenBucket(pg_source_large, bucket_key=bucket_key)
     both = [prod, staging] * (capacity + 3)  # > capacity acquires split across instances
     results = await asyncio.gather(*(b.try_acquire() for b in both))
     allowed = [r for r in results if r.allowed]
     assert len(allowed) == capacity
 
 
-async def test_negative_balance_is_floored_to_zero(pg_source, bucket_key):
+async def test_negative_balance_is_floored_to_zero(pg_source_large, bucket_key):
     """LML#841 review (Finding 3): a pathological negative balance — e.g. a
     backward wall-clock jump making the refill term deeply negative — must not
     yield an unbounded ``retry_after_s`` nor persist a deeper-negative balance.
     The ``GREATEST(0.0, …)`` floor clamps ``avail`` to ``[0, capacity]``."""
-    bucket = await _seed(pg_source, bucket_key, capacity=1, refill=100.0)
+    bucket = await _seed(pg_source_large, bucket_key, capacity=1, refill=100.0)
     # No public API mints a negative balance; corrupt the row directly to model
     # the clock-skew / underflow case. last_refill=now() minimizes accrual.
-    await pg_source.execute(
+    await pg_source_large.execute(
         "UPDATE lml_cache.discogs_rate_bucket SET tokens = -100, last_refill = now() "
         "WHERE bucket_key = $1",
         bucket_key,
@@ -202,15 +200,15 @@ async def test_negative_balance_is_floored_to_zero(pg_source, bucket_key):
     # Floored: retry_after ≈ (1 - 0) / 100 = 0.01s, NOT the un-floored
     # (1 - (-100)) / 100 = 1.01s.
     assert res.retry_after_s < 0.5
-    row = await _row(pg_source, bucket_key)
+    row = await _row(pg_source_large, bucket_key)
     assert row["tokens"] >= 0.0  # never persists a deeper-negative balance
 
 
-async def test_try_acquire_missing_row_raises(pg_source):
+async def test_try_acquire_missing_row_raises(pg_source_large):
     """An unseeded key has no row; try_acquire raises so the gate can fail open."""
     await set_up_discogs_rate_bucket_schema(
-        pg_source, bucket_key="test_seeded_other", capacity=1, refill_per_sec=_TINY_REFILL
+        pg_source_large, bucket_key="test_seeded_other", capacity=1, refill_per_sec=_TINY_REFILL
     )
-    orphan = PgTokenBucket(pg_source, bucket_key=f"test_absent_{uuid.uuid4().hex[:8]}")
+    orphan = PgTokenBucket(pg_source_large, bucket_key=f"test_absent_{uuid.uuid4().hex[:8]}")
     with pytest.raises(RateBucketMissingRowError):
         await orphan.try_acquire()

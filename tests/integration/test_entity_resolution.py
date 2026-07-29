@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
-from entity.sources import PgSource
 from entity.store import EntityStore
 from scripts.entity_resolution.__main__ import (
     OrphanDrainAbortError,
@@ -37,15 +36,6 @@ from tests.integration.conftest import (
     skip_if_drop_targets_populated,
     skip_unless_wxyc_identity_match_artist,
 )
-
-
-@pytest_asyncio.fixture
-async def pg_source(pg_pool):
-    """PgSource wrapping the test pool."""
-    source = PgSource.__new__(PgSource)
-    source._dsn = DATABASE_URL
-    source._pool = pg_pool
-    return source
 
 
 @pytest_asyncio.fixture(autouse=True)

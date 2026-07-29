@@ -29,12 +29,6 @@ def _source(pg_pool) -> PgSource:
     return source
 
 
-@pytest_asyncio.fixture
-async def pg_source(pg_pool):
-    """PgSource wrapping the test pool."""
-    return _source(pg_pool)
-
-
 @pytest_asyncio.fixture(autouse=True)
 async def set_up_entity_schema(pg_pool):
     """Create (or re-create) the entity schema for each test.

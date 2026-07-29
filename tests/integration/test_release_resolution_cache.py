@@ -35,14 +35,7 @@ from entity.release_resolution_cache import (
     set_cached_release_id,
     set_up_release_resolution_cache_schema,
 )
-from entity.sources import PgSource
 from tests.integration.conftest import skip_if_named_tables_populated
-
-
-@pytest_asyncio.fixture
-async def pg_source(pg_pool):
-    """A ``PgSource`` borrowing the test pool (no-op close)."""
-    return PgSource(pool=pg_pool)
 
 
 @pytest_asyncio.fixture(autouse=True)
