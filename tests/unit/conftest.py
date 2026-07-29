@@ -71,6 +71,45 @@ def scrub_credential_env():
     get_settings.cache_clear()
 
 
+def strip_sql_comments(sql: str) -> str:
+    """Drop ``--`` line comments and collapse incidental whitespace.
+
+    Lets a parity check compare the *shape* of two DDL statements without
+    tripping on the explanatory comments a ``.sql`` reference carries inline.
+    Known limitation: splits on ``--`` anywhere in a line, including inside a
+    string literal. Callers that pin this against runtime DDL compensate by
+    asserting the runtime statements carry no ``--`` in the first place.
+    """
+    lines = []
+    for raw in sql.splitlines():
+        line = raw.split("--", 1)[0].rstrip()
+        if line.strip():
+            lines.append(line.strip())
+    return " ".join(lines)
+
+
+def extract_create_table(ddl: str) -> str:
+    """Pull the single ``CREATE TABLE ...);`` statement out of a ``.sql`` file."""
+    start = ddl.index("CREATE TABLE")
+    end = ddl.index(";", start)
+    return strip_sql_comments(ddl[start:end]).strip().rstrip(";")
+
+
+def normalize_sql(text: str) -> str:
+    """Strip ``--`` comments, drop semicolons, collapse whitespace.
+
+    A stricter superset of :func:`strip_sql_comments`: also removes every
+    ``;`` so PL/pgSQL bodies (which carry internal statement terminators the
+    runtime DDL list doesn't) compare equal. Keep this distinct from
+    ``strip_sql_comments`` rather than folding one into the other — the
+    exact-equality parity test in ``test_streaming_catalog_schema.py`` is
+    sensitive to this normalizer's exact semantics. Same ``--``-inside-a-line
+    limitation as ``strip_sql_comments``.
+    """
+    lines = [line.split("--", 1)[0] for line in text.splitlines()]
+    return " ".join(" ".join(lines).replace(";", " ").split())
+
+
 @contextmanager
 def override_deps(app, overrides):
     """Set FastAPI dependency overrides and clear them on exit.

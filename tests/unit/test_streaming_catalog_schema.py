@@ -45,23 +45,9 @@ from entity.streaming_catalog import (
     ALLOW_URL_REMOVAL_GUC,
     set_up_streaming_catalog_schema,
 )
+from tests.unit.conftest import normalize_sql as _normalize_sql
 
 _SQL_REFERENCE = Path(__file__).resolve().parent.parent.parent / "entity" / "streaming_catalog.sql"
-
-
-def _normalize_sql(text: str) -> str:
-    """Strip ``--`` comments, drop semicolons, collapse whitespace.
-
-    Semicolons are replaced on BOTH sides of every comparison (the .sql
-    carries statement terminators, the runtime statements don't; the ones
-    inside the PL/pgSQL bodies are dropped symmetrically, so equality is
-    unaffected). A ``--`` inside a runtime statement would silently truncate
-    it — ``test_runtime_statements_carry_no_line_comments`` guards that side;
-    the .sql's ``--`` prose is the point of the reference file. The RAISE
-    messages use an em-dash, never ``--``.
-    """
-    lines = [line.split("--", 1)[0] for line in text.splitlines()]
-    return " ".join(" ".join(lines).replace(";", " ").split())
 
 
 class _FakeTransaction:
