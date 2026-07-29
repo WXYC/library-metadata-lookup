@@ -343,6 +343,38 @@ def title_subset_is_degenerate(query_title: str, candidate_title: str) -> bool:
     return score_match_track(query_title, candidate_title) < SCORE_MATCH_ACCEPTANCE_FLOOR
 
 
+def album_subset_is_degenerate(query_album: str, candidate_album: str) -> bool:
+    """True when an album's ``token_set_ratio`` clear is pure subset-inflation (LML#721).
+
+    Sibling of ``title_subset_is_degenerate`` for the album axis. The album
+    axis in ``find_track_metadata`` is a third AND-gate on top of artist +
+    title, so its subset-inflation can't by itself cause a false ACCEPT —
+    what it weakens is the album axis's ability to *reject* a wrong-album
+    candidate (LML#487 Tzenni-vs-Yenbett shape): a short generic query album
+    (``Live``) is a token-subset of a long unrelated candidate album (``Live
+    at the Apollo, Vol. 2``), scoring a perfect 100 with no real agreement.
+
+    Unlike the title axis, the album axis has no per-track variant markers to
+    strip (``score_match_track``'s ``strip_track_suffix`` targets shapes like
+    "(Live)"/"(Remix)" that would wrongly gut a legitimate album title
+    containing those same words). ``score_match`` alone is the right
+    comparator here: its ``strip_format_suffix`` already strips album-level
+    reissue/remaster parentheticals, so a legitimate reissue subset (``Tzenni``
+    vs ``Tzenni (Deluxe Edition)``) still scores 100 and is retained.
+
+    * degenerate:  ``Live`` vs ``Live at the Apollo, Vol. 2``   -> 26.7
+    * degenerate:  ``Demos`` vs ``Demos and Rarities 1998-2004`` -> 30.3
+    * degenerate:  ``Singles`` vs ``Singles Going Steady``       -> 51.9
+    * legitimate:  ``Tzenni`` vs ``Tzenni (Deluxe Edition)``     -> 100
+
+    Returns True (degenerate — reject) when the pair falls below the
+    acceptance floor under ``score_match``. A caller scoring the album axis
+    with ``token_set_ratio`` should reject any candidate for which this
+    returns True *after* it has cleared the ``token_set_ratio`` floor.
+    """
+    return score_match(query_album, candidate_album) < SCORE_MATCH_ACCEPTANCE_FLOOR
+
+
 # LML#592 telemetry bands. The 80/80 floor admits organic short-name artist
 # collisions on a shared album title ("Wand" vs "Wanda" scores 88.89 against
 # an identical title at 100). These bands classify the *signature* of such a

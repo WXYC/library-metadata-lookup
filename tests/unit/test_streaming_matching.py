@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from clients.streaming.matching import (
+    album_subset_is_degenerate,
     is_acceptable_match,
     normalize_album_title,
     normalize_artist_name,
@@ -400,6 +401,37 @@ class TestTitleSubsetIsDegenerate:
 
     def test_identical_titles_not_degenerate(self):
         assert title_subset_is_degenerate("Back, Baby", "Back, Baby") is False
+
+
+class TestAlbumSubsetIsDegenerate:
+    """LML#721: the album-axis sibling of ``title_subset_is_degenerate``.
+    Separates a *degenerate* subset (short generic query album buried in a
+    long unrelated candidate album, ``token_set_ratio`` == 100 with no real
+    signal) from a *legitimate* one (differs only by a recognized
+    reissue/remaster suffix). The boundary is ``score_match`` (``token_sort_ratio``,
+    with ``strip_format_suffix`` already applied) below the floor.
+    """
+
+    def test_rejects_generic_album_buried_in_unrelated_candidate(self):
+        # The production shape: `live` ⊂ `live at the apollo, vol. 2` scores
+        # token_set 100 but score_match (token_sort) 26.7.
+        assert album_subset_is_degenerate("Live", "Live at the Apollo, Vol. 2") is True
+
+    def test_rejects_generic_album_demos(self):
+        assert album_subset_is_degenerate("Demos", "Demos and Rarities 1998-2004") is True
+
+    def test_rejects_generic_album_singles(self):
+        assert album_subset_is_degenerate("Singles", "Singles Going Steady") is True
+
+    def test_retains_reissue_suffix_subset(self):
+        # `(Deluxe Edition)` is stripped by strip_format_suffix → the sides match.
+        assert album_subset_is_degenerate("Tzenni", "Tzenni (Deluxe Edition)") is False
+
+    def test_retains_remaster_suffix_subset(self):
+        assert album_subset_is_degenerate("Moon Pix", "Moon Pix (Remastered)") is False
+
+    def test_identical_albums_not_degenerate(self):
+        assert album_subset_is_degenerate("Aluminum Tunes", "Aluminum Tunes") is False
 
 
 class TestStripDiscogsSuffix:
