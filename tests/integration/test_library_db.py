@@ -183,6 +183,12 @@ class TestFindSimilarArtist:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_genuine_misspelling_still_corrected(self, library_db):
+        """Regression guard: a real typo of a library artist still binds (LML#857)."""
+        result = await library_db.find_similar_artist("Stereolb")
+        assert result == "Stereolab"
+
+    @pytest.mark.asyncio
     async def test_short_word(self, library_db):
         result = await library_db.find_similar_artist("XY")
         assert result is None
