@@ -45,6 +45,12 @@ _SERVICE_CASES = [
     ("bandcamp", "https://juanamolina.bandcamp.com/album/doga"),
 ]
 
+_SERVICE_CHECK_OID = (
+    "SELECT oid FROM pg_constraint "
+    "WHERE conname = 'album_streaming_url_cache_service_valid' "
+    "AND conrelid = 'lml_cache.album_streaming_url_cache'::regclass"
+)
+
 
 @pytest_asyncio.fixture
 async def pg_pool(pg_pool_large):
@@ -153,6 +159,58 @@ class TestSchemaBootstrap:
                 "SELECT url FROM lml_cache.album_streaming_url_cache WHERE service = 'bandcamp'"
             )
         assert row["url"] == "https://x.bandcamp.com/album/y"
+
+    @pytest.mark.asyncio
+    async def test_second_boot_leaves_the_check_constraint_untouched(self, pg_pool, pg_source):
+        # Re-booting over an up-to-date table must not DROP+ADD the CHECK:
+        # the constraint OID is the tell (a rewrite allocates a new one), and
+        # a rewrite costs an ACCESS EXCLUSIVE lock plus a full-table
+        # re-validation scan on every production boot.
+        async with pg_pool.acquire() as conn:
+            oid_before = await conn.fetchval(_SERVICE_CHECK_OID)
+
+        await set_up_streaming_url_cache_schema(pg_source)
+
+        async with pg_pool.acquire() as conn:
+            oid_after = await conn.fetchval(_SERVICE_CHECK_OID)
+        assert oid_before is not None
+        assert oid_after == oid_before
+
+    @pytest.mark.asyncio
+    async def test_boot_preserves_a_preexisting_superset_constraint(self, pg_pool, pg_source):
+        # A deployed table may admit services this code version doesn't ship
+        # (a newer deploy widened it, then this build rolled back). Boot must
+        # merge, never narrow: narrowing re-validates and would abort on any
+        # row using the extra service, taking the whole bootstrap transaction
+        # down with it. Simulate by hand-widening the constraint to a strict
+        # superset and seeding a row using the extra service.
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE lml_cache.album_streaming_url_cache "
+                "DROP CONSTRAINT album_streaming_url_cache_service_valid, "
+                "ADD CONSTRAINT album_streaming_url_cache_service_valid CHECK ("
+                "  service IN ('apple_music_album', 'spotify_album', 'bandcamp', 'deezer_album')"
+                ")"
+            )
+            await conn.execute(
+                "INSERT INTO lml_cache.album_streaming_url_cache "
+                "(service, artist_normalized, album_normalized, url) "
+                "VALUES ('deezer_album', 'x', 'y', 'https://example.test/deezer')"
+            )
+            oid_before = await conn.fetchval(_SERVICE_CHECK_OID)
+
+        await set_up_streaming_url_cache_schema(pg_source)
+
+        async with pg_pool.acquire() as conn:
+            # Nothing to add (existing set is a superset), so the constraint
+            # must be untouched — and the collected deezer row intact.
+            oid_after = await conn.fetchval(_SERVICE_CHECK_OID)
+            preserved = await conn.fetchval(
+                "SELECT count(*) FROM lml_cache.album_streaming_url_cache "
+                "WHERE service = 'deezer_album'"
+            )
+        assert oid_after == oid_before
+        assert preserved == 1
 
 
 @pytest.mark.pg
