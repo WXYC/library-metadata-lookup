@@ -71,6 +71,24 @@ class TestLookupPipeline:
         )
 
     @pytest.mark.asyncio
+    async def test_exact_library_artist_resolves_to_library_row(self, app_client):
+        """LML#857: an artist already in the library must resolve to its
+        library row (non-zero library_item.id), not a rowless Discogs-only
+        fallback caused by a false artist "correction"."""
+        resp = await app_client.post(
+            "/api/v1/lookup",
+            json={
+                "artist": "Stereolab",
+                "album": "Dots and Loops",
+                "raw_message": "Stereolab - Dots and Loops",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["results"]) >= 1
+        assert all(r["library_item"]["id"] != 0 for r in body["results"])
+
+    @pytest.mark.asyncio
     async def test_no_results(self, app_client):
         """Nonexistent artist returns empty results."""
         resp = await app_client.post(

@@ -667,6 +667,7 @@ class TestFindSimilarArtist:
         mock_cursor.fetchall = AsyncMock(return_value=[])
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_cursor.fetchone = AsyncMock(return_value=None)
 
         result = await db.find_similar_artist("Nonexistent")
         assert result is None
@@ -688,6 +689,7 @@ class TestFindSimilarArtist:
         mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Living Colour")])
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_cursor.fetchone = AsyncMock(return_value=None)
 
         result = await db.find_similar_artist("Living Color")
         assert result == "Living Colour"
@@ -708,6 +710,7 @@ class TestFindSimilarArtist:
         mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Queen")])
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_cursor.fetchone = AsyncMock(return_value=None)
 
         result = await db.find_similar_artist("Queen")
         assert result is None
@@ -727,6 +730,7 @@ class TestFindSimilarArtist:
         mock_cursor.fetchall = AsyncMock(return_value=[FakeRow(None), FakeRow("Radiohead")])
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_cursor.fetchone = AsyncMock(return_value=None)
 
         result = await db.find_similar_artist("Radiohed")
         assert result == "Radiohead"
@@ -751,6 +755,7 @@ class TestFindSimilarArtist:
         mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Plugz")])
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_cursor.fetchone = AsyncMock(return_value=None)
 
         result = await db.find_similar_artist("Plug")
         assert result is None, (
@@ -781,6 +786,7 @@ class TestFindSimilarArtist:
         mock_cursor.fetchall = AsyncMock(return_value=[FakeRow(candidate)])
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_cursor.fetchone = AsyncMock(return_value=None)
 
         result = await db.find_similar_artist(misspelled)
         assert result == expected
@@ -801,12 +807,13 @@ class TestFindSimilarArtist:
         mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Black Dog")])
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_cursor.fetchone = AsyncMock(return_value=None)
 
         result = await db.find_similar_artist("The Bleack Dog")
 
         assert result == "Black Dog"
         _, params = db._conn.execute.await_args.args
-        assert params == ["ble%", "%dog%"]
+        assert params == ["ble%", "%dog%", "the bleack dog", "bleack dog"]
         assert "the%" not in params
 
     @pytest.mark.asyncio
@@ -825,10 +832,91 @@ class TestFindSimilarArtist:
         mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Black Dog")])
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
+        mock_cursor.fetchone = AsyncMock(return_value=None)
 
         result = await db.find_similar_artist("The Black Dog")
 
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_exact_library_artist_short_circuits_before_candidate_search(self):
+        """An artist that's an exact library match is never 'corrected' to a
+        different, merely-similar-scoring distractor.
+
+        Regression for LML#857: the "John Lennon" -> "Don Lennon" false
+        correction. Even if the candidate query would (nondeterministically)
+        surface a distractor as the only row, the exact-match short-circuit
+        must fire first and the candidate query must never run.
+        """
+        db = LibraryDB()
+
+        class FakeRow:
+            def __init__(self, val):
+                self.val = val
+
+            def __getitem__(self, idx):
+                return self.val
+
+        exact_cursor = AsyncMock()
+        exact_cursor.fetchone = AsyncMock(return_value=(1,))
+
+        candidate_cursor = AsyncMock()
+        candidate_cursor.fetchall = AsyncMock(return_value=[FakeRow("Don Lennon")])
+
+        db._conn = AsyncMock()
+        db._conn.execute = AsyncMock(side_effect=[exact_cursor, candidate_cursor])
+
+        result = await db.find_similar_artist("John Lennon")
+
+        assert result is None
+        db._conn.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_exact_library_artist_resolves_via_real_db(self, tmp_path):
+        """John Lennon / Don Lennon reproduces the exact bug scenario end to end.
+
+        A distractor artist ("Don Lennon") that would otherwise win the
+        candidate-cap race must not cause "John Lennon" -- already an exact
+        library artist -- to be corrected away.
+        """
+        import sqlite3
+
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute("""
+            CREATE TABLE library (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                artist TEXT,
+                call_letters TEXT,
+                artist_call_number INTEGER,
+                release_call_number INTEGER,
+                genre TEXT,
+                format TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE library_fts USING fts5(
+                title, artist,
+                content='library', content_rowid='id'
+            )
+        """)
+        conn.execute(
+            "INSERT INTO library VALUES "
+            "(1, 'Double Fantasy', 'John Lennon', 'L', 1, 1, 'Rock', 'LP')"
+        )
+        conn.execute(
+            "INSERT INTO library VALUES (2, 'Some Album', 'Don Lennon', 'L', 2, 2, 'Rock', 'LP')"
+        )
+        conn.commit()
+        conn.close()
+
+        db = LibraryDB(db_path=db_file)
+        await db.connect()
+
+        result = await db.find_similar_artist("John Lennon")
+        assert result is None
+        await db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1477,6 +1565,7 @@ class TestLibraryDBFindSimilarArtistCache:
 
         mock_cursor = AsyncMock()
         mock_cursor.fetchall = AsyncMock(return_value=[FakeRow("Living Colour")])
+        mock_cursor.fetchone = AsyncMock(return_value=None)
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
 
@@ -1485,7 +1574,7 @@ class TestLibraryDBFindSimilarArtistCache:
 
         assert result1 == "Living Colour"
         assert result1 == result2
-        assert db._conn.execute.call_count == 1
+        assert db._conn.execute.call_count == 2
 
     @pytest.mark.asyncio
     async def test_find_similar_artist_caches_none(self):
@@ -1493,6 +1582,7 @@ class TestLibraryDBFindSimilarArtistCache:
         db = LibraryDB()
         mock_cursor = AsyncMock()
         mock_cursor.fetchall = AsyncMock(return_value=[])
+        mock_cursor.fetchone = AsyncMock(return_value=None)
         db._conn = AsyncMock()
         db._conn.execute = AsyncMock(return_value=mock_cursor)
 
@@ -1501,7 +1591,7 @@ class TestLibraryDBFindSimilarArtistCache:
 
         assert result1 is None
         assert result2 is None
-        assert db._conn.execute.call_count == 1
+        assert db._conn.execute.call_count == 2
 
 
 class TestLibraryDBCacheInvalidation:

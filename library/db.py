@@ -563,10 +563,50 @@ class LibraryDB:
         artist_cache[cache_key] = result
         return result
 
+    async def _artist_exists_exactly(self, artist_lower: str, artist_compare: str) -> bool:
+        """Check whether the typed artist is already an exact library artist.
+
+        Run before any fuzzy candidate search so a name that's already in the
+        library (e.g. "John Lennon") is never "corrected" to a different,
+        merely-similar-scoring artist that happened to survive the candidate cap.
+        """
+        assert self._conn is not None  # Caller validates
+
+        exact_filter = "LOWER(artist) = ? OR LOWER(artist) = ?"
+        unions = [f"SELECT 1 FROM library WHERE {exact_filter}"]
+        params_list = [artist_lower, artist_compare]
+        if self._has_alternate_artist:
+            unions.append(
+                "SELECT 1 FROM library WHERE alternate_artist_name IS NOT NULL "
+                "AND (LOWER(alternate_artist_name) = ? OR LOWER(alternate_artist_name) = ?)"
+            )
+            params_list.extend([artist_lower, artist_compare])
+        if self._has_album_artist:
+            unions.append(
+                "SELECT 1 FROM library WHERE album_artist IS NOT NULL "
+                "AND (LOWER(album_artist) = ? OR LOWER(album_artist) = ?)"
+            )
+            params_list.extend([artist_lower, artist_compare])
+        if self._has_compilation_track_artist:
+            unions.append(
+                "SELECT 1 FROM compilation_track_artist "
+                "WHERE LOWER(artist_name) = ? OR LOWER(artist_name) = ?"
+            )
+            params_list.extend([artist_lower, artist_compare])
+
+        sql = f"SELECT 1 FROM ({' UNION ALL '.join(unions)}) LIMIT 1"
+        cursor = await self._conn.execute(sql, params_list)
+        row = await cursor.fetchone()
+        return row is not None
+
     async def _find_similar_artist_uncached(self, artist: str, threshold: int = 85) -> str | None:
         assert self._conn is not None  # Caller validates
         # Get candidate artists using prefix of first significant word
         artist_lower = artist.lower()
+        artist_compare = strip_leading_article(artist_lower) or artist_lower
+
+        if await self._artist_exists_exactly(artist_lower, artist_compare):
+            return None
 
         # For short names, a single-character difference is proportionally large,
         # so raise the threshold to prevent false corrections (e.g. "Plug" -> "Plugz")
@@ -593,7 +633,6 @@ class LibraryDB:
             for w in words
             if len(w) >= 3 and w != search_word and w not in LEADING_ARTICLES
         )
-        artist_compare = strip_leading_article(artist_lower) or artist_lower
 
         column_filter = " OR ".join("artist LIKE ?" for _ in candidate_patterns)
         unions = [f"SELECT artist AS name FROM library WHERE {column_filter}"]
@@ -619,7 +658,12 @@ class LibraryDB:
             )
             params_list.extend(candidate_patterns)
 
-        sql = f"SELECT DISTINCT name FROM ({' UNION '.join(unions)}) LIMIT 100"
+        sql = (
+            f"SELECT DISTINCT name FROM ({' UNION '.join(unions)}) "
+            "ORDER BY CASE WHEN LOWER(name) = ? OR LOWER(name) = ? THEN 0 ELSE 1 END "
+            "LIMIT 100"
+        )
+        params_list = [*params_list, artist_lower, artist_compare]
         cursor = await self._conn.execute(sql, params_list)
         rows = await cursor.fetchall()
 
