@@ -246,52 +246,6 @@ def _filter_results_by_album_match(
     return kept
 
 
-# Minimum fuzzy score for promoting an artist-fallback row whose *title*
-# matches the requested "song" — i.e. recognising the parsed song as the
-# album the user actually wanted. Set higher than `_ALBUM_MATCH_FLOOR`
-# because the consequence here is asserting the user's intent (album,
-# not track); a borderline match should *not* override the song-not-found
-# message.
-_SONG_AS_ALBUM_TITLE_FLOOR = 90.0
-
-
-def _filter_results_by_song_as_album_title(
-    results: list[LibraryItem],
-    song: str | None,
-) -> list[LibraryItem]:
-    """Pick artist-fallback rows whose title matches the requested song.
-
-    Handles the request shape "on patrol, sun araw" — request-o-matic routes
-    it as ``song="On Patrol"`` / ``artist="Sun Araw"``, but the user typed
-    an album name. The artist+song FTS branch of
-    ``search_library_with_fallback`` surfaces the matching album because
-    the album title contains the song words; per-result track validation
-    then reasonably comes back empty (no track titled "On Patrol" exists on
-    that album — it IS the album) and ``song_not_found`` stays set,
-    producing the misleading 'not on any album' context message about a
-    result sitting in its own list.
-
-    Floor is ``_SONG_AS_ALBUM_TITLE_FLOOR`` (>= 90 via
-    ``rapidfuzz.fuzz.token_set_ratio``) — high enough that a coincidental
-    word overlap won't override the song-not-found path.
-
-    Returns the subset of ``results`` whose normalised title clears the
-    floor against the normalised song. Empty input or whitespace-only song
-    returns ``[]`` cleanly.
-    """
-    if not song or not song.strip() or not results:
-        return []
-    from rapidfuzz import fuzz
-
-    norm_song = normalize_for_comparison(song)
-    matches: list[LibraryItem] = []
-    for item in results:
-        title_norm = normalize_for_comparison(item.title or "")
-        if fuzz.token_set_ratio(norm_song, title_norm) >= _SONG_AS_ALBUM_TITLE_FLOOR:
-            matches.append(item)
-    return matches
-
-
 # V/A series suffixes catalogued in WXYC library as "<base>, vol. N" or close
 # variants. See WXYC/library-metadata-lookup#531 — Discogs returns the canonical
 # release with a long parenthetical subtitle ("Disco Not Disco (Post Punk,

@@ -9,9 +9,13 @@ RELEASE_TITLE / SONG_TITLE skeletons (which dominate the lossy-mojibake
 bucket — 631 of the 815 unmatched rows) also get a fair shot.
 
 Each branch returns a sequence of result dicts plus the ``ExternalSource``
-that produced them. The orchestrator wraps these into synthetic
-``LookupResultItem`` rows so the matcher's existing scoring code applies
-unchanged.
+that produced them. ``search_external_fallback`` is Step 7's dispatch policy
+(artist > album > song precedence, per-branch candidate shaping) over those
+branches; the orchestrator's spine calls only that one function and wraps the
+results into synthetic ``LookupResultItem`` rows via
+``build_external_catalog_item`` — the single construction site for the
+``"(external)"`` sentinel ``LibraryCatalogItem`` (a Backend-Service wire
+contract) — so the matcher's existing scoring code applies unchanged.
 """
 
 from __future__ import annotations
@@ -21,6 +25,8 @@ from typing import Any, Literal
 
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from entity.sources import PgSourceProtocol
+from generated.api_models import LibraryCatalogItem
+from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
 
@@ -256,3 +262,54 @@ async def search_external_tracks(
             logger.warning("MusicBrainz recording fallback query failed: %s", e)
 
     return [], None
+
+
+async def search_external_fallback(
+    parsed: ParsedRequest,
+    *,
+    discogs_cache: DiscogsCacheService | None,
+    mb_pg: PgSourceProtocol | None,
+) -> tuple[list[dict[str, Any]], ExternalSource | None]:
+    """Step 7 dispatch: fuzzy-match whichever skeleton field the request typed.
+
+    The lossy-mojibake matcher sends column-typed bodies, so dispatch is by
+    which skeleton field is set: artist takes precedence (highest-precision
+    lookup), then album, then song. A bare ``raw_message`` with no typed field
+    returns no candidates — LABEL_NAME is too noisy to be useful here.
+
+    Each returned dict carries ``artist``/``title`` keys shaped for
+    ``build_external_catalog_item``.
+    """
+    if parsed.artist:
+        rows, source = await search_external_artists(
+            parsed.artist, discogs_cache=discogs_cache, mb_pg=mb_pg
+        )
+        return [{"artist": r["name"], "title": ""} for r in rows], source
+    if parsed.album:
+        rows, source = await search_external_albums(
+            parsed.album, discogs_cache=discogs_cache, mb_pg=mb_pg
+        )
+        return [{"artist": r["artist"], "title": r["title"]} for r in rows], source
+    if parsed.song:
+        rows, source = await search_external_tracks(
+            parsed.song, discogs_cache=discogs_cache, mb_pg=mb_pg
+        )
+        return [{"artist": r["artist"], "title": r["title"]} for r in rows], source
+    return [], None
+
+
+def build_external_catalog_item(*, artist: str | None, title: str | None) -> LibraryCatalogItem:
+    """Build the ``"(external)"`` sentinel ``LibraryCatalogItem`` for a row-less result.
+
+    Wire contract (Backend-Service string-matches ``call_number == "(external)"``):
+    this is the single construction site for every synthesized ``id=0`` catalog
+    item — both Step 3a's library-miss synthesis (surfaced via the response
+    build's ``items_with_artwork`` path) and Step 7's external-cache fallback.
+    """
+    return LibraryCatalogItem(
+        id=0,
+        artist=artist,
+        title=title or None,
+        call_number="(external)",
+        library_url="",
+    )
