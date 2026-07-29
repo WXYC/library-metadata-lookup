@@ -29,7 +29,7 @@ from generated.api_models import (
     TrackMatchSource,
 )
 from lookup.artwork import _resolve_fallback_artwork, fetch_artwork_for_items
-from lookup.matching import artist_matches_item, filter_results_by_artist
+from lookup.matching import MAX_SEARCH_RESULTS, artist_matches_item, filter_results_by_artist
 from lookup.orchestrator import (
     build_context_message,
     resolve_albums_for_track,
@@ -1325,6 +1325,55 @@ class TestFilterResultsByTrackValidation:
             items, "Flow Coma", "808 State", mock_discogs_service
         )
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_bounded_fan_out_caps_probes_via_chunked_gather(
+        self, mock_discogs_service, monkeypatch
+    ):
+        """LML#808: a wide candidate list (the LML#808 widened artist-only
+        fallback can pass more than ``MAX_SEARCH_RESULTS`` rows) must not fan
+        out into an unbounded per-request Discogs probe burst. Pins the
+        ``LML_SEARCH_MAX_API_CALLS`` cap: chunk 1 fully dispatches, chunk 2
+        never does."""
+        from wxyc_fastapi.observability import get_cache_stats_recorder, init_cache_stats
+
+        monkeypatch.setenv("LML_SEARCH_MAX_API_CALLS", "3")
+        init_cache_stats()
+
+        n_candidates = MAX_SEARCH_RESULTS * 3
+        items = [
+            make_library_item(id=9000 + i, artist="Stereolab", title=f"Album {i}")
+            for i in range(n_candidates)
+        ]
+
+        async def _search(req):
+            get_cache_stats_recorder().record_api_call()
+            return DiscogsSearchResponse(
+                results=[
+                    make_discogs_result(
+                        release_id=50000 + hash(req.album) % 1000,
+                        album=req.album,
+                        artist="Stereolab",
+                    )
+                ]
+            )
+
+        mock_discogs_service.search.side_effect = _search
+        mock_discogs_service.validate_track_on_release.return_value = False
+
+        result = await filter_results_by_track_validation(
+            items, "Some Song", "Stereolab", mock_discogs_service
+        )
+
+        # Nothing validated (validate_track_on_release always False), so the
+        # result is None either way — the assertion that matters is the probe
+        # count, not the return value.
+        assert result is None
+        assert mock_discogs_service.search.await_count == MAX_SEARCH_RESULTS, (
+            f"Expected exactly {MAX_SEARCH_RESULTS} search probes (chunk 1 "
+            f"fully ran, chunk 2 cap-gated), got "
+            f"{mock_discogs_service.search.await_count}. LML#808."
+        )
 
 
 # ---------------------------------------------------------------------------

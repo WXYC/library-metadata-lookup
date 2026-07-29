@@ -41,7 +41,12 @@ import pytest
 import pytest_asyncio
 
 from discogs.cache_service import DiscogsCacheService
-from discogs.models import DiscogsSearchResponse, ReleaseMetadataResponse, TrackReleasesResponse
+from discogs.models import (
+    DiscogsSearchResponse,
+    DiscogsSearchResult,
+    ReleaseMetadataResponse,
+    TrackReleasesResponse,
+)
 from library.db import LibraryDB
 from lookup.models import LookupRequest
 from lookup.orchestrator import perform_lookup
@@ -276,3 +281,71 @@ async def test_cache_absent_leaves_rescue_inert(aphex_library_db, cache_without_
     titles = [r.library_item.title for r in (response.results or [])]
     assert RDJ_TITLE not in titles
     assert response.song_not_found is True
+
+
+def _service_with_live_track_validation(cache_service: DiscogsCacheService) -> AsyncMock:
+    """LML#808: a DiscogsService whose live search+validate probes confirm the
+    track on RDJ specifically — the API-backed path the widened artist-only
+    fallback is meant to reach when the cache doesn't hold the release
+    (``cache_service`` here is the cache-absent fixture, so the #267/#629
+    cache rescue can't help; the *bounded* per-result validation must).
+    """
+    empty_releases = TrackReleasesResponse(track="", artist="", releases=[], total=0, cached=False)
+
+    async def _search(request):
+        album = request.album or ""
+        if album == RDJ_TITLE:
+            return DiscogsSearchResponse(
+                results=[
+                    DiscogsSearchResult(
+                        release_id=RDJ_RELEASE_ID,
+                        release_url=f"https://www.discogs.com/release/{RDJ_RELEASE_ID}",
+                        album=RDJ_TITLE,
+                        artist=ARTIST,
+                    )
+                ]
+            )
+        # The five lower-rowid Aphex albums: Discogs doesn't carry the track.
+        return DiscogsSearchResponse(results=[])
+
+    async def _validate(release_id, song, artist):
+        return release_id == RDJ_RELEASE_ID
+
+    svc = AsyncMock()
+    svc.search = AsyncMock(side_effect=_search)
+    svc.search_releases_by_track = AsyncMock(return_value=empty_releases)
+    svc.search_releases_by_album_title = AsyncMock(return_value=empty_releases)
+    svc.validate_track_on_release = AsyncMock(side_effect=_validate)
+    svc.get_release = AsyncMock(
+        return_value=ReleaseMetadataResponse(
+            release_id=RDJ_RELEASE_ID,
+            title=RDJ_TITLE,
+            artist=ARTIST,
+            release_url=f"https://www.discogs.com/release/{RDJ_RELEASE_ID}",
+        )
+    )
+    svc.cache_service = cache_service
+    return svc
+
+
+@pytest.mark.asyncio
+async def test_cache_miss_surfaces_rdj_via_bounded_api_validation(
+    aphex_library_db, cache_without_rdj
+):
+    """LML#808: with RDJ absent from the cache (so the #267/#629 cache rescue
+    can't help — see ``test_cache_absent_leaves_rescue_inert`` above), the
+    widened artist-only fallback still reaches RDJ in
+    ``filter_results_by_track_validation`` (past the old
+    ``MAX_SEARCH_RESULTS``-by-rowid truncation) and the *bounded* fan-out
+    confirms it via a live Discogs probe. RED before LML#808 (RDJ never
+    reaches validation, only the five lower-rowid rows do); GREEN after."""
+    response = await _run(aphex_library_db, _service_with_live_track_validation(cache_without_rdj))
+
+    titles = [r.library_item.title for r in (response.results or [])]
+    assert RDJ_TITLE in titles, (
+        f"Expected '{RDJ_TITLE}' confirmed via the bounded API validation path, got {titles}"
+    )
+    assert any(r.library_item.id == RDJ_LIBRARY_ID for r in (response.results or [])), (
+        "RDJ should surface as its real high-rowid library row, not a row-less identity"
+    )
+    assert response.song_not_found is False

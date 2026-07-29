@@ -304,6 +304,14 @@ class LookupState:
     read by track validation (3b) to validate the artist's own album against
     Discogs tracklists on the compilation branch."""
 
+    unranked_fallback_candidates: list[LibraryItem] = field(default_factory=list)
+    """LML#808: ``search_state.results`` pre-``limit_results`` truncation
+    (unranked rowid order on the artist-only branch), distinct from
+    ``artist_fallback_results`` above. Written by the search pipeline (step
+    3); track validation (3b) widens to this full set instead of the
+    truncated ``library_results`` when ``song_not_found`` still holds and no
+    compilation was found — now safe since validation's fan-out is bounded."""
+
     matched_via_by_id: dict[int, list[TrackMatchHint]] = field(default_factory=dict)
     """Per-library-id track-match provenance (catalog-track-search §5.1).
     Written by the search pipeline (step 3); read by the response build to set
@@ -584,6 +592,11 @@ async def _step_search_pipeline(
         state.artist_fallback_results = search_state.artist_fallback_results
         state.matched_via_by_id = search_state.matched_via_by_id
         state.timed_out = search_state.timed_out
+        # LML#808: preserve the full, pre-truncation candidate set so track
+        # validation (3b) can widen past the ``limit_results`` cut instead of
+        # only ever seeing the top ``MAX_SEARCH_RESULTS`` rows by rowid.
+        # ``_step_validate_tracks`` decides whether widening actually applies.
+        state.unranked_fallback_candidates = search_state.results
 
         if state.found_on_compilation:
             services.telemetry.record_api_call("discogs")
@@ -653,7 +666,7 @@ async def _step_validate_tracks(
     """Step 3b — validate results against Discogs track data.
 
     READS: ``library_results``, ``found_on_compilation``, ``song_not_found``,
-    ``discogs_titles``, ``artist_fallback_results``.
+    ``discogs_titles``, ``artist_fallback_results``, ``unranked_fallback_candidates``.
     WRITES: ``library_results``, ``song_not_found``, ``discogs_titles``.
 
     Sequences the gate (should step 3b run at all, timed as "track_validation")
@@ -666,8 +679,18 @@ async def _step_validate_tracks(
     on that path, so the gate below never fires. The filter on real_results is
     a defensive guard for any future path that might add id=0 items to
     library_results.
+
+    LML#808: while unconfirmed (``song_not_found`` holds, no compilation
+    found), ``real_results`` widens to ``unranked_fallback_candidates`` instead
+    of the truncated ``library_results``, so a high-rowid album can still
+    reach ``filter_results_by_track_validation`` — safe now that its fan-out
+    is bounded. A confirmed direct match skips the widen; no benefit to it.
     """
     real_results = [r for r in state.library_results if r.id != 0]
+    if state.song_not_found and not state.found_on_compilation:
+        widened = [r for r in state.unranked_fallback_candidates if r.id != 0]
+        if len(widened) > len(real_results):
+            real_results = widened
     should_validate = bool(real_results and parsed.song and parsed.artist) and (
         not state.found_on_compilation or bool(state.artist_fallback_results)
     )
