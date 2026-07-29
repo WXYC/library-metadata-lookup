@@ -207,6 +207,25 @@ def _reset_discogs_pool_singleton():
     _reset()
 
 
+@pytest.fixture(autouse=True)
+def _reset_bio_warm_semaphore():
+    """Suite-wide reset of the bio-warm ``_warm_cache_semaphore`` (LML#748).
+
+    Sibling of ``reset_streaming_warm_state`` for the same failure mode:
+    ``lookup.enrichment.background._warm_cache_semaphore`` is lazily bound to
+    whichever event loop runs the first warm. Under pytest-asyncio's
+    fresh-loop-per-test model, a later test's warm raises ``RuntimeError(...
+    bound to a different event loop)``, which the warmer's blanket except
+    swallows — warms silently no-op for the rest of the session and
+    warm-side-effect assertions flake by test order.
+    """
+    from lookup.enrichment import background as _background_mod
+
+    _background_mod._warm_cache_semaphore = None
+    yield
+    _background_mod._warm_cache_semaphore = None
+
+
 def make_lml_telemetry() -> RequestTelemetry:
     """Build a `RequestTelemetry` with LML's production parameters.
 
