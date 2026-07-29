@@ -90,6 +90,44 @@ async def test_retry_gives_up_when_next_delay_would_exceed_the_deadline(fake_lim
 
 
 @pytest.mark.asyncio
+async def test_retry_gives_up_when_the_deadline_has_already_passed(fake_limiter):
+    """A deadline that is already behind ``time.monotonic()`` (negative
+    remaining budget) still gives up on the first retry decision -- the
+    comparison ``delay > remaining_budget`` doesn't require a positive
+    ``remaining_budget`` to fire, but this pins it explicitly so a future
+    refactor (e.g. clamping ``remaining_budget`` to zero, or an ``if
+    remaining_budget <= 0`` short-circuit that skips the ``delay``
+    comparison) can't silently change the outcome."""
+    breaker = DiscogsCircuitBreaker(failure_threshold=99, remaining_floor=0, cooldown_seconds=60.0)
+
+    client = MagicMock()
+    # Retry-After=1s -- the smallest realistic delay -- against a deadline
+    # that already elapsed 10s ago.
+    client.request = AsyncMock(return_value=_response(429, {"Retry-After": "1"}))
+    service = _make_service(client)
+
+    sleep_spy = AsyncMock()
+
+    with (
+        patch("discogs.service.get_semaphore", return_value=asyncio.Semaphore(5)),
+        patch("discogs.service.get_discogs_rate_gate", return_value=fake_limiter),
+        patch("discogs.service.get_discogs_breaker", return_value=breaker),
+        patch("discogs.service.asyncio.sleep", new=sleep_spy),
+        patch("discogs.service.time.monotonic", return_value=1000.0),
+    ):
+        token = set_retry_budget_deadline(990.0)  # deadline was 10s ago
+        try:
+            result = await service._request_with_retry("GET", "/database/search", max_retries=3)
+        finally:
+            reset_retry_budget_deadline(token)
+
+    assert result is None
+    sleep_spy.assert_not_awaited()
+    assert client.request.await_count == 1
+    assert breaker.state.value == "closed"
+
+
+@pytest.mark.asyncio
 async def test_retry_proceeds_when_the_deadline_can_absorb_the_delay(fake_limiter):
     """Plenty of remaining budget: the retry loop behaves exactly as it did
     pre-#758 -- it sleeps and retries, eventually succeeding."""

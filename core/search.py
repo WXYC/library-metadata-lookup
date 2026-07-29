@@ -849,7 +849,20 @@ async def _run_strategy_pipeline(
     # in the same task after the pipeline returns, mirroring
     # ``_cap_fire_count_var``'s set-at-entry/reset-in-finally propagation
     # across the same ``strategy.attempt`` / ``asyncio.wait_for`` boundary.
-    deadline_token = set_retry_budget_deadline(start + budget_ms / 1000.0)
+    #
+    # Only armed when the CALLER supplied a budget (``caller_budget_ms`` --
+    # the X-Caller-Budget-Ms header, LML#345), not from ``budget_ms`` alone.
+    # ``budget_ms`` is ``resolve_effective_search_budget_ms(caller_budget_ms)``,
+    # which falls back to the env soft default (~4s) when no header was
+    # sent. Arming the retry deadline from that default would cap 429 retry
+    # sleeps at ~4s for every no-header warm-cache/write-path caller,
+    # silently re-imposing the soft budget the loop above deliberately does
+    # NOT enforce for them (see the caller-budget-gate comment below) and
+    # eroding the pre-#758 "keep grinding to the hard cap on empty results"
+    # contract (LML#340/#347) a header-less caller is still entitled to.
+    deadline_token = set_retry_budget_deadline(
+        start + budget_ms / 1000.0 if caller_budget_ms is not None else None
+    )
     try:
         for idx, strategy in enumerate(strategies):
             elapsed_ms = (time.monotonic() - start) * 1000
