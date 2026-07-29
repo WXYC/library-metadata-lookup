@@ -2326,3 +2326,15 @@ class TestLookupStateResultPrecedence:
 
         assert state.result_count == expected_count
         assert state.has_results is (expected_count > 0)
+
+
+class TestLookupStatePromotedSearchStateFields:
+    """LML#750: artist_fallback_results / matched_via_by_id / timed_out ride on
+    ``LookupState`` instead of escaping ``_step_search_pipeline`` on the raw
+    ``SearchState``."""
+
+    def test_defaults(self):
+        state = LookupState()
+        assert state.artist_fallback_results == []
+        assert state.matched_via_by_id == {}
+        assert state.timed_out is False

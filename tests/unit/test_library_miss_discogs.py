@@ -553,7 +553,7 @@ class TestPerformLookupLibraryMissPath:
         )
 
         with patch(
-            "lookup.orchestrator.filter_results_by_track_validation",
+            "lookup.validation.filter_results_by_track_validation",
             new_callable=AsyncMock,
         ) as mock_validate:
             await perform_lookup(request, mock_library_db, mock_discogs_service, telemetry)

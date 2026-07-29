@@ -40,7 +40,15 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/external_search.py": 350,
     "lookup/matching.py": 550,
     "lookup/models.py": 150,
-    "lookup/orchestrator.py": 1300,
+    # Recalibrated 2026-07-29 (LML#750): extracting step 3b's validation cascade
+    # and step 7's external-cache dispatch policy out of the spine dropped it
+    # from 1291 to ~1225 lines. The spine is the known regrowth attractor (its
+    # own history — #944, #750 — is repeated near-miss growth), so this ceiling
+    # is deliberately NOT re-derived from the 1.3x formula (which would reopen
+    # ~370 lines of headroom, i.e. room for another buried concern to
+    # accumulate unnoticed). 1250 keeps just enough slack for an ordinary small
+    # edit while forcing the next real concern straight to extraction.
+    "lookup/orchestrator.py": 1250,
     "lookup/release_resolution.py": 550,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line
@@ -66,7 +74,11 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/streaming_url_postprocess.py": 750,
     "lookup/tail_deadline.py": 150,
     "lookup/timeouts.py": 100,
-    "lookup/validation.py": 300,
+    # Recalibrated 2026-07-29 (LML#750): the step-3b validation cascade
+    # (``apply_track_validation_cascade``) and the LML#717 song-as-album-title
+    # promotion moved in from the spine, carrying this file from 243 to ~395
+    # lines. Smallest multiple of 50 at or above 1.3x the post-change size.
+    "lookup/validation.py": 550,
 }
 
 
