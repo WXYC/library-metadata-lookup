@@ -12,15 +12,23 @@ burst is meant to be run, under human supervision, against staging.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from scripts import gate0_burst
 from scripts.gate0_burst import (
+    _MAX_SAFE_TOTAL,
     GATE0_QUERIES,
+    RequestOutcome,
+    build_report,
     check_burst_size_within_safe_bounds,
     classify_warm_cold,
     is_shed_response,
     parse_server_timing,
     percentile,
+    render_human,
+    run_burst,
     summarize_durations,
 )
 
@@ -154,15 +162,18 @@ class TestIsShedResponse:
 
 class TestCheckBurstSizeWithinSafeBounds:
     def test_modest_defaults_pass(self):
-        assert check_burst_size_within_safe_bounds(concurrency=3, total=12, smoke=False) is None
+        assert (
+            check_burst_size_within_safe_bounds(concurrency=3, total=12, smoke=False, warm=True)
+            is None
+        )
 
     def test_oversized_concurrency_rejected(self):
-        msg = check_burst_size_within_safe_bounds(concurrency=50, total=12, smoke=False)
+        msg = check_burst_size_within_safe_bounds(concurrency=50, total=12, smoke=False, warm=True)
         assert msg is not None
         assert "concurrency" in msg.lower()
 
     def test_oversized_total_rejected(self):
-        msg = check_burst_size_within_safe_bounds(concurrency=3, total=500, smoke=False)
+        msg = check_burst_size_within_safe_bounds(concurrency=3, total=500, smoke=False, warm=False)
         assert msg is not None
         assert "total" in msg.lower()
 
@@ -170,7 +181,33 @@ class TestCheckBurstSizeWithinSafeBounds:
         """--smoke targets /health, not /lookup -- no Discogs risk, so the
         burst-size rail (which exists to protect the shared Discogs budget)
         does not apply."""
-        assert check_burst_size_within_safe_bounds(concurrency=50, total=500, smoke=True) is None
+        assert (
+            check_burst_size_within_safe_bounds(concurrency=50, total=500, smoke=True, warm=True)
+            is None
+        )
+
+    def test_prewarm_counts_toward_total_ceiling(self):
+        """Finding 4 (LML#983 review): with --warm on, the prewarm pass fires
+        len(GATE0_QUERIES) extra live /lookup calls beyond --total. The
+        shared-Discogs-budget ceiling must count them, or it silently
+        understates the real live-request volume by that many."""
+        n_prewarm = len(GATE0_QUERIES)
+        # A --total that sits just under the raw ceiling but goes over once the
+        # prewarm pass is counted.
+        over_with_prewarm = _MAX_SAFE_TOTAL - n_prewarm + 1
+        assert (
+            check_burst_size_within_safe_bounds(
+                concurrency=3, total=over_with_prewarm, smoke=False, warm=True
+            )
+            is not None
+        )
+        # The same --total without a prewarm pass stays within budget.
+        assert (
+            check_burst_size_within_safe_bounds(
+                concurrency=3, total=over_with_prewarm, smoke=False, warm=False
+            )
+            is None
+        )
 
 
 class TestGate0Queries:
@@ -195,3 +232,60 @@ class TestGate0Queries:
 
     def test_at_least_one_ordinary_artist_album_query(self):
         assert any(q.get("album") for q in GATE0_QUERIES)
+
+
+class TestRunBurstAccounting:
+    """The prewarm pass must be kept out of the aggregated measurement."""
+
+    def test_prewarm_outcomes_excluded_from_burst_measurement(self, monkeypatch):
+        """Finding 1 (LML#983 review): the --warm pass fires deliberately-cold
+        requests (one per query) to reproduce the issue trace's warm-one/
+        cold-others shape. Those prewarm outcomes must NOT land in the same
+        series build_report aggregates, or they inflate p95/p99/max and the
+        warm/cold split that the Gate 0 decision reads -- so an N=1 run that
+        genuinely collapses to all-warm would still show a false residual cold
+        signal from the guaranteed-cold prewarm hits."""
+
+        async def _stub_lookup(client, host, api_key, query, timeout):
+            return RequestOutcome(
+                label=str(query.get("label", "lookup")),
+                status_code=200,
+                client_wall_ms=10.0,
+                lml_wall_ms=10.0,
+            )
+
+        monkeypatch.setattr(gate0_burst, "_fire_lookup", _stub_lookup)
+
+        result = asyncio.run(
+            run_burst(
+                host="http://x",
+                api_key="k",
+                concurrency=2,
+                total=4,
+                warm=True,
+                smoke=False,
+                timeout=1.0,
+            )
+        )
+
+        assert len(result.prewarm_outcomes) == len(GATE0_QUERIES)
+        assert len(result.outcomes) == 4
+        # build_report over the burst series sees only the 4 burst requests.
+        report = build_report(result.outcomes, 500.0)
+        assert report["total_requests"] == 4
+
+
+class TestRenderHuman:
+    def test_smoke_mode_omits_misleading_server_timing_warning(self):
+        """Finding 2 (LML#983 review): GET /health emits no Server-Timing
+        header, so server_timing_present is ALWAYS false under --smoke.
+        render_human must not tell the operator LML_EMIT_SERVER_TIMING is off
+        in that case -- it's expected, not a config fault."""
+        report = build_report([], 500.0, smoke=True)
+        text = render_human(report)
+        assert "LML_EMIT_SERVER_TIMING" not in text
+
+    def test_non_smoke_missing_server_timing_still_warns(self):
+        report = build_report([], 500.0, smoke=False)
+        text = render_human(report)
+        assert "LML_EMIT_SERVER_TIMING" in text
