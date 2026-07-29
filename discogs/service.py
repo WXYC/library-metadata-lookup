@@ -8,6 +8,7 @@ import random
 import time
 import weakref
 from collections.abc import Iterator
+from contextvars import ContextVar, Token
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -84,6 +85,37 @@ DISCOGS_API_BASE = "https://api.discogs.com"
 # seconds; once we cross that, the bucket has reset and there's no benefit to
 # waiting longer for the same 429.
 _MAX_RETRY_DELAY_SECONDS = 60.0
+
+# LML#758: absolute ``time.monotonic()`` deadline for the caller budget
+# (X-Caller-Budget-Ms / LML#345) governing the search pipeline currently
+# running in this task. Set at ``core.search._run_strategy_pipeline`` entry
+# (mirroring ``core.search._cap_fire_count_var``'s set-at-entry/reset-in-
+# finally propagation) and read by ``_request_with_retry`` to cap the 429
+# retry-backoff sleep against the caller's remaining time instead of riding
+# the retry loop's up-to-60s ceiling blind to it. ``None`` when no pipeline
+# deadline is active -- the four API-only Discogs seam methods that bypass
+# the search pipeline, and any direct-call unit test -- so the retry loop
+# falls back to the pre-#758 attempt-count-only bound.
+_retry_budget_deadline_var: ContextVar[float | None] = ContextVar(
+    "lml_discogs_retry_budget_deadline", default=None
+)
+
+
+def set_retry_budget_deadline(deadline: float | None) -> Token:
+    """Set the active caller-budget deadline for the 429 retry loop; returns a reset token.
+
+    ``deadline`` is an absolute ``time.monotonic()`` value, not a duration.
+    Callers must ``reset_retry_budget_deadline(token)`` in a ``finally`` so
+    the deadline doesn't leak into whatever runs next in the same task after
+    the pipeline returns (LML#758, mirroring ``core.search._cap_fire_count_var``).
+    """
+    return _retry_budget_deadline_var.set(deadline)
+
+
+def reset_retry_budget_deadline(token: Token) -> None:
+    """Undo :func:`set_retry_budget_deadline`; see its docstring."""
+    _retry_budget_deadline_var.reset(token)
+
 
 # LML#755 saturation-breaker counter. Emitted on the #683 ``cache.*`` counter
 # surface (``get_cache_stats_recorder().record(...)``) every time a live Discogs
@@ -739,6 +771,34 @@ class DiscogsService:
                 if attempt < max_retries:
                     retry_after = response.headers.get("Retry-After")
                     delay = _compute_retry_delay(attempt, retry_after)
+
+                    # LML#758: don't sleep past the caller's remaining budget.
+                    # A deadline is only active when this call is running
+                    # inside a search pipeline (``core.search._run_strategy_
+                    # pipeline`` sets it); direct/API-only callers see ``None``
+                    # and keep the pre-#758 attempt-count-only bound.
+                    deadline = _retry_budget_deadline_var.get()
+                    if deadline is not None:
+                        remaining_budget = deadline - time.monotonic()
+                        if delay > remaining_budget:
+                            logger.warning(
+                                "Discogs rate limit hit, remaining caller budget "
+                                "(%.2fs) can't absorb the next retry delay "
+                                "(%.2fs); giving up early instead of sleeping "
+                                "past the deadline",
+                                remaining_budget,
+                                delay,
+                            )
+                            # Same terminal accounting as retries-exhausted
+                            # below: this attempt's response is a genuine 429,
+                            # so the breaker still learns from it. The `None`
+                            # return is the existing "unknown, not confirmed-
+                            # empty" degrade contract every caller of
+                            # `_request_with_retry` already honors (LML#755).
+                            recorded = True
+                            breaker.record_failure(remaining=remaining_value, epoch=epoch)
+                            return None
+
                     logger.warning(
                         f"Discogs rate limit hit, retrying in {delay:.2f}s "
                         f"(attempt {attempt + 1}/{max_retries + 1}, "
