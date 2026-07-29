@@ -130,18 +130,24 @@ _COMMENTS: dict[str, str] = {
     "DO $catalog_check$": """\
 -- Widen-only maintenance of the named service CHECK, so an already-created
 -- table (where CREATE TABLE IF NOT EXISTS is a no-op) picks up service values
--- added after its creation. Deparses the deployed constraint, extracts its
--- quoted literals, and rewrites only when the shipped set adds something —
--- merging, never narrowing (a rollback deploy must not abort the bootstrap
--- against rows using a newer service), and skipping the rewrite entirely on a
--- steady-state boot (stable constraint OID, no ACCESS EXCLUSIVE lock, no
--- re-validation scan). The rewrite emits the IN (...) form on purpose: PG
--- deparses IN as = ANY (ARRAY[...]) and the extraction reads quoted literals
--- from that deparse; an array-literal constant would deparse as ONE literal
--- and corrupt the next boot's extraction. When the constraint is ABSENT
--- (dropped out-of-band), the re-ADD folds in every service value already
--- live in the table, so a recovery boot can't brick on rows outside the
--- shipped set.""",
+-- added after its creation. Deparses the deployed constraint and
+-- distinguishes three states: PARSEABLE (matches the exact
+-- service = ANY (ARRAY[...]) shape this bootstrap emits; quoted literals are
+-- extracted with a quote-aware pattern -- handles an escaped quote inside a
+-- literal, e.g. 'o''brien' -- and round-tripped before being trusted, then
+-- merged only when the shipped set adds something, never narrowing, skipping
+-- the rewrite entirely on a steady-state boot); ABSENT (dropped out-of-band;
+-- the re-ADD folds in every service value already live in the table so a
+-- recovery boot can't brick on rows outside the shipped set); and
+-- FOREIGN-FORM (a hand-repaired regex CHECK, an array-literal constant, or
+-- anything the round-trip can't reproduce byte-for-byte -- policy is WARN
+-- AND SKIP: RAISE WARNING naming the unparsed deparse and leave the
+-- constraint untouched, never drop-and-rebuild or rebuild-from-live-rows,
+-- since a foreign form implies deliberate out-of-band operator action). The
+-- rewrite emits the IN (...) form on purpose: PG deparses IN as
+-- = ANY (ARRAY[...]) and the extraction reads quoted literals from that
+-- deparse; an array-literal constant would deparse as ONE literal and
+-- corrupt the next boot's extraction.""",
     "CREATE INDEX IF NOT EXISTS idx_streaming_album_service_status": """\
 -- Pending-scan support for the pipelines ("next albums to probe on service
 -- X"), mirroring the legacy per-service status indexes. Shape is provisional

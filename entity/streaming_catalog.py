@@ -30,7 +30,7 @@ Distinct from the runtime ``lml_cache.album_streaming_url_cache`` (lookup
 post-process cache keyed on normalized request strings): this is the offline
 catalog keyed on library-album identity. Do not conflate them.
 
-**No-regress guards.** ``BEFORE UPDATE OR DELETE`` row triggers plus ``BEFORE
+**No-regress guards.** ``BEFORE DELETE OR UPDATE`` row triggers plus ``BEFORE
 TRUNCATE`` statement triggers on all four tables structurally replace the
 #672 whole-file coverage guard: any DML transition that would discard
 collected streaming data is rejected at the database, not detected after the
@@ -202,23 +202,42 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album_service (
 # EXCLUSIVE lock plus a full re-validation scan on EVERY boot, and (b) narrow
 # the constraint under a rollback deploy, aborting the whole bootstrap
 # transaction against collected rows that use a service the older code
-# doesn't ship. This DO block instead deparses the deployed constraint,
-# extracts its quoted literals, and rewrites only when the shipped
-# ``_SERVICES`` adds something — merging, never narrowing, and leaving the
-# constraint (and its OID) untouched on a steady-state boot. The rewrite must
-# emit the ``service IN (...)`` form: PG deparses IN as ``= ANY (ARRAY[...])``
-# and the extraction reads the quoted literals out of that deparse, whereas an
+# doesn't ship. This DO block deparses the deployed constraint and
+# distinguishes three states (LML#890):
+#
+# * PARSEABLE — the deparse matches the exact ``service = ANY (ARRAY[...])``
+#   shape this bootstrap itself emits (PG's canonical deparse of ``service IN
+#   (...)``). Its quoted literals are extracted with a quote-aware pattern
+#   (handles an escaped quote inside a literal, e.g. ``'o''brien'``, without
+#   fragmenting it) and the extraction is round-tripped — rebuilt and diffed
+#   against the deparsed array — before being trusted. Merges only when the
+#   shipped ``_SERVICES`` adds something, leaving the constraint (and its
+#   OID) untouched on a steady-state boot.
+# * ABSENT — dropped out-of-band. The re-ADD folds in every service value
+#   already live in the table, so the recovery boot's re-validation can't
+#   fail against collected out-of-set rows — which would otherwise abort
+#   EVERY subsequent bootstrap until manual repair.
+# * FOREIGN-FORM — deployed but not in a shape this bootstrap can confidently
+#   parse: a hand-repaired regex CHECK, an ``= ANY`` array-literal constant
+#   instead of ``ARRAY[...]``, or anything the round-trip can't reproduce
+#   byte-for-byte. Policy (decided LML#890): WARN AND SKIP — ``RAISE
+#   WARNING`` naming the unparsed deparse and leave the constraint untouched.
+#   Never drop-and-rebuild or rebuild-from-live-rows here: a foreign form
+#   implies deliberate out-of-band operator action, and guessing at a
+#   replacement risks silently narrowing what the operator installed.
+#
+# The rewrite (PARSEABLE-widen and ABSENT-recovery) must emit the
+# ``service IN (...)`` form: PG deparses IN as ``= ANY (ARRAY[...])`` and the
+# extraction reads the quoted literals out of that deparse, whereas an
 # array-literal Const (``'{...}'::text[]``) deparses as ONE literal and would
-# corrupt the next boot's extraction. When the constraint is ABSENT (dropped
-# out-of-band), the re-ADD folds in every service value already live in the
-# table, so the recovery boot's re-validation can't fail against collected
-# out-of-set rows — which would otherwise abort EVERY subsequent bootstrap
-# until manual repair.
+# corrupt the next boot's extraction.
 _DDL_ALBUM_SERVICE_WIDEN_CHECK = f"""\
 DO $catalog_check$
 DECLARE
     existing_def text;
+    inner_array text;
     existing_services text[];
+    rebuilt_array text;
     code_services text[] := ARRAY[
         {_SERVICE_IN_LIST}];
     merged_list text;
@@ -228,8 +247,25 @@ BEGIN
         WHERE conrelid = 'lml_cache.streaming_album_service'::regclass
             AND conname = 'streaming_album_service_valid';
     IF existing_def IS NOT NULL THEN
-        SELECT array_agg(m[1]) INTO existing_services
-            FROM regexp_matches(existing_def, '''([^'']+)''', 'g') AS m;
+        inner_array := substring(
+            existing_def FROM '^CHECK \\(\\(service = ANY \\(ARRAY\\[(.*)\\]\\)\\)\\)$'
+        );
+        IF inner_array IS NULL THEN
+            RAISE WARNING 'streaming_album_service_valid: deployed CHECK (%) is not in the '
+                'expected service = ANY (ARRAY[...]) shape this bootstrap can parse; '
+                'leaving it untouched (foreign-form policy: warn-and-skip)', existing_def;
+            RETURN;
+        END IF;
+        SELECT array_agg(replace(m[1], '''''', '''')) INTO existing_services
+            FROM regexp_matches(inner_array, '''((?:[^'']|'''')*)''', 'g') AS m;
+        SELECT string_agg(quote_literal(s) || '::text', ', ') INTO rebuilt_array
+            FROM unnest(existing_services) AS s;
+        IF rebuilt_array IS DISTINCT FROM inner_array THEN
+            RAISE WARNING 'streaming_album_service_valid: deployed CHECK (%) has literals this '
+                'bootstrap could not confidently round-trip; leaving it untouched '
+                '(foreign-form policy: warn-and-skip)', existing_def;
+            RETURN;
+        END IF;
         IF existing_services @> code_services THEN
             RETURN;
         END IF;
@@ -338,7 +374,7 @@ _DDL_GUARD_ALBUM_FN = f"""\
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_album()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $$
+AS $function$
 BEGIN
     IF current_setting('{ALLOW_URL_REMOVAL_GUC}', true) = 'on' THEN
         IF TG_OP = 'DELETE' THEN
@@ -381,7 +417,7 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$\
+$function$\
 """
 
 # All four row triggers deliberately carry no ``UPDATE OF`` column list: an
@@ -391,7 +427,7 @@ $$\
 # bodies. Fire on every UPDATE; the function decides.
 _DDL_GUARD_ALBUM_TRIGGER = """\
 CREATE OR REPLACE TRIGGER streaming_album_no_regress
-BEFORE UPDATE OR DELETE ON lml_cache.streaming_album
+BEFORE DELETE OR UPDATE ON lml_cache.streaming_album
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_album()\
 """
 
@@ -411,7 +447,7 @@ _DDL_GUARD_ALBUM_SERVICE_FN = f"""\
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_album_service()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $$
+AS $function$
 BEGIN
     IF current_setting('{ALLOW_URL_REMOVAL_GUC}', true) = 'on' THEN
         IF TG_OP = 'DELETE' THEN
@@ -466,12 +502,12 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$\
+$function$\
 """
 
 _DDL_GUARD_ALBUM_SERVICE_TRIGGER = """\
 CREATE OR REPLACE TRIGGER streaming_album_service_no_regress
-BEFORE UPDATE OR DELETE ON lml_cache.streaming_album_service
+BEFORE DELETE OR UPDATE ON lml_cache.streaming_album_service
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_album_service()\
 """
 
@@ -486,7 +522,7 @@ _DDL_GUARD_TRACK_RESULT_FN = f"""\
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_track_result()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $$
+AS $function$
 BEGIN
     IF current_setting('{ALLOW_URL_REMOVAL_GUC}', true) = 'on' THEN
         IF TG_OP = 'DELETE' THEN
@@ -538,12 +574,12 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$\
+$function$\
 """
 
 _DDL_GUARD_TRACK_RESULT_TRIGGER = """\
 CREATE OR REPLACE TRIGGER streaming_track_result_no_regress
-BEFORE UPDATE OR DELETE ON lml_cache.streaming_track_result
+BEFORE DELETE OR UPDATE ON lml_cache.streaming_track_result
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_track_result()\
 """
 
@@ -560,7 +596,7 @@ _DDL_GUARD_BASELINE_FN = f"""\
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_coverage_baseline()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $$
+AS $function$
 BEGIN
     IF current_setting('{ALLOW_URL_REMOVAL_GUC}', true) = 'on' THEN
         IF TG_OP = 'DELETE' THEN
@@ -587,12 +623,12 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$\
+$function$\
 """
 
 _DDL_GUARD_BASELINE_TRIGGER = """\
 CREATE OR REPLACE TRIGGER streaming_coverage_baseline_no_regress
-BEFORE UPDATE OR DELETE ON lml_cache.streaming_coverage_baseline
+BEFORE DELETE OR UPDATE ON lml_cache.streaming_coverage_baseline
 FOR EACH ROW EXECUTE FUNCTION lml_cache.guard_streaming_coverage_baseline()\
 """
 
@@ -606,7 +642,7 @@ _DDL_GUARD_TRUNCATE_FN = f"""\
 CREATE OR REPLACE FUNCTION lml_cache.guard_streaming_truncate()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $$
+AS $function$
 BEGIN
     IF current_setting('{ALLOW_URL_REMOVAL_GUC}', true) = 'on' THEN
         RETURN NULL;
@@ -615,7 +651,7 @@ BEGIN
         '{_OPT_IN_HINT}',
         TG_TABLE_NAME;
 END;
-$$\
+$function$\
 """
 
 _DDL_GUARD_ALBUM_TRUNCATE_TRIGGER = """\
@@ -698,6 +734,73 @@ _BOOTSTRAP_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '10s'"
 _BOOTSTRAP_ADVISORY_LOCK = f"SELECT pg_advisory_xact_lock({_BOOTSTRAP_ADVISORY_LOCK_KEY})"
 
 
+# Steady-state idempotency for the 5 functions + 8 triggers (LML#890): a
+# ``CREATE OR REPLACE`` always writes a fresh catalog row even when the
+# definition is byte-identical, and for a TRIGGER that write takes a SHARE ROW
+# EXCLUSIVE lock on the table — a real cost on a boot racing a long pipeline
+# transaction, paid on every single boot even in steady state. Before issuing
+# either form this module compares the shipped statement against the live
+# definition (``pg_get_functiondef`` / ``pg_get_triggerdef``) and skips the
+# replace when they match, so a boot over an already-current schema issues no
+# writes for these statements at all.
+#
+# The comparison is a checksum-by-round-trip, not OID/xmin: PG's own
+# re-rendering re-indents and re-tags dollar-quoting, so a byte comparison
+# against this module's hand-formatted source needs both sides normalized to
+# the same whitespace-collapsed form (``_normalize_definition``) — and the
+# function/trigger DDL below is deliberately authored to match PG's canonical
+# re-rendering choices (the ``$function$`` dollar-quote tag ``pg_get_
+# functiondef`` always uses, and ``DELETE OR UPDATE`` event order, which is
+# how ``pg_get_triggerdef`` canonicalizes ``UPDATE OR DELETE``) so a
+# genuinely unchanged definition round-trips byte-for-byte once normalized.
+def _normalize_definition(text: str) -> str:
+    return " ".join(text.split())
+
+
+_FUNCTION_NAME_RE = re.compile(r"^CREATE OR REPLACE FUNCTION (\S+\(\))")
+_TRIGGER_HEADER_RE = re.compile(r"^CREATE OR REPLACE TRIGGER (\S+)\nBEFORE .*? ON (\S+)\n")
+
+
+async def _function_definition_is_unchanged(conn, statement: str) -> bool:
+    """True when ``statement``'s function already matches the live definition.
+
+    ``to_regprocedure`` returns NULL (rather than raising) for a function
+    that doesn't exist yet, so a first boot always falls through to the
+    real ``CREATE OR REPLACE``.
+    """
+    match = _FUNCTION_NAME_RE.match(statement)
+    assert match is not None, f"not a CREATE OR REPLACE FUNCTION statement: {statement[:60]!r}"
+    live_def = await conn.fetchval(
+        "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE oid = to_regprocedure($1)",
+        match.group(1),
+    )
+    return live_def is not None and _normalize_definition(live_def) == _normalize_definition(
+        statement
+    )
+
+
+async def _trigger_definition_is_unchanged(conn, statement: str) -> bool:
+    """True when ``statement``'s trigger already matches the live definition.
+
+    ``pg_get_triggerdef`` never emits ``OR REPLACE`` (it reconstructs from the
+    catalog, not from how the trigger was created), so the desired side of the
+    comparison substitutes ``CREATE TRIGGER`` before normalizing.
+    """
+    match = _TRIGGER_HEADER_RE.match(statement)
+    assert match is not None, f"not a CREATE OR REPLACE TRIGGER statement: {statement[:60]!r}"
+    trigger_name, table_name = match.group(1), match.group(2)
+    live_def = await conn.fetchval(
+        "SELECT pg_get_triggerdef(oid) FROM pg_trigger "
+        "WHERE tgname = $1 AND tgrelid = $2::regclass AND NOT tgisinternal",
+        trigger_name,
+        table_name,
+    )
+    if live_def is None:
+        return False
+    desired = statement.replace("CREATE OR REPLACE TRIGGER", "CREATE TRIGGER", 1)
+    return _normalize_definition(live_def) == _normalize_definition(desired)
+
+
 async def set_up_streaming_catalog_schema(pg: PgSource) -> None:
     """Apply the idempotent streaming-catalog DDL (tables, indexes, guards).
 
@@ -712,13 +815,22 @@ async def set_up_streaming_catalog_schema(pg: PgSource) -> None:
     preamble bounds lock waits and serializes concurrent bootstraps (see the
     constants above). The ``CREATE OR REPLACE`` function/trigger forms are the
     idempotent equivalents of ``IF NOT EXISTS`` (which triggers don't
-    support); replacing an identical definition is a no-op in effect. The
-    service-CHECK maintenance semantics (widen-only, steady-state no-op) are
-    documented on ``_DDL_ALBUM_SERVICE_WIDEN_CHECK`` above.
+    support); a function or trigger statement whose live definition already
+    matches is skipped entirely rather than replaced (see
+    ``_function_definition_is_unchanged`` / ``_trigger_definition_is_unchanged``
+    above) so a steady-state boot takes no lock for it. The service-CHECK
+    maintenance semantics (widen-only, steady-state no-op, foreign-form
+    warn-and-skip) are documented on ``_DDL_ALBUM_SERVICE_WIDEN_CHECK`` above.
     """
     async with pg.acquire() as conn:
         async with conn.transaction():
             await conn.execute(_BOOTSTRAP_LOCK_TIMEOUT)
             await conn.execute(_BOOTSTRAP_ADVISORY_LOCK)
             for statement in _DDL_STATEMENTS:
+                if statement.startswith("CREATE OR REPLACE FUNCTION"):
+                    if await _function_definition_is_unchanged(conn, statement):
+                        continue
+                elif statement.startswith("CREATE OR REPLACE TRIGGER"):
+                    if await _trigger_definition_is_unchanged(conn, statement):
+                        continue
                 await conn.execute(statement)

@@ -620,6 +620,140 @@ class TestServiceCheckWiden:
         assert oid is not None
         assert preserved == 1
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "foreign_form_check",
+        [
+            "service ~ '^[a-z_]+$'",
+            "service = ANY ('{spotify,deezer}'::text[])",
+        ],
+        ids=["hand-repaired-regex", "array-literal-constant"],
+    )
+    async def test_boot_leaves_a_foreign_form_check_untouched(
+        self, pg_pool, pg_source, foreign_form_check
+    ):
+        """Neither a hand-repaired regex CHECK nor an ``= ANY`` array-literal
+        constant deparses into the ``service = ANY (ARRAY[...])`` shape this
+        bootstrap's extraction understands (an array-literal Const deparses
+        as ONE literal, corrupting any attempted split). Policy is
+        warn-and-skip: the boot must complete without raising and the
+        constraint must be left byte-for-byte untouched — never narrowed,
+        never silently replaced with a garbage merge, never aborted."""
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE lml_cache.streaming_album_service "
+                "DROP CONSTRAINT streaming_album_service_valid, "
+                f"ADD CONSTRAINT streaming_album_service_valid CHECK ({foreign_form_check})"
+            )
+            oid_before = await conn.fetchval(_SERVICE_CHECK_OID)
+            def_before = await conn.fetchval(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE oid = $1", oid_before
+            )
+
+        await set_up_streaming_catalog_schema(pg_source)
+
+        async with pg_pool.acquire() as conn:
+            oid_after = await conn.fetchval(_SERVICE_CHECK_OID)
+            def_after = await conn.fetchval(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE oid = $1", oid_after
+            )
+        assert oid_after == oid_before
+        assert def_after == def_before
+
+    @pytest.mark.asyncio
+    async def test_boot_widens_a_narrower_check_preserving_a_quote_bearing_literal(
+        self, pg_pool, pg_source
+    ):
+        """A deployed CHECK narrower than the shipped set (so a widen is
+        required) that also carries a quote-bearing literal -- e.g. an
+        apostrophe-bearing service value folded in by an earlier
+        ABSENT-recovery boot -- must not have that literal's escaped quote
+        fragment the extraction. Pre-hardening, ``'o''brien'`` extracts as two
+        bogus entries {'o', 'brien'}; the merged re-ADD then omits the real
+        ``o'brien`` value entirely, and the ALTER's re-validation scan aborts
+        against the live row still using it -- on every subsequent boot."""
+        album_id = await _make_album(pg_pool)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE lml_cache.streaming_album_service "
+                "DROP CONSTRAINT streaming_album_service_valid, "
+                "ADD CONSTRAINT streaming_album_service_valid "
+                "CHECK (service IN ('spotify', 'deezer', 'o''brien'))"
+            )
+            await conn.execute(
+                _INSERT_SERVICE, album_id, "o'brien", "found", "https://example.test/obrien"
+            )
+
+        await set_up_streaming_catalog_schema(pg_source)
+
+        async with pg_pool.acquire() as conn:
+            preserved = await conn.fetchval(
+                "SELECT count(*) FROM lml_cache.streaming_album_service WHERE service = $1",
+                "o'brien",
+            )
+            # The widened constraint must still admit the full shipped set...
+            await conn.execute(_INSERT_SERVICE, album_id, "bandcamp", "pending", None)
+            # ...and still reject a value from neither set.
+            with pytest.raises(asyncpg.CheckViolationError):
+                await conn.execute(_INSERT_SERVICE, album_id, "myspace", "pending", None)
+        assert preserved == 1
+
+
+@pytest.mark.pg
+class TestSteadyStateNoChurn:
+    """Second boot over an up-to-date schema must not re-issue CREATE OR
+    REPLACE for any of the 5 guard functions or 8 triggers (LML#890): a
+    function replace writes a fresh catalog row and a trigger replace also
+    takes a SHARE ROW EXCLUSIVE lock on its table -- neither is warranted when
+    the live definition already matches. ``xmin`` is the tell: CREATE OR
+    REPLACE always bumps it, even when re-applying an identical definition,
+    while the object's OID stays stable either way (so OID alone can't
+    distinguish a skip from a no-op replace)."""
+
+    @pytest.mark.asyncio
+    async def test_second_boot_does_not_replace_unchanged_functions_or_triggers(
+        self, pg_pool, pg_source
+    ):
+        async with pg_pool.acquire() as conn:
+            procs_before = {
+                r["oid"]: r["xmin"]
+                for r in await conn.fetch(
+                    "SELECT oid, xmin FROM pg_proc WHERE pronamespace = 'lml_cache'::regnamespace"
+                )
+            }
+            triggers_before = {
+                r["oid"]: r["xmin"]
+                for r in await conn.fetch(
+                    "SELECT t.oid, t.xmin FROM pg_trigger t "
+                    "JOIN pg_class c ON c.oid = t.tgrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'lml_cache' AND NOT t.tgisinternal"
+                )
+            }
+        assert len(procs_before) == 5
+        assert len(triggers_before) == 8
+
+        await set_up_streaming_catalog_schema(pg_source)
+
+        async with pg_pool.acquire() as conn:
+            procs_after = {
+                r["oid"]: r["xmin"]
+                for r in await conn.fetch(
+                    "SELECT oid, xmin FROM pg_proc WHERE pronamespace = 'lml_cache'::regnamespace"
+                )
+            }
+            triggers_after = {
+                r["oid"]: r["xmin"]
+                for r in await conn.fetch(
+                    "SELECT t.oid, t.xmin FROM pg_trigger t "
+                    "JOIN pg_class c ON c.oid = t.tgrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'lml_cache' AND NOT t.tgisinternal"
+                )
+            }
+        assert procs_after == procs_before
+        assert triggers_after == triggers_before
+
 
 @pytest.mark.pg
 class TestAlbumRowGuard:
