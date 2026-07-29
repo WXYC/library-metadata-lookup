@@ -61,11 +61,13 @@ from entity.store import EntityStore
 from generated.api_models import CacheStats
 from identity.dependencies import get_entity_store
 from library.db import LibraryDB
+from lookup.admission import ADMISSION_WOULD_SHED_STAT_KEY
 from lookup.caller_reason import record_caller_reason_tag
 from lookup.endpoint_family import (
     ENDPOINT_FAMILY_LOOKUP,
     ENDPOINT_FAMILY_LOOKUP_BULK,
     record_endpoint_family_tag,
+    record_low_priority_tag,
 )
 from lookup.enrichment import SKIPPED_PREFETCH_STAT_KEY
 from lookup.models import (
@@ -261,6 +263,9 @@ _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     # LML#507: top-1 prefetch skip counter, seeded to 0 so the skip rate is an
     # alertable baseline series on the #683 cache.* surface.
     SKIPPED_PREFETCH_STAT_KEY,
+    # LML#930 PR2: admission-shed would-shed counter, seeded to 0 so the rate
+    # is an alertable baseline series even in shadow mode (enforce off).
+    ADMISSION_WOULD_SHED_STAT_KEY,
 )
 """LML-specific keys seeded into every request's cache_stats dict so PostHog
 and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and
@@ -514,6 +519,10 @@ async def handle_lookup(
         # cycle can form.
         caller_class = resolve_caller_class(x_caller_class)
         low_priority = is_low_priority_caller_class(caller_class)
+        # LML#930 PR2: tag the resolved traffic class now that it's known --
+        # must run here (after resolve_caller_class), not at the earlier
+        # _record_event_loop_lag call site, where low_priority is undefined.
+        record_low_priority_tag(low_priority)
         # LML#927: propagate the same down-rank-only signal to the Discogs
         # semaphore gate, deeper than the bulk-global permit above -- so a
         # class-5 request that gets past admission control still can't
@@ -693,6 +702,7 @@ async def handle_lookup(
                         1 for r in results if r.reconciled_identity is not None
                     ),
                     "endpoint_family": ENDPOINT_FAMILY_LOOKUP,
+                    "low_priority": low_priority,
                     **({"caller_reason": x_caller_reason} if x_caller_reason is not None else {}),
                 },
             )
@@ -870,6 +880,9 @@ async def handle_bulk_lookup(
     _record_lml_flag_tags()
     _record_event_loop_lag()
     record_endpoint_family_tag(ENDPOINT_FAMILY_LOOKUP_BULK)
+    # LML#930 PR2: every item on this route is always low priority (mirrors
+    # the unconditional set_discogs_low_priority(True) above).
+    record_low_priority_tag(True)
     record_caller_reason_tag(x_caller_reason)
 
     max_concurrent = max_concurrency_from_env(_BULK_LOOKUP_DEFAULT_CONCURRENCY)
@@ -1053,6 +1066,7 @@ async def handle_bulk_lookup(
                     "error_count": counts["error"],
                     "max_concurrent": max_concurrent,
                     "endpoint_family": ENDPOINT_FAMILY_LOOKUP_BULK,
+                    "low_priority": True,
                     **({"caller_reason": x_caller_reason} if x_caller_reason is not None else {}),
                 },
             )

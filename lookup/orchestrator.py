@@ -29,6 +29,7 @@ from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
 from config.settings import get_settings
+from core.event_loop_lag import get_event_loop_lag_ms
 from core.search import (
     SEARCH_TYPE_NONE,
     SearchState,
@@ -41,6 +42,7 @@ from discogs.lookup import lookup_releases_by_track
 from discogs.models import (
     DiscogsSearchResult,
 )
+from discogs.ratelimit import is_discogs_low_priority
 from discogs.service import DiscogsService
 from entity.library_release_override import get_library_release_overrides
 from entity.sources import PgSource, PgSourceProtocol
@@ -52,6 +54,7 @@ from generated.api_models import (
 )
 from library.db import LibraryDB
 from library.models import LibraryItem
+from lookup.admission import evaluate_admission_shed
 from lookup.artwork import fetch_artwork_for_items
 from lookup.candidate_memo import TrackCandidateMemo
 from lookup.enrichment import enrich_artwork_results
@@ -1127,6 +1130,14 @@ async def perform_lookup(
         parsed, albums_for_search, candidate_memo, state, services
     )
 
+    # LML#930 PR2 admission shed: proactively shed the tail for low-priority
+    # traffic under sustained event-loop pressure — rationale in admission.py.
+    admission_reason = evaluate_admission_shed(
+        low_priority=is_discogs_low_priority(), lag_ms=get_event_loop_lag_ms()
+    )
+    if admission_reason is not None:  # ENFORCE only; always None in shadow mode
+        return _build_degraded_response(state, search_state, degraded_reason=admission_reason)
+
     # LML#755 R2-2 backstop. The runner (`core/search.py`) already catches a
     # Discogs saturation-breaker shed *inside* the search pipeline and degrades
     # to cache-only. This try is defense in depth for the remaining tail steps
@@ -1254,10 +1265,12 @@ def _build_degraded_response(
 
     ``degraded_reason`` names *why* the tail was shed — ``upstream_unavailable``
     for a Discogs saturation-breaker shed (LML#755), ``deadline_exceeded`` for a
-    caller-deadline shed (LML#930) — and is surfaced both on the wire
-    (``degraded=True`` + ``degraded_reason``) and as the filterable
-    ``lml.degraded_reason`` Sentry tag so the canary (wxyc-canary#82) and LML#931
-    can slice degraded-mode rate by cause without decoding response bodies.
+    caller-deadline shed (LML#930 PR1), ``cache_only`` for a load-adaptive
+    admission shed of low-priority work under sustained loop lag (LML#930 PR2) —
+    and is surfaced both on the wire (``degraded=True`` + ``degraded_reason``)
+    and as the filterable ``lml.degraded_reason`` Sentry tag so the canary
+    (wxyc-canary#82) and LML#931 can slice degraded-mode rate by cause without
+    decoding response bodies.
     """
     try:
         sentry_sdk.set_tag("lml.degraded_reason", degraded_reason.value)
