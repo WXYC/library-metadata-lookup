@@ -33,8 +33,10 @@ live Discogs ``/database/search`` calls. This script:
   caller-budget shed, not Discogs saturation, and does not trip this rail.
 - Supports ``--smoke``, which points the burst at ``GET /health`` instead of
   ``POST /api/v1/lookup`` -- zero Discogs risk, no API key required -- to
-  validate the concurrency + Server-Timing-parsing plumbing end-to-end before
-  ever touching the real query set.
+  validate the concurrency + request-firing plumbing before ever touching the
+  real query set. Note ``/health`` emits no ``Server-Timing`` header, so a
+  smoke run does NOT exercise the header parser and reports
+  ``server_timing_present: false`` by design.
 
 Usage::
 
@@ -252,7 +254,7 @@ def is_shed_response(status_code: int, body: dict[str, Any] | None) -> bool:
 
     ``degraded_reason: "deadline_exceeded"`` is deliberately excluded: it
     means the *caller's* budget (``X-Caller-Budget-Ms``) or LML's own hard
-    cap elapsed, which is unrelated to Discogs saturation and must not aborts
+    cap elapsed, which is unrelated to Discogs saturation and must not abort
     a Gate 0 run just because a single slow cold-tail request ran past its
     budget.
     """
@@ -263,7 +265,9 @@ def is_shed_response(status_code: int, body: dict[str, Any] | None) -> bool:
     return bool(body.get("degraded")) and body.get("degraded_reason") == "upstream_unavailable"
 
 
-def check_burst_size_within_safe_bounds(*, concurrency: int, total: int, smoke: bool) -> str | None:
+def check_burst_size_within_safe_bounds(
+    *, concurrency: int, total: int, smoke: bool, warm: bool
+) -> str | None:
     """Return an error message if the requested burst risks the shared Discogs
     budget, or ``None`` if it's within the safe default envelope.
 
@@ -272,6 +276,12 @@ def check_burst_size_within_safe_bounds(*, concurrency: int, total: int, smoke: 
     in the abstract. A caller can override with ``--force``, but the default
     posture is to refuse silently-large bursts rather than let a typo or a
     copy-pasted flag fire an oversized wave at the prod-shared breaker.
+
+    The ``--warm`` prewarm pass fires one extra live ``/lookup`` per distinct
+    query (``len(GATE0_QUERIES)``) *before* the ``total``-sized burst, so the
+    ceiling is checked against the true live-request count (``total`` +
+    prewarm) -- otherwise the rail would understate the real Discogs load by
+    that many calls.
     """
     if smoke:
         return None
@@ -281,11 +291,15 @@ def check_burst_size_within_safe_bounds(*, concurrency: int, total: int, smoke: 
             f"({_MAX_SAFE_CONCURRENCY}); staging shares prod's Discogs token and "
             "breaker. Pass --force to override, under supervision."
         )
-    if total > _MAX_SAFE_TOTAL:
+    prewarm = len(GATE0_QUERIES) if warm else 0
+    effective_total = total + prewarm
+    if effective_total > _MAX_SAFE_TOTAL:
+        prewarm_note = f" (+{prewarm} prewarm)" if prewarm else ""
         return (
-            f"--total {total} exceeds the safe default ceiling ({_MAX_SAFE_TOTAL}); "
-            "staging shares prod's Discogs token and breaker. Pass --force to "
-            "override, under supervision."
+            f"--total {total}{prewarm_note} = {effective_total} live /lookup calls "
+            f"exceeds the safe default ceiling ({_MAX_SAFE_TOTAL}); staging shares "
+            "prod's Discogs token and breaker. Pass --force to override, under "
+            "supervision."
         )
     return None
 
@@ -373,13 +387,21 @@ async def _fire_health(client: httpx.AsyncClient, host: str, timeout: float) -> 
         client_wall_ms=client_wall_ms,
         lml_wall_ms=legs.get(LML_WALL_LEG),
         event_loop_lag_ms=legs.get(EVENT_LOOP_LAG_LEG),
-        shed=resp.status_code == 429 or resp.status_code >= 500,
+        # No response body on /health, so only the status-code arm can fire;
+        # route through is_shed_response so the shed predicate stays single-sourced.
+        shed=is_shed_response(resp.status_code, None),
     )
 
 
 @dataclass
 class BurstResult:
+    # Concurrent-burst outcomes -- the measurement series build_report aggregates.
     outcomes: list[RequestOutcome] = field(default_factory=list)
+    # Sequential --warm prewarm outcomes, kept OUT of the aggregate: they are
+    # deliberately cold (they exist to warm one worker's heap) and would inflate
+    # the burst's p95/p99/max + warm-cold split if folded in (LML#983 review
+    # finding 1). Retained here for transparency / shed-abort accounting only.
+    prewarm_outcomes: list[RequestOutcome] = field(default_factory=list)
     aborted_on_shed: bool = False
 
 
@@ -423,7 +445,7 @@ async def run_burst(
         if warm and not smoke:
             for query in GATE0_QUERIES:
                 outcome = await _fire_lookup(client, host, resolved_api_key, query, timeout)
-                result.outcomes.append(outcome)
+                result.prewarm_outcomes.append(outcome)
                 if outcome.shed:
                     result.aborted_on_shed = True
                     logger.error(
@@ -471,8 +493,18 @@ async def run_burst(
     return result
 
 
-def build_report(outcomes: list[RequestOutcome], warm_threshold_ms: float) -> dict[str, Any]:
-    """Aggregate a list of outcomes into the human/JSON report shape."""
+def build_report(
+    outcomes: list[RequestOutcome], warm_threshold_ms: float, smoke: bool = False
+) -> dict[str, Any]:
+    """Aggregate the concurrent-burst outcomes into the human/JSON report shape.
+
+    ``outcomes`` is the *burst* series only -- the ``--warm`` prewarm outcomes
+    are deliberately excluded upstream (see :class:`BurstResult`) so they don't
+    skew these percentiles. ``smoke`` records whether the run targeted
+    ``GET /health`` (which emits no ``Server-Timing`` header), so the renderer
+    can tell an expected-absent-header smoke run apart from a real
+    ``LML_EMIT_SERVER_TIMING``-is-off fault.
+    """
     client_wall = [o.client_wall_ms for o in outcomes]
     lml_wall = [o.lml_wall_ms for o in outcomes if o.lml_wall_ms is not None]
     event_loop_lag = [o.event_loop_lag_ms for o in outcomes if o.event_loop_lag_ms is not None]
@@ -482,6 +514,7 @@ def build_report(outcomes: list[RequestOutcome], warm_threshold_ms: float) -> di
 
     return {
         "total_requests": len(outcomes),
+        "smoke": smoke,
         "errors": errors,
         "shed_count": shed_count,
         "server_timing_present": bool(lml_wall),
@@ -500,13 +533,26 @@ def render_human(report: dict[str, Any]) -> str:
         f"Total requests: {report['total_requests']}  errors: {report['errors']}  "
         f"shed: {report['shed_count']}"
     )
-    if not report["server_timing_present"]:
+    prewarm_requests = report.get("prewarm_requests", 0)
+    if prewarm_requests:
         lines.append(
-            "WARNING: no Server-Timing header observed on any response -- "
-            "LML_EMIT_SERVER_TIMING may be off on the target, or every request "
-            "errored before a header arrived. Falling back to client-measured "
-            "wall time only for the table below."
+            f"(+{prewarm_requests} prewarm requests fired and excluded from the measurement below)"
         )
+    if not report["server_timing_present"]:
+        if report.get("smoke"):
+            lines.append(
+                "Note: --smoke targets GET /health, which emits no Server-Timing "
+                "header, so lml_wall/event_loop_lag are N/A by design. This run "
+                "validated the concurrency + request-firing plumbing only, not the "
+                "Server-Timing parser."
+            )
+        else:
+            lines.append(
+                "WARNING: no Server-Timing header observed on any response -- "
+                "LML_EMIT_SERVER_TIMING may be off on the target, or every request "
+                "errored before a header arrived. Falling back to client-measured "
+                "wall time only for the table below."
+            )
     lines.append(
         f"Warm/cold split (lml_wall < {report['warm_threshold_ms']:.0f}ms = warm): "
         f"{report['warm_count']} warm / {report['cold_count']} cold"
@@ -590,7 +636,7 @@ def main() -> None:
 
     if not args.force:
         bounds_error = check_burst_size_within_safe_bounds(
-            concurrency=args.concurrency, total=args.total, smoke=args.smoke
+            concurrency=args.concurrency, total=args.total, smoke=args.smoke, warm=args.warm
         )
         if bounds_error:
             print(f"ERROR: {bounds_error}", file=sys.stderr)
@@ -608,7 +654,8 @@ def main() -> None:
         )
     )
 
-    report = build_report(result.outcomes, args.warm_threshold_ms)
+    report = build_report(result.outcomes, args.warm_threshold_ms, smoke=args.smoke)
+    report["prewarm_requests"] = len(result.prewarm_outcomes)
     report["aborted_on_shed"] = result.aborted_on_shed
 
     if args.json:
