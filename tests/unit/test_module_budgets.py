@@ -23,6 +23,9 @@ LOOKUP_ROOT = REPO_ROOT / "lookup"
 #: Repo-relative POSIX path -> maximum physical line count (``wc -l``).
 MODULE_BUDGETS: dict[str, int] = {
     "lookup/__init__.py": 50,
+    # LML#930 PR2: shed policy only (predicate + env resolvers + telemetry
+    # projection + orchestration). 1.3x its ~152-line measured size -> 200.
+    "lookup/admission.py": 200,
     "lookup/artist_resolution.py": 550,
     "lookup/artwork.py": 500,
     "lookup/caller_reason.py": 100,

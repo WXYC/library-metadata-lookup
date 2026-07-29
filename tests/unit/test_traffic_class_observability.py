@@ -31,10 +31,12 @@ from httpx import ASGITransport, AsyncClient
 
 from config.settings import get_settings
 from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+from lookup.admission import ADMISSION_WOULD_SHED_STAT_KEY
 from lookup.endpoint_family import (
     ENDPOINT_FAMILY_LOOKUP,
     ENDPOINT_FAMILY_LOOKUP_BULK,
     record_endpoint_family_tag,
+    record_low_priority_tag,
 )
 from lookup.models import LookupResponse
 from main import app
@@ -72,6 +74,35 @@ class TestRecordEndpointFamilyTag:
             record_endpoint_family_tag(ENDPOINT_FAMILY_LOOKUP)  # must not raise
 
 
+class TestRecordLowPriorityTag:
+    """Direct unit coverage for the LML#930 PR2 traffic-class Sentry-tag helper.
+
+    Mirrors ``TestRecordEndpointFamilyTag``'s shape exactly.
+    """
+
+    def test_records_true(self):
+        set_tag = Mock()
+        with patch("lookup.endpoint_family.sentry_sdk.set_tag", set_tag):
+            record_low_priority_tag(True)
+
+        set_tag.assert_called_once_with("lml.low_priority", "true")
+
+    def test_records_false(self):
+        set_tag = Mock()
+        with patch("lookup.endpoint_family.sentry_sdk.set_tag", set_tag):
+            record_low_priority_tag(False)
+
+        set_tag.assert_called_once_with("lml.low_priority", "false")
+
+    def test_swallows_sdk_errors(self):
+        """Any SDK-side exception is swallowed so observability cannot break /lookup."""
+        with patch(
+            "lookup.endpoint_family.sentry_sdk.set_tag",
+            side_effect=RuntimeError("sentry exploded"),
+        ):
+            record_low_priority_tag(True)  # must not raise
+
+
 def _completed_properties(mock_posthog: Mock) -> dict:
     """Pull the full properties dict off the PostHog ``*_completed`` event.
 
@@ -93,6 +124,7 @@ async def _post(
     mock_posthog: Mock,
     set_tag: Mock,
     mock_settings,
+    headers: dict | None = None,
 ) -> None:
     """POST to a lookup endpoint with ``perform_lookup``, PostHog, and
     ``sentry_sdk.set_tag`` all mocked. Shared scaffolding for both endpoints,
@@ -116,7 +148,7 @@ async def _post(
         ),
     ):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-            resp = await ac.post(endpoint, json=json_body)
+            resp = await ac.post(endpoint, json=json_body, headers=headers or {})
 
     assert resp.status_code == 200
 
@@ -163,3 +195,109 @@ class TestEndpointFamilyWiredIntoHandlers:
             c.args for c in set_tag.call_args_list
         ]
         assert _completed_properties(mock_posthog)["endpoint_family"] == ENDPOINT_FAMILY_LOOKUP_BULK
+
+
+class TestLowPriorityWiredIntoHandlers:
+    """End-to-end (via ASGI client): LML#930 PR2's ``lml.low_priority`` Sentry
+    tag + PostHog property on both handlers.
+
+    ``handle_lookup`` resolves ``low_priority`` from ``X-Caller-Class``
+    (class 5 -> true; classes 1-4, absent, and invalid values -> false, same
+    down-rank-only invariant ``TestCallerClassLowPriorityLane`` in
+    ``test_lookup_router.py`` pins for the bulk-permit routing). ``handle_bulk_lookup``
+    tags/sets it ``true`` unconditionally -- every item on that route is
+    always low priority, regardless of any ``X-Caller-Class`` value sent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_lookup_class_five_tags_and_posthog_property_true(self, mock_settings):
+        mock_posthog = Mock()
+        mock_posthog.capture = Mock()
+        set_tag = Mock()
+
+        await _post(
+            "/api/v1/lookup",
+            LOOKUP_BODY,
+            mock_posthog=mock_posthog,
+            set_tag=set_tag,
+            mock_settings=mock_settings,
+            headers={"X-Caller-Class": "5"},
+        )
+
+        assert ("lml.low_priority", "true") in [c.args for c in set_tag.call_args_list]
+        assert _completed_properties(mock_posthog)["low_priority"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {},
+            {"X-Caller-Class": "1"},
+            {"X-Caller-Class": "2"},
+            {"X-Caller-Class": "3"},
+            {"X-Caller-Class": "4"},
+            {"X-Caller-Class": "0"},
+            {"X-Caller-Class": "6"},
+            {"X-Caller-Class": "not-a-class"},
+        ],
+        ids=[
+            "absent",
+            "class-1",
+            "class-2",
+            "class-3",
+            "class-4",
+            "out-of-range-low",
+            "out-of-range-high",
+            "non-numeric",
+        ],
+    )
+    async def test_lookup_non_class_five_tags_and_posthog_property_false(
+        self, mock_settings, headers
+    ):
+        mock_posthog = Mock()
+        mock_posthog.capture = Mock()
+        set_tag = Mock()
+
+        await _post(
+            "/api/v1/lookup",
+            LOOKUP_BODY,
+            mock_posthog=mock_posthog,
+            set_tag=set_tag,
+            mock_settings=mock_settings,
+            headers=headers,
+        )
+
+        assert ("lml.low_priority", "false") in [c.args for c in set_tag.call_args_list]
+        assert _completed_properties(mock_posthog)["low_priority"] is False
+
+    @pytest.mark.asyncio
+    async def test_bulk_lookup_tags_and_posthog_property_true_unconditionally(self, mock_settings):
+        mock_posthog = Mock()
+        mock_posthog.capture = Mock()
+        set_tag = Mock()
+
+        await _post(
+            "/api/v1/lookup/bulk",
+            {"items": [{"artist": "Stereolab", "album": "Aluminum Tunes"}]},
+            mock_posthog=mock_posthog,
+            set_tag=set_tag,
+            mock_settings=mock_settings,
+            # Even an "escalation" attempt (a low X-Caller-Class value) cannot
+            # move a bulk caller off the low-priority lane -- down-rank only.
+            headers={"X-Caller-Class": "1"},
+        )
+
+        assert ("lml.low_priority", "true") in [c.args for c in set_tag.call_args_list]
+        assert _completed_properties(mock_posthog)["low_priority"] is True
+
+
+class TestAdmissionWouldShedStatKeySeeded:
+    """LML#930 PR2: ``admission_would_shed`` is seeded into
+    ``_LML_CACHE_STATS_EXTRA_KEYS`` so the would-shed rate is an alertable
+    baseline series on the #683 ``cache.*`` surface even at 0 (mirrors
+    ``BREAKER_OPEN_STAT_KEY`` / ``EVENT_LOOP_LAG_STAT_KEY``)."""
+
+    def test_key_is_seeded_in_extra_keys(self):
+        from lookup.router import _LML_CACHE_STATS_EXTRA_KEYS
+
+        assert ADMISSION_WOULD_SHED_STAT_KEY in _LML_CACHE_STATS_EXTRA_KEYS

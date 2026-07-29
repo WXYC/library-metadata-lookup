@@ -50,3 +50,28 @@ def record_endpoint_family_tag(endpoint_family: str) -> None:
         sentry_sdk.set_tag("lml.endpoint_family", endpoint_family)
     except Exception as e:
         logger.warning("Failed to record lml.endpoint_family tag: %s", e)
+
+
+def record_low_priority_tag(low_priority: bool) -> None:
+    """Tag the current Sentry transaction with the resolved low-priority flag (LML#930).
+
+    A pure per-request traffic-class tag, so it lives here beside
+    ``record_endpoint_family_tag`` rather than in ``lookup/admission.py``
+    (which owns shed *policy*, not traffic-class tagging).
+
+    Call-site timing matters: at ``handle_lookup`` this must run AFTER
+    ``resolve_caller_class`` resolves ``low_priority`` (router.py, inside the
+    ``try`` block, ~line 516) — NOT alongside ``record_endpoint_family_tag``'s
+    sibling site next to ``_record_event_loop_lag`` (router.py:492), which
+    runs before the class is resolved and would see an undefined value. A
+    future reader must not "align" this call upward to that earlier site.
+    ``handle_bulk_lookup`` calls this unconditionally with ``True`` — every
+    item on that route is always low priority.
+
+    Observability must not break the request path, so any exception is
+    swallowed at WARNING (matches ``record_endpoint_family_tag``).
+    """
+    try:
+        sentry_sdk.set_tag("lml.low_priority", "true" if low_priority else "false")
+    except Exception as e:
+        logger.warning("Failed to record lml.low_priority tag: %s", e)

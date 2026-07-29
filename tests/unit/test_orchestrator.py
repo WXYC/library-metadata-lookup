@@ -409,6 +409,188 @@ class TestPerformLookupBasic:
 
 
 # ---------------------------------------------------------------------------
+# Tests: perform_lookup - LML#930 PR2 admission shed gate
+# ---------------------------------------------------------------------------
+
+
+class TestAdmissionShedGate:
+    """The admission-shed gate sits right after the search pipeline and before
+    the PR1 tail_steps loop: ``evaluate_admission_shed(low_priority, lag_ms)``.
+    Interactive traffic and shadow mode never observably change the response;
+    enforce mode short-circuits to ``degraded(cache_only)`` before any tail
+    step is awaited.
+    """
+
+    @pytest.mark.asyncio
+    async def test_low_priority_high_lag_enforce_degrades_cache_only(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item, monkeypatch
+    ):
+        """Enforce mode: a low-priority request under sustained loop lag sheds
+        to degraded(cache_only) before the tail runs — the library match
+        survives, no tail step is awaited."""
+        from lookup.admission import ADMISSION_SHED_ENFORCE_ENV_VAR
+
+        monkeypatch.setenv(ADMISSION_SHED_ENFORCE_ENV_VAR, "true")
+        mock_library_db.search.return_value = [queen_item]
+
+        request = LookupRequest(
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="Play A Night at the Opera by Queen",
+        )
+
+        miss_probe = AsyncMock()
+        enrich = AsyncMock()
+        with (
+            patch("lookup.orchestrator.is_discogs_low_priority", return_value=True),
+            patch("lookup.orchestrator.get_event_loop_lag_ms", return_value=900.0),
+            patch("lookup.orchestrator._step_library_miss_probe", miss_probe),
+            patch("lookup.orchestrator._step_enrich_metadata", enrich),
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.degraded is True
+        assert response.degraded_reason == DegradedReason.cache_only
+        assert len(response.results) == 1
+        assert response.results[0].library_item.artist == "Queen"
+        miss_probe.assert_not_awaited()
+        enrich.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_low_priority_high_lag_shadow_tail_still_runs(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item, monkeypatch
+    ):
+        """Shadow mode (enforce unset): the predicate holds and would-shed
+        telemetry is emitted, but the response falls through to the normal
+        tail — byte-identical to pre-PR2 for the wire contract."""
+        from lookup.admission import ADMISSION_SHED_ENFORCE_ENV_VAR
+
+        monkeypatch.delenv(ADMISSION_SHED_ENFORCE_ENV_VAR, raising=False)
+        mock_library_db.search.return_value = [queen_item]
+
+        request = LookupRequest(
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="Play A Night at the Opera by Queen",
+        )
+
+        with (
+            patch("lookup.orchestrator.is_discogs_low_priority", return_value=True),
+            patch("lookup.orchestrator.get_event_loop_lag_ms", return_value=900.0),
+            patch("lookup.admission.project_admission_shed_telemetry") as project,
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.degraded is False
+        assert response.degraded_reason is None
+        assert len(response.results) == 1
+        project.assert_called_once_with(enforced=False, lag_ms=900.0)
+
+    @pytest.mark.asyncio
+    async def test_interactive_high_lag_never_sheds(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item, monkeypatch
+    ):
+        """Interactive traffic (low_priority=False) never sheds, no matter how
+        high the loop lag reads — even with enforce on."""
+        from lookup.admission import ADMISSION_SHED_ENFORCE_ENV_VAR
+
+        monkeypatch.setenv(ADMISSION_SHED_ENFORCE_ENV_VAR, "true")
+        mock_library_db.search.return_value = [queen_item]
+
+        request = LookupRequest(
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="Play A Night at the Opera by Queen",
+        )
+
+        with (
+            patch("lookup.orchestrator.is_discogs_low_priority", return_value=False),
+            patch("lookup.orchestrator.get_event_loop_lag_ms", return_value=9000.0),
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.degraded is False
+        assert response.degraded_reason is None
+        assert len(response.results) == 1
+
+    @pytest.mark.asyncio
+    async def test_lag_none_or_below_threshold_tail_runs(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item, monkeypatch
+    ):
+        """A low-priority request with no gauge sample (``None``) or lag under
+        the threshold runs the tail exactly as today, even with enforce on."""
+        from lookup.admission import ADMISSION_SHED_ENFORCE_ENV_VAR
+
+        monkeypatch.setenv(ADMISSION_SHED_ENFORCE_ENV_VAR, "true")
+        mock_library_db.search.return_value = [queen_item]
+
+        request = LookupRequest(
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="Play A Night at the Opera by Queen",
+        )
+
+        for lag_ms in (None, 10.0):
+            with (
+                patch("lookup.orchestrator.is_discogs_low_priority", return_value=True),
+                patch("lookup.orchestrator.get_event_loop_lag_ms", return_value=lag_ms),
+            ):
+                response = await perform_lookup(
+                    request, mock_library_db, mock_discogs_service, telemetry
+                )
+
+            assert response.degraded is False
+            assert response.degraded_reason is None
+            assert len(response.results) == 1
+
+    @pytest.mark.asyncio
+    async def test_admission_control_low_priority_degrades_before_protected_interactive(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item, monkeypatch
+    ):
+        """The AC test (#930): under one injected high gauge value, a
+        low-priority request sheds to cache_only while an interactive request
+        completes the full tail — proving low-priority degrades first and
+        interactive traffic is protected."""
+        from lookup.admission import ADMISSION_SHED_ENFORCE_ENV_VAR
+
+        monkeypatch.setenv(ADMISSION_SHED_ENFORCE_ENV_VAR, "true")
+        mock_library_db.search.return_value = [queen_item]
+
+        request = LookupRequest(
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="Play A Night at the Opera by Queen",
+        )
+
+        with (
+            patch("lookup.orchestrator.is_discogs_low_priority", return_value=True),
+            patch("lookup.orchestrator.get_event_loop_lag_ms", return_value=900.0),
+        ):
+            low_priority_response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        with (
+            patch("lookup.orchestrator.is_discogs_low_priority", return_value=False),
+            patch("lookup.orchestrator.get_event_loop_lag_ms", return_value=900.0),
+        ):
+            interactive_response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert low_priority_response.degraded is True
+        assert low_priority_response.degraded_reason == DegradedReason.cache_only
+        assert interactive_response.degraded is False
+        assert interactive_response.degraded_reason is None
+
+
+# ---------------------------------------------------------------------------
 # Tests: perform_lookup - intra-spine telemetry spans
 # ---------------------------------------------------------------------------
 
