@@ -21,7 +21,6 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from entity.sources import PgSource
 from entity.track_streaming_url_cache import (
     APPLE_MUSIC_TRACK_SERVICE,
     get_cached_track_streaming_url,
@@ -35,12 +34,6 @@ _ALBUM = "DOGA"
 _SONG = "la paradoja"
 _OTHER_SONG = "eras"
 _TRACK_URL = "https://music.apple.com/us/song/la-paradoja/1234567890"
-
-
-@pytest_asyncio.fixture
-async def pg_source(pg_pool):
-    """A ``PgSource`` borrowing the test pool (no-op close)."""
-    return PgSource(pool=pg_pool)
 
 
 @pytest_asyncio.fixture(autouse=True)

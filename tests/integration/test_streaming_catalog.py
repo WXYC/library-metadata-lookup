@@ -26,7 +26,6 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from entity.sources import PgSource
 from entity.streaming_catalog import (
     _SERVICE_IN_LIST,
     _TABLES,
@@ -83,12 +82,6 @@ _SERVICE_CHECK_OID = (
     "SELECT oid FROM pg_constraint WHERE conname = 'streaming_album_service_valid' "
     "AND conrelid = 'lml_cache.streaming_album_service'::regclass"
 )
-
-
-@pytest_asyncio.fixture
-async def pg_source(pg_pool):
-    """A ``PgSource`` borrowing the test pool (no-op close)."""
-    return PgSource(pool=pg_pool)
 
 
 @pytest_asyncio.fixture(autouse=True)

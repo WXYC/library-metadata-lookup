@@ -24,17 +24,10 @@ from entity.api_keys import (
     revoke_api_key,
     set_up_api_keys_schema,
 )
-from entity.sources import PgSource
 from tests.integration.conftest import skip_if_named_tables_populated
 
 _CALLER = "wxyc-canary"
 _TOKEN = "lml_test-token-do-not-use"
-
-
-@pytest_asyncio.fixture
-async def pg_source(pg_pool):
-    """A ``PgSource`` borrowing the test pool (no-op close)."""
-    return PgSource(pool=pg_pool)
 
 
 @pytest_asyncio.fixture(autouse=True)

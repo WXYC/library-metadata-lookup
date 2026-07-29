@@ -26,19 +26,12 @@ from entity.library_release_override import (
     get_library_release_overrides,
     set_up_library_release_override_schema,
 )
-from entity.sources import PgSource
 from tests.integration.conftest import skip_if_named_tables_populated
 
 _INSERT_SQL = (
     "INSERT INTO lml_cache.library_release_override "
     "(library_id, discogs_release_id) VALUES ($1, $2)"
 )
-
-
-@pytest_asyncio.fixture
-async def pg_source(pg_pool):
-    """A ``PgSource`` borrowing the test pool (no-op close)."""
-    return PgSource(pool=pg_pool)
 
 
 @pytest_asyncio.fixture(autouse=True)
