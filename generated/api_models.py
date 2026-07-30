@@ -1189,7 +1189,10 @@ class LibraryCatalogItem(BaseModel):
         ...,
         description='Full call number for shelf lookup, e.g. "Rock CD ABC 123/45". Computed from genre, format, call_letters, artist_call_number, and release_call_number.\n',
     )
-    library_url: str = Field(..., description="URL to view this release in the WXYC library")
+    library_url: str = Field(
+        ...,
+        description="Per-release dj.wxyc.org permalink for this release. Points at the dj-site legacy front door `/dashboard/album/legacy/{id}`, which resolves the legacy library `id` to the canonical release route server-side and 308-redirects. Empty string for a row-less result (`id == 0`).\n",
+    )
     on_streaming: bool | None = Field(
         None,
         description="True if this release is available on at least one streaming service. False means only available in the WXYC physical library. Null if unknown.",
@@ -1802,7 +1805,10 @@ class LibrarySearchItem(BaseModel):
     label: str | None = None
     on_streaming: bool | None = None
     call_number: str | None = Field(None, description='Computed call number (e.g. "Rock CD S 1/1")')
-    library_url: str | None = Field(None, description="URL to the release on wxyc.info")
+    library_url: str | None = Field(
+        None,
+        description="Per-release dj.wxyc.org permalink for this release. Points at the dj-site legacy front door `/dashboard/album/legacy/{id}`, which resolves the legacy library `id` to the canonical release route server-side and 308-redirects. Null when unavailable.\n",
+    )
     matched_via: list[TrackMatchHint] | None = Field(
         None,
         description="Populated when a track-title match drove this release into the results (catalog-track-search plan §5.1). Empty or absent when the release matched on artist / title normally. Backward-compatible — existing consumers ignore the field.\n",
