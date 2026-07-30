@@ -56,8 +56,20 @@ class LibraryItem(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def library_url(self) -> str:
-        """URL to view this release in the WXYC library."""
-        return f"http://www.wxyc.info/wxycdb/libraryRelease?id={self.id}"
+        """Per-release permalink for viewing this release in the WXYC library.
+
+        Points at the dj-site legacy front door
+        (``{dj_site_base_url}/dashboard/album/legacy/{id}``), which resolves this
+        legacy library id -- ``self.id`` is the tubafrenzy ``LIBRARY_RELEASE.ID``,
+        NOT the Backend-Service serial -- to the canonical serial route server-side
+        and 308-redirects (WXYC/dj-site#1050). The lazy ``get_settings()`` import
+        mirrors ``library/db.py`` and avoids an import cycle; it is ``lru_cache``d,
+        so calling it per render is cheap.
+        """
+        from config.settings import get_settings
+
+        base_url = get_settings().dj_site_base_url.rstrip("/")
+        return f"{base_url}/dashboard/album/legacy/{self.id}"
 
     def to_catalog_item(self) -> LibraryCatalogItem:
         """Convert to the API contract model (generated from wxyc-shared/api.yaml)."""
