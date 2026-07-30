@@ -1055,7 +1055,7 @@ class TestHandleLookup:
         assert resp.status_code == 200
         library_item = resp.json()["results"][0]["library_item"]
         assert library_item["call_number"] == "Rock CD S 1/1"
-        assert library_item["library_url"] == "http://www.wxyc.info/wxycdb/libraryRelease?id=10"
+        assert library_item["library_url"] == "https://dj.wxyc.org/dashboard/album/legacy/10"
 
 
 class TestCallerClassLowPriorityLane:

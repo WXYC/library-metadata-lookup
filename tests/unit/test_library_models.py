@@ -56,14 +56,14 @@ class TestLibraryItemCallNumber:
 
 class TestLibraryItemLibraryUrl:
     def test_url_format(self):
-        item = LibraryItem(id=42, artist="Queen", title="The Game")
-        assert item.library_url == "http://www.wxyc.info/wxycdb/libraryRelease?id=42"
+        item = LibraryItem(id=42, artist="Stereolab", title="Aluminum Tunes")
+        assert item.library_url == "https://dj.wxyc.org/dashboard/album/legacy/42"
 
     def test_url_included_in_serialization(self):
         item = LibraryItem(id=99)
         data = item.model_dump()
         assert "library_url" in data
-        assert data["library_url"] == "http://www.wxyc.info/wxycdb/libraryRelease?id=99"
+        assert data["library_url"] == "https://dj.wxyc.org/dashboard/album/legacy/99"
 
 
 class TestToCatalogItem:
@@ -104,14 +104,14 @@ class TestToCatalogItem:
     def test_includes_library_url(self):
         item = LibraryItem(id=42)
         catalog = item.to_catalog_item()
-        assert catalog.library_url == "http://www.wxyc.info/wxycdb/libraryRelease?id=42"
+        assert catalog.library_url == "https://dj.wxyc.org/dashboard/album/legacy/42"
 
     def test_minimal_item(self):
         item = LibraryItem(id=5)
         catalog = item.to_catalog_item()
         assert catalog.id == 5
         assert catalog.call_number == ""
-        assert catalog.library_url == "http://www.wxyc.info/wxycdb/libraryRelease?id=5"
+        assert catalog.library_url == "https://dj.wxyc.org/dashboard/album/legacy/5"
 
     def test_excludes_alternate_artist_name(self):
         item = LibraryItem(id=1, alternate_artist_name="Alt Name")

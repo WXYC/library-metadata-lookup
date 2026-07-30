@@ -48,11 +48,11 @@ class TestLibraryCatalogItem:
             artist="Stereolab",
             title="Aluminum Tunes",
             call_number="Rock CD S 1/1",
-            library_url="http://www.wxyc.info/wxycdb/libraryRelease?id=1",
+            library_url="https://dj.wxyc.org/dashboard/album/legacy/1",
         )
         data = item.model_dump()
         assert data["call_number"] == "Rock CD S 1/1"
-        assert data["library_url"] == "http://www.wxyc.info/wxycdb/libraryRelease?id=1"
+        assert data["library_url"] == "https://dj.wxyc.org/dashboard/album/legacy/1"
 
     def test_required_fields(self):
         with pytest.raises(ValueError):
@@ -82,7 +82,7 @@ class TestLookupResultItem:
         catalog = LibraryCatalogItem(
             id=1,
             call_number="Rock CD S 1/1",
-            library_url="http://www.wxyc.info/wxycdb/libraryRelease?id=1",
+            library_url="https://dj.wxyc.org/dashboard/album/legacy/1",
         )
         item = LookupResultItem(library_item=catalog)
         assert item.library_item.id == 1

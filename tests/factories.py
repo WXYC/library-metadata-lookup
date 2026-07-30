@@ -50,7 +50,7 @@ def make_catalog_item(id=1, artist="Stereolab", title="Aluminum Tunes", **kwargs
         "genre": "Rock",
         "format": "CD",
         "call_number": "Rock CD S 1/1",
-        "library_url": f"http://www.wxyc.info/wxycdb/libraryRelease?id={id}",
+        "library_url": f"https://dj.wxyc.org/dashboard/album/legacy/{id}",
     }
     defaults.update(kwargs)
     return LibraryCatalogItem(id=id, artist=artist, title=title, **defaults)

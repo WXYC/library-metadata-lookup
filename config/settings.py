@@ -105,6 +105,18 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, description="Port to run the server on")
     log_level: str = Field(default="INFO", description="Logging level")
 
+    # dj-site integration
+    # Base URL for the per-release permalinks LibraryItem.library_url emits. Consumers
+    # (the `lookup` tool, Slack, Backend-Service, iOS) land on the dj-site legacy front
+    # door `{dj_site_base_url}/dashboard/album/legacy/{id}`, which 308-redirects the
+    # legacy library id (== tubafrenzy LIBRARY_RELEASE.ID, LML's own id) to the canonical
+    # Backend-Service serial route server-side (WXYC/dj-site#1050). Trailing slashes are
+    # trimmed at render time so an override with a stray "/" can't double the separator.
+    dj_site_base_url: str = Field(
+        default="https://dj.wxyc.org",
+        description="dj-site base URL for per-release library permalinks",
+    )
+
     # Feature Flags
     enable_artwork_lookup: bool = Field(
         default=True, description="Enable artwork lookup from external APIs"
