@@ -1,4 +1,4 @@
-"""Comprehensive multi-location union: ``LookupResponse.also_available_on`` (LML#1022).
+"""Comprehensive multi-location union: folds shelf locations into ``results``.
 
 Per the #1018 product decision, ``/lookup`` is WXYC's operational
 physical-library index: on a track query it surfaces the primary match
@@ -8,14 +8,26 @@ already matched. Source is the LML#1019 recall index
 (``lml_cache.compilation_track_location``) alone; this module issues **no**
 live Discogs call.
 
-Gated on the per-request ``include_locations`` opt-in AND the server-side
-``lml_location_union_enabled`` kill switch (``should_run_location_union``).
-The orchestrator launches :func:`resolve_also_available_on` as a concurrent
+Product direction reversed the original LML#1022 shape: a shelf location is
+no longer a separate ``LookupResponse.also_available_on: LibraryLocation[]``
+entry gated by a request opt-in. It is an ordinary ``LookupResultItem``,
+folded directly into ``results`` and tagged via ``matched_via`` (a
+``TrackMatchHint`` with ``source: discogs_release``) -- the same field the
+catalog-track-search work added for exactly this purpose, so dj-site's
+``MatchedTrackChips`` renders a folded location for free. There is no wire
+home for a location that isn't representable as a full result row.
+
+Gated on a song being present AND the server-side ``lml_location_union_enabled``
+kill switch (``should_run_location_union``) AND the caller not being
+low-priority (``not is_discogs_low_priority()``, checked by the orchestrator
+at the task-creation site -- this module has no such check of its own). The
+orchestrator launches :func:`resolve_also_available_on` as a concurrent
 ``asyncio`` task alongside the main search pipeline (a single indexed btree
-probe, cheap enough to hide under that latency) and, once both finish,
-narrows the ranked candidate list to "every OTHER location" with
-:func:`build_also_available_on` -- excluding whichever library ids the main
-pipeline surfaced as the primary result
+probe, cheap enough to hide under that latency) and, once the whole spine
+(including the enrichment tail) resolves, narrows the ranked candidate list
+to "every OTHER location" and converts survivors into ``LookupResultItem``s
+with :func:`build_location_result_items` -- excluding whichever library ids
+already appear in the built response
 (:func:`primary_library_ids_from_results`).
 """
 
@@ -23,20 +35,22 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from config.settings import get_settings
+from discogs.models import DiscogsSearchResult
 from entity.compilation_track_location import (
     CompilationTrackLocationRow,
     get_compilation_track_locations,
 )
 from entity.sources import PgSource
-from generated.api_models import LibraryLocation
+from generated.api_models import TrackMatchHint, TrackMatchSource
 from library.db import LibraryDB
 from library.models import LibraryItem
-from lookup.models import LookupRequest
+from lookup.models import LookupRequest, LookupResultItem
 from services.parser import ParsedRequest
 
 logger = logging.getLogger(__name__)
@@ -47,56 +61,67 @@ then library_id. Any future credit_role value not in this map ranks last."""
 
 
 def should_run_location_union(request: LookupRequest) -> bool:
-    """Gate for the concurrent recall-index probe: request opt-in + song present
-    + the server-side kill switch. Album-only lookups and non-flagged callers
-    (BS enrichment, the CDC firehose) never reach this far -- checked before any
-    PG work runs, so they pay nothing."""
-    if not request.include_locations:
-        return False
+    """Gate for the concurrent recall-index probe: song present + the
+    server-side kill switch. No per-request opt-in -- the union runs by
+    default for every interactive, song-bearing lookup. The low-priority
+    caller-class exclusion (D4) lives at the orchestrator's task-creation
+    site as a separate ``not is_discogs_low_priority()`` check, not here:
+    this module imports no such symbol, and duplicating the check here would
+    just be a second place for the two to drift apart."""
     if not request.song:
         return False
     return get_settings().lml_location_union_enabled
 
 
-def _title_ratio(row: CompilationTrackLocationRow, query_title: str) -> float:
-    """``fuzz.ratio`` between the row's normalized title and the normalized
-    query title. An exact-match probe means every returned row already shares
-    the same normalized ``track_title``, so this is usually a constant within
-    one probe's results -- it only discriminates when to_match_form collapses
-    two distinct raw titles onto the same normalized key."""
-    return fuzz.ratio(row.track_title, normalize_for_comparison(query_title))
+def _title_ratio(row: CompilationTrackLocationRow, normalized_query_title: str) -> float:
+    """``fuzz.ratio`` between the row's normalized title and the caller's
+    already-normalized query title. An exact-match probe means every
+    returned row already shares the same normalized ``track_title``, so this
+    is usually a constant within one probe's results -- it only
+    discriminates when to_match_form collapses two distinct raw titles onto
+    the same normalized key. Takes the normalized title pre-computed rather
+    than normalizing per row: ``to_match_form`` crosses the PyO3 boundary, so
+    doing it once per probe instead of once per candidate row matters when a
+    track has many credited locations."""
+    return fuzz.ratio(row.track_title, normalized_query_title)
 
 
-def _to_library_location(
-    row: CompilationTrackLocationRow, shelf_item: LibraryItem | None
-) -> LibraryLocation:
-    return LibraryLocation(
-        library_id=row.library_id,
-        artist=shelf_item.artist if shelf_item else None,
-        album_title=shelf_item.title if shelf_item else None,
-        track_position=row.track_position,
-        track_title=row.track_title,
-        track_artist=row.track_artist,
-        credit_role=row.credit_role,  # type: ignore[arg-type]
-        discogs_release_id=row.discogs_release_id,
-        artwork_url=row.artwork_url,
-    )
+@dataclass(frozen=True)
+class ResolvedLocation:
+    """One ranked recall-index row, joined to its shelf ``LibraryItem`` when
+    the join found one.
+
+    ``shelf_item`` is ``None`` when the row's ``library_id`` had no match in
+    the shelf-metadata join -- an individual miss, or the whole join
+    degraded to ``{}`` on a PG exception (see
+    :func:`resolve_also_available_on`). :func:`build_location_result_items`
+    skips these: a location with no shelf metadata (artist/title/call
+    number) cannot be rendered as a ``LookupResultItem``. This is a
+    **meaning change** from the pre-fold design, which emitted a bare
+    ``LibraryLocation`` with null ``artist``/``album_title`` on the same
+    degradation -- the fold has no such partial shape, so a join failure now
+    means "no folded locations" for the affected rows, not "locations with
+    blank fields."
+    """
+
+    row: CompilationTrackLocationRow
+    shelf_item: LibraryItem | None
 
 
 async def resolve_also_available_on(
     parsed: ParsedRequest,
     discogs_cache_pg: PgSource | None,
     db: LibraryDB,
-) -> list[LibraryLocation]:
+) -> list[ResolvedLocation]:
     """The concurrent probe body: recall-index lookup -> rank -> shelf-metadata join.
 
     Ranked credit-tier (primary > featured > extra) -> title-ratio (computed
-    on-the-fly against the typed query title, not stored) -> library_id, for a
-    deterministic order before the caller excludes the primary result's own
-    location. Returns every candidate, unfiltered -- exclusion is
-    :func:`build_also_available_on`'s job, run only after the main pipeline's
-    primary result is known, so this probe has no dependency on it and can run
-    fully concurrently.
+    against the typed query title, not stored) -> library_id, for a
+    deterministic order before the caller excludes locations already present
+    in the built response. Returns every candidate, unfiltered -- exclusion
+    and shelf-metadata-miss filtering are :func:`build_location_result_items`'s
+    job, run only after the response is otherwise built, so this probe has no
+    dependency on it and can run fully concurrently.
 
     Degrades to ``[]`` (never raises) when there is no PG source, no typed
     artist (the recall index's key is ``(track_artist, track_title)``), or no
@@ -111,11 +136,12 @@ async def resolve_also_available_on(
     if not rows:
         return []
 
+    normalized_query_title = normalize_for_comparison(parsed.song)
     ranked = sorted(
         rows,
         key=lambda row: (
             _CREDIT_TIER_RANK.get(row.credit_role, len(_CREDIT_TIER_RANK)),
-            -_title_ratio(row, parsed.song),  # type: ignore[arg-type]
+            -_title_ratio(row, normalized_query_title),
             row.library_id,
         ),
     )
@@ -123,28 +149,100 @@ async def resolve_also_available_on(
     try:
         shelf_items = await db.get_items_by_ids([row.library_id for row in ranked])
     except Exception:
-        logger.exception("location-union shelf-metadata join failed; degrading to bare rows")
+        logger.exception("location-union shelf-metadata join failed; degrading to no locations")
         shelf_items = {}
 
-    return [_to_library_location(row, shelf_items.get(row.library_id)) for row in ranked]
+    return [ResolvedLocation(row=row, shelf_item=shelf_items.get(row.library_id)) for row in ranked]
 
 
-def primary_library_ids_from_results(
-    items_with_artwork: Sequence[tuple[LibraryItem, object | None]],
-    library_results: Sequence[LibraryItem],
-) -> set[int]:
-    """The library ids the main pipeline is about to surface as the primary
-    result -- mirrors ``LookupState.result_count``'s own precedence rule
-    (``items_with_artwork`` wins when non-empty)."""
-    if items_with_artwork:
-        return {item.id for item, _ in items_with_artwork}
-    return {item.id for item in library_results}
+def primary_library_ids_from_results(result_items: Sequence[LookupResultItem]) -> set[int]:
+    """Library ids already present in the built response -- the location
+    union's dedup key.
+
+    Reads straight off the final, post-external-cache-fallback
+    ``result_items`` list (the append site awaits this after
+    ``_step_external_cache_fallback``), so a synthetic external-cache row
+    (library id ``0``, no real shelf id -- ``build_external_catalog_item``)
+    is included harmlessly: no real location row ever carries id ``0``, so it
+    can never collide. Does not assume ids are unique or positive -- a plain
+    set tolerates duplicates for free.
+    """
+    return {item.library_item.id for item in result_items}
 
 
-def build_also_available_on(
-    candidates: list[LibraryLocation], primary_library_ids: set[int]
-) -> list[LibraryLocation]:
-    """Every OTHER shelf location: the ranked candidate list minus whatever the
-    main pipeline is already surfacing as the primary result (wxyc-shared#270:
-    'every other ... location')."""
-    return [loc for loc in candidates if loc.library_id not in primary_library_ids]
+def _to_result_item(location: ResolvedLocation) -> LookupResultItem:
+    """Fold one ranked, shelf-joined recall-index row into an ordinary
+    ``LookupResultItem``.
+
+    Builds ``lookup.models.LookupResultItem`` (the ``SerializeAsAny``-artwork
+    override every other result row uses), not the generated class --
+    building the generated class here would serialize a folded row's
+    ``artwork`` differently from every other row. ``library_item`` comes from
+    the joined shelf item's own ``to_catalog_item()``; ``artwork`` is a
+    ``DiscogsSearchResult`` built from the row's precomputed
+    ``discogs_release_id``/``artwork_url`` (no live Discogs call --
+    confidence is fixed at 1.0 because the recall index's population step
+    already matched this comp to a specific Discogs release and fetched its
+    track credits, the same "already validated this request" posture
+    ``lookup/artwork.py``'s ``_bind_resolved_release`` uses for a trust-bind);
+    ``matched_via`` carries the row's own per-track credit
+    (title/artist_credit/position) tagged ``source: discogs_release`` (the
+    recall index is Discogs-release-derived).
+
+    Folded rows deliberately skip identity resolution (step 6) and
+    streaming-status population (step 3c): zero per-location EntityStore or
+    streaming-DB work. Don't "fix" this by running the shelf artist (e.g.
+    "Soundtracks - L") through identity resolution -- that would quietly add
+    per-location PG cost the LML#1019 precomputed index exists to avoid.
+
+    ``credit_role`` (primary/featured/extra) is a ranking-only signal,
+    already spent by :func:`resolve_also_available_on`'s sort -- it has no
+    wire home and is not carried onto the result.
+    """
+    row, shelf_item = location.row, location.shelf_item
+    assert shelf_item is not None, "caller must filter out locations with no shelf item"
+    artwork = DiscogsSearchResult(
+        album=shelf_item.title,
+        artist=shelf_item.artist,
+        release_id=row.discogs_release_id,
+        release_url=f"https://www.discogs.com/release/{row.discogs_release_id}",
+        artwork_url=row.artwork_url,
+        confidence=1.0,
+    )
+    hint = TrackMatchHint(
+        title=row.track_title,
+        artist_credit=row.track_artist,
+        position=row.track_position,
+        source=TrackMatchSource.discogs_release,
+    )
+    return LookupResultItem(
+        library_item=shelf_item.to_catalog_item(),
+        artwork=artwork.to_match_result(),
+        matched_via=[hint],
+    )
+
+
+def build_location_result_items(
+    candidates: list[ResolvedLocation], primary_library_ids: set[int]
+) -> list[LookupResultItem]:
+    """Every OTHER shelf location, folded into ordinary ``LookupResultItem``s.
+
+    Two exclusions, applied per candidate in ranked order: (1) the library id
+    is already present in the built response (wxyc-shared's original "every
+    other ... location" contract, now enforced against the whole response
+    rather than just the primary), and (2) the shelf-metadata join found no
+    ``LibraryItem`` for this row (see :class:`ResolvedLocation` -- skipped,
+    not crashed on, and never emitted as a partial row).
+    """
+    items = []
+    for location in candidates:
+        if location.row.library_id in primary_library_ids:
+            continue
+        if location.shelf_item is None:
+            logger.debug(
+                "location-union: skipping library_id=%d -- no shelf metadata from the join",
+                location.row.library_id,
+            )
+            continue
+        items.append(_to_result_item(location))
+    return items

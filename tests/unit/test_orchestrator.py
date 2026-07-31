@@ -11,11 +11,13 @@ These tests verify perform_lookup() orchestrates the full pipeline:
 All external dependencies (LibraryDB, DiscogsService) are mocked.
 """
 
-from unittest.mock import AsyncMock, patch
+import asyncio
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from discogs.models import DiscogsSearchResponse
+from entity.compilation_track_location import CompilationTrackLocationRow
 from generated.api_models import (
     DegradedReason,
     DiscogsReleaseInfo,
@@ -23,6 +25,7 @@ from generated.api_models import (
     TrackMatchSource,
 )
 from library.models import LibraryItem
+from lookup.location_union import ResolvedLocation
 from lookup.models import LookupRequest, LookupResponse
 from lookup.orchestrator import LookupState, perform_lookup
 from lookup.spine_deadline import LIMIT_CALLER_BUDGET, SpineDeadline
@@ -1550,57 +1553,59 @@ class TestPerformLookupCompilations:
 # ---------------------------------------------------------------------------
 
 
+def _location_row(
+    *,
+    library_id: int = 60654,
+    track_position: str = "A3",
+    track_artist: str = "brian reitzell",
+    track_title: str = "ikebana",
+    credit_role: str = "primary",
+    discogs_release_id: int = 12345,
+    artwork_url: str | None = "https://example.com/lit.jpg",
+) -> CompilationTrackLocationRow:
+    return CompilationTrackLocationRow(
+        library_id=library_id,
+        track_position=track_position,
+        track_artist=track_artist,
+        track_title=track_title,
+        credit_role=credit_role,
+        discogs_release_id=discogs_release_id,
+        artwork_url=artwork_url,
+    )
+
+
 class TestPerformLookupLocationUnion:
-    """``also_available_on``: gating, the byte-identical-off contract, and the
-    Case A / Case B live-repro shapes from LML#271/#1022. ``resolve_also_available_on``
+    """The location union folded transparently into ``results`` -- gating, the
+    kill-switch-off/low-priority no-op contracts, the Case A / Case B
+    live-repro shapes from LML#271/#1022, dedup, the missing-shelf-item skip,
+    non-suppression of the external-cache fallback, degraded-path carry
+    (bounded await), and post-fold telemetry agreement. ``resolve_also_available_on``
     is patched at the orchestrator's import site -- its own ranking/shelf-join
     logic is covered by ``tests/unit/test_location_union.py``; these tests
-    verify orchestration only: the gate, the concurrent-task wiring, and
-    excluding the primary result's own location."""
+    verify orchestration only."""
 
     @pytest.mark.asyncio
-    async def test_flag_off_omits_also_available_on(
-        self, mock_library_db, mock_discogs_service, telemetry, queen_item
-    ):
-        """Default request (no include_locations): response is byte-identical
-        to pre-#1022 -- also_available_on is None, and the probe never runs."""
-        mock_library_db.search.return_value = [queen_item]
-
-        request = LookupRequest(
-            artist="Queen",
-            album="A Night at the Opera",
-            raw_message="Play A Night at the Opera by Queen",
-        )
-
-        with patch(
-            "lookup.orchestrator.resolve_also_available_on", new_callable=AsyncMock
-        ) as resolve_mock:
-            response = await perform_lookup(
-                request, mock_library_db, mock_discogs_service, telemetry
-            )
-
-        assert response.also_available_on is None
-        resolve_mock.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_kill_switch_disabled_omits_also_available_on(
+    async def test_kill_switch_disabled_no_extra_result_rows(
         self, mock_library_db, mock_discogs_service, telemetry, queen_item, monkeypatch
     ):
-        """Server-side kill switch off: even a caller that opts in via
-        include_locations=true gets the pre-#1022 response shape -- an
-        incident can be mitigated with a Railway var flip, no client deploy."""
+        """Server-side kill switch off: no location rows are ever appended,
+        for any caller -- an incident can be mitigated with a Railway var
+        flip, no client deploy. Asserted on the result-row count (D3 removed
+        the separate field itself, so there is no `also_available_on is None`
+        to assert on anymore)."""
         from config.settings import get_settings
 
         monkeypatch.setenv("LML_LOCATION_UNION_ENABLED", "false")
         get_settings.cache_clear()
         try:
             mock_library_db.search.return_value = [queen_item]
+            mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
 
             request = LookupRequest(
                 artist="Queen",
+                song="Bohemian Rhapsody",
                 album="A Night at the Opera",
-                include_locations=True,
-                raw_message="Play A Night at the Opera by Queen",
+                raw_message="Play Bohemian Rhapsody by Queen",
             )
 
             with patch(
@@ -1610,40 +1615,60 @@ class TestPerformLookupLocationUnion:
                     request, mock_library_db, mock_discogs_service, telemetry
                 )
 
-            assert response.also_available_on is None
+            assert len(response.results) == 1
             resolve_mock.assert_not_awaited()
         finally:
             monkeypatch.delenv("LML_LOCATION_UNION_ENABLED", raising=False)
             get_settings.cache_clear()
 
     @pytest.mark.asyncio
-    async def test_case_b_no_primary_match_surfaces_other_location(
+    async def test_low_priority_caller_gets_no_extra_result_rows(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """D4: a low-priority caller (BS enrichment / the CDC firehose /
+        backfills, signaled via ``is_discogs_low_priority()``) never even
+        launches the probe -- class 5 gets no extra result rows, regardless
+        of what the recall index would have returned."""
+        mock_library_db.search.return_value = [queen_item]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Queen",
+            song="Bohemian Rhapsody",
+            album="A Night at the Opera",
+            raw_message="Play Bohemian Rhapsody by Queen",
+        )
+
+        with (
+            patch("lookup.orchestrator.is_discogs_low_priority", return_value=True),
+            patch(
+                "lookup.orchestrator.resolve_also_available_on", new_callable=AsyncMock
+            ) as resolve_mock,
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert len(response.results) == 1
+        resolve_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_case_b_no_primary_match_surfaces_other_location_as_a_normal_result(
         self, mock_library_db, mock_discogs_service, telemetry
     ):
         """'ikebana by brian reitzell' (LML#271 live-repro): the artist has no
-        own release in the library (Case B) -- also_available_on still
-        surfaces the LiT soundtrack location from the recall index alone."""
-        from generated.api_models import LibraryLocation
-
+        own release in the library (Case B) -- the LiT soundtrack location
+        surfaces as an ordinary result, tagged via matched_via, and the
+        response reads found-on-compilation, not not-found."""
         mock_library_db.search.return_value = []
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
 
-        lit_location = LibraryLocation(
-            library_id=60654,
-            artist="Soundtracks - L",
-            album_title="Lost in Translation",
-            track_position="A3",
-            track_title="ikebana",
-            track_artist="brian reitzell",
-            credit_role="primary",
-            discogs_release_id=12345,
-            artwork_url="https://example.com/lit.jpg",
-        )
+        lit_item = LibraryItem(id=60654, title="Lost in Translation", artist="Soundtracks - L")
+        lit_location = ResolvedLocation(row=_location_row(), shelf_item=lit_item)
 
         request = LookupRequest(
             artist="Brian Reitzell",
             song="Ikebana",
-            include_locations=True,
             raw_message="Ikebana by Brian Reitzell",
         )
 
@@ -1656,19 +1681,30 @@ class TestPerformLookupLocationUnion:
                 request, mock_library_db, mock_discogs_service, telemetry
             )
 
-        assert response.also_available_on == [lit_location]
+        assert len(response.results) == 1
+        item = response.results[0]
+        assert item.library_item.id == 60654
+        assert item.library_item.artist == "Soundtracks - L"
+        assert item.library_item.title == "Lost in Translation"
+        assert item.matched_via is not None
+        assert item.matched_via[0].source == TrackMatchSource.discogs_release
+        # Reads as found -- not the "not found in library" miss message.
+        assert response.song_not_found is False
+        assert response.found_on_compilation is True
+        assert response.search_type == "compilation"
+        assert response.context_message == 'Found "Ikebana" by Brian Reitzell on:'
+        assert response.external_source == "library"
 
     @pytest.mark.asyncio
-    async def test_case_a_own_release_matched_plus_other_location(
+    async def test_case_a_own_release_matched_plus_other_location_primary_first(
         self, mock_library_db, mock_discogs_service, telemetry
     ):
         """'tommib by squarepusher' (LML#271 live-repro): the artist's own
-        release (Go Plastic) already matches (Case A) -- also_available_on
-        still fires and surfaces the LiT location alongside it, but excludes
-        Go Plastic's own library_id from the union (wxyc-shared#270: 'every
-        other ... location')."""
-        from generated.api_models import LibraryLocation
-
+        release (Go Plastic) already matches (Case A) -- the union still
+        fires and appends the LiT location after it, but excludes Go
+        Plastic's own library_id from the appended set (wxyc-shared's
+        original 'every other ... location' contract, now enforced against
+        the whole response). Primary always precedes appended locations."""
         go_plastic = make_library_item(
             id=5, artist="Squarepusher", title="Go Plastic", call_letters="S"
         )
@@ -1684,26 +1720,30 @@ class TestPerformLookupLocationUnion:
             ]
         )
 
-        own_location = LibraryLocation(
-            library_id=5,
-            artist="Squarepusher",
-            album_title="Go Plastic",
-            track_title="tommib",
-            track_artist="squarepusher",
+        own_item = make_library_item(id=5, artist="Squarepusher", title="Go Plastic")
+        own_location = ResolvedLocation(
+            row=_location_row(
+                library_id=5,
+                credit_role="primary",
+                track_artist="squarepusher",
+                track_title="tommib",
+            ),
+            shelf_item=own_item,
         )
-        lit_location = LibraryLocation(
-            library_id=60654,
-            artist="Soundtracks - L",
-            album_title="Lost in Translation",
-            track_title="tommib",
-            track_artist="squarepusher",
-            credit_role="extra",
+        lit_item = LibraryItem(id=60654, title="Lost in Translation", artist="Soundtracks - L")
+        lit_location = ResolvedLocation(
+            row=_location_row(
+                library_id=60654,
+                credit_role="extra",
+                track_artist="squarepusher",
+                track_title="tommib",
+            ),
+            shelf_item=lit_item,
         )
 
         request = LookupRequest(
             artist="Squarepusher",
             song="Tommib",
-            include_locations=True,
             raw_message="Tommib by Squarepusher",
         )
 
@@ -1716,10 +1756,232 @@ class TestPerformLookupLocationUnion:
                 request, mock_library_db, mock_discogs_service, telemetry
             )
 
-        assert len(response.results) == 1
+        assert len(response.results) == 2
+        # Primary always precedes appended locations.
         assert response.results[0].library_item.title == "Go Plastic"
-        # The primary result's own location is excluded from the union.
-        assert response.also_available_on == [lit_location]
+        assert response.results[0].library_item.id == 5
+        assert response.results[1].library_item.id == 60654
+        assert response.results[1].library_item.title == "Lost in Translation"
+        # A response the union contributed to reads as found-on-compilation,
+        # whether or not the primary also matched directly.
+        assert response.found_on_compilation is True
+        assert response.song_not_found is False
+
+    @pytest.mark.asyncio
+    async def test_missing_shelf_item_location_is_skipped_not_crashed_on(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """A location row whose shelf join returned None (an individual miss,
+        or the whole join degraded on a PG exception) is skipped, not crashed
+        on -- the response still carries whichever other locations DID join
+        successfully."""
+        mock_library_db.search.return_value = []
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        lit_item = LibraryItem(id=60654, title="Lost in Translation", artist="Soundtracks - L")
+        joined = ResolvedLocation(row=_location_row(library_id=60654), shelf_item=lit_item)
+        unjoined = ResolvedLocation(row=_location_row(library_id=999), shelf_item=None)
+
+        request = LookupRequest(
+            artist="Brian Reitzell",
+            song="Ikebana",
+            raw_message="Ikebana by Brian Reitzell",
+        )
+
+        with patch(
+            "lookup.orchestrator.resolve_also_available_on",
+            new_callable=AsyncMock,
+            return_value=[unjoined, joined],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert len(response.results) == 1
+        assert response.results[0].library_item.id == 60654
+
+    @pytest.mark.asyncio
+    async def test_external_fallback_still_runs_and_dedups_against_synthetic_id_zero(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """Appending locations happens AFTER step 7's external-cache fallback
+        (not before it), so a primary miss with a resolvable location does
+        not silently suppress the fallback -- and the fallback's synthetic
+        id-0 row does not swallow a real (nonzero) location id in the dedup."""
+        mock_library_db.search.return_value = []
+        mock_library_db.find_similar_artist.return_value = None
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        discogs_cache = AsyncMock()
+        discogs_cache.search_artists_by_name = AsyncMock(
+            return_value=[{"id": 99, "name": "Brian Reitzell", "score": 0.9}]
+        )
+        mb_pg = AsyncMock()
+        mb_pg.fetchall = AsyncMock(return_value=[])
+
+        lit_item = LibraryItem(id=60654, title="Lost in Translation", artist="Soundtracks - L")
+        lit_location = ResolvedLocation(row=_location_row(), shelf_item=lit_item)
+
+        request = LookupRequest(
+            artist="Brian Reitzell",
+            song="Ikebana",
+            include_external_caches=True,
+            raw_message="Ikebana by Brian Reitzell",
+        )
+
+        with patch(
+            "lookup.orchestrator.resolve_also_available_on",
+            new_callable=AsyncMock,
+            return_value=[lit_location],
+        ):
+            response = await perform_lookup(
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache=discogs_cache,
+                mb_pg=mb_pg,
+            )
+
+        # The fallback ran (not suppressed by the union having a location).
+        assert response.external_source == "discogs"
+        ids = [r.library_item.id for r in response.results]
+        assert ids.count(0) == 1, f"expected exactly one synthetic external row, got {ids}"
+        assert 60654 in ids, f"folded location must survive the id-0 dedup, got {ids}"
+        assert len(response.results) == 2
+
+    @pytest.mark.asyncio
+    async def test_degraded_shed_path_still_carries_the_locations(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """A Discogs-breaker shed mid-tail is exactly when a DJ most needs the
+        physical-shelf backups -- the degraded response must still carry the
+        folded locations (already resolved, PG-only, no live enrichment
+        needed), with found_on_compilation/song_not_found recomputed the same
+        way the happy path does. context_message/external_source stay None,
+        matching the pre-existing degraded contract."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        mock_library_db.search.return_value = [queen_item]
+
+        lit_item = LibraryItem(id=60654, title="Lost in Translation", artist="Soundtracks - L")
+        lit_location = ResolvedLocation(
+            row=_location_row(track_artist="queen", track_title="bohemian rhapsody"),
+            shelf_item=lit_item,
+        )
+
+        request = LookupRequest(
+            artist="Queen",
+            song="Bohemian Rhapsody",
+            album="A Night at the Opera",
+            raw_message="Play Bohemian Rhapsody by Queen",
+        )
+
+        async def _shed(*_a, **_k):
+            raise DiscogsBreakerOpenError("shed mid-enrichment")
+
+        with (
+            patch(
+                "lookup.orchestrator.resolve_also_available_on",
+                new_callable=AsyncMock,
+                return_value=[lit_location],
+            ),
+            patch("lookup.orchestrator._step_fetch_artwork", side_effect=_shed),
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.degraded is True
+        assert response.degraded_reason == DegradedReason.upstream_unavailable
+        ids = [r.library_item.id for r in response.results]
+        assert queen_item.id in ids
+        assert 60654 in ids
+        assert len(response.results) == 2
+        assert response.found_on_compilation is True
+        assert response.song_not_found is False
+        assert response.context_message is None
+        assert response.external_source is None
+
+    @pytest.mark.asyncio
+    async def test_stalled_probe_does_not_block_a_degraded_return(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """A degraded/shed early return bounds its await of the location-union
+        task (~250ms) -- a probe that never resolves must not hang the
+        response; its locations degrade to absent instead."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        mock_library_db.search.return_value = [queen_item]
+
+        async def _never_resolves(*_a, **_k):
+            await asyncio.Event().wait()
+
+        request = LookupRequest(
+            artist="Queen",
+            song="Bohemian Rhapsody",
+            album="A Night at the Opera",
+            raw_message="Play Bohemian Rhapsody by Queen",
+        )
+
+        async def _shed(*_a, **_k):
+            raise DiscogsBreakerOpenError("shed mid-enrichment")
+
+        with (
+            patch("lookup.orchestrator.resolve_also_available_on", new=_never_resolves),
+            patch("lookup.orchestrator._step_fetch_artwork", side_effect=_shed),
+            patch("lookup.orchestrator._DEGRADED_LOCATION_UNION_AWAIT_TIMEOUT_S", 0.05),
+        ):
+            response = await asyncio.wait_for(
+                perform_lookup(request, mock_library_db, mock_discogs_service, telemetry),
+                timeout=5.0,
+            )
+
+        assert response.degraded is True
+        assert len(response.results) == 1
+        assert response.results[0].library_item.id == queen_item.id
+
+    @pytest.mark.asyncio
+    async def test_sentry_results_count_recomputed_post_fold(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """The Sentry `lookup.results_count`/`lookup.match_type` trace attrs
+        must be recomputed from the FINAL post-fold result list, agreeing
+        with the router's PostHog `results_count` (already `len(results)`).
+        `_step_project_trace_attrs` runs before the fold and would otherwise
+        leave a stale, smaller count -- this proves the later overwrite wins."""
+        mock_library_db.search.return_value = []
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        lit_item = LibraryItem(id=60654, title="Lost in Translation", artist="Soundtracks - L")
+        lit_location = ResolvedLocation(row=_location_row(), shelf_item=lit_item)
+
+        request = LookupRequest(
+            artist="Brian Reitzell",
+            song="Ikebana",
+            raw_message="Ikebana by Brian Reitzell",
+        )
+
+        mock_transaction = Mock()
+        mock_scope = Mock()
+        mock_scope.transaction = mock_transaction
+
+        with (
+            patch(
+                "lookup.orchestrator.resolve_also_available_on",
+                new_callable=AsyncMock,
+                return_value=[lit_location],
+            ),
+            patch("lookup.orchestrator.sentry_sdk.get_current_scope", return_value=mock_scope),
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
+        assert len(response.results) == 1
+        assert calls["lookup.results_count"] == len(response.results) == 1
+        assert calls["lookup.match_type"] == response.search_type == "compilation"
 
 
 # ---------------------------------------------------------------------------
