@@ -1182,10 +1182,6 @@ class LookupRequest(BaseModel):
         False,
         description="Per cross-cache-identity plan §3.2.2 (E2-LML write contract). When true, the response carries an additional `identity` block (the §3.2.5 cascade's per-source resolution detail), and `api_version` is set to 2. When false (the default), the response is byte-identical to v0.5.0 — `identity` is absent and `api_version` is omitted. Backend's `library-identity-writer.ts` (E2-BS) sets this to true on every call; other consumers (catalog search, dj-site proxy, iOS apps) leave it false.\n",
     )
-    include_locations: bool | None = Field(
-        False,
-        description="Per the comprehensive multi-location union (LML#1018/#1022). When true, the response carries an additional `also_available_on` array — every other WXYC library shelf location that carries the same track (V/A compilations, soundtracks), ranked by LML, so a DJ can find a backup copy when the primary is missing or checked-out. When false (the default), the response is byte-identical to today — `also_available_on` is omitted. DJ-facing callers (dj-site catalog, request-o-matic) set this; Backend enrichment does not.\n",
-    )
     extended: bool | None = Field(
         None,
         description="When true, the top-1 result's `artwork` block is populated with additional fields LML already fetches during enrichment but normally discards: `discogs_artist_id`, `tracklist`, `genres`, `styles`, `label`, `full_release_date`, `artist_image_url`, and `profile_tokens` (cache-only deep parse of the artist's profile markup). Lets a caller obtain a full playcut metadata payload in a single `/lookup` call instead of following up with separate `/discogs/release/{id}` and `/discogs/artist/{id}` requests. Absent or false leaves the response shape unchanged.\n",
@@ -1264,38 +1260,6 @@ class DegradedReason(StrEnum):
     deadline_exceeded = "deadline_exceeded"
     cache_only = "cache_only"
     upstream_unavailable = "upstream_unavailable"
-
-
-class CreditRole(StrEnum):
-    primary = "primary"
-    featured = "featured"
-    extra = "extra"
-
-
-class LibraryLocation(BaseModel):
-    library_id: int = Field(..., description="WXYC library.id (shelf location) for this copy.")
-    artist: str | None = Field(None, description='Shelf/album artist (e.g. "Soundtracks - L").')
-    album_title: str | None = Field(
-        None, description='Album/release title (e.g. "Lost in Translation").'
-    )
-    track_position: str | None = Field(
-        None,
-        description='The track\'s position on this release (e.g. "A1"), when known.',
-    )
-    track_title: str = Field(..., description="Track title.")
-    track_artist: str = Field(
-        ...,
-        description='Credited-as artist for this track (e.g. "Brian Reitzell And Roger J. Manning, Jr."), which may differ from the shelf artist on a compilation.\n',
-    )
-    credit_role: CreditRole | None = Field(
-        None, description="The role this credit represents on the track."
-    )
-    discogs_release_id: int | None = Field(
-        None, description="Discogs release ID, usable as an art re-resolution key."
-    )
-    artwork_url: str | None = Field(
-        None, description="Precomputed cover art URL for this location."
-    )
 
 
 class IdentitySource(StrEnum):
@@ -2572,7 +2536,7 @@ class LookupResultItem(BaseModel):
     reconciled_identity: ReconciledIdentity | None = None
     matched_via: list[TrackMatchHint] | None = Field(
         None,
-        description="Populated when a track-title match (LML's new SONG_AS_TRACK strategy) drove this release into the results, per catalog-track-search plan §5.1. Empty or absent when the release matched via artist/album strategies. Backward-compatible — existing consumers ignore the field.\n",
+        description="Populated when a track-title match drove this release into the results. Two producers: LML's SONG_AS_TRACK strategy (per catalog-track-search plan §5.1) for the primary match, and the comprehensive multi-location union (LML#1018/#1019/#1022) for every other WXYC shelf location carrying the same track (V/A compilations, soundtracks) — those rows are folded directly into `results` alongside the primary, tagged with `source: discogs_release` since the recall index is Discogs-release- derived. Empty or absent when the release matched via artist/album strategies. Backward-compatible — existing consumers ignore the field.\n",
     )
     matched_via_alias: list[ArtistMatchHint] | None = Field(
         None,
@@ -2608,10 +2572,6 @@ class LookupResponse(BaseModel):
     timeout: bool | None = Field(
         False,
         description="True when LML's server-side hard cap fired and the search pipeline was abandoned mid-execution (LML#370). `results` may be partial or empty in that case. Callers can use this to distinguish \"no match\" (empty `results`, `timeout: false`) from \"ran out of time\" (`results` may be empty, `timeout: true`). The hard cap is an internal LML safety floor independent of the caller's `X-Caller-Budget-Ms` header; see LML#338 / LML#340 / LML#370 for the cascade-budget design. Backend also forwards two sibling informal headers on the same `/lookup` and `/lookup/bulk` requests, both prose-referenced here rather than formal parameters (matching `X-Caller-Budget-Ms`'s own precedent): `X-Caller-Class` (the resolved BS→LML traffic class, an integer 1-5 per Backend-Service's per-caller policy, BS#1826) and `X-Caller-Reason` (the `caller` label string itself, e.g. `proxy-library-search` or `catalog-popularity-freetext-resolve`). Both are sent only when Backend has a registered caller for the request and are otherwise omitted; sending them is inert until LML reads them (LML#928 for `X-Caller-Class`-driven lane routing, LML#931 for `X-Caller-Reason` caller telemetry) — see BS#1843.\n",
-    )
-    also_available_on: list[LibraryLocation] | None = Field(
-        None,
-        description="Every other WXYC library shelf location that carries the same track (V/A compilations, soundtracks), ranked by LML so consumers can render in order. Present only when the request set `include_locations: true`; absent otherwise (empty when the flag is set but no other location carries the track) so existing consumers see a byte-identical response (LML#1018/#1022).\n",
     )
     degraded: bool | None = Field(
         False,
