@@ -525,15 +525,19 @@ class Settings(BaseSettings):
         default=True,
         description=(
             "Server-side kill switch for the comprehensive multi-location union "
-            "(LML#1022). /lookup populates `also_available_on` only when BOTH this "
-            "flag is True AND the per-request `include_locations` opt-in is set; "
-            "the request-level flag alone can never turn the union on if this is "
-            "False. When False, /lookup's response is byte-identical to the union "
-            "never having shipped -- `also_available_on` stays omitted even for a "
-            "caller that requests it -- letting an incident be mitigated by a "
-            "Railway var flip instead of a client deploy. Default True (the union "
-            "is active on merge, gated per-request by include_locations as "
-            "before). See WXYC/library-metadata-lookup#1022."
+            "-- server-side gate only, no per-request opt-in. When True (the "
+            "default) and a song is present, /lookup folds every other WXYC "
+            "shelf location that carries the same track (V/A compilations, "
+            "soundtracks) directly into `results` as ordinary LookupResultItems "
+            "tagged via `matched_via`, for every interactive caller except "
+            "low-priority ones (BS enrichment, the CDC firehose, backfills -- "
+            "excluded via `X-Caller-Class`, not this flag). When False, no "
+            "location rows are appended to `results` for any caller -- "
+            "`/lookup`'s response is byte-identical to the union never having "
+            "shipped -- letting an incident be mitigated by a Railway var flip "
+            "instead of a client deploy. See WXYC/library-metadata-lookup#1022 "
+            "and the location-union-transparent-results plan (supersedes the "
+            "original per-request `include_locations` design)."
         ),
     )
     lml_emit_server_timing: bool = Field(

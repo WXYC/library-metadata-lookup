@@ -56,19 +56,29 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/enrichment/item.py": 850,
     "lookup/enrichment/top1.py": 100,
     "lookup/external_search.py": 350,
-    "lookup/location_union.py": 200,
+    # Recalibrated 2026-07-31 (transparent-fold plan, supersedes LML#1022): the
+    # probe now retains the joined shelf `LibraryItem` (a `ResolvedLocation`
+    # dataclass, not a bare `LibraryLocation`) and the module gained the
+    # per-row -> `LookupResultItem` converter that used to live nowhere (the
+    # separate-field design never needed one — `LibraryLocation` rows were the
+    # wire shape). Smallest multiple of 50 at or above the new measured size.
+    "lookup/location_union.py": 250,
     "lookup/matching.py": 550,
     "lookup/models.py": 150,
-    # Recalibrated 2026-07-30 (LML#1022): the comprehensive multi-location union
-    # added a genuinely new spine concern (launching + awaiting the concurrent
-    # recall-index probe, threading `also_available_on` through every response
-    # builder). The bulk of the new logic lives in the extracted
-    # `lookup/location_union.py` per this module's own policy; what remains
-    # here is the irreducible task-creation/await + response-field wiring (43
-    # lines). Same tight-on-purpose posture as the prior 2026-07-29
-    # recalibration: smallest multiple of 50 at or above the new measured size,
-    # not a re-derived 1.3x (which would reopen hundreds of lines of headroom).
-    "lookup/orchestrator.py": 1300,
+    # Recalibrated 2026-07-31 (transparent-fold plan, supersedes the 2026-07-30
+    # LML#1022 calibration): the separate-field design's `also_available_on`
+    # threading collapsed into an ordinary `results` fold, but the fold itself
+    # grew the spine — the append site moved from right after step 3 to after
+    # `_step_external_cache_fallback` (Step 7), five degraded/shed early
+    # returns each gained a bounded await of the location-union task, and the
+    # post-fold signal reconciliation (`_reconcile_post_fold_signals`,
+    # `_project_post_fold_trace_attrs`, the two await helpers) stayed in this
+    # module on purpose — moving it to `lookup/location_union.py` would close
+    # an import cycle via `build_context_message`, which only this module
+    # defines. Same tight-on-purpose posture as every prior recalibration:
+    # smallest multiple of 50 at or above the new measured size, not a
+    # re-derived 1.3x (which would reopen hundreds of lines of headroom).
+    "lookup/orchestrator.py": 1500,
     "lookup/release_resolution.py": 550,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line

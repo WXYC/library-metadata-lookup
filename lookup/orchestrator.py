@@ -47,7 +47,6 @@ from entity.sources import PgSource, PgSourceProtocol
 from entity.store import EntityStore, Identity
 from generated.api_models import (
     DegradedReason,
-    LibraryLocation,
     ReconciledIdentity,
     TrackMatchHint,
 )
@@ -62,7 +61,8 @@ from lookup.external_search import (
     search_external_fallback,
 )
 from lookup.location_union import (
-    build_also_available_on,
+    ResolvedLocation,
+    build_location_result_items,
     primary_library_ids_from_results,
     resolve_also_available_on,
     should_run_location_union,
@@ -1048,10 +1048,14 @@ async def perform_lookup(
     - Step 4.    ``_step_fetch_artwork`` — artwork fetch
     - Step 4b.   ``_step_enrich_metadata`` — metadata enrichment
     - (observability) ``_step_project_trace_attrs`` — Sentry trace projection
-    - Step 5.    ``build_context_message`` — context message
     - Step 6.    ``_step_resolve_result_identities`` — artist identity resolution
     - (response) ``_build_result_items`` — API-model conversion
     - Step 7.    ``_step_external_cache_fallback`` — external-cache fallback
+    - (location fold) ``build_location_result_items`` + ``_reconcile_post_fold_signals``
+      — fold the location-union's other shelf locations into ``results`` and
+      recompute ``search_type``/``found_on_compilation``/``song_not_found``/
+      ``context_message`` (``build_context_message``, Step 5's old call site)/
+      ``external_source`` from the final, post-fold list
     """
     # LML#865: derive the spine deadline once at admission. It bounds step 2's
     # Discogs pass and re-bases step 3's clock so the hard cap + caller budget
@@ -1097,30 +1101,27 @@ async def perform_lookup(
         )
         return _build_timed_out_response(state)
 
-    # LML#1022: launch the recall-index location-union probe as a concurrent
-    # task alongside the search pipeline below (asyncio task, not serial) —
-    # gated on include_locations + song-present + the server-side kill switch,
-    # so an unflagged request never even builds the task. It depends only on
-    # `parsed`, not on the pipeline's outcome, so it races step 3 for free.
+    # Launch the recall-index location-union probe as a concurrent task
+    # alongside the search pipeline below (asyncio task, not serial) — gated
+    # on song-present + the server-side kill switch + the caller not being
+    # low-priority (D4: BS enrichment, the CDC firehose, and backfills are
+    # excluded here, not inside `should_run_location_union`, which has no
+    # such check). No per-request opt-in — this is the default posture for
+    # every interactive, song-bearing lookup. It depends only on `parsed`,
+    # not on the pipeline's outcome, so it races step 3 for free. Awaited at
+    # the append site after the whole spine resolves (see below), not here —
+    # every early return in this function threads the task itself into
+    # `_build_degraded_response`, which bounds its own await, so nothing here
+    # is ever left dangling.
     location_union_task = (
         asyncio.create_task(
             resolve_also_available_on(parsed, services.discogs_cache_pg, services.db)
         )
-        if should_run_location_union(request)
+        if should_run_location_union(request) and not is_discogs_low_priority()
         else None
     )
 
     await _step_search_pipeline(parsed, albums_for_search, candidate_memo, state, services)
-
-    # Await right after the step it raced; every later return in this function
-    # passes the resolved `also_available_on` through, so nothing here is ever
-    # left pending.
-    also_available_on: list[LibraryLocation] | None = None
-    if location_union_task is not None:
-        also_available_on = build_also_available_on(
-            await location_union_task,
-            primary_library_ids_from_results(state.items_with_artwork, state.library_results),
-        )
 
     # LML#930 PR2 admission shed: proactively shed the tail for low-priority
     # traffic under sustained event-loop pressure — rationale in admission.py.
@@ -1128,8 +1129,11 @@ async def perform_lookup(
         low_priority=is_discogs_low_priority(), lag_ms=get_event_loop_lag_ms()
     )
     if admission_reason is not None:  # ENFORCE only; always None in shadow mode
-        return _build_degraded_response(
-            state, degraded_reason=admission_reason, also_available_on=also_available_on
+        return await _build_degraded_response(
+            state,
+            parsed,
+            degraded_reason=admission_reason,
+            location_union_task=location_union_task,
         )
 
     # LML#755 R2-2 backstop. The runner (`core/search.py`) already catches a
@@ -1160,8 +1164,8 @@ async def perform_lookup(
         for step_name, run_step in tail_steps:
             reason = should_shed_tail(services.spine_deadline, step_name, request.raw_message)
             if reason is not None:
-                return _build_degraded_response(
-                    state, degraded_reason=reason, also_available_on=also_available_on
+                return await _build_degraded_response(
+                    state, parsed, degraded_reason=reason, location_union_task=location_union_task
                 )
             await run_step()
     except DiscogsBreakerOpenError:
@@ -1170,21 +1174,14 @@ async def perform_lookup(
             "returning cache-only lookup for %r",
             request.raw_message,
         )
-        return _build_degraded_response(
+        return await _build_degraded_response(
             state,
+            parsed,
             degraded_reason=DegradedReason.upstream_unavailable,
-            also_available_on=also_available_on,
+            location_union_task=location_union_task,
         )
 
     _step_project_trace_attrs(state, services)
-
-    # Step 5: Build context message
-    context = build_context_message(
-        parsed,
-        state.found_on_compilation,
-        state.song_not_found,
-        has_results=state.has_results,
-    )
 
     # LML#930: identity resolution is the last live-Discogs/EntityStore tail leg —
     # shed it too if the caller deadline is exhausted by now (the returned
@@ -1194,8 +1191,11 @@ async def perform_lookup(
         services.spine_deadline, "resolve_identities", request.raw_message
     )
     if identity_reason is not None:
-        return _build_degraded_response(
-            state, degraded_reason=identity_reason, also_available_on=also_available_on
+        return await _build_degraded_response(
+            state,
+            parsed,
+            degraded_reason=identity_reason,
+            location_union_task=location_union_task,
         )
     try:
         identities_by_artist = await _step_resolve_result_identities(state, services)
@@ -1205,26 +1205,52 @@ async def perform_lookup(
             "returning cache-only lookup for %r",
             request.raw_message,
         )
-        return _build_degraded_response(
+        return await _build_degraded_response(
             state,
+            parsed,
             degraded_reason=DegradedReason.upstream_unavailable,
-            also_available_on=also_available_on,
+            location_union_task=location_union_task,
         )
 
     result_items = _build_result_items(state, identities_by_artist)
     external_source = await _step_external_cache_fallback(parsed, result_items, services)
 
+    # Fold the location-union's other shelf locations into `results` (the
+    # transparent-fold design -- no separate response field). Awaited plainly
+    # here (not bounded): by now the whole tail (steps 3a-4b, enrichment) has
+    # had time to run, so the probe is effectively always done. Dedup keys off
+    # the ids already in `result_items`, which at this point includes both the
+    # primary matches AND any external-cache-fallback synthetic rows.
+    folded_locations = await _await_location_union(location_union_task)
+    location_items = build_location_result_items(
+        folded_locations, primary_library_ids_from_results(result_items)
+    )
+    result_items.extend(location_items)
+
+    (
+        song_not_found,
+        found_on_compilation,
+        search_type,
+        context,
+        external_source,
+    ) = _reconcile_post_fold_signals(
+        parsed,
+        state,
+        folded_location_count=len(location_items),
+        external_source=external_source,
+    )
+    _project_post_fold_trace_attrs(result_items, search_type)
+
     return LookupResponse(
         results=result_items,
-        search_type=state.search_type,
-        song_not_found=state.song_not_found,
-        found_on_compilation=state.found_on_compilation,
+        search_type=search_type,
+        song_not_found=song_not_found,
+        found_on_compilation=found_on_compilation,
         context_message=context,
         corrected_artist=state.corrected_artist,
         external_source=external_source,
         timeout=state.timed_out,
         degraded=False,
-        also_available_on=also_available_on,
     )
 
 
@@ -1251,11 +1277,157 @@ def _build_timed_out_response(state: LookupState) -> LookupResponse:
     )
 
 
-def _build_degraded_response(
+_DEGRADED_LOCATION_UNION_AWAIT_TIMEOUT_S = 0.25
+"""Bound on a degraded/shed-path await of the location-union task. A shed
+path is exactly where blocking on a stalled recall-index probe is
+counterproductive — the whole point of shedding is to return fast. Kept short
+(single indexed btree probe territory) rather than tuned against the tail's
+own budget, since a degraded return is trying to get OUT from under a slow
+tail, not adopt another one."""
+
+
+async def _await_location_union(
+    location_union_task: asyncio.Task[list[ResolvedLocation]] | None,
+) -> list[ResolvedLocation]:
+    """Unbounded await for the happy-path append site.
+
+    By the time the happy path gets here the task has had the whole tail
+    (steps 3a-4b, enrichment) to finish, so this rarely actually waits.
+    Defensive: :func:`resolve_also_available_on` documents that it never
+    raises, but a probe failure here must still never surface as a `/lookup`
+    500.
+    """
+    if location_union_task is None:
+        return []
+    try:
+        return await location_union_task
+    except Exception:
+        logger.exception("location-union probe failed at the happy-path append site")
+        return []
+
+
+async def _await_location_union_bounded(
+    location_union_task: asyncio.Task[list[ResolvedLocation]] | None,
+) -> list[ResolvedLocation]:
+    """Bounded await for a degraded/shed early return (~250ms).
+
+    On a timeout, ``asyncio.wait_for`` cancels the underlying task and this
+    degrades to "no locations" rather than let a stuck PG pool acquire hold
+    up an already-degraded response. Contrast :func:`_await_location_union`,
+    the happy path's plain (unbounded) await.
+    """
+    if location_union_task is None:
+        return []
+    try:
+        return await asyncio.wait_for(
+            location_union_task, timeout=_DEGRADED_LOCATION_UNION_AWAIT_TIMEOUT_S
+        )
+    except TimeoutError:
+        logger.info("location-union probe still pending at a degraded shed; degrading to none")
+        return []
+    except Exception:
+        logger.exception("location-union probe failed during a degraded-path await")
+        return []
+
+
+def _reconcile_post_fold_signals(
+    parsed: ParsedRequest,
     state: LookupState,
     *,
+    folded_location_count: int,
+    external_source: str | None,
+) -> tuple[bool, bool, str, str | None, str | None]:
+    """Recompute every state-derived response signal from whether the
+    location union folded anything into the final result list, not from the
+    pre-fold ``LookupState`` alone — so ``results``, ``found_on_compilation``,
+    ``song_not_found``, ``search_type``, ``context_message``, and
+    ``external_source`` always agree about what the caller actually received.
+
+    Returns ``(song_not_found, found_on_compilation, search_type,
+    context_message, external_source)``. A **no-op** when
+    ``folded_location_count`` is 0 — every request the location union didn't
+    touch (kill switch off, low-priority caller, no song, no recall-index
+    hit) gets byte-identical output to before this reconciliation existed;
+    the ``context_message`` branch below reproduces the old Step 5 call site
+    exactly (same three inputs, same function), just moved to run after the
+    fold instead of before it.
+
+    Keyed on the explicit ``folded_location_count``, never on ``matched_via``
+    presence in ``result_items`` — the primary track-match strategies
+    (SONG_AS_TRACK, TRACK_ON_COMPILATION) already stamp ``matched_via`` on
+    PRIMARY rows (``lookup/strategies/track_release_matching.py``), so
+    scanning ``result_items`` for the hint cannot distinguish a folded shelf
+    location from a primary track match.
+
+    Callers that don't need the full bundle — the degraded/shed early
+    returns, which keep ``context_message=None`` and ``external_source=None``
+    unconditionally, per the pre-existing degraded contract — read only the
+    ``song_not_found``/``found_on_compilation`` pair and discard the rest.
+    """
+    if folded_location_count == 0:
+        context_message = build_context_message(
+            parsed,
+            state.found_on_compilation,
+            state.song_not_found,
+            has_results=state.has_results,
+        )
+        return (
+            state.song_not_found,
+            state.found_on_compilation,
+            state.search_type,
+            context_message,
+            external_source,
+        )
+
+    # A response the location union contributed to always reads as
+    # found-on-compilation: at least one row in `results` is a
+    # compilation/soundtrack shelf location, whether or not the artist's own
+    # release also matched (Case A) or not (Case B).
+    song_not_found = False
+    found_on_compilation = True
+    search_type = "compilation"
+    context_message = build_context_message(
+        parsed, found_on_compilation, song_not_found, has_results=True
+    )
+    resolved_external_source = (
+        external_source if external_source in ("discogs", "musicbrainz") else "library"
+    )
+    return (
+        song_not_found,
+        found_on_compilation,
+        search_type,
+        context_message,
+        resolved_external_source,
+    )
+
+
+def _project_post_fold_trace_attrs(result_items: list[LookupResultItem], search_type: str) -> None:
+    """Re-project ``lookup.results_count``/``lookup.match_type`` after the
+    location-union fold, overwriting whatever ``_step_project_trace_attrs``
+    projected pre-fold.
+
+    That call reads ``state.result_count``, which derives from
+    ``state.items_with_artwork``/``state.library_results`` — the folded
+    locations never enter ``LookupState``, so its projection is stale exactly
+    when this matters. Observability must not break the request path; the
+    failure mode mirrors ``_step_project_trace_attrs``.
+    """
+    try:
+        scope = sentry_sdk.get_current_scope()
+        if scope.transaction is not None:
+            scope.transaction.set_data("lookup.results_count", len(result_items))
+            scope.transaction.set_data("lookup.match_type", search_type)
+    except Exception:
+        # Observability must not break the request path.
+        pass
+
+
+async def _build_degraded_response(
+    state: LookupState,
+    parsed: ParsedRequest,
+    *,
     degraded_reason: DegradedReason,
-    also_available_on: list[LibraryLocation] | None = None,
+    location_union_task: asyncio.Task[list[ResolvedLocation]] | None,
 ) -> LookupResponse:
     """Build a degraded ``LookupResponse`` after the tail was shed (LML#755 / LML#930).
 
@@ -1275,25 +1447,49 @@ def _build_degraded_response(
     (wxyc-canary#82) and LML#931 can slice degraded-mode rate by cause without
     decoding response bodies.
 
-    ``also_available_on`` (LML#1022) is whatever the caller already resolved
-    before the shed — the location-union probe runs concurrently with step 3,
-    not the shed tail, so a tail shed does not need to drop it.
+    The location union's other shelf locations are folded in here too — a
+    Discogs-breaker/admission/deadline shed is exactly when a DJ most needs
+    the physical-shelf backups, and they cost no live enrichment (PG-only,
+    already resolved or resolving concurrently). The await is *bounded*
+    (:func:`_await_location_union_bounded`, ~250ms): a shed path is exactly
+    where blocking on a stalled probe would be counterproductive. Both
+    ``found_on_compilation``/``song_not_found`` are recomputed the same way
+    the happy path does (:func:`_reconcile_post_fold_signals`) — without this,
+    a Case-B shed would emit location rows while still claiming
+    ``song_not_found=True``/``found_on_compilation=False``, the exact desync
+    the happy-path reconciliation exists to eliminate. ``context_message`` and
+    ``external_source`` stay ``None`` unconditionally either way, matching the
+    pre-existing degraded contract.
     """
     try:
         sentry_sdk.set_tag("lml.degraded_reason", degraded_reason.value)
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Failed to project degraded_reason onto Sentry transaction: %s", e)
     result_items = _build_result_items(state, {})
+    folded_locations = await _await_location_union_bounded(location_union_task)
+    location_items = build_location_result_items(
+        folded_locations, primary_library_ids_from_results(result_items)
+    )
+    result_items.extend(location_items)
+
+    song_not_found, found_on_compilation, _search_type, _context_message, _external_source = (
+        _reconcile_post_fold_signals(
+            parsed,
+            state,
+            folded_location_count=len(location_items),
+            external_source=None,
+        )
+    )
+
     return LookupResponse(
         results=result_items,
         search_type=state.search_type,
-        song_not_found=state.song_not_found,
-        found_on_compilation=state.found_on_compilation,
+        song_not_found=song_not_found,
+        found_on_compilation=found_on_compilation,
         context_message=None,
         corrected_artist=state.corrected_artist,
         external_source=None,
         timeout=state.timed_out,
         degraded=True,
         degraded_reason=degraded_reason,
-        also_available_on=also_available_on,
     )
