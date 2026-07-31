@@ -1919,3 +1919,64 @@ class TestStreamingStatus:
 
         status = await db.get_streaming_status([100, 200])
         assert status == {}
+
+
+class TestGetItemsByIds:
+    """Tests for get_items_by_ids() -- the shelf-metadata bulk lookup the LML#1022
+    location union uses to bind a recall-index row's library_id back to its
+    shelf artist/album title."""
+
+    @pytest.mark.asyncio
+    async def test_returns_items_keyed_by_id(self, tmp_path):
+        db_path = tmp_path / "test.db"
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+                "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+                "genre TEXT, format TEXT)"
+            )
+            await conn.execute(
+                "INSERT INTO library (id, title, artist, call_letters, "
+                "artist_call_number, release_call_number, genre, format) "
+                "VALUES (60654, 'Lost in Translation', 'Soundtracks - L', 'L', 1, 1, 'Soundtrack', 'LP')"
+            )
+            await conn.commit()
+
+        db = LibraryDB(db_path)
+        await db.connect()
+        items = await db.get_items_by_ids([60654, 99999])
+        await db.close()
+
+        assert set(items) == {60654}
+        assert items[60654].artist == "Soundtracks - L"
+        assert items[60654].title == "Lost in Translation"
+
+    @pytest.mark.asyncio
+    async def test_empty_id_list_short_circuits_without_query(self, tmp_path):
+        db_path = tmp_path / "test.db"
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+                "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+                "genre TEXT, format TEXT)"
+            )
+            await conn.commit()
+
+        db = LibraryDB(db_path)
+        await db.connect()
+        items = await db.get_items_by_ids([])
+        await db.close()
+
+        assert items == {}
+
+    @pytest.mark.asyncio
+    async def test_conn_none_returns_empty_map(self):
+        db = LibraryDB()
+        db._conn = None
+
+        items = await db.get_items_by_ids([1, 2])
+        assert items == {}

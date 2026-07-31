@@ -731,6 +731,28 @@ class LibraryDB:
             "soundcloud_url": row[6],
         }
 
+    async def get_items_by_ids(self, library_ids: list[int]) -> dict[int, LibraryItem]:
+        """Bulk-fetch library rows by id, keyed by id.
+
+        The shelf-metadata lookup the LML#1022 location union uses to bind a
+        recall-index row's bare ``library_id`` back to a displayable shelf
+        ``artist``/``title`` (the recall index itself stores neither -- only
+        the normalized track credit and the Discogs release). One query for
+        the whole candidate set, mirroring ``get_streaming_status``'s
+        bulk-by-id shape; ids with no library row are simply absent from the
+        result.
+        """
+        if not self._conn or not library_ids:
+            return {}
+
+        placeholders = ",".join("?" * len(library_ids))
+        cursor = await self._conn.execute(
+            f"SELECT {self._select_columns()} FROM library WHERE id IN ({placeholders})",
+            library_ids,
+        )
+        rows = await cursor.fetchall()
+        return {row["id"]: LibraryItem(**dict(row)) for row in rows}
+
     async def get_streaming_status(self, library_ids: list[int]) -> dict[int, bool]:
         """Check which library releases have streaming links.
 

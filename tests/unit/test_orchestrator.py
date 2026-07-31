@@ -1546,6 +1546,183 @@ class TestPerformLookupCompilations:
 
 
 # ---------------------------------------------------------------------------
+# Tests: perform_lookup - comprehensive multi-location union (LML#1022)
+# ---------------------------------------------------------------------------
+
+
+class TestPerformLookupLocationUnion:
+    """``also_available_on``: gating, the byte-identical-off contract, and the
+    Case A / Case B live-repro shapes from LML#271/#1022. ``resolve_also_available_on``
+    is patched at the orchestrator's import site -- its own ranking/shelf-join
+    logic is covered by ``tests/unit/test_location_union.py``; these tests
+    verify orchestration only: the gate, the concurrent-task wiring, and
+    excluding the primary result's own location."""
+
+    @pytest.mark.asyncio
+    async def test_flag_off_omits_also_available_on(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+    ):
+        """Default request (no include_locations): response is byte-identical
+        to pre-#1022 -- also_available_on is None, and the probe never runs."""
+        mock_library_db.search.return_value = [queen_item]
+
+        request = LookupRequest(
+            artist="Queen",
+            album="A Night at the Opera",
+            raw_message="Play A Night at the Opera by Queen",
+        )
+
+        with patch(
+            "lookup.orchestrator.resolve_also_available_on", new_callable=AsyncMock
+        ) as resolve_mock:
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.also_available_on is None
+        resolve_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kill_switch_disabled_omits_also_available_on(
+        self, mock_library_db, mock_discogs_service, telemetry, queen_item, monkeypatch
+    ):
+        """Server-side kill switch off: even a caller that opts in via
+        include_locations=true gets the pre-#1022 response shape -- an
+        incident can be mitigated with a Railway var flip, no client deploy."""
+        from config.settings import get_settings
+
+        monkeypatch.setenv("LML_LOCATION_UNION_ENABLED", "false")
+        get_settings.cache_clear()
+        try:
+            mock_library_db.search.return_value = [queen_item]
+
+            request = LookupRequest(
+                artist="Queen",
+                album="A Night at the Opera",
+                include_locations=True,
+                raw_message="Play A Night at the Opera by Queen",
+            )
+
+            with patch(
+                "lookup.orchestrator.resolve_also_available_on", new_callable=AsyncMock
+            ) as resolve_mock:
+                response = await perform_lookup(
+                    request, mock_library_db, mock_discogs_service, telemetry
+                )
+
+            assert response.also_available_on is None
+            resolve_mock.assert_not_awaited()
+        finally:
+            monkeypatch.delenv("LML_LOCATION_UNION_ENABLED", raising=False)
+            get_settings.cache_clear()
+
+    @pytest.mark.asyncio
+    async def test_case_b_no_primary_match_surfaces_other_location(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """'ikebana by brian reitzell' (LML#271 live-repro): the artist has no
+        own release in the library (Case B) -- also_available_on still
+        surfaces the LiT soundtrack location from the recall index alone."""
+        from generated.api_models import LibraryLocation
+
+        mock_library_db.search.return_value = []
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        lit_location = LibraryLocation(
+            library_id=60654,
+            artist="Soundtracks - L",
+            album_title="Lost in Translation",
+            track_position="A3",
+            track_title="ikebana",
+            track_artist="brian reitzell",
+            credit_role="primary",
+            discogs_release_id=12345,
+            artwork_url="https://example.com/lit.jpg",
+        )
+
+        request = LookupRequest(
+            artist="Brian Reitzell",
+            song="Ikebana",
+            include_locations=True,
+            raw_message="Ikebana by Brian Reitzell",
+        )
+
+        with patch(
+            "lookup.orchestrator.resolve_also_available_on",
+            new_callable=AsyncMock,
+            return_value=[lit_location],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert response.also_available_on == [lit_location]
+
+    @pytest.mark.asyncio
+    async def test_case_a_own_release_matched_plus_other_location(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """'tommib by squarepusher' (LML#271 live-repro): the artist's own
+        release (Go Plastic) already matches (Case A) -- also_available_on
+        still fires and surfaces the LiT location alongside it, but excludes
+        Go Plastic's own library_id from the union (wxyc-shared#270: 'every
+        other ... location')."""
+        from generated.api_models import LibraryLocation
+
+        go_plastic = make_library_item(
+            id=5, artist="Squarepusher", title="Go Plastic", call_letters="S"
+        )
+        mock_library_db.search.return_value = [go_plastic]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=999,
+                    album="Go Plastic",
+                    artist="Squarepusher",
+                    artwork_url="https://example.com/go-plastic.jpg",
+                )
+            ]
+        )
+
+        own_location = LibraryLocation(
+            library_id=5,
+            artist="Squarepusher",
+            album_title="Go Plastic",
+            track_title="tommib",
+            track_artist="squarepusher",
+        )
+        lit_location = LibraryLocation(
+            library_id=60654,
+            artist="Soundtracks - L",
+            album_title="Lost in Translation",
+            track_title="tommib",
+            track_artist="squarepusher",
+            credit_role="extra",
+        )
+
+        request = LookupRequest(
+            artist="Squarepusher",
+            song="Tommib",
+            include_locations=True,
+            raw_message="Tommib by Squarepusher",
+        )
+
+        with patch(
+            "lookup.orchestrator.resolve_also_available_on",
+            new_callable=AsyncMock,
+            return_value=[own_location, lit_location],
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert len(response.results) == 1
+        assert response.results[0].library_item.title == "Go Plastic"
+        # The primary result's own location is excluded from the union.
+        assert response.also_available_on == [lit_location]
+
+
+# ---------------------------------------------------------------------------
 # Tests: perform_lookup - artwork
 # ---------------------------------------------------------------------------
 

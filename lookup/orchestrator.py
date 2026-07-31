@@ -47,6 +47,7 @@ from entity.sources import PgSource, PgSourceProtocol
 from entity.store import EntityStore, Identity
 from generated.api_models import (
     DegradedReason,
+    LibraryLocation,
     ReconciledIdentity,
     TrackMatchHint,
 )
@@ -59,6 +60,12 @@ from lookup.enrichment import enrich_artwork_results
 from lookup.external_search import (
     build_external_catalog_item,
     search_external_fallback,
+)
+from lookup.location_union import (
+    build_also_available_on,
+    primary_library_ids_from_results,
+    resolve_also_available_on,
+    should_run_location_union,
 )
 from lookup.matching import (
     WAVE_A_SEARCH_LIMIT,
@@ -1090,7 +1097,30 @@ async def perform_lookup(
         )
         return _build_timed_out_response(state)
 
+    # LML#1022: launch the recall-index location-union probe as a concurrent
+    # task alongside the search pipeline below (asyncio task, not serial) —
+    # gated on include_locations + song-present + the server-side kill switch,
+    # so an unflagged request never even builds the task. It depends only on
+    # `parsed`, not on the pipeline's outcome, so it races step 3 for free.
+    location_union_task = (
+        asyncio.create_task(
+            resolve_also_available_on(parsed, services.discogs_cache_pg, services.db)
+        )
+        if should_run_location_union(request)
+        else None
+    )
+
     await _step_search_pipeline(parsed, albums_for_search, candidate_memo, state, services)
+
+    # Await right after the step it raced; every later return in this function
+    # passes the resolved `also_available_on` through, so nothing here is ever
+    # left pending.
+    also_available_on: list[LibraryLocation] | None = None
+    if location_union_task is not None:
+        also_available_on = build_also_available_on(
+            await location_union_task,
+            primary_library_ids_from_results(state.items_with_artwork, state.library_results),
+        )
 
     # LML#930 PR2 admission shed: proactively shed the tail for low-priority
     # traffic under sustained event-loop pressure — rationale in admission.py.
@@ -1098,7 +1128,9 @@ async def perform_lookup(
         low_priority=is_discogs_low_priority(), lag_ms=get_event_loop_lag_ms()
     )
     if admission_reason is not None:  # ENFORCE only; always None in shadow mode
-        return _build_degraded_response(state, degraded_reason=admission_reason)
+        return _build_degraded_response(
+            state, degraded_reason=admission_reason, also_available_on=also_available_on
+        )
 
     # LML#755 R2-2 backstop. The runner (`core/search.py`) already catches a
     # Discogs saturation-breaker shed *inside* the search pipeline and degrades
@@ -1128,7 +1160,9 @@ async def perform_lookup(
         for step_name, run_step in tail_steps:
             reason = should_shed_tail(services.spine_deadline, step_name, request.raw_message)
             if reason is not None:
-                return _build_degraded_response(state, degraded_reason=reason)
+                return _build_degraded_response(
+                    state, degraded_reason=reason, also_available_on=also_available_on
+                )
             await run_step()
     except DiscogsBreakerOpenError:
         logger.info(
@@ -1136,7 +1170,11 @@ async def perform_lookup(
             "returning cache-only lookup for %r",
             request.raw_message,
         )
-        return _build_degraded_response(state, degraded_reason=DegradedReason.upstream_unavailable)
+        return _build_degraded_response(
+            state,
+            degraded_reason=DegradedReason.upstream_unavailable,
+            also_available_on=also_available_on,
+        )
 
     _step_project_trace_attrs(state, services)
 
@@ -1156,7 +1194,9 @@ async def perform_lookup(
         services.spine_deadline, "resolve_identities", request.raw_message
     )
     if identity_reason is not None:
-        return _build_degraded_response(state, degraded_reason=identity_reason)
+        return _build_degraded_response(
+            state, degraded_reason=identity_reason, also_available_on=also_available_on
+        )
     try:
         identities_by_artist = await _step_resolve_result_identities(state, services)
     except DiscogsBreakerOpenError:
@@ -1165,7 +1205,11 @@ async def perform_lookup(
             "returning cache-only lookup for %r",
             request.raw_message,
         )
-        return _build_degraded_response(state, degraded_reason=DegradedReason.upstream_unavailable)
+        return _build_degraded_response(
+            state,
+            degraded_reason=DegradedReason.upstream_unavailable,
+            also_available_on=also_available_on,
+        )
 
     result_items = _build_result_items(state, identities_by_artist)
     external_source = await _step_external_cache_fallback(parsed, result_items, services)
@@ -1180,6 +1224,7 @@ async def perform_lookup(
         external_source=external_source,
         timeout=state.timed_out,
         degraded=False,
+        also_available_on=also_available_on,
     )
 
 
@@ -1210,6 +1255,7 @@ def _build_degraded_response(
     state: LookupState,
     *,
     degraded_reason: DegradedReason,
+    also_available_on: list[LibraryLocation] | None = None,
 ) -> LookupResponse:
     """Build a degraded ``LookupResponse`` after the tail was shed (LML#755 / LML#930).
 
@@ -1228,6 +1274,10 @@ def _build_degraded_response(
     and as the filterable ``lml.degraded_reason`` Sentry tag so the canary
     (wxyc-canary#82) and LML#931 can slice degraded-mode rate by cause without
     decoding response bodies.
+
+    ``also_available_on`` (LML#1022) is whatever the caller already resolved
+    before the shed — the location-union probe runs concurrently with step 3,
+    not the shed tail, so a tail shed does not need to drop it.
     """
     try:
         sentry_sdk.set_tag("lml.degraded_reason", degraded_reason.value)
@@ -1245,4 +1295,5 @@ def _build_degraded_response(
         timeout=state.timed_out,
         degraded=True,
         degraded_reason=degraded_reason,
+        also_available_on=also_available_on,
     )
