@@ -56,17 +56,19 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/enrichment/item.py": 850,
     "lookup/enrichment/top1.py": 100,
     "lookup/external_search.py": 350,
+    "lookup/location_union.py": 200,
     "lookup/matching.py": 550,
     "lookup/models.py": 150,
-    # Recalibrated 2026-07-29 (LML#750): extracting step 3b's validation cascade
-    # and step 7's external-cache dispatch policy out of the spine dropped it
-    # from 1291 to ~1225 lines. The spine is the known regrowth attractor (its
-    # own history — #944, #750 — is repeated near-miss growth), so this ceiling
-    # is deliberately NOT re-derived from the 1.3x formula (which would reopen
-    # ~370 lines of headroom, i.e. room for another buried concern to
-    # accumulate unnoticed). 1250 keeps just enough slack for an ordinary small
-    # edit while forcing the next real concern straight to extraction.
-    "lookup/orchestrator.py": 1250,
+    # Recalibrated 2026-07-30 (LML#1022): the comprehensive multi-location union
+    # added a genuinely new spine concern (launching + awaiting the concurrent
+    # recall-index probe, threading `also_available_on` through every response
+    # builder). The bulk of the new logic lives in the extracted
+    # `lookup/location_union.py` per this module's own policy; what remains
+    # here is the irreducible task-creation/await + response-field wiring (43
+    # lines). Same tight-on-purpose posture as the prior 2026-07-29
+    # recalibration: smallest multiple of 50 at or above the new measured size,
+    # not a re-derived 1.3x (which would reopen hundreds of lines of headroom).
+    "lookup/orchestrator.py": 1300,
     "lookup/release_resolution.py": 550,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line

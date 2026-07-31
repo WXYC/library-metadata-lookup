@@ -28,6 +28,9 @@ module owns only the idempotent DDL, matching the read-side/write-side split
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+
+from wxyc_etl.text import to_match_form
 
 from entity.sources import PgSource
 
@@ -72,3 +75,59 @@ async def set_up_compilation_track_location_schema(pg: PgSource) -> None:
     await pg.execute(_DDL_SCHEMA)
     await pg.execute(_DDL_TABLE)
     await pg.execute(_DDL_INDEX)
+
+
+@dataclass(frozen=True)
+class CompilationTrackLocationRow:
+    """One recall-index row -- a shelf location credited to a track (LML#1022)."""
+
+    library_id: int
+    track_position: str
+    track_artist: str
+    track_title: str
+    credit_role: str
+    discogs_release_id: int
+    artwork_url: str | None
+
+
+_SELECT_LOCATIONS_SQL = """\
+SELECT library_id, track_position, track_artist, track_title, credit_role,
+       discogs_release_id, artwork_url
+FROM lml_cache.compilation_track_location
+WHERE track_artist = $1 AND track_title = $2\
+"""
+
+
+async def get_compilation_track_locations(
+    pg: PgSource, *, track_artist: str, track_title: str
+) -> list[CompilationTrackLocationRow]:
+    """Single indexed btree probe: every shelf location for ``(track_artist, track_title)``.
+
+    The runtime consumer of the LML#1019 reverse index -- an exact-match probe
+    on the same ``wxyc_etl.text.to_match_form`` normalization the build script
+    (``scripts/build_compilation_track_location.py``) wrote the rows with, so
+    the query's normalized inputs land on the row's normalized columns
+    byte-for-byte. Returns every credit (all ``credit_role`` tiers, every
+    library shelf copy); ranking is the caller's job
+    (``lookup/location_union.py``), not this read helper's.
+
+    An empty normalized artist or title short-circuits without a query (no
+    credited track is ever stored with a blank name). Best-effort, mirroring
+    ``get_library_release_overrides``: a PG failure degrades to an empty list
+    so a transient outage can never break the concurrent probe (its caller
+    just sees "no other locations found").
+    """
+    normalized_artist = to_match_form(track_artist)
+    normalized_title = to_match_form(track_title)
+    if not normalized_artist or not normalized_title:
+        return []
+    try:
+        rows = await pg.fetchall(_SELECT_LOCATIONS_SQL, normalized_artist, normalized_title)
+    except Exception:
+        logger.exception(
+            "compilation_track_location probe failed for artist=%r title=%r",
+            normalized_artist,
+            normalized_title,
+        )
+        return []
+    return [CompilationTrackLocationRow(**row) for row in rows]

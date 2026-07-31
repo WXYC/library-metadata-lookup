@@ -521,6 +521,21 @@ class Settings(BaseSettings):
             "source-stamped rows + flip False. See WXYC/library-metadata-lookup#850."
         ),
     )
+    lml_location_union_enabled: bool = Field(
+        default=True,
+        description=(
+            "Server-side kill switch for the comprehensive multi-location union "
+            "(LML#1022). /lookup populates `also_available_on` only when BOTH this "
+            "flag is True AND the per-request `include_locations` opt-in is set; "
+            "the request-level flag alone can never turn the union on if this is "
+            "False. When False, /lookup's response is byte-identical to the union "
+            "never having shipped -- `also_available_on` stays omitted even for a "
+            "caller that requests it -- letting an incident be mitigated by a "
+            "Railway var flip instead of a client deploy. Default True (the union "
+            "is active on merge, gated per-request by include_locations as "
+            "before). See WXYC/library-metadata-lookup#1022."
+        ),
+    )
     lml_emit_server_timing: bool = Field(
         default=True,
         description=(
