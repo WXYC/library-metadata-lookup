@@ -346,6 +346,9 @@ async def lifespan(app: FastAPI):
     if settings.database_url_discogs:
         from core.dependencies import get_discogs_pool
         from entity.api_keys import set_up_api_keys_schema
+        from entity.compilation_track_location import (
+            set_up_compilation_track_location_schema,
+        )
         from entity.discogs_rate_bucket import set_up_discogs_rate_bucket_schema
         from entity.library_release_override import (
             set_up_library_release_override_schema,
@@ -434,6 +437,15 @@ async def lifespan(app: FastAPI):
                 (
                     "API keys",
                     set_up_api_keys_schema,
+                ),
+                # V/A recall index (LML#1019), another LML-owned lml_cache.*
+                # table. Same pool, same best-effort posture. No runtime
+                # reader yet -- scripts/build_compilation_track_location.py
+                # populates it out-of-band; LML#1022 adds the /lookup
+                # consumer.
+                (
+                    "Compilation track location",
+                    set_up_compilation_track_location_schema,
                 ),
             )
             await _run_lml_cache_bootstraps(source, bootstraps)

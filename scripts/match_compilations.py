@@ -85,7 +85,7 @@ async def load_compilations(db_path: str) -> list[CompAlbum]:
 
 async def exact_match(
     conn: asyncpg.Connection, comps: list[CompAlbum]
-) -> tuple[list[DiscogsMatch], list[CompAlbum]]:
+) -> tuple[list[DiscogsMatch], list[CompAlbum], dict[str, list[tuple[int, str]]]]:
     """Try exact case-insensitive title match against VA Discogs releases."""
     matched: list[DiscogsMatch] = []
     unmatched: list[CompAlbum] = []
