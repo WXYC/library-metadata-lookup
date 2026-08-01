@@ -1612,7 +1612,11 @@ class TestPerformLookupLocationUnion:
                 "lookup.orchestrator.resolve_track_shelf_locations", new_callable=AsyncMock
             ) as resolve_mock:
                 response = await perform_lookup(
-                    request, mock_library_db, mock_discogs_service, telemetry
+                    request,
+                    mock_library_db,
+                    mock_discogs_service,
+                    telemetry,
+                    discogs_cache_pg=AsyncMock(),
                 )
 
             assert len(response.results) == 1
@@ -1646,7 +1650,11 @@ class TestPerformLookupLocationUnion:
             ) as resolve_mock,
         ):
             response = await perform_lookup(
-                request, mock_library_db, mock_discogs_service, telemetry
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
             )
 
         assert len(response.results) == 1
@@ -1659,7 +1667,11 @@ class TestPerformLookupLocationUnion:
         """'ikebana by brian reitzell' (LML#271 live-repro): the artist has no
         own release in the library (Case B) -- the LiT soundtrack location
         surfaces as an ordinary result, tagged via matched_via, and the
-        response reads found-on-compilation, not not-found."""
+        response reads found-on-compilation, not not-found. LML#1026: the
+        recall index is the single source on this path -- the index hit must
+        also suppress TRACK_ON_COMPILATION's live-Discogs comp-discovery
+        probes entirely (the Case-B primary is resolved from the index, and
+        no live discovery call is spent rediscovering it)."""
         mock_library_db.search.return_value = []
         mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
 
@@ -1678,7 +1690,11 @@ class TestPerformLookupLocationUnion:
             return_value=[lit_location],
         ):
             response = await perform_lookup(
-                request, mock_library_db, mock_discogs_service, telemetry
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
             )
 
         assert len(response.results) == 1
@@ -1694,6 +1710,276 @@ class TestPerformLookupLocationUnion:
         assert response.search_type == "compilation"
         assert response.context_message == 'Found "Ikebana" by Brian Reitzell on:'
         assert response.external_source == "library"
+        # LML#1026: no live comp discovery on the union-active path. Step 2's
+        # album-resolution probe (`resolve_albums_for_track`) legitimately
+        # remains -- exactly one call, and never the strategy's Wave B
+        # fingerprint (`artist_as_keyword=True`).
+        assert mock_discogs_service.search_releases_by_track.await_count == 1
+        assert not any(
+            call.kwargs.get("artist_as_keyword")
+            for call in mock_discogs_service.search_releases_by_track.await_args_list
+        ), "the strategy's live comp-discovery pass must not fire on an index hit"
+
+    @pytest.mark.asyncio
+    async def test_low_priority_caller_keeps_the_legacy_live_comp_pass(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#1026 tri-state, the None branch: a class-5 caller never gets a
+        union task, so TRACK_ON_COMPILATION runs its legacy live-Discogs
+        comp-discovery pass byte-identically -- backfill/enrichment recall is
+        untouched by the index-authoritative rework (and so is every caller
+        when LML_LOCATION_UNION_ENABLED is off, the rollback lever)."""
+        mock_library_db.search.return_value = []
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        with (
+            patch("lookup.orchestrator.is_discogs_low_priority", return_value=True),
+            patch(
+                "lookup.orchestrator.resolve_track_shelf_locations", new_callable=AsyncMock
+            ) as resolve_mock,
+        ):
+            await perform_lookup(
+                LookupRequest(
+                    artist="Brian Reitzell",
+                    song="Ikebana",
+                    raw_message="Ikebana by Brian Reitzell",
+                ),
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
+            )
+
+        resolve_mock.assert_not_awaited()
+        assert any(
+            call.kwargs.get("artist_as_keyword")
+            for call in mock_discogs_service.search_releases_by_track.await_args_list
+        ), (
+            "class-5 lookups must keep the legacy live comp-discovery pass "
+            "(Wave B's artist_as_keyword=True call is its fingerprint)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_index_hit_skips_the_library_miss_probe(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#1026: with an album typed and no library results, step 3a used
+        to live-search Discogs and synthesize a rowless id-0 'not in your
+        library' item -- which _build_result_items ranks FIRST, preempting
+        the folded shelf location as primary. An index hit must skip 3a: the
+        fold supplies in-library rows, so the id-0 synthesis would be both a
+        wasted live call and a wrong primary."""
+        mock_library_db.search.return_value = []
+        mock_library_db.find_similar_artist.return_value = None
+        # A confident Discogs match 3a WOULD synthesize if it ran.
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=12345,
+                    album="Lost in Translation",
+                    artist="Brian Reitzell",
+                    artwork_url="https://example.com/lit.jpg",
+                )
+            ]
+        )
+
+        lit_item = LibraryItem(id=60654, title="Lost in Translation", artist="Soundtracks - L")
+        lit_location = ResolvedLocation(row=_location_row(), shelf_item=lit_item)
+
+        request = LookupRequest(
+            artist="Brian Reitzell",
+            song="Ikebana",
+            album="Lost in Translation",
+            raw_message="Ikebana by Brian Reitzell from Lost in Translation",
+        )
+
+        with patch(
+            "lookup.orchestrator.resolve_track_shelf_locations",
+            new_callable=AsyncMock,
+            return_value=[lit_location],
+        ):
+            response = await perform_lookup(
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
+            )
+
+        ids = [r.library_item.id for r in response.results]
+        assert 0 not in ids, f"step 3a's rowless id-0 row must not surface on an index hit: {ids}"
+        assert response.results[0].library_item.id == 60654
+
+    @pytest.mark.asyncio
+    async def test_a_prime_prepends_the_location_ahead_of_trackless_artist_albums(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """A-prime: the artist's own album matched but does NOT carry the
+        track (pre-fold song_not_found=True), and the track lives on a comp
+        the index knows. The response reads found-on-compilation with a
+        'Found ... on:' context -- so the row that actually carries the track
+        must LEAD it, not trail an album that doesn't (the legacy live pass
+        got this ordering by replacing prior results with the comp hit)."""
+        other_album = make_library_item(
+            id=41, artist="Brian Reitzell", title="Auto Music", call_letters="R"
+        )
+        mock_library_db.search.return_value = [other_album]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        lit_item = LibraryItem(id=60654, title="Lost in Translation", artist="Soundtracks - L")
+        lit_location = ResolvedLocation(row=_location_row(), shelf_item=lit_item)
+
+        request = LookupRequest(
+            artist="Brian Reitzell",
+            song="Ikebana",
+            raw_message="Ikebana by Brian Reitzell",
+        )
+
+        with patch(
+            "lookup.orchestrator.resolve_track_shelf_locations",
+            new_callable=AsyncMock,
+            return_value=[lit_location],
+        ):
+            response = await perform_lookup(
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
+            )
+
+        ids = [r.library_item.id for r in response.results]
+        assert ids[0] == 60654, f"the track-bearing location must lead the response, got {ids}"
+        assert 41 in ids, "the artist's own album stays in the response, demoted"
+        assert response.found_on_compilation is True
+        assert response.song_not_found is False
+
+    @pytest.mark.asyncio
+    async def test_overlap_with_existing_result_still_reconciles_signals(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#717 shape: the comp row already surfaced via the artist
+        search's album-title leg, so the fold dedups the sole resolved
+        location away (nothing appended). The index still proved the track
+        is on the returned row -- the response must read found-on-compilation
+        with the found context, not leak the pre-fold song_not_found=True."""
+        lit_as_library_row = LibraryItem(
+            id=60654, title="Lost in Translation", artist="Soundtracks - L"
+        )
+        mock_library_db.search.return_value = [lit_as_library_row]
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        lit_location = ResolvedLocation(row=_location_row(), shelf_item=lit_as_library_row)
+
+        request = LookupRequest(
+            artist="Brian Reitzell",
+            song="Ikebana",
+            raw_message="Ikebana by Brian Reitzell",
+        )
+
+        with patch(
+            "lookup.orchestrator.resolve_track_shelf_locations",
+            new_callable=AsyncMock,
+            return_value=[lit_location],
+        ):
+            response = await perform_lookup(
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
+            )
+
+        ids = [r.library_item.id for r in response.results]
+        assert ids.count(60654) == 1, f"the comp row must appear exactly once, got {ids}"
+        assert response.song_not_found is False
+        assert response.found_on_compilation is True
+        assert response.search_type == "compilation"
+        assert response.context_message == 'Found "Ikebana" by Brian Reitzell on:'
+
+    @pytest.mark.asyncio
+    async def test_degraded_probe_restores_the_legacy_live_pass_end_to_end(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """A probe failure means the index could not be consulted: the
+        strategy must fall back to the full legacy live comp pass (Wave B's
+        artist_as_keyword fingerprint observable) and the fold degrades to
+        no locations -- never an exception, never a silent zeroing of comp
+        recall."""
+        mock_library_db.search.return_value = []
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        request = LookupRequest(
+            artist="Brian Reitzell",
+            song="Ikebana",
+            raw_message="Ikebana by Brian Reitzell",
+        )
+
+        with patch(
+            "lookup.orchestrator.resolve_track_shelf_locations",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("probe exploded"),
+        ):
+            response = await perform_lookup(
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
+            )
+
+        assert any(
+            call.kwargs.get("artist_as_keyword")
+            for call in mock_discogs_service.search_releases_by_track.await_args_list
+        ), "a degraded probe must restore the legacy live comp-discovery pass"
+        assert response.degraded is False
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_real_probe_rank_join_and_fold(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#1026 nit 4: drive the REAL resolve_track_shelf_locations ->
+        rank -> shelf-join -> build_location_result_items chain (the other
+        union tests patch the probe at the orchestrator's import site),
+        mocking only the recall-index read and the library-DB join."""
+        mock_library_db.search.return_value = []
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        lit_item = LibraryItem(id=60654, title="Lost in Translation", artist="Soundtracks - L")
+        mock_library_db.get_items_by_ids = AsyncMock(return_value={60654: lit_item})
+
+        request = LookupRequest(
+            artist="Brian Reitzell",
+            song="Ikebana",
+            raw_message="Ikebana by Brian Reitzell",
+        )
+
+        with patch(
+            "lookup.location_union.get_compilation_track_locations",
+            new_callable=AsyncMock,
+            return_value=[_location_row()],
+        ) as index_read:
+            response = await perform_lookup(
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
+            )
+
+        index_read.assert_awaited_once()
+        mock_library_db.get_items_by_ids.assert_awaited_once_with([60654])
+        assert len(response.results) == 1
+        item = response.results[0]
+        assert item.library_item.id == 60654
+        assert item.library_item.title == "Lost in Translation"
+        assert item.artwork is not None
+        assert item.artwork.release_id == 12345
+        assert item.artwork.artwork_url == "https://example.com/lit.jpg"
+        assert item.matched_via is not None
+        assert item.matched_via[0].source == TrackMatchSource.discogs_release
+        assert item.matched_via[0].position == "A3"
+        assert response.found_on_compilation is True
 
     @pytest.mark.asyncio
     async def test_case_a_own_release_matched_plus_other_location_primary_first(
@@ -1753,7 +2039,11 @@ class TestPerformLookupLocationUnion:
             return_value=[own_location, lit_location],
         ):
             response = await perform_lookup(
-                request, mock_library_db, mock_discogs_service, telemetry
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
             )
 
         assert len(response.results) == 2
@@ -1794,7 +2084,11 @@ class TestPerformLookupLocationUnion:
             return_value=[unjoined, joined],
         ):
             response = await perform_lookup(
-                request, mock_library_db, mock_discogs_service, telemetry
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
             )
 
         assert len(response.results) == 1
@@ -1841,6 +2135,7 @@ class TestPerformLookupLocationUnion:
                 telemetry,
                 discogs_cache=discogs_cache,
                 mb_pg=mb_pg,
+                discogs_cache_pg=AsyncMock(),
             )
 
         # The fallback ran (not suppressed by the union having a location).
@@ -1889,7 +2184,11 @@ class TestPerformLookupLocationUnion:
             patch("lookup.orchestrator._step_fetch_artwork", side_effect=_shed),
         ):
             response = await perform_lookup(
-                request, mock_library_db, mock_discogs_service, telemetry
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
             )
 
         assert response.degraded is True
@@ -1937,7 +2236,13 @@ class TestPerformLookupLocationUnion:
             patch("lookup.orchestrator._DEGRADED_LOCATION_UNION_AWAIT_TIMEOUT_S", 0.05),
         ):
             response = await asyncio.wait_for(
-                perform_lookup(request, mock_library_db, mock_discogs_service, telemetry),
+                perform_lookup(
+                    request,
+                    mock_library_db,
+                    mock_discogs_service,
+                    telemetry,
+                    discogs_cache_pg=AsyncMock(),
+                ),
                 timeout=5.0,
             )
 
@@ -1979,7 +2284,11 @@ class TestPerformLookupLocationUnion:
             patch("lookup.orchestrator.sentry_sdk.get_current_scope", return_value=mock_scope),
         ):
             response = await perform_lookup(
-                request, mock_library_db, mock_discogs_service, telemetry
+                request,
+                mock_library_db,
+                mock_discogs_service,
+                telemetry,
+                discogs_cache_pg=AsyncMock(),
             )
 
         calls = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
@@ -2781,3 +3090,41 @@ class TestLookupStatePromotedSearchStateFields:
         assert state.artist_fallback_results == []
         assert state.matched_via_by_id == {}
         assert state.timed_out is False
+
+
+class TestUnionProbeExceptionRetrieval:
+    """The done-callback that keeps a failed probe task from logging 'Task
+    exception was never retrieved' when an unexpected error aborts
+    perform_lookup before any await site consumes the task (LML#1026 sweep
+    finding)."""
+
+    @pytest.mark.asyncio
+    async def test_failed_task_exception_is_marked_retrieved(self):
+        from lookup.orchestrator import _retrieve_union_probe_exception
+
+        async def _boom():
+            raise RuntimeError("probe exploded")
+
+        task = asyncio.create_task(_boom())
+        task.add_done_callback(_retrieve_union_probe_exception)
+        with pytest.raises(RuntimeError):
+            await task
+        # Callbacks run via call_soon; give the loop one tick, then verify
+        # the exception reads as already-retrieved (no GC warning pending).
+        await asyncio.sleep(0)
+        assert isinstance(task.exception(), RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_is_left_alone(self):
+        from lookup.orchestrator import _retrieve_union_probe_exception
+
+        async def _pending():
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(_pending())
+        task.add_done_callback(_retrieve_union_probe_exception)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+        assert task.cancelled()

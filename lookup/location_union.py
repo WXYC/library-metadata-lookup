@@ -29,6 +29,16 @@ to "every OTHER location" and converts survivors into ``LookupResultItem``s
 with :func:`build_location_result_items` -- excluding whichever library ids
 already appear in the built response
 (:func:`primary_library_ids_from_results`).
+
+The same task is also threaded into step 3's ``TRACK_ON_COMPILATION``
+strategy (LML#1026), for which the recall index is authoritative: an index
+hit (>=1 renderable location) makes the strategy contribute nothing (this
+module's fold supplies the locations, leading the response as the Case-B
+primary), an authoritative miss suppresses the strategy's live-Discogs
+comp-discovery pass, and a DEGRADED probe (this module now raises on any
+probe/rank/join failure rather than masking it as ``[]``) restores the full
+legacy live pass. See ``search_compilations_for_track``'s docstring for the
+tri-state.
 """
 
 from __future__ import annotations
@@ -58,6 +68,19 @@ logger = logging.getLogger(__name__)
 _CREDIT_TIER_RANK: dict[str, int] = {"primary": 0, "featured": 1, "extra": 2}
 """Ranking order (lower is better) -- ties within a tier break on title-ratio,
 then library_id. Any future credit_role value not in this map ranks last."""
+
+LOCATION_UNION_INDEX_HIT_STAT_KEY = "location_union_index_hit"
+LOCATION_UNION_INDEX_MISS_STAT_KEY = "location_union_index_miss"
+LOCATION_UNION_INDEX_DEGRADED_STAT_KEY = "location_union_index_degraded"
+"""Per-request ``cache.*`` counters for the LML#1026 authority decision in
+TRACK_ON_COMPILATION (hit -> fold supplies the results; miss -> live comp
+discovery suppressed; degraded -> probe unavailable, legacy pass restored).
+Recorded at the strategy's consult site; pre-declared in ``lookup/router.py``'s
+``_LML_CACHE_STATS_EXTRA_KEYS`` so all three are alertable baseline series on
+the LML#683 observability surface -- the same paired-counter pattern every
+prior authority flip shipped with (LML#681, LML#755, LML#879). The degraded
+series is the alarm input: a sustained nonzero rate means comp lookups are
+running without the index (discogs-cache PG outage class)."""
 
 
 def should_run_location_union(request: LookupRequest) -> bool:
@@ -91,17 +114,18 @@ class ResolvedLocation:
     """One ranked recall-index row, joined to its shelf ``LibraryItem`` when
     the join found one.
 
-    ``shelf_item`` is ``None`` when the row's ``library_id`` had no match in
-    the shelf-metadata join -- an individual miss, or the whole join
-    degraded to ``{}`` on a PG exception (see
-    :func:`resolve_track_shelf_locations`). :func:`build_location_result_items`
-    skips these: a location with no shelf metadata (artist/title/call
-    number) cannot be rendered as a ``LookupResultItem``. This is a
-    **meaning change** from the pre-fold design, which emitted a bare
-    ``LibraryLocation`` with null ``artist``/``album_title`` on the same
-    degradation -- the fold has no such partial shape, so a join failure now
-    means "no folded locations" for the affected rows, not "locations with
-    blank fields."
+    ``shelf_item`` is ``None`` when the row's ``library_id`` individually had
+    no match in an otherwise-successful shelf-metadata join -- a stale index
+    row (a WHOLE-join failure propagates out of
+    :func:`resolve_track_shelf_locations` as a degradation instead, post
+    LML#1026). :func:`build_location_result_items` skips ``None`` rows (a
+    location with no shelf metadata -- artist/title/call number -- cannot be
+    rendered as a ``LookupResultItem``), and the strategy's hit detection
+    counts only renderable rows. This is a **meaning change** from the
+    pre-fold design, which emitted a bare ``LibraryLocation`` with null
+    ``artist``/``album_title`` for the same rows -- the fold has no such
+    partial shape, so an individual join miss means "not a foldable
+    location," not "a location with blank fields."
     """
 
     row: CompilationTrackLocationRow
@@ -123,9 +147,26 @@ async def resolve_track_shelf_locations(
     job, run only after the response is otherwise built, so this probe has no
     dependency on it and can run fully concurrently.
 
-    Degrades to ``[]`` (never raises) when there is no PG source, no typed
-    artist (the recall index's key is ``(track_artist, track_title)``), or no
-    match -- a miss here must never surface as a lookup failure.
+    Empty-vs-degraded contract (LML#1026): ``[]`` means exactly "no PG source
+    configured, no typed artist/song, or the index authoritatively has no
+    locations for this key". Anything that prevents the index from being
+    consulted or its rows from being ranked/joined RAISES instead --
+    :class:`CompilationTrackLocationProbeError` from the probe, or the raw
+    exception from the rank/join (e.g. a schema relaxation letting a ``None``
+    ``library_id`` into the sort's tie-break, or a whole-join failure). This
+    module deliberately does NOT swallow those into ``[]``: the strategy
+    consumer treats emptiness as an authoritative miss that suppresses the
+    legacy live comp-discovery pass, so a masked degradation would silently
+    zero comp-track recall. Every await site catches and owns its own
+    degrade policy (the fold sites degrade to no-locations; the strategy
+    falls back to the full legacy pass), so a probe failure still never
+    surfaces as a ``/lookup`` 500 -- the LML#1026 nit-1 goal, enforced at
+    the await boundary rather than by an in-module catch.
+
+    An INDIVIDUAL id missing from the shelf join (a stale index row) is not
+    a degradation: it comes back as ``shelf_item=None`` and the consumers
+    filter it (:func:`build_location_result_items` skips it; the strategy
+    counts only renderable locations toward an index hit).
     """
     if discogs_cache_pg is None or not parsed.artist or not parsed.song:
         return []
@@ -146,11 +187,7 @@ async def resolve_track_shelf_locations(
         ),
     )
 
-    try:
-        shelf_items = await db.get_items_by_ids([row.library_id for row in ranked])
-    except Exception:
-        logger.exception("location-union shelf-metadata join failed; degrading to no locations")
-        shelf_items = {}
+    shelf_items = await db.get_items_by_ids([row.library_id for row in ranked])
 
     return [ResolvedLocation(row=row, shelf_item=shelf_items.get(row.library_id)) for row in ranked]
 

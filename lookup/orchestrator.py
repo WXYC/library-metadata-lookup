@@ -519,6 +519,7 @@ async def _step_search_pipeline(
     candidate_memo: TrackCandidateMemo,
     state: LookupState,
     services: LookupServices,
+    location_union_task: asyncio.Task[list[ResolvedLocation]] | None = None,
 ) -> None:
     """Step 3 — execute the search strategy pipeline.
 
@@ -530,6 +531,17 @@ async def _step_search_pipeline(
     ``candidate_memo`` (LML#867) is the step-2 artist-filtered track candidate
     carry-through; it is bound into the ``TRACK_ON_COMPILATION`` execute partial
     so the strategy reuses step 2's Wave A search instead of re-issuing it.
+
+    ``location_union_task`` (LML#1026) is the concurrent recall-index probe,
+    present exactly when the location union is active. It is bound into the
+    ``TRACK_ON_COMPILATION`` execute partial, which treats the index as the
+    single source for comp-track resolution: an index hit makes the strategy
+    contribute nothing (the fold appends the shelf locations, ranked-first as
+    the Case-B primary) and an index miss suppresses the live-Discogs
+    comp-discovery probes -- see ``search_compilations_for_track``'s
+    docstring for the full tri-state. ``None`` (kill switch off /
+    low-priority caller / no song) preserves the legacy live pass
+    byte-identically.
 
     The raw ``SearchState`` this step builds never escapes it: every field a
     later step needs is copied onto ``LookupState`` here.
@@ -565,6 +577,7 @@ async def _step_search_pipeline(
                 pg=services.discogs_cache_pg,
                 allow_release_resolution_fallback=services.allow_release_resolution_fallback,
                 candidate_memo=candidate_memo,
+                location_union_task=location_union_task,
             ),
             search_song_as_artist_func=partial(
                 search_song_as_artist,
@@ -609,10 +622,33 @@ async def _step_search_pipeline(
             services.telemetry.record_api_call("discogs")
 
 
+def _task_resolved_with_renderable_locations(
+    location_union_task: asyncio.Task[list[ResolvedLocation]] | None,
+) -> bool:
+    """Non-blocking peek: did the union probe already resolve with at least
+    one renderable shelf location?
+
+    Used by step 3a's gate (LML#1026): on an index hit the strategy returns
+    nothing, leaving ``library_results`` empty — exactly the state that used
+    to mean "the library has nothing, ask Discogs directly". The peek keeps
+    step 3a from firing a live Discogs search and synthesizing a rowless
+    id-0 row that would outrank the folded shelf location as primary. A
+    pending, cancelled, or failed task reads ``False`` (step 3a proceeds —
+    the safe fallback), and on the only path where this matters the strategy
+    has already awaited the task, so "hit" is always observable by now.
+    """
+    if location_union_task is None or not location_union_task.done():
+        return False
+    if location_union_task.cancelled() or location_union_task.exception() is not None:
+        return False
+    return any(location.shelf_item is not None for location in location_union_task.result())
+
+
 async def _step_library_miss_probe(
     parsed: ParsedRequest,
     state: LookupState,
     services: LookupServices,
+    location_union_task: asyncio.Task[list[ResolvedLocation]] | None = None,
 ) -> None:
     """Step 3a — library-miss Discogs search (LML#583).
 
@@ -643,6 +679,13 @@ async def _step_library_miss_probe(
     # not the five song-bearing LML#652 producers — so gating it is what makes the
     # "no per-row Discogs surfacing/cost on bulk" guarantee true for the real drain.
     # /lookup keeps the default (``True``), so #583 fires there exactly as before.
+    # LML#1026: an index hit means the fold will supply in-library shelf rows
+    # for this track — synthesizing a rowless id=0 "not in your library" item
+    # here would both spend the live Discogs call the hit path is meant to
+    # avoid and outrank the shelf location as primary (_build_result_items
+    # ranks items_with_artwork first).
+    if _task_resolved_with_renderable_locations(location_union_task):
+        return
     if (
         not state.library_results
         and services.allow_release_resolution_fallback
@@ -1110,18 +1153,43 @@ async def perform_lookup(
     # every interactive, song-bearing lookup. It depends only on `parsed`,
     # not on the pipeline's outcome, so it races step 3 for free. Awaited at
     # the append site after the whole spine resolves (see below), not here —
-    # every early return in this function threads the task itself into
-    # `_build_degraded_response`, which bounds its own await, so nothing here
-    # is ever left dangling.
+    # though step 3's TRACK_ON_COMPILATION also consults the same task
+    # (LML#1026: the index is authoritative for comp-track resolution, so the
+    # strategy skips its live comp-discovery pass whenever this task exists;
+    # awaiting a task twice is safe). Every early return in this function
+    # threads the task itself into `_build_degraded_response`, which bounds
+    # its own await, so nothing here is ever left dangling.
+    # The `discogs_cache_pg is not None` leg matters post-LML#1026: with no PG
+    # source the probe can only ever degrade to [], and a task that exists but
+    # cannot consult the index would read as an authoritative "index miss" to
+    # TRACK_ON_COMPILATION — wrongly suppressing the legacy live pass. "Union
+    # unavailable" (no source) must stay distinct from "index says no" (a real
+    # miss), so no task is created at all.
     location_union_task = (
         asyncio.create_task(
             resolve_track_shelf_locations(parsed, services.discogs_cache_pg, services.db)
         )
-        if should_run_location_union(request) and not is_discogs_low_priority()
+        if (
+            services.discogs_cache_pg is not None
+            and should_run_location_union(request)
+            and not is_discogs_low_priority()
+        )
         else None
     )
+    if location_union_task is not None:
+        # GC hygiene: post-LML#1026 the probe RAISES on degradation, and an
+        # unexpected exception escaping perform_lookup after this point would
+        # leave the failed task un-awaited — asyncio would then log "Task
+        # exception was never retrieved" with the probe traceback at GC time,
+        # polluting triage during exactly the incident windows the degraded
+        # counter exists to make legible. The done-callback retrieves the
+        # exception unconditionally (idempotent; every await site still sees
+        # it re-raised).
+        location_union_task.add_done_callback(_retrieve_union_probe_exception)
 
-    await _step_search_pipeline(parsed, albums_for_search, candidate_memo, state, services)
+    await _step_search_pipeline(
+        parsed, albums_for_search, candidate_memo, state, services, location_union_task
+    )
 
     # LML#930 PR2 admission shed: proactively shed the tail for low-priority
     # traffic under sustained event-loop pressure — rationale in admission.py.
@@ -1154,7 +1222,10 @@ async def perform_lookup(
     # unshed — same posture as the empty-state cutoff. The two sheds compose:
     # saturation is "couldn't ask", deadline is "ran out of time to ask".
     tail_steps: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = (
-        ("library_miss_probe", partial(_step_library_miss_probe, parsed, state, services)),
+        (
+            "library_miss_probe",
+            partial(_step_library_miss_probe, parsed, state, services, location_union_task),
+        ),
         ("validate_tracks", partial(_step_validate_tracks, parsed, state, services)),
         ("populate_streaming_status", partial(_step_populate_streaming_status, state, services)),
         ("fetch_artwork", partial(_step_fetch_artwork, parsed, state, services)),
@@ -1222,10 +1293,9 @@ async def perform_lookup(
     # the ids already in `result_items`, which at this point includes both the
     # primary matches AND any external-cache-fallback synthetic rows.
     folded_locations = await _await_location_union(location_union_task)
-    location_items = build_location_result_items(
-        folded_locations, primary_library_ids_from_results(result_items)
+    result_items, folded_location_count, index_confirmed_existing = _fold_locations_into_results(
+        result_items, folded_locations, state
     )
-    result_items.extend(location_items)
 
     (
         song_not_found,
@@ -1236,7 +1306,8 @@ async def perform_lookup(
     ) = _reconcile_post_fold_signals(
         parsed,
         state,
-        folded_location_count=len(location_items),
+        folded_location_count=folded_location_count,
+        index_confirmed_existing=index_confirmed_existing,
         external_source=external_source,
     )
     _project_post_fold_trace_attrs(result_items, search_type)
@@ -1286,6 +1357,64 @@ own budget, since a degraded return is trying to get OUT from under a slow
 tail, not adopt another one."""
 
 
+def _retrieve_union_probe_exception(location_union_task: asyncio.Task) -> None:
+    """Done-callback for the union probe task: mark any failure retrieved.
+
+    ``Task.exception()`` on a done task flags the exception as observed, so
+    asyncio never emits "Task exception was never retrieved" for a probe
+    that failed on a request path that then blew up before any await site
+    consumed it. Retrieval is idempotent — the strategy's consult and the
+    fold's await still see the exception re-raised as normal.
+    """
+    if location_union_task.cancelled():
+        return
+    exc = location_union_task.exception()
+    if exc is not None:
+        logger.debug("location-union probe task failed (retrieved for GC hygiene): %r", exc)
+
+
+def _fold_locations_into_results(
+    result_items: list[LookupResultItem],
+    folded_locations: list[ResolvedLocation],
+    state: LookupState,
+) -> tuple[list[LookupResultItem], int, bool]:
+    """Fold the resolved shelf locations into the built result list.
+
+    Returns ``(combined_items, folded_location_count,
+    index_confirmed_existing)`` -- the latter two feed
+    :func:`_reconcile_post_fold_signals`.
+
+    Positioning (LML#1026): when the pre-fold spine confirmed the track
+    somewhere (``state.song_not_found`` is False), the folded locations are
+    APPENDED after the primaries -- the Case-A contract ("the primary always
+    precedes them"). When it did NOT (``song_not_found`` True -- Case B's
+    empty spine, or the A-prime shape where the artist's own albums matched
+    but none carries the track), the locations are PREPENDED: the response is
+    about to read found-on-compilation with a "Found ... on:" context, and
+    the rows that actually carry the track must lead it, not trail albums
+    that don't. Pre-#1026 the legacy live pass produced the same ordering by
+    *replacing* prior results with the comp hit (stashing them for
+    validation); the fold reproduces the ranking without the replace.
+
+    ``index_confirmed_existing`` is True when a resolved index row's
+    ``library_id`` is already present in the built response (the fold then
+    dedups it away, e.g. the LML#717 shape where the comp row arrived via
+    the album-title leg of the artist search) -- proof the track is on a row
+    the caller is already receiving, which the reconciliation must reflect
+    even though nothing new was appended.
+    """
+    primary_ids = primary_library_ids_from_results(result_items)
+    location_items = build_location_result_items(folded_locations, primary_ids)
+    index_confirmed_existing = any(
+        location.row.library_id in primary_ids for location in folded_locations
+    )
+    if location_items and state.song_not_found:
+        combined = location_items + result_items
+    else:
+        combined = result_items + location_items
+    return combined, len(location_items), index_confirmed_existing
+
+
 async def _await_location_union(
     location_union_task: asyncio.Task[list[ResolvedLocation]] | None,
 ) -> list[ResolvedLocation]:
@@ -1293,9 +1422,11 @@ async def _await_location_union(
 
     By the time the happy path gets here the task has had the whole tail
     (steps 3a-4b, enrichment) to finish, so this rarely actually waits.
-    Defensive: :func:`resolve_track_shelf_locations` documents that it never
-    raises, but a probe failure here must still never surface as a `/lookup`
-    500.
+    Post-LML#1026 :func:`resolve_track_shelf_locations` deliberately RAISES
+    on degradation (probe failure/timeout, rank/join error) so the strategy
+    can distinguish "union unavailable" from an authoritative miss; this
+    fold site's policy for the same failure is simply "no locations" -- and
+    it must never surface as a `/lookup` 500.
     """
     if location_union_task is None:
         return []
@@ -1335,6 +1466,7 @@ def _reconcile_post_fold_signals(
     state: LookupState,
     *,
     folded_location_count: int,
+    index_confirmed_existing: bool = False,
     external_source: str | None,
 ) -> tuple[bool, bool, str, str | None, str | None]:
     """Recompute every state-derived response signal from whether the
@@ -1345,12 +1477,18 @@ def _reconcile_post_fold_signals(
 
     Returns ``(song_not_found, found_on_compilation, search_type,
     context_message, external_source)``. A **no-op** when
-    ``folded_location_count`` is 0 — every request the location union didn't
-    touch (kill switch off, low-priority caller, no song, no recall-index
-    hit) gets byte-identical output to before this reconciliation existed;
-    the ``context_message`` branch below reproduces the old Step 5 call site
-    exactly (same three inputs, same function), just moved to run after the
-    fold instead of before it.
+    ``folded_location_count`` is 0 AND ``index_confirmed_existing`` is False
+    — every request the location union didn't touch (kill switch off,
+    low-priority caller, no song, no recall-index hit) gets byte-identical
+    output to before this reconciliation existed; the ``context_message``
+    branch below reproduces the old Step 5 call site exactly (same three
+    inputs, same function), just moved to run after the fold instead of
+    before it. ``index_confirmed_existing`` (LML#1026) covers the fold's
+    dedup blind spot: when every resolved index row was already present in
+    the response (e.g. the comp row arrived via the artist search's
+    album-title leg — the LML#717 shape), nothing new is appended but the
+    index has still proven the track is on a returned row, so the response
+    must read found-on-compilation, not not-found.
 
     Keyed on the explicit ``folded_location_count``, never on ``matched_via``
     presence in ``result_items`` — the primary track-match strategies
@@ -1364,7 +1502,7 @@ def _reconcile_post_fold_signals(
     unconditionally, per the pre-existing degraded contract — read only the
     ``song_not_found``/``found_on_compilation`` pair and discard the rest.
     """
-    if folded_location_count == 0:
+    if folded_location_count == 0 and not index_confirmed_existing:
         context_message = build_context_message(
             parsed,
             state.found_on_compilation,
@@ -1469,16 +1607,16 @@ async def _build_degraded_response(
         logger.warning("Failed to project degraded_reason onto Sentry transaction: %s", e)
     result_items = _build_result_items(state, {})
     folded_locations = await _await_location_union_bounded(location_union_task)
-    location_items = build_location_result_items(
-        folded_locations, primary_library_ids_from_results(result_items)
+    result_items, folded_location_count, index_confirmed_existing = _fold_locations_into_results(
+        result_items, folded_locations, state
     )
-    result_items.extend(location_items)
 
     song_not_found, found_on_compilation, search_type, _context_message, _external_source = (
         _reconcile_post_fold_signals(
             parsed,
             state,
-            folded_location_count=len(location_items),
+            folded_location_count=folded_location_count,
+            index_confirmed_existing=index_confirmed_existing,
             external_source=None,
         )
     )
