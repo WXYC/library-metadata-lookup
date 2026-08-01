@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import sentry_sdk
 
+from core.observability import observability_guard, project_transaction
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.service import reset_retry_budget_deadline, set_retry_budget_deadline
 from generated.api_models import TrackMatchHint
@@ -216,14 +217,13 @@ def _log_search_budget_exceeded(
         "skipped": [s.value for s in skipped],
     }
     logger.info("search_budget_exceeded %s", payload)
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is None:
-            return
-        transaction.set_data("search_budget_exceeded", True)
-        transaction.set_data("search_strategies_skipped", payload["skipped"])
-    except Exception as e:
-        logger.warning("Failed to project search_budget_exceeded onto Sentry transaction: %s", e)
+    with observability_guard("project search_budget_exceeded onto Sentry transaction", logger):
+        project_transaction(
+            {
+                "search_budget_exceeded": True,
+                "search_strategies_skipped": payload["skipped"],
+            }
+        )
 
 
 def _log_hard_cap_fired(
@@ -246,15 +246,14 @@ def _log_hard_cap_fired(
         "skipped": [s.value for s in skipped],
     }
     logger.info("hard_cap_fired %s", payload)
-    try:
-        transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is None:
-            return
-        transaction.set_data("hard_cap_fired", True)
-        transaction.set_data("hard_cap_skipped_strategies", payload["skipped"])
-        transaction.set_data("hard_cap_elapsed_ms", payload["elapsed_ms"])
-    except Exception as e:
-        logger.warning("Failed to project hard_cap_fired onto Sentry transaction: %s", e)
+    with observability_guard("project hard_cap_fired onto Sentry transaction", logger):
+        project_transaction(
+            {
+                "hard_cap_fired": True,
+                "hard_cap_skipped_strategies": payload["skipped"],
+                "hard_cap_elapsed_ms": payload["elapsed_ms"],
+            }
+        )
 
 
 def detect_ambiguous_format(raw_message: str) -> tuple[str, str] | None:

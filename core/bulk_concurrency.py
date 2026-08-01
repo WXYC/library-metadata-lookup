@@ -76,6 +76,8 @@ from typing import Any
 import sentry_sdk
 from fastapi import Request
 
+from core.observability import observability_guard, project_capped
+
 logger = logging.getLogger(__name__)
 
 _BULK_MAX_CONCURRENT_ENV = "LML_BULK_MAX_CONCURRENT"
@@ -178,19 +180,27 @@ def _project_global_capped(wait_ms: float) -> None:
       tuning ``LML_BULK_GLOBAL_MAX_CONCURRENT``; running max across the
       transaction's items.
 
+    The running-max de-dup is this function's own bookkeeping (a bulk
+    request's items each acquire the permit independently, and only the
+    WORST wait should land as the measurement), so it stays local rather
+    than folding into :func:`core.observability.project_capped` — that
+    helper only knows how to set a tag + measurement for one call, not
+    de-dup across a transaction's many calls. The tag is idempotent
+    ("true" never changes), so gating the ``project_capped`` call on the
+    running-max check (rather than calling it unconditionally, as the
+    original unconditional ``set_tag`` did) has no observable difference:
+    the first capped call for a transaction always clears the check (a
+    genuine wait is never exactly 0.0), so the tag lands on that call same
+    as before.
+
     Observability must not break the request path; failures log and continue.
     """
-    try:
-        sentry_sdk.set_tag("lml.bulk.global_capped", "true")
+    with observability_guard("project global_capped onto Sentry transaction", logger):
         transaction = sentry_sdk.get_current_scope().transaction
-        if transaction is not None and wait_ms > _global_wait_max_by_transaction.get(
-            transaction, 0.0
-        ):
-            _global_wait_max_by_transaction[transaction] = wait_ms
-            transaction.set_measurement("lml.bulk.global_wait_ms", wait_ms)
-            transaction.set_data("lml.bulk.global_wait_ms", wait_ms)
-    except Exception as e:
-        logger.warning("Failed to project global_capped onto Sentry transaction: %s", e)
+        if transaction is None or wait_ms > _global_wait_max_by_transaction.get(transaction, 0.0):
+            if transaction is not None:
+                _global_wait_max_by_transaction[transaction] = wait_ms
+            project_capped("lml.bulk.global_capped", "lml.bulk.global_wait_ms", wait_ms)
 
 
 @contextlib.asynccontextmanager
