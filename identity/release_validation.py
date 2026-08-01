@@ -79,8 +79,45 @@ class InvalidReleaseExternalIdError(ValueError):
     """
 
 
-def _validate_discogs_positive_int(source: str, external_id: str) -> str:
-    """Discogs release/master IDs: positive decimal integer, rejecting ``0``.
+def _make_positive_int_validator(
+    *, zero_sentinel_reason: str, doc: str | None = None
+) -> Callable[[str, str], str]:
+    """Build a positive-decimal-integer validator with a source-specific zero explanation.
+
+    Shared by the Discogs (release/master) and Apple Music album ID rules —
+    both matched ``_DISCOGS_POSITIVE_INT_RE.fullmatch`` and reported the same
+    malformed-shape error text; the only thing that varied between the two
+    hand-written functions was *why* ``0`` is rejected. ``zero_sentinel_reason``
+    fills that clause verbatim (it follows ``"{source} external_id must be > 0; "``
+    in the raised message), so each call site keeps its own wording.
+
+    ``doc``, if given, becomes the returned validator's ``__doc__`` so a
+    module-level assignment like
+    ``_validate_discogs_positive_int = _make_positive_int_validator(...)``
+    keeps a docstring for ``help()`` / IDE tooltips at the call site.
+    """
+
+    def validator(source: str, external_id: str) -> str:
+        if external_id == "0":
+            raise InvalidReleaseExternalIdError(
+                f"{source} external_id must be > 0; {zero_sentinel_reason}"
+            )
+        if not _DISCOGS_POSITIVE_INT_RE.fullmatch(external_id):
+            raise InvalidReleaseExternalIdError(
+                f"{source} external_id must be a positive decimal integer "
+                f"(digits only, no leading sign / whitespace / underscores / "
+                f"leading zeros), got {external_id!r}"
+            )
+        return external_id
+
+    if doc is not None:
+        validator.__doc__ = doc
+    return validator
+
+
+_validate_discogs_positive_int = _make_positive_int_validator(
+    zero_sentinel_reason="0 is the Discogs unknown-release sentinel.",
+    doc="""Discogs release/master IDs: positive decimal integer, rejecting ``0``.
 
     Discogs uses ``0`` to mark the unknown-release / unknown-master placeholder.
     Negative IDs are never valid. The match against ``[1-9][0-9]*`` is strict —
@@ -88,22 +125,12 @@ def _validate_discogs_positive_int(source: str, external_id: str) -> str:
     separators (``"12_000"``) are all rejected, because bare ``int()`` would
     silently accept them and coerce to a *different* Discogs release than the
     caller meant. Returns the input verbatim on success.
-    """
-    if external_id == "0":
-        raise InvalidReleaseExternalIdError(
-            f"{source} external_id must be > 0; 0 is the Discogs unknown-release sentinel."
-        )
-    if not _DISCOGS_POSITIVE_INT_RE.fullmatch(external_id):
-        raise InvalidReleaseExternalIdError(
-            f"{source} external_id must be a positive decimal integer "
-            f"(digits only, no leading sign / whitespace / underscores / "
-            f"leading zeros), got {external_id!r}"
-        )
-    return external_id
+    """,
+)
 
-
-def _validate_apple_music_album_id(source: str, external_id: str) -> str:
-    """Apple Music album IDs: positive decimal integer.
+_validate_apple_music_album_id = _make_positive_int_validator(
+    zero_sentinel_reason="0 is not a valid Apple Music album ID.",
+    doc="""Apple Music album IDs: positive decimal integer.
 
     Apple's URLs of the form
     ``music.apple.com/<locale>/album/<slug>/<id>`` use a numeric album ID
@@ -115,18 +142,8 @@ def _validate_apple_music_album_id(source: str, external_id: str) -> str:
     validator accepts any positive integer-shaped string so an upstream
     that hands a shorter ID is rejected on its own merits, not on a
     digit-count mismatch with the parser.
-    """
-    if external_id == "0":
-        raise InvalidReleaseExternalIdError(
-            "apple_music_album external_id must be > 0; 0 is not a valid Apple Music album ID."
-        )
-    if not _DISCOGS_POSITIVE_INT_RE.fullmatch(external_id):
-        raise InvalidReleaseExternalIdError(
-            f"apple_music_album external_id must be a positive decimal integer "
-            f"(digits only, no leading sign / whitespace / underscores / "
-            f"leading zeros), got {external_id!r}"
-        )
-    return external_id
+    """,
+)
 
 
 def _validate_bandcamp_album_url(source: str, external_id: str) -> str:

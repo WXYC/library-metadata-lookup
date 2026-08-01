@@ -129,6 +129,26 @@ class TestValidateDiscogsRelease:
         with pytest.raises(InvalidReleaseExternalIdError):
             validate_and_canonicalize_external_id("discogs_release", external_id)
 
+    def test_zero_sentinel_error_message_is_exact(self):
+        # The Discogs and Apple Music validators share one factory
+        # (identity/release_validation.py) — pin the exact wording so a
+        # collapse of the two near-identical functions can't drift it. These
+        # strings surface verbatim in the 422 response detail.
+        with pytest.raises(InvalidReleaseExternalIdError) as exc_info:
+            validate_and_canonicalize_external_id("discogs_release", "0")
+        assert str(exc_info.value) == (
+            "discogs_release external_id must be > 0; 0 is the Discogs unknown-release sentinel."
+        )
+
+    def test_malformed_shape_error_message_is_exact(self):
+        with pytest.raises(InvalidReleaseExternalIdError) as exc_info:
+            validate_and_canonicalize_external_id("discogs_release", "12_000")
+        assert str(exc_info.value) == (
+            "discogs_release external_id must be a positive decimal integer "
+            "(digits only, no leading sign / whitespace / underscores / "
+            "leading zeros), got '12_000'"
+        )
+
 
 class TestValidateDiscogsMaster:
     """Discogs master IDs follow the same rule as releases."""
@@ -143,6 +163,15 @@ class TestValidateDiscogsMaster:
     def test_rejects_negative(self):
         with pytest.raises(InvalidReleaseExternalIdError):
             validate_and_canonicalize_external_id("discogs_master", "-5")
+
+    def test_zero_sentinel_error_message_is_exact(self):
+        # Same shared factory as discogs_release, but the {source} token must
+        # still resolve per-call — "master", not "release".
+        with pytest.raises(InvalidReleaseExternalIdError) as exc_info:
+            validate_and_canonicalize_external_id("discogs_master", "0")
+        assert str(exc_info.value) == (
+            "discogs_master external_id must be > 0; 0 is the Discogs unknown-release sentinel."
+        )
 
 
 class TestValidateBandcamp:
@@ -228,6 +257,27 @@ class TestValidateAppleMusicAlbum:
     def test_rejects_non_integer(self, external_id):
         with pytest.raises(InvalidReleaseExternalIdError):
             validate_and_canonicalize_external_id("apple_music_album", external_id)
+
+    def test_zero_error_message_is_exact(self):
+        # Apple's "0 is not a valid..." explanation differs from Discogs's
+        # "0 is the Discogs unknown-release sentinel." wording even though
+        # both validators now share one factory — pin the exact string so a
+        # collapse can't quietly blend the two source-specific explanations.
+        # These strings surface verbatim in the 422 response detail.
+        with pytest.raises(InvalidReleaseExternalIdError) as exc_info:
+            validate_and_canonicalize_external_id("apple_music_album", "0")
+        assert str(exc_info.value) == (
+            "apple_music_album external_id must be > 0; 0 is not a valid Apple Music album ID."
+        )
+
+    def test_malformed_shape_error_message_is_exact(self):
+        with pytest.raises(InvalidReleaseExternalIdError) as exc_info:
+            validate_and_canonicalize_external_id("apple_music_album", "12_000")
+        assert str(exc_info.value) == (
+            "apple_music_album external_id must be a positive decimal integer "
+            "(digits only, no leading sign / whitespace / underscores / "
+            "leading zeros), got '12_000'"
+        )
 
 
 class TestValidateSpotifyAlbum:
