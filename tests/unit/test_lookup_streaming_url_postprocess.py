@@ -52,6 +52,7 @@ import pytest
 from entity.sources import PgSource
 from entity.store import EntityStore
 from entity.streaming_url_cache import ResolveOutcome
+from generated.api_models import StreamingResolutionStatus
 from identity.release_validation import (
     RELEASE_SOURCE_CONFIG,
 )
@@ -195,7 +196,7 @@ _drain_background_tasks = drain_streaming_warm_tasks
 
 async def _run(update, *, settings, clients=None, entity_store=None, pg=None):
     """Invoke the post-process with this module's standard request shape."""
-    await apply_streaming_url_postprocess(
+    return await apply_streaming_url_postprocess(
         update,
         clients=clients if clients is not None else _clients(),
         pg=pg if pg is not None else AsyncMock(spec=PgSource),
@@ -670,6 +671,139 @@ class TestBulkSuppression:
 
         assert update[case["url_field"]] == case["resolved_url"]
         assert not mod._background_tasks
+
+
+# ---------------------------------------------------------------------------
+# LML#1053: the per-service resolution-status return value. The hot-path
+# disposition already computed for the Sentry projection (cache_hit /
+# cache_miss_recent / cache_miss_enqueued / cache_miss_unwarmed / peek error)
+# maps onto the StreamingResolutionStatus vocabulary consumed by
+# ``lookup/enrichment/item.py`` to build ``DiscogsSearchResult.streaming_status``.
+# Keyed by ``cfg.client_attr`` (``apple_music`` / ``spotify`` / ``bandcamp``) —
+# the same keys the wire contract's ``StreamingResolution`` object uses — NOT
+# the registry's ``service_key`` (``apple_music_album`` / ``spotify_album`` /
+# ``bandcamp``). A service the post-process never actually consulted (skipped
+# for any reason) must be absent from the returned dict, not mapped to a
+# status — the caller's never-consulted omission relies on key absence.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStreamingStatusReturnValue:
+    @pytest.mark.parametrize("service", list(_CASES))
+    async def test_cache_hit_returns_verified(self, service):
+        case = _CASES[service]
+        update = _blank_update()
+        with _patch_cache_peek(case["resolved_url"]), _patch_resolver():
+            result = await _run(update, settings=_settings(service))
+        assert result == {case["client_attr"]: StreamingResolutionStatus.verified}
+
+    @pytest.mark.parametrize("service", list(_CASES))
+    async def test_known_recent_miss_returns_absent(self, service):
+        case = _CASES[service]
+        update = _blank_update()
+        with _patch_cache_peek(None, has_fresh_decision=True), _patch_resolver():
+            result = await _run(update, settings=_settings(service))
+        assert result == {case["client_attr"]: StreamingResolutionStatus.absent}
+
+    @pytest.mark.parametrize("service", list(_CASES))
+    async def test_genuine_miss_enqueued_returns_unresolved(self, service):
+        case = _CASES[service]
+        update = _blank_update()
+        with _patch_cache_peek(None), _patch_resolver():
+            result = await _run(update, settings=_settings(service))
+            assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
+            await _drain_background_tasks()
+
+    async def test_bulk_suppressed_miss_returns_unresolved(self):
+        service = "apple_music_album"
+        case = _CASES[service]
+        update = _blank_update()
+        set_suppress_streaming_warm(True)
+        with _patch_cache_peek(None), _patch_resolver():
+            result = await _run(update, settings=_settings(service))
+        assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
+
+    async def test_peek_exception_returns_unresolved(self):
+        # A swallowed cache-peek error is an attempted-but-inconclusive
+        # consult, same bucket as a timeout — not a silent never-consulted.
+        update = _blank_update()
+        with (
+            patch.object(
+                mod,
+                "peek_cached_streaming_url",
+                new=AsyncMock(side_effect=RuntimeError("normalization blew up")),
+            ),
+            _patch_resolver(),
+        ):
+            result = await _run(update, settings=_settings("apple_music_album"))
+        assert result == {"apple_music": StreamingResolutionStatus.unresolved}
+
+    @pytest.mark.parametrize(
+        "missing", ["master_off", "per_service_off", "client_none", "url_already_set"]
+    )
+    async def test_skipped_service_is_absent_from_the_returned_dict(self, missing):
+        service = "apple_music_album"
+        case = _CASES[service]
+        update = _blank_update()
+        clients = _clients()
+        settings = _settings(service)
+        if missing == "master_off":
+            settings = _settings(service, master=False)
+        elif missing == "per_service_off":
+            settings = _settings()
+        elif missing == "client_none":
+            clients = _clients(**{case["client_attr"]: None})
+        elif missing == "url_already_set":
+            update[case["url_field"]] = "https://existing.test/x"
+
+        with _patch_cache_peek(None), _patch_resolver():
+            result = await _run(update, settings=settings, clients=clients)
+        assert case["client_attr"] not in result
+
+    async def test_master_flag_off_returns_empty_dict_for_every_service(self):
+        update = _blank_update()
+        with _patch_cache_peek(None), _patch_resolver():
+            result = await _run(
+                update, settings=_settings("apple_music_album", "spotify_album", master=False)
+            )
+        assert result == {}
+
+    async def test_missing_precondition_returns_empty_dict(self):
+        update = _blank_update()
+        with _patch_cache_peek(None), _patch_resolver():
+            result = await apply_streaming_url_postprocess(
+                update,
+                clients=_clients(),
+                pg=None,  # missing precondition
+                entity_store=_entity_store(),
+                request_artist=_ARTIST,
+                request_album=_ALBUM,
+                settings=_settings("apple_music_album"),
+            )
+        assert result == {}
+
+    async def test_mixed_outcomes_report_independently_per_service(self):
+        # Apple hits, Spotify is a genuine unwarmed miss (bulk) — the return
+        # value must carry both verdicts independently, keyed by client_attr.
+        update = _blank_update()
+        set_suppress_streaming_warm(True)
+
+        async def fake_peek(pg, *, service, artist, album, **kwargs):
+            if service == "apple_music_album":
+                return _CASES["apple_music_album"]["resolved_url"], True
+            return None, False
+
+        with (
+            patch.object(mod, "peek_cached_streaming_url", new=AsyncMock(side_effect=fake_peek)),
+            _patch_resolver(),
+        ):
+            result = await _run(update, settings=_settings("apple_music_album", "spotify_album"))
+
+        assert result == {
+            "apple_music": StreamingResolutionStatus.verified,
+            "spotify": StreamingResolutionStatus.unresolved,
+        }
 
 
 # ---------------------------------------------------------------------------

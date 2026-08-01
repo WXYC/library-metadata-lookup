@@ -1157,6 +1157,18 @@ class StreamingLinks(BaseModel):
     soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
 
 
+class StreamingResolutionStatus(StrEnum):
+    verified = "verified"
+    absent = "absent"
+    unresolved = "unresolved"
+
+
+class StreamingResolution(BaseModel):
+    spotify: StreamingResolutionStatus | None = None
+    apple_music: StreamingResolutionStatus | None = None
+    bandcamp: StreamingResolutionStatus | None = None
+
+
 class ReconciledIdentity(BaseModel):
     discogs_artist_id: int | None = Field(None, description="Discogs artist ID")
     musicbrainz_artist_id: str | None = Field(None, description="MusicBrainz artist UUID")
@@ -2495,6 +2507,10 @@ class DiscogsMatchResult(BaseModel):
     youtube_music_url: str | None = Field(None, description="YouTube Music search URL")
     bandcamp_url: str | None = Field(None, description="Bandcamp album URL")
     soundcloud_url: str | None = Field(None, description="SoundCloud search URL")
+    streaming_status: StreamingResolution | None = Field(
+        None,
+        description="Per-service streaming resolution status (verified / absent / unresolved) for this result, disambiguating WHY a sibling `*_url` field is null. A service marked `unresolved` timed out, had its enrichment tail shed, or was a cold cache miss — its null url is transient and MAY resolve on a later retry; `absent` means the service was consulted and genuinely has no match — its null url is terminal and must NOT be re-probed (re-asking `absent` is the per-play LML-call amplifier BS#1747 killed). A service whose key is OMITTED from this object was never consulted (e.g. Bandcamp on the `/lookup/bulk` path, or the library.db override skipped for a non-library row) and must not be treated as `absent`. Additive and optional: null/omitted on responses from an LML predating the producer rollout, or on paths that resolve no per-service status. Does not change the meaning of the `*_url` fields — it only annotates them. Emitted identically on `/lookup` and `/lookup/bulk` (the LML#681 parity rule). Mirrors the per-service verdict vocabulary of `/api/v1/streaming-check` (LML#376). See LML#1053 / BS#1819.\n",
+    )
     discogs_artist_id: int | None = Field(
         None,
         description="Discogs artist ID for this release. Populated only when the originating `LookupRequest.extended` is true. Lets a caller key an artist-metadata cache without a follow-up release fetch.\n",

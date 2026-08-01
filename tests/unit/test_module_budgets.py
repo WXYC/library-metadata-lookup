@@ -54,6 +54,11 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/enrichment/background.py": 100,
     "lookup/enrichment/context.py": 150,
     "lookup/enrichment/item.py": 850,
+    # LML#1053: the per-service streaming-status merge, extracted out of
+    # item.py to stay under its own ceiling above — a pure function with no
+    # dependency on enrich_one's control flow. 1.3x its ~70-line measured
+    # size -> 100.
+    "lookup/enrichment/streaming_status.py": 100,
     "lookup/enrichment/top1.py": 100,
     "lookup/external_search.py": 350,
     # Recalibrated 2026-07-31 (transparent-fold plan, supersedes LML#1022): the
