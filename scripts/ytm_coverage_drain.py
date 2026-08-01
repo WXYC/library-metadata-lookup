@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""YouTube Music coverage drain — dry-run harness (LML#1056).
+"""YouTube Music coverage drain (LML#1056).
 
 Resolves verified ``music.youtube.com/browse/<browseId>`` album links for a set
 of canonical ``(artist, title)`` candidates via :class:`YouTubeMusicClient`
-(80/80 floor, shared production matcher) and emits a coverage report. It is the
-first acceptance criterion of #1056 ("dry-run report: candidate count, projected
-hit rate, sample matches") and is deliberately **read-only**: the persistence
-step is gated behind :func:`execute_write`, which raises until the write-path
-design fork (#1056 / #1052) is settled.
+(80/80 floor, shared production matcher), emits a coverage report, and -- under
+the explicit ``--execute`` opt-in -- fill-only-persists the matches.
+
+Write path (Option A of the #1056 / #1052 fork)
+-----------------------------------------------
+Persistence goes to ``streaming_availability.db`` -- LML's authoritative,
+top-priority offline link store -- via :meth:`ResultsDB.update_youtube_music_url`
+(fill-only). The rest of the chain already exists: ``export_streaming_links.py``
+copies ``albums.youtube_music_url`` into ``library.db.streaming_links`` and
+``/lookup`` surfaces it, so this drain is the last missing piece, the producer.
+The sibling ``lml_cache.album_streaming_url_cache`` (Option B) is reserved for
+#1052's runtime/rowless population, which cannot reach this library-keyed store.
 
 Candidate source
 ----------------
@@ -17,19 +24,26 @@ has **no** ``artist``/``title`` columns — so the canonical ``(artist, title)``
 obtained by resolving ``discogs_release_id`` against the discogs-cache release
 table, exactly as the #525 cache warmer's ``_refresh_discogs_release`` does. That
 join runs in the discogs-cache PostgreSQL and needs prod credentials plus a human
-go-ahead, so it is out of scope for this dry-run harness. The operator supplies
+go-ahead, so it is out of scope for this harness. The operator supplies
 already-resolved rows and this module stays schema-agnostic via
 :func:`load_candidates_from_rows`; :func:`load_candidates_from_csv` is the
-credential-free path for a local sample.
+credential-free path for a local sample. :func:`execute_write` then maps each
+match back to its ``albums`` row by normalized ``(artist, title)`` -- the same
+key the dedup pipeline wrote -- so there is no normalization drift.
 
-Usage (dry-run only)
---------------------
+Usage
+-----
+    # dry-run (default): resolve + report, write nothing
     uv run python -m scripts.ytm_coverage_drain --sample-csv resolved_names.csv \
         --limit 200 --concurrency 4 --report-json /tmp/ytm_drain_report.json
 
-``--execute`` exists but is a tripwire: it raises :class:`WritePathNotResolvedError`
-so no prod write can happen before the fork is resolved. Persisting is the user's
-action, off-peak, fill-only, one bulk LML consumer at a time.
+    # persist (opt-in, fill-only): add --execute + the target DB
+    uv run python -m scripts.ytm_coverage_drain --sample-csv resolved_names.csv \
+        --execute --results-db streaming_availability.db
+
+Persisting is the user's action -- off-peak, fill-only, one bulk LML consumer at
+a time -- and republishing to prod is a separate ``POST /admin/upload-streaming-db``
+step.
 """
 
 from __future__ import annotations
@@ -44,6 +58,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from clients.streaming.youtube_music import YouTubeMusicClient
+from scripts.streaming_availability.results_db import ResultsDB
 from streaming.models import SourceMatch
 
 log = logging.getLogger("ytm_coverage_drain")
@@ -52,12 +67,7 @@ DEFAULT_CONCURRENCY = 4
 DEFAULT_SAMPLE_SIZE = 15
 DEFAULT_RATE = 2.0
 DEFAULT_SEARCH_LIMIT = 5
-
-
-class WritePathNotResolvedError(RuntimeError):
-    """Raised when ``--execute`` / :func:`execute_write` is used before the
-    #1056 / #1052 write-path design fork (warmer leg vs. direct cache upsert)
-    is resolved. The dry-run path never persists, so this is a hard tripwire."""
+DEFAULT_RESULTS_DB_PATH = "streaming_availability.db"
 
 
 @dataclass(frozen=True)
@@ -159,21 +169,50 @@ def summarize(
     }
 
 
-def execute_write(matched_outcomes: Sequence[DrainOutcome]) -> None:
-    """Persist verified links (fill-only) — GATED, not yet implemented.
+async def execute_write(
+    matched_outcomes: Sequence[DrainOutcome],
+    *,
+    db_path: str = DEFAULT_RESULTS_DB_PATH,
+) -> dict[str, int]:
+    """Fill-only-persist verified YTM links into the streaming_availability store.
 
-    The write path is intentionally unbuilt: #1056 and #1052 share an open
-    design fork over *how* to persist (wire a ``youtube_music`` leg into the
-    ``refresh-for-identities`` dispatcher, the approach rejected for the sibling
-    legs in #548/#549 — versus a direct fill-only upsert into
-    ``lml_cache.album_streaming_url_cache``). Until that is resolved with the
-    user, invoking the write path raises rather than guessing.
+    Option A of the #1056 write-path fork: ``streaming_availability.db`` is the
+    authoritative, top-priority offline link store. Each match maps to its
+    ``albums`` row by normalized ``(artist, title)`` -- the exact key the dedup
+    pipeline wrote -- and ``youtube_music_url`` is filled only when NULL, so a
+    resolved (higher-priority) link is never clobbered (Data Safety; #669). The
+    rest of the chain already exists: ``export_streaming_links.py`` carries the
+    column into ``library.db.streaming_links`` and ``/lookup`` surfaces it, so
+    this is the last missing piece -- the producer.
+
+    Returns a tally ``{written, already_present, unmatched}``. A candidate whose
+    normalized ``(artist, title)`` has no ``albums`` row is counted ``unmatched``
+    and skipped (never a wrong write). Default is dry-run: this runs only under
+    the explicit ``--execute`` opt-in, off-peak, one bulk consumer at a time.
     """
-    raise WritePathNotResolvedError(
-        "YTM drain write path is gated on the #1056/#1052 design fork "
-        "(refresh-for-identities leg vs. direct streaming_url_cache upsert). "
-        f"Refusing to persist {len(matched_outcomes)} matches. Dry-run writes nothing."
-    )
+    tally = {"written": 0, "already_present": 0, "unmatched": 0}
+    db = ResultsDB(db_path)
+    await db.connect()
+    try:
+        for outcome in matched_outcomes:
+            if outcome.match is None:  # defensive: caller passes matches only
+                continue
+            album_id = await db.get_album_id_by_names(
+                outcome.candidate.artist, outcome.candidate.title
+            )
+            if album_id is None:
+                tally["unmatched"] += 1
+                log.warning(
+                    "no albums row for %r - %r; skipping YTM url write",
+                    outcome.candidate.artist,
+                    outcome.candidate.title,
+                )
+                continue
+            wrote = await db.update_youtube_music_url(album_id, outcome.match.url)
+            tally["written" if wrote else "already_present"] += 1
+    finally:
+        await db.close()
+    return tally
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -196,8 +235,19 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         100 * report["hit_rate"],
     )
     if args.execute:
-        # Tripwire: raises until the write-path fork is resolved.
-        execute_write([o for o in outcomes if o.match is not None])
+        # Opt-in, fill-only persistence into the streaming_availability store
+        # (Option A). Default path is dry-run and writes nothing.
+        tally = await execute_write(
+            [o for o in outcomes if o.match is not None], db_path=args.results_db
+        )
+        report["write"] = tally
+        log.info(
+            "persisted YTM links: %d written, %d already present, %d unmatched (db=%s)",
+            tally["written"],
+            tally["already_present"],
+            tally["unmatched"],
+            args.results_db,
+        )
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if args.report_json:
         with open(args.report_json, "w", encoding="utf-8") as f:
@@ -226,9 +276,14 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
     parser.add_argument("--report-json", default=None, help="Optional path to write the report.")
     parser.add_argument(
+        "--results-db",
+        default=DEFAULT_RESULTS_DB_PATH,
+        help="streaming_availability.db path to fill-only-persist into under --execute.",
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
-        help="(GATED) persist matches — raises until the #1056/#1052 write-path fork is resolved.",
+        help="Opt-in: fill-only-persist matches into --results-db (default: dry-run, writes nothing).",
     )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")

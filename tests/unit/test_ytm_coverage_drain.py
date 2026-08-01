@@ -11,10 +11,12 @@ import csv
 
 import pytest
 
+from clients.streaming.matching import normalize_album_title, normalize_artist_name
+from scripts.streaming_availability.dedup import DeduplicatedAlbum
+from scripts.streaming_availability.results_db import ResultsDB
 from scripts.ytm_coverage_drain import (
     Candidate,
     DrainOutcome,
-    WritePathNotResolvedError,
     execute_write,
     load_candidates_from_csv,
     load_candidates_from_rows,
@@ -119,9 +121,76 @@ class TestLoaders:
         assert [c.artist for c in cands] == ["Sessa"]
 
 
-class TestWritePathGated:
-    def test_execute_write_raises_until_fork_resolved(self):
-        # Fill-only persistence is deliberately unimplemented until the
-        # warmer-leg-vs-direct-write fork (#1056 / #1052) is settled.
-        with pytest.raises(WritePathNotResolvedError):
-            execute_write([DrainOutcome(Candidate("Stereolab", "Aluminum Tunes"), _match())])
+class TestExecuteWritePersists:
+    """execute_write fill-only-persists verified YTM links into the
+    streaming_availability results DB -- Option A of the #1056 write-path fork.
+    Each match maps to its albums row by normalized (artist, title) and fills
+    youtube_music_url only when NULL, so a resolved link is never clobbered.
+    """
+
+    async def _seed_album(self, db_path: str, artist: str, title: str) -> None:
+        db = ResultsDB(db_path)
+        await db.connect()
+        try:
+            await db.insert_albums(
+                [
+                    DeduplicatedAlbum(
+                        normalized_artist=normalize_artist_name(artist),
+                        normalized_title=normalize_album_title(title),
+                        display_artist=artist,
+                        display_title=title,
+                        library_ids=[1],
+                        formats=["cd"],
+                    )
+                ]
+            )
+        finally:
+            await db.close()
+
+    async def _read_url(self, db_path: str) -> str | None:
+        db = ResultsDB(db_path)
+        await db.connect()
+        try:
+            rows = await db.get_all_results()
+            return rows[0]["youtube_music_url"]
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_fills_matched_url_into_albums_row(self, tmp_path):
+        db_path = str(tmp_path / "sa.db")
+        await self._seed_album(db_path, "Stereolab", "Aluminum Tunes")
+        url = "https://music.youtube.com/browse/MPREb_stereolab"
+        outcome = DrainOutcome(Candidate("Stereolab", "Aluminum Tunes"), _match(url=url))
+        tally = await execute_write([outcome], db_path=db_path)
+        assert tally == {"written": 1, "already_present": 0, "unmatched": 0}
+        assert await self._read_url(db_path) == url
+
+    @pytest.mark.asyncio
+    async def test_is_fill_only_on_second_run(self, tmp_path):
+        db_path = str(tmp_path / "sa.db")
+        await self._seed_album(db_path, "Stereolab", "Aluminum Tunes")
+        first = "https://music.youtube.com/browse/MPREb_first"
+        await execute_write(
+            [DrainOutcome(Candidate("Stereolab", "Aluminum Tunes"), _match(url=first))],
+            db_path=db_path,
+        )
+        second = "https://music.youtube.com/browse/MPREb_second"
+        tally = await execute_write(
+            [DrainOutcome(Candidate("Stereolab", "Aluminum Tunes"), _match(url=second))],
+            db_path=db_path,
+        )
+        assert tally == {"written": 0, "already_present": 1, "unmatched": 0}
+        assert await self._read_url(db_path) == first  # original preserved
+
+    @pytest.mark.asyncio
+    async def test_unmatched_candidate_is_tallied_not_written(self, tmp_path):
+        db_path = str(tmp_path / "sa.db")
+        await self._seed_album(db_path, "Stereolab", "Aluminum Tunes")
+        outcome = DrainOutcome(
+            Candidate("No Such Artist", "No Such Album"),
+            _match(url="https://music.youtube.com/browse/MPREb_ghost"),
+        )
+        tally = await execute_write([outcome], db_path=db_path)
+        assert tally == {"written": 0, "already_present": 0, "unmatched": 1}
+        assert await self._read_url(db_path) is None
