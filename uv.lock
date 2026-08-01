@@ -679,6 +679,9 @@ dev = [
     { name = "pytest-xdist" },
     { name = "ruff" },
 ]
+drain = [
+    { name = "ytmusicapi" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -707,8 +710,9 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.24.0" },
     { name = "wxyc-etl", specifier = ">=0.8.0,<0.9.0" },
     { name = "wxyc-fastapi", extras = ["posthog"], specifier = ">=1.1.0,<2.0.0" },
+    { name = "ytmusicapi", marker = "extra == 'drain'", specifier = "==1.12.1" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "drain"]
 
 [[package]]
 name = "librt"
@@ -1562,4 +1566,16 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/19/70/80f3b7c10d2630aa66414bf23d210386700aa390547278c789afa994fd7e/xmltodict-1.0.4.tar.gz", hash = "sha256:6d94c9f834dd9e44514162799d344d815a3a4faec913717a9ecbfa5be1bb8e61", size = 26124, upload-time = "2026-02-22T02:21:22.074Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/38/34/98a2f52245f4d47be93b580dae5f9861ef58977d73a79eb47c58f1ad1f3a/xmltodict-1.0.4-py3-none-any.whl", hash = "sha256:a4a00d300b0e1c59fc2bfccb53d7b2e88c32f200df138a0dd2229f842497026a", size = 13580, upload-time = "2026-02-22T02:21:21.039Z" },
+]
+
+[[package]]
+name = "ytmusicapi"
+version = "1.12.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8a/16/f9737ae3a565abaf2e3d106507272f85e43abff6886fb514a22db3a8adaf/ytmusicapi-1.12.1.tar.gz", hash = "sha256:4e33f424db311ece1b9e5f29a51ade46b0697f6e2f284f8a40bcbd7219772755", size = 529510, upload-time = "2026-06-05T16:36:18.225Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/53/6d/f7156e7ab9953d09e14ef538de4e92c484169fac19d207b19b9d9eb9c845/ytmusicapi-1.12.1-py3-none-any.whl", hash = "sha256:2a53f6df504b97b93a4d41c804b699b46190207cb9d864fcf4edeb338b1f15d9", size = 108567, upload-time = "2026-06-05T16:36:16.523Z" },
 ]
