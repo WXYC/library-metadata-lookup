@@ -9,8 +9,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.markup_parser import (
     CachedOnlyResolver,
+    DiscogsServiceResolver,
     _ArtistId,
     _ArtistName,
     _PlainText,
@@ -542,6 +544,61 @@ class TestResolve:
         assert len(resolved) == 0
 
 
+# MARK: - DiscogsServiceResolver Tests
+
+
+class TestDiscogsServiceResolver:
+    """Adapter that consults the live ``DiscogsService`` (write-path bio
+    resolution, e.g. ``GET /discogs/artist/{id}``'s profile-markup parse).
+    """
+
+    @pytest.mark.asyncio
+    async def test_resolves_artist_from_service(self):
+        service = AsyncMock()
+        service.get_artist_details.return_value = ArtistDetails(artist_id=42, name="Stereolab")
+
+        resolver = DiscogsServiceResolver(service)
+        assert await resolver.resolve_artist(42) == "Stereolab"
+
+    @pytest.mark.asyncio
+    async def test_swallows_generic_exceptions(self):
+        service = AsyncMock()
+        service.get_artist_details.side_effect = RuntimeError("Discogs 500")
+
+        resolver = DiscogsServiceResolver(service)
+        assert await resolver.resolve_artist(42) is None
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_degrades_to_none(self):
+        """LML#1049 call site (``discogs/markup_parser.py:441``): now that
+        ``DiscogsService.get_artist_details`` re-raises a saturation-breaker
+        shed instead of swallowing it to ``None``, this resolver's existing
+        broad ``except Exception`` already degrades gracefully -- a shed
+        renders as an unresolved (dropped) token in the bio, exactly like any
+        other resolution failure, and writes no negative cache (this adapter
+        does no caching of its own; the guarantee comes from
+        ``get_artist_details`` itself no longer reaching a tombstone write on
+        a shed). This test pins that the broad catch keeps covering the new
+        exception type.
+        """
+        service = AsyncMock()
+        service.get_artist_details.side_effect = DiscogsBreakerOpenError("shed")
+
+        resolver = DiscogsServiceResolver(service)
+        assert await resolver.resolve_artist(42) is None
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_integrates_with_parse_async(self):
+        """End-to-end: a shed mid-bio-parse drops just that token; the rest of
+        the bio still renders (don't fail the whole enrichment)."""
+        service = AsyncMock()
+        service.get_artist_details.side_effect = DiscogsBreakerOpenError("shed")
+
+        tokens = await parse_async("Featuring [a42]", DiscogsServiceResolver(service))
+
+        assert text_content(tokens) == "Featuring "
+
+
 # MARK: - CachedOnlyResolver Tests
 
 
@@ -622,3 +679,20 @@ class TestCachedOnlyResolver:
         kinds = [type(t).__name__ for t in tokens]
         assert "ArtistLinkToken" in kinds
         assert "ReleaseLinkToken" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_degrades_to_none(self):
+        """LML#1049 call site (``discogs/markup_parser.py:482``): defensive-only —
+        ``self._cache`` here is a ``DiscogsCacheService`` (PG-only reads), which
+        cannot raise ``DiscogsBreakerOpenError`` (that comes from live
+        ``DiscogsService`` HTTP calls, exercised instead by
+        ``TestDiscogsServiceResolver`` above). Pinned anyway so the existing
+        broad ``except Exception`` -- proven generic-resilient by
+        ``test_swallows_cache_exceptions`` -- stays proven exception-type-agnostic
+        if a future refactor ever routes this adapter through a live fetch.
+        """
+        cache = AsyncMock()
+        cache.get_artist_details.side_effect = DiscogsBreakerOpenError("shed")
+
+        resolver = CachedOnlyResolver(cache)
+        assert await resolver.resolve_artist(42) is None

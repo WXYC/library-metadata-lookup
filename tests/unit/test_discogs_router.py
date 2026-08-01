@@ -244,13 +244,12 @@ class TestGetArtist:
     async def test_defensive_breaker_wrap_returns_503_if_propagated(
         self, app_with_discogs, mock_discogs
     ):
-        """LML#1031: pins the DEFENSIVE contract, not current production
-        behavior. IF ``get_artist_details`` ever raises ``DiscogsBreakerOpenError``
-        directly -- which it does not today, see
-        ``test_current_shed_behavior_swallows_to_404`` below -- the router must
-        translate that into a 503 (transient/retryable), not a raw 500. Mirrors
+        """LML#1031 / LML#1049: the router's 503 wrap on a propagated
+        ``DiscogsBreakerOpenError``, exercised with ``get_artist_details``
+        mocked directly (the service-internal propagation path is pinned
+        separately by ``test_real_shed_behavior_returns_503`` below). Mirrors
         ``TestGetRelease.test_breaker_shed_returns_503`` and ``resolve_entity``'s
-        defensive wrap."""
+        equivalent wrap."""
         from discogs.breaker import DiscogsBreakerOpenError
 
         mock_discogs.get_artist_details = AsyncMock(side_effect=DiscogsBreakerOpenError("shed"))
@@ -263,23 +262,20 @@ class TestGetArtist:
         assert resp.status_code == 503
 
     @pytest.mark.asyncio
-    async def test_current_shed_behavior_swallows_to_404(self, mock_settings):
-        """LML#1049: pins the REAL current shed path (known-suboptimal).
+    async def test_real_shed_behavior_returns_503(self, mock_settings):
+        """LML#1049: pins the REAL end-to-end shed path.
 
-        Unlike ``get_release``'s ``_api_fetch`` (which re-raises
-        ``DiscogsBreakerOpenError``, ``discogs/service.py`` ~1520-1526, "FIX 1"),
-        ``get_artist_details``'s own ``_api_fetch`` catches
-        ``DiscogsBreakerOpenError`` internally and returns ``None`` (LML#805,
-        ``discogs/service.py`` ~1685-1695). So a real breaker shed during an
-        artist fetch never reaches the router's 503 branch above -- it degrades
-        to a plain ``None``, and ``get_artist`` raises the same 404 it would for
-        a genuine "no such artist." This violates the breaker's "never return a
-        definitive negative from a shed" contract (``discogs/breaker.py``
-        ~147-156); LML#1049 tracks the fix decision. This test uses a REAL
-        ``DiscogsService`` (not a full mock) with ``_request_with_retry`` stubbed
-        to shed, so it exercises the actual swallow path rather than a mocked
-        shortcut -- it must start failing (and be rewritten) the moment #1049
-        changes this behavior.
+        ``get_artist_details``'s own ``_api_fetch`` now re-raises
+        ``DiscogsBreakerOpenError`` (mirroring ``get_release``'s LML#755 FIX 1,
+        ``discogs/service.py`` ~1495-1501) instead of swallowing it to ``None``
+        (the pre-#1049 LML#805 behavior). A real breaker shed during an artist
+        fetch now reaches the router's 503 branch above -- the same
+        transient/retryable signal ``get_release`` and ``resolve_entity``
+        already give -- rather than degrading to a plain ``None`` that
+        ``get_artist`` would raise as the same 404 it uses for a genuine "no
+        such artist." This test uses a REAL ``DiscogsService`` (not a full
+        mock) with ``_request_with_retry`` stubbed to shed, so it exercises the
+        actual propagation path rather than a mocked shortcut.
         """
         from config.settings import get_settings
         from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
@@ -310,7 +306,7 @@ class TestGetArtist:
             ) as client:
                 resp = await client.get("/api/v1/discogs/artist/45")
 
-        assert resp.status_code == 404
+        assert resp.status_code == 503
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +399,23 @@ class TestResolveEntity:
             transport=ASGITransport(app=app_with_discogs), base_url="http://test"
         ) as client:
             resp = await client.get("/api/v1/discogs/entity/release/789")
+
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_artist_breaker_shed_returns_503(self, app_with_discogs, mock_discogs):
+        """LML#1049: the entity-artist branch's ``except DiscogsBreakerOpenError``
+        wrap (already present, mirroring the release branch above) becomes
+        reachable now that ``get_artist_details`` propagates a shed instead of
+        swallowing it to ``None``."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        mock_discogs.get_artist_details = AsyncMock(side_effect=DiscogsBreakerOpenError("shed"))
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_discogs), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/v1/discogs/entity/artist/45")
 
         assert resp.status_code == 503
 

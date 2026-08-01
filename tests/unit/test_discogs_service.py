@@ -3126,6 +3126,161 @@ class TestGetArtistDetails:
             "expected stack_info on the WARN record (set via stack_info=True)"
         )
 
+    @pytest.mark.asyncio
+    async def test_breaker_shed_propagates_not_swallowed_to_none(self, service):
+        """LML#1049: mirrors ``TestGetRelease.
+        test_breaker_shed_propagates_not_swallowed_to_none``. Unlike ``get_release``
+        (LML#755 FIX 1), ``get_artist_details``'s ``_api_fetch`` used to catch
+        ``DiscogsBreakerOpenError`` and return ``None`` (LML#805) — indistinguishable
+        from a genuine "no such artist" 404 to every downstream caller (the
+        router's 404 branch, the cache-refresh dispatcher, bio/markup
+        enrichment). The shed now propagates as ``DiscogsBreakerOpenError`` so
+        callers can tell "couldn't ask" apart from a confirmed absence. A
+        non-breaker error still degrades to ``None`` (see the sibling test
+        below)."""
+        with patch.object(
+            service,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            side_effect=DiscogsBreakerOpenError("shed"),
+        ):
+            with pytest.raises(DiscogsBreakerOpenError):
+                await service.get_artist_details(77)
+
+    @pytest.mark.asyncio
+    async def test_non_breaker_error_still_returns_none(self, service):
+        """The LML#1049 re-raise is narrow: only ``DiscogsBreakerOpenError``
+        escapes. A generic error keeps the pre-existing graceful-degrade
+        contract (mirrors ``TestGetRelease.test_non_breaker_error_still_returns_none``)."""
+        with patch.object(
+            service,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("discogs 500"),
+        ):
+            result = await service.get_artist_details(77)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_does_not_write_tombstone(self, service_with_cache):
+        """LML#1049 core bug: a breaker shed must NOT be cached as a negative.
+
+        Contrast with ``test_genuine_404_still_writes_tombstone`` below — a real
+        Discogs-confirmed absence still tombstones. The shed re-raises out of
+        ``_api_fetch`` *before* ``fallthrough``'s write-back gate
+        (``if api_result is not None: ... pg_write(...)``, ``discogs/fallthrough.py``)
+        is ever reached, so ``write_artist_details`` is never called — the same
+        ordering that already protects ``get_release`` (see
+        ``cache/dispatch.py``'s "get_release re-raised before any
+        tombstone/write-back" comment).
+        """
+        service_with_cache.cache_service.get_artist_details = AsyncMock(return_value=None)
+        service_with_cache.cache_service.write_artist_details = AsyncMock()
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            side_effect=DiscogsBreakerOpenError("shed"),
+        ):
+            with pytest.raises(DiscogsBreakerOpenError):
+                await service_with_cache.get_artist_details(77)
+
+        service_with_cache.cache_service.write_artist_details.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_genuine_404_still_writes_tombstone(self, service_with_cache):
+        """Contrast case for ``test_breaker_shed_does_not_write_tombstone``: a
+        real Discogs 404 ("confirmed no such artist") still tombstones via the
+        existing LML#510 write-back, unaffected by the LML#1049 shed fix."""
+        service_with_cache.cache_service.get_artist_details = AsyncMock(return_value=None)
+        service_with_cache.cache_service.write_artist_details = AsyncMock()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.raise_for_status = MagicMock(side_effect=Exception("Not Found"))
+        mock_resp.json.return_value = {}
+
+        with patch.object(
+            service_with_cache,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ):
+            result = await service_with_cache.get_artist_details(999999)
+
+        assert result is None
+        service_with_cache.cache_service.write_artist_details.assert_called_once()
+        written = service_with_cache.cache_service.write_artist_details.call_args[0][0]
+        assert written.not_found is True
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_emits_artist_breaker_shed_counter(self, service, monkeypatch):
+        """LML#1049 (item 4): a low-volume, unsampled PostHog counter fires on
+        every artist-path shed, mirroring ``discogs.ratelimit._capture_fail_open``
+        (LML#879) so a sustained breaker OPEN on the artist path stays
+        observable now that the shed no longer surfaces as a plain ``None``.
+        """
+        monkeypatch.setenv("ENABLE_TELEMETRY", "true")
+        monkeypatch.setenv("ENVIRONMENT", "unit-test-env")
+        from config.settings import get_settings
+
+        get_settings.cache_clear()
+        events: list[dict] = []
+
+        class _FakePosthog:
+            def capture(self, *, distinct_id, event, properties):
+                events.append(
+                    {"distinct_id": distinct_id, "event": event, "properties": properties}
+                )
+
+        monkeypatch.setattr(
+            "discogs.service.get_posthog_client", lambda event_prefix: _FakePosthog()
+        )
+
+        with patch.object(
+            service,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            side_effect=DiscogsBreakerOpenError("shed"),
+        ):
+            with pytest.raises(DiscogsBreakerOpenError):
+                await service.get_artist_details(77)
+
+        get_settings.cache_clear()
+        assert len(events) == 1
+        event = events[0]
+        assert event["distinct_id"] == "library-metadata-lookup-service"
+        assert event["event"] == "discogs_artist_breaker_shed"
+        assert event["properties"]["artist_id"] == 77
+        assert event["properties"]["environment"] == "unit-test-env"
+
+    @pytest.mark.asyncio
+    async def test_counter_emission_failure_never_breaks_the_shed(self, service, monkeypatch):
+        """Best-effort telemetry: a broken PostHog accessor must not prevent the
+        shed from propagating (mirrors ``test_counter_emission_failure_never_breaks_fail_open``
+        in ``tests/unit/test_discogs_rate_gate.py``)."""
+        monkeypatch.setenv("ENABLE_TELEMETRY", "true")
+        from config.settings import get_settings
+
+        get_settings.cache_clear()
+
+        def _exploding_accessor(event_prefix):
+            raise RuntimeError("posthog accessor broken")
+
+        monkeypatch.setattr("discogs.service.get_posthog_client", _exploding_accessor)
+
+        with patch.object(
+            service,
+            "_request_with_retry",
+            new_callable=AsyncMock,
+            side_effect=DiscogsBreakerOpenError("shed"),
+        ):
+            with pytest.raises(DiscogsBreakerOpenError):
+                await service.get_artist_details(77)
+
+        get_settings.cache_clear()
+
 
 # ---------------------------------------------------------------------------
 # get_artist_image delegates to get_artist_details
@@ -3152,6 +3307,29 @@ class TestGetArtistImageDelegation:
     @pytest.mark.asyncio
     async def test_returns_none_when_no_details(self, service):
         with patch.object(service, "get_artist_details", new_callable=AsyncMock, return_value=None):
+            result = await service.get_artist_image(77)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_breaker_shed_degrades_to_none(self, service):
+        """LML#1049 call site (``discogs/service.py:1725``): ``get_artist_image``
+        is a best-effort artist-image fallback (its sole caller,
+        ``lookup.artwork._resolve_fallback_artwork``, treats ``None`` as "no
+        fallback image this time"). Now that ``get_artist_details`` re-raises a
+        breaker shed instead of swallowing it, this delegator catches the shed
+        itself and degrades to ``None`` -- matching its documented ``str | None``
+        contract -- rather than leaking ``DiscogsBreakerOpenError`` out of a
+        method whose docstring promises "or None if unavailable". No caching
+        happens here either way (this method has no cache of its own), so the
+        degrade is a per-request "no image" — never a persisted negative.
+        """
+        with patch.object(
+            service,
+            "get_artist_details",
+            new_callable=AsyncMock,
+            side_effect=DiscogsBreakerOpenError("shed"),
+        ):
             result = await service.get_artist_image(77)
 
         assert result is None
