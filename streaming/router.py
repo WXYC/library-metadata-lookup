@@ -7,7 +7,6 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException
 from wxyc_fastapi.observability import RequestTelemetry, init_cache_stats
 
@@ -16,6 +15,7 @@ from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.deezer import DeezerClient
 from clients.streaming.spotify import SpotifyClient
 from core.dependencies import get_streaming_posthog_client
+from core.observability import observability_guard, project_capped
 from core.search import resolve_positive_int_env
 from streaming.dependencies import (
     get_apple_music_client,
@@ -110,13 +110,13 @@ def _project_inflight_capped(wait_ms: float) -> None:
 
     Observability must not break the request path; failures log and continue.
     """
-    try:
-        sentry_sdk.set_tag("lml.streaming_check.inflight_capped", "true")
-        scope = sentry_sdk.get_current_scope()
-        if scope.transaction is not None:
-            scope.transaction.set_measurement("lml.streaming_check.inflight_wait_ms", wait_ms)
-    except Exception as e:
-        logger.warning("Failed to project inflight_capped onto Sentry transaction: %s", e)
+    with observability_guard("project inflight_capped onto Sentry transaction", logger):
+        project_capped(
+            "lml.streaming_check.inflight_capped",
+            "lml.streaming_check.inflight_wait_ms",
+            wait_ms,
+            also_set_data=False,
+        )
 
 
 def _summary_properties(

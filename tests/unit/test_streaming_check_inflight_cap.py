@@ -21,6 +21,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from config.settings import get_settings
+from core import observability
 from core.dependencies import get_streaming_posthog_client
 from streaming import router as router_mod
 from streaming.dependencies import (
@@ -220,8 +221,8 @@ class TestInFlightCapObservability:
                 new_callable=AsyncMock,
                 side_effect=gated_check,
             ),
-            patch.object(router_mod.sentry_sdk, "get_current_scope", return_value=scope),
-            patch.object(router_mod.sentry_sdk, "set_tag", set_tag),
+            patch.object(observability.sentry_sdk, "get_current_scope", return_value=scope),
+            patch.object(observability.sentry_sdk, "set_tag", set_tag),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app_client), base_url="http://test"
@@ -275,8 +276,8 @@ class TestInFlightCapObservability:
                 new_callable=AsyncMock,
                 return_value=_empty_response(),
             ),
-            patch.object(router_mod.sentry_sdk, "get_current_scope", return_value=scope),
-            patch.object(router_mod.sentry_sdk, "set_tag", set_tag),
+            patch.object(observability.sentry_sdk, "get_current_scope", return_value=scope),
+            patch.object(observability.sentry_sdk, "set_tag", set_tag),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app_client), base_url="http://test"

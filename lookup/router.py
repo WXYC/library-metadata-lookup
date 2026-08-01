@@ -42,6 +42,7 @@ from core.dependencies import (
     get_posthog_client,
 )
 from core.event_loop_lag import get_event_loop_lag_ms
+from core.observability import observability_guard, project_capped
 from core.search import SEARCH_API_CALL_CAP_FIRED_STAT_KEY, resolve_positive_int_env
 from discogs.cache_service import DiscogsCacheService
 from discogs.memory_cache import set_skip_cache
@@ -222,14 +223,8 @@ def _project_inflight_capped(wait_ms: float) -> None:
 
     Observability must not break the request path; failures log and continue.
     """
-    try:
-        sentry_sdk.set_tag("lml.lookup.inflight_capped", "true")
-        scope = sentry_sdk.get_current_scope()
-        if scope.transaction is not None:
-            scope.transaction.set_measurement("lml.lookup.inflight_wait_ms", wait_ms)
-            scope.transaction.set_data("lml.lookup.inflight_wait_ms", wait_ms)
-    except Exception as e:
-        logger.warning("Failed to project inflight_capped onto Sentry transaction: %s", e)
+    with observability_guard("project inflight_capped onto Sentry transaction", logger):
+        project_capped("lml.lookup.inflight_capped", "lml.lookup.inflight_wait_ms", wait_ms)
 
 
 # LML#681 flag-tag keys. Recorded once per cache_stats context at the router
@@ -290,7 +285,7 @@ def _record_lml_flag_tags() -> None:
     is swallowed (matches ``_project_cache_stats_to_transaction``). ``record`` is
     a no-op when ``init_cache_stats`` wasn't called for the context.
     """
-    try:
+    with observability_guard("record LML flag tags into cache_stats", logger):
         settings = get_settings()
         recorder = get_cache_stats_recorder()
         recorder.record(
@@ -301,8 +296,6 @@ def _record_lml_flag_tags() -> None:
             LML_RESOLVE_COMPILATION_RELEASE_STAT_KEY,
             1 if settings.lml_resolve_compilation_release else 0,
         )
-    except Exception as e:
-        logger.warning("Failed to record LML flag tags into cache_stats: %s", e)
 
 
 def _record_event_loop_lag() -> None:
@@ -320,15 +313,13 @@ def _record_event_loop_lag() -> None:
     life), leaving the seeded ``0``. Observability must not break the request
     path: any exception is swallowed at WARNING (matches ``_record_lml_flag_tags``).
     """
-    try:
+    with observability_guard("record event-loop lag into cache_stats", logger):
         if not get_settings().lml_event_loop_lag_gauge:
             return
         lag_ms = get_event_loop_lag_ms()
         if lag_ms is None:
             return
         get_cache_stats_recorder().record(EVENT_LOOP_LAG_STAT_KEY, lag_ms)
-    except Exception as e:
-        logger.warning("Failed to record event-loop lag into cache_stats: %s", e)
 
 
 # Canonical full path for the bulk endpoint. Referenced by the explicit
@@ -368,7 +359,7 @@ def _project_cache_stats_to_transaction(stats: dict | None) -> None:
     """
     if not stats:
         return
-    try:
+    with observability_guard("project cache_stats onto Sentry transaction", logger):
         transaction = sentry_sdk.get_current_scope().transaction
         if transaction is None:
             return
@@ -376,8 +367,6 @@ def _project_cache_stats_to_transaction(stats: dict | None) -> None:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 transaction.set_data(f"lml.cache.{key}", value)
                 transaction.set_measurement(f"lml.cache.{key}", value)
-    except Exception as e:
-        logger.warning("Failed to project cache_stats onto Sentry transaction: %s", e)
 
 
 def _emit_server_timing_header(
@@ -400,12 +389,10 @@ def _emit_server_timing_header(
     Observability must not break the request path — any failure (a settings read
     or the serialize) logs at WARNING and the response ships without the header.
     """
-    try:
+    with observability_guard("emit Server-Timing header", logger):
         if not get_settings().lml_emit_server_timing:
             return
         http_response.headers["Server-Timing"] = telemetry.as_server_timing(extra=extra)
-    except Exception as e:
-        logger.warning("Failed to emit Server-Timing header: %s", e)
 
 
 @router.post(
