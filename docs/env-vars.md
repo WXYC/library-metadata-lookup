@@ -88,7 +88,7 @@ Three auth surfaces in this service, intentionally separate:
 | Surface | Direction | Env var | Implementation |
 |---|---|---|---|
 | Inbound from tubafrenzy / Backend-Service | tubafrenzy → LML | `LML_API_KEY` | `core/auth.py:require_lml_key` (router-level dep) |
-| `/admin/*` (library.db upload) | ETL → LML | `ADMIN_TOKEN` | `routers/admin.py:_validate_auth` (per-route call) |
+| `/admin/*` (library.db upload) | ETL → LML | `ADMIN_TOKEN` | `core/auth.py:require_admin_token` (per-route dep in `routers/admin.py`) |
 | Outbound streaming-status webhook | LML → tubafrenzy | `ETL_NOTIFY_KEY` | `routers/admin.py:_send_streaming_webhook` (sends `Authorization: Bearer ...`) |
 
 Untouched: `/health`, `/identity/resolve`, `/identity/bulk`. Identity routes are consumed by semantic-index too, so locking them down is a separate decision.

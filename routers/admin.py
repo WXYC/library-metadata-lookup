@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi import Path as PathParam
 from fastapi.responses import JSONResponse, Response
 
 from config.settings import Settings, get_settings
+from core.auth import require_admin_token
 from core.dependencies import (
     close_library_db,
     get_discogs_cache_service_from_pool,
@@ -238,22 +239,6 @@ async def _send_streaming_webhooks(
     return results
 
 
-def _validate_auth(
-    settings: Settings,
-    authorization: str | None,
-) -> None:
-    """Validate bearer token against ADMIN_TOKEN setting."""
-    if not settings.admin_token:
-        raise HTTPException(status_code=403, detail="Admin endpoint disabled (no ADMIN_TOKEN set)")
-
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing authorization")
-
-    parts = authorization.split(" ", 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer" or parts[1] != settings.admin_token:
-        raise HTTPException(status_code=403, detail="Invalid token")
-
-
 @router.post(
     "/upload-library-db",
     summary="Upload a new library.db file",
@@ -263,12 +248,12 @@ def _validate_auth(
         401: {"description": "Missing authorization"},
         403: {"description": "Invalid or missing token"},
     },
+    dependencies=[Depends(require_admin_token)],
 )
 async def upload_library_db(
     file: UploadFile,
     settings: Settings = Depends(get_settings),
     object_store: ObjectStore = Depends(get_object_store),
-    authorization: str | None = Header(None),
 ):
     """Replace the library.db file with an uploaded SQLite database.
 
@@ -288,8 +273,6 @@ async def upload_library_db(
     the replica that served the request; others refresh at next restart) is a
     runbook note, not code (epic #834, PR 4).
     """
-    _validate_auth(settings, authorization)
-
     db_path = settings.resolved_library_db_path
     # ``.upload.tmp`` (not ``.tmp``) so this scratch file never collides with
     # ``LocalDirStore.put``'s own internal ``<name>.tmp`` in local mode, where the
@@ -382,13 +365,13 @@ async def upload_library_db(
         },
         500: {"description": "Server-side fault writing or reading the file"},
     },
+    dependencies=[Depends(require_admin_token)],
 )
 async def upload_streaming_db(
     file: UploadFile,
     force: bool = False,
     settings: Settings = Depends(get_settings),
     object_store: ObjectStore = Depends(get_object_store),
-    authorization: str | None = Header(None),
 ):
     """Store a streaming_availability.db backup in the object store.
 
@@ -414,8 +397,6 @@ async def upload_streaming_db(
     object fails closed at 409. ``put`` is atomic per object (S3 PUT; the local
     store does tmp + ``os.replace``), so no replace dance is needed here.
     """
-    _validate_auth(settings, authorization)
-
     with tempfile.TemporaryDirectory(prefix="lml-streaming-upload-") as td:
         tdir = Path(td)
         # The upload scratch file MUST end in ``.tmp`` and the baseline temp below
@@ -545,11 +526,10 @@ async def upload_streaming_db(
         403: {"description": "Invalid or missing token"},
         404: {"description": "streaming_availability.db not present in the store"},
     },
+    dependencies=[Depends(require_admin_token)],
 )
 async def download_streaming_db(
-    settings: Settings = Depends(get_settings),
     object_store: ObjectStore = Depends(get_object_store),
-    authorization: str | None = Header(None),
 ):
     """Stream the current streaming_availability.db from the object store.
 
@@ -559,8 +539,6 @@ async def download_streaming_db(
     object (~53MB) is buffered and returned in one response; that egress is
     negligible at the daily sync cadence.
     """
-    _validate_auth(settings, authorization)
-
     try:
         data = await object_store.get(STREAMING_DB_FILENAME)
     except ObjectNotFoundError:
@@ -604,12 +582,11 @@ TombstoneEntityType = Literal["release", "artist"]
         404: {"description": "Row not found, or row exists but is not a tombstone"},
         503: {"description": "Discogs cache pool not configured"},
     },
+    dependencies=[Depends(require_admin_token)],
 )
 async def delete_tombstone(
     entity_type: TombstoneEntityType = PathParam(..., description="`release` or `artist`"),
     entity_id: int = PathParam(..., description="Discogs id"),
-    settings: Settings = Depends(get_settings),
-    authorization: str | None = Header(None),
     cache_service: DiscogsCacheService | None = Depends(get_discogs_cache_service_from_pool),
 ):
     """Delete a tombstoned row + evict the L1 entry.
@@ -628,8 +605,6 @@ async def delete_tombstone(
     only, and a tombstone lives in L2 (PG); we read it back and re-serve
     it. This endpoint is the L2 surface.
     """
-    _validate_auth(settings, authorization)
-
     if cache_service is None:
         raise HTTPException(
             status_code=503,

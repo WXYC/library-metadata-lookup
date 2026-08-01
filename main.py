@@ -559,7 +559,8 @@ async def _validation_exception_handler(
 
 # Health and admin keep their own auth posture:
 #   - /health is open for Railway healthchecks
-#   - /admin/* uses ADMIN_TOKEN (see routers/admin.py:_validate_auth)
+#   - /admin/* uses ADMIN_TOKEN, attached per-route via core.auth.require_admin_token
+#     (routers/admin.py) -- a separate secret from LML_API_KEY below
 # Identity is open for now (semantic-index consumes it; separate decision).
 app.include_router(health_router, prefix="", tags=["health"])
 app.include_router(admin_router, prefix="/admin", tags=["admin"])

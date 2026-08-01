@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from unittest.mock import patch
 
 import pytest
@@ -18,6 +19,19 @@ def _settings(*, require_auth: bool = False, key: str | None = None) -> Settings
     return Settings(
         lml_require_auth=require_auth,
         lml_api_key=key,
+        discogs_token=None,
+        database_url_discogs=None,
+        sentry_dsn=None,
+        posthog_api_key=None,
+        enable_telemetry=False,
+        library_db_path="test.db",
+    )
+
+
+def _admin_settings(*, admin_token: str | None = None) -> Settings:
+    """Settings with just ``admin_token`` set and unrelated config quieted."""
+    return Settings(
+        admin_token=admin_token,
         discogs_token=None,
         database_url_discogs=None,
         sentry_dsn=None,
@@ -205,6 +219,152 @@ class TestRequireLmlKey:
                 authorization="Bearer anything",
             )
         assert exc.value.status_code == 500
+
+
+class TestRequireAdminToken:
+    """Direct unit tests for the dep guarding ``/admin/*`` (routers/admin.py).
+
+    Pins the exact wire behavior of the ``_validate_auth`` this dep replaces --
+    same status codes and messages for every rejection branch, with the token
+    comparison now going through the shared, timing-safe ``_token_matches``
+    instead of a plain ``!=``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_admin_token_configured_returns_403(self):
+        from core.auth import require_admin_token
+
+        with pytest.raises(HTTPException) as exc:
+            await require_admin_token(
+                settings=_admin_settings(admin_token=None),
+                authorization="Bearer anything",
+            )
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Admin endpoint disabled (no ADMIN_TOKEN set)"
+
+    @pytest.mark.asyncio
+    async def test_no_admin_token_configured_returns_403_even_without_header(self):
+        # Matches _validate_auth's check order: the misconfiguration check runs
+        # before the header is even inspected.
+        from core.auth import require_admin_token
+
+        with pytest.raises(HTTPException) as exc:
+            await require_admin_token(
+                settings=_admin_settings(admin_token=None),
+                authorization=None,
+            )
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Admin endpoint disabled (no ADMIN_TOKEN set)"
+
+    @pytest.mark.asyncio
+    async def test_missing_header_returns_401(self):
+        from core.auth import require_admin_token
+
+        with pytest.raises(HTTPException) as exc:
+            await require_admin_token(
+                settings=_admin_settings(admin_token="secret"),
+                authorization=None,
+            )
+        assert exc.value.status_code == 401
+        assert exc.value.detail == "Missing authorization"
+
+    @pytest.mark.asyncio
+    async def test_malformed_header_returns_403(self):
+        # Header present but not in "<scheme> <token>" form.
+        from core.auth import require_admin_token
+
+        with pytest.raises(HTTPException) as exc:
+            await require_admin_token(
+                settings=_admin_settings(admin_token="secret"),
+                authorization="secret",
+            )
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Invalid token"
+
+    @pytest.mark.asyncio
+    async def test_wrong_scheme_returns_403(self):
+        from core.auth import require_admin_token
+
+        with pytest.raises(HTTPException) as exc:
+            await require_admin_token(
+                settings=_admin_settings(admin_token="secret"),
+                authorization="Basic c2VjcmV0",
+            )
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Invalid token"
+
+    @pytest.mark.asyncio
+    async def test_wrong_token_returns_403(self):
+        from core.auth import require_admin_token
+
+        with pytest.raises(HTTPException) as exc:
+            await require_admin_token(
+                settings=_admin_settings(admin_token="secret"),
+                authorization="Bearer wrong",
+            )
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Invalid token"
+
+    @pytest.mark.asyncio
+    async def test_correct_bearer_passes(self):
+        from core.auth import require_admin_token
+
+        await require_admin_token(
+            settings=_admin_settings(admin_token="secret"),
+            authorization="Bearer secret",
+        )
+
+    @pytest.mark.asyncio
+    async def test_lowercase_scheme_passes(self):
+        # RFC 7235 says the scheme is case-insensitive.
+        from core.auth import require_admin_token
+
+        await require_admin_token(
+            settings=_admin_settings(admin_token="secret"),
+            authorization="bearer secret",
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_token_is_rejected_not_500(self):
+        # secrets.compare_digest on *str* raises TypeError for non-ASCII input,
+        # which would surface as a 500; the shared _token_matches helper
+        # compares the bytes form, so this is a clean 403 instead.
+        from core.auth import require_admin_token
+
+        with pytest.raises(HTTPException) as exc:
+            await require_admin_token(
+                settings=_admin_settings(admin_token="secret"),
+                authorization="Bearer nördic-tøken",
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_uses_constant_time_compare(self):
+        # The one behavior change from the `!=` this dep replaces: the token
+        # comparison must go through secrets.compare_digest.
+        from core.auth import require_admin_token
+
+        with patch("core.auth.secrets.compare_digest", wraps=secrets.compare_digest) as spy:
+            await require_admin_token(
+                settings=_admin_settings(admin_token="secret"),
+                authorization="Bearer secret",
+            )
+        spy.assert_called_once_with(b"secret", b"secret")
+
+    @pytest.mark.asyncio
+    async def test_shares_bearer_parse_helper_with_require_lml_key(self):
+        # Both deps must go through the same parsing core rather than each
+        # re-implementing the split/scheme-check logic.
+        from core.auth import _parse_bearer_token
+
+        with patch("core.auth._parse_bearer_token", wraps=_parse_bearer_token) as spy:
+            from core.auth import require_admin_token
+
+            await require_admin_token(
+                settings=_admin_settings(admin_token="secret"),
+                authorization="Bearer secret",
+            )
+        spy.assert_called_once_with("Bearer secret")
 
 
 class TestRequireLmlKeyTableBackedKeys:
@@ -592,6 +752,51 @@ class TestProtectedRouteRegistration:
 
     @pytest.mark.parametrize("method,path", EXPECTED_UNPROTECTED)
     def test_route_does_not_have_require_lml_key(self, method, path):
+        from core.auth import require_lml_key
+        from main import app
+
+        route = _find_route(app, method, path)
+        assert route is not None, f"Route {method} {path} not found in app.routes"
+        deps = _collect_dep_callables(route)
+        assert require_lml_key not in deps, (
+            f"Route {method} {path} should NOT have require_lml_key. "
+            f"Resolved deps: {sorted(d.__name__ for d in deps)}"
+        )
+
+
+class TestAdminRouteAuthRegistration:
+    """Guards that ``require_admin_token`` is attached to every ``/admin/*`` route.
+
+    Mirrors ``TestProtectedRouteRegistration``'s ``require_lml_key`` sweep so a
+    future admin endpoint that forgets the dep is caught the same way, rather
+    than silently shipping unauthenticated.
+    """
+
+    ADMIN_ROUTES = [
+        ("POST", "/admin/upload-library-db"),
+        ("POST", "/admin/upload-streaming-db"),
+        ("GET", "/admin/download-streaming-db"),
+        ("DELETE", "/admin/discogs/tombstone/{entity_type}/{entity_id}"),
+    ]
+
+    @pytest.mark.parametrize("method,path", ADMIN_ROUTES)
+    def test_route_has_require_admin_token(self, method, path):
+        from core.auth import require_admin_token
+        from main import app
+
+        route = _find_route(app, method, path)
+        assert route is not None, f"Route {method} {path} not found in app.routes"
+        deps = _collect_dep_callables(route)
+        assert require_admin_token in deps, (
+            f"Route {method} {path} is missing require_admin_token dep. "
+            f"Resolved deps: {sorted(d.__name__ for d in deps)}"
+        )
+
+    @pytest.mark.parametrize("method,path", ADMIN_ROUTES)
+    def test_route_does_not_have_require_lml_key(self, method, path):
+        # /admin/* uses ADMIN_TOKEN, a deliberately separate secret from the
+        # LML_API_KEY tubafrenzy/Backend-Service callers use -- confirms the
+        # consolidation didn't accidentally fold the two auth surfaces together.
         from core.auth import require_lml_key
         from main import app
 
