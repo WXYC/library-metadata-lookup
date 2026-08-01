@@ -69,12 +69,12 @@ result to gate its read-through.)
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from wxyc_etl.text import to_match_form
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
+from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute, swallowing_fetch
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -100,11 +100,13 @@ RELEASE_RESOLUTION_CACHE_UNAVAILABLE_STAT_KEY = "release_resolution_cache_unavai
 # get deleted, so let positive entries self-heal on a quarterly cadence.
 DEFAULT_POSITIVE_TTL = timedelta(days=90)
 
-# How long a known-miss row stays authoritative before we re-probe Discogs.
-# Matches the negative cache / streaming cache (7 days): long enough that a
-# request spike doesn't repeatedly hammer the API for the same misses, short
-# enough that a newly-cataloged release becomes resolvable within a week.
-DEFAULT_MISS_TTL = timedelta(days=7)
+# DEFAULT_MISS_TTL (7 days -- matches the negative cache / streaming cache;
+# long enough that a request spike doesn't repeatedly hammer the API for the
+# same misses, short enough that a newly-cataloged release becomes resolvable
+# within a week) is re-exported from entity.cache_toolkit (LML#1034) -- it was
+# defined here verbatim (and duplicated in streaming_url_cache.py) before the
+# duplication survey gave it one home. The import above keeps it importable
+# under this module's name for any existing caller.
 
 # LML#824: how long a *crowd-out* miss stays authoritative. A crowd-out empty
 # (the bounded resolve truncated its candidate set at ``max_validations`` — the
@@ -181,8 +183,7 @@ SET release_id = EXCLUDED.release_id,
 """
 
 
-@dataclass(frozen=True)
-class ReleaseResolution:
+class ReleaseResolution(CachedValue[int]):
     """Outcome of a release-resolution cache read.
 
     Three-valued, because a positive cache must let the caller tell a fresh
@@ -199,10 +200,33 @@ class ReleaseResolution:
       aged past its TTL (``miss_ttl``, or ``crowd_out_miss_ttl`` for a crowd-out
       miss). Run the live probe. The SQL WHERE collapses all these into this
       shape, so the caller can't (and needn't) tell them apart.
+
+    Name- and constructor-shape-preserving alias over ``entity.cache_toolkit
+    .CachedValue`` (LML#1034): external code (``lookup/rowless.py``,
+    ``tests/unit/test_nonlibrary_release_resolution.py``) imports this class
+    by name and constructs it with ``release_id=``/``was_present=`` keywords,
+    so it keeps its own field name rather than folding into the generic
+    ``value`` field callers never see.
     """
 
-    release_id: int | None
-    was_present: bool
+    def __init__(self, release_id: int | None, was_present: bool) -> None:
+        super().__init__(value=release_id, was_present=was_present)
+
+    @property
+    def release_id(self) -> int | None:
+        return self.value
+
+    def __repr__(self) -> str:
+        return (
+            f"ReleaseResolution(release_id={self.release_id!r}, was_present={self.was_present!r})"
+        )
+
+
+# Sentinel distinct from a legitimate ``fetchone`` result of ``None`` (an
+# absent row): lets ``get_cached_release_id`` tell "the PG call raised" from
+# "the PG call succeeded and found no fresh row" after delegating the
+# try/except to ``swallowing_fetch``, so its LML#681 stats stay correct.
+_UNAVAILABLE = object()
 
 
 async def set_up_release_resolution_cache_schema(pg: PgSource) -> None:
@@ -255,23 +279,29 @@ async def get_cached_release_id(
     positive_cutoff = reference_now - positive_ttl
     miss_cutoff = reference_now - miss_ttl
     crowd_out_cutoff = reference_now - crowd_out_miss_ttl
-    try:
-        row = await pg.fetchone(
-            _SELECT_SQL,
-            artist_key,
-            title_key,
-            is_track,
-            positive_cutoff,
-            miss_cutoff,
-            crowd_out_cutoff,
-        )
-    except Exception:
-        logger.exception(
-            "release_resolution_cache get failed for %s / %s / is_track=%s",
-            artist_key,
-            title_key,
-            is_track,
-        )
+    # Policy divergence (LML#1034, kept local, not delegated to the toolkit):
+    # the PG-exception branch and the "row is None" branch both resolve to the
+    # same ReleaseResolution shape, but must record DIFFERENT cache-stats
+    # counters (LML#681) -- a PG outage must not inflate the miss rate. A
+    # sentinel distinct from ``None`` (which fetchone itself can legitimately
+    # return for "no row") lets this thin wrapper still tell the two apart
+    # after delegating the try/except to swallowing_fetch.
+    row = await swallowing_fetch(
+        pg,
+        _SELECT_SQL,
+        artist_key,
+        title_key,
+        is_track,
+        positive_cutoff,
+        miss_cutoff,
+        crowd_out_cutoff,
+        miss=_UNAVAILABLE,
+        logger=logger,
+        log_label="release_resolution_cache get failed for %s / %s / is_track=%s",
+        log_args=(artist_key, title_key, is_track),
+    )
+
+    if row is _UNAVAILABLE:
         # Degradation, not a cache miss (LML#681): count it apart so a PG outage
         # doesn't inflate the miss rate. The caller still falls through to a live
         # probe as if the cache were empty.
@@ -321,12 +351,15 @@ async def set_cached_release_id(
     artist_key = to_match_form(artist)
     title_key = to_match_form(title)
     crowd_out_flag = crowd_out and release_id is None
-    try:
-        await pg.execute(_UPSERT_SQL, artist_key, title_key, is_track, release_id, crowd_out_flag)
-    except Exception:
-        logger.exception(
-            "release_resolution_cache set failed for %s / %s / is_track=%s",
-            artist_key,
-            title_key,
-            is_track,
-        )
+    await swallowing_execute(
+        pg,
+        _UPSERT_SQL,
+        artist_key,
+        title_key,
+        is_track,
+        release_id,
+        crowd_out_flag,
+        logger=logger,
+        log_label="release_resolution_cache set failed for %s / %s / is_track=%s",
+        log_args=(artist_key, title_key, is_track),
+    )

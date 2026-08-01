@@ -61,17 +61,16 @@ from typing import Literal
 from wxyc_etl.text import to_match_form
 
 from clients.streaming.base import BaseStreamingClient
+from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute, swallowing_fetch
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
 
-# How long a known-miss row stays authoritative before we re-check the
-# upstream service. Hits are kept forever; this TTL only applies when
-# ``url IS NULL``. 7 days trades freshness for cache amortization — long
-# enough that bulk request-spike traffic doesn't repeatedly hammer the API
-# for the same misses, short enough that a newly-released album becomes
-# visible within a week.
-DEFAULT_MISS_TTL = timedelta(days=7)
+# DEFAULT_MISS_TTL is re-exported from entity.cache_toolkit (LML#1034) -- it
+# was defined here verbatim (and duplicated in release_resolution_cache.py)
+# before the duplication survey gave it one home. The import above keeps it
+# importable under this module's name for existing callers
+# (lookup/streaming_url_postprocess.py, tests/unit/test_streaming_url_cache.py).
 
 # The services the cache ships. The named CHECK constraint pins this set at
 # the DB level; a future PR adding a service (Deezer's 'deezer_album') extends
@@ -230,21 +229,6 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
             await conn.execute(_DDL_SERVICE_WIDEN_CHECK)
 
 
-@dataclass(frozen=True)
-class _CachedRow:
-    """Internal carrier for a cache SELECT outcome.
-
-    The cache's public surface is ``str | None`` — the resolver only needs
-    the URL. ``_CachedRow`` carries the extra "was a row returned" bit that
-    the resolver uses to distinguish a fresh known miss (skip the API) from a
-    stale or absent entry (call the API). Kept private to this module so its
-    shape can evolve without leaking into call sites.
-    """
-
-    url: str | None
-    was_present: bool
-
-
 async def get_cached_streaming_url(
     pg: PgSource,
     *,
@@ -268,7 +252,7 @@ async def get_cached_streaming_url(
     result = await _fetch_cached_row(
         pg, service=service, artist=artist, album=album, miss_ttl=miss_ttl, now=now
     )
-    return result.url
+    return result.value
 
 
 async def peek_cached_streaming_url(
@@ -299,7 +283,7 @@ async def peek_cached_streaming_url(
     result = await _fetch_cached_row(
         pg, service=service, artist=artist, album=album, miss_ttl=miss_ttl, now=now
     )
-    return result.url, result.was_present
+    return result.value, result.was_present
 
 
 async def _fetch_cached_row(
@@ -310,7 +294,7 @@ async def _fetch_cached_row(
     album: str,
     miss_ttl: timedelta,
     now: datetime | None,
-) -> _CachedRow:
+) -> CachedValue[str]:
     """Read the cache row keyed by ``(service, artist, album)`` honoring the TTL.
 
     Module-private helper powering both ``get_cached_streaming_url`` (URL only)
@@ -321,21 +305,26 @@ async def _fetch_cached_row(
     album_key = to_match_form(album)
     reference_now = now or datetime.now(UTC)
     miss_cutoff = reference_now - miss_ttl
-    try:
-        row = await pg.fetchone(_SELECT_SQL, service, artist_key, album_key, miss_cutoff)
-    except Exception:
-        logger.exception(
-            "streaming_url_cache get failed for %s / %s / %s", service, artist_key, album_key
-        )
-        return _CachedRow(url=None, was_present=False)
+    row = await swallowing_fetch(
+        pg,
+        _SELECT_SQL,
+        service,
+        artist_key,
+        album_key,
+        miss_cutoff,
+        miss=None,
+        logger=logger,
+        log_label="streaming_url_cache get failed for %s / %s / %s",
+        log_args=(service, artist_key, album_key),
+    )
 
     if row is None:
-        # Either no row at all, or a stale known-miss filtered out by the SQL
-        # WHERE. Both render the same way; the resolver treats either as
-        # "call the API."
-        return _CachedRow(url=None, was_present=False)
+        # Either a PG failure, no row at all, or a stale known-miss filtered
+        # out by the SQL WHERE. All render the same way; the resolver treats
+        # any of them as "call the API."
+        return CachedValue(value=None, was_present=False)
 
-    return _CachedRow(url=row["url"], was_present=True)
+    return CachedValue(value=row["url"], was_present=True)
 
 
 ResolveSource = Literal[
@@ -397,8 +386,8 @@ async def resolve_streaming_url_with_cache(
     cached = await _fetch_cached_row(
         pg, service=service, artist=artist, album=album, miss_ttl=miss_ttl, now=now
     )
-    if cached.url is not None:
-        return ResolveOutcome(url=cached.url, source="cache_hit")
+    if cached.value is not None:
+        return ResolveOutcome(url=cached.value, source="cache_hit")
     if cached.was_present:
         # SQL filter already excluded stale misses; a present row with NULL
         # URL is necessarily an in-TTL known miss — skip the API.
@@ -445,9 +434,14 @@ async def set_cached_streaming_url(
     """
     artist_key = to_match_form(artist)
     album_key = to_match_form(album)
-    try:
-        await pg.execute(_UPSERT_SQL, service, artist_key, album_key, url)
-    except Exception:
-        logger.exception(
-            "streaming_url_cache set failed for %s / %s / %s", service, artist_key, album_key
-        )
+    await swallowing_execute(
+        pg,
+        _UPSERT_SQL,
+        service,
+        artist_key,
+        album_key,
+        url,
+        logger=logger,
+        log_label="streaming_url_cache set failed for %s / %s / %s",
+        log_args=(service, artist_key, album_key),
+    )

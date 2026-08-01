@@ -32,6 +32,7 @@ from dataclasses import dataclass
 
 from wxyc_etl.text import to_match_form
 
+from entity.cache_toolkit import swallowing_fetch
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -121,13 +122,15 @@ async def get_compilation_track_locations(
     normalized_title = to_match_form(track_title)
     if not normalized_artist or not normalized_title:
         return []
-    try:
-        rows = await pg.fetchall(_SELECT_LOCATIONS_SQL, normalized_artist, normalized_title)
-    except Exception:
-        logger.exception(
-            "compilation_track_location probe failed for artist=%r title=%r",
-            normalized_artist,
-            normalized_title,
-        )
-        return []
+    rows = await swallowing_fetch(
+        pg,
+        _SELECT_LOCATIONS_SQL,
+        normalized_artist,
+        normalized_title,
+        miss=[],
+        logger=logger,
+        log_label="compilation_track_location probe failed for artist=%r title=%r",
+        log_args=(normalized_artist, normalized_title),
+        many=True,
+    )
     return [CompilationTrackLocationRow(**row) for row in rows]

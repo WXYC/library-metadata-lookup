@@ -39,6 +39,7 @@ import logging
 
 from wxyc_etl.text import to_match_form
 
+from entity.cache_toolkit import swallowing_execute, swallowing_fetch
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -146,17 +147,18 @@ async def get_cached_track_streaming_url(
     artist_key = to_match_form(artist)
     album_key = _album_key(album)
     song_key = to_match_form(song)
-    try:
-        row = await pg.fetchone(_SELECT_SQL, service, artist_key, album_key, song_key)
-    except Exception:
-        logger.exception(
-            "track_streaming_url_cache get failed for %s / %s / %s / %s",
-            service,
-            artist_key,
-            album_key,
-            song_key,
-        )
-        return None
+    row = await swallowing_fetch(
+        pg,
+        _SELECT_SQL,
+        service,
+        artist_key,
+        album_key,
+        song_key,
+        miss=None,
+        logger=logger,
+        log_label="track_streaming_url_cache get failed for %s / %s / %s / %s",
+        log_args=(service, artist_key, album_key, song_key),
+    )
     if row is None:
         return None
     return row["url"]
@@ -182,13 +184,15 @@ async def set_cached_track_streaming_url(
     artist_key = to_match_form(artist)
     album_key = _album_key(album)
     song_key = to_match_form(song)
-    try:
-        await pg.execute(_UPSERT_SQL, service, artist_key, album_key, song_key, url)
-    except Exception:
-        logger.exception(
-            "track_streaming_url_cache set failed for %s / %s / %s / %s",
-            service,
-            artist_key,
-            album_key,
-            song_key,
-        )
+    await swallowing_execute(
+        pg,
+        _UPSERT_SQL,
+        service,
+        artist_key,
+        album_key,
+        song_key,
+        url,
+        logger=logger,
+        log_label="track_streaming_url_cache set failed for %s / %s / %s / %s",
+        log_args=(service, artist_key, album_key, song_key),
+    )
