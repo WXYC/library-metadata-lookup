@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import aiosqlite
 
+from clients.streaming.matching import normalize_album_title, normalize_artist_name
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
 
 _SCHEMA = """
@@ -119,8 +120,17 @@ class ResultsDB:
             ("bandcamp_url", "TEXT"),
             ("bandcamp_status", "TEXT NOT NULL DEFAULT 'pending'"),
             ("bandcamp_checked_at", "TEXT"),
+            # YouTube Music coverage drain (#1056). The drain fills youtube_music_url
+            # offline; export_streaming_links.py already carries it into
+            # library.db.streaming_links and /lookup already surfaces it. On prod the
+            # url column predates ResultsDB (earlier pipeline era) so this ALTER is a
+            # no-op there and only the status/checked_at markers are added.
+            ("youtube_music_url", "TEXT"),
+            ("youtube_music_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("youtube_music_checked_at", "TEXT"),
         ]
         bandcamp_status_added = "bandcamp_status" not in columns
+        youtube_music_status_added = "youtube_music_status" not in columns
         for col_name, col_type in migrations:
             if col_name not in columns:
                 await self._db.execute(f"ALTER TABLE albums ADD COLUMN {col_name} {col_type}")
@@ -129,6 +139,10 @@ class ResultsDB:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_albums_bandcamp_status ON albums(bandcamp_status)"
         )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_albums_youtube_music_status "
+            "ON albums(youtube_music_status)"
+        )
         if bandcamp_status_added:
             # The ALTER stamps 'pending' on every existing row; rows that already
             # carry a resolved URL are really 'found'. Backfill so the marker is
@@ -136,6 +150,14 @@ class ResultsDB:
             await self._db.execute(
                 "UPDATE albums SET bandcamp_status = 'found' "
                 "WHERE bandcamp_url IS NOT NULL AND bandcamp_status = 'pending'"
+            )
+        if youtube_music_status_added:
+            # Same #661 backfill for the youtube_music marker: a prod row carrying a
+            # url from the earlier pipeline era is 'found', not 'pending', so a
+            # fill-only drain skips it and reporting stays trustworthy.
+            await self._db.execute(
+                "UPDATE albums SET youtube_music_status = 'found' "
+                "WHERE youtube_music_url IS NOT NULL AND youtube_music_status = 'pending'"
             )
 
     async def close(self) -> None:
@@ -296,6 +318,7 @@ class ResultsDB:
             "discogs": {},
             "deezer": {},
             "bandcamp": {},
+            "youtube_music": {},
             "total": 0,
         }
 
@@ -303,7 +326,7 @@ class ResultsDB:
         row = await cursor.fetchone()
         stats["total"] = row[0] if row else 0
 
-        for service in ("spotify", "apple", "discogs", "deezer", "bandcamp"):
+        for service in ("spotify", "apple", "discogs", "deezer", "bandcamp", "youtube_music"):
             col = f"{service}_status"
             cursor = await self._db.execute(
                 f"SELECT {col}, COUNT(*) FROM albums GROUP BY {col}"  # noqa: S608
@@ -363,6 +386,48 @@ class ResultsDB:
                 (now, album_id),
             )
             await self._db.commit()
+
+    async def update_youtube_music_url(self, album_id: int, url: str) -> bool:
+        """Fill in a verified YouTube Music album URL -- **fill-only**.
+
+        The write only lands when ``youtube_music_url IS NULL``, so an already
+        resolved (top-priority) link is never clobbered by a later, lower-value
+        pass (Data Safety). On a fill it also stamps the ``found`` status marker
+        and ``checked_at`` so the row is excluded from future pending scans and
+        attempted-vs-resolved reporting stays trustworthy (the #669/#661 lesson).
+
+        Returns ``True`` if a row was filled, ``False`` if it was a no-op
+        (already had a url, or no such album) -- lets the #1056 drain tally
+        written-vs-already-present without a follow-up read.
+        """
+        assert self._db is not None
+        async with self._write_lock:
+            now = datetime.now(UTC).isoformat()
+            cursor = await self._db.execute(
+                "UPDATE albums SET youtube_music_url = ?, youtube_music_status = 'found', "
+                "youtube_music_checked_at = ? WHERE id = ? AND youtube_music_url IS NULL",
+                (url, now, album_id),
+            )
+            await self._db.commit()
+            return cursor.rowcount > 0
+
+    async def get_album_id_by_names(self, artist: str, title: str) -> int | None:
+        """Resolve an album's id from raw ``(artist, title)``.
+
+        Normalizes with the same ``normalize_artist_name`` /
+        ``normalize_album_title`` the dedup pipeline keyed rows with (dedup.py),
+        so a producer resolving names from any source (e.g. the #1056 drain's
+        discogs-cache join) maps to the stored row with zero normalization
+        drift. Returns ``None`` when no row matches. The ``UNIQUE(normalized_
+        artist, normalized_title)`` constraint guarantees at most one match.
+        """
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "SELECT id FROM albums WHERE normalized_artist = ? AND normalized_title = ?",
+            (normalize_artist_name(artist), normalize_album_title(title)),
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else None
 
     async def get_artists_without_bandcamp_slug(
         self,

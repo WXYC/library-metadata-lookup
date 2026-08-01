@@ -6,6 +6,7 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 
+from clients.streaming.matching import normalize_album_title, normalize_artist_name
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
 from scripts.streaming_availability.results_db import ResultsDB
 
@@ -597,3 +598,169 @@ class TestBandcampStatusMigrationOnExistingDb:
             assert rows[0]["bandcamp_status"] == "pending"
         finally:
             await db2.close()
+
+
+class TestYouTubeMusicFillOnlyWrite:
+    """Fill-only youtube_music_url writer for the #1056 YTM coverage drain.
+
+    The drain resolves verified music.youtube.com/browse/<id> links offline and
+    writes them into the authoritative streaming_availability store (Option A of
+    the #1056 / #1052 write-path fork). Writes are fill-only: a resolved URL is
+    the top-priority link and must never be clobbered by a later, lower-value
+    pass (Data Safety; the #669 status-marker lesson).
+    """
+
+    @pytest.mark.asyncio
+    async def test_columns_exist_and_default(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["youtube_music_url"] is None
+        assert rows[0]["youtube_music_status"] == "pending"
+        assert rows[0]["youtube_music_checked_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_write_sets_url_status_and_timestamp(self, db):
+        await db.insert_albums([_make_album()])
+        album_id = (await db.get_pending("spotify", limit=10))[0]["id"]
+        url = "https://music.youtube.com/browse/MPREb_stereolab"
+        wrote = await db.update_youtube_music_url(album_id, url)
+        assert wrote is True
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["youtube_music_url"] == url
+        assert rows[0]["youtube_music_status"] == "found"
+        assert rows[0]["youtube_music_checked_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_fill_only_does_not_overwrite_existing_url(self, db):
+        await db.insert_albums([_make_album()])
+        album_id = (await db.get_pending("spotify", limit=10))[0]["id"]
+        first = "https://music.youtube.com/browse/MPREb_first"
+        await db.update_youtube_music_url(album_id, first)
+        wrote = await db.update_youtube_music_url(
+            album_id, "https://music.youtube.com/browse/MPREb_second"
+        )
+        assert wrote is False  # already filled -> no-op
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["youtube_music_url"] == first  # original preserved
+
+    @pytest.mark.asyncio
+    async def test_write_to_missing_album_is_noop(self, db):
+        wrote = await db.update_youtube_music_url(9999, "https://music.youtube.com/browse/MPREb_x")
+        assert wrote is False
+
+    @pytest.mark.asyncio
+    async def test_get_stats_includes_youtube_music(self, db):
+        await db.insert_albums([_make_album()])
+        album_id = (await db.get_pending("spotify", limit=10))[0]["id"]
+        await db.update_youtube_music_url(album_id, "https://music.youtube.com/browse/MPREb_x")
+        stats = await db.get_stats()
+        assert stats["youtube_music"]["found"] == 1
+
+
+class TestGetAlbumIdByNames:
+    """execute_write maps a resolved candidate to its albums row by normalized
+    (artist, title) -- the exact key the dedup pipeline wrote (dedup.py) -- so
+    there is no normalization drift between producer and store."""
+
+    @pytest.mark.asyncio
+    async def test_finds_row_via_normalized_key(self, db):
+        album = _make_album(
+            normalized_artist=normalize_artist_name("Stereolab"),
+            normalized_title=normalize_album_title("Aluminum Tunes"),
+            display_artist="Stereolab",
+            display_title="Aluminum Tunes",
+        )
+        await db.insert_albums([album])
+        # Raw display-cased names normalize to the stored key.
+        album_id = await db.get_album_id_by_names("Stereolab", "Aluminum Tunes")
+        assert album_id is not None
+        rows = await db.get_pending("spotify", limit=10)
+        assert album_id == rows[0]["id"]
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_absent(self, db):
+        assert await db.get_album_id_by_names("Nonexistent Artist", "No Such Album") is None
+
+
+class TestYouTubeMusicMigrationOnExistingDb:
+    """Exercise the ALTER path against a DB created before the youtube_music_*
+    columns -- a CREATE-only definition would pass on a fresh DB but silently
+    miss the columns on a pre-existing file (the same regression fence as
+    TestBandcampStatusMigrationOnExistingDb)."""
+
+    OLD_SCHEMA = """
+        CREATE TABLE albums (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            normalized_artist TEXT NOT NULL,
+            normalized_title TEXT NOT NULL,
+            display_artist TEXT NOT NULL,
+            display_title TEXT NOT NULL,
+            library_ids TEXT NOT NULL,
+            formats TEXT NOT NULL,
+            is_compilation INTEGER NOT NULL DEFAULT 0,
+            spotify_status TEXT NOT NULL DEFAULT 'pending',
+            apple_status TEXT NOT NULL DEFAULT 'pending',
+            youtube_music_url TEXT,
+            UNIQUE(normalized_artist, normalized_title)
+        )
+    """
+
+    async def _make_old_db(self, path: str, *, url: str | None) -> None:
+        conn = await aiosqlite.connect(path)
+        try:
+            await conn.executescript(self.OLD_SCHEMA)
+            await conn.execute(
+                "INSERT INTO albums "
+                "(normalized_artist, normalized_title, display_artist, display_title, "
+                " library_ids, formats, youtube_music_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "stereolab",
+                    "aluminum tunes",
+                    "Stereolab",
+                    "Aluminum Tunes",
+                    "[1]",
+                    '["cd"]',
+                    url,
+                ),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_migration_adds_status_and_checked_at(self, tmp_path):
+        path = str(tmp_path / "old.db")
+        await self._make_old_db(path, url=None)
+
+        db = ResultsDB(path)
+        await db.connect()
+        try:
+            rows = await db.get_all_results()
+            assert rows[0]["youtube_music_status"] == "pending"
+            assert rows[0]["youtube_music_checked_at"] is None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_migration_backfills_found_for_resolved_url(self, tmp_path):
+        # A row that already carries a url (from the earlier pipeline era) must be
+        # marked 'found', not left 'pending', so attempted-vs-resolved reporting is
+        # trustworthy and a fill-only pass skips it (#661 pattern).
+        path = str(tmp_path / "old.db")
+        await self._make_old_db(path, url="https://music.youtube.com/browse/MPREb_pre")
+
+        db = ResultsDB(path)
+        await db.connect()
+        try:
+            rows = await db.get_all_results()
+            assert rows[0]["youtube_music_status"] == "found"
+            # Fill-only must not clobber the pre-existing url.
+            wrote = await db.update_youtube_music_url(
+                rows[0]["id"], "https://music.youtube.com/browse/MPREb_new"
+            )
+            assert wrote is False
+            rows = await db.get_all_results()
+            assert rows[0]["youtube_music_url"] == "https://music.youtube.com/browse/MPREb_pre"
+        finally:
+            await db.close()
