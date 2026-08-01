@@ -1900,6 +1900,10 @@ class TestPerformLookupLocationUnion:
         assert len(response.results) == 2
         assert response.found_on_compilation is True
         assert response.song_not_found is False
+        # A location folded into a shed response must reconcile search_type to
+        # "compilation" too -- not leak the pre-fold state.search_type, which
+        # would contradict found_on_compilation=True (degraded-path M1).
+        assert response.search_type == "compilation"
         assert response.context_message is None
         assert response.external_source is None
 
