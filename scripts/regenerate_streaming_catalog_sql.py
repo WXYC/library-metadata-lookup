@@ -127,8 +127,11 @@ _COMMENTS: dict[str, str] = {
 -- values. url rejects '' at the column level (NULL-tolerant CHECK) so NULL
 -- stays the one "no url" value; slug is transition-guarded but not
 -- CHECK-banned because legacy rows may carry '' slugs.""",
-    "DO $catalog_check$": """\
--- Widen-only maintenance of the named service CHECK, so an already-created
+    "DO $widen_service_check$": """\
+-- Widen-only maintenance of the named service CHECK (generation logic lives
+-- in entity/ddl.py's build_widen_service_check_sql, shared with
+-- entity/streaming_url_cache.py and entity/track_streaming_url_cache.py --
+-- LML#1038), so an already-created
 -- table (where CREATE TABLE IF NOT EXISTS is a no-op) picks up service values
 -- added after its creation. Deparses the deployed constraint and
 -- distinguishes three states: PARSEABLE (matches the exact

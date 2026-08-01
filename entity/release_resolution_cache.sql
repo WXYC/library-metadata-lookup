@@ -1,12 +1,16 @@
 -- Positive release-resolution cache schema for LML#632.
 --
--- This file is the canonical DDL reference for the
--- `lml_cache.release_resolution_cache` table. Like
--- `lml_cache.album_streaming_url_cache` (LML#573) and unlike
--- `entity.release_identity` (the discogs-cache-owned identity contract,
--- migrated via alembic), this table lives in the LML-owned `lml_cache.*`
--- schema (per WXYC/discogs-etl#288, Option 3) and is bootstrapped from LML's
--- own FastAPI lifespan -- no discogs-cache coordination. discogs-cache tooling
+-- Canonical DDL reference for `lml_cache.release_resolution_cache`: the
+-- durable positive cache that lets the 2nd-and-later add of the same
+-- non-library release short-circuit the Discogs probe + per-release
+-- track-validation entirely. Stores only the resolved Discogs `release_id`
+-- (or NULL for a known miss) -- the existing by-id `get_release` cache fills
+-- in the rest.
+--
+-- It lives in the LML-owned `lml_cache.*` schema (per WXYC/discogs-etl#288,
+-- Option 3) -- not the discogs-cache-owned `entity.*` identity contract,
+-- which is created and migrated only via discogs-cache alembic migrations --
+-- and is bootstrapped from LML's own FastAPI lifespan; discogs-cache tooling
 -- never touches `lml_cache.*`.
 --
 -- This file exists so:
@@ -15,11 +19,13 @@
 --   2. An operator can apply the schema directly to a non-discogs-cache PG
 --      (e.g. local dev) without booting the full LML app.
 --
--- The runtime source of truth is `entity/release_resolution_cache.py`
--- (`set_up_release_resolution_cache_schema`), which issues these statements via
--- the `IF NOT EXISTS` forms on every boot. If the canonical shape changes,
--- update both places (and the parity assertions in
--- tests/unit/test_release_resolution_cache_schema.py).
+-- GENERATED FILE -- regenerate via:
+--   uv run python -m scripts.regenerate_lml_cache_sql
+-- Statements come verbatim from `entity/release_resolution_cache.py`; do not hand-edit
+-- this file -- a per-module unit test (`tests/unit/test_release_resolution_cache_schema.py`)
+-- pins the statement text. The runtime source of truth is
+-- `entity/release_resolution_cache.py`'s `set_up_release_resolution_cache_schema`, which issues these statements
+-- (`IF NOT EXISTS` forms) on every boot.
 
 CREATE SCHEMA IF NOT EXISTS lml_cache;
 
@@ -35,10 +41,11 @@ CREATE TABLE IF NOT EXISTS lml_cache.release_resolution_cache (
 );
 
 -- LML#824: `crowd_out` marks a short-TTL crowd-out miss (bounded resolve
--- truncated its candidate set) apart from a full-7-day exhausted miss. The
--- runtime bootstrap additionally issues this idempotent ALTER so a table that
--- predates the column gains it in place (a fresh install already has it from the
--- CREATE TABLE above, making the ALTER a no-op):
+-- truncated its candidate set) apart from a full-7-day exhausted miss. A
+-- fresh install already has the column from the CREATE TABLE above; the
+-- runtime bootstrap additionally issues this idempotent ALTER (not shown as
+-- a top-level statement -- it is a follow-up upgrade for a table that
+-- predates the column, a no-op once the column exists) so an existing prod
+-- table gains it in place:
 --
---   ALTER TABLE lml_cache.release_resolution_cache
---       ADD COLUMN IF NOT EXISTS crowd_out BOOLEAN NOT NULL DEFAULT false;
+--   ALTER TABLE lml_cache.release_resolution_cache ADD COLUMN IF NOT EXISTS crowd_out BOOLEAN NOT NULL DEFAULT false;

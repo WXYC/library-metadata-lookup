@@ -33,6 +33,7 @@ from dataclasses import dataclass
 
 from wxyc_etl.text import to_match_form
 
+from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -64,8 +65,6 @@ class CompilationTrackLocationProbeError(Exception):
     no-locations; the strategy falls back to the full legacy live pass.
     """
 
-
-_DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
 # Column shapes and the credit_role tier set are documented in
 # entity/compilation_track_location.sql -- keep both in lockstep (the parity

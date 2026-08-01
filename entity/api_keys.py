@@ -34,11 +34,10 @@ import logging
 from typing import Any
 
 from entity.cache_toolkit import swallowing_execute
+from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
-
-_DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
 _DDL_TABLE = """\
 CREATE TABLE IF NOT EXISTS lml_cache.api_keys (

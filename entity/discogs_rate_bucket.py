@@ -43,11 +43,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
-
-_DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
 _DDL_TABLE = """\
 CREATE TABLE IF NOT EXISTS lml_cache.discogs_rate_bucket (

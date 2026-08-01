@@ -40,6 +40,8 @@ import logging
 from wxyc_etl.text import to_match_form
 
 from entity.cache_toolkit import swallowing_execute, swallowing_fetch
+from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
+from entity.ddl import widen_service_check
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -51,11 +53,9 @@ logger = logging.getLogger(__name__)
 APPLE_MUSIC_TRACK_SERVICE = "apple_music_track"
 _SERVICES = (APPLE_MUSIC_TRACK_SERVICE,)
 
-# Shared IN-list literal so the CREATE-time CHECK and the idempotent ALTER are
-# generated from the same source — they can never drift.
+# Shared IN-list literal so the CREATE-time CHECK is generated from the same
+# source as the widen check below — they can never drift.
 _SERVICE_IN_LIST = ", ".join(f"'{s}'" for s in _SERVICES)
-
-_DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
 # ``url TEXT NOT NULL`` enforces the #782/BS#1192 guard structurally: this
 # cache stores only resolved track deep-links, never a "checked, not found"
@@ -76,19 +76,19 @@ CREATE TABLE IF NOT EXISTS lml_cache.track_streaming_url_cache (
 )\
 """
 
-# Idempotent widen of the named CHECK. ``CREATE TABLE IF NOT EXISTS`` is a
-# no-op on an already-created prod table, so a new service value added to
-# ``_SERVICES`` would never reach an existing table without this ALTER. The
-# DROP-IF-EXISTS + ADD pair is byte-stable across boots and runs atomically
-# within the single statement. Driven from the same ``_SERVICE_IN_LIST`` as the
-# CREATE so the two can't drift.
-_DDL_ALTER_CHECK = f"""\
-ALTER TABLE lml_cache.track_streaming_url_cache
-    DROP CONSTRAINT IF EXISTS track_streaming_url_cache_service_valid,
-    ADD CONSTRAINT track_streaming_url_cache_service_valid CHECK (
-        service IN ({_SERVICE_IN_LIST})
-    )\
-"""
+# Bare table/constraint names for the shared widen-check builder
+# (``entity.ddl.widen_service_check``). Previously this module issued a
+# static, unconditional ``DROP CONSTRAINT``/``ADD CONSTRAINT`` pair on every
+# boot -- the original, narrowest generation of the widen pattern. LML#1038
+# deletes that port in favor of the shared implementation, which also
+# upgrades this table's widen path to the newest generation's steady-state
+# no-op (no ACCESS EXCLUSIVE lock / re-validation scan on an unchanged
+# constraint), round-trip validation, and foreign-form warn-and-skip
+# (LML#890) -- a deliberate behavior upgrade, not a pure rename. See
+# ``entity.ddl.build_widen_service_check_sql`` for the full generation
+# rationale.
+_WIDEN_CHECK_TABLE = "track_streaming_url_cache"
+_WIDEN_CHECK_CONSTRAINT = "track_streaming_url_cache_service_valid"
 
 # Hit-only SELECT: the ``url NOT NULL`` schema means any present row is a
 # durable hit. Keyed on the full ``(service, artist, album, song)`` composite —
@@ -116,13 +116,18 @@ async def set_up_track_streaming_url_cache_schema(pg: PgSource) -> None:
     """Apply the idempotent track-cache-schema DDL.
 
     Called once from ``main.py`` lifespan. Schema and table creation are both
-    ``IF NOT EXISTS`` so re-running on every boot is safe. The final ALTER
+    ``IF NOT EXISTS`` so re-running on every boot is safe. The final step
     widens the named CHECK to the current ``_SERVICES`` set so a prod table
     frozen at an older service set still accepts a newly-added service.
     """
     await pg.execute(_DDL_SCHEMA)
     await pg.execute(_DDL_TABLE)
-    await pg.execute(_DDL_ALTER_CHECK)
+    await widen_service_check(
+        pg,
+        table=_WIDEN_CHECK_TABLE,
+        constraint=_WIDEN_CHECK_CONSTRAINT,
+        services=_SERVICES,
+    )
 
 
 def _album_key(album: str | None) -> str:

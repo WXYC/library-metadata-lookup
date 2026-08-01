@@ -36,11 +36,10 @@ from __future__ import annotations
 import logging
 
 from entity.cache_toolkit import swallowing_fetch
+from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
-
-_DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
 # Keyed by the WXYC library release id (== tubafrenzy LIBRARY_RELEASE.ID ==
 # LibraryItem.id). ``discogs_release_id > 0`` mirrors the LML#401/#518 sentinel

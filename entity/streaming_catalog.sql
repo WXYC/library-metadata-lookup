@@ -135,7 +135,10 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album_service (
     CONSTRAINT streaming_album_service_url_nonempty CHECK (url <> '')
 );
 
--- Widen-only maintenance of the named service CHECK, so an already-created
+-- Widen-only maintenance of the named service CHECK (generation logic lives
+-- in entity/ddl.py's build_widen_service_check_sql, shared with
+-- entity/streaming_url_cache.py and entity/track_streaming_url_cache.py --
+-- LML#1038), so an already-created
 -- table (where CREATE TABLE IF NOT EXISTS is a no-op) picks up service values
 -- added after its creation. Deparses the deployed constraint and
 -- distinguishes three states: PARSEABLE (matches the exact
@@ -156,7 +159,7 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album_service (
 -- deparse; an array-literal constant would deparse as ONE literal and
 -- corrupt the next boot's extraction.
 
-DO $catalog_check$
+DO $widen_service_check$
 DECLARE
     existing_def text;
     inner_array text;
@@ -205,7 +208,7 @@ BEGIN
         'ADD CONSTRAINT streaming_album_service_valid CHECK (service IN ('
         || merged_list || '))';
 END;
-$catalog_check$;
+$widen_service_check$;
 
 -- Pending-scan support for the pipelines ("next albums to probe on service
 -- X"), mirroring the legacy per-service status indexes. Shape is provisional
