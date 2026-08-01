@@ -17,11 +17,10 @@ from dataclasses import dataclass, field, fields
 from typing import NoReturn
 
 import asyncpg
-from rapidfuzz import fuzz
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
 from config.settings import _WORK_MEM_RE, get_settings
-from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
+from discogs.matching import TracklistEntry, scan_tracklist_for_match
 from discogs.memory_cache import async_cached, create_ttl_cache
 from discogs.models import (
     ArtistCredit,
@@ -129,18 +128,6 @@ class ArtistEqualityCandidates:
             ids |= getattr(self, f.name)
         return ids
 
-
-# Mirrors ``_ARTIST_FUZZY_MATCH_THRESHOLD`` in ``discogs/service.py`` — the
-# release-level fuzzy fallback used here must score the same way the API path
-# does so cache hits and cache misses can't disagree about whether a track is
-# on a release. Tied to that constant by intent, not duplicated by accident.
-_ARTIST_FUZZY_MATCH_THRESHOLD = 70
-
-# Mirrors ``_TRACK_TITLE_FUZZY_MATCH_THRESHOLD`` in ``discogs/service.py`` (LML#334)
-# — the track-title fuzzy fallback applied here after the bidirectional substring
-# gate misses. Must score the same as the API path so cache hits and misses agree
-# on whether a (possibly misspelled) track title is on a release.
-_TRACK_TITLE_FUZZY_MATCH_THRESHOLD = 85
 
 # Default TTL for a negative-cache entry (7 days, matching the
 # migration's column default). 7 days is conservative: tracks that
@@ -2569,65 +2556,16 @@ class DiscogsCacheService:
 
             primary_artist = release_artist_row["artist_name"] if release_artist_row else ""
 
-            track_lower = normalize_for_track_comparison(track)
-            artist_lower = normalize_artist_for_validation(artist)
-
-            release_artist_clean = normalize_artist_for_validation(primary_artist)
-
-            for row in track_rows:
-                item_title = normalize_for_track_comparison(row["title"])
-
-                if track_lower not in item_title and item_title not in track_lower:
-                    # Fuzzy title fallback (LML#334): typographic noise that leaves
-                    # token content intact (singular/plural, a dropped interior word,
-                    # dash-vs-paren suffix) misses the substring gate but clears the
-                    # token_set_ratio floor. Mirrors the API path's
-                    # ``_iter_title_matched_items``.
-                    if (
-                        not item_title
-                        or fuzz.token_set_ratio(track_lower, item_title)
-                        < _TRACK_TITLE_FUZZY_MATCH_THRESHOLD
-                    ):
-                        continue
-
-                seq = row["sequence"]
-                artists_for_track = track_artists.get(seq, [])
-                if artists_for_track:
-                    for track_artist in artists_for_track:
-                        track_artist_lower = normalize_artist_for_validation(track_artist)
-                        if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
-                            return True
-                    joined = normalize_artist_for_validation(" ".join(artists_for_track))
-                    if (
-                        joined
-                        and fuzz.token_set_ratio(artist_lower, joined)
-                        >= _ARTIST_FUZZY_MATCH_THRESHOLD
-                    ):
-                        return True
-
-                # Release-level fallback, consulted whenever the per-track
-                # main credits (post-#333 ``extra = 0`` filter) didn't
-                # close the match — either no per-track main credit exists
-                # for this row at all, or one exists but didn't substring/
-                # fuzz-match the requested artist. Rescued by a
-                # release-level credit that does match. The band-member
-                # shape (per-track main credits list only members, release-
-                # level is the band) is one canonical case; see #333
-                # acceptance criteria. Mirrors the API path in
-                # ``discogs/service.py``. Do not remove without replacing
-                # the rescue path.
-                if release_artist_clean and (
-                    artist_lower in release_artist_clean or release_artist_clean in artist_lower
-                ):
-                    return True
-                if (
-                    release_artist_clean
-                    and fuzz.token_set_ratio(artist_lower, release_artist_clean)
-                    >= _ARTIST_FUZZY_MATCH_THRESHOLD
-                ):
-                    return True
-
-            return False
+            # Adapt the plain asyncpg rows into the shape the shared kernel
+            # needs (LML#1035) -- see the module-note in
+            # ``discogs/matching.py``. ``track_artists.get(seq)`` is ``None``
+            # for a row with no ``extra = 0`` credits, matching
+            # ``TrackItem.artists``'s ``None``/empty shape on the API path.
+            entries = (
+                TracklistEntry(title=row["title"], artists=track_artists.get(row["sequence"]))
+                for row in track_rows
+            )
+            return scan_tracklist_for_match(entries, track, artist, release_artist=primary_artist)
 
         except Exception as e:
             _classify_cache_error("validate_track_on_release", e)

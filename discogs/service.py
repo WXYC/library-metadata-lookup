@@ -27,7 +27,12 @@ from config.settings import get_settings
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.fallthrough import apply_request_ctx_tags, fallthrough, request_context
 from discogs.live_request_counter import increment_discogs_live_requests_total
-from discogs.matching import normalize_artist_for_validation, normalize_for_track_comparison
+from discogs.matching import (
+    TRACK_TITLE_FUZZY_MATCH_THRESHOLD,
+    TracklistEntry,
+    normalize_for_track_comparison,
+    scan_tracklist_for_match,
+)
 from discogs.memory_cache import (
     ARTIST_CACHE,
     LABEL_CACHE,
@@ -140,28 +145,6 @@ One lookup can make several live Discogs requests; the request-level measurement
 should retain the worst observed backlog, not whichever request happened to run
 last. Weak keys mirror ``core.bulk_concurrency``'s queue-wait measurement cache.
 """
-
-# Fuzzy fallback for `validate_track_on_release` artist matching. Strict substring
-# matching loses on collaboration trios where neither name is a substring of the
-# other (e.g., request "Orcutt Shelley Miller" vs release artist
-# "Bill Orcutt, Tashi Shelley & Robbie Miller"). rapidfuzz token_set_ratio is
-# order- and stopword-tolerant; the threshold was chosen so that one shared
-# token across two short names ("Bill Orcutt" vs "Orcutt Shelley Miller") just
-# clears the bar (~70.6) while unrelated artists score well below 50. See LML#210.
-_ARTIST_FUZZY_MATCH_THRESHOLD = 70
-
-# Fuzzy fallback for `validate_track_on_release` track-title matching (LML#334).
-# The bidirectional substring gate loses on typographic noise that leaves token
-# content intact: a singular/plural typo ("tower of dub" vs "Towers Of Dub"), a
-# dropped interior word ("smells teen spirit" vs "Smells Like Teen Spirit"), or a
-# dash-vs-paren suffix ("de la soul - radio edit" vs "de la soul (radio edit)").
-# token_set_ratio is order- and stopword-tolerant. The threshold is stricter than
-# the artist-side 70 because track titles are short, so a single shared token can
-# score 50+; 85 lets the substitutions above through (each scores >= 96) while
-# rejecting one-shared-token adversarial near-misses ("towers of dub" vs "towers
-# of london" scores ~82). Mirrored in `discogs/cache_service.py` so cache hits and
-# misses agree on the verdict.
-_TRACK_TITLE_FUZZY_MATCH_THRESHOLD = 85
 
 
 def _approx_semaphore_queue_depth(semaphore: asyncio.Semaphore) -> int:
@@ -2085,11 +2068,7 @@ class DiscogsService:
             if release is None:
                 return False
 
-            track_lower = normalize_for_track_comparison(track)
-            artist_lower = normalize_artist_for_validation(artist)
-            return _scan_tracklist_for_match(
-                release, release_id, track, track_lower, artist, artist_lower
-            )
+            return _scan_tracklist_for_match(release, release_id, track, artist)
 
         cache = self.cache_service
         if cache is not None:
@@ -2181,7 +2160,7 @@ def _iter_title_matched_items(
             yield item
         elif (
             item_title
-            and fuzz.token_set_ratio(track_lower, item_title) >= _TRACK_TITLE_FUZZY_MATCH_THRESHOLD
+            and fuzz.token_set_ratio(track_lower, item_title) >= TRACK_TITLE_FUZZY_MATCH_THRESHOLD
         ):
             yield item
 
@@ -2190,58 +2169,27 @@ def _scan_tracklist_for_match(
     release: ReleaseMetadataResponse,
     release_id: int,
     track: str,
-    track_lower: str,
     artist: str,
-    artist_lower: str,
 ) -> bool:
     """Tracklist match logic extracted from ``validate_track_on_release``.
 
-    Kept as a module-level helper so ``validate_track_on_release``'s body
-    after the seam refactor reads as orchestration, not algorithm. Inputs
-    are pre-normalized by the caller (single call to
-    ``normalize_for_track_comparison`` / ``normalize_artist_for_validation``)
-    so the inner loop is hot-path arithmetic.
+    Thin wrapper (LML#1035) around the shared, pure/sync
+    :func:`discogs.matching.scan_tracklist_for_match` kernel: adapts
+    ``release.tracklist`` (parsed ``TrackItem`` models) into
+    :class:`~discogs.matching.TracklistEntry` rows and logs the verdict.
+    ``discogs/cache_service.py``'s ``validate_track_on_release`` calls the
+    same kernel over its own asyncpg-row adaptation, so the two paths can no
+    longer diverge on tuning.
     """
-    for item in _iter_title_matched_items(release, track_lower):
-        # Per-track credits first (compilations, or tracks crediting the
-        # writers/performers). A positive hit short-circuits.
-        if item.artists:
-            for track_artist in item.artists:
-                track_artist_lower = normalize_artist_for_validation(track_artist)
-                if artist_lower in track_artist_lower or track_artist_lower in artist_lower:
-                    logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")
-                    return True
-            # Fuzzy fallback: when no individual per-track artist substring-matches,
-            # compare against the joined credit string. Catches collaboration trios
-            # where each member is credited separately but the request uses the
-            # compact group name (LML#210).
-            joined = normalize_artist_for_validation(" ".join(item.artists))
-            if (
-                joined
-                and fuzz.token_set_ratio(artist_lower, joined) >= _ARTIST_FUZZY_MATCH_THRESHOLD
-            ):
-                logger.info(f"Validated (fuzzy): '{track}' by '{artist}' on release {release_id}")
-                return True
-
-        # Release-level artist. Always consulted when per-track credits
-        # haven't already matched — per-track credits often list band
-        # members / producers / writers rather than the band itself (e.g.,
-        # The Orb's "Towers Of Dub" on Live 93 is credited to Paterson /
-        # Weston / Fehlmann), so the release-level credit is the last
-        # word on "is this track by this artist."
-        release_artist = normalize_artist_for_validation(release.artist)
-        if release_artist and (artist_lower in release_artist or release_artist in artist_lower):
-            logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")
-            return True
-        if (
-            release_artist
-            and fuzz.token_set_ratio(artist_lower, release_artist) >= _ARTIST_FUZZY_MATCH_THRESHOLD
-        ):
-            logger.info(f"Validated (fuzzy): '{track}' by '{artist}' on release {release_id}")
-            return True
-
-    logger.info(f"Track '{track}' by '{artist}' NOT found on release {release_id}")
-    return False
+    entries = (
+        TracklistEntry(title=item.title, artists=item.artists) for item in release.tracklist or []
+    )
+    matched = scan_tracklist_for_match(entries, track, artist, release_artist=release.artist)
+    if matched:
+        logger.info(f"Validated: '{track}' by '{artist}' found on release {release_id}")
+    else:
+        logger.info(f"Track '{track}' by '{artist}' NOT found on release {release_id}")
+    return matched
 
 
 def _scan_tracklist_for_credit(release: ReleaseMetadataResponse, track_lower: str) -> str | None:
