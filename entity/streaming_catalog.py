@@ -75,9 +75,15 @@ promoted.
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
-from entity.ddl import build_widen_service_check_sql
+from entity.ddl import (
+    LmlCacheBootstrapStatement,
+    bootstrap_lml_cache_table,
+    build_widen_service_check_sql,
+)
 from entity.sources import PgSource
 
 # The services a catalog probe can target. The named CHECK pins this set at
@@ -693,9 +699,17 @@ _DDL_STATEMENTS = (
 #   auto-released at COMMIT/ROLLBACK. Advisory keys share one keyspace per
 #   database — record new discogs-cache advisory keys in discogs-etl's
 #   CLAUDE.md before allocating another.
+# LML#1038 PR-2: the lock_timeout + advisory-lock preamble text itself now
+# lives in ``entity.ddl.bootstrap_lml_cache_table``, which this module's
+# bootstrap calls with ``advisory_key=_BOOTSTRAP_ADVISORY_LOCK_KEY`` below --
+# only the key (a distinguishing value in the shared database-wide advisory
+# keyspace) is still this module's own. Kept, unlike
+# ``entity/streaming_url_cache.py``'s retired 886001: this bootstrap has a
+# genuine non-lifespan caller (``scripts/streaming_availability/
+# catalog_dao.py``), so ``main.py``'s session-scoped lock around every
+# lifespan-invoked bootstrap does not, by itself, serialize a concurrent
+# offline-DAO run against a live boot.
 _BOOTSTRAP_ADVISORY_LOCK_KEY = 842001
-_BOOTSTRAP_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '10s'"
-_BOOTSTRAP_ADVISORY_LOCK = f"SELECT pg_advisory_xact_lock({_BOOTSTRAP_ADVISORY_LOCK_KEY})"
 
 
 # Steady-state idempotency for the 5 functions + 8 triggers (LML#890): a
@@ -765,6 +779,39 @@ async def _trigger_definition_is_unchanged(conn, statement: str) -> bool:
     return _normalize_definition(live_def) == _normalize_definition(desired)
 
 
+def _skip_if_unchanged(statement: str) -> Callable[[Any], Awaitable[None]]:
+    """Wrap one ``CREATE OR REPLACE FUNCTION``/``TRIGGER`` statement so the
+    shared bootstrap helper skips the write when the live definition already
+    matches -- see ``_function_definition_is_unchanged`` /
+    ``_trigger_definition_is_unchanged`` above.
+    """
+
+    async def _run(conn: Any) -> None:
+        if statement.startswith("CREATE OR REPLACE FUNCTION"):
+            if await _function_definition_is_unchanged(conn, statement):
+                return
+        elif statement.startswith("CREATE OR REPLACE TRIGGER"):
+            if await _trigger_definition_is_unchanged(conn, statement):
+                return
+        await conn.execute(statement)
+
+    return _run
+
+
+# Every statement from ``_DDL_STATEMENTS`` (still the canonical ordered list
+# the sidecar generator and the parity tests read), wrapping each
+# CREATE-OR-REPLACE FUNCTION/TRIGGER in the skip-if-unchanged check. Every
+# other statement passes through as the same bare string ``_DDL_STATEMENTS``
+# already carries -- ``bootstrap_lml_cache_table`` executes a bare string
+# unconditionally and awaits a callable with the live connection.
+_DDL_BOOTSTRAP_STATEMENTS: tuple[LmlCacheBootstrapStatement, ...] = tuple(
+    _skip_if_unchanged(statement)
+    if statement.startswith(("CREATE OR REPLACE FUNCTION", "CREATE OR REPLACE TRIGGER"))
+    else statement
+    for statement in _DDL_STATEMENTS
+)
+
+
 async def set_up_streaming_catalog_schema(pg: PgSource) -> None:
     """Apply the idempotent streaming-catalog DDL (tables, indexes, guards).
 
@@ -773,28 +820,21 @@ async def set_up_streaming_catalog_schema(pg: PgSource) -> None:
     unreachable, the caller logs and continues) and, from PR B on, from the
     offline DAO's ``connect()`` — both call sites share this one bootstrap.
 
-    Runs as a single transaction on one pooled connection: every statement
+    Runs as a single transaction on one pooled connection
+    (``entity.ddl.bootstrap_lml_cache_table``, LML#1038 PR-2): every statement
     here is transactional DDL, so a mid-boot failure leaves either the whole
     catalog or none of it — never tables without their guard triggers. The
-    preamble bounds lock waits and serializes concurrent bootstraps (see the
-    constants above). The ``CREATE OR REPLACE`` function/trigger forms are the
-    idempotent equivalents of ``IF NOT EXISTS`` (which triggers don't
-    support); a function or trigger statement whose live definition already
-    matches is skipped entirely rather than replaced (see
-    ``_function_definition_is_unchanged`` / ``_trigger_definition_is_unchanged``
-    above) so a steady-state boot takes no lock for it. The service-CHECK
-    maintenance semantics (widen-only, steady-state no-op, foreign-form
-    warn-and-skip) are documented on ``_DDL_ALBUM_SERVICE_WIDEN_CHECK`` above.
+    preamble bounds lock waits and serializes concurrent bootstraps against
+    the non-lifespan offline-DAO caller (``advisory_key=
+    _BOOTSTRAP_ADVISORY_LOCK_KEY`` above). The ``CREATE OR REPLACE``
+    function/trigger forms are the idempotent equivalents of ``IF NOT
+    EXISTS`` (which triggers don't support); a function or trigger statement
+    whose live definition already matches is skipped entirely rather than
+    replaced (see ``_skip_if_unchanged`` above) so a steady-state boot takes
+    no lock for it. The service-CHECK maintenance semantics (widen-only,
+    steady-state no-op, foreign-form warn-and-skip) are documented on
+    ``_DDL_ALBUM_SERVICE_WIDEN_CHECK`` above.
     """
-    async with pg.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(_BOOTSTRAP_LOCK_TIMEOUT)
-            await conn.execute(_BOOTSTRAP_ADVISORY_LOCK)
-            for statement in _DDL_STATEMENTS:
-                if statement.startswith("CREATE OR REPLACE FUNCTION"):
-                    if await _function_definition_is_unchanged(conn, statement):
-                        continue
-                elif statement.startswith("CREATE OR REPLACE TRIGGER"):
-                    if await _trigger_definition_is_unchanged(conn, statement):
-                        continue
-                await conn.execute(statement)
+    await bootstrap_lml_cache_table(
+        pg, *_DDL_BOOTSTRAP_STATEMENTS, advisory_key=_BOOTSTRAP_ADVISORY_LOCK_KEY
+    )

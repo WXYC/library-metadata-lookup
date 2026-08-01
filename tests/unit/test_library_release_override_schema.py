@@ -18,7 +18,6 @@ against PostgreSQL.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -26,7 +25,6 @@ from entity.library_release_override import (
     _DDL_TABLE,
     set_up_library_release_override_schema,
 )
-from entity.sources import PgSource
 from tests.unit.conftest import extract_create_table as _extract_create_table
 from tests.unit.conftest import strip_sql_comments as _strip_sql_comments
 
@@ -80,46 +78,59 @@ class TestCanonicalDDLReference:
 
 @pytest.mark.asyncio
 class TestSetUpLibraryReleaseOverrideSchema:
-    """``set_up_library_release_override_schema`` runs exactly the idempotent DDL."""
+    """``set_up_library_release_override_schema`` runs exactly the idempotent DDL.
 
-    async def test_creates_schema_then_table(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+    LML#1038 PR-2: runs through ``entity.ddl.bootstrap_lml_cache_table`` --
+    one transaction on one acquired connection, behind a ``lock_timeout``
+    preamble. ``mock_pg_tx`` (``tests/unit/conftest.py``) is the shared fake
+    for this shape.
+    """
 
-        await set_up_library_release_override_schema(pg)
+    async def test_creates_schema_then_table(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
 
-        # Exactly two executes — schema then table. No mutation of existing rows
-        # (no UPDATE/DELETE/INSERT on bootstrap).
-        assert pg.execute.await_count == 2
-        schema_sql = pg.execute.await_args_list[0].args[0]
-        table_sql = pg.execute.await_args_list[1].args[0]
+        await set_up_library_release_override_schema(mock_pg_tx)
+
+        # [0] is the lock_timeout preamble; [1]/[2] are schema then table. No
+        # mutation of existing rows (no UPDATE/DELETE/INSERT on bootstrap).
+        assert conn.execute.await_count == 3
+        schema_sql = conn.execute.await_args_list[1].args[0]
+        table_sql = conn.execute.await_args_list[2].args[0]
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in schema_sql
         assert "CREATE TABLE IF NOT EXISTS lml_cache.library_release_override" in table_sql
         assert "PRIMARY KEY" in table_sql
         assert "CHECK (discogs_release_id > 0)" in table_sql
 
-    async def test_bootstrap_is_idempotent(self):
-        # Re-running the bootstrap issues the byte-identical DDL each time.
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+    async def test_runs_as_one_transaction_on_one_connection(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
 
-        await set_up_library_release_override_schema(pg)
-        first = [call.args[0] for call in pg.execute.await_args_list]
-        pg.execute.reset_mock()
-        await set_up_library_release_override_schema(pg)
-        second = [call.args[0] for call in pg.execute.await_args_list]
+        await set_up_library_release_override_schema(mock_pg_tx)
+
+        mock_pg_tx.acquire.assert_called_once()
+        conn.transaction.assert_called_once()
+        conn._mock_tx_ctx.__aenter__.assert_awaited_once()
+        conn._mock_tx_ctx.__aexit__.assert_awaited_once()
+
+    async def test_bootstrap_is_idempotent(self, mock_pg_tx):
+        # Re-running the bootstrap issues the byte-identical DDL each time.
+        conn = mock_pg_tx._mock_conn
+
+        await set_up_library_release_override_schema(mock_pg_tx)
+        first = [call.args[0] for call in conn.execute.await_args_list]
+        conn.execute.reset_mock()
+        await set_up_library_release_override_schema(mock_pg_tx)
+        second = [call.args[0] for call in conn.execute.await_args_list]
 
         assert first == second
 
-    async def test_bootstrap_does_not_mutate_rows(self):
+    async def test_bootstrap_does_not_mutate_rows(self, mock_pg_tx):
         # Regression guard: the bootstrap is pure DDL — never an INSERT/UPDATE/
         # DELETE that could touch seeded override rows on every boot.
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+        conn = mock_pg_tx._mock_conn
 
-        await set_up_library_release_override_schema(pg)
+        await set_up_library_release_override_schema(mock_pg_tx)
 
-        executed = [call.args[0] for call in pg.execute.await_args_list]
+        executed = [call.args[0] for call in conn.execute.await_args_list]
         assert not any("INSERT" in sql for sql in executed)
         assert not any("UPDATE" in sql for sql in executed)
         assert not any("DELETE" in sql for sql in executed)

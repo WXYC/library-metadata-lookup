@@ -36,12 +36,13 @@ lifespan; the DDL is ``IF NOT EXISTS`` so re-running on every boot is safe.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from wxyc_etl.text import to_match_form
 
 from entity.cache_toolkit import swallowing_execute, swallowing_fetch
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
-from entity.ddl import widen_service_check
+from entity.ddl import bootstrap_lml_cache_table, widen_service_check
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -118,16 +119,20 @@ async def set_up_track_streaming_url_cache_schema(pg: PgSource) -> None:
     Called once from ``main.py`` lifespan. Schema and table creation are both
     ``IF NOT EXISTS`` so re-running on every boot is safe. The final step
     widens the named CHECK to the current ``_SERVICES`` set so a prod table
-    frozen at an older service set still accepts a newly-added service.
+    frozen at an older service set still accepts a newly-added service. Runs
+    as one transaction behind a ``lock_timeout`` preamble
+    (``entity.ddl.bootstrap_lml_cache_table``, LML#1038 PR-2).
     """
-    await pg.execute(_DDL_SCHEMA)
-    await pg.execute(_DDL_TABLE)
-    await widen_service_check(
-        pg,
-        table=_WIDEN_CHECK_TABLE,
-        constraint=_WIDEN_CHECK_CONSTRAINT,
-        services=_SERVICES,
-    )
+
+    async def _widen(conn: Any) -> None:
+        await widen_service_check(
+            conn,
+            table=_WIDEN_CHECK_TABLE,
+            constraint=_WIDEN_CHECK_CONSTRAINT,
+            services=_SERVICES,
+        )
+
+    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE, _widen)
 
 
 def _album_key(album: str | None) -> str:

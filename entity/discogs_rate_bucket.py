@@ -42,8 +42,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
+from entity.ddl import bootstrap_lml_cache_table
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -149,11 +151,17 @@ async def set_up_discogs_rate_bucket_schema(
     safe and a second process with a different ``capacity``/``refill_per_sec``
     does not clobber the shared budget. If the discogs-cache PG is unreachable
     at startup the caller logs and continues; the gate degrades to the local
-    limiter (flag OFF or fail-open) until the next boot.
+    limiter (flag OFF or fail-open) until the next boot. Runs as one
+    transaction behind a ``lock_timeout`` preamble
+    (``entity.ddl.bootstrap_lml_cache_table``, LML#1038 PR-2); the seed is a
+    callable statement since it binds parameters rather than executing a bare
+    string.
     """
-    await pg.execute(_DDL_SCHEMA)
-    await pg.execute(_DDL_TABLE)
-    await pg.execute(_SEED_SQL, bucket_key, capacity, refill_per_sec)
+
+    async def _seed(conn: Any) -> None:
+        await conn.execute(_SEED_SQL, bucket_key, capacity, refill_per_sec)
+
+    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE, _seed)
 
 
 class PgTokenBucket:

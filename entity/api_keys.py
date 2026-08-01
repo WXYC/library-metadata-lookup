@@ -35,6 +35,7 @@ from typing import Any
 
 from entity.cache_toolkit import swallowing_execute
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
+from entity.ddl import bootstrap_lml_cache_table
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -93,10 +94,12 @@ async def set_up_api_keys_schema(pg: PgSource) -> None:
     Called once from ``main.py`` lifespan as one more ``bootstraps`` tuple
     entry, same best-effort posture as the other ``lml_cache.*`` bootstraps:
     schema and table creation are both ``IF NOT EXISTS``, so re-running on
-    every boot is safe.
+    every boot is safe. Runs as one transaction behind a ``lock_timeout``
+    preamble (``entity.ddl.bootstrap_lml_cache_table``, LML#1038 PR-2) so a
+    mid-boot failure can never leave the schema created but the table
+    missing.
     """
-    await pg.execute(_DDL_SCHEMA)
-    await pg.execute(_DDL_TABLE)
+    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE)
 
 
 async def fetch_active_keys(pg: PgSource) -> list[dict[str, Any]]:

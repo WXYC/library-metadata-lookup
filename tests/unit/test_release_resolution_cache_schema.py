@@ -20,7 +20,6 @@ drives the real DDL and TTL math against PostgreSQL.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -28,7 +27,6 @@ from entity.release_resolution_cache import (
     _DDL_TABLE,
     set_up_release_resolution_cache_schema,
 )
-from entity.sources import PgSource
 from tests.unit.conftest import extract_create_table as _extract_create_table
 from tests.unit.conftest import strip_sql_comments as _strip_sql_comments
 
@@ -81,21 +79,27 @@ class TestCanonicalDDLReference:
 
 @pytest.mark.asyncio
 class TestSetUpReleaseResolutionCacheSchema:
-    """``set_up_release_resolution_cache_schema`` runs exactly the idempotent DDL."""
+    """``set_up_release_resolution_cache_schema`` runs exactly the idempotent DDL.
 
-    async def test_creates_schema_then_table_then_alters(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+    LML#1038 PR-2: runs through ``entity.ddl.bootstrap_lml_cache_table`` --
+    one transaction on one acquired connection, behind a ``lock_timeout``
+    preamble. ``mock_pg_tx`` (``tests/unit/conftest.py``) is the shared fake
+    for this shape.
+    """
 
-        await set_up_release_resolution_cache_schema(pg)
+    async def test_creates_schema_then_table_then_alters(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
 
-        # Three executes — schema, then table, then the additive crowd_out column
-        # ALTER (LML#824) that upgrades a pre-existing prod table in place (the
-        # CREATE TABLE IF NOT EXISTS above is a no-op there). All idempotent.
-        assert pg.execute.await_count == 3
-        schema_sql = pg.execute.await_args_list[0].args[0]
-        table_sql = pg.execute.await_args_list[1].args[0]
-        alter_sql = pg.execute.await_args_list[2].args[0]
+        await set_up_release_resolution_cache_schema(mock_pg_tx)
+
+        # [0] is the lock_timeout preamble; [1]-[3] are schema, table, then
+        # the additive crowd_out column ALTER (LML#824) that upgrades a
+        # pre-existing prod table in place (the CREATE TABLE IF NOT EXISTS
+        # above is a no-op there). All idempotent.
+        assert conn.execute.await_count == 4
+        schema_sql = conn.execute.await_args_list[1].args[0]
+        table_sql = conn.execute.await_args_list[2].args[0]
+        alter_sql = conn.execute.await_args_list[3].args[0]
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in schema_sql
         assert "CREATE TABLE IF NOT EXISTS lml_cache.release_resolution_cache" in table_sql
         assert "CONSTRAINT release_id_validity CHECK" in table_sql
@@ -103,14 +107,24 @@ class TestSetUpReleaseResolutionCacheSchema:
         assert "ALTER TABLE lml_cache.release_resolution_cache" in alter_sql
         assert "ADD COLUMN IF NOT EXISTS crowd_out BOOLEAN NOT NULL DEFAULT false" in alter_sql
 
-    async def test_does_not_read_or_backfill(self):
+    async def test_runs_as_one_transaction_on_one_connection(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
+
+        await set_up_release_resolution_cache_schema(mock_pg_tx)
+
+        mock_pg_tx.acquire.assert_called_once()
+        conn.transaction.assert_called_once()
+        conn._mock_tx_ctx.__aenter__.assert_awaited_once()
+        conn._mock_tx_ctx.__aexit__.assert_awaited_once()
+
+    async def test_does_not_read_or_backfill(self, mock_pg_tx):
         # The bootstrap is pure DDL: no probe, no data INSERT. The crowd_out
         # ALTER (LML#824) is an idempotent DDL column add, not a row backfill.
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+        conn = mock_pg_tx._mock_conn
 
-        await set_up_release_resolution_cache_schema(pg)
+        await set_up_release_resolution_cache_schema(mock_pg_tx)
 
-        pg.fetchone.assert_not_awaited()
-        executed = [call.args[0] for call in pg.execute.await_args_list]
+        mock_pg_tx.fetchone.assert_not_awaited()
+        conn.fetchrow.assert_not_awaited()
+        executed = [call.args[0] for call in conn.execute.await_args_list]
         assert not any("INSERT" in sql for sql in executed)

@@ -76,6 +76,7 @@ from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute, swallowing_fetch
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
+from entity.ddl import bootstrap_lml_cache_table
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -243,10 +244,10 @@ async def set_up_release_resolution_cache_schema(pg: PgSource) -> None:
     upgrades a table created before that column existed: ``CREATE TABLE IF NOT
     EXISTS`` cannot add a column to an already-present table, so prod needs the
     idempotent ALTER to gain the marker. It's a no-op once the column exists.
+    Runs as one transaction behind a ``lock_timeout`` preamble
+    (``entity.ddl.bootstrap_lml_cache_table``, LML#1038 PR-2).
     """
-    await pg.execute(_DDL_SCHEMA)
-    await pg.execute(_DDL_TABLE)
-    await pg.execute(_DDL_ADD_CROWD_OUT_COLUMN)
+    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE, _DDL_ADD_CROWD_OUT_COLUMN)
 
 
 async def get_cached_release_id(

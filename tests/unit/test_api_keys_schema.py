@@ -16,12 +16,10 @@ against PostgreSQL.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
 from entity.api_keys import set_up_api_keys_schema
-from entity.sources import PgSource
 
 _SQL_REFERENCE = Path(__file__).resolve().parent.parent.parent / "entity" / "api_keys.sql"
 
@@ -107,15 +105,21 @@ class TestCanonicalDDLMatchesRuntime:
 
 @pytest.mark.asyncio
 class TestSetUpApiKeysSchema:
-    async def test_creates_schema_then_table(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+    """LML#1038 PR-2: runs through ``entity.ddl.bootstrap_lml_cache_table`` --
+    one transaction on one acquired connection, behind a ``lock_timeout``
+    preamble. ``mock_pg_tx`` (``tests/unit/conftest.py``) is the shared fake
+    for this shape, reused across every ``lml_cache.*`` bootstrap test.
+    """
 
-        await set_up_api_keys_schema(pg)
+    async def test_creates_schema_then_table(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
 
-        assert pg.execute.await_count == 2
-        schema_sql = pg.execute.await_args_list[0].args[0]
-        table_sql = pg.execute.await_args_list[1].args[0]
+        await set_up_api_keys_schema(mock_pg_tx)
+
+        # [0] is the lock_timeout preamble; [1]/[2] are schema then table.
+        assert conn.execute.await_count == 3
+        schema_sql = conn.execute.await_args_list[1].args[0]
+        table_sql = conn.execute.await_args_list[2].args[0]
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in schema_sql
         assert "CREATE TABLE IF NOT EXISTS lml_cache.api_keys" in table_sql
         assert "key_hash TEXT NOT NULL UNIQUE" in table_sql
@@ -124,24 +128,32 @@ class TestSetUpApiKeysSchema:
         assert "UNIQUE(caller_name)" not in table_sql
         assert "UNIQUE (caller_name)" not in table_sql
 
-    async def test_bootstrap_is_idempotent(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+    async def test_runs_as_one_transaction_on_one_connection(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
 
-        await set_up_api_keys_schema(pg)
-        first = [call.args[0] for call in pg.execute.await_args_list]
-        pg.execute.reset_mock()
-        await set_up_api_keys_schema(pg)
-        second = [call.args[0] for call in pg.execute.await_args_list]
+        await set_up_api_keys_schema(mock_pg_tx)
+
+        mock_pg_tx.acquire.assert_called_once()
+        conn.transaction.assert_called_once()
+        conn._mock_tx_ctx.__aenter__.assert_awaited_once()
+        conn._mock_tx_ctx.__aexit__.assert_awaited_once()
+
+    async def test_bootstrap_is_idempotent(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
+
+        await set_up_api_keys_schema(mock_pg_tx)
+        first = [call.args[0] for call in conn.execute.await_args_list]
+        conn.execute.reset_mock()
+        await set_up_api_keys_schema(mock_pg_tx)
+        second = [call.args[0] for call in conn.execute.await_args_list]
 
         assert first == second
 
-    async def test_does_not_touch_other_lml_cache_tables(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+    async def test_does_not_touch_other_lml_cache_tables(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
 
-        await set_up_api_keys_schema(pg)
+        await set_up_api_keys_schema(mock_pg_tx)
 
-        executed = [call.args[0] for call in pg.execute.await_args_list]
+        executed = [call.args[0] for call in conn.execute.await_args_list]
         assert not any("streaming_url_cache" in sql for sql in executed)
         assert not any("discogs_rate_bucket" in sql for sql in executed)

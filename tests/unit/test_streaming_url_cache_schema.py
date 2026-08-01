@@ -31,11 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from entity.streaming_url_cache import (
-    _BOOTSTRAP_ADVISORY_LOCK,
-    _BOOTSTRAP_LOCK_TIMEOUT,
-    set_up_streaming_url_cache_schema,
-)
+from entity.streaming_url_cache import set_up_streaming_url_cache_schema
 
 
 class _FakeTransaction:
@@ -144,10 +140,12 @@ class TestSetUpStreamingUrlCacheSchema:
 
         await set_up_streaming_url_cache_schema(pg)
 
-        # Two-statement preamble, then schema, table, then the widen-only DO
-        # block (so a pre-existing prod table picks up new service values
-        # that CREATE TABLE IF NOT EXISTS cannot add). No backfill.
-        ddl = pg.statements[2:]
+        # One-statement lock_timeout preamble (LML#1038 PR-2 dropped the
+        # inner advisory lock -- see the module docstring), then schema,
+        # table, then the widen-only DO block (so a pre-existing prod table
+        # picks up new service values that CREATE TABLE IF NOT EXISTS cannot
+        # add). No backfill.
+        ddl = pg.statements[1:]
         assert len(ddl) == 3
         schema_sql, table_sql, widen_sql = ddl
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in schema_sql
@@ -218,10 +216,21 @@ class TestSetUpStreamingUrlCacheSchema:
         assert pg.in_transaction is False
         assert all(in_txn for _, in_txn in pg.executed)
 
-    async def test_preamble_bounds_lock_waits_and_serializes_boots(self):
+    async def test_preamble_bounds_lock_waits(self):
         pg = _FakePgSource()
 
         await set_up_streaming_url_cache_schema(pg)
 
-        assert pg.statements[0] == _BOOTSTRAP_LOCK_TIMEOUT
-        assert pg.statements[1] == _BOOTSTRAP_ADVISORY_LOCK
+        assert pg.statements[0] == "SET LOCAL lock_timeout = '10s'"
+
+    async def test_no_inner_advisory_lock(self):
+        # LML#1038 PR-2: every caller of this bootstrap goes through
+        # main.py's lifespan, which already wraps every bootstrap call in
+        # one session-scoped advisory lock -- an inner xact lock here (the
+        # pre-PR-2 posture, key 886001) serialized nothing an outer caller
+        # wasn't already serializing. See the module docstring.
+        pg = _FakePgSource()
+
+        await set_up_streaming_url_cache_schema(pg)
+
+        assert not any("pg_advisory" in sql for sql in pg.statements)
