@@ -326,3 +326,22 @@ uv run python -m scripts.resolve_apple_urls \
 ```
 
 The emitted `apple_urls.tsv` is applied back via the Backend-Service fill-only write (SELECT-before / count-after; never overwrites a non-null URL).
+
+## YouTube Music Coverage Drain (`scripts/ytm_coverage_drain.py`)
+
+Resolves verified `music.youtube.com/browse/<browseId>` album links for a set of canonical `(artist, title)` candidates (epic [LML#830](https://github.com/WXYC/library-metadata-lookup/issues/830), impl [LML#1056](https://github.com/WXYC/library-metadata-lookup/issues/1056); GO from the [#833](https://github.com/WXYC/library-metadata-lookup/issues/833) spike). Uses `YouTubeMusicClient` (`clients/streaming/youtube_music.py`) — unauthenticated `ytmusicapi` album search, scored through the shared production matcher (`find_best_source_match`, 80/80 floor). Per-candidate exceptions are isolated (a malformed search becomes a miss, never aborts the run).
+
+**Write path — Option A.** Persistence is fill-only into `streaming_availability.db` (`ResultsDB.update_youtube_music_url`, `WHERE youtube_music_url IS NULL`). The rest of the chain already exists: `scripts/export_streaming_links.py` carries `albums.youtube_music_url` into `library.db.streaming_links` and `/lookup` surfaces it — this drain is the producer. Each match maps back to its `albums` row by normalized `(artist, title)` (`get_album_id_by_names`, same normalizer as the dedup pipeline), so there is no drift; unmatched candidates are tallied and skipped, never wrong-written.
+
+`ytmusicapi` is the optional `drain` extra (not a runtime dep; lazy import) — run under `--extra drain`. `--execute` is opt-in; the default is dry-run (writes nothing). Persisting is the operator's action (off-peak, fill-only, one bulk consumer at a time), followed by a `POST /admin/upload-streaming-db` republish.
+
+```bash
+# dry-run: resolve + coverage report (count, hit rate, sample matches/misses)
+uv run --extra drain python -m scripts.ytm_coverage_drain \
+  --sample-csv resolved_names.csv --limit 200 --concurrency 4 \
+  --report-json /tmp/ytm_drain_report.json
+
+# persist (opt-in, fill-only) into the streaming_availability store
+uv run --extra drain python -m scripts.ytm_coverage_drain \
+  --sample-csv resolved_names.csv --execute --results-db streaming_availability.db
+```
