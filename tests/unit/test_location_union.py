@@ -87,7 +87,7 @@ class TestShouldRunLocationUnion:
 
 
 @pytest.mark.asyncio
-class TestResolveAlsoAvailableOn:
+class TestResolveTrackShelfLocations:
     async def test_no_pg_returns_empty(self):
         parsed = ParsedRequest(artist="Brian Reitzell", song="Ikebana")
         db = AsyncMock()

@@ -1591,8 +1591,8 @@ class TestPerformLookupLocationUnion:
         """Server-side kill switch off: no location rows are ever appended,
         for any caller -- an incident can be mitigated with a Railway var
         flip, no client deploy. Asserted on the result-row count (D3 removed
-        the separate field itself, so there is no `also_available_on is None`
-        to assert on anymore)."""
+        the separate response field itself, so there is no removed-field
+        attribute left to assert `is None` on)."""
         from config.settings import get_settings
 
         monkeypatch.setenv("LML_LOCATION_UNION_ENABLED", "false")

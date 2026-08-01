@@ -66,7 +66,7 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/matching.py": 550,
     "lookup/models.py": 150,
     # Recalibrated 2026-07-31 (transparent-fold plan, supersedes the 2026-07-30
-    # LML#1022 calibration): the separate-field design's `also_available_on`
+    # LML#1022 calibration): the separate-field design's response-array
     # threading collapsed into an ordinary `results` fold, but the fold itself
     # grew the spine — the append site moved from right after step 3 to after
     # `_step_external_cache_fallback` (Step 7), five degraded/shed early
