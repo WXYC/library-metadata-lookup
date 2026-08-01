@@ -56,14 +56,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from wxyc_etl.text import to_match_form
 
 from clients.streaming.base import BaseStreamingClient
 from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute, swallowing_fetch
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
-from entity.ddl import widen_service_check
+from entity.ddl import bootstrap_lml_cache_table, widen_service_check
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -115,20 +115,6 @@ CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
 _WIDEN_CHECK_TABLE = "album_streaming_url_cache"
 _WIDEN_CHECK_CONSTRAINT = "album_streaming_url_cache_service_valid"
 
-# Bootstrap preamble, run inside the single wrapping transaction:
-#
-# - ``lock_timeout`` bounds how long boot DDL waits behind a conflicting lock
-#   instead of queueing indefinitely and stalling the lifespan.
-# - ``pg_advisory_xact_lock`` serializes concurrent bootstraps so two
-#   simultaneous boots can't interleave the widen block's deparse/rewrite
-#   steps. Key 886001 = LML#886; arbitrary but stable, auto-released at
-#   COMMIT/ROLLBACK. Advisory keys share one keyspace per database — record
-#   new discogs-cache advisory keys in discogs-etl's CLAUDE.md before
-#   allocating another (842001 is ``entity/streaming_catalog.py``'s).
-_BOOTSTRAP_ADVISORY_LOCK_KEY = 886001
-_BOOTSTRAP_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '10s'"
-_BOOTSTRAP_ADVISORY_LOCK = f"SELECT pg_advisory_xact_lock({_BOOTSTRAP_ADVISORY_LOCK_KEY})"
-
 # Staleness lives in the WHERE clause (LML#576). ``$1`` is the service key,
 # ``$4`` the lower bound on ``last_checked_at`` for a "fresh" known miss
 # (typically ``now - miss_ttl``). A hit (url not null) is always returned; a
@@ -165,11 +151,17 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
     caller logs and continues; the cache layer degrades to a no-op until the
     next deploy.
 
-    Runs as a single transaction on one pooled connection, behind the
-    ``lock_timeout`` + advisory-lock preamble (ported from
-    ``entity/streaming_catalog.py``'s bootstrap convention, LML#886): the rare
-    widen-block rewrite (DROP + ADD) is otherwise non-atomic, and two
-    concurrent boots could interleave its deparse/rewrite steps.
+    Runs as a single transaction on one pooled connection, behind a
+    ``lock_timeout`` preamble (``entity.ddl.bootstrap_lml_cache_table``,
+    LML#1038 PR-2): the rare widen-block rewrite (DROP + ADD) is otherwise
+    non-atomic. No advisory key -- unlike ``entity/streaming_catalog.py``,
+    every caller of this bootstrap goes through ``main.py``'s lifespan
+    (there is no standalone-script call site), and that lifespan already
+    wraps every bootstrap call in one session-scoped advisory lock
+    (``_LML_CACHE_BOOTSTRAP_ADVISORY_LOCK_KEY``) before this function ever
+    runs, so a second, inner xact lock here (the pre-PR-2 posture, key
+    886001, retired) serialized nothing an outer caller wasn't already
+    serializing.
 
     The final step widens the named CHECK constraint to the current
     ``_SERVICES`` set, merging rather than narrowing (see
@@ -178,18 +170,16 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
     without it a prod table frozen at an older service set would reject
     UPSERTs for a newly-added service.
     """
-    async with pg.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(_BOOTSTRAP_LOCK_TIMEOUT)
-            await conn.execute(_BOOTSTRAP_ADVISORY_LOCK)
-            await conn.execute(_DDL_SCHEMA)
-            await conn.execute(_DDL_TABLE)
-            await widen_service_check(
-                conn,
-                table=_WIDEN_CHECK_TABLE,
-                constraint=_WIDEN_CHECK_CONSTRAINT,
-                services=_SERVICES,
-            )
+
+    async def _widen(conn: Any) -> None:
+        await widen_service_check(
+            conn,
+            table=_WIDEN_CHECK_TABLE,
+            constraint=_WIDEN_CHECK_CONSTRAINT,
+            services=_SERVICES,
+        )
+
+    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE, _widen)
 
 
 async def get_cached_streaming_url(

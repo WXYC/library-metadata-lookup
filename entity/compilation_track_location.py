@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from wxyc_etl.text import to_match_form
 
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
+from entity.ddl import bootstrap_lml_cache_table
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -98,11 +99,15 @@ async def set_up_compilation_track_location_schema(pg: PgSource) -> None:
     process works against a bare discogs-cache PG with no LML deploy behind
     it). Schema, table, and index creation are all ``IF NOT EXISTS`` /
     idempotent, so re-running on every boot -- or every build-script
-    invocation -- is safe and never mutates a populated row.
+    invocation -- is safe and never mutates a populated row. Runs as one
+    transaction behind a ``lock_timeout`` preamble
+    (``entity.ddl.bootstrap_lml_cache_table``, LML#1038 PR-2); no advisory
+    key here -- unlike ``entity/streaming_catalog.py``, this table had no
+    inner advisory lock before PR-2, and its DDL is entirely ``IF NOT
+    EXISTS`` with no seeded-row ordering concern between the two call
+    sites, so PR-2 does not introduce a new one.
     """
-    await pg.execute(_DDL_SCHEMA)
-    await pg.execute(_DDL_TABLE)
-    await pg.execute(_DDL_INDEX)
+    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE, _DDL_INDEX)
 
 
 @dataclass(frozen=True)

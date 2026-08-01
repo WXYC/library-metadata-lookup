@@ -17,11 +17,17 @@ store modules:
 from __future__ import annotations
 
 import re
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
 
-from entity.ddl import LML_CACHE_SCHEMA_DDL, build_widen_service_check_sql, widen_service_check
+from entity.ddl import (
+    LML_CACHE_SCHEMA_DDL,
+    bootstrap_lml_cache_table,
+    build_widen_service_check_sql,
+    widen_service_check,
+)
 
 
 class TestLmlCacheSchemaDdl:
@@ -147,3 +153,153 @@ class TestWidenServiceCheck:
 
         assert len(conn.calls) == 1
         assert "lml_cache.track_streaming_url_cache" in conn.calls[0]
+
+
+class _FakeTransaction:
+    def __init__(self, source: _FakePgSource) -> None:
+        self._source = source
+
+    async def __aenter__(self) -> _FakeTransaction:
+        self._source.transaction_starts += 1
+        self._source.in_transaction = True
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self._source.transaction_ends += 1
+        self._source.in_transaction = False
+
+
+class _FakeConnection:
+    def __init__(self, source: _FakePgSource) -> None:
+        self._source = source
+
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction(self._source)
+
+    async def execute(self, sql: str, *args: object) -> str:
+        self._source.executed.append((sql, self._source.in_transaction))
+        return "CREATE"
+
+
+class _FakePgSource:
+    """Records every statement issued and whether it ran inside the wrapping
+    transaction. Mirrors ``test_streaming_url_cache_schema.py``'s fake so a
+    reader who has seen one recognizes the other -- deliberately defines only
+    ``acquire``; any pool-level ``execute``/``fetchone`` call is an
+    ``AttributeError``, doubling as a not-pool-level-called assertion."""
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, bool]] = []
+        self.acquire_count = 0
+        self.transaction_starts = 0
+        self.transaction_ends = 0
+        self.in_transaction = False
+
+    @property
+    def statements(self) -> list[str]:
+        return [sql for sql, _ in self.executed]
+
+    @asynccontextmanager
+    async def acquire(self):
+        self.acquire_count += 1
+        yield _FakeConnection(self)
+
+
+@pytest.mark.asyncio
+class TestBootstrapLmlCacheTable:
+    """PR-2: the shared transactional posture for every ``lml_cache.*`` bootstrap.
+
+    Gives all 8 bootstraps (only 2 have it today: ``streaming_url_cache.py``,
+    ``streaming_catalog.py``) one transaction on one connection behind a
+    ``SET LOCAL lock_timeout`` preamble, plus an opt-in
+    ``pg_advisory_xact_lock`` for the (now rare) bootstrap invoked from
+    somewhere other than ``main.py``'s lifespan -- see the PR-2 body for the
+    per-table advisory-key decision.
+    """
+
+    async def test_runs_every_statement_inside_one_transaction(self):
+        pg = _FakePgSource()
+
+        await bootstrap_lml_cache_table(
+            pg, "CREATE SCHEMA IF NOT EXISTS lml_cache", "CREATE TABLE t ()"
+        )
+
+        assert pg.acquire_count == 1
+        assert pg.transaction_starts == 1
+        assert pg.transaction_ends == 1
+        assert pg.in_transaction is False
+        assert all(in_txn for _, in_txn in pg.executed[1:])  # [0] is the lock_timeout preamble
+
+    async def test_issues_the_lock_timeout_preamble_first(self):
+        pg = _FakePgSource()
+
+        await bootstrap_lml_cache_table(pg, "CREATE SCHEMA IF NOT EXISTS lml_cache")
+
+        assert pg.statements[0] == "SET LOCAL lock_timeout = '10s'"
+
+    async def test_statements_run_in_order_after_the_preamble(self):
+        pg = _FakePgSource()
+
+        await bootstrap_lml_cache_table(pg, "STATEMENT A", "STATEMENT B", "STATEMENT C")
+
+        assert pg.statements[1:] == ["STATEMENT A", "STATEMENT B", "STATEMENT C"]
+
+    async def test_no_advisory_lock_by_default(self):
+        pg = _FakePgSource()
+
+        await bootstrap_lml_cache_table(pg, "CREATE SCHEMA IF NOT EXISTS lml_cache")
+
+        assert not any("pg_advisory" in sql for sql in pg.statements)
+
+    async def test_advisory_key_issues_the_xact_lock_right_after_the_preamble(self):
+        pg = _FakePgSource()
+
+        await bootstrap_lml_cache_table(pg, "CREATE TABLE t ()", advisory_key=123456)
+
+        assert pg.statements[0] == "SET LOCAL lock_timeout = '10s'"
+        assert pg.statements[1] == "SELECT pg_advisory_xact_lock(123456)"
+        assert pg.statements[2] == "CREATE TABLE t ()"
+
+    async def test_accepts_a_callable_statement_for_custom_per_statement_logic(self):
+        # entity/streaming_catalog.py's CREATE-OR-REPLACE-skip-if-unchanged
+        # functions/triggers, and every widen_service_check call site, need
+        # more than "execute this literal string" -- a callable receives the
+        # live connection and decides for itself.
+        pg = _FakePgSource()
+        calls: list[str] = []
+
+        async def _custom(conn: object) -> None:
+            calls.append("ran")
+            await conn.execute("CUSTOM STATEMENT")  # type: ignore[attr-defined]
+
+        await bootstrap_lml_cache_table(pg, "CREATE SCHEMA IF NOT EXISTS lml_cache", _custom)
+
+        assert calls == ["ran"]
+        assert pg.statements[2:] == ["CUSTOM STATEMENT"]
+
+    async def test_widen_service_check_composes_as_a_callable_statement(self):
+        pg = _FakePgSource()
+
+        await bootstrap_lml_cache_table(
+            pg,
+            "CREATE SCHEMA IF NOT EXISTS lml_cache",
+            "CREATE TABLE lml_cache.t (service TEXT)",
+            lambda conn: widen_service_check(
+                conn, table="t", constraint="t_service_valid", services=("a",)
+            ),
+        )
+
+        assert pg.statements[-1].startswith("DO $")
+        assert "t_service_valid" in pg.statements[-1]
+
+    async def test_mid_boot_failure_propagates_and_closes_the_transaction(self):
+        pg = _FakePgSource()
+
+        async def _boom(conn: object) -> None:
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await bootstrap_lml_cache_table(pg, "CREATE SCHEMA IF NOT EXISTS lml_cache", _boom)
+
+        assert pg.transaction_starts == 1
+        assert pg.transaction_ends == 1  # __aexit__ still runs (rollback), even on raise

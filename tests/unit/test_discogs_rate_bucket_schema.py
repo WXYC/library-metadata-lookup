@@ -20,12 +20,10 @@ real DDL (and the atomic-acquire semantics) against PostgreSQL.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
 from entity.discogs_rate_bucket import _DDL_TABLE, set_up_discogs_rate_bucket_schema
-from entity.sources import PgSource
 from tests.unit.conftest import extract_create_table as _extract_create_table
 from tests.unit.conftest import strip_sql_comments as _strip_sql_comments
 
@@ -72,61 +70,77 @@ class TestCanonicalDDLReference:
 
 @pytest.mark.asyncio
 class TestSetUpDiscogsRateBucketSchema:
-    """``set_up_discogs_rate_bucket_schema`` runs exactly the idempotent DDL + seed."""
+    """``set_up_discogs_rate_bucket_schema`` runs exactly the idempotent DDL + seed.
 
-    async def test_creates_schema_table_then_seeds(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+    LML#1038 PR-2: runs through ``entity.ddl.bootstrap_lml_cache_table`` --
+    one transaction on one acquired connection, behind a ``lock_timeout``
+    preamble. ``mock_pg_tx`` (``tests/unit/conftest.py``) is the shared fake
+    for this shape. The seed is a callable statement (it binds parameters
+    rather than executing a bare string).
+    """
+
+    async def test_creates_schema_table_then_seeds(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
 
         await set_up_discogs_rate_bucket_schema(
-            pg, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
+            mock_pg_tx, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
         )
 
-        assert pg.execute.await_count == 3
-        schema_sql = pg.execute.await_args_list[0].args[0]
-        table_sql = pg.execute.await_args_list[1].args[0]
-        seed_sql = pg.execute.await_args_list[2].args[0]
+        # [0] is the lock_timeout preamble.
+        assert conn.execute.await_count == 4
+        schema_sql = conn.execute.await_args_list[1].args[0]
+        table_sql = conn.execute.await_args_list[2].args[0]
+        seed_sql = conn.execute.await_args_list[3].args[0]
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in schema_sql
         assert "CREATE TABLE IF NOT EXISTS lml_cache.discogs_rate_bucket" in table_sql
         assert "bucket_key TEXT PRIMARY KEY" in table_sql
         assert "INSERT INTO lml_cache.discogs_rate_bucket" in seed_sql
         assert "ON CONFLICT (bucket_key) DO NOTHING" in seed_sql
 
-    async def test_seed_binds_the_given_bucket_key_and_capacity(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+    async def test_runs_as_one_transaction_on_one_connection(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
 
         await set_up_discogs_rate_bucket_schema(
-            pg, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
+            mock_pg_tx, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
         )
 
-        seed_args = pg.execute.await_args_list[2].args
+        mock_pg_tx.acquire.assert_called_once()
+        conn.transaction.assert_called_once()
+        conn._mock_tx_ctx.__aenter__.assert_awaited_once()
+        conn._mock_tx_ctx.__aexit__.assert_awaited_once()
+
+    async def test_seed_binds_the_given_bucket_key_and_capacity(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
+
+        await set_up_discogs_rate_bucket_schema(
+            mock_pg_tx, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
+        )
+
+        seed_args = conn.execute.await_args_list[3].args
         assert seed_args[1:] == ("discogs", 50, 50 / 60)
 
-    async def test_bootstrap_is_idempotent(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+    async def test_bootstrap_is_idempotent(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
 
         await set_up_discogs_rate_bucket_schema(
-            pg, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
+            mock_pg_tx, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
         )
-        first = [call.args for call in pg.execute.await_args_list]
-        pg.execute.reset_mock()
+        first = [call.args for call in conn.execute.await_args_list]
+        conn.execute.reset_mock()
         await set_up_discogs_rate_bucket_schema(
-            pg, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
+            mock_pg_tx, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
         )
-        second = [call.args for call in pg.execute.await_args_list]
+        second = [call.args for call in conn.execute.await_args_list]
 
         assert first == second
 
-    async def test_does_not_touch_other_lml_cache_tables(self):
-        pg = AsyncMock(spec=PgSource)
-        pg.execute = AsyncMock(return_value="CREATE")
+    async def test_does_not_touch_other_lml_cache_tables(self, mock_pg_tx):
+        conn = mock_pg_tx._mock_conn
 
         await set_up_discogs_rate_bucket_schema(
-            pg, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
+            mock_pg_tx, bucket_key="discogs", capacity=50, refill_per_sec=50 / 60
         )
 
-        executed = [call.args[0] for call in pg.execute.await_args_list]
+        executed = [call.args[0] for call in conn.execute.await_args_list]
         assert not any("streaming_url_cache" in sql for sql in executed)
         assert not any("api_keys" in sql for sql in executed)

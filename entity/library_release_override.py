@@ -37,6 +37,7 @@ import logging
 
 from entity.cache_toolkit import swallowing_fetch
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
+from entity.ddl import bootstrap_lml_cache_table
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -74,10 +75,11 @@ async def set_up_library_release_override_schema(pg: PgSource) -> None:
     ``IF NOT EXISTS`` so re-running on every boot is safe and never mutates a
     seeded row. If the discogs-cache PG is unreachable at startup the caller
     logs and continues; the read helper degrades to an empty map, so /lookup
-    falls through to the pre-override fuzzy pick.
+    falls through to the pre-override fuzzy pick. Runs as one transaction
+    behind a ``lock_timeout`` preamble
+    (``entity.ddl.bootstrap_lml_cache_table``, LML#1038 PR-2).
     """
-    await pg.execute(_DDL_SCHEMA)
-    await pg.execute(_DDL_TABLE)
+    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE)
 
 
 async def get_library_release_overrides(pg: PgSource, library_ids: list[int]) -> dict[int, int]:

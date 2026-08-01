@@ -22,18 +22,25 @@ is the single home for both:
   and a warn-instead-of-clobber policy for a foreign-form constraint), not a
   behavior-preserving rename -- see LML#1038's PR body for the callout.
 
-Bootstrap *orchestration* (the transactional + ``lock_timeout`` posture, and
-the advisory-lock story) is deliberately NOT here -- this module stays
-DDL-text generation only, matching ``entity/cache_toolkit.py``'s scope split
-(that module is the get/set toolkit companion; this one is DDL/bootstrap
-machinery). See LML#1038 PR-2 for the shared ``bootstrap_lml_cache_table``
-helper.
+PR-2 adds the third piece, :func:`bootstrap_lml_cache_table`: the shared
+transactional + ``lock_timeout`` posture only 2 of the 8 bootstraps had
+before it (``streaming_url_cache.py``, ``streaming_catalog.py``) -- the other
+6 issued their ``CREATE SCHEMA`` / ``CREATE TABLE`` / ... statements as
+separate autocommitted calls, so a mid-boot failure could leave a schema
+created but its table missing. This is a deliberate behavior upgrade (its own
+PR per the ticket, not folded into PR-1's pure refactor). Matches
+``entity/cache_toolkit.py``'s scope split (that module is the get/set toolkit
+companion; this one is DDL/bootstrap machinery) -- this module still only
+orchestrates DDL, never a row read/write.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any, Protocol, runtime_checkable
+from collections.abc import Awaitable, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from entity.sources import PgSource
 
 #: Issued first by every ``lml_cache.*`` bootstrap. ``lml_cache`` is
 #: LML-owned (discogs-etl#288, Option 3) -- no alembic, no discogs-cache
@@ -159,3 +166,60 @@ async def widen_service_check(
     """
     sql = build_widen_service_check_sql(table=table, constraint=constraint, services=services)
     await pg.execute(sql)
+
+
+#: One statement a bootstrap issues: either a bare SQL string (the common
+#: case -- executed as-is), or an async callable receiving the live
+#: ``asyncpg.Connection`` for a statement that needs more than
+#: "execute this literal" (``widen_service_check``'s per-table call, or
+#: ``entity/streaming_catalog.py``'s skip-if-the-live-definition-already-
+#: matches logic for its ``CREATE OR REPLACE FUNCTION``/``TRIGGER`` forms).
+LmlCacheBootstrapStatement = str | Callable[[Any], Awaitable[None]]
+
+_BOOTSTRAP_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '10s'"
+
+
+async def bootstrap_lml_cache_table(
+    pg: PgSource, *statements: LmlCacheBootstrapStatement, advisory_key: int | None = None
+) -> None:
+    """Run one ``lml_cache.*`` table's bootstrap DDL as a single transaction.
+
+    Every statement runs on one pooled connection inside one
+    ``conn.transaction()``, behind a ``SET LOCAL lock_timeout = '10s'``
+    preamble that bounds how long boot DDL waits behind a conflicting lock
+    instead of queueing indefinitely and stalling the lifespan. All-or-
+    nothing: a mid-boot failure rolls back the whole transaction rather than
+    leaving a schema created but its table (or a widened CHECK) missing --
+    the posture ``entity/streaming_url_cache.py`` and
+    ``entity/streaming_catalog.py`` already had; every ``lml_cache.*``
+    bootstrap gets it now (LML#1038 PR-2).
+
+    ``statements`` run in the given order; a plain ``str`` is issued via
+    ``conn.execute(statement)`` unchanged, and a callable is awaited with the
+    connection so it can run its own multi-step logic against the SAME
+    transaction (``widen_service_check`` and
+    ``entity/streaming_catalog.py``'s skip-if-unchanged
+    function/trigger statements both compose this way).
+
+    ``advisory_key``, when given, issues
+    ``SELECT pg_advisory_xact_lock(<key>)`` immediately after the
+    ``lock_timeout`` preamble, serializing concurrent bootstraps of this
+    table from a source OTHER than ``main.py``'s lifespan (which already
+    wraps every lifespan-invoked bootstrap in one session-scoped advisory
+    lock -- see ``main.py``'s ``_LML_CACHE_BOOTSTRAP_ADVISORY_LOCK_KEY``).
+    Pass it only for a table with a genuine non-lifespan caller (e.g.
+    ``entity/streaming_catalog.py``'s bootstrap, also called directly by
+    ``scripts/streaming_availability/catalog_dao.py``); the session lock
+    alone suffices for every other table -- see the LML#1038 PR-2 body for
+    the per-table decision and its rationale.
+    """
+    async with pg.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(_BOOTSTRAP_LOCK_TIMEOUT)
+            if advisory_key is not None:
+                await conn.execute(f"SELECT pg_advisory_xact_lock({advisory_key})")
+            for statement in statements:
+                if callable(statement):
+                    await statement(conn)
+                else:
+                    await conn.execute(statement)
