@@ -84,20 +84,30 @@ class TestConcurrentRateLimiter:
     """Verify the rate limiter prevents burst bypass under parallel load."""
 
     @pytest.mark.asyncio
-    async def test_rate_limiter_uses_configured_rate(self):
-        """get_rate_limiter() wires the configured req/min into a 60s-window bucket.
+    async def test_rate_limiter_uses_configured_rate(self, monkeypatch):
+        """get_rate_limiter() wires ``discogs_rate_limit`` into a 60s-window bucket.
 
-        Pins the production shape (``discogs_rate_limit`` tokens per 60s) that the
-        throttle-behavior test below deliberately compresses for speed.
+        Overrides the setting to a sentinel the default (50) would never produce,
+        so the assertion actually catches a wiring regression: comparing
+        ``limiter.max_rate`` to ``settings.discogs_rate_limit`` alone is a
+        tautology, since ``get_rate_limiter`` builds the limiter from that same
+        setting. Pins the production shape (configured req/min tokens per 60s)
+        that the throttle-behavior test below deliberately compresses for speed.
         """
         from config.settings import get_settings
 
-        reset_rate_limiting()
-        limiter = get_rate_limiter()
-        settings = get_settings()
+        monkeypatch.setenv("DISCOGS_RATE_LIMIT", "37")
+        get_settings.cache_clear()
+        try:
+            reset_rate_limiting()
+            limiter = get_rate_limiter()
 
-        assert limiter.max_rate == settings.discogs_rate_limit
-        assert limiter.time_period == 60
+            assert limiter.max_rate == 37
+            assert limiter.time_period == 60
+        finally:
+            # Drop the sentinel-valued Settings so the next test re-reads the
+            # env monkeypatch restores at teardown rather than a cached 37.
+            get_settings.cache_clear()
 
     @pytest.mark.asyncio
     async def test_rate_limiter_no_burst_bypass(self):
@@ -112,7 +122,8 @@ class TestConcurrentRateLimiter:
         ``test_rate_limiter_uses_configured_rate`` above.
         """
         max_rate = 5
-        limiter = AsyncLimiter(max_rate, 0.1)
+        period = 0.1
+        limiter = AsyncLimiter(max_rate, period)
 
         timestamps: list[float] = []
         lock = asyncio.Lock()
@@ -129,10 +140,19 @@ class TestConcurrentRateLimiter:
 
         assert len(timestamps) == max_rate * 2
 
-        # The overflow tasks are delayed relative to the first batch, so the
-        # admission span is strictly positive (no burst bypass).
+        # The first `max_rate` tasks drain the initial bucket instantly; the next
+        # `max_rate` must each wait for a token to refill (`max_rate` tokens per
+        # `period`), so refilling the whole overflow takes ~`period` and the last
+        # admission lands that long after the first. Assert at least half that
+        # refill delay: a floor large enough that a no-op limiter -- whose workers
+        # would merely append sequentially under the lock, microseconds apart --
+        # cannot satisfy it, yet one a loaded CI runner only ever overshoots (real
+        # timer waits push the span larger, never below the token-refill time).
         time_span = timestamps[-1] - timestamps[0]
-        assert time_span > 0, "Rate limiter should have throttled the overflow tasks"
+        assert time_span >= period / 2, (
+            f"overflow tasks should wait for refill, but the admission span was "
+            f"{time_span:.4f}s (< {period / 2:.4f}s) -- burst was not throttled"
+        )
 
     @pytest.mark.asyncio
     async def test_rate_limiter_concurrent_with_semaphore(self):
