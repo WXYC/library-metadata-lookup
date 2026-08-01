@@ -21,7 +21,7 @@ Gated on a song being present AND the server-side ``lml_location_union_enabled``
 kill switch (``should_run_location_union``) AND the caller not being
 low-priority (``not is_discogs_low_priority()``, checked by the orchestrator
 at the task-creation site -- this module has no such check of its own). The
-orchestrator launches :func:`resolve_also_available_on` as a concurrent
+orchestrator launches :func:`resolve_track_shelf_locations` as a concurrent
 ``asyncio`` task alongside the main search pipeline (a single indexed btree
 probe, cheap enough to hide under that latency) and, once the whole spine
 (including the enrichment tail) resolves, narrows the ranked candidate list
@@ -94,7 +94,7 @@ class ResolvedLocation:
     ``shelf_item`` is ``None`` when the row's ``library_id`` had no match in
     the shelf-metadata join -- an individual miss, or the whole join
     degraded to ``{}`` on a PG exception (see
-    :func:`resolve_also_available_on`). :func:`build_location_result_items`
+    :func:`resolve_track_shelf_locations`). :func:`build_location_result_items`
     skips these: a location with no shelf metadata (artist/title/call
     number) cannot be rendered as a ``LookupResultItem``. This is a
     **meaning change** from the pre-fold design, which emitted a bare
@@ -108,7 +108,7 @@ class ResolvedLocation:
     shelf_item: LibraryItem | None
 
 
-async def resolve_also_available_on(
+async def resolve_track_shelf_locations(
     parsed: ParsedRequest,
     discogs_cache_pg: PgSource | None,
     db: LibraryDB,
@@ -196,7 +196,7 @@ def _to_result_item(location: ResolvedLocation) -> LookupResultItem:
     per-location PG cost the LML#1019 precomputed index exists to avoid.
 
     ``credit_role`` (primary/featured/extra) is a ranking-only signal,
-    already spent by :func:`resolve_also_available_on`'s sort -- it has no
+    already spent by :func:`resolve_track_shelf_locations`'s sort -- it has no
     wire home and is not carried onto the result.
     """
     row, shelf_item = location.row, location.shelf_item

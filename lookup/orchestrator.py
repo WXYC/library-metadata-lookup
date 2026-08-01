@@ -64,7 +64,7 @@ from lookup.location_union import (
     ResolvedLocation,
     build_location_result_items,
     primary_library_ids_from_results,
-    resolve_also_available_on,
+    resolve_track_shelf_locations,
     should_run_location_union,
 )
 from lookup.matching import (
@@ -1115,7 +1115,7 @@ async def perform_lookup(
     # is ever left dangling.
     location_union_task = (
         asyncio.create_task(
-            resolve_also_available_on(parsed, services.discogs_cache_pg, services.db)
+            resolve_track_shelf_locations(parsed, services.discogs_cache_pg, services.db)
         )
         if should_run_location_union(request) and not is_discogs_low_priority()
         else None
@@ -1293,7 +1293,7 @@ async def _await_location_union(
 
     By the time the happy path gets here the task has had the whole tail
     (steps 3a-4b, enrichment) to finish, so this rarely actually waits.
-    Defensive: :func:`resolve_also_available_on` documents that it never
+    Defensive: :func:`resolve_track_shelf_locations` documents that it never
     raises, but a probe failure here must still never surface as a `/lookup`
     500.
     """

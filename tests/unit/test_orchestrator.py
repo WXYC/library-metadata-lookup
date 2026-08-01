@@ -1579,7 +1579,7 @@ class TestPerformLookupLocationUnion:
     kill-switch-off/low-priority no-op contracts, the Case A / Case B
     live-repro shapes from LML#271/#1022, dedup, the missing-shelf-item skip,
     non-suppression of the external-cache fallback, degraded-path carry
-    (bounded await), and post-fold telemetry agreement. ``resolve_also_available_on``
+    (bounded await), and post-fold telemetry agreement. ``resolve_track_shelf_locations``
     is patched at the orchestrator's import site -- its own ranking/shelf-join
     logic is covered by ``tests/unit/test_location_union.py``; these tests
     verify orchestration only."""
@@ -1609,7 +1609,7 @@ class TestPerformLookupLocationUnion:
             )
 
             with patch(
-                "lookup.orchestrator.resolve_also_available_on", new_callable=AsyncMock
+                "lookup.orchestrator.resolve_track_shelf_locations", new_callable=AsyncMock
             ) as resolve_mock:
                 response = await perform_lookup(
                     request, mock_library_db, mock_discogs_service, telemetry
@@ -1642,7 +1642,7 @@ class TestPerformLookupLocationUnion:
         with (
             patch("lookup.orchestrator.is_discogs_low_priority", return_value=True),
             patch(
-                "lookup.orchestrator.resolve_also_available_on", new_callable=AsyncMock
+                "lookup.orchestrator.resolve_track_shelf_locations", new_callable=AsyncMock
             ) as resolve_mock,
         ):
             response = await perform_lookup(
@@ -1673,7 +1673,7 @@ class TestPerformLookupLocationUnion:
         )
 
         with patch(
-            "lookup.orchestrator.resolve_also_available_on",
+            "lookup.orchestrator.resolve_track_shelf_locations",
             new_callable=AsyncMock,
             return_value=[lit_location],
         ):
@@ -1748,7 +1748,7 @@ class TestPerformLookupLocationUnion:
         )
 
         with patch(
-            "lookup.orchestrator.resolve_also_available_on",
+            "lookup.orchestrator.resolve_track_shelf_locations",
             new_callable=AsyncMock,
             return_value=[own_location, lit_location],
         ):
@@ -1789,7 +1789,7 @@ class TestPerformLookupLocationUnion:
         )
 
         with patch(
-            "lookup.orchestrator.resolve_also_available_on",
+            "lookup.orchestrator.resolve_track_shelf_locations",
             new_callable=AsyncMock,
             return_value=[unjoined, joined],
         ):
@@ -1830,7 +1830,7 @@ class TestPerformLookupLocationUnion:
         )
 
         with patch(
-            "lookup.orchestrator.resolve_also_available_on",
+            "lookup.orchestrator.resolve_track_shelf_locations",
             new_callable=AsyncMock,
             return_value=[lit_location],
         ):
@@ -1882,7 +1882,7 @@ class TestPerformLookupLocationUnion:
 
         with (
             patch(
-                "lookup.orchestrator.resolve_also_available_on",
+                "lookup.orchestrator.resolve_track_shelf_locations",
                 new_callable=AsyncMock,
                 return_value=[lit_location],
             ),
@@ -1932,7 +1932,7 @@ class TestPerformLookupLocationUnion:
             raise DiscogsBreakerOpenError("shed mid-enrichment")
 
         with (
-            patch("lookup.orchestrator.resolve_also_available_on", new=_never_resolves),
+            patch("lookup.orchestrator.resolve_track_shelf_locations", new=_never_resolves),
             patch("lookup.orchestrator._step_fetch_artwork", side_effect=_shed),
             patch("lookup.orchestrator._DEGRADED_LOCATION_UNION_AWAIT_TIMEOUT_S", 0.05),
         ):
@@ -1972,7 +1972,7 @@ class TestPerformLookupLocationUnion:
 
         with (
             patch(
-                "lookup.orchestrator.resolve_also_available_on",
+                "lookup.orchestrator.resolve_track_shelf_locations",
                 new_callable=AsyncMock,
                 return_value=[lit_location],
             ),

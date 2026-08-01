@@ -23,7 +23,7 @@ from lookup.location_union import (
     ResolvedLocation,
     build_location_result_items,
     primary_library_ids_from_results,
-    resolve_also_available_on,
+    resolve_track_shelf_locations,
     should_run_location_union,
 )
 from lookup.models import LookupRequest
@@ -91,14 +91,14 @@ class TestResolveAlsoAvailableOn:
     async def test_no_pg_returns_empty(self):
         parsed = ParsedRequest(artist="Brian Reitzell", song="Ikebana")
         db = AsyncMock()
-        result = await resolve_also_available_on(parsed, None, db)
+        result = await resolve_track_shelf_locations(parsed, None, db)
         assert result == []
 
     async def test_no_artist_returns_empty_without_querying(self):
         parsed = ParsedRequest(song="Ikebana")
         pg = AsyncMock()
         db = AsyncMock()
-        result = await resolve_also_available_on(parsed, pg, db)
+        result = await resolve_track_shelf_locations(parsed, pg, db)
         assert result == []
         pg.fetchall.assert_not_called()
 
@@ -116,7 +116,7 @@ class TestResolveAlsoAvailableOn:
             AsyncMock(return_value=[row]),
         )
 
-        result = await resolve_also_available_on(parsed, pg, db)
+        result = await resolve_track_shelf_locations(parsed, pg, db)
 
         assert result == [ResolvedLocation(row=row, shelf_item=lit_item)]
 
@@ -147,7 +147,7 @@ class TestResolveAlsoAvailableOn:
             AsyncMock(return_value=rows),
         )
 
-        result = await resolve_also_available_on(parsed, pg, db)
+        result = await resolve_track_shelf_locations(parsed, pg, db)
 
         # Both tied primaries rank ahead of the extra credit; ties break by id.
         assert [loc.row.library_id for loc in result] == [1, 2, 3]
@@ -166,7 +166,7 @@ class TestResolveAlsoAvailableOn:
             AsyncMock(return_value=[row]),
         )
 
-        result = await resolve_also_available_on(parsed, pg, db)
+        result = await resolve_track_shelf_locations(parsed, pg, db)
 
         assert result == [ResolvedLocation(row=row, shelf_item=None)]
 
@@ -184,7 +184,7 @@ class TestResolveAlsoAvailableOn:
             AsyncMock(return_value=[row]),
         )
 
-        result = await resolve_also_available_on(parsed, pg, db)
+        result = await resolve_track_shelf_locations(parsed, pg, db)
 
         assert result == [ResolvedLocation(row=row, shelf_item=None)]
 
