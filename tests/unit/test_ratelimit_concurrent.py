@@ -10,6 +10,7 @@ import asyncio
 import time
 
 import pytest
+from aiolimiter import AsyncLimiter
 
 from discogs.ratelimit import get_rate_limiter, get_semaphore, reset_rate_limiting
 
@@ -83,15 +84,35 @@ class TestConcurrentRateLimiter:
     """Verify the rate limiter prevents burst bypass under parallel load."""
 
     @pytest.mark.asyncio
-    async def test_rate_limiter_no_burst_bypass(self):
-        """Concurrent tasks cannot bypass the rate limiter by acquiring simultaneously.
+    async def test_rate_limiter_uses_configured_rate(self):
+        """get_rate_limiter() wires the configured req/min into a 60s-window bucket.
 
-        The rate limiter is configured for N requests per minute. If we fire
-        more tasks than the rate limit in quick succession, they should be
-        throttled and not all complete instantly.
+        Pins the production shape (``discogs_rate_limit`` tokens per 60s) that the
+        throttle-behavior test below deliberately compresses for speed.
         """
+        from config.settings import get_settings
+
         reset_rate_limiting()
         limiter = get_rate_limiter()
+        settings = get_settings()
+
+        assert limiter.max_rate == settings.discogs_rate_limit
+        assert limiter.time_period == 60
+
+    @pytest.mark.asyncio
+    async def test_rate_limiter_no_burst_bypass(self):
+        """Concurrent tasks exceeding the burst are throttled, not all admitted at once.
+
+        Exercises the same ``AsyncLimiter`` token bucket the service uses, but on a
+        compressed window (5 tokens / 100ms rather than the production 50 / 60s).
+        A real 60s window refills one overflow token every ~1.2s, so proving the
+        throttle with 10 overflow tasks costs ~12s of pure wall-clock wait for a
+        ``span > 0`` assertion. The compressed window verifies the identical
+        behavior in milliseconds; the production window value is pinned in
+        ``test_rate_limiter_uses_configured_rate`` above.
+        """
+        max_rate = 5
+        limiter = AsyncLimiter(max_rate, 0.1)
 
         timestamps: list[float] = []
         lock = asyncio.Lock()
@@ -101,19 +122,17 @@ class TestConcurrentRateLimiter:
                 async with lock:
                     timestamps.append(time.monotonic())
 
-        # Fire more tasks than the rate limit allows
-        # Default rate limit is 50/min, so fire 60 tasks
-        tasks = [asyncio.create_task(worker()) for _ in range(60)]
+        # Fire more tasks than the burst: the first `max_rate` drain the initial
+        # bucket instantly, the rest must wait for refill.
+        tasks = [asyncio.create_task(worker()) for _ in range(max_rate * 2)]
         await asyncio.gather(*tasks)
 
-        assert len(timestamps) == 60
+        assert len(timestamps) == max_rate * 2
 
-        # All timestamps should exist (all tasks completed)
-        # The rate limiter uses a token bucket, so the first batch goes through
-        # immediately and subsequent ones are delayed.
-        # Check that at least one task was delayed (span > 0)
+        # The overflow tasks are delayed relative to the first batch, so the
+        # admission span is strictly positive (no burst bypass).
         time_span = timestamps[-1] - timestamps[0]
-        assert time_span > 0, "Rate limiter should have throttled some requests"
+        assert time_span > 0, "Rate limiter should have throttled the overflow tasks"
 
     @pytest.mark.asyncio
     async def test_rate_limiter_concurrent_with_semaphore(self):

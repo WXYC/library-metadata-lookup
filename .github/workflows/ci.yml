@@ -86,7 +86,20 @@ jobs:
       # Default `pytest` honours pyproject addopts (`-m 'not pg and not external_api'`),
       # so this job runs every unmarked test across tests/unit/, tests/integration/, and
       # tests/e2e/. Infra-tagged tests run in their own jobs (`pg`, `external_api`).
-      - run: pytest -v --cov=. --cov-report=xml
+      #
+      # -n auto (pytest-xdist) fans the ~5k independent unit tests across the
+      # runner's cores; --cov combines per-worker coverage automatically. xdist is
+      # scoped to this job only — the pg / external_api jobs stay serial (they
+      # share a PG schema / the Discogs rate budget). --durations surfaces the
+      # slowest tests so a serial-wait backslide (e.g. an un-mocked sleep) is
+      # visible in the log instead of silently re-inflating the run.
+      - name: Run tests
+        env:
+          # sys.monitoring line tracer (Python 3.12 + coverage >= 7.4): lower
+          # per-line coverage overhead than the default C trace core, verified to
+          # produce identical line counts (line-rate 0.8717 either way).
+          COVERAGE_CORE: sysmon
+        run: pytest -n auto --cov=. --cov-report=xml --durations=15
       - name: Upload coverage reports
         uses: codecov/codecov-action@v5
         with:

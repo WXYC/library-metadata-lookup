@@ -180,7 +180,12 @@ class TestErrorHandling:
             )
         )
         client._http = mock_http
-        results = await client.search_album("Stereolab", "Aluminum Tunes")
+        # A constant 500 exhausts the exponential-backoff retry loop (both the
+        # quoted and unquoted passes). Patch asyncio.sleep so the test asserts the
+        # empty-result contract without waiting out the real ~62s of backoff --
+        # mirrors TestRetryOn429.test_retries_on_429 above.
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            results = await client.search_album("Stereolab", "Aluminum Tunes")
         assert results == []
 
 
