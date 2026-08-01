@@ -119,6 +119,31 @@ class _FakePgSource:
         yield _FakeConnection(self)
 
 
+class TestStreamingServiceParity:
+    """LML#1037 hard constraint: the enum-derived storage keys must equal
+    ``_SERVICES`` -- the CHECK-list parity proof for the code-side allowlist.
+    The LIVE deployed-constraint counterpart is
+    ``tests/integration/test_streaming_catalog.py::
+    TestStreamingServiceCheckParity``.
+    """
+
+    def test_services_equals_enum_catalog_keys(self):
+        from streaming.service import StreamingService
+
+        assert set(_SERVICES) == {s.catalog_key for s in StreamingService}
+
+    def test_services_is_exactly_the_seven_offline_catalog_services(self):
+        assert set(_SERVICES) == {
+            "spotify",
+            "deezer",
+            "apple_music",
+            "bandcamp",
+            "tidal",
+            "youtube_music",
+            "soundcloud",
+        }
+
+
 class TestCanonicalDDLReference:
     """``entity/streaming_catalog.sql`` is the inline DDL reference."""
 

@@ -190,8 +190,14 @@ def _validate_spotify_album_id(source: str, external_id: str) -> str:
 # ``lookup.streaming_url_postprocess.STREAMING_URL_CACHE_CONFIG``: Discogs
 # release/master are identity-mintable but never URL-cached (they aren't
 # resolved from a live streaming probe), and Bandcamp is identity-mintable
-# but only joins the cache registry in PR-3. The parity test asserts
-# ``STREAMING_URL_CACHE_CONFIG.keys() ⊆ RELEASE_SOURCE_CONFIG.keys()``.
+# but only joins the cache registry in PR-3. This registry stays keyed by the
+# bare mint-source string (LML#1037 did not fold it into the
+# ``streaming.service.StreamingService`` enum — it mixes two Discogs
+# identity-only sources into an otherwise streaming-service-shaped key set,
+# which is exactly the kind of asymmetric membership the enum's three
+# vocabularies don't have). The parity test asserts the image of
+# ``STREAMING_URL_CACHE_CONFIG``'s enum keys under
+# ``streaming.service.ALBUM_CACHE_KEYS`` ⊆ ``RELEASE_SOURCE_CONFIG.keys()``.
 # ``musicbrainz_release`` is intentionally absent — it is read-only today
 # (no write helper / sentinel rule), readable via the store's
 # ``_RELEASE_IDENTITY_COLUMN_TO_SOURCE`` tuple but not mintable here.

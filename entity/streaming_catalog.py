@@ -85,21 +85,17 @@ from entity.ddl import (
     build_widen_service_check_sql,
 )
 from entity.sources import PgSource
+from streaming.service import OFFLINE_CATALOG_SERVICES
 
 # The services a catalog probe can target. The named CHECK pins this set at
 # the DB level; the seed maps the SQLite wide columns (spotify_*, deezer_*,
 # apple_*, bandcamp_*) and the real prod file's drift columns (tidal_url,
 # youtube_music_url, soundcloud_url) onto these values. Adding a service
-# extends this tuple and the widen DO block below picks it up.
-_SERVICES = (
-    "spotify",
-    "deezer",
-    "apple_music",
-    "bandcamp",
-    "tidal",
-    "youtube_music",
-    "soundcloud",
-)
+# extends ``streaming.service.OFFLINE_CATALOG_SERVICES`` and the widen DO
+# block below picks it up. LML#1037: derived from the shared
+# ``StreamingService`` enum (catalog-key granularity) instead of a
+# free-floating literal tuple -- same values, same order.
+_SERVICES = tuple(s.catalog_key for s in OFFLINE_CATALOG_SERVICES)
 
 # Import-time tripwire: service values are spliced into SQL literals and read
 # back out of pg_get_constraintdef's deparse by the widen block's quoted-

@@ -44,14 +44,18 @@ from entity.cache_toolkit import swallowing_execute, swallowing_fetch
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.ddl import bootstrap_lml_cache_table, widen_service_check
 from entity.sources import PgSource
+from streaming.service import TRACK_CACHE_KEYS, StreamingService
 
 logger = logging.getLogger(__name__)
 
 # The single service L1 ships. The named CHECK constraint pins this set at the
-# DB level; a future PR (e.g. a Spotify track deep-link) extends this tuple and
-# the ALTER below picks it up. Kept as a module constant so the bootstrap DDL
-# and the parity test can both reference it without re-typing the literal.
-APPLE_MUSIC_TRACK_SERVICE = "apple_music_track"
+# DB level; a future PR (e.g. a Spotify track deep-link) extends
+# ``streaming.service.TRACK_CACHE_KEYS`` and the ALTER below picks it up.
+# Kept as a module constant so the bootstrap DDL and the parity test can both
+# reference it without re-typing the literal. LML#1037: derived from the
+# shared ``StreamingService`` enum's track-cache-key granularity instead of a
+# free-floating literal -- same value.
+APPLE_MUSIC_TRACK_SERVICE: str = TRACK_CACHE_KEYS[StreamingService.APPLE_MUSIC]
 _SERVICES = (APPLE_MUSIC_TRACK_SERVICE,)
 
 # Shared IN-list literal so the CREATE-time CHECK is generated from the same

@@ -131,6 +131,29 @@ class TestCanonicalDDLReference:
         assert "PRIMARY KEY (service, artist_normalized, album_normalized)" in ddl
 
 
+class TestStreamingServiceParity:
+    """LML#1037 hard constraint: the enum-derived storage keys must equal
+    ``_SERVICES`` -- the CHECK-list parity proof for the code-side allowlist.
+    The LIVE deployed-constraint counterpart (against a real PostgreSQL
+    connection) is
+    ``tests/integration/test_streaming_url_persistent_lookup.py::
+    TestStreamingServiceCheckParity``.
+    """
+
+    def test_services_equals_enum_album_cache_keys(self):
+        from entity.streaming_url_cache import _SERVICES
+        from streaming.service import StreamingService
+
+        assert set(_SERVICES) == {
+            s.album_cache_key for s in StreamingService if s.album_cache_key is not None
+        }
+
+    def test_services_is_exactly_apple_spotify_bandcamp(self):
+        from entity.streaming_url_cache import _SERVICES
+
+        assert set(_SERVICES) == {"apple_music_album", "spotify_album", "bandcamp"}
+
+
 @pytest.mark.asyncio
 class TestSetUpStreamingUrlCacheSchema:
     """``set_up_streaming_url_cache_schema`` runs exactly the idempotent DDL."""

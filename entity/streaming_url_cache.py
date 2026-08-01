@@ -65,6 +65,7 @@ from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execu
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.ddl import bootstrap_lml_cache_table, widen_service_check
 from entity.sources import PgSource
+from streaming.service import ALBUM_CACHE_KEYS, ALBUM_CACHED_SERVICES
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +77,13 @@ logger = logging.getLogger(__name__)
 
 # The services the cache ships. The named CHECK constraint pins this set at
 # the DB level; a future PR adding a service (Deezer's 'deezer_album') extends
-# this tuple and the widen DO block below picks it up. Kept as a module
-# constant so the bootstrap DDL and a parity test can both reference it
-# without re-typing the literal. PR-3 added 'bandcamp'.
-_SERVICES = ("apple_music_album", "spotify_album", "bandcamp")
+# ``streaming.service.ALBUM_CACHED_SERVICES`` and the widen DO block below
+# picks it up. Kept as a module constant so the bootstrap DDL and a parity
+# test can both reference it without re-typing the literal. PR-3 added
+# 'bandcamp'. LML#1037: derived from the shared ``StreamingService`` enum's
+# album-cache-key granularity instead of a free-floating literal tuple --
+# same values, same order.
+_SERVICES = tuple(ALBUM_CACHE_KEYS[s] for s in ALBUM_CACHED_SERVICES)
 
 # Shared IN-list literal so the CREATE-time CHECK and the widen DO block's
 # code-side array are generated from the same source — they can never drift.

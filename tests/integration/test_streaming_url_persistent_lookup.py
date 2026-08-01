@@ -21,6 +21,7 @@ Run with: pytest -m pg -v tests/integration/test_streaming_url_persistent_lookup
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -36,6 +37,7 @@ from entity.streaming_url_cache import (
     set_up_streaming_url_cache_schema,
 )
 from streaming.models import SourceMatch
+from streaming.service import StreamingService
 from tests.integration.conftest import skip_if_named_tables_populated
 
 _SERVICE_CASES = [
@@ -204,6 +206,32 @@ class TestSchemaBootstrap:
             )
         assert oid_after == oid_before
         assert preserved == 1
+
+
+@pytest.mark.pg
+class TestStreamingServiceCheckParity:
+    """LML#1037 hard constraint: the LIVE deployed CHECK constraint's value
+    set must equal the ``StreamingService`` enum's album-cache-key storage
+    keys, byte-for-byte -- not just the code-side ``_SERVICES`` tuple the
+    unit-level twin (``tests/unit/test_streaming_url_cache_schema.py::
+    TestStreamingServiceParity``) pins. This is the proof that the refactor
+    introduced zero data migration: what PostgreSQL actually enforces after a
+    fresh boot is exactly what the enum says it should."""
+
+    @pytest.mark.asyncio
+    async def test_deployed_check_matches_enum_album_cache_keys(self, pg_pool, pg_source):
+        await set_up_streaming_url_cache_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            constraint_def = await conn.fetchval(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conname = 'album_streaming_url_cache_service_valid' "
+                "AND conrelid = 'lml_cache.album_streaming_url_cache'::regclass"
+            )
+        assert constraint_def is not None
+        deployed = set(re.findall(r"'([^']+)'", constraint_def))
+        expected = {s.album_cache_key for s in StreamingService if s.album_cache_key is not None}
+        assert deployed == expected
+        assert deployed == {"apple_music_album", "spotify_album", "bandcamp"}
 
 
 @pytest.mark.pg

@@ -97,6 +97,7 @@ from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, probe_timeout_s_
 from release.apple_music_url_parser import apple_album_id_from_url
 from release.bandcamp_url_parser import bandcamp_album_id_from_url
 from release.spotify_url_parser import spotify_album_id_from_url
+from streaming.service import ALBUM_CACHE_KEYS, ALBUM_CACHED_SERVICES, StreamingService
 
 if TYPE_CHECKING:
     from config.settings import Settings
@@ -185,10 +186,13 @@ class StreamingUrlCacheConfig:
     concerns) so neither registry carries Optional fields for the other's
     members. ``flag_setting`` names the per-service ``Settings`` attribute;
     ``url_to_external_id`` extracts the mintable ID from a resolved URL
-    (``None`` → surface URL, skip mint). The registry *key* doubles as the
+    (``None`` → surface URL, skip mint). The registry *key* (a
+    ``StreamingService`` member, LML#1037) doubles as the client-dispatch
+    lookup (``service.catalog_key`` into the ``clients`` dict / the returned
+    ``statuses`` dict) and, via ``streaming.service.ALBUM_CACHE_KEYS``, the
     mint source (a key into ``RELEASE_SOURCE_CONFIG``) — the post-process
-    threads it into ``_mint_identity`` directly, so there is no separate
-    ``mint_source`` field to keep in sync.
+    derives both from the key rather than carrying a ``client_attr`` field
+    that would just restate ``service.catalog_key``.
 
     ``probe_timeout_s`` is the static per-service wall-clock ceiling.
     ``timeout_env_var`` (optional) names an integer-ms env var that overrides
@@ -202,40 +206,42 @@ class StreamingUrlCacheConfig:
     probe_timeout_s: float
     url_to_external_id: Callable[[str], str | None]
     url_field: str
-    client_attr: str
     flag_setting: str
     timeout_env_var: str | None = None
 
 
-# Cache + post-process registry. Deliberately a SUBSET of
+# Cache + post-process registry (LML#1037: keyed by ``StreamingService``
+# instead of a free-floating album-cache-key string — the same
+# ``ALBUM_CACHED_SERVICES`` ordering ``entity/streaming_url_cache.py``'s
+# ``_SERVICES`` derives from, so this dict's iteration order and that table's
+# CHECK-constraint literal order stay in lockstep). Deliberately a SUBSET of
 # ``identity.release_validation.RELEASE_SOURCE_CONFIG`` (5 entries): Discogs
 # release/master are identity-only (never resolved from a live streaming
 # probe). Apple + Spotify (PR-1) and Bandcamp (PR-3) are all
-# minted-from-live-probe AND URL-cached. The parity test asserts these keys ⊆
-# RELEASE_SOURCE_CONFIG keys; the completeness guard in the test suite pins the
-# exact key set. A future PR adds Deezer ('deezer_album') here and ALTERs the
-# table's named CHECK constraint to match.
-STREAMING_URL_CACHE_CONFIG: dict[str, StreamingUrlCacheConfig] = {
-    "apple_music_album": StreamingUrlCacheConfig(
+# minted-from-live-probe AND URL-cached. The parity test asserts these keys'
+# ``ALBUM_CACHE_KEYS`` images ⊆ RELEASE_SOURCE_CONFIG keys; the completeness
+# guard in the test suite pins the exact key set. A future PR adds Deezer here
+# (extending ``streaming.service.ALBUM_CACHE_KEYS``) and ALTERs the table's
+# named CHECK constraint to match.
+STREAMING_URL_CACHE_CONFIG: dict[StreamingService, StreamingUrlCacheConfig] = {
+    StreamingService.APPLE_MUSIC: StreamingUrlCacheConfig(
         miss_ttl=DEFAULT_MISS_TTL,
         probe_timeout_s=_DEFAULT_PROBE_TIMEOUT_S,
         url_to_external_id=apple_album_id_from_url,
         url_field="apple_music_url",
-        client_attr="apple_music",
         flag_setting="lml_persist_streaming_url_apple_music",
         # Back-compat: the pre-LML#573 Apple post-process honored this env var
         # (via apple_music_lookup_timeout_s); keep it tuning this leg too.
         timeout_env_var=APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR,
     ),
-    "spotify_album": StreamingUrlCacheConfig(
+    StreamingService.SPOTIFY: StreamingUrlCacheConfig(
         miss_ttl=DEFAULT_MISS_TTL,
         probe_timeout_s=_DEFAULT_PROBE_TIMEOUT_S,
         url_to_external_id=spotify_album_id_from_url,
         url_field="spotify_url",
-        client_attr="spotify",
         flag_setting="lml_persist_streaming_url_spotify",
     ),
-    "bandcamp": StreamingUrlCacheConfig(
+    StreamingService.BANDCAMP: StreamingUrlCacheConfig(
         miss_ttl=DEFAULT_MISS_TTL,
         # Looser ceiling than Apple/Spotify — see _BANDCAMP_PROBE_TIMEOUT_S.
         probe_timeout_s=_BANDCAMP_PROBE_TIMEOUT_S,
@@ -243,10 +249,13 @@ STREAMING_URL_CACHE_CONFIG: dict[str, StreamingUrlCacheConfig] = {
         # extractor returns the parser-canonical URL the validator expects.
         url_to_external_id=bandcamp_album_id_from_url,
         url_field="bandcamp_url",
-        client_attr="bandcamp",
         flag_setting="lml_persist_streaming_url_bandcamp",
     ),
 }
+assert tuple(STREAMING_URL_CACHE_CONFIG) == ALBUM_CACHED_SERVICES, (
+    "STREAMING_URL_CACHE_CONFIG's declaration order drifted from "
+    "streaming.service.ALBUM_CACHED_SERVICES"
+)
 
 
 async def apply_streaming_url_postprocess(
@@ -277,7 +286,7 @@ async def apply_streaming_url_postprocess(
         update: The item's ``update`` dict. Each active service's
             ``cfg.url_field`` key must be present (``None`` or ``str``); on a
             cache hit it is overwritten with the URL.
-        clients: Maps ``cfg.client_attr`` → client (or ``None`` when the
+        clients: Maps ``service.catalog_key`` → client (or ``None`` when the
             service's credentials are unconfigured — that service is skipped,
             not an error). Each client is a process-global singleton, so the
             background warm may use it after the request returns.
@@ -294,7 +303,7 @@ async def apply_streaming_url_postprocess(
 
     Returns:
         LML#1053: the per-service resolution verdict for every service this
-        call actually consulted, keyed by ``cfg.client_attr`` (``apple_music``
+        call actually consulted, keyed by ``service.catalog_key`` (``apple_music``
         / ``spotify`` / ``bandcamp`` — the same keys the wire contract's
         ``StreamingResolution`` object uses). A cache hit maps to ``verified``;
         a known recent miss (a fresh "not found" already on record) maps to
@@ -315,12 +324,17 @@ async def apply_streaming_url_postprocess(
     # Capture the (narrowed, non-None) client in the tuple via the walrus so
     # the loop below doesn't re-index the dict (and so the type-checker sees a
     # non-Optional client when threading it into the background warm).
+    # ``storage_key`` (LML#1037: ``ALBUM_CACHE_KEYS[service]``, e.g.
+    # "apple_music_album") is the exact string every downstream PG bind /
+    # Sentry key / mint-source call used before this refactor — only the
+    # registry's OUTER key changed type (str -> StreamingService); every
+    # runtime string value threaded through below is unchanged.
     active = [
-        (service_key, cfg, client)
-        for service_key, cfg in STREAMING_URL_CACHE_CONFIG.items()
+        (service, ALBUM_CACHE_KEYS[service], cfg, client)
+        for service, cfg in STREAMING_URL_CACHE_CONFIG.items()
         if getattr(settings, cfg.flag_setting, False)
         and update.get(cfg.url_field) is None
-        and (client := clients.get(cfg.client_attr)) is not None
+        and (client := clients.get(service.catalog_key)) is not None
     ]
     if not active:
         return {}
@@ -334,62 +348,62 @@ async def apply_streaming_url_postprocess(
         *(
             peek_cached_streaming_url(
                 pg,
-                service=service_key,
+                service=storage_key,
                 artist=request_artist,
                 album=request_album,
                 miss_ttl=cfg.miss_ttl,
             )
-            for service_key, cfg, _client in active
+            for _service, storage_key, cfg, _client in active
         ),
         return_exceptions=True,
     )
 
     suppress_warm = should_suppress_streaming_warm()
     statuses: dict[str, StreamingResolutionStatus] = {}
-    for (service_key, cfg, client), peek in zip(active, peeks, strict=True):
+    for (service, storage_key, cfg, client), peek in zip(active, peeks, strict=True):
         if isinstance(peek, BaseException):
             logger.warning(
                 "streaming-URL cache peek failed for %s / %s / %s: %r",
-                service_key,
+                storage_key,
                 request_artist,
                 request_album,
                 peek,
             )
             # LML#1053: an attempted-but-errored consult is inconclusive, not
             # never-consulted — same bucket as a timeout.
-            statuses[cfg.client_attr] = StreamingResolutionStatus.unresolved
+            statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
             continue
         cached_url, has_fresh_decision = peek
         if cached_url is not None:
             # Synchronous hit: fill the URL now. No mint — the URL was minted on
             # the resolution that first wrote this cache row.
             update[cfg.url_field] = cached_url
-            _project_sentry(service_key, "cache_hit")
-            statuses[cfg.client_attr] = StreamingResolutionStatus.verified
+            _project_sentry(storage_key, "cache_hit")
+            statuses[service.catalog_key] = StreamingResolutionStatus.verified
         elif has_fresh_decision:
             # Known recent miss: the cache already records "checked, not found"
             # within the TTL. No probe is warranted, so don't schedule a no-op
             # warm (it would just re-derive the same recent-miss verdict). A
             # real, sourced negative — not a couldn't-check.
-            _project_sentry(service_key, "cache_miss_recent")
-            statuses[cfg.client_attr] = StreamingResolutionStatus.absent
+            _project_sentry(storage_key, "cache_miss_recent")
+            statuses[service.catalog_key] = StreamingResolutionStatus.absent
         elif suppress_warm:
             # Bulk path: cache read-fill only. The offline warmer owns bulk fill;
             # spawning a warm here would decouple the drain's probes from the
             # request and starve the live /lookup path's own warms. No warm
             # means no confirmed verdict this request — transient, not terminal.
-            _project_sentry(service_key, "cache_miss_unwarmed")
-            statuses[cfg.client_attr] = StreamingResolutionStatus.unresolved
+            _project_sentry(storage_key, "cache_miss_unwarmed")
+            statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
         else:
             # Genuine miss (absent/stale): defer the live probe + UPSERT + mint
             # to a bounded, deduplicated background task. The response returns
             # without this service's URL; the warm fills the cache for next
             # time — so this request's verdict is transient, not terminal.
             _enqueue_streaming_warm(
-                service_key, cfg, client, pg, entity_store, request_artist, request_album
+                storage_key, cfg, client, pg, entity_store, request_artist, request_album
             )
-            _project_sentry(service_key, "cache_miss_enqueued")
-            statuses[cfg.client_attr] = StreamingResolutionStatus.unresolved
+            _project_sentry(storage_key, "cache_miss_enqueued")
+            statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
 
     return statuses
 
