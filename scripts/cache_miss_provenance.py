@@ -23,7 +23,8 @@ Input shapes accepted (pick one):
   the API leg (i.e., the cache missed for that release_id):
 
     * ``Validated: 'TRACK' by 'ARTIST' found on release RELEASE_ID``
-    * ``Validated (fuzzy): 'TRACK' by 'ARTIST' on release RELEASE_ID``
+    * ``Validated (fuzzy): 'TRACK' by 'ARTIST' on release RELEASE_ID`` (LML#1035:
+      no longer emitted going forward -- kept for parsing historical logs)
     * ``Track 'TRACK' by 'ARTIST' NOT found on release RELEASE_ID``
 
   ``method`` is set to ``validate_track_on_release`` for all three. The
@@ -80,6 +81,9 @@ class MissEvent:
 _LOG_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"Validated: '.+' by '.+' found on release (\d+)"), "validate_track_on_release"),
     (
+        # LML#1035 folded discogs/service.py's fuzzy/exact match branches into
+        # one shared kernel, so this "(fuzzy)" variant is no longer emitted by
+        # current code -- retained so the script keeps parsing pre-#1035 logs.
         re.compile(r"Validated \(fuzzy\): '.+' by '.+' on release (\d+)"),
         "validate_track_on_release",
     ),
