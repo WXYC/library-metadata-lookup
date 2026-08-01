@@ -54,6 +54,16 @@ dev = [
     # marker needed — it patches botocore's HTTP layer, so no network or service.
     "moto[s3]>=5.0.0",
 ]
+# ytmusicapi backs the offline YouTube Music coverage drain (LML#1056). It is an
+# *extra*, not a runtime dependency: the client's import is lazy and the service
+# never resolves YouTube Music on the /lookup hot path, so the deploy image stays
+# lean. Pinned exactly (not >=) because it is a reverse-engineered web client
+# whose internal API Google changes periodically — a silent minor bump could
+# break the drain mid-run; bumps should be deliberate, changelog-reviewed PRs.
+# Run the drain with `uv run --extra drain python -m scripts.ytm_coverage_drain`.
+drain = [
+    "ytmusicapi==1.12.1",
+]
 
 [build-system]
 requires = ["setuptools>=65.0", "wheel"]
