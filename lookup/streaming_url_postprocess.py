@@ -252,10 +252,15 @@ STREAMING_URL_CACHE_CONFIG: dict[StreamingService, StreamingUrlCacheConfig] = {
         flag_setting="lml_persist_streaming_url_bandcamp",
     ),
 }
-assert tuple(STREAMING_URL_CACHE_CONFIG) == ALBUM_CACHED_SERVICES, (
-    "STREAMING_URL_CACHE_CONFIG's declaration order drifted from "
-    "streaming.service.ALBUM_CACHED_SERVICES"
-)
+# Explicit raise (not bare `assert`) so this drift guard survives `python -O` /
+# `PYTHONOPTIMIZE=1`, which compiles `assert` statements out and would silently
+# disable it in optimized production runs -- mirroring the same-class import-time
+# guard convention in streaming/orchestrator.py.
+if tuple(STREAMING_URL_CACHE_CONFIG) != ALBUM_CACHED_SERVICES:
+    raise RuntimeError(
+        "STREAMING_URL_CACHE_CONFIG's declaration order drifted from "
+        "streaming.service.ALBUM_CACHED_SERVICES"
+    )
 
 
 async def apply_streaming_url_postprocess(
