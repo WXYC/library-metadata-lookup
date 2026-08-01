@@ -147,7 +147,16 @@ async def get_artist(
     svc = _require_service(service)
     if refresh:
         _refresh_l1(DiscogsService.get_artist_details, artist_id)
-    result = await svc.get_artist_details(artist_id)
+    try:
+        result = await svc.get_artist_details(artist_id)
+    except DiscogsBreakerOpenError as e:
+        # LML#755 R2-3: the Discogs saturation breaker shed this live probe. 503
+        # (transient / retryable), not a raw 500 — the caller should back off and
+        # retry rather than treat this as a hard failure.
+        raise HTTPException(
+            status_code=503,
+            detail="Discogs temporarily shed (rate-saturated); retry shortly.",
+        ) from e
 
     if result is None:
         raise HTTPException(
