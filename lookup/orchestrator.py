@@ -1452,12 +1452,14 @@ async def _build_degraded_response(
     the physical-shelf backups, and they cost no live enrichment (PG-only,
     already resolved or resolving concurrently). The await is *bounded*
     (:func:`_await_location_union_bounded`, ~250ms): a shed path is exactly
-    where blocking on a stalled probe would be counterproductive. Both
-    ``found_on_compilation``/``song_not_found`` are recomputed the same way
-    the happy path does (:func:`_reconcile_post_fold_signals`) — without this,
-    a Case-B shed would emit location rows while still claiming
-    ``song_not_found=True``/``found_on_compilation=False``, the exact desync
-    the happy-path reconciliation exists to eliminate. ``context_message`` and
+    where blocking on a stalled probe would be counterproductive. The
+    ``found_on_compilation``/``song_not_found``/``search_type`` signals are
+    recomputed the same way the happy path does
+    (:func:`_reconcile_post_fold_signals`) — without this, a Case-B shed would
+    emit location rows while still claiming
+    ``song_not_found=True``/``found_on_compilation=False`` with a stale
+    ``search_type``, the exact desync the happy-path reconciliation exists to
+    eliminate. ``context_message`` and
     ``external_source`` stay ``None`` unconditionally either way, matching the
     pre-existing degraded contract.
     """
@@ -1472,7 +1474,7 @@ async def _build_degraded_response(
     )
     result_items.extend(location_items)
 
-    song_not_found, found_on_compilation, _search_type, _context_message, _external_source = (
+    song_not_found, found_on_compilation, search_type, _context_message, _external_source = (
         _reconcile_post_fold_signals(
             parsed,
             state,
@@ -1483,7 +1485,7 @@ async def _build_degraded_response(
 
     return LookupResponse(
         results=result_items,
-        search_type=state.search_type,
+        search_type=search_type,
         song_not_found=song_not_found,
         found_on_compilation=found_on_compilation,
         context_message=None,
