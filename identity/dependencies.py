@@ -2,12 +2,14 @@
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 
 from fastapi import Depends, HTTPException
 
 from config.settings import Settings, get_settings
 from core.bulk_body import TRANSIENT_PG_ERRORS
 from core.dependencies import get_discogs_pool
+from core.service_unavailable import service_unavailable_detail
 from entity.sources import PgSource
 from entity.store import EntityStore
 
@@ -15,9 +17,9 @@ logger = logging.getLogger(__name__)
 
 # Shared across every router that depends on `get_entity_store` (cache/router.py,
 # identity/router.py, ...) — previously duplicated verbatim in each router module.
-_ENTITY_STORE_UNAVAILABLE_DETAIL = (
-    "Entity store is not available. Ensure DATABASE_URL_DISCOGS is configured "
-    "and the entity schema has been applied."
+_ENTITY_STORE_UNAVAILABLE_DETAIL = service_unavailable_detail(
+    "Entity store",
+    "Ensure DATABASE_URL_DISCOGS is configured and the entity schema has been applied.",
 )
 
 _entity_store: EntityStore | None = None
@@ -116,6 +118,38 @@ def require_entity_store(store: EntityStore | None) -> EntityStore:
     if store is None:
         raise HTTPException(status_code=503, detail=_ENTITY_STORE_UNAVAILABLE_DETAIL) from None
     return store
+
+
+def require_service[T](
+    getter: Callable[..., Awaitable[T | None]], detail: str
+) -> Callable[..., Awaitable[T]]:
+    """Build a FastAPI dependency that 503s when ``getter`` resolves to ``None`` (LML#1036).
+
+    Generic sibling of :func:`require_entity_store`: that helper is a
+    hand-written "None -> 503" guard for exactly one type (``EntityStore``),
+    called manually inside a handler body against an already-resolved
+    ``Depends(get_entity_store)`` value. This factory produces the same guard
+    for any optional-service getter dependency, parametrized by the getter
+    and the 503 detail, and wires it in ONE step instead of two: use it
+    directly as ``Depends(require_service(get_discogs_service, detail))`` in
+    a route signature. FastAPI resolves ``getter`` itself (a normal
+    dependency, complete with its own nested ``Depends()`` chain and
+    per-request caching) via the returned callable's own ``Depends(getter)``
+    default, so ``app.dependency_overrides[getter]`` still reaches through
+    the wrapper exactly as it would a bare ``Depends(getter)`` parameter.
+
+    ``discogs/router.py``'s ``_require_service`` and ``cache/router.py``'s
+    ``_require_discogs_service`` were two hand-written copies of exactly this
+    "if service is None: raise HTTPException(503, ...)" shape; both are now
+    instances of this factory (``require_service(get_discogs_service, ...)``).
+    """
+
+    async def _require(service: T | None = Depends(getter)) -> T:
+        if service is None:
+            raise HTTPException(status_code=503, detail=detail) from None
+        return service
+
+    return _require
 
 
 async def close_entity_store() -> None:

@@ -7,6 +7,7 @@ import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from core.dependencies import get_discogs_cache_service, get_discogs_service
+from core.service_unavailable import service_unavailable_detail
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.markup_parser import DiscogsServiceResolver, parse_async
@@ -20,6 +21,7 @@ from discogs.models import (
     TracksAutocompleteResponse,
 )
 from discogs.service import DiscogsService
+from identity.dependencies import require_service
 
 logger = logging.getLogger(__name__)
 
@@ -36,15 +38,20 @@ _REFRESH_DESCRIPTION = (
     "`DELETE /admin/discogs/tombstone/{type}/{id}` for that recovery surface."
 )
 
+# LML#1036: does NOT fit `service_unavailable_detail`'s "is not available"
+# shape -- this one is phrased "is not configured". Kept as a hand-written
+# literal rather than changed to match every other service's detail bytes.
+_DISCOGS_SERVICE_UNAVAILABLE_DETAIL = (
+    "Discogs service is not configured. Set DISCOGS_TOKEN environment variable."
+)
+_DISCOGS_CACHE_UNAVAILABLE_DETAIL = service_unavailable_detail(
+    "Discogs cache", "Set DATABASE_URL_DISCOGS."
+)
 
-def _require_service(service: DiscogsService | None) -> DiscogsService:
-    """Raise 503 if service is not available."""
-    if service is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Discogs service is not configured. Set DISCOGS_TOKEN environment variable.",
-        )
-    return service
+# LML#1036: was a hand-written `_require_service` guard, a verbatim copy of
+# cache/router.py's own (now also retired). Both are instances of the shared
+# `require_service` factory (identity/dependencies.py).
+_require_discogs_service = require_service(get_discogs_service, _DISCOGS_SERVICE_UNAVAILABLE_DETAIL)
 
 
 def _refresh_l1(cached_func: Callable, *args, **kwargs) -> None:
@@ -82,10 +89,9 @@ async def get_track_releases(
     track: str = Query(..., description="Track/song title to search for"),
     artist: str | None = Query(None, description="Optional artist name for filtering"),
     limit: int = Query(20, ge=1, le=100, description="Maximum number of results"),
-    service: DiscogsService | None = Depends(get_discogs_service),
+    svc: DiscogsService = Depends(_require_discogs_service),
 ) -> TrackReleasesResponse:
     """Find all releases containing a specific track."""
-    svc = _require_service(service)
     return await svc.search_releases_by_track(track, artist, limit)
 
 
@@ -102,10 +108,9 @@ async def get_track_releases(
 async def get_release(
     release_id: int,
     refresh: bool = Query(False, description=_REFRESH_DESCRIPTION),
-    service: DiscogsService | None = Depends(get_discogs_service),
+    svc: DiscogsService = Depends(_require_discogs_service),
 ) -> ReleaseMetadataResponse:
     """Get full metadata for a release by ID."""
-    svc = _require_service(service)
     if refresh:
         _refresh_l1(DiscogsService.get_release, release_id)
     try:
@@ -141,10 +146,9 @@ async def get_release(
 async def get_artist(
     artist_id: int,
     refresh: bool = Query(False, description=_REFRESH_DESCRIPTION),
-    service: DiscogsService | None = Depends(get_discogs_service),
+    svc: DiscogsService = Depends(_require_discogs_service),
 ) -> ArtistDetails:
     """Get full details for an artist by Discogs ID."""
-    svc = _require_service(service)
     if refresh:
         _refresh_l1(DiscogsService.get_artist_details, artist_id)
     try:
@@ -196,11 +200,9 @@ async def resolve_entity(
     entity_type: EntityType,
     entity_id: int,
     refresh: bool = Query(False, description=_REFRESH_DESCRIPTION),
-    service: DiscogsService | None = Depends(get_discogs_service),
+    svc: DiscogsService = Depends(_require_discogs_service),
 ) -> EntityResolveResponse:
     """Resolve a Discogs entity (artist, release, or master) to its name."""
-    svc = _require_service(service)
-
     # Dispatch to the cached method matching this entity type. Adding a new
     # `EntityType` value MUST come with a matching entry here; the parametrized
     # test in test_discogs_router.py walks every enum value so a missing leg
@@ -263,7 +265,7 @@ async def autocomplete_tracks(
     if cache is None:
         raise HTTPException(
             status_code=503,
-            detail="Discogs cache is not available. Set DATABASE_URL_DISCOGS.",
+            detail=_DISCOGS_CACHE_UNAVAILABLE_DETAIL,
         )
 
     try:

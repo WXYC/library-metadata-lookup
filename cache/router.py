@@ -52,10 +52,11 @@ from core.bulk_concurrency import (
     watch_disconnect,
 )
 from core.dependencies import get_discogs_service, get_musicbrainz_pg
+from core.service_unavailable import service_unavailable_detail
 from discogs.ratelimit import set_discogs_low_priority
 from discogs.service import DiscogsService
 from entity.store import EntityStore
-from identity.dependencies import get_entity_store, require_entity_store
+from identity.dependencies import get_entity_store, require_entity_store, require_service
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
@@ -94,16 +95,15 @@ _REFRESH_DEFAULT_CONCURRENCY = 10
 
 _REFRESH_ROUTE = "/api/v1/cache/refresh-for-identities"
 
-_DISCOGS_SERVICE_UNAVAILABLE_DETAIL = (
-    "Discogs service is not available. Ensure DISCOGS_TOKEN (or "
-    "DISCOGS_API_KEY / DISCOGS_API_SECRET) is configured."
+_DISCOGS_SERVICE_UNAVAILABLE_DETAIL = service_unavailable_detail(
+    "Discogs service",
+    "Ensure DISCOGS_TOKEN (or DISCOGS_API_KEY / DISCOGS_API_SECRET) is configured.",
 )
 
-
-def _require_discogs_service(service: DiscogsService | None) -> DiscogsService:
-    if service is None:
-        raise HTTPException(status_code=503, detail=_DISCOGS_SERVICE_UNAVAILABLE_DETAIL) from None
-    return service
+# LML#1036: was a hand-written `_require_discogs_service` guard, a verbatim
+# copy of discogs/router.py's own (now also retired). Both are instances of
+# the shared `require_service` factory (identity/dependencies.py).
+_require_discogs_service = require_service(get_discogs_service, _DISCOGS_SERVICE_UNAVAILABLE_DETAIL)
 
 
 @router.post(
@@ -133,7 +133,7 @@ def _require_discogs_service(service: DiscogsService | None) -> DiscogsService:
 async def handle_refresh_for_identities(
     http_request: Request,
     entity_store: EntityStore | None = Depends(get_entity_store),
-    discogs_service: DiscogsService | None = Depends(get_discogs_service),
+    discogs: DiscogsService = Depends(_require_discogs_service),
     mb_pg: PgSourceProtocol | None = Depends(get_musicbrainz_pg),
     spotify_client: SpotifyClient | None = Depends(get_spotify_client),
     apple_music_client: AppleMusicClient | None = Depends(get_apple_music_client),
@@ -154,7 +154,6 @@ async def handle_refresh_for_identities(
     )
 
     store = require_entity_store(entity_store)
-    discogs = _require_discogs_service(discogs_service)
 
     # LML#927: this route is part of the bulk family (shares the LML#716
     # global permit with `/lookup/bulk` and identity bulk-resolve), so it is
