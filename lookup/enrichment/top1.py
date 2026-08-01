@@ -11,6 +11,7 @@ non-top-1 items reuse the same per-result streaming-URL build in
 ``lookup.enrichment.item``.
 """
 
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import ArtistDetails, DiscogsSearchResult, ReleaseMetadataResponse
 from discogs.service import DiscogsService
 
@@ -54,7 +55,18 @@ async def fetch_top1_release_details(
         if not isinstance(artist_id, int) or artist_id <= 0:
             return year, None, None, release, None
 
-        details = await discogs_service.get_artist_details(artist_id, lean=True)
+        try:
+            details = await discogs_service.get_artist_details(artist_id, lean=True)
+        except DiscogsBreakerOpenError:
+            # LML#1049: a breaker shed on the artist-bio step is "couldn't
+            # enrich the bio this time," not a reason to discard the
+            # release-level enrichment (``year`` / ``release``) already
+            # fetched successfully this same request. Degrade just the
+            # bio/wiki/details fields — narrower than the generic ``except``
+            # below, which (pre-existing, unchanged) still drops everything
+            # on a non-shed failure. No negative is cached either way:
+            # ``get_artist_details`` itself already guarantees that on a shed.
+            return year, None, None, release, None
         if not details:
             return year, None, None, release, None
 

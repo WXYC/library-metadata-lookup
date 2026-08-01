@@ -21,6 +21,7 @@ from wxyc_fastapi.http import async_singleton
 from wxyc_fastapi.observability import (
     add_breadcrumb,
     get_cache_stats_recorder,
+    get_posthog_client,
     timed_api,
 )
 
@@ -132,6 +133,49 @@ def reset_retry_budget_deadline(token: Token) -> None:
 # request is shed because the breaker is OPEN, so breaker-open time is alertable
 # on the same PostHog/Sentry seam as the row-less flag degradation alerts.
 BREAKER_OPEN_STAT_KEY = "discogs_breaker_open_shed"
+
+# LML#1049: a dedicated, low-volume PostHog counter for artist-path breaker
+# sheds — mirrors the LML#879 unsampled fail-open counter
+# (``discogs.ratelimit._capture_fail_open``/``_FAIL_OPEN_EVENT``) in shape and
+# emit mechanism. ``BREAKER_OPEN_STAT_KEY`` above already records every shed
+# (any method) on the shared ``cache.*`` seam, but that surface has no
+# per-method breakdown — before LML#1049, an artist-path shed was invisible
+# past it anyway (swallowed to ``None`` before propagating). Now that
+# ``get_artist_details`` re-raises, this counter gives the artist path its own
+# queryable, sampling-independent signal so a sustained breaker OPEN stays
+# observable without reintroducing the LML#805 per-event Sentry flood.
+_ARTIST_BREAKER_SHED_EVENT = "discogs_artist_breaker_shed"
+_ARTIST_BREAKER_POSTHOG_EVENT_PREFIX = "discogs_artist_breaker"
+_ARTIST_BREAKER_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
+
+
+def _capture_artist_breaker_shed(artist_id: int) -> None:
+    """Emit the unsampled PostHog counter for one artist-path breaker shed.
+
+    Mirrors ``discogs.ratelimit._capture_fail_open`` (LML#879): best-effort,
+    gated by ``Settings.enable_telemetry``, wired through the shared
+    ``wxyc_fastapi.observability.get_posthog_client`` accessor. A telemetry
+    failure must never turn the shed's re-raise into something worse — every
+    branch below is wrapped so this function cannot raise.
+    """
+    try:
+        settings = get_settings()
+        if not settings.enable_telemetry:
+            return
+        client = get_posthog_client(event_prefix=_ARTIST_BREAKER_POSTHOG_EVENT_PREFIX)
+        if client is None:
+            return
+        client.capture(
+            distinct_id=_ARTIST_BREAKER_POSTHOG_DISTINCT_ID,
+            event=_ARTIST_BREAKER_SHED_EVENT,
+            properties={
+                "artist_id": artist_id,
+                "environment": settings.environment,
+            },
+        )
+    except Exception:
+        logger.warning("Failed to emit %s counter", _ARTIST_BREAKER_SHED_EVENT, exc_info=True)
+
 
 # Log fingerprint for `search_artists`' malformed-item page-distrust path.
 # The live smoke (tests/integration/test_search_artists_live.py) matches on
@@ -1658,16 +1702,31 @@ class DiscogsService:
                 )
 
             except DiscogsBreakerOpenError:
-                # LML#805: a saturation-breaker shed is expected degrade, not an
-                # artist-fetch failure — DEBUG, not ERROR, so a sustained OPEN
-                # episode doesn't flood Sentry (#755). Return ``None`` (same as
-                # the generic path). The LML#510 ERROR path below is reserved for
-                # genuine fetch failures / artist 404s, which stay alertable.
+                # LML#1049 FIX 1 (mirrors ``get_release``'s LML#755 FIX 1 above): a
+                # breaker shed is "couldn't ask," not "asked, Discogs confirms no
+                # such artist" — re-raise BEFORE any tombstone/write-back so the
+                # shed can never poison the artist cache. This exception escapes
+                # ``fallthrough()`` (``discogs/fallthrough.py``) untouched: its
+                # write-back is gated on ``api_result is not None``, which is only
+                # ever reached if ``_api_fetch`` *returns* — raising here skips
+                # that gate entirely, same ordering that already protects
+                # ``get_release`` (see ``cache/dispatch.py``'s "get_release
+                # re-raised before any tombstone/write-back" comment). Was: LML#805
+                # caught this and returned ``None`` (identical to a genuine 404) to
+                # avoid flooding Sentry during a sustained OPEN episode (32.5K
+                # events, LML#805) — DEBUG-level logging plus the dedicated
+                # low-volume ``_capture_artist_breaker_shed`` counter below
+                # preserve that no-flood property without swallowing the signal.
+                # Downstream callers now handle the shed per their own semantics
+                # (router → 503, cache-refresh dispatcher → retriable ``error``,
+                # bio/markup enrichment → silent per-request degrade) instead of
+                # every one of them seeing an indistinguishable ``None``.
+                _capture_artist_breaker_shed(artist_id)
                 logger.debug(
-                    "Discogs saturation breaker shed get_artist_details for %s; returning None",
+                    "Discogs saturation breaker shed get_artist_details for %s; propagating",
                     artist_id,
                 )
-                return None
+                raise
             except Exception as e:
                 # LML#510: promoted from warning → error so Sentry's default
                 # `error+` filter captures artist 404s post-deploy. The
@@ -1721,8 +1780,20 @@ class DiscogsService:
 
         Returns:
             Image URI string, or None if unavailable
+
+        A saturation-breaker shed degrades to ``None`` here rather than
+        propagating (LML#1049): this is a best-effort artwork-fallback helper
+        (sole caller: ``lookup.artwork._resolve_fallback_artwork``, which
+        already treats ``None`` as "no fallback image this time" and does no
+        caching of its own), so "couldn't ask" and "asked, no image" are both
+        safe to collapse to ``None`` at this boundary — unlike
+        ``get_artist_details`` itself, nothing here would ever persist a
+        negative as a result.
         """
-        details = await self.get_artist_details(artist_id)
+        try:
+            details = await self.get_artist_details(artist_id)
+        except DiscogsBreakerOpenError:
+            return None
         return details.image_url if details else None
 
     @async_cached(LABEL_CACHE)

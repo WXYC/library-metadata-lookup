@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from clients.streaming.apple_music import AppleMusicClient, AppleMusicTrackMatch
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import (
     ArtistCredit,
     ArtistDetails,
@@ -385,6 +386,73 @@ class TestTop1LeanHydration:
 
         discogs_service.get_release.assert_awaited_once_with(555, lean=True)
         discogs_service.get_artist_details.assert_awaited_once_with(99, lean=True)
+
+
+class TestTop1ArtistBreakerShed:
+    """LML#1049 call site (``lookup/enrichment/top1.py:57``): best-effort
+    enrichment. ``get_artist_details`` now re-raises a saturation-breaker shed
+    instead of swallowing it, so a shed on the artist bio step must not throw
+    away the release-level enrichment (``year`` / ``release``) that already
+    succeeded this same request -- only the bio/wiki are dropped, "couldn't
+    enrich the bio this time." No negative is cached (``get_artist_details``
+    itself already guarantees that on a shed)."""
+
+    @pytest.mark.asyncio
+    async def test_shed_on_artist_step_preserves_already_fetched_release(self):
+        from lookup.enrichment.top1 import fetch_top1_release_details
+
+        artwork = make_discogs_result(
+            release_id=555,
+            artist="Duke Ellington & John Coltrane",
+            album="Duke Ellington & John Coltrane",
+        )
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=555,
+            title="Duke Ellington & John Coltrane",
+            artist="Duke Ellington & John Coltrane",
+            year=1963,
+            artist_id=99,
+            release_url="https://discogs.com/release/555",
+        )
+        discogs_service.get_artist_details.side_effect = DiscogsBreakerOpenError("shed")
+
+        year, bio, wiki, release, details = await fetch_top1_release_details(
+            discogs_service, artwork
+        )
+
+        assert year == 1963
+        assert release is not None
+        assert release.release_id == 555
+        assert bio is None
+        assert wiki is None
+        assert details is None
+
+    @pytest.mark.asyncio
+    async def test_non_breaker_error_on_artist_step_still_degrades_fully(self):
+        """Contrast: a non-shed error on the artist step keeps the pre-existing
+        broad-catch behavior (drops the whole tuple), unaffected by LML#1049."""
+        from lookup.enrichment.top1 import fetch_top1_release_details
+
+        artwork = make_discogs_result(
+            release_id=555,
+            artist="Duke Ellington & John Coltrane",
+            album="Duke Ellington & John Coltrane",
+        )
+        discogs_service = AsyncMock()
+        discogs_service.get_release.return_value = ReleaseMetadataResponse(
+            release_id=555,
+            title="Duke Ellington & John Coltrane",
+            artist="Duke Ellington & John Coltrane",
+            year=1963,
+            artist_id=99,
+            release_url="https://discogs.com/release/555",
+        )
+        discogs_service.get_artist_details.side_effect = RuntimeError("Discogs 500")
+
+        result = await fetch_top1_release_details(discogs_service, artwork)
+
+        assert result == (None, None, None, None, None)
 
 
 class TestEnrichArtworkResultsExtended:

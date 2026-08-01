@@ -186,6 +186,33 @@ async def _refresh_discogs_artist(
             await discogs_service.get_artist_details(artist_id)
         except asyncio.CancelledError:
             raise
+        except DiscogsBreakerOpenError:
+            # LML#1049: ``get_artist_details`` now re-raises a saturation-breaker
+            # shed (mirroring ``get_release``'s LML#755 FIX-1, propagated to this
+            # walk-to-artist leg the same way ``_refresh_discogs_release`` above
+            # already handles the release leg — LML#814). Without this dedicated
+            # arm the shed would fall into the generic ``except Exception`` below
+            # and log at ERROR via ``logger.exception``, reproducing the #755
+            # Sentry flood (the Sentry LoggingIntegration promotes each such
+            # record to a discrete event) on this cron-driven fan-out.
+            #
+            # A shed is expected degrade: log at DEBUG and record the retriable
+            # ``error`` outcome, tagged ``message="DiscogsBreakerOpenError"`` so a
+            # dashboard can tell it apart from a hard leg failure — same shape as
+            # the release leg. Nothing negative is persisted: ``get_artist_details``
+            # re-raised before any tombstone/write-back (LML#1049 FIX 1), and this
+            # dispatcher only reports outcomes, it does not cache.
+            logger.debug(
+                "cache refresh: discogs artist leg shed by saturation breaker "
+                "artist_id=%d; recording retriable error (cache-only)",
+                artist_id,
+            )
+            span.set_data("lml.cache.outcome", "error")
+            return ArtistRefreshOutcome(
+                external_id=str(artist_id),
+                outcome="error",
+                message="DiscogsBreakerOpenError",
+            )
         except Exception as exc:
             logger.exception("cache refresh: discogs artist leg failed artist_id=%d", artist_id)
             span.set_data("lml.cache.outcome", "error")

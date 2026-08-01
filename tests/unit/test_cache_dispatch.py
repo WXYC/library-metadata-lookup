@@ -409,6 +409,48 @@ class TestRefreshIdentity:
         assert artist_outcomes[0].outcome == "error"
         assert artist_outcomes[0].external_id == "42"
 
+    async def test_artist_leg_breaker_shed_records_error_without_error_log(self, caplog):
+        """LML#1049: mirrors ``test_release_leg_breaker_shed_records_error_without_error_log``.
+
+        ``get_artist_details`` now re-raises a saturation-breaker shed (LML#1049,
+        mirroring ``get_release``'s LML#755 FIX 1) instead of swallowing it to
+        ``None``. Without a dedicated ``except DiscogsBreakerOpenError`` leg here,
+        that shed would fall into the generic ``except Exception`` a few lines
+        below and log at ERROR via ``logger.exception`` — reproducing the #755
+        Sentry flood on this cron-driven walk-to-artists path. The shed must:
+        emit no ERROR-level record; record the retriable ``error`` outcome
+        tagged ``message="DiscogsBreakerOpenError"`` (parallel to the release
+        leg's own tag); and not demote the release leg's own ``warmed`` status
+        (an artist failure inside a release walk is partial value, not a retry
+        trigger — same rule as the generic-exception case above).
+        """
+        rel = _release(artists=[ArtistCredit(artist_id=42, name="Juana Molina")])
+        discogs = AsyncMock()
+        discogs.get_release = AsyncMock(return_value=rel)
+        discogs.get_artist_details = AsyncMock(
+            side_effect=DiscogsBreakerOpenError("Discogs saturation breaker open")
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            result = await refresh_identity(
+                identity_id=1,
+                source_pairs=[("discogs_release", "12345")],
+                discogs_service=discogs,
+            )
+
+        assert result.status == "warmed"
+        artist_outcomes = result.sources["discogs_release"].artists
+        assert len(artist_outcomes) == 1
+        assert artist_outcomes[0].outcome == "error"
+        assert artist_outcomes[0].external_id == "42"
+        assert artist_outcomes[0].message == "DiscogsBreakerOpenError"
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records == [], f"breaker shed emitted ERROR record(s): {error_records}"
+        assert any(
+            r.levelno == logging.DEBUG and "breaker" in r.getMessage().lower()
+            for r in caplog.records
+        )
+
     async def test_empty_source_pairs_rolls_up_to_not_implemented(self):
         """A row with no per-source columns populated still emits a result."""
         discogs = AsyncMock()

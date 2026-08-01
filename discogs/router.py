@@ -154,16 +154,12 @@ async def get_artist(
     try:
         result = await svc.get_artist_details(artist_id)
     except DiscogsBreakerOpenError as e:
-        # LML#1031: defensive wrap, mirroring resolve_entity's framing below —
-        # NOT closing an active 500. get_artist_details's own _api_fetch
-        # currently CATCHES DiscogsBreakerOpenError internally and returns
-        # None (LML#805, service.py ~1685-1695) rather than propagating it,
-        # unlike get_release's _api_fetch, which re-raises (service.py
-        # ~1520-1526, "FIX 1"). So today a real breaker shed here surfaces as
-        # the 404 branch below, not this one. This except exists so the 503
-        # contract holds the moment get_artist_details ever starts
-        # propagating a shed instead of swallowing it. LML#1049 tracks the
-        # decision on whether/how to close that gap (shed -> misleading 404).
+        # LML#1031 originally added this wrap defensively — get_artist_details's
+        # own _api_fetch used to CATCH DiscogsBreakerOpenError internally and
+        # return None (LML#805), so a real shed surfaced as the 404 branch
+        # below, not here. LML#1049 closed that gap: _api_fetch now re-raises
+        # (mirroring get_release's FIX 1, service.py ~1495-1501), so this
+        # branch is live in production, not just a defensive placeholder.
         raise HTTPException(
             status_code=503,
             detail="Discogs temporarily shed (rate-saturated); retry shortly.",
@@ -180,6 +176,15 @@ async def get_artist(
             resolver = DiscogsServiceResolver(svc)
             result.profile_tokens = await parse_async(result.profile, resolver)
         except Exception:
+            # LML#1049 related-observation: this broad catch would also swallow a
+            # DiscogsBreakerOpenError raised while DiscogsServiceResolver walks
+            # entity refs in the profile markup (it can make further live
+            # Discogs calls). No separate fix needed — DiscogsServiceResolver's
+            # own resolve_artist/resolve_release already catch and degrade any
+            # exception (including a shed) to None per-token before it would
+            # ever reach this frame, so a shed here renders as a dropped token,
+            # never an uncaught propagation. See
+            # tests/unit/test_markup_parser.py::TestDiscogsServiceResolver.
             logger.warning("Failed to parse profile markup for artist %d", artist_id)
 
     return result
@@ -235,9 +240,11 @@ async def resolve_entity(
             return EntityResolveResponse(name=master.title, type=entity_type, id=entity_id)
     except DiscogsBreakerOpenError as e:
         # LML#755 R2-3: a saturation-breaker shed on this diagnostic route → 503
-        # (transient), not a raw 500. Currently only the release branch's
-        # ``get_release`` re-raises the shed, but wrapping the whole dispatch
-        # keeps the contract if another branch's fetch ever propagates it too.
+        # (transient), not a raw 500. Both the release branch's ``get_release``
+        # (LML#755 FIX 1) and the artist branch's ``get_artist_details``
+        # (LML#1049) re-raise a shed; wrapping the whole dispatch also keeps
+        # the contract if the master branch's fetch ever starts propagating
+        # one too.
         raise HTTPException(
             status_code=503,
             detail="Discogs temporarily shed (rate-saturated); retry shortly.",
