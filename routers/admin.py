@@ -370,7 +370,6 @@ async def upload_library_db(
 async def upload_streaming_db(
     file: UploadFile,
     force: bool = False,
-    settings: Settings = Depends(get_settings),
     object_store: ObjectStore = Depends(get_object_store),
 ):
     """Store a streaming_availability.db backup in the object store.
