@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from library.db import LibraryDB, _to_fts_match_query
+from library.db import LibraryDB, _fts_normalize, _to_fts_match_query
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -399,6 +399,36 @@ class TestToFtsMatchQuery:
     def test_whitespace_only_query_yields_empty_string(self):
         assert _to_fts_match_query("   ") == ""
         assert _to_fts_match_query("\t\n") == ""
+
+
+# ---------------------------------------------------------------------------
+# _fts_normalize
+# ---------------------------------------------------------------------------
+
+
+class TestFtsNormalize:
+    """Pure helper shared by ``_fallback_like_search`` and ``_fuzzy_search``:
+    strips diacritics via wxyc_etl's ``to_match_form`` and then collapses any
+    remaining non-alphanumeric character to a space, so the LIKE/fuzzy
+    fallback chain tokenizes on plain ASCII words."""
+
+    @pytest.mark.parametrize(
+        "query, expected",
+        [
+            # Diacritics are stripped to their ASCII base letters.
+            ("Nilüfer Yanya", "nilufer yanya"),
+            ("Hermanos Gutiérrez", "hermanos gutierrez"),
+            # Punctuation collapses to whitespace rather than disappearing,
+            # so words on either side don't fuse together.
+            ("Chuquimamani-Condori", "chuquimamani condori"),
+            ("Duke Ellington & John Coltrane", "duke ellington   john coltrane"),
+            # Empty and whitespace-only input yields empty output.
+            ("", ""),
+            ("   ", ""),
+        ],
+    )
+    def test_normalizes_query(self, query, expected):
+        assert _fts_normalize(query) == expected
 
 
 class TestSearchEmptyMatchQueryGuard:

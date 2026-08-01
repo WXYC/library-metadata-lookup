@@ -87,6 +87,23 @@ def _to_fts_match_query(query: str) -> str:
     return " ".join('"' + t.replace('"', '""') + '"' for t in terms)
 
 
+def _fts_normalize(query: str) -> str:
+    """Normalize a query for the LIKE/fuzzy fallback tokenizers.
+
+    First strips diacritics and lowercases via the shared ``wxyc_etl``
+    ``to_match_form`` (so e.g. "Nilüfer Yanya" matches "nilufer yanya"),
+    then collapses every remaining non-ASCII-alphanumeric, non-whitespace
+    character to a space. The collapse-to-space (rather than delete) keeps
+    punctuation from fusing adjacent words together -- "Chuquimamani-Condori"
+    becomes "chuquimamani condori", two tokens, not "chuquimamanicondori".
+
+    Used by :meth:`LibraryDB._fallback_like_search` and
+    :meth:`LibraryDB._fuzzy_search`, which both split the result on
+    whitespace to build their word lists.
+    """
+    return re.sub(r"[^a-z0-9\s]", " ", normalize_for_comparison(query))
+
+
 # Module-level caches for library search results.
 # Lazy-initialized from settings. Cleared when the database is closed/replaced.
 _artist_cache: TTLCache | None = None
@@ -389,7 +406,7 @@ class LibraryDB:
         Splits query into words and searches for titles/artists containing all words.
         """
         # Strip diacritics first, then remove remaining special chars
-        normalized = re.sub(r"[^a-z0-9\s]", " ", normalize_for_comparison(query))
+        normalized = _fts_normalize(query)
         words = normalized.split()
 
         # Remove stopwords that might cause mismatches
@@ -487,7 +504,7 @@ class LibraryDB:
             threshold: Minimum fuzzy match score (0-100) to include results
         """
         # Strip diacritics first, then remove remaining special chars
-        normalized = re.sub(r"[^a-z0-9\s]", " ", normalize_for_comparison(query))
+        normalized = _fts_normalize(query)
         words = normalized.split()
 
         if not words:
