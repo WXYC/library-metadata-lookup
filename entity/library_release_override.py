@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 
+from entity.cache_toolkit import swallowing_fetch
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -92,9 +93,14 @@ async def get_library_release_overrides(pg: PgSource, library_ids: list[int]) ->
     """
     if not library_ids:
         return {}
-    try:
-        rows = await pg.fetchall(_SELECT_SQL, library_ids)
-    except Exception:
-        logger.exception("library_release_override prefetch failed for %d ids", len(library_ids))
-        return {}
+    rows = await swallowing_fetch(
+        pg,
+        _SELECT_SQL,
+        library_ids,
+        miss=[],
+        logger=logger,
+        log_label="library_release_override prefetch failed for %d ids",
+        log_args=(len(library_ids),),
+        many=True,
+    )
     return {row["library_id"]: row["discogs_release_id"] for row in rows}

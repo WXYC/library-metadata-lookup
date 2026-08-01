@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from entity.cache_toolkit import swallowing_execute
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -119,10 +120,13 @@ async def mark_key_used(pg: PgSource, key_hash: str) -> None:
     The throttling ``WHERE`` clause in ``_TOUCH_LAST_USED_SQL`` means a touch
     within the last hour is a no-op UPDATE (0 rows affected), not an error.
     """
-    try:
-        await pg.execute(_TOUCH_LAST_USED_SQL, key_hash)
-    except Exception:
-        logger.exception("api_keys last_used_at touch failed")
+    await swallowing_execute(
+        pg,
+        _TOUCH_LAST_USED_SQL,
+        key_hash,
+        logger=logger,
+        log_label="api_keys last_used_at touch failed",
+    )
 
 
 async def insert_api_key(
