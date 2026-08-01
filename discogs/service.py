@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import time
 import weakref
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from contextvars import ContextVar, Token
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -24,9 +25,9 @@ from wxyc_fastapi.observability import (
 )
 
 from config.settings import get_settings
+from discogs.admission import admit_or_shed, retry_429
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.fallthrough import apply_request_ctx_tags, fallthrough, request_context
-from discogs.live_request_counter import increment_discogs_live_requests_total
 from discogs.matching import (
     TRACK_TITLE_FUZZY_MATCH_THRESHOLD,
     TracklistEntry,
@@ -250,6 +251,114 @@ def _project_bulk_semaphore_wait(wait_ms: float) -> None:
             transaction.set_data(_BULK_SEMAPHORE_WAIT_MEASUREMENT, wait_ms)
     except Exception as e:
         logger.warning("Failed to project Discogs bulk semaphore wait: %s", e)
+
+
+@contextlib.asynccontextmanager
+async def acquire_discogs_permits(
+    bulk_semaphore: asyncio.Semaphore | None,
+    semaphore: asyncio.Semaphore,
+    *,
+    low_priority: bool,
+) -> AsyncIterator[None]:
+    """Hold the LML#927 bulk reservation (outer, when ``bulk_semaphore`` is
+    given) and the shared LML#358/#569 concurrency permit (inner) for the
+    duration of the block.
+
+    LML#1040: extracted out of ``_request_with_retry``'s retry loop into its
+    own composable, independently-testable piece -- kept in THIS module
+    (rather than ``discogs/admission.py``, where ``admit_or_shed`` and
+    ``retry_429`` moved) because ``tests/unit/test_discogs_service.py::
+    TestRequestWithRetrySpans`` patches the whole ``discogs.service.sentry_sdk``
+    name; see that test file and the note atop ``discogs/admission.py`` for why.
+
+    The semaphore wraps a single attempt, not the whole retry loop (LML#569).
+    A 429's inter-attempt ``asyncio.sleep(Retry-After)`` must run *outside*
+    the held permit, so a caller riding out a 30-60s rate-limit window
+    doesn't park one of the 5 permits for that whole window and amplify
+    ``lml.discogs.semaphore`` acquire-wait for unrelated callers (the last
+    unhandled tail of #537, cause #3) -- callers must ``async with`` this
+    context manager PER ATTEMPT, not once for the whole retry loop. The egress
+    cap is still the per-attempt rate-gate acquire the caller performs inside
+    this block -- releasing the semaphore during the sleep does not bypass it.
+
+    This ``try/finally`` guarantees exactly one release per acquire:
+    cancellation mid-block or a raise inside it leaves no leaked permit and
+    never double-releases. As a result the ``lml.discogs.semaphore`` /
+    ``lml.discogs.rate_limiter`` spans fire once per attempt rather than once
+    per request -- a span-count schema change documented in the #569 PR (no
+    dashboard/alert aggregates on that count).
+
+    LML#927: a low-priority call holds the bulk reservation semaphore OUTER
+    to the shared semaphore, acquired first so bulk can never occupy more
+    than ``LML_DISCOGS_BULK_MAX_CONCURRENT`` of the shared permits --
+    reserving the rest for interactive callers. Both acquires (and
+    everything the caller does inside this block) live inside the same
+    try/finally as the request itself -- so a cancellation between the two
+    acquires (bulk granted, then cancelled while waiting on the shared one)
+    cannot strand the bulk permit. Released INNER -> OUTER (shared semaphore
+    first, then bulk) in the ``finally``, the same ordered, deadlock-free
+    discipline LML#953 established: nothing already holding the shared
+    semaphore ever waits on this one, so no acquire cycle can form.
+
+    Explicit acquire/release (not ``async with semaphore:``) so the wait is
+    wrapped in a Sentry span. The 5-permit semaphore is the dominant source
+    of pre-request dark time on backfill cascades -- sampling the queue depth
+    right before the await gives the trace explorer a relative-load signal
+    per call. See WXYC/library-metadata-lookup#358.
+
+    Args:
+        bulk_semaphore: The LML#927 bulk-lane reservation semaphore, or
+            ``None`` for an interactive (non-low-priority) caller -- in
+            which case only ``semaphore`` is touched.
+        semaphore: The shared LML#358/#569 concurrency semaphore.
+        low_priority: Tags the ``lml.discogs.semaphore`` span/transaction
+            with ``lml.discogs.priority`` (``"bulk"`` or ``"interactive"``)
+            so wait-time p95/p99 can be sliced by traffic class.
+    """
+    bulk_permit_held = False
+    main_permit_held = False
+    try:
+        if bulk_semaphore is not None:
+            with sentry_sdk.start_span(
+                op="lock.acquire", name="lml.discogs.bulk_semaphore"
+            ) as bulk_span:
+                bulk_queue_depth = _approx_semaphore_queue_depth(bulk_semaphore)
+                bulk_span.set_data("lml.bulk_semaphore.queue_depth", bulk_queue_depth)
+                _project_bulk_semaphore_queue_depth(bulk_queue_depth)
+                apply_request_ctx_tags(bulk_span)
+                bulk_capped_on_arrival = bulk_semaphore.locked()
+                bulk_wait_start = time.perf_counter()
+                await bulk_semaphore.acquire()
+                bulk_permit_held = True
+                if bulk_capped_on_arrival:
+                    _project_bulk_semaphore_wait((time.perf_counter() - bulk_wait_start) * 1000.0)
+
+        with sentry_sdk.start_span(op="lock.acquire", name="lml.discogs.semaphore") as span:
+            queue_depth = _approx_semaphore_queue_depth(semaphore)
+            span.set_data("lml.semaphore.queue_depth", queue_depth)
+            _project_semaphore_queue_depth(queue_depth)
+            apply_request_ctx_tags(span)
+            # LML#927: tag this span with the traffic class so
+            # ``lml.discogs.semaphore`` p95/p99 wait can be sliced by class --
+            # the direct signal for verifying interactive is no longer
+            # head-of-line-blocked behind bulk.
+            sentry_sdk.set_tag("lml.discogs.priority", "bulk" if low_priority else "interactive")
+            await semaphore.acquire()
+            main_permit_held = True
+
+        yield
+    finally:
+        # Released before the retry sleep, on success, and on any
+        # error/cancellation in this attempt -- one release per acquire.
+        # Inner (shared semaphore) released before outer (bulk reservation).
+        if main_permit_held:
+            semaphore.release()
+        if bulk_permit_held:
+            # ``bulk_permit_held`` is only ever set True inside the
+            # ``bulk_semaphore is not None`` branch above, so the semaphore
+            # itself is never None here.
+            assert bulk_semaphore is not None
+            bulk_semaphore.release()
 
 
 def _parse_ratelimit_remaining(raw: str | None) -> int | None:
@@ -555,67 +664,28 @@ class DiscogsService:
         low_priority = is_discogs_low_priority()
         bulk_semaphore = get_bulk_discogs_semaphore() if low_priority else None
 
-        # LML#755 saturation shed. When the breaker is OPEN, fast-fail *before*
-        # ``rate_limiter.acquire()`` — no queuing on the 50/min limiter, no
-        # network call, no 429 backoff sleep. The shed raises
-        # ``DiscogsBreakerOpenError`` (NOT a ``None`` return): a shed is
-        # "couldn't ask, try later", which callers must treat as *unknown* —
-        # never a confirmed-empty verdict that would poison a durable negative
-        # cache (LML#755 review, FIX 1). Cache hits never reach here — they
-        # short-circuit in ``fallthrough`` before the live probe — so only the
-        # live-probe tail is shed. ``epoch`` guards the half-open trial: the
-        # terminal ``record_*`` below only drives a half-open transition when its
-        # epoch still matches (FIX 6).
-        #
-        # LML#940: count every live-Discogs request *attempt* right here,
-        # before the admit/shed decision -- a shed attempt is demand too, and
-        # this is the sole ``allow_request()`` call site. See
-        # ``discogs/live_request_counter.py`` for why counting here (not per
-        # ``/lookup``) is required for the wxyc-canary idle-tail fix.
-        increment_discogs_live_requests_total()
-        epoch = breaker.allow_request()
-        if epoch is None:
-            self._record_breaker_shed(method, path)
-            raise DiscogsBreakerOpenError(f"Discogs saturation breaker open: {method} {path}")
-
         # LML#537: tag both wait spans with the seam's method + cache_state
         # via ``apply_request_ctx_tags`` (a no-op when no context is active —
         # the case for the small handful of legacy direct-call tests).
         # Production callers enter via ``fallthrough()`` (dominant) or via
         # the ``request_context()`` helper (the four API-only methods that
         # bypass the seam and the four ``cache is None`` fallback branches).
+        #
+        # LML#1040: the admission stack below composes three independently
+        # tested pieces (``discogs/admission.py`` -- read their docstrings for
+        # the full rationale this used to carry inline): ``admit_or_shed``
+        # (LML#755 breaker admit/shed + LML#787 abort bookkeeping),
+        # ``acquire_discogs_permits`` (LML#927 bulk reservation, outer, +
+        # LML#358/#569 shared semaphore, inner -- per attempt, released before
+        # the retry sleep), and ``retry_429`` (the 429 backoff loop, with the
+        # LML#758 caller-budget-deadline early-giveup). Verified acquire order
+        # (unchanged from pre-#1040): breaker admit -> per attempt: bulk
+        # sub-semaphore -> shared semaphore -> rate gate -> request.
+        async with admit_or_shed(
+            breaker, method, path, on_shed=self._record_breaker_shed
+        ) as admission:
 
-        # The semaphore wraps a single attempt, not the whole retry loop
-        # (LML#569). A 429's inter-attempt ``asyncio.sleep(Retry-After)`` runs
-        # *outside* the held permit, so a caller riding out a 30-60s rate-limit
-        # window no longer parks one of the 5 permits for that whole window and
-        # amplifies ``lml.discogs.semaphore`` acquire-wait for unrelated callers
-        # (the last unhandled tail of #537, cause #3). The egress cap is still
-        # the per-attempt ``rate_limiter.acquire()`` below — releasing the
-        # semaphore during the sleep does not bypass the AsyncLimiter.
-        #
-        # The per-attempt try/finally guarantees exactly one release per
-        # acquire: cancellation mid-sleep (sleep is outside the block) or a
-        # raise inside the request leaves no leaked permit and never
-        # double-releases. As a result the ``lml.discogs.semaphore`` /
-        # ``lml.discogs.rate_limiter`` spans now fire once per attempt rather
-        # than once per request — a span-count schema change documented in the
-        # #569 PR (no current dashboard/alert aggregates on that count).
-        #
-        # LML#787: an ADMITTED request must always resolve its breaker
-        # bookkeeping. The terminal ``record_*`` sites below set ``recorded``;
-        # any exit that reaches the outer ``finally`` without one — the
-        # ``httpx.RequestError`` → ``return None`` path, cancellation during
-        # the request / limiter acquire / retry sleep, or an unexpected raise —
-        # reports ``record_aborted``. If the victim was the HALF_OPEN trial,
-        # that re-OPENs the breaker (fresh cool-down → fresh trial) instead of
-        # latching it shedding forever (the 2026-07-13 incident); in every
-        # other state/epoch it is a no-op. The mid-flight shed raise inside the
-        # loop also lands here: its entry epoch is stale by construction
-        # (``_open`` bumped it), so the abort is a guaranteed no-op.
-        recorded = False
-        try:
-            for attempt in range(max_retries + 1):
+            async def _attempt(attempt: int) -> httpx.Response:
                 # LML#755 in-flight shed (FIX 3 / R2-1): re-check the breaker at
                 # the top of each attempt via the READ-ONLY
                 # ``should_shed_inflight`` — NOT the state-mutating
@@ -628,72 +698,15 @@ class DiscogsService:
                 # genuine trial (matching epoch) finish and sheds everyone else.
                 # The first attempt (attempt 0) was just admitted above, so only
                 # re-check on retries.
-                if attempt > 0 and breaker.should_shed_inflight(epoch):
+                if attempt > 0 and breaker.should_shed_inflight(admission.epoch):
                     self._record_breaker_shed(method, path)
                     raise DiscogsBreakerOpenError(
                         f"Discogs saturation breaker opened mid-flight: {method} {path}"
                     )
 
-                # LML#927: a low-priority call holds the bulk reservation
-                # semaphore OUTER to the shared semaphore below, acquired
-                # first so bulk can never occupy more than
-                # ``LML_DISCOGS_BULK_MAX_CONCURRENT`` of the shared permits --
-                # reserving the rest for interactive callers. Both acquires
-                # (and everything downstream) now live inside the same
-                # try/finally as the request itself -- not just the bare
-                # `await ...acquire()` calls the pre-#927 code used outside any
-                # try -- so a cancellation between the two acquires (bulk
-                # granted, then cancelled while waiting on the shared one)
-                # cannot strand the bulk permit. Released INNER -> OUTER
-                # (shared semaphore first, then bulk) in the `finally`, the
-                # same ordered, deadlock-free discipline LML#953 established:
-                # nothing already holding the shared semaphore ever waits on
-                # this one, so no acquire cycle can form.
-                bulk_permit_held = False
-                main_permit_held = False
-                try:
-                    if bulk_semaphore is not None:
-                        with sentry_sdk.start_span(
-                            op="lock.acquire", name="lml.discogs.bulk_semaphore"
-                        ) as bulk_span:
-                            bulk_queue_depth = _approx_semaphore_queue_depth(bulk_semaphore)
-                            bulk_span.set_data("lml.bulk_semaphore.queue_depth", bulk_queue_depth)
-                            _project_bulk_semaphore_queue_depth(bulk_queue_depth)
-                            apply_request_ctx_tags(bulk_span)
-                            bulk_capped_on_arrival = bulk_semaphore.locked()
-                            bulk_wait_start = time.perf_counter()
-                            await bulk_semaphore.acquire()
-                            bulk_permit_held = True
-                            if bulk_capped_on_arrival:
-                                _project_bulk_semaphore_wait(
-                                    (time.perf_counter() - bulk_wait_start) * 1000.0
-                                )
-
-                    # Explicit acquire/release (not `async with semaphore:`) so
-                    # the wait is wrapped in a Sentry span. The 5-permit
-                    # semaphore is the dominant source of pre-request dark time
-                    # on backfill cascades — sampling the queue depth right
-                    # before the await gives the trace explorer a
-                    # relative-load signal per call. See
-                    # WXYC/library-metadata-lookup#358.
-                    with sentry_sdk.start_span(
-                        op="lock.acquire", name="lml.discogs.semaphore"
-                    ) as span:
-                        queue_depth = _approx_semaphore_queue_depth(semaphore)
-                        span.set_data("lml.semaphore.queue_depth", queue_depth)
-                        _project_semaphore_queue_depth(queue_depth)
-                        apply_request_ctx_tags(span)
-                        # LML#927: tag this span with the traffic class so
-                        # ``lml.discogs.semaphore`` p95/p99 wait can be sliced
-                        # by class -- the direct signal for verifying
-                        # interactive is no longer head-of-line-blocked behind
-                        # bulk.
-                        sentry_sdk.set_tag(
-                            "lml.discogs.priority", "bulk" if low_priority else "interactive"
-                        )
-                        await semaphore.acquire()
-                        main_permit_held = True
-
+                async with acquire_discogs_permits(
+                    bulk_semaphore, semaphore, low_priority=low_priority
+                ):
                     with sentry_sdk.start_span(
                         op="lock.acquire", name="lml.discogs.rate_limiter"
                     ) as span:
@@ -708,107 +721,86 @@ class DiscogsService:
                     remaining = response.headers.get("X-Discogs-Ratelimit-Remaining")
                     if remaining:
                         logger.debug(f"Discogs rate limit remaining: {remaining}")
-                except httpx.RequestError as e:
-                    logger.error(
-                        "Discogs request failed: %s %s -> %s: %r",
-                        method,
-                        path,
-                        type(e).__name__,
-                        e,
-                        exc_info=True,
-                    )
-                    # No terminal ``record_*`` here on purpose: a network-layer
-                    # failure is not a rate-limit signal, so it neither feeds
-                    # the failure run nor closes a trial. The outer ``finally``
-                    # reports ``record_aborted`` (LML#787) so a dying trial
-                    # re-OPENs instead of latching.
-                    return None
-                finally:
-                    # Released before the retry sleep below, on success, and on
-                    # any error/cancellation in this attempt — one release per
-                    # acquire. Inner (shared semaphore) released before outer
-                    # (bulk reservation).
-                    if main_permit_held:
-                        semaphore.release()
-                    if bulk_permit_held:
-                        # `bulk_permit_held` is only ever set True inside the
-                        # `bulk_semaphore is not None` branch above, so the
-                        # semaphore itself is never None here.
-                        assert bulk_semaphore is not None
-                        bulk_semaphore.release()
 
-                # LML#755: feed the breaker **once per request, on the terminal
-                # outcome** (FIX 2/5), not per attempt — the counting unit is
-                # failed *requests*, not failed attempts. A non-429 terminal
-                # response ends the loop, so we record here and return; a 429
-                # that still has retries left loops WITHOUT recording (the
-                # failure is only terminal once retries are exhausted).
-                remaining_value = _parse_ratelimit_remaining(remaining)
-                if response.status_code != 429:
-                    recorded = True
-                    if response.status_code >= 500:
-                        # 5xx is neutral: don't reset the failure run, don't
-                        # close a half-open trial (FIX 5). Only opens on an
-                        # exhausted floor.
-                        breaker.record_server_error(remaining=remaining_value, epoch=epoch)
-                    else:
-                        breaker.record_success(remaining=remaining_value, epoch=epoch)
-                    return response
+                return response
 
-                if attempt < max_retries:
-                    retry_after = response.headers.get("Retry-After")
-                    delay = _compute_retry_delay(attempt, retry_after)
-
+            try:
+                response = await retry_429(
+                    _attempt,
+                    max_retries=max_retries,
+                    compute_delay=_compute_retry_delay,
                     # LML#758: don't sleep past the caller's remaining budget.
                     # A deadline is only active when this call is running
                     # inside a search pipeline (``core.search._run_strategy_
                     # pipeline`` sets it); direct/API-only callers see ``None``
                     # and keep the pre-#758 attempt-count-only bound.
-                    deadline = _retry_budget_deadline_var.get()
-                    if deadline is not None:
-                        remaining_budget = deadline - time.monotonic()
-                        if delay > remaining_budget:
-                            logger.warning(
-                                "Discogs rate limit hit, remaining caller budget "
-                                "(%.2fs) can't absorb the next retry delay "
-                                "(%.2fs); giving up early instead of sleeping "
-                                "past the deadline",
-                                remaining_budget,
-                                delay,
-                            )
-                            # Same terminal accounting as retries-exhausted
-                            # below: this attempt's response is a genuine 429,
-                            # so the breaker still learns from it. The `None`
-                            # return is the existing "unknown, not confirmed-
-                            # empty" degrade contract every caller of
-                            # `_request_with_retry` already honors (LML#755).
-                            recorded = True
-                            breaker.record_failure(remaining=remaining_value, epoch=epoch)
-                            return None
-
-                    logger.warning(
+                    budget_deadline=_retry_budget_deadline_var.get(),
+                    on_retry=lambda attempt, delay, retry_after: logger.warning(
                         f"Discogs rate limit hit, retrying in {delay:.2f}s "
                         f"(attempt {attempt + 1}/{max_retries + 1}, "
                         f"Retry-After={retry_after})"
-                    )
-                    # Sleep WITHOUT holding the permit; re-acquire on the next
-                    # pass.
-                    await asyncio.sleep(delay)
-                    continue
-
-                # Retries exhausted: this request definitively 429'd. Record
-                # exactly one failure (per-request unit) carrying the last-seen
-                # remaining so an at/below-floor bucket opens proactively even
-                # before the reactive threshold (FIX 2).
-                logger.error("Discogs rate limit hit, max retries exhausted")
-                recorded = True
-                breaker.record_failure(remaining=remaining_value, epoch=epoch)
+                    ),
+                    on_budget_exceeded=lambda remaining_budget, delay: logger.warning(
+                        "Discogs rate limit hit, remaining caller budget "
+                        "(%.2fs) can't absorb the next retry delay "
+                        "(%.2fs); giving up early instead of sleeping "
+                        "past the deadline",
+                        remaining_budget,
+                        delay,
+                    ),
+                    on_exhausted=lambda: logger.error(
+                        "Discogs rate limit hit, max retries exhausted"
+                    ),
+                )
+            except httpx.RequestError as e:
+                logger.error(
+                    "Discogs request failed: %s %s -> %s: %r",
+                    method,
+                    path,
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
+                # No terminal ``record_*`` here on purpose: a network-layer
+                # failure is not a rate-limit signal, so it neither feeds
+                # the failure run nor closes a trial. ``admit_or_shed``'s
+                # ``finally`` reports ``record_aborted`` (LML#787) so a dying
+                # trial re-OPENs instead of latching.
                 return None
 
+            # LML#755: feed the breaker **once per request, on the terminal
+            # outcome** (FIX 2/5), not per attempt — the counting unit is
+            # failed *requests*, not failed attempts. ``retry_429`` already
+            # collapsed "429s exhausted" and "429, budget can't absorb the
+            # next delay" into the same terminal shape (the last-seen 429
+            # response, returned rather than converted to ``None`` -- see its
+            # docstring), so both cases converge on the ``record_failure``
+            # call below: the 429 is still a genuine rate-limit signal either
+            # way (LML#758).
+            remaining_value = _parse_ratelimit_remaining(
+                response.headers.get("X-Discogs-Ratelimit-Remaining")
+            )
+            if response.status_code != 429:
+                admission.mark_recorded()
+                if response.status_code >= 500:
+                    # 5xx is neutral: don't reset the failure run, don't
+                    # close a half-open trial (FIX 5). Only opens on an
+                    # exhausted floor.
+                    breaker.record_server_error(remaining=remaining_value, epoch=admission.epoch)
+                else:
+                    breaker.record_success(remaining=remaining_value, epoch=admission.epoch)
+                return response
+
+            # Retries exhausted (or the caller budget couldn't absorb the next
+            # retry delay): this request definitively 429'd. Record exactly
+            # one failure (per-request unit) carrying the last-seen remaining
+            # so an at/below-floor bucket opens proactively even before the
+            # reactive threshold (FIX 2). The ``None`` return is the existing
+            # "unknown, not confirmed-empty" degrade contract every caller of
+            # ``_request_with_retry`` already honors (LML#755).
+            admission.mark_recorded()
+            breaker.record_failure(remaining=remaining_value, epoch=admission.epoch)
             return None
-        finally:
-            if not recorded:
-                breaker.record_aborted(epoch=epoch)
 
     def _parse_title(self, title: str) -> tuple[str, str]:
         """Parse Discogs title format 'Artist - Album' into components."""

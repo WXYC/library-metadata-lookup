@@ -8,7 +8,16 @@ and album-level matching (page scraping).
 
 from __future__ import annotations
 
-import asyncio
+# LML#1040: ``_request_with_retry``'s 429 loop now delegates to the shared
+# ``discogs.admission.retry_429``, whose ``asyncio.sleep(delay)`` call is no
+# longer textually in this module -- but ``tests/unit/
+# test_bandcamp_retry_characterization.py`` patches
+# ``clients.bandcamp.asyncio.sleep`` (module-ATTRIBUTE patching against
+# whatever ``asyncio`` name this module exposes). That patch mutates the
+# SAME shared ``asyncio`` module object ``discogs.admission`` also imports,
+# so it still takes effect there; removing this import would only break the
+# patch-target resolution, not any real behavior. Keep it.
+import asyncio  # noqa: F401
 import logging
 import re
 
@@ -16,6 +25,7 @@ import httpx
 
 from clients.streaming.base import BaseStreamingClient
 from clients.streaming.matching import find_best_source_match, score_match
+from discogs.admission import retry_429
 from streaming.models import SourceMatch
 
 log = logging.getLogger(__name__)
@@ -52,6 +62,34 @@ MAX_RETRIES = 3
 RETRY_BASE_DELAY = 5.0  # seconds
 
 
+def _compute_bandcamp_retry_delay(attempt: int, retry_after: str | None) -> float:
+    """Bandcamp's pre-LML#1040 429 delay policy, unchanged: a valid numeric
+    ``Retry-After`` wins verbatim (no cap); otherwise exponential backoff with
+    NO jitter -- unlike Discogs's ``discogs.service._compute_retry_delay``,
+    which both jitters and caps at 60s. Kept byte-identical to the pre-#1040
+    inline computation; see ``tests/unit/test_bandcamp_retry_characterization.py``.
+    """
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    return RETRY_BASE_DELAY * (2**attempt)
+
+
+class _BandcampRequestFailedError(Exception):
+    """Internal sentinel: ``client.request()`` raised inside one attempt.
+
+    Distinguishes a request-layer failure -- converted to ``None``, matching
+    the pre-LML#1040 bare ``except Exception: return None`` that wrapped ONLY
+    the ``client.request()`` call -- from an exception raised by
+    ``self._rate_limiter.acquire()`` or the ``async with self._semaphore:``
+    block, which the pre-#1040 code did NOT catch (and still doesn't: this
+    sentinel is only raised from inside the inner ``try``, so anything else
+    propagates unconverted, same as before).
+    """
+
+
 class BandcampClient(BaseStreamingClient):
     """Bandcamp HTTP client for autocomplete search and page scraping.
 
@@ -65,35 +103,39 @@ class BandcampClient(BaseStreamingClient):
     async def _request_with_retry(self, method: str, url: str, **kwargs) -> httpx.Response | None:
         """Make an HTTP request with retry on 429.
 
-        Returns the response, or None on failure after retries.
+        Returns the response, or None on failure after retries. LML#1040:
+        the retry loop itself is ``discogs.admission.retry_429``, shared with
+        ``DiscogsService._request_with_retry``; this method supplies
+        Bandcamp's own permit acquisition, delay policy, and log wording
+        (byte-identical to the pre-#1040 inline loop -- see
+        ``tests/unit/test_bandcamp_retry_characterization.py``).
         """
         client = await self._get_client()
-        for attempt in range(MAX_RETRIES + 1):
+
+        async def _attempt(attempt: int) -> httpx.Response:
             async with self._semaphore:
                 await self._rate_limiter.acquire()
                 try:
-                    resp = await client.request(method, url, **kwargs)
-                except Exception:
-                    return None
+                    return await client.request(method, url, **kwargs)
+                except Exception as e:
+                    raise _BandcampRequestFailedError() from e
 
-            if resp.status_code == 429:
-                if attempt < MAX_RETRIES:
-                    retry_after = resp.headers.get("Retry-After")
-                    if retry_after:
-                        try:
-                            delay = float(retry_after)
-                        except ValueError:
-                            delay = RETRY_BASE_DELAY * (2**attempt)
-                    else:
-                        delay = RETRY_BASE_DELAY * (2**attempt)
-                    log.warning(f"429 rate limited, retrying in {delay}s (attempt {attempt + 1})")
-                    await asyncio.sleep(delay)
-                    continue
-                log.warning(f"429 rate limited after {MAX_RETRIES} retries, giving up: {url}")
-                return None
+        try:
+            response = await retry_429(
+                _attempt,
+                max_retries=MAX_RETRIES,
+                compute_delay=_compute_bandcamp_retry_delay,
+                on_retry=lambda attempt, delay, retry_after: log.warning(
+                    f"429 rate limited, retrying in {delay}s (attempt {attempt + 1})"
+                ),
+                on_exhausted=lambda: log.warning(
+                    f"429 rate limited after {MAX_RETRIES} retries, giving up: {url}"
+                ),
+            )
+        except _BandcampRequestFailedError:
+            return None
 
-            return resp
-        return None
+        return None if response.status_code == 429 else response
 
     async def find_album_match(self, artist: str, title: str) -> SourceMatch | None:
         """Search Bandcamp for ``(artist, title)`` and return the best match.
