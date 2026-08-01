@@ -234,6 +234,21 @@ class TestGetArtist:
 
         assert resp.status_code == 503
 
+    @pytest.mark.asyncio
+    async def test_breaker_shed_returns_503(self, app_with_discogs, mock_discogs):
+        """R2-3: a saturation-breaker shed on this route returns 503 (transient /
+        retryable), NOT a raw 500. Mirrors ``TestGetRelease.test_breaker_shed_returns_503``."""
+        from discogs.breaker import DiscogsBreakerOpenError
+
+        mock_discogs.get_artist_details = AsyncMock(side_effect=DiscogsBreakerOpenError("shed"))
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app_with_discogs), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/v1/discogs/artist/45")
+
+        assert resp.status_code == 503
+
 
 # ---------------------------------------------------------------------------
 # GET /discogs/entity/{entity_type}/{entity_id}
