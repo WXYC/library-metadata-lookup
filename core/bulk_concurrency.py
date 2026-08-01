@@ -71,10 +71,11 @@ import logging
 import os
 import time
 import weakref
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from typing import Any
 
 import sentry_sdk
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from core.observability import observability_guard, project_capped
 
@@ -394,6 +395,117 @@ async def cancel_and_drain(future: asyncio.Future[Any]) -> None:
         await future
 
 
+async def run_bulk_gather[R](
+    coroutines: Iterable[Awaitable[R]],
+    *,
+    http_request: Request,
+    watch_disconnect_fn: Callable[[Request], Coroutine[Any, Any, None]],
+    on_abort: Callable[[], None],
+    sentinel_task_name: str = "lml.bulk.disconnect_sentinel",
+    on_race_settled: Callable[[bool], None] | None = None,
+) -> list[R]:
+    """Race a bulk ``asyncio.gather`` against a client-disconnect sentinel (LML#1033).
+
+    Hoisted out of ``handle_bulk_lookup`` (``lookup/router.py``),
+    ``bulk_resolve_libraries`` (``identity/router.py``), and
+    ``handle_refresh_for_identities`` (``cache/router.py``), which copy-pasted
+    this ~40-line shape nearly verbatim: spawn the gather, race it against
+    :func:`watch_disconnect`, drain BOTH arms on any exit (including parent
+    cancellation, so permit-holding tasks always unwind), tag
+    ``lml.client_aborted`` and raise ``HTTPException(499)`` when the sentinel
+    wins, else drain the sentinel and hand back the gather's own result.
+
+    NOT used by the single ``/lookup`` permit-phase race in
+    ``lookup.router.handle_lookup`` (LML#706/#715/#953) — that races a
+    *semaphore acquire*, not a batch gather, returns a body with
+    ``response.status_code = 499`` instead of raising, and has its own
+    permit-leak-safety shape. Deliberately left alone — the LML#1033 non-goal.
+
+    Args:
+        coroutines: Already-constructed awaitables, one per unit of work —
+            typically ``(run_one(item) for item in items)``. A single-element
+            iterable also works: ``artists.router.genres_bulk`` passes
+            ``[process_all_artists()]``, since that route's per-artist loop
+            stays sequential inside its own coroutine (LML#370/#372's
+            cascade-cascade lesson) and only wants the disconnect race, not
+            per-item concurrency.
+        http_request: Forwarded to ``watch_disconnect_fn``. The sentinel must
+            be spawned only after the request body is fully consumed (e.g. by
+            ``parse_bulk_body`` before this call) — ``watch_disconnect``
+            awaits ``request.receive()``, which would otherwise swallow the
+            ``http.request`` body messages the body parser needs.
+        watch_disconnect_fn: The caller's OWN module-level reference to
+            :func:`watch_disconnect` (e.g. ``lookup.router.watch_disconnect``),
+            not this module's. Existing tests patch
+            ``patch("<router-module>.watch_disconnect", fake_sentinel)``;
+            calling this module's own ``watch_disconnect`` directly would not
+            observe that patch.
+        on_abort: Invoked once, after the ``lml.client_aborted`` tag is set
+            and the gather is cancelled + drained, but before the 499 is
+            raised. Each route uses it for its own abort log line and
+            ``http_span.set_data("http.status_code", 499)`` — wording/fields
+            differ per route, so they stay call-site data (the "parameterize
+            or accept a callback" LML#1033 calls for on per-route span data).
+        sentinel_task_name: Forwarded to ``asyncio.create_task`` so each
+            route keeps its own distinguishable task name (mirrors the
+            pre-extraction per-route names).
+        on_race_settled: Optional; called with the computed ``client_aborted``
+            boolean right after the race settles, for both outcomes.
+            ``handle_bulk_lookup`` / ``handle_refresh_for_identities`` use
+            this for an inner span's ``client_aborted`` data;
+            ``bulk_resolve_libraries`` never did, so it stays opt-in.
+
+    Returns:
+        ``gather_future.result()`` — per-item results in input order
+        (``asyncio.gather`` preserves order regardless of completion order).
+
+    Raises:
+        HTTPException: 499 ``"client disconnected"``, when the sentinel wins.
+        BaseException: whatever ``gather_future.result()`` raises when a
+            per-item coroutine didn't isolate its own failure (route-specific
+            — e.g. ``bulk_resolve_libraries``'s fail-closed
+            ``HTTPException(503)`` — the caller decides whether to catch it,
+            same as before this extraction), or whatever cancelled this
+            coroutine while it was itself awaiting the race.
+    """
+    gather_future = asyncio.gather(*coroutines)
+    sentinel_task = asyncio.create_task(watch_disconnect_fn(http_request), name=sentinel_task_name)
+    waitables: set[asyncio.Future[Any]] = {gather_future, sentinel_task}
+
+    try:
+        done, _pending = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        # Parent task cancellation (server shutdown / timeout middleware) must
+        # propagate to both children AND drain them, not just signal them —
+        # otherwise the permits an in-flight item still holds stay held while
+        # the cancellation propagates asynchronously.
+        await cancel_and_drain(gather_future)
+        await cancel_and_drain(sentinel_task)
+        raise
+
+    # Tie broken toward "gather done": if both completed in the same
+    # `asyncio.wait` wakeup, the work already finished, so proceed rather
+    # than treat it as an abort.
+    client_aborted = sentinel_task in done and not gather_future.done()
+    if on_race_settled is not None:
+        on_race_settled(client_aborted)
+
+    if client_aborted:
+        # Tag is global-scope (filterable across all routes as
+        # `lml.client_aborted:true`); any span data is the caller's to set
+        # via `on_abort`.
+        sentry_sdk.set_tag("lml.client_aborted", "true")
+        await cancel_and_drain(gather_future)
+        on_abort()
+        raise HTTPException(status_code=499, detail="client disconnected")
+
+    # Work finished first (or failed). Drain the still-pending sentinel so it
+    # doesn't leak, then surface the gather's outcome — which may itself
+    # raise; that's the caller's to handle.
+    await cancel_and_drain(sentinel_task)
+    return gather_future.result()
+
+
 __all__ = [
     "LOW_PRIORITY_CALLER_CLASS",
     "ClientDisconnectedWhileQueuedError",
@@ -404,5 +516,6 @@ __all__ = [
     "maybe_acquire_bulk_global_permit_or_reap",
     "max_concurrency_from_env",
     "resolve_caller_class",
+    "run_bulk_gather",
     "watch_disconnect",
 ]

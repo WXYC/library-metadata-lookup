@@ -15,7 +15,8 @@ file; this file only asserts the *envelope* the handlers produce.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -134,23 +135,34 @@ class TestHttpExceptionEnvelope:
         route. Genuine mid-flight cancellation (`asyncio.CancelledError`) is a
         `BaseException`, so it is never caught by either handler and still
         propagates unconverted.
+
+        LML#1033: `genres_bulk` migrated off `http_request.is_disconnected()`
+        polling onto the shared `core.bulk_concurrency.run_bulk_gather`
+        sentinel race (the same mechanism `/lookup/bulk` and the other
+        bulk-family routes use), so producing the 499 here means racing a
+        fast `watch_disconnect` against a slow per-item call instead of
+        monkeypatching `Request.is_disconnected`.
         """
 
-        async def _always_disconnected(self):
-            return True
+        async def _slow_resolve(**kwargs):
+            await asyncio.sleep(5)
+            raise AssertionError("should have been cancelled before returning")
 
-        # is_disconnected is read off the raw Starlette Request, not a DI seam,
-        # so patch it directly rather than through dependency_overrides.
-        from starlette.requests import Request as StarletteRequest
+        async def _fast_disconnect(_request):
+            await asyncio.sleep(0.01)
 
-        original = StarletteRequest.is_disconnected
-        StarletteRequest.is_disconnected = _always_disconnected
-        try:
-            resp = await _post(
-                app_client, _GENRES_ROUTE, json_body={"artists": [{"artist_name": "Stereolab"}]}
+        with (
+            patch("artists.router.resolve_artist_genres", side_effect=_slow_resolve),
+            patch("artists.router.watch_disconnect", _fast_disconnect),
+        ):
+            resp = await asyncio.wait_for(
+                _post(
+                    app_client,
+                    _GENRES_ROUTE,
+                    json_body={"artists": [{"artist_name": "Stereolab"}]},
+                ),
+                timeout=3.0,
             )
-        finally:
-            StarletteRequest.is_disconnected = original
 
         assert resp.status_code == 499
 

@@ -36,6 +36,7 @@ from artists.genre_models import (
 )
 from artists.resolver import BareNameArtistResolver, InvalidNameError
 from core.bulk_body import TRANSIENT_PG_ERRORS, parse_bulk_body, resolve_input_cap
+from core.bulk_concurrency import run_bulk_gather, watch_disconnect
 from core.dependencies import (
     get_artist_resolve_posthog_client,
     get_discogs_cache_service_from_pool,
@@ -473,78 +474,93 @@ async def genres_bulk(
     artists = request.artists
     logger.info("artist-genres bulk start: artists=%d", len(artists))
 
+    async def _process_all() -> list[ArtistGenresResultItem]:
+        # Bio enrichment: one cache-only bulk artist-details read for the
+        # whole batch, keyed on the supplied Discogs ids (name-only inputs
+        # can't be keyed and get no bio). Cheap and additive — it stays
+        # inside the bulk budget rather than fanning out a per-artist live
+        # API call on top of the genres fallback.
+        #
+        # Best-effort + fault-isolated: bio is a nullable add-on, so a
+        # failure in THIS extra read must never fail the genres batch the
+        # endpoint exists to serve. Degrade to no-bios and press on; the
+        # genres path below hits the cache on its own and still 503s on a
+        # genuine pool outage. `CancelledError` (client abort / shutdown)
+        # is a `BaseException`, so `except Exception` lets it propagate.
+        bio_ids = sorted({a.discogs_artist_id for a in artists if a.discogs_artist_id is not None})
+        try:
+            bio_by_id = (
+                _extract_artist_bios(await discogs_cache.get_artist_details_bulk(bio_ids))
+                if bio_ids
+                else {}
+            )
+        except Exception:
+            logger.warning(
+                "artist-genres bio enrichment read failed; serving genres without bios",
+                exc_info=True,
+            )
+            bio_by_id = {}
+
+        # Artists are processed sequentially: the cache reads are cheap, and
+        # running the (rare) API-fallback legs serially inherits the shared
+        # Discogs limiter's global pacing without the intra-request fan-out
+        # that would starve interleaved live-lookup traffic (the LML#370/#372
+        # cascade-cascade lesson) — so this whole batch is passed to
+        # `run_bulk_gather` (LML#1033) as ONE coroutine rather than N
+        # concurrently gathered ones; the helper only adds the disconnect
+        # race here, not per-item concurrency.
+        results: list[ArtistGenresResultItem] = []
+        for item in artists:
+            agg = await resolve_artist_genres(
+                artist_name=item.artist_name,
+                discogs_artist_id=item.discogs_artist_id,
+                discogs_cache=discogs_cache,
+                discogs_service=discogs_service,
+            )
+            results.append(
+                ArtistGenresResultItem(
+                    artist_name=item.artist_name,
+                    discogs_artist_id=item.discogs_artist_id,
+                    genres=agg.genres,
+                    styles=agg.styles,
+                    source=agg.source,
+                    bio=(
+                        bio_by_id.get(item.discogs_artist_id)
+                        if item.discogs_artist_id is not None
+                        else None
+                    ),
+                )
+            )
+        return results
+
     with sentry_sdk.start_span(op="http.server", name=f"POST {_GENRES_ROUTE_PATH}") as http_span:
         http_span.set_data("http.method", "POST")
         http_span.set_data("http.target", _GENRES_ROUTE_PATH)
         http_span.set_data("lml.artist_genres.artists", len(artists))
 
+        def _on_abort() -> None:
+            http_span.set_data("http.status_code", 499)
+            logger.warning("artist-genres bulk aborted by client: artists=%d", len(artists))
+
         try:
-            # Don't spend the bio read if the client already walked away
-            # (mirrors the per-item guard's budget-freeing intent, run once
-            # up front rather than only inside the genres loop below).
-            if await http_request.is_disconnected():
-                http_span.set_data("http.status_code", 499)
-                logger.warning("artist-genres bulk aborted by client: artists=%d", len(artists))
-                raise HTTPException(status_code=499, detail="client disconnected")
-
-            # Bio enrichment: one cache-only bulk artist-details read for the
-            # whole batch, keyed on the supplied Discogs ids (name-only inputs
-            # can't be keyed and get no bio). Cheap and additive — it stays
-            # inside the bulk budget rather than fanning out a per-artist live
-            # API call on top of the genres fallback.
-            #
-            # Best-effort + fault-isolated: bio is a nullable add-on, so a
-            # failure in THIS extra read must never fail the genres batch the
-            # endpoint exists to serve. Degrade to no-bios and press on; the
-            # genres path below hits the cache on its own and still 503s on a
-            # genuine pool outage. `CancelledError` (client abort / shutdown)
-            # is a `BaseException`, so `except Exception` lets it propagate.
-            bio_ids = sorted(
-                {a.discogs_artist_id for a in artists if a.discogs_artist_id is not None}
-            )
-            try:
-                bio_by_id = (
-                    _extract_artist_bios(await discogs_cache.get_artist_details_bulk(bio_ids))
-                    if bio_ids
-                    else {}
+            # Race the (sequential) batch against a client-disconnect sentinel
+            # (LML#1033: core.bulk_concurrency.run_bulk_gather), replacing the
+            # per-await `http_request.is_disconnected()` polling this route
+            # used before -- polling only ever caught a disconnect at the next
+            # loop iteration; the sentinel race gets the same 499 outcome via
+            # the standard cancellation path instead (a disconnect cancels
+            # `_process_all()`, which raises `CancelledError` at whatever
+            # `await` it's parked on -- same effect as the old per-item check,
+            # without a poll call per item).
+            results = (
+                await run_bulk_gather(
+                    [_process_all()],
+                    http_request=http_request,
+                    watch_disconnect_fn=watch_disconnect,
+                    on_abort=_on_abort,
+                    sentinel_task_name="lml.artist_genres.disconnect_sentinel",
                 )
-            except Exception:
-                logger.warning(
-                    "artist-genres bio enrichment read failed; serving genres without bios",
-                    exc_info=True,
-                )
-                bio_by_id = {}
-
-            results: list[ArtistGenresResultItem] = []
-            for item in artists:
-                # Free the shared Discogs rate-limit budget promptly if the
-                # client walks away mid-batch (mirrors the bulk family's
-                # watch_disconnect 499, adapted to the sequential loop).
-                if await http_request.is_disconnected():
-                    http_span.set_data("http.status_code", 499)
-                    logger.warning("artist-genres bulk aborted by client: artists=%d", len(artists))
-                    raise HTTPException(status_code=499, detail="client disconnected")
-
-                agg = await resolve_artist_genres(
-                    artist_name=item.artist_name,
-                    discogs_artist_id=item.discogs_artist_id,
-                    discogs_cache=discogs_cache,
-                    discogs_service=discogs_service,
-                )
-                results.append(
-                    ArtistGenresResultItem(
-                        artist_name=item.artist_name,
-                        discogs_artist_id=item.discogs_artist_id,
-                        genres=agg.genres,
-                        styles=agg.styles,
-                        source=agg.source,
-                        bio=(
-                            bio_by_id.get(item.discogs_artist_id)
-                            if item.discogs_artist_id is not None
-                            else None
-                        ),
-                    )
-                )
+            )[0]
         except asyncio.CancelledError:
             http_span.set_data("http.status_code", 499)
             logger.warning("artist-genres bulk aborted by client: artists=%d", len(artists))

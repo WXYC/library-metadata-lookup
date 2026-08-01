@@ -16,7 +16,6 @@ Provides:
 import asyncio
 import logging
 from collections import Counter
-from typing import Any
 
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -28,8 +27,8 @@ from core.bulk_body import (
 )
 from core.bulk_concurrency import (
     acquire_bulk_global_permit,
-    cancel_and_drain,
     max_concurrency_from_env,
+    run_bulk_gather,
     watch_disconnect,
 )
 from core.dependencies import discogs_pool_max_size
@@ -330,59 +329,35 @@ async def bulk_resolve_libraries(
         http_span.set_data("lml.bulk_resolve.inputs", inputs_count)
         http_span.set_data("lml.bulk_resolve.max_concurrent", max_concurrent)
 
-        # Race the gather against a client-disconnect sentinel (LML#700). uvicorn
-        # does not propagate a client socket close into the handler, so a plain
-        # `await asyncio.gather(...)` runs the in-flight per-input tasks — and the
-        # discogs-cache pool permits they hold (bounded by `max_concurrent`) — to
-        # completion against a client that is already gone. The sentinel lets a
-        # disconnect cancel the outstanding gather promptly instead. Mirrors the
-        # `/lookup/bulk` shape (lookup/router.py) and reuses the shared
-        # `watch_disconnect` / `cancel_and_drain` helpers rather than forking the
-        # logic.
-        #
-        # `gather` preserves input order (results[i] <-> inputs[i]) regardless of
-        # completion order, satisfying the api.yaml ordering contract.
+        def _on_abort() -> None:
+            # 499 = Nginx "client closed request" — nobody reads the body, but
+            # it pins the span/log for triage.
+            http_span.set_data("http.status_code", 499)
+            logger.warning("bulk resolve aborted by client: inputs=%d", inputs_count)
+
+        # Race the gather against a client-disconnect sentinel (LML#700,
+        # hoisted into core.bulk_concurrency.run_bulk_gather by LML#1033).
+        # uvicorn does not propagate a client socket close into the handler,
+        # so a plain `await asyncio.gather(...)` would run the in-flight
+        # per-input tasks — and the discogs-cache pool permits they hold
+        # (bounded by `max_concurrent`) — to completion against a client that
+        # is already gone; the sentinel lets a disconnect cancel the
+        # outstanding gather promptly instead. `gather` preserves input order
+        # (results[i] <-> inputs[i]) regardless of completion order,
+        # satisfying the api.yaml ordering contract.
         #
         # Spawning the sentinel must happen *after* `await http_request.json()`
         # above has fully consumed the request body — `watch_disconnect` awaits
         # `request.receive()`, which would otherwise swallow the `http.request`
         # body messages the JSON parser needs.
-        gather_future = asyncio.gather(*(_resolve_one(r) for r in request.inputs))
-        sentinel_task = asyncio.create_task(
-            watch_disconnect(http_request),
-            name="lml.bulk_resolve.disconnect_sentinel",
-        )
-        waitables: set[asyncio.Future[Any]] = {gather_future, sentinel_task}
-
         try:
-            done, _pending = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
-        except BaseException:
-            # Outer cancellation (server shutdown / timeout middleware) must
-            # propagate to both children AND drain them, not just signal them — a
-            # bare `.cancel()` is asynchronous, so the pool permits stay held
-            # until the tasks observe the cancel and unwind.
-            await cancel_and_drain(gather_future)
-            await cancel_and_drain(sentinel_task)
-            raise
-
-        if sentinel_task in done and not gather_future.done():
-            # Client departed first. Cancel + drain the gather so the per-input
-            # tasks unwind and their permits free promptly instead of after the
-            # whole batch finishes. The tag is global-scope (filterable across
-            # routes as `lml.client_aborted:true`); the 499 + warn log mirror the
-            # `/lookup/bulk` abort branch. 499 = Nginx "client closed request" —
-            # nobody reads the body, but it pins the span/log for triage.
-            sentry_sdk.set_tag("lml.client_aborted", "true")
-            await cancel_and_drain(gather_future)
-            http_span.set_data("http.status_code", 499)
-            logger.warning("bulk resolve aborted by client: inputs=%d", inputs_count)
-            raise HTTPException(status_code=499, detail="client disconnected")
-
-        # Work finished first (or failed). Drain the still-pending sentinel so it
-        # doesn't leak, then surface the gather's outcome.
-        await cancel_and_drain(sentinel_task)
-        try:
-            results = gather_future.result()
+            results = await run_bulk_gather(
+                (_resolve_one(r) for r in request.inputs),
+                http_request=http_request,
+                watch_disconnect_fn=watch_disconnect,
+                on_abort=_on_abort,
+                sentinel_task_name="lml.bulk_resolve.disconnect_sentinel",
+            )
         except asyncio.CancelledError:
             # Server-driven cancellation surfaced through the gather (shutdown /
             # outer timeout), or a child observed a cancel — distinct from the
@@ -393,7 +368,10 @@ async def bulk_resolve_libraries(
             logger.warning("bulk resolve aborted (cancelled): inputs=%d", inputs_count)
             raise
         except HTTPException as exc:
-            # Fail-closed 503 (or any explicit status) from a per-input failure.
+            # Fail-closed 503 (or any explicit status) from a per-input failure
+            # -- or the 499 `run_bulk_gather` itself raises on abort, whose
+            # `on_abort` callback above already pinned the span/log, so this
+            # `set_data` call is a harmless no-op re-write to the same value.
             # Pin the status on the span before re-raising so the trace carries
             # the real outcome rather than an unset code.
             http_span.set_data("http.status_code", exc.status_code)

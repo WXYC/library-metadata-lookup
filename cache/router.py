@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -47,8 +47,8 @@ from cache.models import (
 from core.bulk_body import TRANSIENT_PG_ERRORS, parse_bulk_body
 from core.bulk_concurrency import (
     acquire_bulk_global_permit,
-    cancel_and_drain,
     max_concurrency_from_env,
+    run_bulk_gather,
     watch_disconnect,
 )
 from core.dependencies import get_discogs_service, get_musicbrainz_pg
@@ -234,40 +234,29 @@ async def handle_refresh_for_identities(
             span.set_data("lml.cache.size", len(identity_ids))
             span.set_data("lml.cache.max_concurrent", max_concurrent)
 
-            gather_future = asyncio.gather(*(_run_one(identity_id) for identity_id in identity_ids))
-            sentinel_task = asyncio.create_task(
-                watch_disconnect(http_request),
-                name="lml.cache.disconnect_sentinel",
-            )
-            waitables: set[asyncio.Future[Any]] = {gather_future, sentinel_task}
-
-            try:
-                done, _pending = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
-            except BaseException:
-                # Parent cancellation must propagate to both children AND drain
-                # them, not just signal. Without the drain, the in-flight items
-                # keep holding Discogs semaphore permits while the cancel
-                # propagates asynchronously.
-                await cancel_and_drain(gather_future)
-                await cancel_and_drain(sentinel_task)
-                raise
-
-            client_aborted = sentinel_task in done and not gather_future.done()
-            span.set_data("lml.cache.client_aborted", client_aborted)
-
-            if client_aborted:
-                sentry_sdk.set_tag("lml.client_aborted", "true")
-                await cancel_and_drain(gather_future)
+            def _on_abort() -> None:
                 logger.warning(
                     "cache refresh aborted by client: size=%d max_concurrent=%d",
                     len(identity_ids),
                     max_concurrent,
                 )
                 http_span.set_data("http.status_code", 499)
-                raise HTTPException(status_code=499, detail="client disconnected")
 
-            await cancel_and_drain(sentinel_task)
-            results = gather_future.result()
+            # Race the gather against a client-disconnect sentinel (LML#1033:
+            # core.bulk_concurrency.run_bulk_gather). Mirrors `/lookup/bulk`'s
+            # shape (lookup/router.py). Spawning the sentinel must happen
+            # *after* `parse_bulk_body` above has fully consumed the request
+            # body — `watch_disconnect` awaits `request.receive()`, which
+            # would otherwise swallow `http.request` body messages the body
+            # parser needs.
+            results = await run_bulk_gather(
+                (_run_one(identity_id) for identity_id in identity_ids),
+                http_request=http_request,
+                watch_disconnect_fn=watch_disconnect,
+                on_abort=_on_abort,
+                sentinel_task_name="lml.cache.disconnect_sentinel",
+                on_race_settled=lambda aborted: span.set_data("lml.cache.client_aborted", aborted),
+            )
 
         counts = Counter(r.status for r in results)
         http_span.set_data("lml.cache.warmed", counts.get("warmed", 0))
