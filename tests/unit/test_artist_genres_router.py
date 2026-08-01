@@ -9,7 +9,9 @@ routes). The ranking + fallback *semantics* live in
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import asyncio
+import logging
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -317,6 +319,73 @@ class TestErrorSurface:
                     _ROUTE, content=b"not json {", headers={"Content-Type": "application/json"}
                 )
         assert resp.status_code == 400
+
+
+class TestClientAbort:
+    """Client-disconnect handling (LML#1033): migrated from per-await
+    ``http_request.is_disconnected()`` polling to the shared
+    ``core.bulk_concurrency.run_bulk_gather`` sentinel race the other three
+    bulk-family routes already use. The per-artist loop stays sequential (one
+    coroutine, no per-item concurrency — see ``artists.router.genres_bulk``),
+    so this pins the *outcome*, not a dispatch-shape change. Mirrors
+    ``TestBulkLookupClientAbort`` in ``test_bulk_lookup_endpoint.py``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_returns_499_cancels_work_tags_and_logs(self, make_app, caplog):
+        started = 0
+        cleaned_up = 0
+
+        async def slow_resolve(**kwargs):
+            nonlocal started, cleaned_up
+            started += 1
+            try:
+                await asyncio.sleep(5)
+                raise AssertionError("should have been cancelled before returning")
+            finally:
+                cleaned_up += 1
+
+        async def fake_sentinel(_request):
+            await asyncio.sleep(0.01)
+
+        captured_tags: dict[str, str] = {}
+
+        ctx, app = make_app()
+        with ctx:
+            with (
+                patch("artists.router.resolve_artist_genres", side_effect=slow_resolve),
+                patch("artists.router.watch_disconnect", fake_sentinel),
+                patch(
+                    "core.bulk_concurrency.sentry_sdk.set_tag",
+                    side_effect=captured_tags.__setitem__,
+                ),
+                caplog.at_level(logging.WARNING, logger="artists.router"),
+            ):
+                resp = await asyncio.wait_for(
+                    _post(
+                        app,
+                        {
+                            "artists": [
+                                {"artist_name": "Stereolab"},
+                                {"artist_name": "Jessica Pratt"},
+                                {"artist_name": "Juana Molina"},
+                            ]
+                        },
+                    ),
+                    timeout=3.0,
+                )
+
+        assert resp.status_code == 499, f"Expected 499 on client disconnect, got {resp.status_code}"
+        assert started > 0, "test mis-configured: no items ever started"
+        assert started == cleaned_up, (
+            f"{started - cleaned_up} item(s) started but never cleaned up — "
+            "cancellation did not propagate into the sequential loop"
+        )
+        assert captured_tags.get("lml.client_aborted") == "true", (
+            f"Expected lml.client_aborted=true tag; got {captured_tags!r}"
+        )
+        abort_logs = [r for r in caplog.records if "artist-genres bulk aborted" in r.message]
+        assert abort_logs, f"Expected an abort warn log; got: {[r.message for r in caplog.records]}"
 
 
 class TestAuth:
