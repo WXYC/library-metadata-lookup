@@ -1058,6 +1058,117 @@ class TestHandleLookup:
         assert library_item["library_url"] == "https://dj.wxyc.org/dashboard/album/legacy/10"
 
 
+class TestInitLookupObservability:
+    """LML#1036: `init_lookup_observability` replaces the identical six-call
+    preamble block `handle_lookup` and `handle_bulk_lookup` used to repeat
+    inline (`init_cache_stats` -> `_record_lml_flag_tags` ->
+    `_record_event_loop_lag` -> `record_endpoint_family_tag` ->
+    `record_caller_reason_tag` -> conditional `set_skip_cache`). These tests
+    exercise the helper directly and assert against the recorded cache-stats
+    / tag state it produces, not implementation internals -- the same
+    externally-observable contract the two endpoints' own end-to-end tests
+    (test_rowless_flag_observability.py, this file's
+    `test_extra_keys_seeded_and_projected_onto_transaction`) already pin.
+    """
+
+    def test_seeds_the_passed_extra_keys_at_zero(self):
+        """Step 1: `init_cache_stats(extra_keys=...)` seeds every passed key
+        at 0 -- the LML#544 round 2 shape-stability contract this helper must
+        not regress."""
+        from wxyc_fastapi.observability import get_cache_stats
+
+        from lookup.router import ENDPOINT_FAMILY_LOOKUP, init_lookup_observability
+
+        init_lookup_observability(
+            ENDPOINT_FAMILY_LOOKUP,
+            None,
+            extra_keys=("lml1036_probe_key_a", "lml1036_probe_key_b"),
+        )
+
+        stats = get_cache_stats()
+        assert stats["lml1036_probe_key_a"] == 0
+        assert stats["lml1036_probe_key_b"] == 0
+
+    @pytest.mark.parametrize("nonlibrary, expected", [(True, 1), (False, 0)])
+    def test_records_the_lml681_flag_tag_once(self, monkeypatch, nonlibrary, expected):
+        """Step 2: `_record_lml_flag_tags` (LML#681) -- the flag state lands
+        as a clean 0/1 cache_stats key. Calling the helper once must record
+        it exactly once, preserving the #681 "once per cache_stats context,
+        additive-only recorder" contract -- a regression here would sum
+        across repeated calls instead of reflecting the flag cleanly."""
+        from wxyc_fastapi.observability import get_cache_stats
+
+        from config.settings import get_settings
+        from lookup.router import (
+            _LML_CACHE_STATS_EXTRA_KEYS,
+            ENDPOINT_FAMILY_LOOKUP,
+            LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY,
+            init_lookup_observability,
+        )
+
+        monkeypatch.setenv("LML_RESOLVE_NONLIBRARY_RELEASE", "true" if nonlibrary else "false")
+        get_settings.cache_clear()
+        try:
+            init_lookup_observability(
+                ENDPOINT_FAMILY_LOOKUP, None, extra_keys=_LML_CACHE_STATS_EXTRA_KEYS
+            )
+            stats = get_cache_stats()
+            assert stats[LML_RESOLVE_NONLIBRARY_RELEASE_STAT_KEY] == expected
+        finally:
+            get_settings.cache_clear()
+
+    def test_records_endpoint_family_and_caller_reason_sentry_tags(self):
+        """Steps 4-5: both string-valued Sentry tags fire exactly once, with
+        the family/reason the caller passed in -- matching
+        `record_endpoint_family_tag` / `record_caller_reason_tag`'s own
+        per-call contract. Both helpers reach `sentry_sdk.set_tag` through the
+        SAME shared module object regardless of which package imports it, so
+        this patches the one canonical target rather than two import paths
+        (patching both would silently patch-then-repatch the same attribute)."""
+        from lookup.router import ENDPOINT_FAMILY_LOOKUP_BULK, init_lookup_observability
+
+        with patch("sentry_sdk.set_tag") as mock_set_tag:
+            init_lookup_observability(
+                ENDPOINT_FAMILY_LOOKUP_BULK, "proxy-library-search", extra_keys=()
+            )
+
+        mock_set_tag.assert_any_call("lml.endpoint_family", ENDPOINT_FAMILY_LOOKUP_BULK)
+        mock_set_tag.assert_any_call("lml.caller_reason", "proxy-library-search")
+        assert mock_set_tag.call_count == 2
+
+    def test_absent_caller_reason_sets_no_sentry_tag(self):
+        """`caller_reason=None` is `record_caller_reason_tag`'s documented
+        no-op contract -- no tag call at all, not an empty-string tag. The
+        endpoint-family tag still fires, so this asserts on the specific
+        `lml.caller_reason` call rather than total call count."""
+        from lookup.router import ENDPOINT_FAMILY_LOOKUP, init_lookup_observability
+
+        with patch("sentry_sdk.set_tag") as mock_set_tag:
+            init_lookup_observability(ENDPOINT_FAMILY_LOOKUP, None, extra_keys=())
+
+        called_keys = [c.args[0] for c in mock_set_tag.call_args_list]
+        assert "lml.caller_reason" not in called_keys
+
+    def test_skip_cache_true_sets_the_context_var(self):
+        """Step 6: a truthy `skip_cache` honors the query flag by flipping the
+        ContextVar the memory-cache layer reads."""
+        from discogs.memory_cache import should_skip_cache
+        from lookup.router import ENDPOINT_FAMILY_LOOKUP, init_lookup_observability
+
+        init_lookup_observability(ENDPOINT_FAMILY_LOOKUP, None, skip_cache=True, extra_keys=())
+        assert should_skip_cache() is True
+
+    def test_skip_cache_defaults_to_false_and_is_a_no_op(self):
+        """`skip_cache` defaults to False; the ContextVar is left alone (the
+        session-wide `reset_caches` autouse fixture already primes it False,
+        so this pins the helper's own default doesn't flip it)."""
+        from discogs.memory_cache import should_skip_cache
+        from lookup.router import ENDPOINT_FAMILY_LOOKUP, init_lookup_observability
+
+        init_lookup_observability(ENDPOINT_FAMILY_LOOKUP, None, extra_keys=())
+        assert should_skip_cache() is False
+
+
 class TestCallerClassLowPriorityLane:
     """LML#928/#953: ``X-Caller-Class`` routes a single ``/lookup`` request
     onto the low-priority lane (the LML#716/#924 process-global bulk permit)

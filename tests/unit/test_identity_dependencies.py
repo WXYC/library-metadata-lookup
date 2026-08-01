@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 import asyncpg
 import pytest
+from fastapi import Depends, FastAPI, HTTPException
+from httpx import ASGITransport, AsyncClient
 
 import core.dependencies as core_deps
 import identity.dependencies as deps
@@ -289,3 +291,71 @@ async def test_returns_none_when_probe_raises_interface_error(
     assert result is None
     assert deps._entity_probe_failed is True
     assert any("probe failed; disabling identity routes" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# require_service (LML#1036) — generic sibling of require_entity_store
+# ---------------------------------------------------------------------------
+
+
+async def _fake_getter() -> str | None:
+    """Stand-in FastAPI getter dependency for `require_service` unit tests."""
+    return None
+
+
+class TestRequireService:
+    @pytest.mark.asyncio
+    async def test_passes_a_resolved_service_through(self):
+        """A non-None value reaches the caller unchanged — the getter is
+        never consulted directly, since the value is supplied to the guard's
+        own `service` parameter, exactly as FastAPI's Depends() resolution
+        would supply it."""
+        guard = deps.require_service(_fake_getter, "irrelevant detail")
+        sentinel = object()
+        assert await guard(service=sentinel) is sentinel
+
+    @pytest.mark.asyncio
+    async def test_raises_503_with_the_exact_detail_when_the_getter_yields_none(self):
+        detail = "Widget service is not available. Set WIDGET_TOKEN."
+        guard = deps.require_service(_fake_getter, detail)
+        with pytest.raises(HTTPException) as exc_info:
+            await guard(service=None)
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == detail
+
+    @pytest.mark.asyncio
+    async def test_wired_as_a_route_dependency_resolves_the_getter_via_depends(self):
+        """The guard's default parameter is `Depends(getter)`, not a direct
+        call to `getter()` — so when mounted on a route, FastAPI's own
+        dependency-injection resolves it (and `app.dependency_overrides`
+        reaches it), matching how `discogs/router.py` and `cache/router.py`
+        wire it in (``Depends(require_service(get_discogs_service, ...))``)."""
+
+        async def _unavailable_getter() -> str | None:
+            return None
+
+        async def _available_getter() -> str | None:
+            return "widget-service"
+
+        detail = "Widget service is not available."
+        unavailable_guard = deps.require_service(_unavailable_getter, detail)
+        available_guard = deps.require_service(_available_getter, detail)
+
+        app = FastAPI()
+
+        @app.get("/unavailable")
+        async def unavailable_probe(service: str = Depends(unavailable_guard)) -> dict:
+            return {"service": service}
+
+        @app.get("/available")
+        async def available_probe(service: str = Depends(available_guard)) -> dict:
+            return {"service": service}
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            unavailable_resp = await client.get("/unavailable")
+            available_resp = await client.get("/available")
+
+        assert unavailable_resp.status_code == 503
+        assert unavailable_resp.json()["detail"] == detail
+        assert available_resp.status_code == 200
+        assert available_resp.json() == {"service": "widget-service"}

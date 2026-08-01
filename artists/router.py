@@ -42,6 +42,7 @@ from core.dependencies import (
     get_discogs_cache_service_from_pool,
     get_discogs_service,
 )
+from core.service_unavailable import service_unavailable_detail
 from discogs.cache_service import CacheUnavailableError, DiscogsCacheService
 from discogs.service import BREAKER_OPEN_STAT_KEY, DiscogsService
 from entity.store import EntityStore
@@ -102,8 +103,8 @@ _GENRES_ROUTE_PATH = "/api/v1/artists/genres/bulk"
 # inside Railway's ~5-minute request-timeout ceiling. Callers page.
 _GENRES_INPUT_CAP = 25
 
-_DISCOGS_CACHE_UNAVAILABLE_DETAIL = (
-    "Discogs cache is not available. Ensure DATABASE_URL_DISCOGS is configured."
+_DISCOGS_CACHE_UNAVAILABLE_DETAIL = service_unavailable_detail(
+    "Discogs cache", "Ensure DATABASE_URL_DISCOGS is configured."
 )
 # Mid-flight variants: the dependency gates above prove the wiring existed at
 # request start, so a failure DURING the request is most often a transient
@@ -327,6 +328,11 @@ async def resolve_bulk(
     # requests — the LML#544 shape rule), and RequestTelemetry carries the
     # aggregate event. Explicit `http.server` span mirrors the siblings —
     # query with `op:http.server span.description:*artists/resolve/bulk*`.
+    # Deliberately narrower than lookup/router.py's full
+    # `_LML_CACHE_STATS_EXTRA_KEYS` (LML#1036 seeding-decision survey, see
+    # that constant's docstring): this route never touches the release-
+    # resolution cache or the event-loop-lag gauge, so seeding those keys
+    # here would add permanently-zero noise instead of a stable series.
     init_cache_stats(extra_keys=(BREAKER_OPEN_STAT_KEY,))
     telemetry = RequestTelemetry(
         api_call_keys=["discogs"],

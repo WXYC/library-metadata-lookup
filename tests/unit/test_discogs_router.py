@@ -15,24 +15,30 @@ from discogs.models import (
     ReleaseMetadataResponse,
     TrackReleasesResponse,
 )
-from discogs.router import _require_service
+from discogs.router import _DISCOGS_SERVICE_UNAVAILABLE_DETAIL, _require_discogs_service
 from discogs.service import DiscogsService
 from tests.unit.conftest import override_deps
 
 # ---------------------------------------------------------------------------
-# _require_service
+# _require_discogs_service (LML#1036: an instance of the shared
+# identity.dependencies.require_service factory -- see
+# tests/unit/test_identity_dependencies.py::TestRequireService for the
+# factory's own unit tests).
 # ---------------------------------------------------------------------------
 
 
-class TestRequireService:
-    def test_returns_service(self):
+class TestRequireDiscogsService:
+    @pytest.mark.asyncio
+    async def test_returns_service(self):
         svc = AsyncMock(spec=DiscogsService)
-        assert _require_service(svc) is svc
+        assert await _require_discogs_service(service=svc) is svc
 
-    def test_none_raises_503(self):
+    @pytest.mark.asyncio
+    async def test_none_raises_503_with_the_configured_detail(self):
         with pytest.raises(HTTPException) as exc_info:
-            _require_service(None)
+            await _require_discogs_service(service=None)
         assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == _DISCOGS_SERVICE_UNAVAILABLE_DETAIL
 
 
 # ---------------------------------------------------------------------------

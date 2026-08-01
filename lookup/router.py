@@ -269,7 +269,27 @@ and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and
 ``init_cache_stats`` and LML#544 round 2 for the shape-stability rationale.
 Adding a new key here is the single point of update; LML#681's row-less flag
 observability (flag tags, ``nonlibrary_release_surfaced``, the #632
-hit/miss/unavailable counters) was the most recent addition."""
+hit/miss/unavailable counters) was the most recent addition.
+
+LML#1036 seeding-decision survey: this is one of four ``init_cache_stats(...)``
+call sites in the repo, and the other three deliberately seed a narrower (or
+empty) set rather than this one -- surveyed and confirmed intentional, not
+drift:
+
+* ``artists/router.py``'s ``resolve_bulk`` seeds only ``(BREAKER_OPEN_STAT_KEY,)``
+  because that route's payload never touches the release-resolution cache,
+  the event-loop-lag gauge, or any of this tuple's other lookup-pipeline-
+  specific counters -- seeding them would add permanently-zero noise to a
+  shape those subsystems never apply to. The Discogs saturation-breaker
+  counter IS relevant there (escalation can shed on that route too), so it
+  alone is seeded.
+* ``streaming/router.py``'s ``handle_streaming_check`` calls bare
+  ``init_cache_stats()`` (no extras) because that path is application-cache-
+  free end to end (LML#639/#641) -- there is no LML-specific key for it to
+  stabilize.
+
+Each site's own call comment carries its local rationale; this note just
+records that the three-way split was reviewed together and left as-is."""
 
 
 def _record_lml_flag_tags() -> None:
@@ -321,6 +341,58 @@ def _record_event_loop_lag() -> None:
         if lag_ms is None:
             return
         get_cache_stats_recorder().record(EVENT_LOOP_LAG_STAT_KEY, lag_ms)
+
+
+def init_lookup_observability(
+    family: str,
+    caller_reason: str | None,
+    *,
+    skip_cache: bool = False,
+    extra_keys: tuple[str, ...] = _LML_CACHE_STATS_EXTRA_KEYS,
+) -> None:
+    """Shared telemetry preamble for `/lookup` and `/lookup/bulk` (LML#1036).
+
+    Runs the same six-call sequence both handlers ran inline at request
+    entry, in the order `handle_lookup` established:
+
+    1. ``init_cache_stats(extra_keys=extra_keys)`` — seed the cache_stats
+       context so PostHog/Sentry payload shapes stay stable (LML#544 round 2).
+    2. ``_record_lml_flag_tags()`` — LML#681 row-less-family flag state, once
+       per context.
+    3. ``_record_event_loop_lag()`` — LML#907 event-loop-lag gauge sample,
+       once per context.
+    4. ``record_endpoint_family_tag(family)`` — LML#944 traffic-class tag.
+    5. ``record_caller_reason_tag(caller_reason)`` — LML#931 caller-reason tag.
+    6. ``set_skip_cache(True)`` when ``skip_cache`` is truthy.
+
+    Both handlers called this same six-call block verbatim before this
+    extraction; the "once per cache_stats context" contract steps 2 and 3
+    depend on (LML#681 — `_record_lml_flag_tags` is an additive-only
+    recorder, so calling it more than once per context would double-count)
+    is preserved because this helper itself is still called exactly once per
+    handler invocation, same as the inline block was.
+
+    `extra_keys` defaults to the shared `_LML_CACHE_STATS_EXTRA_KEYS` set
+    both existing call sites already passed identically; a future sibling
+    endpoint with a different seeding decision passes its own tuple (see the
+    LML#1036 seeding-decision survey in `_LML_CACHE_STATS_EXTRA_KEYS`'s
+    docstring above).
+
+    `record_low_priority_tag` is deliberately NOT part of this preamble: at
+    `handle_lookup` it must run AFTER `resolve_caller_class` resolves
+    `low_priority` — a value this function has no access to — and at
+    `handle_bulk_lookup` it is called unconditionally with `True`. Both call
+    sites invoke it separately, next to their own call to this helper; see
+    `lookup.endpoint_family.record_low_priority_tag`'s call-site-timing
+    docstring for why moving it here would be wrong.
+    """
+    init_cache_stats(extra_keys=extra_keys)
+    _record_lml_flag_tags()
+    _record_event_loop_lag()
+    record_endpoint_family_tag(family)
+    record_caller_reason_tag(caller_reason)
+    if skip_cache:
+        set_skip_cache(True)
 
 
 # Canonical full path for the bulk endpoint. Referenced by the explicit
@@ -473,19 +545,15 @@ async def handle_lookup(
     ),
 ):
     """Process a lookup request."""
-    # Pre-declare LML-specific cache-stats keys so PostHog/Sentry payload shapes
-    # are stable even on requests with zero in-flight joins or zero L1 write
-    # failures (LML#544 round 2). Without extra_keys, the keys would only
-    # appear in payloads from the first request that records them.
-    init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
-    # LML#681: tag the per-request payload with the row-less-family flag state
-    # (0/1) once per context so the flip is sliceable in PostHog/Sentry.
-    _record_lml_flag_tags()
-    _record_event_loop_lag()
-    record_endpoint_family_tag(ENDPOINT_FAMILY_LOOKUP)
-    record_caller_reason_tag(x_caller_reason)
-    if skip_cache:
-        set_skip_cache(True)
+    # LML#1036: shared telemetry preamble (cache_stats seed, LML#681 flag
+    # tags, LML#907 event-loop-lag stamp, endpoint-family + caller-reason
+    # Sentry tags, skip_cache honor) -- see `init_lookup_observability`.
+    init_lookup_observability(
+        ENDPOINT_FAMILY_LOOKUP,
+        x_caller_reason,
+        skip_cache=skip_cache,
+        extra_keys=_LML_CACHE_STATS_EXTRA_KEYS,
+    )
 
     try:
         # LML#928/#953: class 5 (batch/cron/backfill) additionally routes this
@@ -842,17 +910,11 @@ async def handle_bulk_lookup(
     # transaction only commit on response completion.
     logger.info("bulk lookup start: size=%d", len(request.items))
 
-    # Honor the same `skip_cache` query flag the per-item route accepts. Backed
-    # by a ContextVar, so setting once at the batch top propagates into each
-    # `_run_one` task via the inherited task context.
-    if skip_cache:
-        set_skip_cache(True)
-
     # Bulk does streaming-URL cache read-fill ONLY — never spawns the background
     # warm (LML#706). A 35k-album drain returns fast per item, so an enqueued
     # warm tail would decouple from the request and starve the live /lookup
-    # path's own warms. Same ContextVar-propagation mechanism as `skip_cache`,
-    # and the same posture as the unconditional `bandcamp=None` pin below —
+    # path's own warms. Same ContextVar-propagation mechanism as `skip_cache`
+    # below, and the same posture as the unconditional `bandcamp=None` pin —
     # `allow_release_resolution_fallback` is caller-controlled since LML#920.
     set_suppress_streaming_warm(True)
 
@@ -863,22 +925,26 @@ async def handle_bulk_lookup(
     set_discogs_low_priority(True)
 
     # One cache_stats context for the whole batch: the in-process caches are
-    # shared, so aggregate counters reflect the batch's behavior — the property
-    # that motivates this endpoint.
-    # Pre-declare LML-specific cache-stats keys so PostHog/Sentry payload shapes
-    # are stable even on requests with zero in-flight joins or zero L1 write
-    # failures (LML#544 round 2). Without extra_keys, the keys would only
-    # appear in payloads from the first request that records them.
-    init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
-    # LML#681: record the flag tag once for the whole batch (shared context),
-    # so the bulk value stays 0/1 instead of summing across items.
-    _record_lml_flag_tags()
-    _record_event_loop_lag()
-    record_endpoint_family_tag(ENDPOINT_FAMILY_LOOKUP_BULK)
+    # shared, so aggregate counters reflect the batch's behavior — the
+    # property that motivates this endpoint. LML#1036: shared telemetry
+    # preamble (see `init_lookup_observability`) -- also honors the same
+    # `skip_cache` query flag the per-item route accepts (backed by a
+    # ContextVar, so setting once at the batch top propagates into each
+    # `_run_one` task via the inherited task context) and records the flag
+    # tag once for the whole batch (shared context), so the bulk value stays
+    # 0/1 instead of summing across items.
+    init_lookup_observability(
+        ENDPOINT_FAMILY_LOOKUP_BULK,
+        x_caller_reason,
+        skip_cache=skip_cache,
+        extra_keys=_LML_CACHE_STATS_EXTRA_KEYS,
+    )
     # LML#930 PR2: every item on this route is always low priority (mirrors
-    # the unconditional set_discogs_low_priority(True) above).
+    # the unconditional set_discogs_low_priority(True) above). Not part of
+    # the shared preamble -- unlike `handle_lookup` (where `low_priority` is
+    # resolved later from `resolve_caller_class`), here it's unconditionally
+    # True, so this call just sits next to the preamble instead of inside it.
     record_low_priority_tag(True)
-    record_caller_reason_tag(x_caller_reason)
 
     max_concurrent = max_concurrency_from_env(_BULK_LOOKUP_DEFAULT_CONCURRENCY)
     semaphore = asyncio.Semaphore(max_concurrent)

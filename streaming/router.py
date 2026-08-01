@@ -224,6 +224,9 @@ async def handle_streaming_check(
     # Per-request telemetry (LML#639). The cache-stats bracket and api_calls map
     # are seeded with a stable, all-zero shape: the streaming-check path is
     # application-cache-free and the clients record no API calls yet (LML#641).
+    # No `extra_keys` (LML#1036 seeding-decision survey, see
+    # `lookup.router._LML_CACHE_STATS_EXTRA_KEYS`'s docstring): there is no
+    # LML-specific key this cache-free path needs to stabilize.
     init_cache_stats()
     telemetry = RequestTelemetry(
         api_call_keys=list(_STREAMING_SERVICES),
