@@ -235,9 +235,16 @@ class TestGetArtist:
         assert resp.status_code == 503
 
     @pytest.mark.asyncio
-    async def test_breaker_shed_returns_503(self, app_with_discogs, mock_discogs):
-        """R2-3: a saturation-breaker shed on this route returns 503 (transient /
-        retryable), NOT a raw 500. Mirrors ``TestGetRelease.test_breaker_shed_returns_503``."""
+    async def test_defensive_breaker_wrap_returns_503_if_propagated(
+        self, app_with_discogs, mock_discogs
+    ):
+        """LML#1031: pins the DEFENSIVE contract, not current production
+        behavior. IF ``get_artist_details`` ever raises ``DiscogsBreakerOpenError``
+        directly -- which it does not today, see
+        ``test_current_shed_behavior_swallows_to_404`` below -- the router must
+        translate that into a 503 (transient/retryable), not a raw 500. Mirrors
+        ``TestGetRelease.test_breaker_shed_returns_503`` and ``resolve_entity``'s
+        defensive wrap."""
         from discogs.breaker import DiscogsBreakerOpenError
 
         mock_discogs.get_artist_details = AsyncMock(side_effect=DiscogsBreakerOpenError("shed"))
@@ -248,6 +255,56 @@ class TestGetArtist:
             resp = await client.get("/api/v1/discogs/artist/45")
 
         assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_current_shed_behavior_swallows_to_404(self, mock_settings):
+        """LML#1049: pins the REAL current shed path (known-suboptimal).
+
+        Unlike ``get_release``'s ``_api_fetch`` (which re-raises
+        ``DiscogsBreakerOpenError``, ``discogs/service.py`` ~1520-1526, "FIX 1"),
+        ``get_artist_details``'s own ``_api_fetch`` catches
+        ``DiscogsBreakerOpenError`` internally and returns ``None`` (LML#805,
+        ``discogs/service.py`` ~1685-1695). So a real breaker shed during an
+        artist fetch never reaches the router's 503 branch above -- it degrades
+        to a plain ``None``, and ``get_artist`` raises the same 404 it would for
+        a genuine "no such artist." This violates the breaker's "never return a
+        definitive negative from a shed" contract (``discogs/breaker.py``
+        ~147-156); LML#1049 tracks the fix decision. This test uses a REAL
+        ``DiscogsService`` (not a full mock) with ``_request_with_retry`` stubbed
+        to shed, so it exercises the actual swallow path rather than a mocked
+        shortcut -- it must start failing (and be rewritten) the moment #1049
+        changes this behavior.
+        """
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from discogs.breaker import DiscogsBreakerOpenError
+        from main import app
+
+        real_service = DiscogsService(token="test-token")
+
+        with (
+            patch.object(
+                real_service,
+                "_request_with_retry",
+                new_callable=AsyncMock,
+                side_effect=DiscogsBreakerOpenError("shed"),
+            ),
+            override_deps(
+                app,
+                {
+                    get_library_db: AsyncMock(),
+                    get_discogs_service: real_service,
+                    get_posthog_client: None,
+                    get_settings: mock_settings,
+                },
+            ),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/api/v1/discogs/artist/45")
+
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
