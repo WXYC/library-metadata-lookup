@@ -20,6 +20,7 @@ Run with: pytest -m pg -v tests/integration/test_streaming_catalog.py
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import asyncpg
@@ -31,6 +32,7 @@ from entity.streaming_catalog import (
     _TABLES,
     set_up_streaming_catalog_schema,
 )
+from streaming.service import StreamingService
 from tests.integration.conftest import opted_in, skip_if_named_tables_populated
 
 # ``_TABLES`` is parents-before-children (creation order), so its reverse is
@@ -506,6 +508,38 @@ class TestSchemaBootstrap:
                 list(_TABLES),
             )
         assert sorted(r["event_object_table"] for r in rows) == sorted(_TABLES)
+
+
+@pytest.mark.pg
+class TestStreamingServiceCheckParity:
+    """LML#1037 hard constraint: the LIVE deployed CHECK constraint's value
+    set must equal the ``StreamingService`` enum's full catalog-key set (all
+    7 offline-catalog services), byte-for-byte. See
+    ``tests/unit/test_streaming_catalog_schema.py::TestStreamingServiceParity``
+    for the code-side (unit-level) twin."""
+
+    @pytest.mark.asyncio
+    async def test_deployed_check_matches_enum_catalog_keys(self, pg_pool, pg_source):
+        await set_up_streaming_catalog_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            constraint_def = await conn.fetchval(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conname = 'streaming_album_service_valid' "
+                "AND conrelid = 'lml_cache.streaming_album_service'::regclass"
+            )
+        assert constraint_def is not None
+        deployed = set(re.findall(r"'([^']+)'", constraint_def))
+        expected = {s.catalog_key for s in StreamingService}
+        assert deployed == expected
+        assert deployed == {
+            "spotify",
+            "deezer",
+            "apple_music",
+            "bandcamp",
+            "tidal",
+            "youtube_music",
+            "soundcloud",
+        }
 
 
 @pytest.mark.pg

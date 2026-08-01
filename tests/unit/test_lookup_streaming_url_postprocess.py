@@ -62,7 +62,14 @@ from lookup.streaming_url_postprocess import (
     apply_streaming_url_postprocess,
     set_suppress_streaming_warm,
 )
+from streaming.service import ALBUM_CACHE_KEYS, SERVICE_BY_ALBUM_CACHE_KEY, StreamingService
 from tests.conftest import drain_streaming_warm_tasks, reset_streaming_warm_state
+
+# Maps this file's storage-key test data (``_CASES``, string-keyed) onto the
+# StreamingService enum member that owns each key (LML#1037:
+# STREAMING_URL_CACHE_CONFIG is keyed by the enum, not the bare storage
+# string).
+_SERVICE_BY_STORAGE_KEY = SERVICE_BY_ALBUM_CACHE_KEY
 
 # Per-service test data. The cache module is service-agnostic; what differs per
 # service is the URL field, client attr, per-service flag, and a
@@ -956,32 +963,43 @@ class TestWarmConcurrencyBound:
 
 class TestRegistryInvariants:
     """The cache registry is a subset of the identity registry; guards keep it
-    from drifting."""
+    from drifting.
+
+    LML#1037: ``STREAMING_URL_CACHE_CONFIG`` is now keyed by the
+    ``StreamingService`` enum, not the bare album-cache-key string this file's
+    own ``_CASES`` test data (and ``RELEASE_SOURCE_CONFIG``, out of this
+    ticket's scope) still use — every comparison below maps one side through
+    ``ALBUM_CACHE_KEYS`` / ``SERVICE_BY_ALBUM_CACHE_KEY`` rather than
+    comparing the registry's keys directly against a string.
+    """
 
     def test_parametrize_keys_match_cache_config(self):
-        assert set(_CASES) == set(STREAMING_URL_CACHE_CONFIG.keys())
+        assert set(_CASES) == {ALBUM_CACHE_KEYS[s] for s in STREAMING_URL_CACHE_CONFIG}
 
     def test_cache_config_is_subset_of_release_source_config(self):
-        assert set(STREAMING_URL_CACHE_CONFIG.keys()) <= set(RELEASE_SOURCE_CONFIG.keys())
+        assert {ALBUM_CACHE_KEYS[s] for s in STREAMING_URL_CACHE_CONFIG} <= set(
+            RELEASE_SOURCE_CONFIG.keys()
+        )
 
     def test_cache_config_matches_table_check_constraint_allowlist(self):
         from entity.streaming_url_cache import _SERVICES
 
-        assert set(STREAMING_URL_CACHE_CONFIG.keys()) == set(_SERVICES)
+        assert {ALBUM_CACHE_KEYS[s] for s in STREAMING_URL_CACHE_CONFIG} == set(_SERVICES)
 
     def test_cache_config_ships_apple_spotify_and_bandcamp(self):
         assert set(STREAMING_URL_CACHE_CONFIG.keys()) == {
-            "apple_music_album",
-            "spotify_album",
-            "bandcamp",
+            StreamingService.APPLE_MUSIC,
+            StreamingService.SPOTIFY,
+            StreamingService.BANDCAMP,
         }
 
     @pytest.mark.parametrize("service", list(_CASES))
     def test_cache_config_fields_match_expectations(self, service):
         case = _CASES[service]
-        cfg = STREAMING_URL_CACHE_CONFIG[service]
+        enum_service = _SERVICE_BY_STORAGE_KEY[service]
+        cfg = STREAMING_URL_CACHE_CONFIG[enum_service]
         assert cfg.url_field == case["url_field"]
-        assert cfg.client_attr == case["client_attr"]
+        assert enum_service.catalog_key == case["client_attr"]
         assert cfg.flag_setting == case["flag_setting"]
         assert cfg.probe_timeout_s == case["probe_timeout_s"]
         assert service in RELEASE_SOURCE_CONFIG
@@ -1005,28 +1023,32 @@ class TestPerServiceTimeoutResolution:
         from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
 
         assert (
-            STREAMING_URL_CACHE_CONFIG["apple_music_album"].timeout_env_var
+            STREAMING_URL_CACHE_CONFIG[StreamingService.APPLE_MUSIC].timeout_env_var
             == APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
         )
 
     def test_spotify_entry_has_no_env_var(self):
-        assert STREAMING_URL_CACHE_CONFIG["spotify_album"].timeout_env_var is None
+        assert STREAMING_URL_CACHE_CONFIG[StreamingService.SPOTIFY].timeout_env_var is None
 
     def test_bandcamp_entry_has_no_env_var(self):
-        assert STREAMING_URL_CACHE_CONFIG["bandcamp"].timeout_env_var is None
+        assert STREAMING_URL_CACHE_CONFIG[StreamingService.BANDCAMP].timeout_env_var is None
 
     def test_bandcamp_effective_timeout_is_static_nine_seconds(self, monkeypatch):
         from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
 
         monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
-        assert mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG["bandcamp"]) == 9.0
+        assert (
+            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG[StreamingService.BANDCAMP])
+            == 9.0
+        )
 
     def test_apple_effective_timeout_honors_env_override(self, monkeypatch):
         from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
 
         monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
         assert (
-            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG["apple_music_album"]) == 1.5
+            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG[StreamingService.APPLE_MUSIC])
+            == 1.5
         )
 
     def test_apple_effective_timeout_defaults_without_env(self, monkeypatch):
@@ -1034,11 +1056,15 @@ class TestPerServiceTimeoutResolution:
 
         monkeypatch.delenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, raising=False)
         assert (
-            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG["apple_music_album"]) == 4.0
+            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG[StreamingService.APPLE_MUSIC])
+            == 4.0
         )
 
     def test_spotify_effective_timeout_ignores_apple_env(self, monkeypatch):
         from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR
 
         monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
-        assert mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG["spotify_album"]) == 4.0
+        assert (
+            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG[StreamingService.SPOTIFY])
+            == 4.0
+        )

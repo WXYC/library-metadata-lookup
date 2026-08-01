@@ -17,6 +17,8 @@ Run with: pytest -m pg -v tests/integration/test_track_streaming_url_cache_pg.py
 
 from __future__ import annotations
 
+import re
+
 import asyncpg
 import pytest
 import pytest_asyncio
@@ -27,6 +29,7 @@ from entity.track_streaming_url_cache import (
     set_cached_track_streaming_url,
     set_up_track_streaming_url_cache_schema,
 )
+from streaming.service import StreamingService
 from tests.integration.conftest import skip_if_named_tables_populated
 
 _ARTIST = "Juana Molina"
@@ -89,6 +92,29 @@ class TestSchemaBootstrap:
                     "VALUES ($1, 'x', 'y', 'z', NULL)",
                     APPLE_MUSIC_TRACK_SERVICE,
                 )
+
+
+@pytest.mark.pg
+class TestStreamingServiceCheckParity:
+    """LML#1037 hard constraint: the LIVE deployed CHECK constraint's value
+    set must equal the ``StreamingService`` enum's track-cache-key storage
+    keys, byte-for-byte. See ``tests/unit/test_track_streaming_url_cache_schema.py::
+    TestStreamingServiceParity`` for the code-side (unit-level) twin."""
+
+    @pytest.mark.asyncio
+    async def test_deployed_check_matches_enum_track_cache_keys(self, pg_pool, pg_source):
+        await set_up_track_streaming_url_cache_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            constraint_def = await conn.fetchval(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conname = 'track_streaming_url_cache_service_valid' "
+                "AND conrelid = 'lml_cache.track_streaming_url_cache'::regclass"
+            )
+        assert constraint_def is not None
+        deployed = set(re.findall(r"'([^']+)'", constraint_def))
+        expected = {s.track_cache_key for s in StreamingService if s.track_cache_key is not None}
+        assert deployed == expected
+        assert deployed == {"apple_music_track"}
 
 
 @pytest.mark.pg

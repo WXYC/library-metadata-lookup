@@ -10,6 +10,7 @@ from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.deezer import DeezerClient
 from clients.streaming.spotify import SpotifyClient
 from streaming.models import StreamingCheckResponse, StreamingCheckSources
+from streaming.service import CATALOG_CHECK_SERVICES
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +19,12 @@ logger = logging.getLogger(__name__)
 # API-locked, so the gather loop relies on this mapping being 1:1).
 # Explicit raise (not `assert`) so the guard survives `python -O` /
 # `PYTHONOPTIMIZE=1`, which compiles bare `assert` statements out and would
-# silently disable the check in optimized production runs.
-_EXPECTED_SERVICE_FIELDS = {"spotify", "deezer", "apple_music", "bandcamp"}
+# silently disable the check in optimized production runs. LML#1037: derived
+# from the shared `StreamingService` enum's catalog-key granularity (via
+# `CATALOG_CHECK_SERVICES`, the canonical ordering this module's kwargs and
+# `StreamingCheckSources`'s fields both follow) instead of a free-floating
+# literal set -- same values.
+_EXPECTED_SERVICE_FIELDS = {s.catalog_key for s in CATALOG_CHECK_SERVICES}
 if set(StreamingCheckSources.model_fields) != _EXPECTED_SERVICE_FIELDS:
     raise RuntimeError(
         "StreamingCheckSources fields drifted from check_streaming_availability "
@@ -69,12 +74,20 @@ async def check_streaming_availability(
     # The kwarg names (spotify / deezer / apple_music / bandcamp) double as
     # `StreamingCheckSources` field names — the response shape is API-locked,
     # so the gather loop maps name-to-client uniformly without branching.
-    clients = {
-        "spotify": spotify,
-        "deezer": deezer,
-        "apple_music": apple_music,
-        "bandcamp": bandcamp,
-    }
+    # LML#1037: the dict's KEYS are derived from `CATALOG_CHECK_SERVICES` (the
+    # same canonical ordering `_EXPECTED_SERVICE_FIELDS` above uses) instead of
+    # a free-floating literal dict — the VALUES still bind directly to this
+    # function's named kwargs (unchanged signature, so `streaming/router.py`'s
+    # call site and every existing test needs no update). `strict=True` makes
+    # a future kwarg/registry-order drift fail loudly at call time rather than
+    # silently mis-pairing a client with the wrong service key.
+    clients = dict(
+        zip(
+            (s.catalog_key for s in CATALOG_CHECK_SERVICES),
+            (spotify, deezer, apple_music, bandcamp),
+            strict=True,
+        )
+    )
     tasks: dict[str, asyncio.Task] = {
         name: asyncio.create_task(client.find_album_match(artist, title))
         for name, client in clients.items()
