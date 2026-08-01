@@ -44,6 +44,25 @@ class _FakeClient:
         return self._matches.get((artist, title))
 
 
+class _RaisingClient:
+    """Raises for one (artist, title), matches everything else.
+
+    Mimics the shared matcher's contract of re-raising when every result row
+    fails extraction (``clients/streaming/matching.py``, LML#640/#376) -- e.g. a
+    YTM result set whose rows all lack an ``artists`` key.
+    """
+
+    def __init__(self, raise_on: tuple[str, str]):
+        self._raise_on = raise_on
+        self.calls: list[tuple[str, str]] = []
+
+    async def find_album_match(self, artist: str, title: str) -> SourceMatch | None:
+        self.calls.append((artist, title))
+        if (artist, title) == self._raise_on:
+            raise KeyError("artists")
+        return _match()
+
+
 class TestSummarize:
     def test_counts_and_hit_rate(self):
         outcomes = [
@@ -89,6 +108,19 @@ class TestResolveCandidates:
         cands = [Candidate(f"A{i}", f"T{i}") for i in range(6)]
         outcomes = await resolve_candidates(client, cands, concurrency=3)
         assert [o.candidate.artist for o in outcomes] == [f"A{i}" for i in range(6)]
+
+    @pytest.mark.asyncio
+    async def test_isolates_per_candidate_exceptions(self):
+        # A single malformed search (the matcher re-raises when every row fails
+        # extraction) must become a miss, not abort the whole run and discard
+        # every already-resolved match. Mirrors the /streaming-check orchestrator.
+        client = _RaisingClient(raise_on=("Boom", "Bad"))
+        cands = [Candidate("Boom", "Bad"), Candidate("Stereolab", "Aluminum Tunes")]
+        outcomes = await resolve_candidates(client, cands, concurrency=2)
+        by_artist = {o.candidate.artist: o for o in outcomes}
+        assert by_artist["Boom"].match is None  # raise -> miss
+        assert by_artist["Stereolab"].match is not None  # run continued
+        assert len(client.calls) == 2
 
 
 class TestLoaders:

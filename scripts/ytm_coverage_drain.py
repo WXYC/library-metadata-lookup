@@ -33,12 +33,16 @@ key the dedup pipeline wrote -- so there is no normalization drift.
 
 Usage
 -----
+``ytmusicapi`` lives in the ``drain`` extra (not ``dev``), and ``_run`` always
+builds a real client, so the drain must run under ``--extra drain`` or the lazy
+``from ytmusicapi import YTMusic`` raises ``ModuleNotFoundError``.
+
     # dry-run (default): resolve + report, write nothing
-    uv run python -m scripts.ytm_coverage_drain --sample-csv resolved_names.csv \
+    uv run --extra drain python -m scripts.ytm_coverage_drain --sample-csv resolved_names.csv \
         --limit 200 --concurrency 4 --report-json /tmp/ytm_drain_report.json
 
     # persist (opt-in, fill-only): add --execute + the target DB
-    uv run python -m scripts.ytm_coverage_drain --sample-csv resolved_names.csv \
+    uv run --extra drain python -m scripts.ytm_coverage_drain --sample-csv resolved_names.csv \
         --execute --results-db streaming_availability.db
 
 Persisting is the user's action -- off-peak, fill-only, one bulk LML consumer at
@@ -136,7 +140,16 @@ async def resolve_candidates(
 
     async def _one(c: Candidate) -> DrainOutcome:
         async with sem:
-            match = await client.find_album_match(c.artist, c.title)
+            try:
+                match = await client.find_album_match(c.artist, c.title)
+            except Exception:
+                # One malformed search must not abort the whole run. The shared
+                # matcher re-raises when every result row fails extraction
+                # (clients/streaming/matching.py, LML#640/#376) -- e.g. a YTM
+                # result set whose rows all lack `artists`. Treat as a miss,
+                # mirroring the /streaming-check orchestrator's per-task isolation.
+                log.exception("resolve failed for %r - %r; recording a miss", c.artist, c.title)
+                return DrainOutcome(candidate=c, match=None)
         return DrainOutcome(candidate=c, match=match)
 
     return list(await asyncio.gather(*(_one(c) for c in candidates)))

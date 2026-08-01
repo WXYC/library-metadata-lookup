@@ -764,3 +764,33 @@ class TestYouTubeMusicMigrationOnExistingDb:
             assert rows[0]["youtube_music_url"] == "https://music.youtube.com/browse/MPREb_pre"
         finally:
             await db.close()
+
+    @pytest.mark.asyncio
+    async def test_backfill_runs_once_and_preserves_manual_reset(self, tmp_path):
+        # The pending->found backfill must run only when youtube_music_status is
+        # first added, so a later connect never re-stamps a row an operator
+        # deliberately reset to 'pending' (URL kept) to force a re-attempt.
+        # Removing the youtube_music_status_added guard would clobber that reset
+        # -- this is the regression fence (mirrors the bandcamp analog).
+        path = str(tmp_path / "reset.db")
+
+        db = ResultsDB(path)
+        await db.connect()
+        try:
+            await db.insert_albums([_make_album()])
+            album_id = (await db.get_pending("spotify", limit=10))[0]["id"]
+            await db.update_youtube_music_url(album_id, "https://music.youtube.com/browse/MPREb_x")
+            await db._db.execute(
+                "UPDATE albums SET youtube_music_status = 'pending' WHERE id = ?", (album_id,)
+            )
+            await db._db.commit()
+        finally:
+            await db.close()
+
+        db2 = ResultsDB(path)
+        await db2.connect()
+        try:
+            rows = await db2.get_all_results()
+            assert rows[0]["youtube_music_status"] == "pending"
+        finally:
+            await db2.close()
