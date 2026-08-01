@@ -75,6 +75,7 @@ from wxyc_etl.text import to_match_form
 from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute, swallowing_fetch
+from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -118,8 +119,6 @@ DEFAULT_POSITIVE_TTL = timedelta(days=90)
 # difference: long enough to absorb one flood pass, short enough that a
 # transient crowd-out self-heals within the hour.
 DEFAULT_CROWD_OUT_MISS_TTL = timedelta(hours=1)
-
-_DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
 # Named CHECK constraint (``release_id_validity``) avoids reliance on PG
 # auto-naming, matching the streaming cache's convention. Kept free of inline

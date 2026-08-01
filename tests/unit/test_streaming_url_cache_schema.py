@@ -1,4 +1,4 @@
-"""Unit tests for the streaming-URL cache schema bootstrap (LML#573, LML#886).
+"""Unit tests for the streaming-URL cache schema bootstrap (LML#573, LML#1038).
 
 Two surfaces:
 
@@ -8,11 +8,12 @@ Two surfaces:
   constraint and composite PK, so a reviewer / operator has the DDL inline.
 * ``set_up_streaming_url_cache_schema`` — the lifespan bootstrap helper. It
   must issue ``CREATE SCHEMA`` then ``CREATE TABLE`` (named CHECK), then the
-  widen-only DO block (LML#886 — ported from ``entity/streaming_catalog.py``'s
-  ``_DDL_ALBUM_SERVICE_WIDEN_CHECK``), all inside one transaction on one
-  connection behind a ``lock_timeout`` + advisory-lock preamble. No row
-  mutation (the LML#571→#573 apple-table backfill was removed in #573's
-  PR-2).
+  widen-only DO block (``entity.ddl.widen_service_check`` — LML#1038
+  generalized this table onto the same LML#890 generation
+  ``entity/streaming_catalog.py`` pioneered, retiring this module's own
+  ~33-line LML#886 port), all inside one transaction on one connection behind
+  a ``lock_timeout`` + advisory-lock preamble. No row mutation (the
+  LML#571→#573 apple-table backfill was removed in #573's PR-2).
 
 PG is faked with a recording double (mirrors
 ``test_streaming_catalog_schema.py``'s ``_FakePgSource``): ``AsyncMock`` can
@@ -153,7 +154,10 @@ class TestSetUpStreamingUrlCacheSchema:
         assert "CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache" in table_sql
         assert "CONSTRAINT album_streaming_url_cache_service_valid CHECK" in table_sql
         assert "PRIMARY KEY (service, artist_normalized, album_normalized)" in table_sql
-        assert "DO $cache_check$" in widen_sql
+        # LML#1038: the widen block now comes from the shared
+        # entity.ddl.build_widen_service_check_sql -- same widen-only shape,
+        # generic dollar-quote tag (not this table's own).
+        assert widen_sql.startswith("DO $")
         assert "album_streaming_url_cache_service_valid" in widen_sql
 
     async def test_widen_block_admits_the_full_service_set(self):

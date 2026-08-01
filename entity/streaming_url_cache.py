@@ -62,6 +62,8 @@ from wxyc_etl.text import to_match_form
 
 from clients.streaming.base import BaseStreamingClient
 from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute, swallowing_fetch
+from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
+from entity.ddl import widen_service_check
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
@@ -83,8 +85,6 @@ _SERVICES = ("apple_music_album", "spotify_album", "bandcamp")
 # code-side array are generated from the same source — they can never drift.
 _SERVICE_IN_LIST = ", ".join(f"'{s}'" for s in _SERVICES)
 
-_DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
-
 # Named CHECK constraint (``album_streaming_url_cache_service_valid``) avoids
 # reliance on PG auto-naming so the widen DO block below can manage it by
 # name. The service-value list is generated from ``_SERVICES`` so the two
@@ -103,59 +103,17 @@ CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
 )\
 """
 
-# Widen-only maintenance of the named service CHECK (ported from
-# ``entity/streaming_catalog.py``'s ``_DDL_ALBUM_SERVICE_WIDEN_CHECK``,
-# LML#886). A static DROP+ADD (this module's prior pattern) would (a) take an
-# ACCESS EXCLUSIVE lock plus a full re-validation scan on EVERY boot even
-# though the steady-state constraint is already correct, and (b) narrow the
-# constraint under a rollback deploy — the ALTER is generated from the
-# shipped ``_SERVICES`` tuple, so deploying an older build against a table
-# whose rows already use a newer service value fails validation and aborts
-# the whole bootstrap transaction. This DO block instead deparses the
-# deployed constraint, extracts its quoted literals, and rewrites only when
-# the shipped ``_SERVICES`` adds something — merging, never narrowing, and
-# leaving the constraint (and its OID) untouched on a steady-state boot. The
-# rewrite must emit the ``service IN (...)`` form: PG deparses IN as ``= ANY
-# (ARRAY[...])`` and the extraction reads the quoted literals out of that
-# deparse, whereas an array-literal Const (``'{...}'::text[]``) deparses as
-# ONE literal and would corrupt the next boot's extraction. When the
-# constraint is ABSENT (dropped out-of-band), the re-ADD folds in every
-# service value already live in the table, so the recovery boot's
-# re-validation can't fail against collected out-of-set rows — which would
-# otherwise abort EVERY subsequent bootstrap until manual repair.
-_DDL_SERVICE_WIDEN_CHECK = f"""\
-DO $cache_check$
-DECLARE
-    existing_def text;
-    existing_services text[];
-    code_services text[] := ARRAY[
-        {_SERVICE_IN_LIST}];
-    merged_list text;
-BEGIN
-    SELECT pg_get_constraintdef(oid) INTO existing_def
-        FROM pg_constraint
-        WHERE conrelid = 'lml_cache.album_streaming_url_cache'::regclass
-            AND conname = 'album_streaming_url_cache_service_valid';
-    IF existing_def IS NOT NULL THEN
-        SELECT array_agg(m[1]) INTO existing_services
-            FROM regexp_matches(existing_def, '''([^'']+)''', 'g') AS m;
-        IF existing_services @> code_services THEN
-            RETURN;
-        END IF;
-    ELSE
-        SELECT array_agg(DISTINCT service) INTO existing_services
-            FROM lml_cache.album_streaming_url_cache;
-    END IF;
-    SELECT string_agg(DISTINCT quote_literal(s), ', ' ORDER BY quote_literal(s))
-        INTO merged_list
-        FROM unnest(coalesce(existing_services, ARRAY[]::text[]) || code_services) AS s;
-    EXECUTE 'ALTER TABLE lml_cache.album_streaming_url_cache '
-        'DROP CONSTRAINT IF EXISTS album_streaming_url_cache_service_valid, '
-        'ADD CONSTRAINT album_streaming_url_cache_service_valid CHECK (service IN ('
-        || merged_list || '))';
-END;
-$cache_check$\
-"""
+# Bare table/constraint names for the shared widen-check builder
+# (``entity.ddl.widen_service_check``). Previously this module carried its
+# own ~33-line DO-block port (LML#886, "ported from
+# entity/streaming_catalog.py"); LML#1038 deletes that port in favor of the
+# one shared implementation, which also upgrades this table's widen path to
+# the newest generation's round-trip validation + foreign-form warn-and-skip
+# (LML#890) — a deliberate behavior upgrade, not a pure rename. See
+# ``entity.ddl.build_widen_service_check_sql`` for the full generation
+# rationale.
+_WIDEN_CHECK_TABLE = "album_streaming_url_cache"
+_WIDEN_CHECK_CONSTRAINT = "album_streaming_url_cache_service_valid"
 
 # Bootstrap preamble, run inside the single wrapping transaction:
 #
@@ -213,12 +171,12 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
     widen-block rewrite (DROP + ADD) is otherwise non-atomic, and two
     concurrent boots could interleave its deparse/rewrite steps.
 
-    The final DO block widens the named CHECK constraint to the current
+    The final step widens the named CHECK constraint to the current
     ``_SERVICES`` set, merging rather than narrowing (see
-    ``_DDL_SERVICE_WIDEN_CHECK``). ``CREATE TABLE IF NOT EXISTS`` cannot add a
-    value to an already-created table's constraint, so without it a prod
-    table frozen at an older service set would reject UPSERTs for a
-    newly-added service.
+    ``entity.ddl.build_widen_service_check_sql``). ``CREATE TABLE IF NOT
+    EXISTS`` cannot add a value to an already-created table's constraint, so
+    without it a prod table frozen at an older service set would reject
+    UPSERTs for a newly-added service.
     """
     async with pg.acquire() as conn:
         async with conn.transaction():
@@ -226,7 +184,12 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
             await conn.execute(_BOOTSTRAP_ADVISORY_LOCK)
             await conn.execute(_DDL_SCHEMA)
             await conn.execute(_DDL_TABLE)
-            await conn.execute(_DDL_SERVICE_WIDEN_CHECK)
+            await widen_service_check(
+                conn,
+                table=_WIDEN_CHECK_TABLE,
+                constraint=_WIDEN_CHECK_CONSTRAINT,
+                services=_SERVICES,
+            )
 
 
 async def get_cached_streaming_url(

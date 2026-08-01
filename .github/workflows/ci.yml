@@ -56,8 +56,14 @@ jobs:
       # falls back to PATH, where the editable install lands the binaries.
       - run: pip install -e ".[dev]"
       - run: bash scripts/generate_api_models.sh
+      # entity/*.sql are the canonical-DDL sidecars for the lml_cache.* store
+      # modules (LML#1038): generated from the Python DDL constants, never
+      # hand-edited. Two generators (streaming_catalog.py's own, plus the
+      # shared one for its seven siblings) cover all 8.
+      - run: python -m scripts.regenerate_streaming_catalog_sql
+      - run: python -m scripts.regenerate_lml_cache_sql
       - name: Check for drift
-        run: git diff --exit-code generated/
+        run: git diff --exit-code generated/ entity/*.sql
 
   typecheck:
     name: Type Check

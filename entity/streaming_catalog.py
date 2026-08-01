@@ -76,6 +76,8 @@ from __future__ import annotations
 
 import re
 
+from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
+from entity.ddl import build_widen_service_check_sql
 from entity.sources import PgSource
 
 # The services a catalog probe can target. The named CHECK pins this set at
@@ -119,8 +121,6 @@ ALLOW_URL_REMOVAL_GUC = "lml_cache.allow_url_removal"
 _OPT_IN_HINT = (
     f"opt in via set_config(''{ALLOW_URL_REMOVAL_GUC}'', ''on'', true) in this transaction"
 )
-
-_DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
 # ``GENERATED ALWAYS`` on this identity and ``streaming_track_result``'s: the
 # one-time seed (PR C) inserts the SQLite ``albums.id`` / ``track_results.id``
@@ -231,58 +231,22 @@ CREATE TABLE IF NOT EXISTS lml_cache.streaming_album_service (
 # extraction reads the quoted literals out of that deparse, whereas an
 # array-literal Const (``'{...}'::text[]``) deparses as ONE literal and would
 # corrupt the next boot's extraction.
-_DDL_ALBUM_SERVICE_WIDEN_CHECK = f"""\
-DO $catalog_check$
-DECLARE
-    existing_def text;
-    inner_array text;
-    existing_services text[];
-    rebuilt_array text;
-    code_services text[] := ARRAY[
-        {_SERVICE_IN_LIST}];
-    merged_list text;
-BEGIN
-    SELECT pg_get_constraintdef(oid) INTO existing_def
-        FROM pg_constraint
-        WHERE conrelid = 'lml_cache.streaming_album_service'::regclass
-            AND conname = 'streaming_album_service_valid';
-    IF existing_def IS NOT NULL THEN
-        inner_array := substring(
-            existing_def FROM '^CHECK \\(\\(service = ANY \\(ARRAY\\[(.*)\\]\\)\\)\\)$'
-        );
-        IF inner_array IS NULL THEN
-            RAISE WARNING 'streaming_album_service_valid: deployed CHECK (%) is not in the '
-                'expected service = ANY (ARRAY[...]) shape this bootstrap can parse; '
-                'leaving it untouched (foreign-form policy: warn-and-skip)', existing_def;
-            RETURN;
-        END IF;
-        SELECT array_agg(replace(m[1], '''''', '''')) INTO existing_services
-            FROM regexp_matches(inner_array, '''((?:[^'']|'''')*)''', 'g') AS m;
-        SELECT string_agg(quote_literal(s) || '::text', ', ') INTO rebuilt_array
-            FROM unnest(existing_services) AS s;
-        IF rebuilt_array IS DISTINCT FROM inner_array THEN
-            RAISE WARNING 'streaming_album_service_valid: deployed CHECK (%) has literals this '
-                'bootstrap could not confidently round-trip; leaving it untouched '
-                '(foreign-form policy: warn-and-skip)', existing_def;
-            RETURN;
-        END IF;
-        IF existing_services @> code_services THEN
-            RETURN;
-        END IF;
-    ELSE
-        SELECT array_agg(DISTINCT service) INTO existing_services
-            FROM lml_cache.streaming_album_service;
-    END IF;
-    SELECT string_agg(DISTINCT quote_literal(s), ', ' ORDER BY quote_literal(s))
-        INTO merged_list
-        FROM unnest(coalesce(existing_services, ARRAY[]::text[]) || code_services) AS s;
-    EXECUTE 'ALTER TABLE lml_cache.streaming_album_service '
-        'DROP CONSTRAINT IF EXISTS streaming_album_service_valid, '
-        'ADD CONSTRAINT streaming_album_service_valid CHECK (service IN ('
-        || merged_list || '))';
-END;
-$catalog_check$\
-"""
+#
+# LML#1038: this DO block's generation logic now lives in
+# ``entity.ddl.build_widen_service_check_sql``, generalized to any
+# ``(table, constraint, services)`` triple -- this was the ONLY generation of
+# the pattern before #1038; ``entity/streaming_url_cache.py`` and
+# ``entity/track_streaming_url_cache.py`` now call the same shared builder
+# for their own tables instead of carrying their own ports. Computed at
+# import time (not a literal) so this stays a plain string usable inside
+# ``_DDL_STATEMENTS`` below with zero change to the bootstrap loop or to
+# ``scripts/regenerate_streaming_catalog_sql.py``, which reads
+# ``_DDL_STATEMENTS`` verbatim.
+_DDL_ALBUM_SERVICE_WIDEN_CHECK = build_widen_service_check_sql(
+    table="streaming_album_service",
+    constraint="streaming_album_service_valid",
+    services=_SERVICES,
+)
 
 # Pending-scan support for the pipelines ("next albums to probe on service X"),
 # mirroring the SQLite per-service status indexes. Invariant this encodes for
