@@ -7,7 +7,10 @@ and ``entity/api_keys.py`` (``mark_key_used`` only) repeated one skeleton:
 normalize keys, run a ``PgSource.fetchone``/``fetchall``/``execute`` call, and
 on any exception log it and degrade to a miss shape rather than propagate --
 every one of these tables is a best-effort cache, and a PG hiccup must never
-break the ``/lookup`` request path.
+break the ``/lookup`` request path. (One later opt-out: LML#1026 made
+``compilation_track_location``'s READ helper raise a typed probe error instead
+of degrading, because its emptiness is authoritative for the strategy layer --
+see that module's docstrings. Its DDL writes stay outside this toolkit too.)
 
 This module gives that idiom two composable free functions (matching the
 repo's free-function store idiom, not a class hierarchy) instead of a

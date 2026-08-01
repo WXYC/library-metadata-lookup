@@ -153,9 +153,10 @@ class TestResolveTrackShelfLocations:
         assert [loc.row.library_id for loc in result] == [1, 2, 3]
 
     async def test_missing_library_row_yields_none_shelf_item(self, monkeypatch):
-        """A recall-index row with no matching library row (or the whole join
-        failing) surfaces as shelf_item=None -- the converter's job to skip,
-        not this probe's."""
+        """A recall-index row with no matching library row surfaces as
+        shelf_item=None -- the converter's job to skip, not this probe's.
+        (A WHOLE-join failure propagates instead, post-LML#1026 -- see
+        test_whole_join_failure_propagates_as_degradation.)"""
         parsed = ParsedRequest(artist="Squarepusher", song="Tommib")
         pg = AsyncMock()
         db = AsyncMock()
@@ -170,10 +171,14 @@ class TestResolveTrackShelfLocations:
 
         assert result == [ResolvedLocation(row=row, shelf_item=None)]
 
-    async def test_whole_join_failure_degrades_every_row_to_none_shelf_item(self, monkeypatch):
-        """A PG exception on the shelf-metadata join degrades to `{}` -- every
-        ranked row still comes back, all with shelf_item=None, rather than
-        the whole probe raising."""
+    async def test_whole_join_failure_propagates_as_degradation(self, monkeypatch):
+        """LML#1026 contract inversion: a whole-join failure is a DEGRADATION,
+        not data. Pre-#1026 it degraded in-module to shelf_item=None rows --
+        a truthy list the strategy's hit detection would then have to
+        special-case (and the fold renders none of, so a swallowed failure
+        could make the track vanish entirely). Now it propagates; every
+        await site catches and owns its policy (fold -> no locations;
+        strategy -> full legacy pass)."""
         parsed = ParsedRequest(artist="Squarepusher", song="Tommib")
         pg = AsyncMock()
         db = AsyncMock()
@@ -184,9 +189,50 @@ class TestResolveTrackShelfLocations:
             AsyncMock(return_value=[row]),
         )
 
+        with pytest.raises(RuntimeError):
+            await resolve_track_shelf_locations(parsed, pg, db)
+
+    async def test_individual_join_miss_still_yields_none_shelf_item(self, monkeypatch):
+        """An INDIVIDUAL id missing from an otherwise-successful join (a stale
+        index row) is not a degradation: it comes back as shelf_item=None and
+        the consumers filter it (the fold skips it; the strategy counts only
+        renderable locations toward a hit)."""
+        parsed = ParsedRequest(artist="Squarepusher", song="Tommib")
+        pg = AsyncMock()
+        db = AsyncMock()
+        stale, live = _row(library_id=1), _row(library_id=2)
+        live_item = make_library_item(id=2, artist="Various Artists", title="A Comp")
+        db.get_items_by_ids = AsyncMock(return_value={2: live_item})
+        monkeypatch.setattr(
+            "lookup.location_union.get_compilation_track_locations",
+            AsyncMock(return_value=[stale, live]),
+        )
+
         result = await resolve_track_shelf_locations(parsed, pg, db)
 
-        assert result == [ResolvedLocation(row=row, shelf_item=None)]
+        assert result == [
+            ResolvedLocation(row=stale, shelf_item=None),
+            ResolvedLocation(row=live, shelf_item=live_item),
+        ]
+
+    async def test_poison_rows_propagate_as_degradation(self, monkeypatch):
+        """Rows that break ranking -- e.g. a future recall-index schema
+        relaxation making ``library_id`` nullable, so the sort's tie-break
+        compares ``None`` with an int -- propagate as a degradation rather
+        than being swallowed (the LML#1026 nit-1 no-500 goal is enforced at
+        the await boundary: every await site catches)."""
+        parsed = ParsedRequest(artist="Brian Reitzell", song="Ikebana")
+        pg = AsyncMock()
+        db = AsyncMock()
+        db.get_items_by_ids = AsyncMock(return_value={})
+        poison = _row(library_id=None)  # type: ignore[arg-type]
+        monkeypatch.setattr(
+            "lookup.location_union.get_compilation_track_locations",
+            AsyncMock(return_value=[poison, _row(library_id=1)]),
+        )
+
+        with pytest.raises(TypeError):
+            await resolve_track_shelf_locations(parsed, pg, db)
 
 
 class TestPrimaryLibraryIdsFromResults:

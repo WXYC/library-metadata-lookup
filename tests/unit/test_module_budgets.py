@@ -61,29 +61,36 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/enrichment/streaming_status.py": 100,
     "lookup/enrichment/top1.py": 100,
     "lookup/external_search.py": 350,
-    # Recalibrated 2026-07-31 (transparent-fold plan, supersedes LML#1022): the
-    # probe now retains the joined shelf `LibraryItem` (a `ResolvedLocation`
-    # dataclass, not a bare `LibraryLocation`) and the module gained the
-    # per-row -> `LookupResultItem` converter that used to live nowhere (the
-    # separate-field design never needed one — `LibraryLocation` rows were the
-    # wire shape). Smallest multiple of 50 at or above the new measured size.
-    "lookup/location_union.py": 250,
+    # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
+    # transparent-fold calibration): the module gained the empty-vs-degraded
+    # contract (probe/rank/join failures deliberately PROPAGATE — never
+    # collapse to [], which the strategy would read as an authoritative
+    # index miss — with every await site owning its own degrade policy) and
+    # the three location_union_index_* stat keys. Smallest multiple of 50 at
+    # or above the new measured size.
+    "lookup/location_union.py": 300,
     "lookup/matching.py": 550,
     "lookup/models.py": 150,
-    # Recalibrated 2026-07-31 (transparent-fold plan, supersedes the 2026-07-30
-    # LML#1022 calibration): the separate-field design's response-array
-    # threading collapsed into an ordinary `results` fold, but the fold itself
-    # grew the spine — the append site moved from right after step 3 to after
-    # `_step_external_cache_fallback` (Step 7), five degraded/shed early
-    # returns each gained a bounded await of the location-union task, and the
-    # post-fold signal reconciliation (`_reconcile_post_fold_signals`,
-    # `_project_post_fold_trace_attrs`, the two await helpers) stayed in this
-    # module on purpose — moving it to `lookup/location_union.py` would close
-    # an import cycle via `build_context_message`, which only this module
-    # defines. Same tight-on-purpose posture as every prior recalibration:
-    # smallest multiple of 50 at or above the new measured size, not a
-    # re-derived 1.3x (which would reopen hundreds of lines of headroom).
-    "lookup/orchestrator.py": 1500,
+    # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31
+    # transparent-fold calibration): the location-union task is now threaded
+    # through `_step_search_pipeline` into the TRACK_ON_COMPILATION execute
+    # partial (the recall index is authoritative for comp-track resolution on
+    # the union-active path), the task-creation gate grew the
+    # `discogs_cache_pg is not None` leg so "union unavailable" can never
+    # read as an authoritative index miss, and the review pass added
+    # `_task_resolved_with_renderable_locations` (step 3a's index-hit skip)
+    # plus `_fold_locations_into_results` (shared happy/degraded fold with
+    # song_not_found-aware positioning and the LML#717 overlap signal). The
+    # strategy-side logic itself lives in
+    # `lookup/strategies/track_on_compilation.py` per this module's
+    # extraction policy. Same tight-on-purpose posture as every prior
+    # recalibration: smallest multiple of 50 at or above the new measured
+    # size, not a re-derived 1.3x (which would reopen hundreds of lines of
+    # headroom). Third consecutive recalibration in three days — the
+    # documented extraction blocker (the reconciliation needs
+    # build_context_message, orchestrator-only) is the debt to pay down
+    # before the next one.
+    "lookup/orchestrator.py": 1650,
     "lookup/release_resolution.py": 550,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line

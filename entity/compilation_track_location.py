@@ -27,15 +27,43 @@ module owns only the idempotent DDL, matching the read-side/write-side split
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
 from wxyc_etl.text import to_match_form
 
-from entity.cache_toolkit import swallowing_fetch
 from entity.sources import PgSource
 
 logger = logging.getLogger(__name__)
+
+_PROBE_TIMEOUT_S = 0.5
+"""Belt-and-suspenders bound on the read probe (LML#1026, parent plan §7).
+
+The ``except Exception`` below covers failure but not slowness: a stuck pool
+acquire or a PG hiccup would otherwise ride the awaiting task as spine
+latency. Post-#1026 the TRACK_ON_COMPILATION strategy awaits the probe task
+mid-spine (not just at the fold's append site), so the probe bounds itself
+here rather than relying on every await site to wrap it. 500ms is ~50x the
+healthy single-digit-ms btree probe; anything slower already means PG is
+sick, and the designed outcome — degrade, fall back to the legacy live pass
+— is the same at 500ms as at 2s, so a longer bound buys no recall, only
+stall (review finding on the original 2s sizing)."""
+
+
+class CompilationTrackLocationProbeError(Exception):
+    """The recall index could not be consulted (PG failure, probe timeout, or
+    a row shape the dataclass no longer recognizes).
+
+    Deliberately distinct from an empty result: post-LML#1026 the strategy
+    treats an empty probe result as an AUTHORITATIVE index miss (suppressing
+    the legacy live comp-discovery pass), so "could not ask" must never
+    collapse into "index says no" — a discogs-cache outage would otherwise
+    silently zero comp-track recall for its whole duration. Callers own the
+    degrade policy: the orchestrator's fold await sites degrade to
+    no-locations; the strategy falls back to the full legacy live pass.
+    """
+
 
 _DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS lml_cache"
 
@@ -113,24 +141,34 @@ async def get_compilation_track_locations(
     (``lookup/location_union.py``), not this read helper's.
 
     An empty normalized artist or title short-circuits without a query (no
-    credited track is ever stored with a blank name). Best-effort, mirroring
-    ``get_library_release_overrides``: a PG failure degrades to an empty list
-    so a transient outage can never break the concurrent probe (its caller
-    just sees "no other locations found").
+    credited track is ever stored with a blank name), and an empty result
+    means exactly "the index has no locations for this key" — an
+    authoritative miss. A PG failure, a probe slower than
+    ``_PROBE_TIMEOUT_S``, or a row shape the dataclass no longer recognizes
+    (schema drift) raise :class:`CompilationTrackLocationProbeError` instead
+    of masquerading as a miss (LML#1026 — pre-#1026 this helper degraded to
+    ``[]``, which was harmless when the only consumer was the additive fold
+    but would silently suppress the legacy live pass now that the strategy
+    treats emptiness as authoritative). Await sites own the degrade policy
+    and all of them catch.
     """
     normalized_artist = to_match_form(track_artist)
     normalized_title = to_match_form(track_title)
     if not normalized_artist or not normalized_title:
         return []
-    rows = await swallowing_fetch(
-        pg,
-        _SELECT_LOCATIONS_SQL,
-        normalized_artist,
-        normalized_title,
-        miss=[],
-        logger=logger,
-        log_label="compilation_track_location probe failed for artist=%r title=%r",
-        log_args=(normalized_artist, normalized_title),
-        many=True,
-    )
-    return [CompilationTrackLocationRow(**row) for row in rows]
+    # Deliberately NOT entity.cache_toolkit.swallowing_fetch (LML#1034): this
+    # is the one lml_cache reader whose emptiness is authoritative (LML#1026),
+    # so its failures must raise, never degrade to the miss shape.
+    try:
+        rows = await asyncio.wait_for(
+            pg.fetchall(_SELECT_LOCATIONS_SQL, normalized_artist, normalized_title),
+            timeout=_PROBE_TIMEOUT_S,
+        )
+        return [CompilationTrackLocationRow(**row) for row in rows]
+    except Exception as exc:
+        logger.exception(
+            "compilation_track_location probe degraded for artist=%r title=%r",
+            normalized_artist,
+            normalized_title,
+        )
+        raise CompilationTrackLocationProbeError(f"recall-index probe degraded: {exc!r}") from exc

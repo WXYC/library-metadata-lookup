@@ -72,6 +72,11 @@ from lookup.endpoint_family import (
     record_low_priority_tag,
 )
 from lookup.enrichment import SKIPPED_PREFETCH_STAT_KEY
+from lookup.location_union import (
+    LOCATION_UNION_INDEX_DEGRADED_STAT_KEY,
+    LOCATION_UNION_INDEX_HIT_STAT_KEY,
+    LOCATION_UNION_INDEX_MISS_STAT_KEY,
+)
 from lookup.models import (
     BulkLookupRequest,
     BulkLookupResponse,
@@ -262,6 +267,13 @@ _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     # LML#930 PR2: admission-shed would-shed counter, seeded to 0 so the rate
     # is an alertable baseline series even in shadow mode (enforce off).
     ADMISSION_WOULD_SHED_STAT_KEY,
+    # LML#1026 recall-index authority verdicts in TRACK_ON_COMPILATION: all
+    # three seed to 0 so hit-rate is dashboardable and a sustained nonzero
+    # degraded rate (comp lookups running without the index -- discogs-cache
+    # PG outage class) is an alertable baseline series on the #683 surface.
+    LOCATION_UNION_INDEX_HIT_STAT_KEY,
+    LOCATION_UNION_INDEX_MISS_STAT_KEY,
+    LOCATION_UNION_INDEX_DEGRADED_STAT_KEY,
 )
 """LML-specific keys seeded into every request's cache_stats dict so PostHog
 and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and

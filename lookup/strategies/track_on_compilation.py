@@ -27,6 +27,7 @@ from typing import Any, ClassVar, Protocol
 import sentry_sdk
 from wxyc_etl.text import is_compilation_artist
 from wxyc_etl.text import to_match_form as normalize_for_comparison
+from wxyc_fastapi.observability import get_cache_stats_recorder
 
 from config.settings import get_settings
 from core.search import (
@@ -48,6 +49,12 @@ from lookup.artist_resolution import (
 )
 from lookup.candidate_memo import TrackCandidateMemo, TrackCandidateSet
 from lookup.concurrency import _chunked_gather
+from lookup.location_union import (
+    LOCATION_UNION_INDEX_DEGRADED_STAT_KEY,
+    LOCATION_UNION_INDEX_HIT_STAT_KEY,
+    LOCATION_UNION_INDEX_MISS_STAT_KEY,
+    ResolvedLocation,
+)
 from lookup.matching import (
     _FALLBACK_ARTIST_SIMILARITY_FLOOR,
     _FETCH_LIMIT,
@@ -416,6 +423,8 @@ async def _run_discogs_probes(
     parsed: ParsedRequest,
     discogs_service: DiscogsService | None,
     candidate_memo: TrackCandidateMemo | None,
+    *,
+    suppress_comp_discovery: bool = False,
 ) -> _ProbeBundle:
     """Phase: candidate discovery via Discogs. Resolver pre-pass
     (``_resolve_artist_for_probes``) -> Wave A/Wave B artist-scoped probes
@@ -423,7 +432,19 @@ async def _run_discogs_probes(
     freshly gathered) -> the optional speculative album-title probe (#339),
     all in parallel so a cold cache pays ``max()`` rather than the sum.
     Two-channel seam (#626): probes use ``parsed.artist``, not the caller's
-    library-side ``lib_artist``."""
+    library-side ``lib_artist``.
+
+    ``suppress_comp_discovery=True`` (LML#1026, union-active authoritative
+    index miss): the Wave A/Wave B comp-discovery probes are the recall
+    index's job and are skipped outright -- ``raw_releases`` comes back empty
+    so the downstream collect/validate machinery is a no-op. Only the #319
+    album-title probe (the trio-collaboration case -- an *artist's own*
+    release matched by typed album title, which the V/A-tracks-only recall
+    index cannot answer) still fires, when its usual preconditions hold. On
+    this branch the resolver pre-pass runs only when the album probe can
+    actually consume its ``swapped`` outcome (album typed + service wired) --
+    its only remaining consumer -- so the common no-album shape skips the
+    flag-gated trigram PG query whose result nothing would read."""
     assert parsed.song is not None and parsed.artist is not None  # guaranteed by the caller's gate
 
     # Widen the Discogs query to include a parenthetical remix/mix/version/edit
@@ -435,6 +456,25 @@ async def _run_discogs_probes(
     if remix_match and parsed.song.lower() in raw_lower:
         song_search = f"{parsed.song} ({remix_match.group(1)})"
         logger.info(f"Using full track name with version info: '{song_search}'")
+
+    if suppress_comp_discovery:
+        album_fallback_should_fire = False
+        album_fallback_response: TrackReleasesResponse | None = None
+        album_fallback_error: str | None = None
+        if discogs_service is not None and parsed.album:
+            _, suppressed_outcome = await _resolve_artist_for_probes(parsed, discogs_service)
+            album_fallback_should_fire = not suppressed_outcome.swapped
+            if album_fallback_should_fire:
+                album_fallback_response, album_fallback_error = await _album_title_probe_safe(
+                    discogs_service, parsed.album
+                )
+        return _ProbeBundle(
+            song_search=song_search,
+            raw_releases=[],
+            album_fallback_should_fire=album_fallback_should_fire,
+            album_fallback_response=album_fallback_response,
+            album_fallback_error=album_fallback_error,
+        )
 
     artist_for_probes, outcome = await _resolve_artist_for_probes(parsed, discogs_service)
 
@@ -799,6 +839,62 @@ async def _carry_through_nonlibrary_release(
     return rowless
 
 
+async def _consult_recall_index(
+    location_union_task: "asyncio.Task[list[ResolvedLocation]]",
+) -> bool | None:
+    """Await the orchestrator's already-racing recall-index probe (LML#1026)
+    and classify its verdict for the tri-state below.
+
+    - ``True`` -- index HIT: at least one RENDERABLE location (a row whose
+      shelf join produced a ``LibraryItem``). Counting renderable rows, not
+      raw rows, is load-bearing: ``build_location_result_items`` skips
+      ``shelf_item=None`` rows, so a raw-count "hit" over stale index rows
+      would make the strategy contribute nothing while the fold renders
+      nothing -- the track would vanish from the response entirely.
+    - ``False`` -- authoritative index MISS (the probe ran; nothing
+      renderable). The caller suppresses live comp discovery (the
+      #271-locked "removed, not augmented" decision).
+    - ``None`` -- DEGRADED: the probe could not be consulted
+      (``CompilationTrackLocationProbeError`` from the read helper's
+      failure/timeout paths, or any rank/join exception). The caller falls
+      back to the FULL legacy live pass -- "union unavailable" must never
+      read as "index says no", the same invariant the orchestrator's
+      task-creation gate enforces for the no-PG-source config case.
+
+    The await is wrapped in ``asyncio.shield``: the strategy runner bounds
+    each attempt with ``asyncio.wait_for`` (``core/search.py``), and
+    ``Task.cancel`` delegates into whatever future the attempt is currently
+    awaiting -- unshielded, a per-strategy budget cancellation would cancel
+    the SHARED union task, and the orchestrator's later fold await would see
+    a ``CancelledError`` its ``except Exception`` cannot catch. With the
+    shield, cancellation still aborts this attempt (``CancelledError``
+    propagates -- deliberately not caught here) but the union task survives
+    for the fold. The task bounds its own PG leg
+    (``_PROBE_TIMEOUT_S``), so by TRACK_ON_COMPILATION time it is
+    effectively always done and this await is free; awaiting the same task
+    again later at the fold site returns the same result.
+
+    Each verdict records its ``location_union_index_*`` cache-stats counter
+    (pre-declared in ``lookup/router.py``) -- the degraded series is the
+    alertable signal that comp lookups are running without the index.
+    """
+    try:
+        locations = await asyncio.shield(location_union_task)
+    except Exception as exc:
+        logger.warning(
+            "location-union probe degraded inside TRACK_ON_COMPILATION; "
+            "restoring the legacy live pass: %s",
+            exc,
+        )
+        get_cache_stats_recorder().record(LOCATION_UNION_INDEX_DEGRADED_STAT_KEY)
+        return None
+    hit = any(location.shelf_item is not None for location in locations)
+    get_cache_stats_recorder().record(
+        LOCATION_UNION_INDEX_HIT_STAT_KEY if hit else LOCATION_UNION_INDEX_MISS_STAT_KEY
+    )
+    return hit
+
+
 async def search_compilations_for_track(
     db: LibraryDB,
     parsed: ParsedRequest,
@@ -807,12 +903,40 @@ async def search_compilations_for_track(
     pg: PgSource | None = None,
     allow_release_resolution_fallback: bool = True,
     candidate_memo: TrackCandidateMemo | None = None,
+    location_union_task: "asyncio.Task[list[ResolvedLocation]] | None" = None,
 ) -> tuple[list[LibraryItem], dict[int, ResolvedRelease]]:
     """Search for track on compilation albums using Discogs and library keyword search.
 
     The second tuple element maps each surfaced library id to the
     :class:`~lookup.release_resolution.ResolvedRelease` it matched — the widened
     ``discogs_titles`` seam consumed by the artwork-binding step.
+
+    LML#1026 — the recall index is authoritative on the union-active path.
+    ``location_union_task`` is the orchestrator's concurrent
+    ``resolve_track_shelf_locations`` probe, threaded in exactly when the
+    location union is active (song present + ``lml_location_union_enabled`` +
+    not a low-priority caller + a discogs-cache PG source configured). Its
+    verdict (``_consult_recall_index``) drives a tri-state:
+
+    - **No task, or the probe DEGRADED** (kill switch off / class-5 caller /
+      no song / no PG source / probe failure or timeout): the full legacy
+      live pass below runs byte-identically — which makes
+      ``LML_LOCATION_UNION_ENABLED=false`` a complete rollback lever, keeps
+      backfill/enrichment callers untouched, and means a discogs-cache
+      outage costs the union, never comp-track recall.
+    - **Index HIT** (≥1 renderable location): return ``([], {})``
+      immediately. The track IS in the library; the orchestrator's fold
+      supplies the shelf location(s) (ranked-first becomes the Case-B
+      primary), and none of the phases below run — no keyword search, no
+      live probes, no album-title fallback, no rowless carve (a rowless
+      "not in your library" row would be wrong and would preempt the shelf
+      location as primary).
+    - **Authoritative index MISS** (the probe ran; nothing renderable): per
+      the #271-locked "removed, not augmented" decision, the Wave A/B
+      comp-discovery probes and their per-release validates are suppressed
+      (``suppress_comp_discovery=True``); the co-located non-comp features —
+      the keyword last-resort, the #319 album-title (trio) fallback, and the
+      #628 rowless non-library carry-through — still run.
 
     The body is a sequence of named phases sharing the request-scoped
     ``results``/``seen_ids``/``discogs_titles`` accumulators:
@@ -827,6 +951,16 @@ async def search_compilations_for_track(
     if not parsed.song or not parsed.artist:
         return [], {}
 
+    index_verdict: bool | None = None
+    if location_union_task is not None:
+        index_verdict = await _consult_recall_index(location_union_task)
+    if index_verdict is True:
+        logger.info(
+            "Recall index has shelf locations for '%s'; skipping the live comp pass (LML#1026)",
+            parsed.song,
+        )
+        return [], {}
+
     logger.info(f"Searching for '{parsed.song}' on other releases (compilations, etc.)")
 
     results: list[LibraryItem] = []
@@ -839,7 +973,14 @@ async def search_compilations_for_track(
 
     discogs_found_releases = False
     try:
-        probes = await _run_discogs_probes(parsed, discogs_service, candidate_memo)
+        probes = await _run_discogs_probes(
+            parsed,
+            discogs_service,
+            candidate_memo,
+            # An authoritative miss suppresses comp discovery; a degraded
+            # probe (index_verdict None) restores the full legacy pass.
+            suppress_comp_discovery=index_verdict is not None,
+        )
         song_search = probes.song_search
         raw_releases = probes.raw_releases
 

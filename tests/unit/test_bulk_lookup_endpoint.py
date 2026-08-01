@@ -74,6 +74,29 @@ def _match_response(artist: str, album: str) -> LookupResponse:
     )
 
 
+def _live_orchestrator_overrides(mock_library_db, mock_discogs_service, mock_settings, *, pg=None):
+    """The one shared override map for live-``perform_lookup`` harnesses.
+
+    Both live-orchestrator fixtures (the step-3a gate class and the LML#1026
+    location-union guard class) consume this so the dependency graph they
+    exercise cannot drift apart; ``pg`` is the single knob that differs
+    (``None`` = no discogs-cache source; a mock = the union-task gate's
+    PG precondition is satisfied).
+    """
+    return {
+        get_library_db: mock_library_db,
+        get_discogs_service: mock_discogs_service,
+        get_discogs_cache_service: None,
+        get_musicbrainz_pg: None,
+        get_entity_store: None,
+        get_discogs_cache_pg: pg,
+        get_posthog_client: None,
+        get_apple_music_client: None,
+        get_spotify_client: None,
+        get_settings: mock_settings,
+    }
+
+
 def _no_match_response() -> LookupResponse:
     return LookupResponse(results=[], search_type="none")
 
@@ -786,18 +809,7 @@ class TestBulkLookupReleaseResolutionFallbackFlag:
         pool, MusicBrainz source, entity store, or streaming clients."""
         with override_deps(
             app,
-            {
-                get_library_db: mock_library_db,
-                get_discogs_service: mock_discogs_service,
-                get_discogs_cache_service: None,
-                get_musicbrainz_pg: None,
-                get_entity_store: None,
-                get_discogs_cache_pg: None,
-                get_posthog_client: None,
-                get_apple_music_client: None,
-                get_spotify_client: None,
-                get_settings: mock_settings,
-            },
+            _live_orchestrator_overrides(mock_library_db, mock_discogs_service, mock_settings),
         ):
             yield app
 
@@ -1397,3 +1409,56 @@ class TestCallerClassAntiUpRankInvariant:
             "X-Caller-Class -- the header must never up-rank a bulk caller out of "
             "the low-priority lane"
         )
+
+
+class TestBulkNeverRunsLocationUnion:
+    """LML#1026 nit 2 (bulk amplification guard): a `/lookup/bulk` caller must
+    never fan out one recall-index PG probe + one sqlite shelf-join per item.
+
+    Post-fold this is structural rather than a per-item flag pin: the route
+    sets ``set_discogs_low_priority(True)`` unconditionally for the whole
+    batch, and the orchestrator's union-task gate checks
+    ``not is_discogs_low_priority()`` -- so no task, no probe, no join. This
+    test drives the REAL ``perform_lookup`` per item with a discogs-cache PG
+    source wired (so the only thing standing between a bulk item and the
+    probe is the low-priority contextvar) and pins that the probe is never
+    awaited for song-bearing items.
+    """
+
+    @pytest.fixture
+    def app_client_live_orchestrator_with_pg(
+        self, mock_library_db, mock_discogs_service, mock_settings
+    ):
+        with override_deps(
+            app,
+            _live_orchestrator_overrides(
+                mock_library_db, mock_discogs_service, mock_settings, pg=AsyncMock()
+            ),
+        ):
+            yield app
+
+    @pytest.mark.asyncio
+    async def test_bulk_items_never_launch_the_recall_index_probe(
+        self, app_client_live_orchestrator_with_pg, mock_discogs_service
+    ):
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(results=[])
+
+        with patch(
+            "lookup.orchestrator.resolve_track_shelf_locations", new_callable=AsyncMock
+        ) as probe:
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client_live_orchestrator_with_pg),
+                base_url="http://test",
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={
+                        "items": [
+                            {"artist": "Juana Molina", "song": "la paradoja"},
+                            {"artist": "Jessica Pratt", "song": "Back, Baby"},
+                        ]
+                    },
+                )
+
+        assert resp.status_code == 200
+        probe.assert_not_awaited()

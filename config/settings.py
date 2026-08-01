@@ -531,13 +531,19 @@ class Settings(BaseSettings):
             "soundtracks) directly into `results` as ordinary LookupResultItems "
             "tagged via `matched_via`, for every interactive caller except "
             "low-priority ones (BS enrichment, the CDC firehose, backfills -- "
-            "excluded via `X-Caller-Class`, not this flag). When False, no "
-            "location rows are appended to `results` for any caller -- "
+            "excluded via `X-Caller-Class`, not this flag). On that same "
+            "union-active path the recall index is authoritative for "
+            "comp-track resolution (LML#1026): TRACK_ON_COMPILATION's "
+            "live-Discogs comp-discovery pass fires only when the index "
+            "cannot be consulted (a degraded probe restores the legacy "
+            "pass; a hit or authoritative miss suppresses it). When False, no "
+            "location rows are appended to `results` for any caller AND the "
+            "legacy live comp-discovery pass is fully restored -- "
             "`/lookup`'s response is byte-identical to the union never having "
             "shipped -- letting an incident be mitigated by a Railway var flip "
             "instead of a client deploy. See WXYC/library-metadata-lookup#1022 "
-            "and the location-union-transparent-results plan (supersedes the "
-            "original per-request `include_locations` design)."
+            "and #1026, and the location-union-transparent-results plan "
+            "(supersedes the original per-request `include_locations` design)."
         ),
     )
     lml_emit_server_timing: bool = Field(
