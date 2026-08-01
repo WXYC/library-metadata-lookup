@@ -150,9 +150,16 @@ async def get_artist(
     try:
         result = await svc.get_artist_details(artist_id)
     except DiscogsBreakerOpenError as e:
-        # LML#755 R2-3: the Discogs saturation breaker shed this live probe. 503
-        # (transient / retryable), not a raw 500 — the caller should back off and
-        # retry rather than treat this as a hard failure.
+        # LML#1031: defensive wrap, mirroring resolve_entity's framing below —
+        # NOT closing an active 500. get_artist_details's own _api_fetch
+        # currently CATCHES DiscogsBreakerOpenError internally and returns
+        # None (LML#805, service.py ~1685-1695) rather than propagating it,
+        # unlike get_release's _api_fetch, which re-raises (service.py
+        # ~1520-1526, "FIX 1"). So today a real breaker shed here surfaces as
+        # the 404 branch below, not this one. This except exists so the 503
+        # contract holds the moment get_artist_details ever starts
+        # propagating a shed instead of swallowing it. LML#1049 tracks the
+        # decision on whether/how to close that gap (shed -> misleading 404).
         raise HTTPException(
             status_code=503,
             detail="Discogs temporarily shed (rate-saturated); retry shortly.",
