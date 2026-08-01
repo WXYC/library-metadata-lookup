@@ -4571,7 +4571,7 @@ class TestBandcampStreamingUrlPostprocessWiring:
 
         with patch(
             "lookup.enrichment.item.apply_streaming_url_postprocess",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ) as postprocess:
             await enrich_artwork_results(
                 [(item, None)],
@@ -4603,6 +4603,7 @@ class TestBandcampStreamingUrlPostprocessWiring:
         async def _resolve(update, **kwargs):
             captured["bandcamp_url_at_call"] = update["bandcamp_url"]
             update["bandcamp_url"] = album_url
+            return {}
 
         with patch(
             "lookup.enrichment.item.apply_streaming_url_postprocess",
@@ -4645,6 +4646,7 @@ class TestBandcampStreamingUrlPostprocessWiring:
 
         async def _capture(update, **kwargs):
             captured["bandcamp_url_at_call"] = update["bandcamp_url"]
+            return {}
 
         with patch(
             "lookup.enrichment.item.apply_streaming_url_postprocess",
@@ -4702,7 +4704,7 @@ class TestBandcampStreamingUrlPostprocessWiring:
 
         with patch(
             "lookup.enrichment.item.apply_streaming_url_postprocess",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ):
             results = await enrich_artwork_results(
                 [(item, None)],

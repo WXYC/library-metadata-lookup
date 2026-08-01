@@ -20,6 +20,7 @@ from generated.api_models import (
     DiscogsTrackReleasesResponse,
     DiscogsWriterCredits,
     Member,
+    StreamingResolution,
 )
 from generated.api_models import DiscogsMatchResult as _GeneratedDiscogsMatchResult
 
@@ -263,6 +264,14 @@ class DiscogsSearchResult(BaseModel):
     youtube_music_url: str | None = None
     bandcamp_url: str | None = None
     soundcloud_url: str | None = None
+    # Per-service resolution verdict (LML#1053) disambiguating WHY a sibling
+    # ``*_url`` above is null: ``verified`` (url present), ``absent``
+    # (consulted, no match — terminal), ``unresolved`` (probe attempted but
+    # inconclusive — transient). A service key absent from the object was
+    # never consulted at all and must not be conflated with ``absent``. Set
+    # by ``lookup/enrichment/item.py`` from the same signals that already
+    # produce the ``*_url`` fields — purely additive, never changes them.
+    streaming_status: StreamingResolution | None = None
     # Extended fields (populated only when LookupRequest.extended=True). LML
     # already loads release + artist details during the streaming-URL
     # enrichment pass; these stash the rest of the payload so the response
@@ -307,6 +316,7 @@ class DiscogsSearchResult(BaseModel):
             youtube_music_url=self.youtube_music_url,
             bandcamp_url=self.bandcamp_url,
             soundcloud_url=self.soundcloud_url,
+            streaming_status=self.streaming_status,
             discogs_artist_id=self.discogs_artist_id,
             tracklist=self.tracklist,
             genres=self.genres,

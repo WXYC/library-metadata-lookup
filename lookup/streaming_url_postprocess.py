@@ -91,6 +91,7 @@ from entity.streaming_url_cache import (
     peek_cached_streaming_url,
     resolve_streaming_url_with_cache,
 )
+from generated.api_models import StreamingResolutionStatus
 from identity.release_validation import validate_and_canonicalize_external_id
 from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, probe_timeout_s_from_env
 from release.apple_music_url_parser import apple_album_id_from_url
@@ -257,7 +258,7 @@ async def apply_streaming_url_postprocess(
     request_artist: str | None,
     request_album: str | None,
     settings: Settings,
-) -> None:
+) -> dict[str, StreamingResolutionStatus]:
     """Backstop each configured service's URL in ``update`` via the cache, with
     a bounded background live-probe warm on a miss.
 
@@ -290,11 +291,26 @@ async def apply_streaming_url_postprocess(
             the library row's — that's the point). Empty/``None`` skips.
         settings: Carries the master ``lml_persist_streaming_urls`` kill switch
             and the per-service ``cfg.flag_setting`` flags (AND-gated).
+
+    Returns:
+        LML#1053: the per-service resolution verdict for every service this
+        call actually consulted, keyed by ``cfg.client_attr`` (``apple_music``
+        / ``spotify`` / ``bandcamp`` — the same keys the wire contract's
+        ``StreamingResolution`` object uses). A cache hit maps to ``verified``;
+        a known recent miss (a fresh "not found" already on record) maps to
+        ``absent`` — a real, sourced negative, not a couldn't-check; a genuine
+        miss — whether it enqueues a background warm or is suppressed on the
+        bulk path — maps to ``unresolved``, since neither leaves this request
+        with a confirmed verdict; a swallowed cache-peek error maps to
+        ``unresolved`` too (attempted, inconclusive). A service this call never
+        even considered (master/per-service flag off, no client, or the URL
+        field was already non-null entering this function) is simply absent
+        from the returned dict — the caller must not backfill it as ``absent``.
     """
     if not settings.lml_persist_streaming_urls:
-        return
+        return {}
     if pg is None or entity_store is None or not request_artist or not request_album:
-        return
+        return {}
 
     # Capture the (narrowed, non-None) client in the tuple via the walrus so
     # the loop below doesn't re-index the dict (and so the type-checker sees a
@@ -307,7 +323,7 @@ async def apply_streaming_url_postprocess(
         and (client := clients.get(cfg.client_attr)) is not None
     ]
     if not active:
-        return
+        return {}
 
     # Fast PG SELECTs, concurrently. ``peek_cached_streaming_url`` swallows its
     # own PG errors (returns ``(None, False)``); ``return_exceptions`` contains
@@ -329,6 +345,7 @@ async def apply_streaming_url_postprocess(
     )
 
     suppress_warm = should_suppress_streaming_warm()
+    statuses: dict[str, StreamingResolutionStatus] = {}
     for (service_key, cfg, client), peek in zip(active, peeks, strict=True):
         if isinstance(peek, BaseException):
             logger.warning(
@@ -338,6 +355,9 @@ async def apply_streaming_url_postprocess(
                 request_album,
                 peek,
             )
+            # LML#1053: an attempted-but-errored consult is inconclusive, not
+            # never-consulted — same bucket as a timeout.
+            statuses[cfg.client_attr] = StreamingResolutionStatus.unresolved
             continue
         cached_url, has_fresh_decision = peek
         if cached_url is not None:
@@ -345,24 +365,33 @@ async def apply_streaming_url_postprocess(
             # the resolution that first wrote this cache row.
             update[cfg.url_field] = cached_url
             _project_sentry(service_key, "cache_hit")
+            statuses[cfg.client_attr] = StreamingResolutionStatus.verified
         elif has_fresh_decision:
             # Known recent miss: the cache already records "checked, not found"
             # within the TTL. No probe is warranted, so don't schedule a no-op
-            # warm (it would just re-derive the same recent-miss verdict).
+            # warm (it would just re-derive the same recent-miss verdict). A
+            # real, sourced negative — not a couldn't-check.
             _project_sentry(service_key, "cache_miss_recent")
+            statuses[cfg.client_attr] = StreamingResolutionStatus.absent
         elif suppress_warm:
             # Bulk path: cache read-fill only. The offline warmer owns bulk fill;
             # spawning a warm here would decouple the drain's probes from the
-            # request and starve the live /lookup path's own warms.
+            # request and starve the live /lookup path's own warms. No warm
+            # means no confirmed verdict this request — transient, not terminal.
             _project_sentry(service_key, "cache_miss_unwarmed")
+            statuses[cfg.client_attr] = StreamingResolutionStatus.unresolved
         else:
             # Genuine miss (absent/stale): defer the live probe + UPSERT + mint
             # to a bounded, deduplicated background task. The response returns
-            # without this service's URL; the warm fills the cache for next time.
+            # without this service's URL; the warm fills the cache for next
+            # time — so this request's verdict is transient, not terminal.
             _enqueue_streaming_warm(
                 service_key, cfg, client, pg, entity_store, request_artist, request_album
             )
             _project_sentry(service_key, "cache_miss_enqueued")
+            statuses[cfg.client_attr] = StreamingResolutionStatus.unresolved
+
+    return statuses
 
 
 def _effective_probe_timeout_s(cfg: StreamingUrlCacheConfig) -> float:

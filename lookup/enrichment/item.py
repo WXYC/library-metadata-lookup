@@ -38,6 +38,7 @@ from entity.track_streaming_url_cache import (
     get_cached_track_streaming_url,
     set_cached_track_streaming_url,
 )
+from generated.api_models import StreamingResolutionStatus
 from library.models import LibraryItem
 from lookup.artist_resolution import (
     _artist_pair_verified,
@@ -46,6 +47,7 @@ from lookup.artist_resolution import (
     _project_mb_rescue_attrs,
 )
 from lookup.enrichment.context import EnrichmentContext
+from lookup.enrichment.streaming_status import resolve_streaming_status
 from lookup.rowless import (
     ROWLESS_LIBRARY_ID,
 )
@@ -234,6 +236,11 @@ async def enrich_one(
     probe_match: AppleMusicTrackMatch | None = None
     probe_artwork_url: str | None = None
     probe_release_year: int | None = None
+    # LML#1053: this item's Apple-leg resolution verdict. ``None`` until some
+    # signal below sets it — stays ``None`` (never-consulted, key omitted from
+    # the final ``StreamingResolution``) when no override/cache-hit/probe ever
+    # ran. Finalized (override precedence) right before ``update`` is built.
+    apple_status: StreamingResolutionStatus | None = None
     probe_method = "find_track_metadata" if not library_row_acceptable else "find_track_url"
     skip_happy_probe = library_row_acceptable and apple_music_override
 
@@ -277,6 +284,7 @@ async def enrich_one(
         if cached_track_url is not None:
             apple_music_url = cached_track_url
             track_cache_hit = True
+            apple_status = StreamingResolutionStatus.verified
 
     if (
         ctx.apple_music is not None
@@ -302,6 +310,13 @@ async def enrich_one(
                     ctx.apple_music.find_track_url(row_artist, search_term, album=ctx.album),
                     timeout=apple_probe_timeout_s,
                 )
+                # LML#1053: the probe ran to completion — a hit is verified, a
+                # clean no-match is absent (terminal, not a couldn't-check).
+                apple_status = (
+                    StreamingResolutionStatus.verified
+                    if apple_music_url is not None
+                    else StreamingResolutionStatus.absent
+                )
                 # L1 write-back: persist a freshly-resolved track deep-link so
                 # the next lookup of this ``(artist, album, song)`` is a HIT.
                 # Never persist a null (#782/BS#1192) — guarded on a non-null
@@ -322,11 +337,23 @@ async def enrich_one(
                     ctx.apple_music.find_track_metadata(row_artist, search_term, album=ctx.album),
                     timeout=apple_probe_timeout_s,
                 )
+                # LML#1053: same verdict rule as the happy path above — the
+                # probe ran to completion either way.
+                apple_status = (
+                    StreamingResolutionStatus.verified
+                    if probe_match is not None
+                    else StreamingResolutionStatus.absent
+                )
                 if probe_match is not None:
                     apple_music_url = probe_match.url
                     probe_artwork_url = probe_match.artwork_url
                     probe_release_year = probe_match.release_year
         except TimeoutError:
+            # LML#1053: attempted but inconclusive — transient, not terminal.
+            # Covers both the genuine-outage and the self-inflicted
+            # deadline-clamped shed cases below; both leave this request with
+            # no confirmed verdict either way.
+            apple_status = StreamingResolutionStatus.unresolved
             # LML#930 PR2: a `wait_for` timeout self-inflicted by the deadline
             # clamp above (`apple_probe_timeout_s < base_apple_timeout_s`) is
             # NOT an Apple outage — it's the budget running out, and at a
@@ -380,6 +407,9 @@ async def enrich_one(
                     e,
                 )
         except Exception:
+            # LML#1053: the LML#444 swallow-and-degrade path — attempted but
+            # inconclusive, same bucket as a timeout.
+            apple_status = StreamingResolutionStatus.unresolved
             logger.exception(
                 "AppleMusicClient.%s raised for %s - %s",
                 probe_method,
@@ -594,7 +624,7 @@ async def enrich_one(
     # ``entity.release_identity``. The ``clients`` dict may carry ``None``
     # values (e.g. Spotify creds unconfigured) — the post-process filters
     # them. Gated by the master + per-service flags.
-    await apply_streaming_url_postprocess(
+    postprocess_status = await apply_streaming_url_postprocess(
         update,
         clients={
             "apple_music": ctx.apple_music,
@@ -606,6 +636,20 @@ async def enrich_one(
         request_artist=ctx.artist,
         request_album=ctx.album,
         settings=settings,
+    )
+
+    # LML#1053: resolve the final per-service verdict — this leg's own
+    # signals (override precedence + the Apple probe outcome) merged with the
+    # post-process's (authoritative for any service IT consulted). Captured
+    # here, BEFORE the deferred Bandcamp search-URL fallback below, so a
+    # generic search page can never masquerade as "verified". See
+    # ``lookup/enrichment/streaming_status.py`` for the merge rule.
+    update["streaming_status"] = resolve_streaming_status(
+        apple_music_override=apple_music_override,
+        apple_probe_status=apple_status,
+        spotify_url=spotify_url,
+        bandcamp_url=bandcamp_url,
+        postprocess_status=postprocess_status,
     )
 
     # Bandcamp's templated search-URL fallback, deferred past the
