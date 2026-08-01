@@ -9,8 +9,8 @@ already matched. Source is the LML#1019 recall index
 live Discogs call.
 
 Product direction reversed the original LML#1022 shape: a shelf location is
-no longer a separate ``LookupResponse.also_available_on: LibraryLocation[]``
-entry gated by a request opt-in. It is an ordinary ``LookupResultItem``,
+no longer a separate opt-in ``LookupResponse`` field of ``LibraryLocation``
+entries. It is an ordinary ``LookupResultItem``,
 folded directly into ``results`` and tagged via ``matched_via`` (a
 ``TrackMatchHint`` with ``source: discogs_release``) -- the same field the
 catalog-track-search work added for exactly this purpose, so dj-site's
