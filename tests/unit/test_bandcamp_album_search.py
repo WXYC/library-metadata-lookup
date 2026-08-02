@@ -25,7 +25,7 @@ from clients.bandcamp import (
 )
 from clients.streaming.matching import SCORE_MATCH_ACCEPTANCE_FLOOR, score_match
 
-ARTIFACTS_DIR = Path(__file__).resolve().parent.parent.parent / "plans" / "lml-1069-artifacts"
+FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "bandcamp"
 
 
 def _autocomplete_response(results: list[dict]) -> httpx.Response:
@@ -172,7 +172,7 @@ class TestNormalizeBcTitle:
 class TestSearchAlbums:
     @pytest.mark.asyncio
     async def test_parses_golden_repro_fixture(self):
-        data = json.loads((ARTIFACTS_DIR / "autocomplete_a_golden_repro.json").read_text())
+        data = json.loads((FIXTURES_DIR / "autocomplete_a_golden_repro.json").read_text())
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.request = AsyncMock(
