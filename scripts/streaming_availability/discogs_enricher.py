@@ -6,11 +6,8 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from clients.streaming.matching import (
-    is_acceptable_match,
-    score_match,
-    strip_discogs_suffix,
-)
+from clients.streaming.matching import is_acceptable_match, score_match
+from discogs.matching import strip_discogs_suffix
 
 if TYPE_CHECKING:
     import asyncpg

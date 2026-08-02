@@ -27,7 +27,7 @@ dependencies = [
     "wxyc-fastapi[posthog]>=1.1.0,<2.0.0",
     "aiolimiter>=1.1.0",
     "python-multipart>=0.0.6",
-    "wxyc-etl>=0.8.0,<0.9.0",
+    "wxyc-etl>=0.10.0,<0.11.0",
     "pyjwt[crypto]>=2.8.0",
     # boto3 is a RUNTIME dep, not dev-only: the library.db boot-fetch (main.py
     # lifespan) and the /admin upload paths both call the S3ObjectStore, and the

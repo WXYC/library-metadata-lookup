@@ -6,12 +6,24 @@ import aiosqlite
 from cachetools import TTLCache  # type: ignore[import-untyped]
 from rapidfuzz import fuzz
 from wxyc_etl.schema import library_columns
+from wxyc_etl.text import strip_leading_article
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
-from core.text import LEADING_ARTICLES, strip_leading_article
 from library.models import LibraryItem
 
 logger = logging.getLogger(__name__)
+
+LEADING_ARTICLES = frozenset({"the", "a", "an"})
+"""English articles stripped from normalized artist names.
+
+Sole local survivor of the former ``core/text.py`` (LML#1042 folded that
+module's ``strip_leading_article`` into ``wxyc_etl.text.strip_leading_article``
+directly — the two were byte-identical, so it was a pure delegation, not a
+behavior change). This frozenset is a word-membership filter for candidate
+search-term selection below, distinct from the strip function itself, and
+has no crate equivalent to promote to, so it stays local. ``library/db.py``
+is its only consumer.
+"""
 
 STOPWORDS = frozenset(
     {
