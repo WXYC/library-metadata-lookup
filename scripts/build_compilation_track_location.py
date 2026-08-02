@@ -134,12 +134,12 @@ async def get_processed_library_ids(conn: asyncpg.Connection) -> set[int]:
 
 
 _OVERRIDE_SQL = """\
-SELECT library_id, discogs_release_id
-FROM lml_cache.library_release_override
-WHERE library_id = ANY($1)
-  AND discogs_release_id IN (SELECT id FROM va_release)
+SELECT lro.library_id, lro.discogs_release_id
+FROM lml_cache.library_release_override lro
+WHERE lro.library_id = ANY($1)
+  AND lro.discogs_release_id IN (SELECT id FROM va_release)
   AND EXISTS (
-      SELECT 1 FROM release_track rt WHERE rt.release_id = discogs_release_id
+      SELECT 1 FROM release_track rt WHERE rt.release_id = lro.discogs_release_id
   )\
 """
 

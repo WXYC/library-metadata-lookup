@@ -349,6 +349,11 @@ class TestMatchCompReleaseOverrideSeeding:
     LIB_ID = 60654
     LIB_TITLE = "Lost In Translation"
     LIB_ARTIST = "Soundtracks - L"
+    # A second "Soundtracks - L" shelf row with a *valid* override to the same
+    # LiT release. Seeded alongside the guard-skip negatives so their result is
+    # a positive `{SIBLING_ID: 13468045}`, not a bare `{}` that would also hold
+    # if override consultation were removed entirely (LML#1083 review).
+    SIBLING_ID = 60655
 
     async def test_shelf_row_has_no_title_cascade_match_on_its_own(self, pg_pool):
         """Baseline: without an override, this shelf row is genuinely unmatchable."""
@@ -373,24 +378,40 @@ class TestMatchCompReleaseOverrideSeeding:
         assert result == {self.LIB_ID: 13468045}
 
     async def test_override_to_a_non_va_release_is_skipped(self, pg_pool):
-        """An override pointed at a release absent from va_release can't seed the index."""
+        """An override pointed at a release absent from va_release can't seed the index.
+
+        A sibling comp with a *valid* override seeds in the same batch, so the
+        omission of LIB_ID proves the guard filtered its (non-va) override --
+        not that override consultation is inert (which would yield a bare {}).
+        """
         async with pg_pool.acquire() as conn:
+            await _seed_lost_in_translation(conn)
             await conn.execute("INSERT INTO release (id, title) VALUES (777, 'Not A VA Release')")
             await conn.execute(
                 "INSERT INTO release_track (release_id, sequence, position, title) VALUES "
                 "(777, 1, 'A1', 'Some Track')"
             )
             await _insert_override(conn, self.LIB_ID, 777)
-            comp = CompCandidate(
-                library_id=self.LIB_ID, title=self.LIB_TITLE, artist=self.LIB_ARTIST
-            )
-            result = await match_comp_release(conn, [comp])
+            await _insert_override(conn, self.SIBLING_ID, 13468045)
+            comps = [
+                CompCandidate(library_id=self.LIB_ID, title=self.LIB_TITLE, artist=self.LIB_ARTIST),
+                CompCandidate(
+                    library_id=self.SIBLING_ID, title=self.LIB_TITLE, artist=self.LIB_ARTIST
+                ),
+            ]
+            result = await match_comp_release(conn, comps)
 
-        assert result == {}
+        assert result == {self.SIBLING_ID: 13468045}
 
     async def test_override_to_a_release_with_no_cached_tracklist_is_skipped(self, pg_pool):
-        """An override pointed at a va_release with zero release_track rows can't seed the index."""
+        """An override pointed at a va_release with zero release_track rows can't seed the index.
+
+        A sibling comp with a *valid* override seeds in the same batch, so the
+        omission of LIB_ID proves the guard filtered its (tracklist-less)
+        override -- not that override consultation is inert.
+        """
         async with pg_pool.acquire() as conn:
+            await _seed_lost_in_translation(conn)
             await conn.execute(
                 "INSERT INTO release (id, title) VALUES (888, 'No Tracklist Cached')"
             )
@@ -399,12 +420,16 @@ class TestMatchCompReleaseOverrideSeeding:
                 "(888, 'No Tracklist Cached', 'no tracklist cached')"
             )
             await _insert_override(conn, self.LIB_ID, 888)
-            comp = CompCandidate(
-                library_id=self.LIB_ID, title=self.LIB_TITLE, artist=self.LIB_ARTIST
-            )
-            result = await match_comp_release(conn, [comp])
+            await _insert_override(conn, self.SIBLING_ID, 13468045)
+            comps = [
+                CompCandidate(library_id=self.LIB_ID, title=self.LIB_TITLE, artist=self.LIB_ARTIST),
+                CompCandidate(
+                    library_id=self.SIBLING_ID, title=self.LIB_TITLE, artist=self.LIB_ARTIST
+                ),
+            ]
+            result = await match_comp_release(conn, comps)
 
-        assert result == {}
+        assert result == {self.SIBLING_ID: 13468045}
 
     async def test_override_wins_over_a_conflicting_title_cascade_match(self, pg_pool):
         """library_id 28 exact-title-matches release 555, but its override points elsewhere."""
