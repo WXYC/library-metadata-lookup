@@ -259,13 +259,17 @@ class BandcampClient(BaseStreamingClient):
         """Search Bandcamp for ``(artist, title)`` and return the best match.
 
         See ``BaseStreamingClient.find_album_match`` for the contract.
-        Two-phase: autocomplete the artist subdomain, then scrape the
-        artist's ``/music`` catalog and fuzzy-match the album title. Both
-        phases' response shapes are encapsulated here.
+        Artist-first: autocomplete the artist subdomain, then scrape the
+        artist's ``/music`` catalog and fuzzy-match the album title. When
+        that yields nothing, falls back to the shared album-first
+        ``find_album_match_via_search`` (LML#1069 PR2) -- a label/imprint-
+        hosted release never has an own-artist catalog match to find, so
+        without the fallback this method can never see it. Worst case this
+        costs one extra rate-limited autocomplete request; both phases'
+        response shapes stay encapsulated here.
         """
         artist_results = await self.search_artist(artist)
-        if not artist_results:
-            return None
+        match: SourceMatch | None = None
         best_artist: dict | None = None
         best_artist_score = 0.0
         for result in artist_results:
@@ -273,21 +277,29 @@ class BandcampClient(BaseStreamingClient):
             if s >= 80.0 and s > best_artist_score:
                 best_artist = result
                 best_artist_score = s
-        if best_artist is None:
+        if best_artist is not None:
+            # A fetch failure (None) is treated as "no catalog" for the live
+            # match path -- there is no retry loop here, so it degrades to no match.
+            catalog = await self.fetch_artist_catalog(best_artist["slug"]) or []
+            matched_artist_name = best_artist["name"]
+            match = find_best_source_match(
+                catalog,
+                artist,
+                title,
+                artist_fn=lambda _: matched_artist_name,
+                title_fn=lambda x: x["title"],
+                url_fn=lambda x: x["url"],
+                service="bandcamp",
+            )
+        if match is not None:
+            return match
+
+        try:
+            return await self.find_album_match_via_search(artist, title)
+        except BandcampSearchUnavailableError:
+            # No retry channel on the live path (same posture as the
+            # catalog-fetch-failure case above) -- degrade to no match.
             return None
-        # A fetch failure (None) is treated as "no catalog" for the live
-        # match path -- there is no retry loop here, so it degrades to no match.
-        catalog = await self.fetch_artist_catalog(best_artist["slug"]) or []
-        matched_artist_name = best_artist["name"]
-        return find_best_source_match(
-            catalog,
-            artist,
-            title,
-            artist_fn=lambda _: matched_artist_name,
-            title_fn=lambda x: x["title"],
-            url_fn=lambda x: x["url"],
-            service="bandcamp",
-        )
 
     async def search_artist(self, artist_name: str) -> list[dict]:
         """Search Bandcamp autocomplete for artist pages.
