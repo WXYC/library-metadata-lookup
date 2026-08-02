@@ -22,7 +22,11 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 
-from scripts.build_compilation_track_location import build_compilation_track_location
+from scripts.build_compilation_track_location import (
+    CompCandidate,
+    build_compilation_track_location,
+    match_comp_release,
+)
 from tests.integration.conftest import skip_if_named_tables_populated
 
 
@@ -32,13 +36,22 @@ async def fresh_schema(pg_pool):
 
     Mirrors ``test_cache_lean_json_agg_parity.py``'s ``fresh_schema`` fixture
     for the shared (non-LML-owned) ``release*`` tables. The LML-owned
-    ``lml_cache.compilation_track_location`` gets the stricter populated-table
+    ``lml_cache.compilation_track_location`` and ``lml_cache.library_release_override``
+    (LML#1082's override-seeding source) both get the stricter populated-table
     veto (as in ``test_library_release_override.py``) since a mispointed
-    ``DATABASE_URL_TEST`` there would risk real collected recall-index rows.
+    ``DATABASE_URL_TEST`` there would risk real collected recall-index rows or
+    hand-verified override pins.
     """
     async with pg_pool.acquire() as conn:
-        await skip_if_named_tables_populated(conn, (("lml_cache", "compilation_track_location"),))
+        await skip_if_named_tables_populated(
+            conn,
+            (
+                ("lml_cache", "compilation_track_location"),
+                ("lml_cache", "library_release_override"),
+            ),
+        )
         await conn.execute("DROP TABLE IF EXISTS lml_cache.compilation_track_location")
+        await conn.execute("DROP TABLE IF EXISTS lml_cache.library_release_override")
         for table in ("release_track_artist", "release_track", "va_release", "release"):
             await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
         await conn.execute("""
@@ -73,13 +86,17 @@ async def fresh_schema(pg_pool):
             )
         """)
     from entity.compilation_track_location import set_up_compilation_track_location_schema
+    from entity.library_release_override import set_up_library_release_override_schema
     from entity.sources import PgSource
 
-    await set_up_compilation_track_location_schema(PgSource(pool=pg_pool))
+    pg_source = PgSource(pool=pg_pool)
+    await set_up_compilation_track_location_schema(pg_source)
+    await set_up_library_release_override_schema(pg_source)
     yield
     async with pg_pool.acquire() as conn:
         for table in (
             "lml_cache.compilation_track_location",
+            "lml_cache.library_release_override",
             "release_track_artist",
             "release_track",
             "va_release",
@@ -107,6 +124,44 @@ async def _seed_the_sound_of_dub(conn):
             (555, 2, "Scientist", 0, None),
             (555, 2, "Kiki Hitomi", 1, "Featuring"),
         ],
+    )
+
+
+async def _seed_lost_in_translation(conn):
+    """Lost In Translation OST -> Discogs release 13468045 (LML#1082's motivating repro).
+
+    Deliberately NOT title-cascade-matchable from a "Soundtracks - L" shelf row
+    titled "Lost In Translation" -- neither the exact-match nor the
+    prefix-strip phase can bridge "Lost In Translation" to the full Discogs
+    title, so a comp filed against this release is only reachable via
+    ``library_release_override``.
+    """
+    await conn.execute(
+        "INSERT INTO release (id, title) VALUES "
+        "(13468045, 'Lost In Translation (Music From The Motion Picture)')"
+    )
+    await conn.execute(
+        "INSERT INTO va_release (id, title, norm_title) VALUES "
+        "(13468045, 'Lost In Translation (Music From The Motion Picture)', "
+        "'lost in translation music from the motion picture')"
+    )
+    await conn.execute(
+        "INSERT INTO release_track (release_id, sequence, position, title) VALUES "
+        "(13468045, 1, 'A7', 'Tommib')"
+    )
+    await conn.execute(
+        "INSERT INTO release_track_artist "
+        "(release_id, track_sequence, artist_name, extra, role) VALUES "
+        "(13468045, 1, 'Squarepusher', 0, NULL)"
+    )
+
+
+async def _insert_override(conn, library_id: int, discogs_release_id: int) -> None:
+    await conn.execute(
+        "INSERT INTO lml_cache.library_release_override (library_id, discogs_release_id) "
+        "VALUES ($1, $2)",
+        library_id,
+        discogs_release_id,
     )
 
 
@@ -276,3 +331,135 @@ class TestBuildAgainstRealPostgres:
             )
 
         assert stats == {"candidates": 1, "matched": 0, "rows_inserted": 0}
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+class TestMatchCompReleaseOverrideSeeding:
+    """Real-Postgres proof of the ``_OVERRIDE_SQL`` guard (LML#1082).
+
+    ``tests/unit/test_build_compilation_track_location.py::TestMatchCompRelease``
+    covers the seeding/precedence/fallback decision against a mocked ``conn``;
+    this class proves the guard predicate itself -- override target must be in
+    ``va_release`` AND carry at least one ``release_track`` row -- against real
+    tables, using the ticket's own repro (library 60654, "Soundtracks - L"
+    shelf, Lost In Translation OST) as the override-only fixture.
+    """
+
+    LIB_ID = 60654
+    LIB_TITLE = "Lost In Translation"
+    LIB_ARTIST = "Soundtracks - L"
+
+    async def test_shelf_row_has_no_title_cascade_match_on_its_own(self, pg_pool):
+        """Baseline: without an override, this shelf row is genuinely unmatchable."""
+        async with pg_pool.acquire() as conn:
+            await _seed_lost_in_translation(conn)
+            comp = CompCandidate(
+                library_id=self.LIB_ID, title=self.LIB_TITLE, artist=self.LIB_ARTIST
+            )
+            result = await match_comp_release(conn, [comp])
+
+        assert result == {}
+
+    async def test_override_only_comp_is_indexed_via_the_override(self, pg_pool):
+        async with pg_pool.acquire() as conn:
+            await _seed_lost_in_translation(conn)
+            await _insert_override(conn, self.LIB_ID, 13468045)
+            comp = CompCandidate(
+                library_id=self.LIB_ID, title=self.LIB_TITLE, artist=self.LIB_ARTIST
+            )
+            result = await match_comp_release(conn, [comp])
+
+        assert result == {self.LIB_ID: 13468045}
+
+    async def test_override_to_a_non_va_release_is_skipped(self, pg_pool):
+        """An override pointed at a release absent from va_release can't seed the index."""
+        async with pg_pool.acquire() as conn:
+            await conn.execute("INSERT INTO release (id, title) VALUES (777, 'Not A VA Release')")
+            await conn.execute(
+                "INSERT INTO release_track (release_id, sequence, position, title) VALUES "
+                "(777, 1, 'A1', 'Some Track')"
+            )
+            await _insert_override(conn, self.LIB_ID, 777)
+            comp = CompCandidate(
+                library_id=self.LIB_ID, title=self.LIB_TITLE, artist=self.LIB_ARTIST
+            )
+            result = await match_comp_release(conn, [comp])
+
+        assert result == {}
+
+    async def test_override_to_a_release_with_no_cached_tracklist_is_skipped(self, pg_pool):
+        """An override pointed at a va_release with zero release_track rows can't seed the index."""
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO release (id, title) VALUES (888, 'No Tracklist Cached')"
+            )
+            await conn.execute(
+                "INSERT INTO va_release (id, title, norm_title) VALUES "
+                "(888, 'No Tracklist Cached', 'no tracklist cached')"
+            )
+            await _insert_override(conn, self.LIB_ID, 888)
+            comp = CompCandidate(
+                library_id=self.LIB_ID, title=self.LIB_TITLE, artist=self.LIB_ARTIST
+            )
+            result = await match_comp_release(conn, [comp])
+
+        assert result == {}
+
+    async def test_override_wins_over_a_conflicting_title_cascade_match(self, pg_pool):
+        """library_id 28 exact-title-matches release 555, but its override points elsewhere."""
+        async with pg_pool.acquire() as conn:
+            await _seed_the_sound_of_dub(conn)
+            await _seed_lost_in_translation(conn)
+            await _insert_override(conn, 28, 13468045)
+            comp = CompCandidate(
+                library_id=28, title="The Sound of Dub", artist="Various Artists - Reggae"
+            )
+            result = await match_comp_release(conn, [comp])
+
+        assert result == {28: 13468045}
+
+    async def test_comp_with_no_override_still_falls_through_to_the_title_cascade(self, pg_pool):
+        async with pg_pool.acquire() as conn:
+            await _seed_the_sound_of_dub(conn)
+            comp = CompCandidate(
+                library_id=28, title="The Sound of Dub", artist="Various Artists - Reggae"
+            )
+            result = await match_comp_release(conn, [comp])
+
+        assert result == {28: 555}
+
+    async def test_full_build_indexes_an_override_only_comp_end_to_end(self, pg_pool, tmp_path):
+        """The ticket's own repro, end to end: 60654 gets a compilation_track_location
+
+        row for Squarepusher/Tommib purely off the override -- no title match involved.
+        """
+        async with pg_pool.acquire() as conn:
+            await _seed_lost_in_translation(conn)
+            await _insert_override(conn, self.LIB_ID, 13468045)
+
+        library_db = await _write_library_db(
+            tmp_path, [(self.LIB_ID, self.LIB_TITLE, self.LIB_ARTIST)]
+        )
+
+        async with pg_pool.acquire() as conn:
+            stats = await build_compilation_track_location(
+                library_db_path=library_db,
+                discogs_conn=conn,
+                discogs_service=None,
+                full=True,
+            )
+
+        assert stats == {"candidates": 1, "matched": 1, "rows_inserted": 1}
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT track_position, track_artist, track_title, discogs_release_id "
+                "FROM lml_cache.compilation_track_location WHERE library_id = $1",
+                self.LIB_ID,
+            )
+        assert dict(row) == {
+            "track_position": "A7",
+            "track_artist": "squarepusher",
+            "track_title": "tommib",
+            "discogs_release_id": 13468045,
+        }

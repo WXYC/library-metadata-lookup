@@ -4,11 +4,14 @@ Answers "which library shelf locations contain track *T* credited to artist
 *A*?" by walking every compilation-shelf row in ``library.db`` (any artist
 ``wxyc_etl.text.is_compilation_artist`` recognizes -- "Various Artists - *"
 and "Soundtracks - *" shelf buckets alike), matching it to a Discogs release
-via the same normalized-title cascade ``scripts/match_compilations.py`` uses
-against ``va_release``, and persisting every ``release_track_artist`` credit
-for that release -- not just the primary artist -- tiered into a coarse
-``credit_role``. Precision ranking is LML#1022's job; this only guarantees
-every candidate row exists for it to rank.
+-- preferring a hand-verified ``lml_cache.library_release_override`` pin
+(LML#850/#858) and falling back to the same normalized-title cascade
+``scripts/match_compilations.py`` uses against ``va_release`` for comps the
+override table doesn't cover (LML#1082) -- and persisting every
+``release_track_artist`` credit for that release -- not just the primary
+artist -- tiered into a coarse ``credit_role``. Precision ranking is
+LML#1022's job; this only guarantees every candidate row exists for it to
+rank.
 
 Runs standalone, outside the FastAPI service (a discogs-etl-cloned checkout
 per the ship-dag triage resolution on LML#1019), so schema bootstrap is
@@ -130,36 +133,68 @@ async def get_processed_library_ids(conn: asyncpg.Connection) -> set[int]:
     return {row["library_id"] for row in rows}
 
 
+_OVERRIDE_SQL = """\
+SELECT library_id, discogs_release_id
+FROM lml_cache.library_release_override
+WHERE library_id = ANY($1)
+  AND discogs_release_id IN (SELECT id FROM va_release)
+  AND EXISTS (
+      SELECT 1 FROM release_track rt WHERE rt.release_id = discogs_release_id
+  )\
+"""
+
+
 async def match_comp_release(
     conn: asyncpg.Connection, comps: list[CompCandidate]
 ) -> dict[int, int]:
-    """Match each comp to a Discogs release id, reusing ``match_compilations.py``.
+    """Match each comp to a Discogs release id: authoritative override first, title cascade as fallback.
 
-    Runs the same exact -> prefix-strip -> trigram cascade the standalone VA
-    matcher uses against ``va_release``, so this build doesn't reinvent
-    comp-title matching. Returns ``library_id -> discogs_release_id`` for
-    every comp that matched; an unmatched comp is simply absent from the
+    Seeds the result from ``lml_cache.library_release_override`` (LML#850 /
+    LML#858) -- the same hand-verified ``library_id -> discogs_release_id``
+    pin the runtime ``/lookup`` path consults via
+    ``lookup/artwork.py::get_library_release_overrides``. An override only
+    seeds a match when its target is itself indexable: present in
+    ``va_release`` *and* carrying at least one ``release_track`` row (the
+    ``_OVERRIDE_SQL`` guard) -- the same "no cached tracklist" skip class the
+    caller already logs for a cascade hit with an empty tracklist. Comps
+    left unclaimed by a (guarded) override fall through to the same exact ->
+    prefix-strip -> trigram cascade ``match_compilations.py`` runs against
+    ``va_release``, so this build still doesn't reinvent comp-title matching
+    for the comps the override table doesn't cover. The override always wins
+    on conflict -- an override-claimed comp is removed from the candidate
+    pool before the cascade runs, so it can never be reassigned by a
+    title match. Returns ``library_id -> discogs_release_id`` for every comp
+    matched either way; a comp matched by neither is simply absent from the
     result (retried on the next run).
     """
     if not comps:
         return {}
-    albums = [
-        CompAlbum(
-            id=comp.library_id,
-            title=comp.title,
-            display_artist=comp.artist,
-            normalized_title=normalize_comp_title(comp.title),
-        )
-        for comp in comps
-    ]
-    await conn.execute("SET pg_trgm.similarity_threshold = 0.3")
-    exact_matches, remaining, title_map = await exact_match(conn, albums)
-    prefix_matches, remaining = await prefix_strip_match(title_map, remaining)
-    fuzzy_matches, _unmatched = await trigram_match(conn, remaining)
-    return {
-        match.comp_id: match.discogs_release_id
-        for match in (*exact_matches, *prefix_matches, *fuzzy_matches)
+
+    library_ids = [comp.library_id for comp in comps]
+    override_rows = await conn.fetch(_OVERRIDE_SQL, library_ids)
+    matches: dict[int, int] = {
+        row["library_id"]: row["discogs_release_id"] for row in override_rows
     }
+
+    remaining_comps = [comp for comp in comps if comp.library_id not in matches]
+    if remaining_comps:
+        albums = [
+            CompAlbum(
+                id=comp.library_id,
+                title=comp.title,
+                display_artist=comp.artist,
+                normalized_title=normalize_comp_title(comp.title),
+            )
+            for comp in remaining_comps
+        ]
+        await conn.execute("SET pg_trgm.similarity_threshold = 0.3")
+        exact_matches, cascade_remaining, title_map = await exact_match(conn, albums)
+        prefix_matches, cascade_remaining = await prefix_strip_match(title_map, cascade_remaining)
+        fuzzy_matches, _unmatched = await trigram_match(conn, cascade_remaining)
+        for match in (*exact_matches, *prefix_matches, *fuzzy_matches):
+            matches[match.comp_id] = match.discogs_release_id
+
+    return matches
 
 
 _CREDITS_SQL = """\
