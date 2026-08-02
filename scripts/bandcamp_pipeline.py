@@ -7,6 +7,14 @@ Phase 2 (Lookup): For artists with known slugs (from Phase 1 or Wikidata),
     fetches the artist's Bandcamp catalog and fuzzy-matches album titles.
     Writes album-level URLs to albums.bandcamp_url.
 
+Phase album-search (LML#1069): album-first discovery via the general
+    Bandcamp autocomplete index (``BandcampClient.find_album_match_via_
+    search``), for rows the artist-first Phase 2 backlog doesn't own --
+    label/imprint-hosted releases whose own-artist catalog page never
+    carries the album. Unlike the legacy phases (write-by-default,
+    ``--dry-run`` opts out), this phase is dry by default; writes are
+    opt-in via ``--execute``.
+
 When both phases run together (the default), they operate concurrently:
 search discoveries are passed to lookup via an asyncio.Queue so album
 matching begins immediately as slugs are found.
@@ -14,6 +22,10 @@ matching begins immediately as slugs are found.
 Usage:
     python -m scripts.bandcamp_pipeline [--phase {search,lookup,both}]
         [--include-streaming] [--artist-fallback] [--dry-run] [--limit N]
+
+    python -m scripts.bandcamp_pipeline --phase album-search \\
+        [--include-not-found] [--limit N] [--report-json PATH] \\
+        [--execute [--no-verify-hits]]
 """
 
 from __future__ import annotations
@@ -27,9 +39,10 @@ from collections import defaultdict
 
 from rapidfuzz import fuzz
 
-from clients.bandcamp import BandcampClient, extract_slug
+from clients.bandcamp import BandcampClient, BandcampSearchUnavailableError, extract_slug
 from clients.streaming.matching import score_match
 from scripts.streaming_availability.results_db import ResultsDB
+from streaming.models import SourceMatch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -305,6 +318,102 @@ async def phase_lookup(
     return results
 
 
+async def phase_album_search(
+    client: BandcampClient,
+    db: ResultsDB,
+    *,
+    include_not_found: bool = False,
+    limit: int | None = None,
+    execute: bool = False,
+    verify_hits: bool = False,
+) -> dict:
+    """Phase album-search (LML#1069): album-first Bandcamp discovery.
+
+    Candidates come from ``ResultsDB.get_pending_album_search`` -- rows the
+    artist-first Phase 2 catalog backlog doesn't own. Each row costs exactly
+    one autocomplete request via ``BandcampClient.find_album_match_via_
+    search``. Writes are fill-only and opt-in behind ``execute``; without it
+    this only resolves and tallies (dry by default, unlike the legacy
+    phases -- see module docstring).
+
+    Write semantics:
+        - hit -> ``update_bandcamp_url`` (only under ``execute``; also
+          requires ``verify_album_page`` to pass when ``verify_hits`` is set).
+        - miss on a ``pending`` row -> ``mark_bandcamp_not_found`` (only
+          under ``execute``); album-first is now the primary mechanism, so a
+          miss here is durable, not a signal to preserve ``pending`` for a
+          future artist-first sweep (measured marginal yield ~0).
+        - miss on an already ``not_found`` row (via ``include_not_found``)
+          -> no write; already durably recorded, tallied ``skipped`` so a
+          re-run stays idempotent.
+        - ``BandcampSearchUnavailableError`` (transient HTTP failure after
+          retries) -> no write, tallied ``fetch_failed``; the row stays
+          ``pending``/re-runnable (#661 posture).
+
+    Returns a dict of tallies (``hits``, ``misses``, ``skipped``,
+    ``verify_failed``, ``fetch_failed``) plus ``would_write``: the list of
+    hit rows (written or not, depending on ``execute``) for ``--report-json``.
+    """
+    rows = await db.get_pending_album_search(include_not_found=include_not_found, limit=limit)
+    tallies = {"hits": 0, "misses": 0, "skipped": 0, "verify_failed": 0, "fetch_failed": 0}
+    would_write: list[dict] = []
+
+    if not rows:
+        log.info("No albums pending album-first Bandcamp search")
+        return {**tallies, "would_write": would_write}
+
+    log.info(f"Album-search: {len(rows)} candidates ({'execute' if execute else 'dry-run'})")
+
+    for i, row in enumerate(rows, 1):
+        artist = row["display_artist"]
+        title = row["display_title"]
+
+        try:
+            match: SourceMatch | None = await client.find_album_match_via_search(artist, title)
+        except BandcampSearchUnavailableError:
+            tallies["fetch_failed"] += 1
+            continue
+
+        if match is None:
+            if row["bandcamp_status"] == "pending":
+                if execute:
+                    await db.mark_bandcamp_not_found(row["id"])
+                tallies["misses"] += 1
+            else:
+                tallies["skipped"] += 1
+            continue
+
+        if verify_hits and not await client.verify_album_page(match.url, artist, title):
+            tallies["verify_failed"] += 1
+            continue
+
+        tallies["hits"] += 1
+        would_write.append(
+            {
+                "id": row["id"],
+                "artist": artist,
+                "title": title,
+                "bandcamp_url": match.url,
+                "confidence": match.confidence,
+            }
+        )
+        if execute:
+            await db.update_bandcamp_url(row["id"], match.url)
+
+        if i % 100 == 0:
+            log.info(
+                f"  {i}/{len(rows)}: {tallies['hits']} hits, {tallies['misses']} misses, "
+                f"{tallies['verify_failed']} verify-failed, {tallies['fetch_failed']} fetch-failed"
+            )
+
+    log.info(
+        f"Album-search complete: {tallies['hits']} hits, {tallies['misses']} misses, "
+        f"{tallies['skipped']} skipped (already not_found), "
+        f"{tallies['verify_failed']} verify-failed, {tallies['fetch_failed']} fetch-failed"
+    )
+    return {**tallies, "would_write": would_write}
+
+
 async def run_concurrent(
     client: BandcampClient,
     db: ResultsDB,
@@ -445,6 +554,31 @@ async def main(args: argparse.Namespace) -> None:
     await db.connect()
 
     try:
+        if args.phase == "album-search":
+            if args.dry_run:
+                log.info(
+                    "--dry-run is a no-op for --phase album-search "
+                    "(dry by default; pass --execute to write)"
+                )
+            client = BandcampClient()
+            try:
+                verify_hits = args.execute if args.verify_hits is None else args.verify_hits
+                report = await phase_album_search(
+                    client,
+                    db,
+                    include_not_found=args.include_not_found,
+                    limit=args.limit,
+                    execute=args.execute,
+                    verify_hits=verify_hits,
+                )
+            finally:
+                await client.close()
+            if args.report_json:
+                with open(args.report_json, "w") as f:
+                    json.dump(report, f, indent=2)
+                log.info(f"Wrote album-search report to {args.report_json}")
+            return
+
         if args.dry_run:
             await dry_run(db, include_streaming=args.include_streaming)
             return
@@ -494,13 +628,13 @@ async def main(args: argparse.Namespace) -> None:
         await db.close()
 
 
-if __name__ == "__main__":
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Unified Bandcamp pipeline: discover slugs + match albums"
     )
     parser.add_argument(
         "--phase",
-        choices=["search", "lookup", "both"],
+        choices=["search", "lookup", "both", "album-search"],
         default="both",
         help="Which phase to run (default: both)",
     )
@@ -521,5 +655,48 @@ if __name__ == "__main__":
         default="streaming_availability.db",
         help="Path to streaming_availability.db",
     )
-    args = parser.parse_args()
-    asyncio.run(main(args))
+    parser.add_argument(
+        "--include-not-found",
+        action="store_true",
+        help="[album-search] Also target rows already marked bandcamp not_found",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="[album-search only] Persist writes. Without this, album-search "
+        "always resolves and tallies without writing (dry by default).",
+    )
+    parser.add_argument(
+        "--verify-hits",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="[album-search] Confirm a hit's og:title before writing. "
+        "Defaults to matching --execute (on when executing, off in dry-run).",
+    )
+    parser.add_argument(
+        "--report-json",
+        help="[album-search] Path to write the tallies + would-be-written report",
+    )
+    return parser
+
+
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Enforce the album-search flag interactions (LML#1069).
+
+    ``--execute`` only makes sense for ``--phase album-search`` (the legacy
+    phases already write by default) and is mutually exclusive with
+    ``--dry-run`` (which the legacy phases use to mean "write nothing").
+    Calls ``parser.error`` (exits 2) on an invalid combination, matching
+    argparse's own convention for a bad flag combo.
+    """
+    if args.execute and args.dry_run:
+        parser.error("--execute cannot be combined with --dry-run")
+    if args.execute and args.phase != "album-search":
+        parser.error("--execute is only valid with --phase album-search")
+
+
+if __name__ == "__main__":
+    arg_parser = build_arg_parser()
+    parsed_args = arg_parser.parse_args()
+    validate_args(arg_parser, parsed_args)
+    asyncio.run(main(parsed_args))

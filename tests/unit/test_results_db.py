@@ -425,6 +425,111 @@ class TestGetPendingBandcampLookup:
         assert pending[0]["bandcamp_slug"] == "autechre"
 
 
+class TestGetPendingAlbumSearch:
+    """LML#1069 album-first candidate selector.
+
+    Targets rows the existing artist-first Phase 2 backlog (``get_pending_
+    bandcamp_lookup``) does NOT own: no bandcamp_url, non-compilation, and
+    either never searched (NULL slug) or artist-searched-with-no-band-found
+    (the ``''`` sentinel). A row with a *real* recorded slug stays Phase-2's,
+    even if album-search would otherwise be willing to look at it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_includes_null_slug_pending_row(self, db):
+        await db.insert_albums([_make_album()])
+        candidates = await db.get_pending_album_search()
+        assert len(candidates) == 1
+        assert candidates[0]["display_artist"] == "Stereolab"
+
+    @pytest.mark.asyncio
+    async def test_includes_empty_string_sentinel_slug(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "")
+        candidates = await db.get_pending_album_search()
+        assert len(candidates) == 1
+
+    @pytest.mark.asyncio
+    async def test_excludes_real_slug_row(self, db):
+        # Owned by the existing Phase-2 catalog backlog -- album-search must
+        # not pre-empt a pending catalog scrape.
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
+        candidates = await db.get_pending_album_search()
+        assert candidates == []
+
+    @pytest.mark.asyncio
+    async def test_excludes_compilations(self, db):
+        await db.insert_albums(
+            [
+                _make_album(
+                    normalized_artist="various artists",
+                    display_artist="Various Artists",
+                    is_compilation=True,
+                ),
+            ]
+        )
+        candidates = await db.get_pending_album_search()
+        assert candidates == []
+
+    @pytest.mark.asyncio
+    async def test_excludes_rows_with_bandcamp_url(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_url(
+            rows[0]["id"], "https://stereolab.bandcamp.com/album/aluminum-tunes"
+        )
+        candidates = await db.get_pending_album_search()
+        assert candidates == []
+
+    @pytest.mark.asyncio
+    async def test_excludes_not_found_by_default(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.mark_bandcamp_not_found(rows[0]["id"])
+        candidates = await db.get_pending_album_search()
+        assert candidates == []
+
+    @pytest.mark.asyncio
+    async def test_include_not_found_extends_to_not_found_rows(self, db):
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.mark_bandcamp_not_found(rows[0]["id"])
+        candidates = await db.get_pending_album_search(include_not_found=True)
+        assert len(candidates) == 1
+
+    @pytest.mark.asyncio
+    async def test_include_not_found_still_excludes_real_slug_rows(self, db):
+        # A not_found row with a real slug is still Phase-2's territory --
+        # the slug filter applies regardless of status.
+        await db.insert_albums([_make_album()])
+        rows = await db.get_pending("spotify", limit=10)
+        await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
+        await db.mark_bandcamp_not_found(rows[0]["id"])
+        candidates = await db.get_pending_album_search(include_not_found=True)
+        assert candidates == []
+
+    @pytest.mark.asyncio
+    async def test_respects_limit(self, db):
+        await db.insert_albums(
+            [
+                _make_album(),
+                _make_album(
+                    normalized_artist="autechre",
+                    normalized_title="confield",
+                    display_artist="Autechre",
+                    display_title="Confield",
+                    library_ids=[3],
+                    formats=["cd"],
+                ),
+            ]
+        )
+        candidates = await db.get_pending_album_search(limit=1)
+        assert len(candidates) == 1
+
+
 class TestBandcampStatusMarker:
     """Phase-2 resumability marker (#661): bandcamp_status / bandcamp_checked_at."""
 
