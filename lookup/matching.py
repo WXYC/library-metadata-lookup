@@ -10,10 +10,9 @@ layer of `lookup/` — and unit-tested without mocks. Extracted verbatim from
 import logging
 import re
 
-from wxyc_etl.text import is_compilation_artist
+from wxyc_etl.text import is_compilation_artist, strip_leading_article
 from wxyc_etl.text import to_match_form as normalize_for_comparison
 
-from core.text import strip_leading_article
 from discogs.models import ReleaseInfo
 from library.models import LibraryItem
 from services.parser import ParsedRequest

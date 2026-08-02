@@ -34,10 +34,8 @@ from rapidfuzz import fuzz
 # annotations (``(Live)``, ``(2024 Remaster)``) that legitimately
 # distinguish two tracks on the same release, and would also drop leading
 # articles, breaking ``The Way`` vs ``Way`` discrimination.
+from wxyc_etl.text import strip_discogs_disambiguation
 from wxyc_etl.text import to_match_form as normalize_for_comparison
-
-# Discogs disambiguation suffix: (2), (22), etc.
-_DISCOGS_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")
 
 
 def strip_discogs_suffix(name: str) -> str:
@@ -45,10 +43,24 @@ def strip_discogs_suffix(name: str) -> str:
 
     Discogs appends these to artist and label names when multiple entities
     share the same name. Safe to apply to names that have no suffix (no-op).
+
+    Delegates to ``wxyc_etl.text.strip_discogs_disambiguation(name, broad=False)``
+    (LML#1042 / wxyc-etl#147). One deliberate behavior change from the old
+    local ``\\s*\\(\\d+\\)$`` regex: this now tolerates trailing whitespace
+    after the closing paren (``"Foo (2) "`` -> ``"Foo"``, where the old regex
+    left it unstripped because ``$`` sat directly against ``)``). No traced
+    call site of this function feeds a persisted cache key (all call sites —
+    ``normalize_artist_for_validation`` below, plus the VA-disambiguation and
+    streaming-availability scripts — use the output for in-request fuzzy
+    scoring or as a search-API query string), so widening the strip is a
+    low-risk quality improvement, not a cache-key-stability risk. Also
+    narrows from Unicode-digit-aware (Python's ``\\d``) to ASCII-digit-only,
+    per the primitive's contract; Discogs' own disambiguator scheme is
+    ASCII-only so this has no practical effect on real Discogs data.
     """
     if not name:
         return name
-    return _DISCOGS_SUFFIX_RE.sub("", name)
+    return strip_discogs_disambiguation(name, False)
 
 
 def normalize_for_track_comparison(text: str | None) -> str:
@@ -69,6 +81,20 @@ def normalize_for_track_comparison(text: str | None) -> str:
 
     This handles common Discogs/user mismatches like
     "Me & Mr. Jones" vs "Me And Mr Jones".
+
+    LML#1042 deliberately does NOT swap the ampersand fold below for
+    ``wxyc_etl.text.fold_conjunctions``. ``fold_conjunctions`` only folds a
+    whitespace-flanked ``&`` (``Sleater & Kinney`` -> ``Sleater and
+    Kinney``), leaving a token-glued ``&`` (``R&B``) untouched — but this
+    function immediately strips all remaining punctuation afterward, so a
+    glued ``&`` that survives the fold would be deleted outright:
+    ``"R&B"`` -> (fold_conjunctions, no-op) -> ``"R&B"`` -> (punctuation
+    strip) -> ``"RB"``, silently merging two tokens into one and destroying
+    the "and" comparison signal. The bare ``.replace`` used here treats
+    every ``&`` as a conjunction (glued or not), which keeps ``"R&B"`` ->
+    ``"r and b"`` — the same shape a DJ typing "R and B" would produce. See
+    ``tests/unit/test_normalization_consolidation.py`` for the pinned
+    behavior table.
     """
     if not text:
         return ""

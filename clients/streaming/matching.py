@@ -8,9 +8,9 @@ from collections.abc import Callable, Iterable
 
 import sentry_sdk
 from rapidfuzz import fuzz
+from wxyc_etl.text import strip_discogs_disambiguation
 from wxyc_etl.text import to_match_form as normalize_for_comparison  # noqa: F401
 
-from discogs.matching import strip_discogs_suffix  # noqa: F401
 from streaming.models import SourceMatch
 
 logger = logging.getLogger(__name__)
@@ -115,7 +115,17 @@ _BRACKET_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Leading "The " prefix
+# Leading "The " prefix. LML#1042 deliberately keeps this narrower than
+# ``wxyc_etl.text.strip_leading_article`` (which also drops "A"/"An"): this
+# regex feeds ``score_match``'s fallback rescoring, which selects the
+# streaming-service candidate that gets persisted as the winning URL for a
+# given (already-fixed) cache key. Widening the strip to "A"/"An" would
+# change *which candidate wins* on ties like "A Tribe Called Quest" vs
+# "Tribe Called Quest" — a live match-quality behavior change, not a pure
+# refactor, and one that wants its own measurement rather than riding in on
+# a normalization-consolidation PR. See
+# ``tests/unit/test_normalization_consolidation.py`` for the pinned
+# divergence from the crate's broader article strip.
 _THE_PREFIX_RE = re.compile(r"^The\s+", re.IGNORECASE)
 
 
@@ -212,21 +222,27 @@ def score_match_track(query: str, result: str) -> float:
     return score_match(strip_track_suffix(query), strip_track_suffix(result))
 
 
+# "and" <-> "&" variant generation for ``normalize_artist_credit`` below.
+#
+# LML#1042 deliberately does NOT swap ``_AMPERSAND_RE`` for
+# ``wxyc_etl.text.fold_conjunctions``. The two have different contracts:
+# ``fold_conjunctions`` is a single-direction *canonicalizer* (only folds a
+# whitespace-flanked ``&``, leaving a token-glued ``&`` like ``Sam&Dave``
+# alone), while ``normalize_artist_credit`` is a *search-variant generator*
+# for Discogs recall — it wants to try "and" spellings for ANY ``&``,
+# glued or not, because a rare-but-real glued-ampersand credit is exactly
+# the kind of typographic noise a fuzzy Discogs search should route around.
+# Swapping to ``fold_conjunctions`` would silently narrow recall (no more
+# "Sam and Dave" variant for "Sam&Dave"). There is also no crate primitive
+# for the reverse "and" -> "&" direction ``_AND_RE`` needs, so at least one
+# local regex is required regardless; keeping both here (rather than
+# half-adopting the primitive for one direction only) keeps the symmetric
+# variant-generation logic in one place. See
+# ``tests/unit/test_normalization_consolidation.py`` for the pinned
+# glued-ampersand variant behavior this decision preserves.
 _AND_RE = re.compile(r"\band\b", re.IGNORECASE)
 _AMPERSAND_RE = re.compile(r"\s*&\s*")
 _FEAT_RE = re.compile(r"\s+(?:feat\.?|featuring|ft\.?)\s+.*$", re.IGNORECASE)
-# Narrow numeric-only disambig form ("Sessa (2)"). Kept as a separate
-# constant because some callers (``normalize_artist_credit``) only want to
-# strip the numeric form to preserve other parenthetical metadata.
-_DISCOGS_DISAMBIG_RE = re.compile(r"\s*\(\d+\)\s*$")
-# Broader disambig form Discogs uses for any name collision: numeric IDs
-# (``Sade (1)``), country codes (``Stereolab (UK)``), single-word qualifiers
-# (``Sade (band)``, ``M83 (3)``). Constrained to a bounded character class
-# so we don't accidentally strip parts of legitimate names: alphanumeric
-# only, length 1-20, no nested parens. The intent is to capture "Discogs
-# disambig metadata" while declining to touch artist names that happen to
-# end with longer parenthetical material.
-_DISCOGS_DISAMBIG_BROAD_RE = re.compile(r"\s*\(\s*[A-Za-z0-9][A-Za-z0-9\s.\-]{0,18}\)\s*$")
 
 
 # Shared acceptance threshold for artist+title fuzzy matching across LML#477,
@@ -252,11 +268,22 @@ def strip_discogs_disambig(name: str) -> str:
 
     Returns the input unchanged when no suffix matches, or when the input
     is empty. Conservative on what it strips — a 1-19 character alphanumeric
-    parenthetical at end-of-string only (regex: leading alphanumeric, then up
-    to 18 more alphanumerics/spaces/``.``/``-``) — so legitimate artist names
-    with longer parenthetical material aren't truncated.
+    parenthetical at end-of-string only, so legitimate artist names with
+    longer parenthetical material aren't truncated.
+
+    Delegates to ``wxyc_etl.text.strip_discogs_disambiguation(name, broad=True)``
+    (LML#1042 / wxyc-etl#147). One divergence found while pinning this
+    call site's behavior before the swap: the old local regex allowed
+    whitespace right after the opening paren (``"Foo ( UK)"`` -> ``"Foo"``);
+    the crate primitive requires the qualifier to sit flush against ``(``
+    and leaves ``"Foo ( UK)"`` unstripped. Traced call sites
+    (``lookup/artist_resolution.py``, ``lookup/enrichment/__init__.py``) use
+    the output for in-request fuzzy-match scoring and a process-local TTL
+    cache, never a persisted PG cache key, so this narrowing is safe —
+    it only means a malformed (space-after-paren) disambiguator is left
+    alone rather than stripped, which is the more conservative direction.
     """
-    return _DISCOGS_DISAMBIG_BROAD_RE.sub("", name)
+    return strip_discogs_disambiguation(name, True)
 
 
 def normalize_artist_credit(artist: str) -> list[str]:
@@ -296,8 +323,16 @@ def normalize_artist_credit(artist: str) -> list[str]:
         _add(_FEAT_RE.sub("", original))
 
     # Parenthetical Discogs disambiguation: "Artist (2)" → "Artist"
-    if _DISCOGS_DISAMBIG_RE.search(original):
-        _add(_DISCOGS_DISAMBIG_RE.sub("", original))
+    #
+    # Delegates to wxyc_etl.text.strip_discogs_disambiguation(_, broad=False)
+    # (LML#1042 / wxyc-etl#147) rather than a local regex. Verified
+    # byte-identical to the old ``_DISCOGS_DISAMBIG_RE = r"\s*\(\d+\)\s*$"``
+    # across every case in tests/unit/test_normalize_artist_credit.py and
+    # tests/unit/test_normalization_consolidation.py before the swap — this
+    # is a pure delegation, not a behavior change.
+    stripped_numeric = strip_discogs_disambiguation(original, False)
+    if stripped_numeric != original:
+        _add(stripped_numeric)
 
     return variants
 

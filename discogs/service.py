@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import sentry_sdk
 from rapidfuzz import fuzz
-from wxyc_etl.text import is_compilation_artist
+from wxyc_etl.text import is_compilation_artist, to_match_form
 from wxyc_fastapi.http import async_singleton
 from wxyc_fastapi.observability import (
     add_breadcrumb,
@@ -485,7 +485,19 @@ def calculate_confidence(
     score = 0.0
 
     def normalize(s: str | None) -> str:
-        return s.lower().strip() if s else ""
+        """Lightweight normalization for confidence-score substring comparison.
+
+        LML#1042: delegates to ``wxyc_etl.text.to_match_form`` (NFKD +
+        diacritic-strip + lowercase + trim) instead of the former ad-hoc
+        ``s.lower().strip()``. Deliberate behavior change: diacritic-bearing
+        WXYC artist names (``Nilüfer Yanya``, ``Hermanos Gutiérrez``) now
+        substring-match their plain-ASCII spelling instead of requiring an
+        exact accented match, which can only raise a confidence score, never
+        lower one — this feeds search-result ranking, not a persisted cache
+        key, so the wider match is a low-risk quality improvement. See
+        ``tests/unit/test_normalization_consolidation.py``.
+        """
+        return to_match_form(s) if s else ""
 
     req_artist = normalize(request_artist)
     req_album = normalize(request_album)

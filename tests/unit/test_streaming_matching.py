@@ -12,12 +12,13 @@ from clients.streaming.matching import (
     normalize_artist_name,
     score_match,
     score_match_track,
-    strip_discogs_suffix,
+    strip_discogs_disambig,
     strip_format_suffix,
     strip_the_prefix,
     strip_track_suffix,
     title_subset_is_degenerate,
 )
+from discogs.matching import strip_discogs_suffix
 
 
 class TestStripFormatSuffix:
@@ -452,6 +453,48 @@ class TestStripDiscogsSuffix:
     )
     def test_strip_discogs_suffix(self, name, expected):
         assert strip_discogs_suffix(name) == expected
+
+
+class TestStripDiscogsDisambig:
+    """Broad disambig strip (numeric + country/word qualifiers).
+
+    Delegates to ``wxyc_etl.text.strip_discogs_disambiguation(name,
+    broad=True)`` since LML#1042. There was no dedicated test class for
+    this function before #1042 (only indirect coverage via
+    ``normalize_artist_credit``'s narrow numeric form) — added here as
+    part of pinning this call site's behavior before the swap.
+    """
+
+    @pytest.mark.parametrize(
+        "name, expected",
+        [
+            pytest.param("Sessa (2)", "Sessa", id="numeric"),
+            pytest.param("Stereolab (UK)", "Stereolab", id="country-code"),
+            pytest.param("Sade (band)", "Sade", id="word-qualifier"),
+            pytest.param("Björk", "Björk", id="no-suffix"),
+            pytest.param("", "", id="empty"),
+            pytest.param(
+                "Csillagrablók (Unofficial Bootleg Rip)",
+                "Csillagrablók (Unofficial Bootleg Rip)",
+                id="too-long-qualifier-preserved",
+            ),
+            pytest.param("Sessa (2) ", "Sessa", id="trailing-whitespace-tolerated"),
+        ],
+    )
+    def test_strip_discogs_disambig(self, name, expected):
+        assert strip_discogs_disambig(name) == expected
+
+    def test_space_after_open_paren_no_longer_stripped(self):
+        """LML#1042 divergence pin: crate requires content flush against ``(``.
+
+        The pre-#1042 local regex (``\\(\\s*[A-Za-z0-9]...``) tolerated a
+        space right after the opening paren; the crate primitive does not.
+        Discogs' own disambiguator format never has this space, so this is
+        a safe narrowing, not a functional regression — pinned here so a
+        future change to this call site's behavior is a deliberate diff,
+        not a silent one.
+        """
+        assert strip_discogs_disambig("Foo ( UK)") == "Foo ( UK)"
 
 
 class TestFindBestMatch:
@@ -1675,3 +1718,18 @@ class TestStripThePrefix:
     )
     def test_strip_the_prefix(self, name, expected):
         assert strip_the_prefix(name) == expected
+
+    def test_scope_stays_narrower_than_crate_leading_article_strip(self):
+        """LML#1042 landmine 5 pin: only "The " is stripped here, not "A"/"An".
+
+        ``wxyc_etl.text.strip_leading_article`` drops "the"/"a"/"an", but
+        this function backs ``score_match``'s fallback rescoring, which
+        picks the streaming candidate that gets persisted as the winning
+        URL. Widening the scope would change which candidate wins on
+        "A Tribe Called Quest" vs "Tribe Called Quest"-shaped ties — a live
+        match-quality behavior change that deserves its own measurement,
+        not a silent ride-along in a normalization-consolidation refactor.
+        See the module-level comment above ``_THE_PREFIX_RE``.
+        """
+        assert strip_the_prefix("A Tribe Called Quest") == "A Tribe Called Quest"
+        assert strip_the_prefix("An Cat Dubh") == "An Cat Dubh"

@@ -14,9 +14,9 @@ ships (plan §3.3 step 4), at which point the lookup can move to a
 index and the dependency on stored-row canonicality goes away.
 
 The canonical form layered here on top of
-``wxyc_etl.text.to_identity_match_form`` adds two extra folds that the
-shared normalizer does not yet do but the issue lists as observed
-divergence vectors:
+``wxyc_etl.text.to_identity_match_form`` adds one extra fold that the
+shared normalizer does not yet do but the issue lists as an observed
+divergence vector:
 
 - Apostrophe-class fold (`’`, `‘`, `ʼ`, `ʹ` → `'`). Scope is single-quote
   shapes only — double-quote pairs (`“ ”`), guillemets (`« »`), and
@@ -24,26 +24,30 @@ divergence vectors:
   don't appear as artist-name divergence vectors in the WXYC catalog.
   If a future divergence audit (e.g., the BS#802 rollout report) surfaces
   hits for those, widen the fold here.
-- Conjunction fold (``Sleater & Kinney`` ↔ ``Sleater and Kinney``).
-  Keyed on whitespace around ASCII ``&`` only. Fullwidth ``＆`` (U+FF06)
-  does **not** fold to ``and`` here — NFKC inside ``to_identity_match_form``
-  runs after this regex, so the fullwidth form normalizes to ASCII ``&``
-  too late to catch. The case is exotic enough for WXYC's catalog that we
-  lock the limitation rather than complicate the layering; see
-  ``tests/unit/test_identity_normalize.py::test_fullwidth_ampersand_not_folded``.
+
+The conjunction fold (``Sleater & Kinney`` ↔ ``Sleater and Kinney``) is
+delegated to ``wxyc_etl.text.fold_conjunctions`` (LML#1042 / wxyc-etl#147),
+which reproduces this module's original ``\\s+&\\s+`` regex behavior
+byte-for-byte: it only folds ``&`` when whitespace-flanked on both sides
+(a token-glued ``&`` like ``M&M`` / ``A&E`` is left alone) and it is
+Unicode-whitespace-aware (NBSP, thin space, etc. all count) — verified
+against every case in ``tests/unit/test_identity_normalize.py`` before the
+swap. Fullwidth ``＆`` (U+FF06) does **not** fold to ``and`` here — NFKC
+inside ``to_identity_match_form`` runs after ``fold_conjunctions``, so the
+fullwidth form normalizes to ASCII ``&`` too late to catch. The case is
+exotic enough for WXYC's catalog that we lock the limitation rather than
+complicate the layering; see
+``tests/unit/test_identity_normalize.py::test_fullwidth_ampersand_not_folded``.
 
 Whitespace runs collapse to a single ASCII space, and the result is
 lower-cased + leading/trailing-trimmed by ``to_identity_match_form``.
-``\\s+`` matches Unicode whitespace (NBSP, thin space, etc.) — Backend's
-column has carried those when artist names were pasted from rich-text
-sources.
 """
 
 from __future__ import annotations
 
 import re
 
-from wxyc_etl.text import to_identity_match_form
+from wxyc_etl.text import fold_conjunctions, to_identity_match_form
 
 # Curly / modifier apostrophes that Backend's column may carry. Mapped to
 # ASCII apostrophe U+0027 so ``Don't`` and ``Don’t`` resolve to the same row.
@@ -59,11 +63,6 @@ _APOSTROPHE_FOLD = str.maketrans(
     }
 )
 
-# ``&`` is the conjunction fold key when it sits between whitespace
-# (``Sleater & Kinney``). When it's glued to a token (``M&M``, ``A&E``)
-# it's typographic, not the conjunction, so we leave it alone.
-_AMPERSAND_CONJUNCTION_RE = re.compile(r"\s+&\s+")
-
 # Final whitespace pass. ``to_identity_match_form`` trims and lowercases,
 # but does not collapse interior runs introduced by upstream folds.
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
@@ -75,7 +74,8 @@ def canonicalize_for_identity_lookup(name: str) -> str:
     Layered transform:
 
     1. Apostrophe fold (curly / modifier → ASCII).
-    2. Conjunction fold (`` & `` → `` and ``).
+    2. Conjunction fold (`` & `` → `` and ``), via
+       ``wxyc_etl.text.fold_conjunctions``.
     3. ``wxyc_etl.text.to_identity_match_form`` (NFKC, lowercase, diacritic
        strip, trailing-paren strip, leading-article drop).
     4. Whitespace-run collapse.
@@ -86,6 +86,6 @@ def canonicalize_for_identity_lookup(name: str) -> str:
     if not name:
         return ""
     folded = name.translate(_APOSTROPHE_FOLD)
-    folded = _AMPERSAND_CONJUNCTION_RE.sub(" and ", folded)
+    folded = fold_conjunctions(folded)
     normalized = to_identity_match_form(folded)
     return _WHITESPACE_RUN_RE.sub(" ", normalized).strip()

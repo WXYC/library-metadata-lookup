@@ -22,12 +22,9 @@ from pathlib import Path
 
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.deezer import DeezerClient
-from clients.streaming.matching import (
-    find_best_match,
-    strip_discogs_suffix,
-    strip_format_suffix,
-)
+from clients.streaming.matching import find_best_match, strip_format_suffix
 from clients.streaming.spotify import SpotifyClient
+from discogs.matching import strip_discogs_suffix
 from scripts._lib.runtime import set_up_script_runtime
 from scripts._lib.signals import ShutdownFlag
 from scripts.streaming_availability.dedup import deduplicate_library
