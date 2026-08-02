@@ -792,6 +792,24 @@ class TestYouTubeMusicNotFoundMarker:
         assert rows[0]["youtube_music_url"] == url
 
     @pytest.mark.asyncio
+    async def test_mark_youtube_music_not_found_returns_true_when_marked(self, db):
+        await db.insert_albums([_make_album()])
+        album_id = (await db.get_pending("spotify", limit=10))[0]["id"]
+        marked = await db.mark_youtube_music_not_found(album_id)
+        assert marked is True
+
+    @pytest.mark.asyncio
+    async def test_mark_youtube_music_not_found_returns_false_when_already_resolved(self, db):
+        # The fill-only guard no-ops when the row was resolved out-of-band
+        # between a pending-scan read and this write -- callers (execute_write)
+        # need this signal to avoid overcounting a moot miss as a real one.
+        await db.insert_albums([_make_album()])
+        album_id = (await db.get_pending("spotify", limit=10))[0]["id"]
+        await db.update_youtube_music_url(album_id, "https://music.youtube.com/browse/MPREb_x")
+        marked = await db.mark_youtube_music_not_found(album_id)
+        assert marked is False
+
+    @pytest.mark.asyncio
     async def test_get_pending_youtube_music_excludes_found_and_attempted(self, db):
         await db.insert_albums(
             [

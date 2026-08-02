@@ -208,6 +208,46 @@ class TestLoadCandidatesFromDb:
         assert candidates[0].title == "DOGA"
         assert candidates[0].album_id == by_artist["Juana Molina"]
 
+    @pytest.mark.asyncio
+    async def test_blank_display_name_rows_are_marked_not_found_not_left_stalling(self, tmp_path):
+        # get_pending has no ORDER BY/OFFSET, so an unsearchable blank-name row
+        # left 'pending' would reappear in every future pending-scan page and
+        # could stall pagination for real candidates behind it. It must be
+        # marked not_found (like any other attempted-but-unusable candidate)
+        # instead of silently dropped.
+        db_path = str(tmp_path / "sa.db")
+        db = ResultsDB(db_path)
+        await db.connect()
+        try:
+            await db.insert_albums(
+                [
+                    DeduplicatedAlbum(
+                        normalized_artist="blank artist",
+                        normalized_title="blank title",
+                        display_artist="",
+                        display_title="Something",
+                        library_ids=[1],
+                        formats=["cd"],
+                    ),
+                    DeduplicatedAlbum(
+                        normalized_artist=normalize_artist_name("Sessa"),
+                        normalized_title=normalize_album_title("Grandeza"),
+                        display_artist="Sessa",
+                        display_title="Grandeza",
+                        library_ids=[2],
+                        formats=["cd"],
+                    ),
+                ]
+            )
+            candidates = await load_candidates_from_db(db, limit=10)
+            assert [c.artist for c in candidates] == ["Sessa"]
+
+            rows = await db.get_all_results()
+            blank_row = next(r for r in rows if r["display_artist"] == "")
+            assert blank_row["youtube_music_status"] == "not_found"
+        finally:
+            await db.close()
+
 
 class TestExecuteWritePersists:
     """execute_write fill-only-persists verified YTM links into the
@@ -307,6 +347,33 @@ class TestExecuteWritePersists:
         assert row["youtube_music_url"] is None
 
     @pytest.mark.asyncio
+    async def test_execute_write_miss_when_already_resolved_counts_already_present(self, tmp_path):
+        # The row got resolved out-of-band between the pending-scan read and
+        # this write landing (e.g. a second run over an overlapping window).
+        # mark_youtube_music_not_found's fill-only guard no-ops -- the tally
+        # must reflect that as already_present, not double-count it as a
+        # genuine not_found.
+        db_path = str(tmp_path / "sa.db")
+        await self._seed_album(db_path, "Stereolab", "Aluminum Tunes")
+        row = await self._read_row(db_path)
+        url = "https://music.youtube.com/browse/MPREb_x"
+        seed_db = ResultsDB(db_path)
+        await seed_db.connect()
+        try:
+            await seed_db.update_youtube_music_url(row["id"], url)
+        finally:
+            await seed_db.close()
+
+        outcome = DrainOutcome(
+            Candidate("Stereolab", "Aluminum Tunes", album_id=row["id"]), match=None
+        )
+        tally = await execute_write([outcome], db_path=db_path)
+        assert tally == {"written": 0, "already_present": 1, "unmatched": 0, "not_found": 0}
+        row = await self._read_row(db_path)
+        assert row["youtube_music_status"] == "found"
+        assert row["youtube_music_url"] == url
+
+    @pytest.mark.asyncio
     async def test_execute_write_miss_without_album_id_is_skipped(self, tmp_path):
         db_path = str(tmp_path / "sa.db")
         await self._seed_album(db_path, "Stereolab", "Aluminum Tunes")
@@ -331,6 +398,30 @@ class TestExecuteWritePersists:
         tally = await execute_write([outcome], db_path=db_path)
         assert tally == {"written": 1, "already_present": 0, "unmatched": 0, "not_found": 0}
         assert await self._read_url(db_path) == url
+
+    @pytest.mark.asyncio
+    async def test_reuses_a_provided_connection_instead_of_opening_a_second_one(self, tmp_path):
+        # --from-db --execute would otherwise open a second ResultsDB against
+        # the same file just to write, paying a redundant connect/migrate
+        # round-trip. Passing an already-connected db must be honored, and
+        # execute_write must not close a connection it doesn't own.
+        db_path = str(tmp_path / "sa.db")
+        await self._seed_album(db_path, "Stereolab", "Aluminum Tunes")
+        row = await self._read_row(db_path)
+        db = ResultsDB(db_path)
+        await db.connect()
+        try:
+            url = "https://music.youtube.com/browse/MPREb_reused"
+            outcome = DrainOutcome(
+                Candidate("Stereolab", "Aluminum Tunes", album_id=row["id"]), _match(url=url)
+            )
+            tally = await execute_write([outcome], db_path=db_path, db=db)
+            assert tally == {"written": 1, "already_present": 0, "unmatched": 0, "not_found": 0}
+            # Still open and usable -- execute_write did not close it.
+            rows = await db.get_all_results()
+            assert rows[0]["youtube_music_url"] == url
+        finally:
+            await db.close()
 
 
 class TestRerunResumability:

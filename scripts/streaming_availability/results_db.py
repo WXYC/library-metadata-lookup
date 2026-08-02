@@ -387,22 +387,28 @@ class ResultsDB:
             )
             await self._db.commit()
 
-    async def mark_youtube_music_not_found(self, album_id: int) -> None:
+    async def mark_youtube_music_not_found(self, album_id: int) -> bool:
         """Durably record a YTM drain attempt that found no match -- fill-only guarded.
 
         Mirrors mark_bandcamp_not_found (#661) but adds `AND youtube_music_url IS NULL`
         so a transient miss can never downgrade a row already resolved to 'found'
         (Data Safety; the #669 fill-only invariant). Leaves youtube_music_url NULL.
+
+        Returns ``True`` if the row was marked ``not_found``, ``False`` if it was
+        a no-op (already resolved) -- lets callers (the #1070 drain's
+        ``execute_write``) distinguish a genuine miss from a moot one instead of
+        overcounting a not_found tally when the guard silently blocks the write.
         """
         assert self._db is not None
         async with self._write_lock:
             now = datetime.now(UTC).isoformat()
-            await self._db.execute(
+            cursor = await self._db.execute(
                 "UPDATE albums SET youtube_music_status = 'not_found', "
                 "youtube_music_checked_at = ? WHERE id = ? AND youtube_music_url IS NULL",
                 (now, album_id),
             )
             await self._db.commit()
+            return cursor.rowcount > 0
 
     async def update_youtube_music_url(self, album_id: int, url: str) -> bool:
         """Fill in a verified YouTube Music album URL -- **fill-only**.
