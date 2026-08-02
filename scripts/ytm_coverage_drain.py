@@ -152,8 +152,14 @@ async def load_candidates_from_db(db: ResultsDB, limit: int) -> list[Candidate]:
     is resumable for free -- a re-run only ever sees the untried backlog. Each
     row's own ``id`` is carried as ``Candidate.album_id`` so the write path can
     target it directly, with no ``(artist, title)`` names-join. ``db`` must
-    already be connected; rows with a blank display artist or title are
-    skipped, mirroring :func:`load_candidates_from_rows`.
+    already be connected.
+
+    A row with a blank display artist or title can never be meaningfully
+    searched, so unlike :func:`load_candidates_from_rows` (whose CSV/one-shot
+    callers can just drop it), it is marked ``not_found`` here rather than
+    silently skipped: ``get_pending`` has no ``ORDER BY``/``OFFSET``, so a row
+    left ``pending`` would reappear in this exact page on every future call and
+    could stall pagination for real candidates behind it.
     """
     rows = await db.get_pending("youtube_music", limit=limit)
     out: list[Candidate] = []
@@ -161,6 +167,12 @@ async def load_candidates_from_db(db: ResultsDB, limit: int) -> list[Candidate]:
         artist = str(row["display_artist"] or "").strip()
         title = str(row["display_title"] or "").strip()
         if not artist or not title:
+            log.warning(
+                "albums row %s has a blank display artist/title; marking "
+                "not_found instead of leaving it pending forever",
+                row["id"],
+            )
+            await db.mark_youtube_music_not_found(row["id"])
             continue
         out.append(Candidate(artist=artist, title=title, album_id=row["id"]))
     return out
@@ -223,6 +235,7 @@ async def execute_write(
     outcomes: Sequence[DrainOutcome],
     *,
     db_path: str = DEFAULT_RESULTS_DB_PATH,
+    db: ResultsDB | None = None,
 ) -> dict[str, int]:
     """Fill-only-persist every drain outcome -- matches and misses -- (#1070).
 
@@ -240,23 +253,36 @@ async def execute_write(
 
     For a **miss**: if the candidate carries an ``album_id``, durably mark
     ``not_found`` (fill-only guarded) so a re-run's pending-scan skips it --
-    the resumability this drain exists for (#1070). A CSV-path miss has no
-    ``album_id`` and no row to mark, so it's skipped silently (expected).
+    the resumability this drain exists for (#1070). If the row was actually
+    resolved out-of-band since the pending-scan read, the guard no-ops and the
+    miss is tallied ``already_present`` instead, so a moot miss never inflates
+    ``not_found``. A CSV-path miss has no ``album_id`` and no row to mark, so
+    it's skipped silently (expected).
+
+    ``db``: an already-connected :class:`ResultsDB` to reuse instead of opening
+    a new one against ``db_path``. The ``--from-db`` CLI path passes the same
+    connection its pending-scan already opened, avoiding a second
+    connect/migrate round-trip against the same SQLite file. When omitted (the
+    default, and every pre-#1070 caller), a connection is opened here and
+    closed on return, as before -- a caller-supplied ``db`` is never closed by
+    this function, since it doesn't own it.
 
     Returns a tally ``{written, already_present, unmatched, not_found}``.
     Default is dry-run: this runs only under the explicit ``--execute``
     opt-in, off-peak, one bulk consumer at a time.
     """
     tally = {"written": 0, "already_present": 0, "unmatched": 0, "not_found": 0}
-    db = ResultsDB(db_path)
-    await db.connect()
+    owns_connection = db is None
+    if db is None:
+        db = ResultsDB(db_path)
+        await db.connect()
     try:
         for outcome in outcomes:
             candidate = outcome.candidate
             if outcome.match is None:
                 if candidate.album_id is not None:
-                    await db.mark_youtube_music_not_found(candidate.album_id)
-                    tally["not_found"] += 1
+                    marked = await db.mark_youtube_music_not_found(candidate.album_id)
+                    tally["not_found" if marked else "already_present"] += 1
                 continue
             album_id = candidate.album_id
             if album_id is None:
@@ -272,57 +298,63 @@ async def execute_write(
             wrote = await db.update_youtube_music_url(album_id, outcome.match.url)
             tally["written" if wrote else "already_present"] += 1
     finally:
-        await db.close()
+        if owns_connection:
+            await db.close()
     return tally
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
-    if args.from_db:
-        db = ResultsDB(args.results_db)
-        await db.connect()
-        try:
+    # In --from-db mode, this connection stays open across the load and (if
+    # --execute) the write, so execute_write reuses it instead of paying a
+    # second connect/migrate round-trip against the same SQLite file (#1070).
+    db: ResultsDB | None = None
+    try:
+        if args.from_db:
+            db = ResultsDB(args.results_db)
+            await db.connect()
             candidates = await load_candidates_from_db(db, args.limit)
-        finally:
-            await db.close()
-    else:
-        candidates = load_candidates_from_csv(args.sample_csv)
-        if args.limit:
-            candidates = candidates[: args.limit]
-    log.info(
-        "resolving %d candidates against YouTube Music (concurrency=%d, rate=%.1f/s)",
-        len(candidates),
-        args.concurrency,
-        args.rate,
-    )
-    client = YouTubeMusicClient(rate_limit=(args.rate, 1), limit=args.search_limit)
-    outcomes = await resolve_candidates(client, candidates, concurrency=args.concurrency)
-    report = summarize(outcomes, sample_size=args.sample_size)
-    log.info(
-        "resolved %d/%d (%.1f%%)",
-        report["resolved"],
-        report["candidates"],
-        100 * report["hit_rate"],
-    )
-    if args.execute:
-        # Opt-in, fill-only persistence of every outcome -- found and missed
-        # alike (#1070 resumability). Default path is dry-run and writes nothing.
-        tally = await execute_write(outcomes, db_path=args.results_db)
-        report["write"] = tally
+        else:
+            candidates = load_candidates_from_csv(args.sample_csv)
+            if args.limit:
+                candidates = candidates[: args.limit]
         log.info(
-            "persisted YTM outcomes: %d written, %d already present, %d unmatched, "
-            "%d not_found (db=%s)",
-            tally["written"],
-            tally["already_present"],
-            tally["unmatched"],
-            tally["not_found"],
-            args.results_db,
+            "resolving %d candidates against YouTube Music (concurrency=%d, rate=%.1f/s)",
+            len(candidates),
+            args.concurrency,
+            args.rate,
         )
-    print(json.dumps(report, indent=2, ensure_ascii=False))
-    if args.report_json:
-        with open(args.report_json, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-        log.info("wrote report to %s", args.report_json)
-    return report
+        client = YouTubeMusicClient(rate_limit=(args.rate, 1), limit=args.search_limit)
+        outcomes = await resolve_candidates(client, candidates, concurrency=args.concurrency)
+        report = summarize(outcomes, sample_size=args.sample_size)
+        log.info(
+            "resolved %d/%d (%.1f%%)",
+            report["resolved"],
+            report["candidates"],
+            100 * report["hit_rate"],
+        )
+        if args.execute:
+            # Opt-in, fill-only persistence of every outcome -- found and missed
+            # alike (#1070 resumability). Default path is dry-run and writes nothing.
+            tally = await execute_write(outcomes, db_path=args.results_db, db=db)
+            report["write"] = tally
+            log.info(
+                "persisted YTM outcomes: %d written, %d already present, %d unmatched, "
+                "%d not_found (db=%s)",
+                tally["written"],
+                tally["already_present"],
+                tally["unmatched"],
+                tally["not_found"],
+                args.results_db,
+            )
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        if args.report_json:
+            with open(args.report_json, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
+            log.info("wrote report to %s", args.report_json)
+        return report
+    finally:
+        if db is not None:
+            await db.close()
 
 
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
