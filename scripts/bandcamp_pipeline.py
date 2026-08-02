@@ -349,6 +349,12 @@ async def phase_album_search(
         - ``BandcampSearchUnavailableError`` (transient HTTP failure after
           retries) -> no write, tallied ``fetch_failed``; the row stays
           ``pending``/re-runnable (#661 posture).
+        - Any OTHER exception raised while searching or verifying a row
+          (e.g. a malformed autocomplete response the shared matcher can't
+          score) is logged and tallied ``fetch_failed`` the same way --
+          one bad row must never abort the rest of a multi-thousand-row
+          unattended drain, mirroring ``phase_search``'s
+          ``process_batched(..., return_exceptions=True)`` posture.
 
     Returns a dict of tallies (``hits``, ``misses``, ``skipped``,
     ``verify_failed``, ``fetch_failed``) plus ``would_write``: the list of
@@ -373,6 +379,13 @@ async def phase_album_search(
         except BandcampSearchUnavailableError:
             tallies["fetch_failed"] += 1
             continue
+        except Exception:
+            log.exception(
+                f"Unexpected error in album-search for {artist!r} / {title!r} "
+                f"(row {row['id']}) -- treating as a transient failure, row stays re-runnable"
+            )
+            tallies["fetch_failed"] += 1
+            continue
 
         if match is None:
             if row["bandcamp_status"] == "pending":
@@ -383,7 +396,14 @@ async def phase_album_search(
                 tallies["skipped"] += 1
             continue
 
-        if verify_hits and not await client.verify_album_page(match.url, artist, title):
+        verified = True
+        if verify_hits:
+            try:
+                verified = await client.verify_album_page(match.url, artist, title)
+            except Exception:
+                log.exception(f"Unexpected error verifying album-search hit for row {row['id']}")
+                verified = False
+        if not verified:
             tallies["verify_failed"] += 1
             continue
 

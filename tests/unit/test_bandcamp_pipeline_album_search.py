@@ -181,6 +181,52 @@ class TestPhaseAlbumSearchFetchFailure:
         assert rows[0]["bandcamp_status"] == "pending"
         assert rows[0]["bandcamp_url"] is None
 
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_from_search_does_not_abort_remaining_rows(self, db):
+        # A malformed autocomplete row (e.g. a non-string field triggering a
+        # TypeError deep in the shared matcher, or a JSONDecodeError from a
+        # truncated response) must degrade to a per-row fetch_failed, not
+        # crash the whole multi-thousand-row unattended drain (#661 posture,
+        # same principle phase_search already applies via process_batched).
+        from scripts.bandcamp_pipeline import phase_album_search
+
+        await db.insert_albums(
+            [
+                _make_album(),
+                _make_album(
+                    normalized_artist="autechre",
+                    normalized_title="confield",
+                    display_artist="Autechre",
+                    display_title="Confield",
+                    library_ids=[3],
+                ),
+            ]
+        )
+        client = AsyncMock()
+        client.find_album_match_via_search = AsyncMock(side_effect=[TypeError("boom"), _MATCH])
+
+        report = await phase_album_search(client, db, execute=True, verify_hits=False)
+
+        assert report["fetch_failed"] == 1
+        assert report["hits"] == 1
+        assert client.find_album_match_via_search.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_from_verify_treated_as_verify_failed(self, db):
+        from scripts.bandcamp_pipeline import phase_album_search
+
+        await db.insert_albums([_make_album()])
+        client = AsyncMock()
+        client.find_album_match_via_search = AsyncMock(return_value=_MATCH)
+        client.verify_album_page = AsyncMock(side_effect=RuntimeError("boom"))
+
+        report = await phase_album_search(client, db, execute=True, verify_hits=True)
+
+        assert report["verify_failed"] == 1
+        assert report["hits"] == 0
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["bandcamp_url"] is None
+
 
 class TestPhaseAlbumSearchSelectorScoping:
     @pytest.mark.asyncio
