@@ -75,7 +75,10 @@ _QUERY_VINYL_SIZE_RE = re.compile(r"\s+\d{1,2}[\"”]\s*$")
 # Babalon's "044 (Hilf Dir Selbst!)") -- no pattern was found that's safe
 # against legitimate numeric-leading titles ("2112"); accepted as a measured
 # loss rather than risking a false-accept elsewhere.
-_NORMALIZE_BRACKET_TAG_RE = _QUERY_BRACKET_TAG_RE
+#
+# The bracket-tag strip reuses _QUERY_BRACKET_TAG_RE verbatim (same pattern,
+# same "trailing bracket is noise" reasoning) rather than a second compiled
+# copy -- see clean_title_for_query for that pattern's own definition.
 _NORMALIZE_YEAR_RANGE_RE = re.compile(r"\s*\(\d{4}-\d{2,4}\)\s*$")
 _NORMALIZE_SLASH_SPACING_RE = re.compile(r"\s*/\s*")
 
@@ -142,7 +145,7 @@ def normalize_bc_title(title: str) -> str:
     """
     if not title:
         return title
-    result = _NORMALIZE_BRACKET_TAG_RE.sub("", title)
+    result = _QUERY_BRACKET_TAG_RE.sub("", title)
     result = _NORMALIZE_YEAR_RANGE_RE.sub("", result)
     result = _NORMALIZE_SLASH_SPACING_RE.sub("/", result)
     return result.strip()
