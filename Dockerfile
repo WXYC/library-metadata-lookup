@@ -1,15 +1,3 @@
-FROM python:3.12-slim AS builder
-
-# Install Rust toolchain and build wxyc-etl wheel
-RUN apt-get update && apt-get install -y --no-install-recommends curl git gcc libc6-dev && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-    . "$HOME/.cargo/env" && \
-    pip install --no-cache-dir maturin && \
-    git clone --depth 1 https://github.com/WXYC/wxyc-etl.git /tmp/wxyc-etl && \
-    cd /tmp/wxyc-etl/wxyc-etl-python && \
-    maturin build --release && \
-    cp /tmp/wxyc-etl/target/wheels/*.whl /tmp/
-
 FROM python:3.12-slim
 
 # Create non-root user
@@ -17,11 +5,13 @@ RUN groupadd -r appuser && useradd -r -g appuser -s /sbin/nologin appuser
 
 WORKDIR /app
 
-# Install wxyc-etl wheel from builder stage
-COPY --from=builder /tmp/*.whl /tmp/
-RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl
-
-# Install dependencies
+# Install dependencies. wxyc-etl (like every other dependency) is pinned in
+# pyproject.toml (`wxyc-etl>=0.8.0,<0.9.0`) and ships prebuilt abi3 manylinux
+# wheels on PyPI, so `pip install .` pulls it with no build step. This is the
+# same resolution CI validates against. Do NOT reintroduce a source build of
+# wxyc-etl here: compiling it from git HEAD ignored the version pin (shipping
+# an untested version into the image) and paid a full Rust release compile on
+# every cold build. See WXYC/library-metadata-lookup#1077.
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir .
 
