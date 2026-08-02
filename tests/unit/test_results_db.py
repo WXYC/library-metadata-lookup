@@ -762,6 +762,66 @@ class TestYouTubeMusicFillOnlyWrite:
         assert stats["youtube_music"]["found"] == 1
 
 
+class TestYouTubeMusicNotFoundMarker:
+    """Resumable miss marker for the #1070 from-db drain (mirrors #661 bandcamp).
+
+    Unlike mark_bandcamp_not_found, this one is fill-only guarded (AND
+    youtube_music_url IS NULL) so a transient miss can never downgrade a row
+    already resolved to 'found' (Data Safety; the #669 fill-only invariant).
+    """
+
+    @pytest.mark.asyncio
+    async def test_mark_youtube_music_not_found_sets_status_and_timestamp(self, db):
+        await db.insert_albums([_make_album()])
+        album_id = (await db.get_pending("spotify", limit=10))[0]["id"]
+        await db.mark_youtube_music_not_found(album_id)
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["youtube_music_status"] == "not_found"
+        assert rows[0]["youtube_music_checked_at"] is not None
+        assert rows[0]["youtube_music_url"] is None
+
+    @pytest.mark.asyncio
+    async def test_mark_youtube_music_not_found_never_downgrades_found(self, db):
+        await db.insert_albums([_make_album()])
+        album_id = (await db.get_pending("spotify", limit=10))[0]["id"]
+        url = "https://music.youtube.com/browse/MPREb_stereolab"
+        await db.update_youtube_music_url(album_id, url)
+        await db.mark_youtube_music_not_found(album_id)
+        rows = await db.get_pending("spotify", limit=10)
+        assert rows[0]["youtube_music_status"] == "found"
+        assert rows[0]["youtube_music_url"] == url
+
+    @pytest.mark.asyncio
+    async def test_get_pending_youtube_music_excludes_found_and_attempted(self, db):
+        await db.insert_albums(
+            [
+                _make_album(),
+                _make_album(
+                    normalized_artist="autechre",
+                    normalized_title="confield",
+                    display_artist="Autechre",
+                    display_title="Confield",
+                    library_ids=[3],
+                ),
+                _make_album(
+                    normalized_artist="juana molina",
+                    normalized_title="doga",
+                    display_artist="Juana Molina",
+                    display_title="DOGA",
+                    library_ids=[4],
+                ),
+            ]
+        )
+        rows = await db.get_pending("spotify", limit=10)
+        by_artist = {r["display_artist"]: r["id"] for r in rows}
+        await db.update_youtube_music_url(
+            by_artist["Stereolab"], "https://music.youtube.com/browse/MPREb_stereolab"
+        )
+        await db.mark_youtube_music_not_found(by_artist["Autechre"])
+        pending = await db.get_pending("youtube_music", limit=10)
+        assert [r["display_artist"] for r in pending] == ["Juana Molina"]
+
+
 class TestGetAlbumIdByNames:
     """execute_write maps a resolved candidate to its albums row by normalized
     (artist, title) -- the exact key the dedup pipeline wrote (dedup.py) -- so

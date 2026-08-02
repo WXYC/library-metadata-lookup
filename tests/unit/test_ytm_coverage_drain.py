@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 
+import aiosqlite
 import pytest
 
 from clients.streaming.matching import normalize_album_title, normalize_artist_name
@@ -19,6 +20,7 @@ from scripts.ytm_coverage_drain import (
     DrainOutcome,
     execute_write,
     load_candidates_from_csv,
+    load_candidates_from_db,
     load_candidates_from_rows,
     resolve_candidates,
     summarize,
@@ -153,6 +155,60 @@ class TestLoaders:
         assert [c.artist for c in cands] == ["Sessa"]
 
 
+class TestLoadCandidatesFromDb:
+    """The #1070 from-db candidate source: a pending-scan over albums, resumable
+    for free because get_pending("youtube_music") excludes found + not_found rows.
+    """
+
+    async def _seed(self, db_path: str) -> dict[str, int]:
+        db = ResultsDB(db_path)
+        await db.connect()
+        try:
+            await db.insert_albums(
+                [
+                    DeduplicatedAlbum(
+                        normalized_artist=normalize_artist_name(artist),
+                        normalized_title=normalize_album_title(title),
+                        display_artist=artist,
+                        display_title=title,
+                        library_ids=[1],
+                        formats=["cd"],
+                    )
+                    for artist, title in [
+                        ("Stereolab", "Aluminum Tunes"),
+                        ("Autechre", "Confield"),
+                        ("Juana Molina", "DOGA"),
+                    ]
+                ]
+            )
+            rows = await db.get_pending("spotify", limit=10)
+            by_artist = {r["display_artist"]: r["id"] for r in rows}
+            await db.update_youtube_music_url(
+                by_artist["Stereolab"], "https://music.youtube.com/browse/MPREb_stereolab"
+            )
+            await db.mark_youtube_music_not_found(by_artist["Autechre"])
+            return by_artist
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_load_candidates_from_db_yields_only_pending_with_album_id(self, tmp_path):
+        db_path = str(tmp_path / "sa.db")
+        by_artist = await self._seed(db_path)
+
+        db = ResultsDB(db_path)
+        await db.connect()
+        try:
+            candidates = await load_candidates_from_db(db, limit=10)
+        finally:
+            await db.close()
+
+        assert len(candidates) == 1
+        assert candidates[0].artist == "Juana Molina"
+        assert candidates[0].title == "DOGA"
+        assert candidates[0].album_id == by_artist["Juana Molina"]
+
+
 class TestExecuteWritePersists:
     """execute_write fill-only-persists verified YTM links into the
     streaming_availability results DB -- Option A of the #1056 write-path fork.
@@ -188,6 +244,15 @@ class TestExecuteWritePersists:
         finally:
             await db.close()
 
+    async def _read_row(self, db_path: str) -> aiosqlite.Row:
+        db = ResultsDB(db_path)
+        await db.connect()
+        try:
+            rows = await db.get_all_results()
+            return rows[0]
+        finally:
+            await db.close()
+
     @pytest.mark.asyncio
     async def test_fills_matched_url_into_albums_row(self, tmp_path):
         db_path = str(tmp_path / "sa.db")
@@ -195,7 +260,7 @@ class TestExecuteWritePersists:
         url = "https://music.youtube.com/browse/MPREb_stereolab"
         outcome = DrainOutcome(Candidate("Stereolab", "Aluminum Tunes"), _match(url=url))
         tally = await execute_write([outcome], db_path=db_path)
-        assert tally == {"written": 1, "already_present": 0, "unmatched": 0}
+        assert tally == {"written": 1, "already_present": 0, "unmatched": 0, "not_found": 0}
         assert await self._read_url(db_path) == url
 
     @pytest.mark.asyncio
@@ -212,7 +277,7 @@ class TestExecuteWritePersists:
             [DrainOutcome(Candidate("Stereolab", "Aluminum Tunes"), _match(url=second))],
             db_path=db_path,
         )
-        assert tally == {"written": 0, "already_present": 1, "unmatched": 0}
+        assert tally == {"written": 0, "already_present": 1, "unmatched": 0, "not_found": 0}
         assert await self._read_url(db_path) == first  # original preserved
 
     @pytest.mark.asyncio
@@ -224,5 +289,102 @@ class TestExecuteWritePersists:
             _match(url="https://music.youtube.com/browse/MPREb_ghost"),
         )
         tally = await execute_write([outcome], db_path=db_path)
-        assert tally == {"written": 0, "already_present": 0, "unmatched": 1}
+        assert tally == {"written": 0, "already_present": 0, "unmatched": 1, "not_found": 0}
         assert await self._read_url(db_path) is None
+
+    @pytest.mark.asyncio
+    async def test_execute_write_marks_miss_as_not_found_when_album_id_present(self, tmp_path):
+        db_path = str(tmp_path / "sa.db")
+        await self._seed_album(db_path, "Stereolab", "Aluminum Tunes")
+        row = await self._read_row(db_path)
+        outcome = DrainOutcome(
+            Candidate("Stereolab", "Aluminum Tunes", album_id=row["id"]), match=None
+        )
+        tally = await execute_write([outcome], db_path=db_path)
+        assert tally == {"written": 0, "already_present": 0, "unmatched": 0, "not_found": 1}
+        row = await self._read_row(db_path)
+        assert row["youtube_music_status"] == "not_found"
+        assert row["youtube_music_url"] is None
+
+    @pytest.mark.asyncio
+    async def test_execute_write_miss_without_album_id_is_skipped(self, tmp_path):
+        db_path = str(tmp_path / "sa.db")
+        await self._seed_album(db_path, "Stereolab", "Aluminum Tunes")
+        outcome = DrainOutcome(Candidate("Stereolab", "Aluminum Tunes"), match=None)
+        tally = await execute_write([outcome], db_path=db_path)
+        assert tally == {"written": 0, "already_present": 0, "unmatched": 0, "not_found": 0}
+        row = await self._read_row(db_path)
+        assert row["youtube_music_status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_execute_write_writes_found_by_album_id_without_names_join(self, tmp_path):
+        db_path = str(tmp_path / "sa.db")
+        await self._seed_album(db_path, "Stereolab", "Aluminum Tunes")
+        row = await self._read_row(db_path)
+        url = "https://music.youtube.com/browse/MPREb_stereolab"
+        # Names deliberately wouldn't resolve via get_album_id_by_names -- the
+        # album_id write path must not need the names-join at all.
+        outcome = DrainOutcome(
+            Candidate("Nonmatching Artist", "Nonmatching Title", album_id=row["id"]),
+            _match(url=url),
+        )
+        tally = await execute_write([outcome], db_path=db_path)
+        assert tally == {"written": 1, "already_present": 0, "unmatched": 0, "not_found": 0}
+        assert await self._read_url(db_path) == url
+
+
+class TestRerunResumability:
+    """AC #3: a re-run over an overlapping candidate set re-searches ~0 already-
+    attempted albums. This is the entire point of the #1070 from-db drain --
+    the rate-limited YTM endpoint must never be re-hit for a prior miss.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rerun_over_overlapping_set_researches_zero_attempted(self, tmp_path):
+        db_path = str(tmp_path / "sa.db")
+        seed_db = ResultsDB(db_path)
+        await seed_db.connect()
+        try:
+            await seed_db.insert_albums(
+                [
+                    DeduplicatedAlbum(
+                        normalized_artist=normalize_artist_name(artist),
+                        normalized_title=normalize_album_title(title),
+                        display_artist=artist,
+                        display_title=title,
+                        library_ids=[1],
+                        formats=["cd"],
+                    )
+                    for artist, title in [
+                        ("Stereolab", "Aluminum Tunes"),
+                        ("Juana Molina", "DOGA"),
+                        ("So Kalmery", "Obscure LP"),
+                    ]
+                ]
+            )
+        finally:
+            await seed_db.close()
+
+        client = _FakeClient({("Stereolab", "Aluminum Tunes"): _match()})
+
+        # First run: --from-db, --execute. Marks one found, two not_found.
+        run1_db = ResultsDB(db_path)
+        await run1_db.connect()
+        try:
+            candidates = await load_candidates_from_db(run1_db, limit=10)
+        finally:
+            await run1_db.close()
+        assert len(candidates) == 3
+        outcomes = await resolve_candidates(client, candidates, concurrency=2)
+        assert len(client.calls) == 3
+        tally = await execute_write(outcomes, db_path=db_path)
+        assert tally == {"written": 1, "already_present": 0, "unmatched": 0, "not_found": 2}
+
+        # Re-run over the same (overlapping) set: 0 new candidates, 0 new searches.
+        rerun_db = ResultsDB(db_path)
+        await rerun_db.connect()
+        try:
+            rerun_candidates = await load_candidates_from_db(rerun_db, limit=10)
+        finally:
+            await rerun_db.close()
+        assert rerun_candidates == []

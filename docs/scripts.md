@@ -350,19 +350,27 @@ The emitted `apple_urls.tsv` is applied back via the Backend-Service fill-only w
 
 ## YouTube Music Coverage Drain (`scripts/ytm_coverage_drain.py`)
 
-Resolves verified `music.youtube.com/browse/<browseId>` album links for a set of canonical `(artist, title)` candidates (epic [LML#830](https://github.com/WXYC/library-metadata-lookup/issues/830), impl [LML#1056](https://github.com/WXYC/library-metadata-lookup/issues/1056); GO from the [#833](https://github.com/WXYC/library-metadata-lookup/issues/833) spike). Uses `YouTubeMusicClient` (`clients/streaming/youtube_music.py`) — unauthenticated `ytmusicapi` album search, scored through the shared production matcher (`find_best_source_match`, 80/80 floor). Per-candidate exceptions are isolated (a malformed search becomes a miss, never aborts the run).
+Resolves verified `music.youtube.com/browse/<browseId>` album links for a set of canonical `(artist, title)` candidates (epic [LML#830](https://github.com/WXYC/library-metadata-lookup/issues/830), impl [LML#1056](https://github.com/WXYC/library-metadata-lookup/issues/1056), productionized [LML#1070](https://github.com/WXYC/library-metadata-lookup/issues/1070); GO from the [#833](https://github.com/WXYC/library-metadata-lookup/issues/833) spike). Uses `YouTubeMusicClient` (`clients/streaming/youtube_music.py`) — unauthenticated `ytmusicapi` album search, scored through the shared production matcher (`find_best_source_match`, 80/80 floor). Per-candidate exceptions are isolated (a malformed search becomes a miss, never aborts the run).
 
-**Write path — Option A.** Persistence is fill-only into `streaming_availability.db` (`ResultsDB.update_youtube_music_url`, `WHERE youtube_music_url IS NULL`). The rest of the chain already exists: `scripts/export_streaming_links.py` carries `albums.youtube_music_url` into `library.db.streaming_links` and `/lookup` surfaces it — this drain is the producer. Each match maps back to its `albums` row by normalized `(artist, title)` (`get_album_id_by_names`, same normalizer as the dedup pipeline), so there is no drift; unmatched candidates are tallied and skipped, never wrong-written.
+**Candidate source (DECIDED, #1070).** Exactly one of `--from-db` / `--sample-csv` is required. `--from-db` is the production source: a pending-scan over `streaming_availability.db.albums` (`ResultsDB.get_pending("youtube_music", limit)`), which already excludes both resolved (`found`) and previously-attempted (`not_found`) rows — the drain is **resumable for free**. Because `albums` already holds the canonical `(artist, title)`, the row's own `id` is carried as the write target, eliminating the names-join entirely on this path. `--sample-csv` remains the credential-free dry-run/sample harness; wiring `entity.release_identity` → discogs-cache as a candidate source was considered and rejected (same-or-narrower universe, needs prod credentials + a human go-ahead mid-run).
+
+**Write path — Option A.** Persistence is fill-only into `streaming_availability.db`: `ResultsDB.update_youtube_music_url` (`WHERE youtube_music_url IS NULL`) for matches, and `ResultsDB.mark_youtube_music_not_found` (same guard) for misses — so a re-run never re-searches an already-attempted candidate and never downgrades a resolved row. The rest of the chain already exists: `scripts/export_streaming_links.py` carries `albums.youtube_music_url` into `library.db.streaming_links` and `/lookup` surfaces it — this drain is the producer. On `--from-db`, each outcome writes by the candidate's own `album_id` (no names-join); on `--sample-csv`, a match maps to its `albums` row by normalized `(artist, title)` (`get_album_id_by_names`) and an unmatched candidate is tallied and skipped, never wrong-written — a `--sample-csv` miss has no `album_id` and so is skipped (not markable).
 
 `ytmusicapi` is the optional `drain` extra (not a runtime dep; lazy import) — run under `--extra drain`. `--execute` is opt-in; the default is dry-run (writes nothing). Persisting is the operator's action (off-peak, fill-only, one bulk consumer at a time), followed by a `POST /admin/upload-streaming-db` republish.
 
 ```bash
-# dry-run: resolve + coverage report (count, hit rate, sample matches/misses)
+# production dry-run: pending-scan + coverage report, write nothing
+uv run --extra drain python -m scripts.ytm_coverage_drain \
+  --from-db --limit 200 --results-db streaming_availability.db
+
+# production persist (opt-in, fill-only, resumable pagination): --limit is the
+# get_pending page size; each --execute run marks found + not_found and shrinks
+# the next run's pending set, so repeated invocations walk the whole backlog
+uv run --extra drain python -m scripts.ytm_coverage_drain \
+  --from-db --limit 200 --execute --results-db streaming_availability.db
+
+# sample dry-run (credential-free, local CSV)
 uv run --extra drain python -m scripts.ytm_coverage_drain \
   --sample-csv resolved_names.csv --limit 200 --concurrency 4 \
   --report-json /tmp/ytm_drain_report.json
-
-# persist (opt-in, fill-only) into the streaming_availability store
-uv run --extra drain python -m scripts.ytm_coverage_drain \
-  --sample-csv resolved_names.csv --execute --results-db streaming_availability.db
 ```
