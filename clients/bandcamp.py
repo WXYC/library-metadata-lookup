@@ -24,7 +24,11 @@ import re
 import httpx
 
 from clients.streaming.base import BaseStreamingClient
-from clients.streaming.matching import find_best_source_match, score_match
+from clients.streaming.matching import (
+    find_best_source_match,
+    is_acceptable_match,
+    score_match,
+)
 from discogs.admission import retry_429
 from streaming.models import SourceMatch
 
@@ -42,6 +46,117 @@ _ALBUM_WITH_TITLE_RE = re.compile(
 
 # Fallback: just <a href="/album/...">
 _ALBUM_HREF_RE = re.compile(r'href="(/album/[^"]+)"')
+
+# LML#1069: the autocomplete API's ``url`` field comes back doubled --
+# "https://x.bandcamp.comhttps://x.bandcamp.com/album/y" -- keep the LAST
+# "https://..." segment. Passes an already-clean URL through unchanged (no
+# earlier "https://" occurrence to jump past), so this keeps working
+# transparently if Bandcamp ever fixes the quirk.
+_HTTPS_PREFIX = "https://"
+
+# Query-side format junk a DJ never types but the library carries verbatim:
+# trailing vinyl-size markers (12", 7", 10"), trailing bracketed tags
+# ([missing], [EP]), and a trailing "(studio)" qualifier. Conservative and
+# query-only -- scoring still sees the raw title (clients/bandcamp.py's
+# ``find_album_match_via_search``), so over-stripping here costs recall, not
+# precision.
+_QUERY_BRACKET_TAG_RE = re.compile(r"\s*\[[^\]]*\]\s*$")
+_QUERY_STUDIO_SUFFIX_RE = re.compile(r"\s*\(studio\)\s*$", re.IGNORECASE)
+_QUERY_VINYL_SIZE_RE = re.compile(r"\s+\d{1,2}[\"”]\s*$")
+
+# Recall-recovery normalization (LML#1069 near-miss corpus) applied to BOTH
+# the query title and each candidate's title as a SECOND acceptance pass --
+# never widens the floor itself, just reconciles structural noise Bandcamp's
+# own listings carry that a DJ's library entry doesn't.
+#   - trailing bracketed catalog tag ("Ghost Dance [KLP186]") -- Pine Hill Haints
+#   - trailing year-range parenthetical ("As / If / When (1978-83)") -- Z'ev
+#   - slash spacing ("Sunset / Sunrise" <-> "Sunset/Sunrise") -- The Dutchess & The Duke
+# Deliberately does NOT attempt a leading-catalog-number strip (Christoph De
+# Babalon's "044 (Hilf Dir Selbst!)") -- no pattern was found that's safe
+# against legitimate numeric-leading titles ("2112"); accepted as a measured
+# loss rather than risking a false-accept elsewhere.
+_NORMALIZE_BRACKET_TAG_RE = _QUERY_BRACKET_TAG_RE
+_NORMALIZE_YEAR_RANGE_RE = re.compile(r"\s*\(\d{4}-\d{2,4}\)\s*$")
+_NORMALIZE_SLASH_SPACING_RE = re.compile(r"\s*/\s*")
+
+# Bandcamp album-page ``og:title`` meta content: "Title, by Artist".
+_OG_TITLE_RE = re.compile(r'<meta property="og:title" content="([^"]+)"')
+_OG_TITLE_SPLIT_RE = re.compile(r"^(.*), by (.+)$")
+
+
+class BandcampSearchUnavailableError(Exception):
+    """Raised by ``find_album_match_via_search`` when the album-autocomplete
+    request failed after retries (network error, non-200, or exhausted 429
+    backoff) -- as opposed to a request that succeeded but found no
+    floor-clearing match.
+
+    The distinction matters to the offline album-search drain
+    (scripts/bandcamp_pipeline.py): a transient blip must not be durably
+    recorded as ``not_found`` (#661), so the drain catches this and leaves
+    the row ``pending``/re-runnable rather than writing. The PR2 runtime
+    probe fallback has no such persistence concern and is expected to catch
+    this and degrade to "no match" like any other adapter failure.
+    """
+
+
+def fix_autocomplete_url(url: str) -> str:
+    """De-double the Bandcamp autocomplete API's ``url`` field.
+
+    >>> fix_autocomplete_url(
+    ...     "https://x.bandcamp.comhttps://x.bandcamp.com/album/y"
+    ... )
+    'https://x.bandcamp.com/album/y'
+    >>> fix_autocomplete_url("https://x.bandcamp.com/album/y")
+    'https://x.bandcamp.com/album/y'
+    """
+    idx = url.rfind(_HTTPS_PREFIX)
+    return url[idx:] if idx > 0 else url
+
+
+def clean_title_for_query(title: str) -> str:
+    """Strip library format-suffix junk from a title for the autocomplete
+    QUERY STRING only -- scoring still compares against the raw title.
+
+    Handles the shapes seen in the LML#1069 measurement: trailing vinyl-size
+    markers (``12"``), trailing bracketed tags (``[missing]``), and a
+    trailing ``(studio)`` qualifier. Conservative: when in doubt, leaves the
+    token in, since a slightly noisier query only costs recall while the
+    80/80 floor still guards precision.
+    """
+    if not title:
+        return title
+    result = _QUERY_BRACKET_TAG_RE.sub("", title)
+    result = _QUERY_STUDIO_SUFFIX_RE.sub("", result)
+    result = _QUERY_VINYL_SIZE_RE.sub("", result)
+    return result.strip()
+
+
+def normalize_bc_title(title: str) -> str:
+    """Recall-recovery normalization for the LML#1069 near-miss corpus.
+
+    Applied to both sides (query title and candidate title) as a SECOND
+    acceptance pass in ``find_album_match_via_search`` -- only consulted
+    when the raw-field pass misses. See the near-miss corpus in
+    ``plans/lml-1069-bandcamp-album-first.md`` for the TRUE/FALSE rows this
+    is parameterized against.
+    """
+    if not title:
+        return title
+    result = _NORMALIZE_BRACKET_TAG_RE.sub("", title)
+    result = _NORMALIZE_YEAR_RANGE_RE.sub("", result)
+    result = _NORMALIZE_SLASH_SPACING_RE.sub("/", result)
+    return result.strip()
+
+
+def parse_og_title(og_title: str) -> tuple[str, str] | None:
+    """Split a Bandcamp album page's ``og:title`` content ("Title, by Artist")
+    into ``(title, artist)``. Returns ``None`` if the content doesn't match
+    that shape.
+    """
+    match = _OG_TITLE_SPLIT_RE.match(og_title)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
 
 
 def extract_slug(url: str | None) -> str | None:
@@ -255,3 +370,117 @@ class BandcampClient(BaseStreamingClient):
                 )
 
         return albums
+
+    async def search_albums(self, query: str) -> list[dict] | None:
+        """Search Bandcamp autocomplete for album-type results (LML#1069).
+
+        Unlike ``search_artist`` (which collapses any fetch failure to
+        ``[]``, fine for its no-persistence live-only caller), this
+        distinguishes a transient fetch failure (``None`` -- network error,
+        non-200, or exhausted 429 backoff) from a genuine empty result set
+        (``[]``), mirroring ``fetch_artist_catalog``'s None/[] split (#661).
+        The offline album-search drain needs that distinction to avoid
+        durably recording a blip as ``not_found``.
+
+        Returns a list of dicts with keys ``artist``, ``title``, ``url``
+        (de-doubled via ``fix_autocomplete_url``) on success, or ``None`` on
+        fetch failure.
+        """
+        resp = await self._request_with_retry(
+            "GET",
+            AUTOCOMPLETE_URL,
+            params={"q": query, "param": "a"},
+            timeout=10.0,
+        )
+        if resp is None or resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        results = []
+        for item in data.get("results", []):
+            if item.get("type") != "a":
+                continue
+            results.append(
+                {
+                    "artist": item.get("band_name", ""),
+                    "title": item.get("name", ""),
+                    "url": fix_autocomplete_url(item.get("url", "")),
+                }
+            )
+        return results
+
+    async def find_album_match_via_search(self, artist: str, title: str) -> SourceMatch | None:
+        """Album-first Bandcamp discovery (LML#1069): search the general
+        Bandcamp index for ``artist title`` and bind by the returned
+        ``band_name``, rather than requiring the artist's own catalog page
+        to carry the album. Recovers label/imprint-hosted releases (and
+        heals artist-first false negatives) that ``find_album_match`` can
+        never see, since that path only ever looks at the matched artist's
+        own subdomain catalog.
+
+        Exactly one autocomplete request. Runs the shared 80/80-floor
+        matcher (``find_best_source_match``) up to twice against that SAME
+        result set: once on raw fields, and -- only if that misses -- once
+        more with ``normalize_bc_title`` applied to both sides' titles,
+        accepting the first pass that clears the floor (see
+        ``normalize_bc_title`` for the near-miss corpus this recovers).
+
+        Raises:
+            BandcampSearchUnavailableError: the autocomplete request failed
+                after retries (see ``search_albums``). Offline callers
+                should catch this to avoid a durable not_found write on a
+                transient blip; the live runtime path (PR2) is expected to
+                catch it and degrade to "no match" like any other adapter
+                failure.
+        """
+        query = f"{artist} {clean_title_for_query(title)}".strip()
+        results = await self.search_albums(query)
+        if results is None:
+            raise BandcampSearchUnavailableError(query)
+        if not results:
+            return None
+
+        match = find_best_source_match(
+            results,
+            artist,
+            title,
+            artist_fn=lambda r: r["artist"],
+            title_fn=lambda r: r["title"],
+            url_fn=lambda r: r["url"],
+            service="bandcamp",
+        )
+        if match is not None:
+            return match
+
+        normalized_title = normalize_bc_title(title)
+        return find_best_source_match(
+            results,
+            artist,
+            normalized_title,
+            artist_fn=lambda r: r["artist"],
+            title_fn=lambda r: normalize_bc_title(r["title"]),
+            url_fn=lambda r: r["url"],
+            service="bandcamp",
+        )
+
+    async def verify_album_page(self, url: str, artist: str, title: str) -> bool:
+        """Fetch a matched album page and confirm its ``og:title`` clears the
+        80/80 floor against the requested ``(artist, title)``.
+
+        The album-search drain's insurance against persisting a wrong direct
+        link (worse than no link at all, per the LML#1069 plan's house rule)
+        before a write. Conservative: any fetch or parse failure returns
+        ``False`` -- an unverifiable hit is not written.
+        """
+        resp = await self._request_with_retry("GET", url, timeout=15.0, follow_redirects=True)
+        if resp is None or resp.status_code != 200:
+            return False
+        resp.encoding = "utf-8"
+        match = _OG_TITLE_RE.search(resp.text)
+        if not match:
+            return False
+        parsed = parse_og_title(match.group(1))
+        if parsed is None:
+            return False
+        page_title, page_artist = parsed
+        return is_acceptable_match(score_match(artist, page_artist), score_match(title, page_title))

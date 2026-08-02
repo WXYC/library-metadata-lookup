@@ -486,6 +486,38 @@ class ResultsDB:
         cursor = await self._db.execute(query, params)
         return list(await cursor.fetchall())
 
+    async def get_pending_album_search(
+        self, *, include_not_found: bool = False, limit: int | None = None
+    ) -> list[aiosqlite.Row]:
+        """Get candidates for album-first Bandcamp discovery (LML#1069).
+
+        Targets rows the existing artist-first Phase 2 backlog
+        (``get_pending_bandcamp_lookup``) does not own: no ``bandcamp_url``,
+        not a compilation, and either never searched (``bandcamp_slug IS
+        NULL``) or artist-searched-with-no-band-found (the ``''`` sentinel
+        slug). A row with a *real* recorded slug stays Phase-2's -- album-
+        search must not mark it ``not_found`` and pre-empt a pending catalog
+        scrape.
+
+        Args:
+            include_not_found: when True, also include rows already marked
+                ``bandcamp_status = 'not_found'`` (previously exhausted by
+                the artist-first path only). Default restricts to
+                ``pending`` -- a real-slug row stays excluded either way.
+            limit: maximum rows to return.
+        """
+        assert self._db is not None
+        statuses = "('pending', 'not_found')" if include_not_found else "('pending')"
+        query = (
+            "SELECT * FROM albums WHERE bandcamp_url IS NULL AND is_compilation = 0 "
+            f"AND bandcamp_status IN {statuses} "  # noqa: S608
+            "AND (bandcamp_slug IS NULL OR bandcamp_slug = '')"
+        )
+        if limit is not None:
+            query += f" LIMIT {limit}"
+        cursor = await self._db.execute(query)
+        return list(await cursor.fetchall())
+
     async def get_all_results(self) -> list[aiosqlite.Row]:
         """Get all albums ordered by artist and title."""
         assert self._db is not None

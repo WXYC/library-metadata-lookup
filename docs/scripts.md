@@ -91,6 +91,27 @@ Options: `--phase` (default: both, runs concurrently), `--include-streaming` (se
 
 Uses `BandcampClient` (`clients/bandcamp.py`) extending `BaseStreamingClient` (`clients/streaming/base.py`) with rate limiting (1 req/s, semaphore 2) and 429 retry with exponential backoff. Optionally loads Wikidata slugs via `DATABASE_URL_WIKIDATA`.
 
+### Phase album-search: album-first discovery (LML#1069)
+
+Phases 1/2 above are **artist-first**: they only ever find an album if it lives on the matched artist's own `*.bandcamp.com` subdomain catalog. `--phase album-search` is **album-first** instead — it searches the general Bandcamp autocomplete index (`param="a"`, album-type results) for `artist title` and binds by the returned `band_name`, so it also recovers releases hosted on a label/imprint/reissue subdomain that the artist's own page never carries (the measurement's golden repro: George Theodorakis's *The Rules of the Game* lives on `into-the-light.bandcamp.com`, not the artist's own `georgerakis.bandcamp.com`).
+
+The shared method both this phase and the runtime probe (`BandcampClient.find_album_match`, LML#573 tier) call is `find_album_match_via_search(artist, title)` — exactly one autocomplete request, matched via the same 80/80-floor `find_best_source_match` used by every other adapter (LML#592 telemetry included). It runs the floor check twice at most against that single result set: once on raw fields, and — only if that misses — once more with `normalize_bc_title` applied to both sides' titles (recovers catalog-tag/year-range/slash-spacing near-misses; see `clients/bandcamp.py` for the corpus this is parameterized against). `search_albums` distinguishes a transient fetch failure (`None` — network error, non-200, exhausted 429 backoff) from a genuine empty result set (`[]`), mirroring `fetch_artist_catalog`'s None/`[]` split (#661); `find_album_match_via_search` raises `BandcampSearchUnavailableError` on the former so this phase can avoid a durable `not_found` write on a blip.
+
+**Candidates** come from `ResultsDB.get_pending_album_search()`: no `bandcamp_url`, non-compilation, `bandcamp_status = 'pending'` (or also `'not_found'` with `--include-not-found`), and `bandcamp_slug` is `NULL` or `''`. A row with a *real* recorded slug is always excluded — it's owned by the Phase 2 catalog backlog above, and album-search must not pre-empt a pending catalog scrape.
+
+**Writes are opt-in and fill-only**, the opposite default of Phases 1/2: without `--execute` the phase only resolves and tallies (a `--report-json` of would-be writes); nothing is persisted. A hit writes via `update_bandcamp_url`; a miss on a `pending` row writes `not_found` via `mark_bandcamp_not_found` (album-first is now the primary mechanism, so a miss here is durable — no future artist-first sweep is preserved for it); a miss on an already-`not_found` row is a no-op (tallied `skipped`, keeps re-runs idempotent); a `BandcampSearchUnavailableError` is tallied `fetch_failed` and leaves the row untouched/re-runnable.
+
+**Usage:**
+```bash
+# dry-run (default): resolve + tally, write nothing
+python -m scripts.bandcamp_pipeline --phase album-search --limit 500 --report-json /tmp/report.json
+
+# persist (opt-in, fill-only, with og:title verification before each write)
+python -m scripts.bandcamp_pipeline --phase album-search --execute --db-path streaming_availability.db
+```
+
+Flags (album-search only): `--include-not-found` (also target rows already marked `not_found`), `--execute` (persist writes; only valid with `--phase album-search`, and an argparse error combined with `--dry-run`), `--verify-hits` / `--no-verify-hits` (fetch the matched album page and require its `og:title` — `"Title, by Artist"` — to clear the same 80/80 floor before writing; defaults to matching `--execute`, i.e. on when executing, off in dry-run), `--report-json PATH` (write the tallies + would-be-written rows). `--dry-run` is accepted but a no-op for this phase (it's already dry by default); `--limit`/`--db-path` are shared with the legacy phases.
+
 ## Resolver Calibration (`scripts/resolver_calibration/`)
 
 Sweeps the trigram-similarity floor used by `lookup/artist_resolution.resolve_canonical_artist` (the pre-pass for `search_compilations_for_track` — see WXYC/library-metadata-lookup#318). Builds labeled datasets — positives from `artist_name_variation`, `entity.identity`, and (optionally) synthetic listener-typo corruptions; negatives from sampled close-but-distinct `artist` pairs — and writes a precision/recall sweep + a borderline-band CSV.
