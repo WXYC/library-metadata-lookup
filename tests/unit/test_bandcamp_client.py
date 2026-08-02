@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from clients.bandcamp import BandcampClient, extract_slug
+from clients.bandcamp import BandcampClient, BandcampSearchUnavailableError, extract_slug
+from streaming.models import SourceMatch
 
 
 def _autocomplete_response(results: list[dict]) -> httpx.Response:
@@ -309,10 +310,13 @@ class TestFetchArtistCatalog:
 
 
 class TestFindAlbumMatch:
-    """`find_album_match` runs Bandcamp's two-phase flow (autocomplete the
-    artist subdomain, then scrape the catalog) and returns a normalized
-    `SourceMatch` (LML#392). Both phases' response shapes stay encapsulated
-    here; the orchestrator never branches on the two-phase nature."""
+    """`find_album_match` runs Bandcamp's two-phase artist-first flow
+    (autocomplete the artist subdomain, then scrape the catalog) and, since
+    LML#1069 PR2, falls back to the shared album-first
+    `find_album_match_via_search` when that yields nothing — a label/
+    imprint-hosted release never has an own-artist catalog match to find.
+    Returns a normalized `SourceMatch` (LML#392); the orchestrator never
+    branches on either the two-phase nature or the fallback."""
 
     @pytest.mark.asyncio
     async def test_returns_source_match_when_artist_and_album_both_match(self):
@@ -330,23 +334,30 @@ class TestFindAlbumMatch:
                 }
             ]
         )
+        client.find_album_match_via_search = AsyncMock()
 
         match = await client.find_album_match("Stereolab", "Aluminum Tunes")
 
         assert match is not None
         assert match.url == "https://stereolab.bandcamp.com/album/aluminum-tunes"
         assert match.confidence >= 80.0
+        # Artist-first already found it -- no reason to burn a second,
+        # rate-limited autocomplete request on the album-search fallback.
+        client.find_album_match_via_search.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_artist_autocomplete_empty(self):
+    async def test_returns_none_when_artist_autocomplete_empty_and_fallback_finds_nothing(self):
         client = BandcampClient()
         client.search_artist = AsyncMock(return_value=[])
+        client.find_album_match_via_search = AsyncMock(return_value=None)
 
         match = await client.find_album_match("Unknown", "Whatever")
+
         assert match is None
+        client.find_album_match_via_search.assert_awaited_once_with("Unknown", "Whatever")
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_artist_match_below_floor(self):
+    async def test_returns_none_when_artist_match_below_floor_and_fallback_finds_nothing(self):
         """Autocomplete returned a hit, but the artist name fuzz-score is <80.
 
         Also pins that the catalog scrape is short-circuited — without this,
@@ -364,13 +375,16 @@ class TestFindAlbumMatch:
             ]
         )
         client.fetch_artist_catalog = AsyncMock()
+        client.find_album_match_via_search = AsyncMock(return_value=None)
 
         match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+
         assert match is None
         client.fetch_artist_catalog.assert_not_awaited()
+        client.find_album_match_via_search.assert_awaited_once_with("Stereolab", "Aluminum Tunes")
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_catalog_empty(self):
+    async def test_returns_none_when_catalog_empty_and_fallback_finds_nothing(self):
         client = BandcampClient()
         client.search_artist = AsyncMock(
             return_value=[
@@ -378,12 +392,13 @@ class TestFindAlbumMatch:
             ]
         )
         client.fetch_artist_catalog = AsyncMock(return_value=[])
+        client.find_album_match_via_search = AsyncMock(return_value=None)
 
         match = await client.find_album_match("Stereolab", "Aluminum Tunes")
         assert match is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_catalog_fetch_fails(self):
+    async def test_returns_none_when_catalog_fetch_fails_and_fallback_finds_nothing(self):
         # fetch_artist_catalog now returns None on a fetch failure; the live
         # match path must coalesce that to no-match, never pass None into the
         # matcher (which iterates the catalog and would TypeError on None).
@@ -394,12 +409,13 @@ class TestFindAlbumMatch:
             ]
         )
         client.fetch_artist_catalog = AsyncMock(return_value=None)
+        client.find_album_match_via_search = AsyncMock(return_value=None)
 
         match = await client.find_album_match("Stereolab", "Aluminum Tunes")
         assert match is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_album_title_doesnt_match(self):
+    async def test_returns_none_when_album_title_doesnt_match_and_fallback_finds_nothing(self):
         client = BandcampClient()
         client.search_artist = AsyncMock(
             return_value=[
@@ -414,6 +430,70 @@ class TestFindAlbumMatch:
                 }
             ]
         )
+        client.find_album_match_via_search = AsyncMock(return_value=None)
 
         match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+        assert match is None
+
+
+class TestFindAlbumMatchAlbumSearchFallback:
+    """LML#1069 PR2: the album-first ``find_album_match_via_search`` seam
+    both this live tier and the offline album-search drain
+    (scripts/bandcamp_pipeline.py) share."""
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_album_search_when_artist_first_finds_nothing(self):
+        client = BandcampClient()
+        client.search_artist = AsyncMock(return_value=[])
+        fallback_match = SourceMatch(
+            url="https://into-the-light.bandcamp.com/album/the-rules-of-the-game",
+            confidence=100.0,
+        )
+        client.find_album_match_via_search = AsyncMock(return_value=fallback_match)
+
+        match = await client.find_album_match("George Theodorakis", "The Rules of the Game")
+
+        assert match is fallback_match
+        client.find_album_match_via_search.assert_awaited_once_with(
+            "George Theodorakis", "The Rules of the Game"
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_when_catalog_title_doesnt_match(self):
+        # Artist-first found the RIGHT artist but the album isn't in their
+        # own catalog (a label/imprint-hosted release) -- the fallback is
+        # what recovers it.
+        client = BandcampClient()
+        client.search_artist = AsyncMock(
+            return_value=[
+                {
+                    "name": "George Theodorakis",
+                    "url": "https://georgerakis.bandcamp.com",
+                    "slug": "georgerakis",
+                }
+            ]
+        )
+        client.fetch_artist_catalog = AsyncMock(return_value=[])
+        fallback_match = SourceMatch(
+            url="https://into-the-light.bandcamp.com/album/the-rules-of-the-game",
+            confidence=100.0,
+        )
+        client.find_album_match_via_search = AsyncMock(return_value=fallback_match)
+
+        match = await client.find_album_match("George Theodorakis", "The Rules of the Game")
+
+        assert match is fallback_match
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_search_unavailable(self):
+        # The live path has no retry channel (see the catalog-fetch-failure
+        # comment above) -- a transient autocomplete failure degrades to no
+        # match, same as any other adapter failure, rather than propagating.
+        client = BandcampClient()
+        client.search_artist = AsyncMock(return_value=[])
+        client.find_album_match_via_search = AsyncMock(
+            side_effect=BandcampSearchUnavailableError("boom")
+        )
+
+        match = await client.find_album_match("Unknown", "Whatever")
         assert match is None
