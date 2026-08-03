@@ -52,6 +52,12 @@ class TestStripFormatSuffix:
             pytest.param("Noises [EP]", "Noises", id="bracket-ep"),
             pytest.param("Laminations [sampler EP]", "Laminations", id="bracket-sampler-ep"),
             pytest.param("College Karma [EP]", "College Karma", id="bracket-ep-two-words"),
+            pytest.param("Black Candy [KP006]", "Black Candy", id="bracket-catalog-number"),
+            pytest.param("Tugboat [CAD-612]", "Tugboat", id="bracket-catalog-number-hyphenated"),
+            pytest.param("Untitled [Live]", "Untitled [Live]", id="bracket-real-word-not-stripped"),
+            pytest.param(
+                "Untitled [2019]", "Untitled [2019]", id="bracket-pure-digits-not-stripped"
+            ),
         ],
     )
     def test_strip_format_suffix(self, title, expected):
@@ -111,6 +117,14 @@ class TestScoreMatch:
     def test_the_prefix_mismatch(self):
         """'Afros' should score well against 'The Afros'."""
         assert score_match("Afros", "The Afros") >= 80.0
+
+    def test_catalog_number_bracket_tag_high_score(self):
+        """LML#1069 regression: K Records embeds catalog numbers directly in
+        the Bandcamp ``og:title`` (e.g. Beat Happening's real page title is
+        "Black Candy [KP006], by Beat Happening"). The un-stripped
+        ``[KP006]`` tag must not drag the title score under the 80/80
+        ``verify_album_page`` acceptance floor."""
+        assert score_match("Black Candy", "Black Candy [KP006]") >= 80.0
 
 
 class TestStripTrackSuffix:
