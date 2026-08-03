@@ -115,6 +115,31 @@ _BRACKET_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Trailing catalog-number bracket tags. Some labels embed the release's
+# catalog number directly in the Bandcamp ``og:title`` meta tag rather than
+# a format word ``_BRACKET_SUFFIX_RE`` above already recognizes -- e.g. K
+# Records' real page title for Beat Happening's "Black Candy" is literally
+# "Black Candy [KP006], by Beat Happening". Discovered during the LML#1069
+# Bandcamp album-first drain: the un-stripped ``[KP006]`` tag dragged the
+# title score under the 80 ``verify_album_page`` acceptance floor and
+# permanently stuck a ~299-row pool of otherwise-correct verifications as
+# "pending" (they never got a chance to persist their Bandcamp URL).
+#
+# Deliberately narrow -- this function feeds ``score_match``, shared across
+# Bandcamp/Spotify/Apple/Deezer matching, not just the Bandcamp drain, so
+# this must not become a blanket bracket-strip. Only strips bracket content
+# that reads as a code, not a word: uppercase letters/digits/hyphens only,
+# with at least one letter AND at least one digit. That excludes:
+#   - format words already spelled in caps (``[EP]``, ``[LP]`` -- no digit)
+#   - anything with lowercase or spaces (multi-word bracketed phrases like
+#     "[Japan Edition]" or "[Disc One]" read as meaningful title content,
+#     not a catalog stamp)
+#   - pure-numeric brackets (``[2019]`` -- ambiguous between a reissue year
+#     and real title content, so left alone)
+_CATALOG_NUMBER_BRACKET_RE = re.compile(
+    r"\s*\[(?=[A-Z0-9-]*[0-9])(?=[A-Z0-9-]*[A-Z])[A-Z0-9-]+\]\s*$"
+)
+
 # Leading "The " prefix. LML#1042 deliberately keeps this narrower than
 # ``wxyc_etl.text.strip_leading_article`` (which also drops "A"/"An"): this
 # regex feeds ``score_match``'s fallback rescoring, which selects the
@@ -135,6 +160,7 @@ def strip_format_suffix(title: str) -> str:
         return title
     result = _PARENTHETICAL_SUFFIX_RE.sub("", title)
     result = _BRACKET_SUFFIX_RE.sub("", result)
+    result = _CATALOG_NUMBER_BRACKET_RE.sub("", result)
     result = _FORMAT_SUFFIX_RE.sub("", result)
     return result.strip()
 
