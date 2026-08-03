@@ -127,18 +127,64 @@ _BRACKET_SUFFIX_RE = re.compile(
 #
 # Deliberately narrow -- this function feeds ``score_match``, shared across
 # Bandcamp/Spotify/Apple/Deezer matching, not just the Bandcamp drain, so
-# this must not become a blanket bracket-strip. Only strips bracket content
-# that reads as a code, not a word: uppercase letters/digits/hyphens only,
-# with at least one letter AND at least one digit. That excludes:
+# this must not become a blanket bracket-strip. The regex only isolates the
+# bracket (letters/digits/hyphens, case-insensitive); ``_is_catalog_number``
+# below does the actual "is this a code, not a word" gate: content must have
+# at least one letter AND at least one digit. That excludes:
 #   - format words already spelled in caps (``[EP]``, ``[LP]`` -- no digit)
-#   - anything with lowercase or spaces (multi-word bracketed phrases like
+#   - anything with spaces (multi-word bracketed phrases like
 #     "[Japan Edition]" or "[Disc One]" read as meaningful title content,
-#     not a catalog stamp)
+#     not a catalog stamp) -- the character class has no room for a space
 #   - pure-numeric brackets (``[2019]`` -- ambiguous between a reissue year
-#     and real title content, so left alone)
-_CATALOG_NUMBER_BRACKET_RE = re.compile(
-    r"\s*\[(?=[A-Z0-9-]*[0-9])(?=[A-Z0-9-]*[A-Z])[A-Z0-9-]+\]\s*$"
-)
+#     and real title content, so left alone) and pure-letter brackets
+#     (``[XYZ]`` -- no digit, so left alone)
+#
+# Known accepted blind spot: this heuristic also matches legitimate
+# disc/volume/side/matrix markers -- ``[CD2]``, ``[DISC2]``, ``[VOL2]``,
+# ``[A1]``/``[B2]`` -- which are letter+digit codes by the same shape as a
+# catalog number. Left as-is: those pairs already scored well above the 80
+# floor via plain fuzzy matching before this regex existed, so stripping
+# them only sharpens an already-passing near-tie into an exact tie rather
+# than crossing a new accept/reject boundary. A fully precise distinction
+# would need real catalog-number knowledge (label prefix lists, Discogs
+# catalog-number metadata, etc.), which is out of scope here.
+#
+# Side effect worth flagging for a future reader: two candidates that used
+# to both score under the acceptance floor can now both normalize to the
+# same stripped title and tie at 100. That tie is resolved by whatever the
+# caller's existing tie-break is -- ``find_best_match``/``find_best_typed_match``'s
+# strict "first strictly-greater score wins" fold (first candidate keeps the
+# win on an exact tie) below, or ``lookup/release_resolution.py``'s
+# ``release_id``-ordered sort for the bounded-validation path. Not a new
+# problem this change introduces -- both tie-breaks are pre-existing,
+# general infrastructure -- just a newly-reachable case worth knowing about.
+_CATALOG_NUMBER_BRACKET_RE = re.compile(r"\s*\[([A-Z0-9-]+)\]\s*$", re.IGNORECASE)
+
+
+def _is_catalog_number(bracket_content: str) -> bool:
+    """True when bracket content reads as a code (letters+digits, optionally
+    hyphenated) rather than a natural-language word or bare acronym.
+
+    Used by ``_strip_catalog_number_bracket`` to gate ``_CATALOG_NUMBER_BRACKET_RE``
+    matches -- the regex alone only knows the content is letters/digits/hyphens;
+    this decides whether it's *code-like* (needs both a letter and a digit).
+    """
+    has_digit = False
+    has_letter = False
+    for char in bracket_content:
+        has_digit = has_digit or char.isdigit()
+        has_letter = has_letter or char.isalpha()
+    return has_digit and has_letter
+
+
+def _strip_catalog_number_bracket(title: str) -> str:
+    """Strip a trailing catalog-number bracket tag (see ``_CATALOG_NUMBER_BRACKET_RE``
+    above), if the bracket content passes the ``_is_catalog_number`` gate."""
+    match = _CATALOG_NUMBER_BRACKET_RE.search(title)
+    if match and _is_catalog_number(match.group(1)):
+        return title[: match.start()]
+    return title
+
 
 # Leading "The " prefix. LML#1042 deliberately keeps this narrower than
 # ``wxyc_etl.text.strip_leading_article`` (which also drops "A"/"An"): this
@@ -154,14 +200,37 @@ _CATALOG_NUMBER_BRACKET_RE = re.compile(
 _THE_PREFIX_RE = re.compile(r"^The\s+", re.IGNORECASE)
 
 
+# Bound on ``strip_format_suffix``'s fixed-point loop below. Four patterns
+# strip per pass, so real titles converge in 1-2 iterations even when
+# multiple tags are stacked; this just guards against pathological input
+# oscillating instead of converging.
+_MAX_FORMAT_SUFFIX_STRIP_ITERATIONS = 5
+
+
 def strip_format_suffix(title: str) -> str:
-    """Remove trailing format indicators and parenthetical reissue tags from a library title."""
+    """Remove trailing format indicators and parenthetical reissue tags from a library title.
+
+    Loops the strip patterns to a fixed point (bounded by
+    ``_MAX_FORMAT_SUFFIX_STRIP_ITERATIONS``) rather than applying each once
+    in a straight line. Real Bandcamp ``og:title`` values stack multiple
+    trailing tags -- e.g. a catalog number plus a format word,
+    "Black Candy [KP006] LP" -- and every pattern here is anchored to the
+    end of the string, so an outer tag blocks an inner one's anchor until
+    the outer tag is stripped first. A single pass would leave
+    "Black Candy [KP006] LP" at "Black Candy [KP006]" (only the trailing
+    " LP" removed); looping cleans both.
+    """
     if not title:
         return title
-    result = _PARENTHETICAL_SUFFIX_RE.sub("", title)
-    result = _BRACKET_SUFFIX_RE.sub("", result)
-    result = _CATALOG_NUMBER_BRACKET_RE.sub("", result)
-    result = _FORMAT_SUFFIX_RE.sub("", result)
+    result = title
+    for _ in range(_MAX_FORMAT_SUFFIX_STRIP_ITERATIONS):
+        previous = result
+        result = _PARENTHETICAL_SUFFIX_RE.sub("", result)
+        result = _BRACKET_SUFFIX_RE.sub("", result)
+        result = _strip_catalog_number_bracket(result)
+        result = _FORMAT_SUFFIX_RE.sub("", result)
+        if result == previous:
+            break
     return result.strip()
 
 

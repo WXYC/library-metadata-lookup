@@ -58,6 +58,26 @@ class TestStripFormatSuffix:
             pytest.param(
                 "Untitled [2019]", "Untitled [2019]", id="bracket-pure-digits-not-stripped"
             ),
+            pytest.param(
+                "Black Candy [kp006]",
+                "Black Candy",
+                id="bracket-catalog-number-lowercase",
+            ),
+            pytest.param(
+                "Black Candy [KP006] LP",
+                "Black Candy",
+                id="bracket-catalog-number-plus-trailing-format-word",
+            ),
+            pytest.param(
+                "Title [EP] [KP006]",
+                "Title",
+                id="stacked-bracket-tags-catalog-and-format",
+            ),
+            pytest.param(
+                "Weird Compilation [XYZ]",
+                "Weird Compilation [XYZ]",
+                id="bracket-all-letters-no-digit-not-stripped",
+            ),
         ],
     )
     def test_strip_format_suffix(self, title, expected):
@@ -125,6 +145,16 @@ class TestScoreMatch:
         ``[KP006]`` tag must not drag the title score under the 80/80
         ``verify_album_page`` acceptance floor."""
         assert score_match("Black Candy", "Black Candy [KP006]") >= 80.0
+
+    def test_catalog_number_bracket_tag_with_format_word_high_score(self):
+        """LML#1069 follow-up: a real Bandcamp ``og:title`` can combine a
+        catalog number with a format word in the same trailing run (e.g.
+        "Black Candy [KP006] LP"). A single straight-line pass through
+        ``strip_format_suffix``'s regexes leaves the catalog bracket
+        uncleaned -- the trailing " LP" blocks its end-anchor until
+        ``_FORMAT_SUFFIX_RE`` strips it -- so ``strip_format_suffix`` must
+        iterate to a fixed point for both tags to come off."""
+        assert score_match("Black Candy", "Black Candy [KP006] LP") >= 80.0
 
 
 class TestStripTrackSuffix:
