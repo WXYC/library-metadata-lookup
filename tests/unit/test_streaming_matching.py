@@ -78,6 +78,11 @@ class TestStripFormatSuffix:
                 "Weird Compilation [XYZ]",
                 id="bracket-all-letters-no-digit-not-stripped",
             ),
+            pytest.param(
+                "Black Candy (Reissue) (Remaster) (Deluxe Edition) [single] [EP] [KP006] LP",
+                "Black Candy",
+                id="deeply-stacked-tags-exceed-old-iteration-cap",
+            ),
         ],
     )
     def test_strip_format_suffix(self, title, expected):
