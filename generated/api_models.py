@@ -564,6 +564,52 @@ class TrackSearchParams(BaseModel):
     n: int | None = None
 
 
+class CompilationTrackInput(BaseModel):
+    artist_name: constr(min_length=1, max_length=255) = Field(
+        ..., description="Per-track performing artist (CTA.artist_name)."
+    )
+    track_title: constr(max_length=255) | None = Field(
+        None, description="Track title; nullable, matching the CTA column."
+    )
+    track_position: constr(max_length=20) | None = Field(
+        None, description='Sleeve position label, e.g. "A1", "3".'
+    )
+
+
+class CompilationTrack(BaseModel):
+    id: int = Field(..., description="Server-assigned CTA row id.")
+    artist_name: str
+    track_title: str | None = None
+    track_position: str | None = None
+
+
+class CompilationTrackList(BaseModel):
+    library_id: int
+    tracks: list[CompilationTrack]
+
+
+class CompilationTracksWriteRequest(BaseModel):
+    tracks: list[CompilationTrackInput] = Field(..., min_length=1)
+
+
+class CompilationTracksWriteResponse(BaseModel):
+    library_id: int
+    inserted: int = Field(..., description="Rows newly created.")
+    skipped: int = Field(
+        ...,
+        description="Rows already present (matched on a CTA uniqueness key); left untouched.",
+    )
+    tracks: list[CompilationTrack]
+
+
+class CompilationTrackSuggestions(BaseModel):
+    library_id: int
+    discogs_release_id: int = Field(
+        ..., description="The resolved Discogs release id, or null if none resolved."
+    )
+    tracks: list[CompilationTrackInput]
+
+
 class RotationEntry(BaseModel):
     id: int
     album_id: int
