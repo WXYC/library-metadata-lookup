@@ -20,7 +20,7 @@ from wxyc_fastapi.observability import (
 from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
-from config.settings import get_settings
+from config.settings import Settings, get_settings
 from core.bulk_body import parse_bulk_body
 from core.bulk_concurrency import (
     ClientDisconnectedWhileQueuedError,
@@ -858,9 +858,12 @@ async def handle_bulk_lookup(
     posthog_client: Posthog | None = Depends(get_posthog_client),
     apple_music: AppleMusicClient | None = Depends(get_apple_music_client),
     spotify: SpotifyClient | None = Depends(get_spotify_client),
-    # No Bandcamp dependency on the bulk path — the Bandcamp leg is disabled
-    # here (bandcamp=None at the perform_lookup call below), so resolving its
-    # client would be dead work. See the call site for the rate-limit rationale.
+    # Bandcamp is resolved but forwarded to perform_lookup ONLY when
+    # lml_bulk_bandcamp_streaming_warm is on (default off); otherwise it is
+    # pinned to None at the call site below, exactly as before. See the call
+    # site for the flag-gate + rate-limit rationale.
+    bandcamp: BandcampClient | None = Depends(get_bandcamp_client),
+    settings: Settings = Depends(get_settings),
     skip_cache: bool = False,
     allow_release_resolution_fallback: bool = Query(
         False,
@@ -1017,16 +1020,21 @@ async def handle_bulk_lookup(
                         mb_pg=mb_pg,
                         apple_music=apple_music,
                         spotify=spotify,
-                        # Bandcamp is intentionally NOT forwarded on the bulk
-                        # path (LML#573 PR-3): its client is rate-limited to
+                        # Bandcamp on the bulk path is gated by the dedicated
+                        # lml_bulk_bandcamp_streaming_warm flag (default off,
+                        # extends #1052). With the flag OFF this is None — exactly
+                        # the LML#573 PR-3 posture: its client is rate-limited to
                         # 1 req/s, so a per-item live album probe would serialize
                         # the 35k-album drain into hours of requests against
                         # Bandcamp (and starve the shared singleton for the live
-                        # /lookup path). Passing None makes the post-process skip
-                        # the Bandcamp leg here; the search-URL fallback still
-                        # applies, and the offline warmer (#548) is the right tier
-                        # for bulk Bandcamp cache population.
-                        bandcamp=None,
+                        # /lookup path), so the post-process skips the Bandcamp
+                        # leg and the search-URL fallback applies. With the flag
+                        # ON, the injected client flows through so a cold miss
+                        # schedules the bounded background warm (the post-process
+                        # exempts Bandcamp from the bulk suppression), resolving
+                        # the DIRECT album URL into the cache for subsequent
+                        # lookups. Enable only after the BS#642 drain completes.
+                        bandcamp=bandcamp if settings.lml_bulk_bandcamp_streaming_warm else None,
                         discogs_cache_pg=discogs_cache_pg,
                         caller_budget_ms=x_caller_budget_ms,
                         # Caller-controlled since LML#920 (default False, the
