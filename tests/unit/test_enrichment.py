@@ -16,6 +16,7 @@ from discogs.models import (
 )
 from lookup.enrichment import enrich_artwork_results
 from lookup.enrichment.item import _build_streaming_search_url
+from lookup.rowless import ROWLESS_LIBRARY_ID
 from tests.factories import make_discogs_result, make_library_item
 
 
@@ -4656,6 +4657,33 @@ class TestBandcampStreamingUrlPostprocessWiring:
         assert clients["bandcamp"] is bandcamp
         assert clients["apple_music"] is apple_music
         assert clients["spotify"] is spotify
+
+    @pytest.mark.parametrize(
+        ("item_id", "expected_rowless"),
+        [(ROWLESS_LIBRARY_ID, True), (42, False)],
+    )
+    @pytest.mark.asyncio
+    async def test_is_rowless_threaded_from_item_id(self, item_id, expected_rowless):
+        # LML#1087: the bulk-Bandcamp warm exemption keys on rowlessness
+        # (item.id == ROWLESS_LIBRARY_ID) so it can never fire for a real library
+        # row. enrich_one must thread that bit into the post-process; assert the
+        # wiring for both a rowless (id==0) and a library (id!=0) item.
+        item = make_library_item(id=item_id, artist="Juana Molina", title="DOGA")
+
+        with patch(
+            "lookup.enrichment.item.apply_streaming_url_postprocess",
+            new=AsyncMock(return_value={}),
+        ) as postprocess:
+            await enrich_artwork_results(
+                [(item, None)],
+                AsyncMock(),
+                song="la paradoja",
+                album="DOGA",
+                bandcamp=AsyncMock(),
+            )
+
+        postprocess.assert_awaited_once()
+        assert postprocess.await_args.kwargs["is_rowless"] is expected_rowless
 
     @pytest.mark.asyncio
     async def test_postprocess_sees_bandcamp_url_none_then_resolved_url_wins(self):
