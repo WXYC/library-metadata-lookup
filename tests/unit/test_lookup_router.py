@@ -131,6 +131,54 @@ class TestHandleLookup:
             assert mock_posthog.capture.call_count >= 1
 
     @pytest.mark.asyncio
+    async def test_lookup_suppresses_per_step_posthog_events(
+        self, mock_db, mock_discogs, mock_settings
+    ):
+        # /lookup constructs telemetry with emit_step_events=False, so even
+        # when the pipeline records steps, only the `lookup_completed` summary
+        # reaches PostHog — not the per-step events (`lookup_library_search`,
+        # …) that are read by no insight or alert and that a Backend-Service
+        # backfill multiplied into a ~7x ingestion spike (2026-08-01).
+        from config.settings import get_settings
+        from core.dependencies import get_discogs_service, get_library_db, get_posthog_client
+        from main import app
+
+        mock_posthog = Mock()
+        mock_posthog.capture = Mock()
+        mock_posthog.flush = Mock()
+
+        response = LookupResponse(results=[], search_type="direct")
+
+        async def _fake_lookup(*args, **kwargs):
+            # Record a step so that, absent suppression, a per-step
+            # `lookup_library_search` event would fire alongside the summary.
+            with kwargs["telemetry"].track_step("library_search"):
+                pass
+            return response
+
+        with override_deps(
+            app,
+            {
+                get_library_db: mock_db,
+                get_discogs_service: mock_discogs,
+                get_posthog_client: mock_posthog,
+                get_settings: mock_settings,
+            },
+        ):
+            with patch(
+                "lookup.router.perform_lookup",
+                new=AsyncMock(side_effect=_fake_lookup),
+            ):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    resp = await client.post("/api/v1/lookup", json=LOOKUP_BODY)
+
+        assert resp.status_code == 200
+        events = [c.kwargs["event"] for c in mock_posthog.capture.call_args_list]
+        assert events == ["lookup_completed"]
+
+    @pytest.mark.asyncio
     async def test_error_returns_500(self, app_client):
         with patch(
             "lookup.router.perform_lookup",
