@@ -717,6 +717,13 @@ async def handle_lookup(
                     api_call_keys=["discogs"],
                     distinct_id="library-metadata-lookup-service",
                     event_prefix="lookup",
+                    # Emit only the `lookup_completed` summary, not the ~9
+                    # per-step `lookup_<step>` events (wxyc-fastapi>=1.3.0). No
+                    # insight or alert reads the per-step events; the summary
+                    # already carries every step timing under `steps`. This is
+                    # /lookup's ~7x PostHog fan-out — a Backend-Service backfill
+                    # (2026-08-01) multiplied it into a ~440k events/day spike.
+                    emit_step_events=False,
                 )
                 response = await perform_lookup(
                     request=request,
