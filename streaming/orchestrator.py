@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 
 from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
@@ -13,6 +14,40 @@ from streaming.models import StreamingCheckResponse, StreamingCheckSources
 from streaming.service import CATALOG_CHECK_SERVICES
 
 logger = logging.getLogger(__name__)
+
+# LML#1081: per-service wall-clock ceilings for a single `/streaming-check` leg.
+# Without these, `check_streaming_availability` awaited each service's
+# `find_album_match` with no timeout, so one slow leg could stall the whole
+# request. Bandcamp is uniquely dangerous: it is multi-phase (autocomplete →
+# catalog scrape → album-first search fallback, #1080), rate-limited to 1 req/s,
+# and retries 429s through an exponential backoff (~5s+10s+20s per phase) with
+# no internal `budget_deadline` — an untimed worst case of ~105s that also holds
+# a #753 concurrency-semaphore slot the entire time. The others are single httpx
+# calls (client-side `timeout=10s`) with light retries, so they get the tighter
+# default. Both are generous enough for the normal path (Bandcamp artist-first
+# resolves in ~1.4s; the label-hosted search fallback in a handful of 1-req/s
+# fetches) while capping the 429-storm tail. Mirrors the sibling
+# `lookup/streaming_url_postprocess._BANDCAMP_PROBE_TIMEOUT_S` pattern; on
+# timeout a service degrades to `errored_sources` (LML#376 "None = do not
+# persist / retry later"), never failing the whole request.
+_DEFAULT_STREAMING_CHECK_TIMEOUT_S = 10.0
+_BANDCAMP_STREAMING_CHECK_TIMEOUT_S = 15.0
+_STREAMING_CHECK_TIMEOUTS: dict[str, float] = {
+    "bandcamp": _BANDCAMP_STREAMING_CHECK_TIMEOUT_S,
+}
+
+
+def _timeout_for(service: str, overrides: Mapping[str, float] | None) -> float:
+    """Resolve the wall-clock ceiling for one `/streaming-check` service leg.
+
+    ``overrides`` (a caller-supplied per-service map, used by tests and any
+    future settings-threaded tuning) wins; otherwise the per-service default
+    from ``_STREAMING_CHECK_TIMEOUTS``, else ``_DEFAULT_STREAMING_CHECK_TIMEOUT_S``.
+    """
+    if overrides is not None and service in overrides:
+        return overrides[service]
+    return _STREAMING_CHECK_TIMEOUTS.get(service, _DEFAULT_STREAMING_CHECK_TIMEOUT_S)
+
 
 # Fail loudly at import time if the orchestrator's per-service kwargs ever
 # drift from `StreamingCheckSources` field names (the response shape is
@@ -40,6 +75,7 @@ async def check_streaming_availability(
     deezer: DeezerClient | None = None,
     apple_music: AppleMusicClient | None = None,
     bandcamp: BandcampClient | None = None,
+    timeouts: Mapping[str, float] | None = None,
 ) -> StreamingCheckResponse:
     """Check streaming availability for an artist+title across all configured services.
 
@@ -64,6 +100,11 @@ async def check_streaming_availability(
         deezer: Optional Deezer client.
         apple_music: Optional Apple Music client.
         bandcamp: Optional Bandcamp client.
+        timeouts: Optional per-service wall-clock ceiling override (seconds),
+            keyed by service name (LML#1081). Any service absent from the map
+            uses its default from ``_STREAMING_CHECK_TIMEOUTS`` /
+            ``_DEFAULT_STREAMING_CHECK_TIMEOUT_S``. A leg that exceeds its
+            ceiling is reported in ``errored_sources`` rather than stalling.
 
     Returns:
         ``StreamingCheckResponse`` with the verdict, per-source match details, and
@@ -88,8 +129,20 @@ async def check_streaming_availability(
             strict=True,
         )
     )
+    # LML#1081: each leg is wrapped in `asyncio.wait_for` so a slow/429-stormed
+    # service (Bandcamp especially) can't stall the whole request. wait_for
+    # cancels the underlying coroutine on timeout, releasing its rate-limiter /
+    # semaphore promptly; the timed-out service degrades to `errored_sources`
+    # via the `except TimeoutError` branch below. Applying the ceiling at task
+    # creation (not just when awaited) bounds each service's *total* concurrent
+    # lifetime, independent of the order the loop awaits them in.
     tasks: dict[str, asyncio.Task] = {
-        name: asyncio.create_task(client.find_album_match(artist, title))
+        name: asyncio.create_task(
+            asyncio.wait_for(
+                client.find_album_match(artist, title),
+                timeout=_timeout_for(name, timeouts),
+            )
+        )
         for name, client in clients.items()
         if client is not None
     }
@@ -106,6 +159,20 @@ async def check_streaming_availability(
             if match is not None:
                 any_found = True
                 setattr(sources, service, match)
+        except TimeoutError:
+            # LML#1081: exceeded the per-service wall-clock ceiling (e.g. a
+            # Bandcamp 429 backoff chain). Not a couldn't-find — an inconclusive
+            # couldn't-check, so it joins `errored` (LML#376 escalates the
+            # verdict to None absent positive evidence). Logged at warning
+            # without a stack trace: it's an expected degradation, not a bug.
+            errored.add(service)
+            logger.warning(
+                "Streaming check timed out for %s on %s - %s (ceiling %.1fs)",
+                service,
+                artist,
+                title,
+                _timeout_for(service, timeouts),
+            )
         except Exception:
             errored.add(service)
             logger.exception("Streaming check failed for %s on %s - %s", service, artist, title)

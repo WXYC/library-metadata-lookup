@@ -8,12 +8,19 @@ files (test_spotify_client.py, test_deezer_client.py, test_apple_music_client.py
 test_bandcamp_client.py).
 """
 
+import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import pytest
 
 from streaming.models import SourceMatch, StreamingCheckSources
-from streaming.orchestrator import _EXPECTED_SERVICE_FIELDS, check_streaming_availability
+from streaming.orchestrator import (
+    _BANDCAMP_STREAMING_CHECK_TIMEOUT_S,
+    _DEFAULT_STREAMING_CHECK_TIMEOUT_S,
+    _EXPECTED_SERVICE_FIELDS,
+    check_streaming_availability,
+)
 
 
 def test_orchestrator_kwargs_match_response_fields():
@@ -208,3 +215,102 @@ async def test_multiple_services_all_match():
     assert result.sources.spotify is not None
     assert result.sources.deezer is not None
     assert result.sources.apple_music is not None
+
+
+class _SlowClient:
+    """A streaming client whose ``find_album_match`` sleeps before returning.
+
+    Stands in for a Bandcamp leg stuck in a 429 backoff chain (LML#1081) — the
+    orchestrator must cut it off via its per-service wall-clock ceiling rather
+    than awaiting the full sleep.
+    """
+
+    def __init__(self, delay: float, match: SourceMatch | None = None):
+        self._delay = delay
+        self._match = match
+
+    async def find_album_match(self, artist: str, title: str) -> SourceMatch | None:
+        await asyncio.sleep(self._delay)
+        return self._match
+
+
+def test_bandcamp_ceiling_looser_than_default():
+    """LML#1081: Bandcamp's multi-phase, 1-req/s leg gets a looser ceiling than
+    the single-call API services, but both are finite."""
+    assert _BANDCAMP_STREAMING_CHECK_TIMEOUT_S > _DEFAULT_STREAMING_CHECK_TIMEOUT_S
+    assert _DEFAULT_STREAMING_CHECK_TIMEOUT_S > 0
+
+
+@pytest.mark.asyncio
+async def test_bandcamp_timeout_degrades_to_errored():
+    """LML#1081: a Bandcamp leg that exceeds its ceiling degrades to
+    ``errored_sources: ["bandcamp"]`` (LML#376 None-verdict) within a bounded
+    time — it does not stall the whole request waiting out the retry chain."""
+    bandcamp = _SlowClient(
+        delay=5.0,
+        match=SourceMatch(
+            url="https://olofdreijer.bandcamp.com/album/loud-bloom", confidence=100.0
+        ),
+    )
+
+    start = time.perf_counter()
+    result = await check_streaming_availability(
+        "Olof Dreijer",
+        "Loud Bloom",
+        bandcamp=bandcamp,
+        timeouts={"bandcamp": 0.05},
+    )
+    elapsed = time.perf_counter() - start
+
+    assert "bandcamp" in result.errored_sources
+    assert result.sources.bandcamp is None
+    # No positive evidence + an error → LML#376 escalates to None (do not persist).
+    assert result.on_streaming is None
+    # Bounded: cut at ~0.05s, not the 5s the slow leg would have taken.
+    assert elapsed < 1.0
+
+
+@pytest.mark.asyncio
+async def test_slow_bandcamp_does_not_block_other_services():
+    """LML#1081: one slow service's ceiling must not delay the others — a fast
+    Spotify match still wins the verdict while Bandcamp times out."""
+    spotify = _mock_client(
+        SourceMatch(url="https://open.spotify.com/album/2I8Y2r289lu5s26k50N9GL", confidence=95.0)
+    )
+    bandcamp = _SlowClient(delay=5.0)
+
+    start = time.perf_counter()
+    result = await check_streaming_availability(
+        "Olof Dreijer",
+        "Loud Bloom",
+        spotify=spotify,
+        bandcamp=bandcamp,
+        timeouts={"bandcamp": 0.05},
+    )
+    elapsed = time.perf_counter() - start
+
+    assert result.on_streaming is True  # positive evidence from Spotify wins
+    assert result.sources.spotify is not None
+    assert "bandcamp" in result.errored_sources
+    assert elapsed < 1.0
+
+
+@pytest.mark.asyncio
+async def test_default_ceiling_applies_to_non_bandcamp_services():
+    """LML#1081: the per-service ceiling generalizes — a stalled Spotify leg is
+    also cut off (via the default timeout override) and degrades to errored."""
+    spotify = _SlowClient(delay=5.0)
+
+    start = time.perf_counter()
+    result = await check_streaming_availability(
+        "Olof Dreijer",
+        "Loud Bloom",
+        spotify=spotify,
+        timeouts={"spotify": 0.05},
+    )
+    elapsed = time.perf_counter() - start
+
+    assert "spotify" in result.errored_sources
+    assert result.sources.spotify is None
+    assert result.on_streaming is None
+    assert elapsed < 1.0
