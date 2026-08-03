@@ -208,8 +208,13 @@ def _patch_resolver(**kwargs):
 _drain_background_tasks = drain_streaming_warm_tasks
 
 
-async def _run(update, *, settings, clients=None, entity_store=None, pg=None):
-    """Invoke the post-process with this module's standard request shape."""
+async def _run(update, *, settings, clients=None, entity_store=None, pg=None, is_rowless=False):
+    """Invoke the post-process with this module's standard request shape.
+
+    ``is_rowless`` mirrors ``enrich_one``'s ``item.id == ROWLESS_LIBRARY_ID``
+    signal — the bulk-Bandcamp warm exemption only applies to rowless
+    (non-library) items.
+    """
     return await apply_streaming_url_postprocess(
         update,
         clients=clients if clients is not None else _clients(),
@@ -218,6 +223,7 @@ async def _run(update, *, settings, clients=None, entity_store=None, pg=None):
         request_artist=_ARTIST,
         request_album=_ALBUM,
         settings=settings,
+        is_rowless=is_rowless,
     )
 
 
@@ -688,22 +694,27 @@ class TestBulkSuppression:
 
 
 # ---------------------------------------------------------------------------
-# Bulk Bandcamp warm exemption (LML#1081-family, extending #1052): the dedicated
+# Bulk Bandcamp warm exemption (LML#1087, extending #1052): the dedicated
 # ``lml_bulk_bandcamp_streaming_warm`` flag lets a cold Bandcamp miss schedule
 # its bounded background warm on the otherwise-suppressed /lookup/bulk path, so
-# a brand-new/rotation non-library album gets a DIRECT Bandcamp URL warmed into
-# the cache instead of Backend-Service synthesizing a bandcamp.com/search?q=
-# fallback. Default-off (ships dark, gated on the BS#642 backfill drain). The
+# a brand-new/rotation NON-LIBRARY (rowless) album gets a DIRECT Bandcamp URL
+# warmed into the cache instead of Backend-Service synthesizing a
+# bandcamp.com/search?q= fallback. Scoped to rowless (item.id == 0) items only —
+# library albums already get Bandcamp via the offline #1069 drain, so warming
+# them at runtime (1 req/s) would re-introduce the hours-long serialized backfill
+# the bandcamp=None pin guarded against. Mirrors #1052's rowless-only Spotify
+# precedent. Default-off (ships dark, gated on the BS#642 backfill drain). The
 # exemption is Bandcamp-specific and does NOT touch Apple/Spotify bulk behavior.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestBulkBandcampWarmExemption:
-    async def test_flag_on_bandcamp_miss_enqueues_warm_despite_suppression(self):
-        # The load-bearing behavior: suppress_warm is set (bulk), but with the
-        # dedicated flag on a genuine Bandcamp miss schedules the warm anyway —
-        # projecting cache_miss_enqueued (not cache_miss_unwarmed).
+    async def test_flag_on_rowless_bandcamp_miss_enqueues_warm_despite_suppression(self):
+        # The load-bearing behavior: suppress_warm is set (bulk), but for a
+        # ROWLESS item with the dedicated flag on, a genuine Bandcamp miss
+        # schedules the warm anyway — projecting cache_miss_enqueued (not
+        # cache_miss_unwarmed).
         update = _blank_update()
         scope, transaction = _sentry_scope()
         set_suppress_streaming_warm(True)
@@ -713,7 +724,9 @@ class TestBulkBandcampWarmExemption:
             _patch_resolver(return_value=ResolveOutcome(url=None, source="live_miss")),
             patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
-            result = await _run(update, settings=_settings("bandcamp", bulk_bandcamp_warm=True))
+            result = await _run(
+                update, settings=_settings("bandcamp", bulk_bandcamp_warm=True), is_rowless=True
+            )
             assert len(mod._background_tasks) == 1
             await _drain_background_tasks()
 
@@ -724,10 +737,13 @@ class TestBulkBandcampWarmExemption:
         assert calls.get("streaming_url.persistent_lookup.cache_miss_unwarmed.bandcamp") is None
         assert result == {"bandcamp": StreamingResolutionStatus.unresolved}
 
-    async def test_flag_off_bandcamp_stays_suppressed_and_inert(self):
-        # Bandcamp client present in ``clients`` and its per-service flag on, but
-        # with the dedicated bulk flag OFF the suppression still applies: no live
-        # probe, no background warm — exactly today's bulk behavior.
+    async def test_flag_on_nonrowless_library_item_stays_suppressed(self):
+        # The guard the #1087 review added: a NON-rowless (library, id != 0) item
+        # must NOT trip the exemption even with the flag on — library albums are
+        # warmed by the offline #1069 drain, so a runtime 1-req/s warm per bulk
+        # miss would re-create the ~65k-album serialized backfill the bulk
+        # suppression exists to prevent. Suppressed => cache_miss_unwarmed, no
+        # warm.
         update = _blank_update()
         scope, transaction = _sentry_scope()
         set_suppress_streaming_warm(True)
@@ -737,7 +753,33 @@ class TestBulkBandcampWarmExemption:
             _patch_resolver() as resolve,
             patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
         ):
-            await _run(update, settings=_settings("bandcamp", bulk_bandcamp_warm=False))
+            await _run(
+                update, settings=_settings("bandcamp", bulk_bandcamp_warm=True), is_rowless=False
+            )
+
+        resolve.assert_not_called()
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get("streaming_url.persistent_lookup.cache_miss_unwarmed.bandcamp") is True
+
+    async def test_flag_off_bandcamp_stays_suppressed_and_inert(self):
+        # Bandcamp client present in ``clients`` and its per-service flag on, and
+        # even a ROWLESS item — but with the dedicated bulk flag OFF the
+        # suppression still applies: no live probe, no background warm — exactly
+        # today's bulk behavior. The flag dominates the rowless signal.
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+        set_suppress_streaming_warm(True)
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            await _run(
+                update, settings=_settings("bandcamp", bulk_bandcamp_warm=False), is_rowless=True
+            )
 
         resolve.assert_not_called()
         assert not mod._background_tasks

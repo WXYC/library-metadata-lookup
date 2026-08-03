@@ -636,6 +636,13 @@ async def enrich_one(
         request_artist=ctx.artist,
         request_album=ctx.album,
         settings=settings,
+        # Rowless (non-library) items are the only ones eligible for the
+        # bulk-path Bandcamp warm exemption (LML#1087): library rows are already
+        # warmed by the offline #1069 drain, so warming them at runtime (1 req/s)
+        # would re-introduce the serialized-backfill starvation the bulk
+        # suppression prevents. Consulted only under bulk suppression, for
+        # Bandcamp; inert on the interactive path.
+        is_rowless=item.id == ROWLESS_LIBRARY_ID,
     )
 
     # LML#1053: resolve the final per-service verdict — this leg's own
