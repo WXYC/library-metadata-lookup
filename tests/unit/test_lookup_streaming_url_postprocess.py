@@ -136,13 +136,20 @@ def _reset_warm_state():
     reset_streaming_warm_state()
 
 
-def _settings(*enabled_services: str, master: bool = True) -> SimpleNamespace:
-    """A Settings-like stub with the AND-gate flags the post-process reads."""
+def _settings(
+    *enabled_services: str, master: bool = True, bulk_bandcamp_warm: bool = False
+) -> SimpleNamespace:
+    """A Settings-like stub with the AND-gate flags the post-process reads.
+
+    ``bulk_bandcamp_warm`` backs ``lml_bulk_bandcamp_streaming_warm`` — the
+    dedicated flag that exempts Bandcamp from the /lookup/bulk warm suppression.
+    """
     flags = {
         "lml_persist_streaming_urls": master,
         "lml_persist_streaming_url_apple_music": False,
         "lml_persist_streaming_url_spotify": False,
         "lml_persist_streaming_url_bandcamp": False,
+        "lml_bulk_bandcamp_streaming_warm": bulk_bandcamp_warm,
     }
     for service in enabled_services:
         flags[_FLAG_BY_SERVICE[service]] = True
@@ -677,6 +684,101 @@ class TestBulkSuppression:
             await _run(update, settings=_settings(service))
 
         assert update[case["url_field"]] == case["resolved_url"]
+        assert not mod._background_tasks
+
+
+# ---------------------------------------------------------------------------
+# Bulk Bandcamp warm exemption (LML#1081-family, extending #1052): the dedicated
+# ``lml_bulk_bandcamp_streaming_warm`` flag lets a cold Bandcamp miss schedule
+# its bounded background warm on the otherwise-suppressed /lookup/bulk path, so
+# a brand-new/rotation non-library album gets a DIRECT Bandcamp URL warmed into
+# the cache instead of Backend-Service synthesizing a bandcamp.com/search?q=
+# fallback. Default-off (ships dark, gated on the BS#642 backfill drain). The
+# exemption is Bandcamp-specific and does NOT touch Apple/Spotify bulk behavior.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBulkBandcampWarmExemption:
+    async def test_flag_on_bandcamp_miss_enqueues_warm_despite_suppression(self):
+        # The load-bearing behavior: suppress_warm is set (bulk), but with the
+        # dedicated flag on a genuine Bandcamp miss schedules the warm anyway —
+        # projecting cache_miss_enqueued (not cache_miss_unwarmed).
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+        set_suppress_streaming_warm(True)
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver(return_value=ResolveOutcome(url=None, source="live_miss")),
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            result = await _run(update, settings=_settings("bandcamp", bulk_bandcamp_warm=True))
+            assert len(mod._background_tasks) == 1
+            await _drain_background_tasks()
+
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get("streaming_url.persistent_lookup.cache_miss_enqueued.bandcamp") is True
+        assert calls.get("streaming_url.persistent_lookup.cache_miss_unwarmed.bandcamp") is None
+        assert result == {"bandcamp": StreamingResolutionStatus.unresolved}
+
+    async def test_flag_off_bandcamp_stays_suppressed_and_inert(self):
+        # Bandcamp client present in ``clients`` and its per-service flag on, but
+        # with the dedicated bulk flag OFF the suppression still applies: no live
+        # probe, no background warm — exactly today's bulk behavior.
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+        set_suppress_streaming_warm(True)
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            await _run(update, settings=_settings("bandcamp", bulk_bandcamp_warm=False))
+
+        resolve.assert_not_called()
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get("streaming_url.persistent_lookup.cache_miss_unwarmed.bandcamp") is True
+
+    @pytest.mark.parametrize("service", ["apple_music_album", "spotify_album"])
+    async def test_flag_on_does_not_exempt_apple_or_spotify(self, service):
+        # The exemption is Bandcamp-only: even with the bulk-Bandcamp flag on, a
+        # suppressed Apple/Spotify miss still does cache-read-fill only (no warm).
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+        set_suppress_streaming_warm(True)
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            await _run(update, settings=_settings(service, bulk_bandcamp_warm=True))
+
+        resolve.assert_not_called()
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+        # Sentry keys use the storage key (``spotify_album``), not the catalog key.
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
+
+    async def test_flag_only_consulted_under_suppression(self):
+        # The interactive /lookup path (no suppression) already warms Bandcamp on
+        # a miss; the dedicated flag must not gate that path — a Bandcamp miss
+        # with suppression OFF warms regardless of the flag's value.
+        update = _blank_update()
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver(return_value=ResolveOutcome(url=None, source="live_miss")),
+        ):
+            await _run(update, settings=_settings("bandcamp", bulk_bandcamp_warm=False))
+            assert len(mod._background_tasks) == 1
+            await _drain_background_tasks()
         assert not mod._background_tasks
 
 

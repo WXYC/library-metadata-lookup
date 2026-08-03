@@ -371,12 +371,13 @@ class TestBulkLookupEndpoint:
         assert mock_lookup.await_args.kwargs["request"].extended is None
 
     @pytest.mark.asyncio
-    async def test_bulk_does_not_forward_bandcamp_client(self, app_client):
-        """The bulk drain must NOT run the Bandcamp leg: its client is rate-
-        limited to 1 req/s, so a per-item live probe would serialize a 35k-album
-        drain into hours of requests against Bandcamp. The handler passes
-        bandcamp=None so the post-process skips the Bandcamp leg on bulk (the
-        search-URL fallback still applies). LML#573 PR-3."""
+    async def test_bulk_omits_bandcamp_client_when_flag_off(self, app_client):
+        """With ``lml_bulk_bandcamp_streaming_warm`` off (the default), the bulk
+        drain must NOT forward the Bandcamp client: a per-item live probe would
+        serialize a 35k-album drain against Bandcamp's 1 req/s limit and starve
+        the interactive path's warms. The handler passes bandcamp=None so the
+        post-process skips the Bandcamp leg on bulk (the search-URL fallback
+        still applies). LML#573 PR-3; flag-gate extends #1052."""
         with patch(
             "lookup.router.perform_lookup",
             new_callable=AsyncMock,
@@ -393,6 +394,47 @@ class TestBulkLookupEndpoint:
         assert resp.status_code == 200
         assert mock_lookup.await_count == 1
         assert mock_lookup.await_args.kwargs.get("bandcamp") is None
+
+    @pytest.mark.asyncio
+    async def test_bulk_forwards_bandcamp_client_when_flag_on(
+        self, mock_db, mock_discogs, mock_settings
+    ):
+        """With ``lml_bulk_bandcamp_streaming_warm`` on, the Bandcamp client
+        dependency flows into every per-item ``perform_lookup`` so the
+        streaming-URL post-process can warm the direct Bandcamp URL on the bulk
+        enrichment path (extends #1052's bulk warm from Spotify to Bandcamp)."""
+        from streaming.dependencies import get_bandcamp_client
+
+        sentinel = object()
+        flag_on_settings = mock_settings.model_copy(
+            update={"lml_bulk_bandcamp_streaming_warm": True}
+        )
+        with (
+            override_deps(
+                app,
+                {
+                    get_library_db: mock_db,
+                    get_discogs_service: mock_discogs,
+                    get_posthog_client: None,
+                    get_settings: flag_on_settings,
+                    get_bandcamp_client: sentinel,
+                },
+            ),
+            patch(
+                "lookup.router.perform_lookup",
+                new_callable=AsyncMock,
+                return_value=_no_match_response(),
+            ) as mock_lookup,
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={"items": [{"artist": "Juana Molina", "album": "DOGA"}]},
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_count == 1
+        assert mock_lookup.await_args.kwargs.get("bandcamp") is sentinel
 
     @pytest.mark.asyncio
     async def test_results_preserve_input_order(self, app_client):

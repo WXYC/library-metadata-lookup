@@ -629,6 +629,34 @@ class Settings(BaseSettings):
             "supplies True. New in PR-3. See WXYC/library-metadata-lookup#573."
         ),
     )
+    lml_bulk_bandcamp_streaming_warm: bool = Field(
+        default=False,
+        description=(
+            "Dedicated kill switch that exempts Bandcamp from the /lookup/bulk "
+            "streaming-URL warm suppression. The bulk (enrichment) path normally "
+            "does cache read-fill only — set_suppress_streaming_warm(True) — so a "
+            "cold non-library album returns no bandcamp_url and Backend-Service "
+            "synthesizes a bandcamp.com/search?q= fallback. When this is True "
+            "(AND-gated with LML_PERSIST_STREAMING_URLS and "
+            "LML_PERSIST_STREAMING_URL_BANDCAMP), a genuine Bandcamp miss on the "
+            "bulk path schedules the same bounded, off-response-path background "
+            "warm the interactive /lookup path uses, resolving the DIRECT album "
+            "URL and writing it to lml_cache.album_streaming_url_cache so "
+            "subsequent bulk lookups of the same (artist, album) read-fill it. "
+            "The triggering response still returns null (the warm is off the "
+            "response path). Default False so this ships DARK: Bandcamp is "
+            "rate-limited to 1 req/s and shares LML_STREAMING_WARM_CONCURRENCY "
+            "with the interactive path, so enabling it while the BS#642 backfill "
+            "drain is live could flood the limiter and starve interactive warms — "
+            "enable only after that drain completes, watching the "
+            "cache_miss_enqueued warm counters. Extends the #1052 bulk warm "
+            "(Spotify, rowless-only) to Bandcamp; #1052 deliberately kept the "
+            "bandcamp=None pin citing #548's near-zero runtime identity yield, "
+            "but a missing direct Bandcamp URL is a visible user-facing symptom "
+            "on brand-new/rotation plays. See WXYC/library-metadata-lookup#1052 "
+            "and #548."
+        ),
+    )
     # Streaming Webhook Configuration
     streaming_webhook_urls: str | None = Field(
         None,
