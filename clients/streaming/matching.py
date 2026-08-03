@@ -200,25 +200,36 @@ def _strip_catalog_number_bracket(title: str) -> str:
 _THE_PREFIX_RE = re.compile(r"^The\s+", re.IGNORECASE)
 
 
-# Bound on ``strip_format_suffix``'s fixed-point loop below. Four patterns
-# strip per pass, so real titles converge in 1-2 iterations even when
-# multiple tags are stacked; this just guards against pathological input
-# oscillating instead of converging.
-_MAX_FORMAT_SUFFIX_STRIP_ITERATIONS = 5
+# Bound on ``strip_format_suffix``'s fixed-point loop below. NOT a
+# correctness guard: each iteration either shrinks ``result`` by at least
+# one character (one of the four ``.sub("", ...)`` calls actually matched)
+# or leaves it byte-identical, which trips the loop's own ``break``. A
+# ``.sub("", ...)`` call can only ever remove characters, never add them, so
+# the loop is provably terminating on its own -- worst case bounded by
+# ``len(title)`` -- with no risk of oscillating instead of converging. This
+# cap exists purely as a defensive sanity bound against unforeseen input,
+# not because any particular pattern count needs it, so it's given generous
+# headroom rather than tuned to the minimum that covers today's known
+# suffix shapes. (LML#1069 follow-up: an earlier cap of 5 fully exhausted on
+# a real four-tag-deep stack -- "Title (Reissue) (Remaster)
+# (Deluxe Edition) [single] [EP] [KP006] LP" needs 8 iterations to fully
+# converge -- silently truncating the strip one layer short of done.)
+_MAX_FORMAT_SUFFIX_STRIP_ITERATIONS = 20
 
 
 def strip_format_suffix(title: str) -> str:
     """Remove trailing format indicators and parenthetical reissue tags from a library title.
 
     Loops the strip patterns to a fixed point (bounded by
-    ``_MAX_FORMAT_SUFFIX_STRIP_ITERATIONS``) rather than applying each once
-    in a straight line. Real Bandcamp ``og:title`` values stack multiple
-    trailing tags -- e.g. a catalog number plus a format word,
-    "Black Candy [KP006] LP" -- and every pattern here is anchored to the
-    end of the string, so an outer tag blocks an inner one's anchor until
-    the outer tag is stripped first. A single pass would leave
-    "Black Candy [KP006] LP" at "Black Candy [KP006]" (only the trailing
-    " LP" removed); looping cleans both.
+    ``_MAX_FORMAT_SUFFIX_STRIP_ITERATIONS``, see its comment for why that
+    bound is generous rather than tight) rather than applying each once in a
+    straight line. Real Bandcamp ``og:title`` values stack multiple trailing
+    tags -- e.g. a catalog number plus a format word, "Black Candy [KP006]
+    LP" -- and every pattern here is anchored to the end of the string, so
+    an outer tag blocks an inner one's anchor until the outer tag is
+    stripped first. A single pass would leave "Black Candy [KP006] LP" at
+    "Black Candy [KP006]" (only the trailing " LP" removed); looping cleans
+    both, and deeper stacks besides.
     """
     if not title:
         return title
