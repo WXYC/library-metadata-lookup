@@ -16,9 +16,12 @@ import pytest
 
 from streaming.models import SourceMatch, StreamingCheckSources
 from streaming.orchestrator import (
+    _BANDCAMP_STREAMING_CHECK_TIMEOUT_ENV_VAR,
     _BANDCAMP_STREAMING_CHECK_TIMEOUT_S,
     _DEFAULT_STREAMING_CHECK_TIMEOUT_S,
     _EXPECTED_SERVICE_FIELDS,
+    _STREAMING_CHECK_TIMEOUT_ENV_VAR,
+    _timeout_for,
     check_streaming_availability,
 )
 
@@ -241,6 +244,40 @@ def test_bandcamp_ceiling_looser_than_default():
     assert _DEFAULT_STREAMING_CHECK_TIMEOUT_S > 0
 
 
+def test_timeout_for_resolves_defaults(monkeypatch):
+    """LML#1081: absent an override or env var, `_timeout_for` wires Bandcamp to
+    its looser ceiling and every other service to the shared default.
+
+    Pins the resolution the async timeout tests never exercise (they all inject
+    an explicit `timeouts` override): a regression that dropped the Bandcamp
+    entry from `_STREAMING_CHECK_TIMEOUTS` — silently collapsing it to the 10s
+    default and defeating the fix's whole point — would trip here."""
+    monkeypatch.delenv(_STREAMING_CHECK_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.delenv(_BANDCAMP_STREAMING_CHECK_TIMEOUT_ENV_VAR, raising=False)
+
+    assert _timeout_for("bandcamp", None) == _BANDCAMP_STREAMING_CHECK_TIMEOUT_S
+    assert _timeout_for("spotify", None) == _DEFAULT_STREAMING_CHECK_TIMEOUT_S
+    assert _timeout_for("apple_music", None) == _DEFAULT_STREAMING_CHECK_TIMEOUT_S
+
+
+def test_timeout_for_reads_env(monkeypatch):
+    """LML#1081: both ceilings are tunable at request time via their env knobs
+    (integer ms → seconds), no redeploy — mirrors the Apple probe convention."""
+    monkeypatch.setenv(_STREAMING_CHECK_TIMEOUT_ENV_VAR, "2000")
+    monkeypatch.setenv(_BANDCAMP_STREAMING_CHECK_TIMEOUT_ENV_VAR, "30000")
+
+    assert _timeout_for("spotify", None) == 2.0
+    assert _timeout_for("bandcamp", None) == 30.0
+
+
+def test_timeout_for_explicit_override_beats_env(monkeypatch):
+    """LML#1081: an explicit `timeouts` entry (tests / future settings-threaded
+    tuning) wins over both the env knob and the static default."""
+    monkeypatch.setenv(_BANDCAMP_STREAMING_CHECK_TIMEOUT_ENV_VAR, "30000")
+
+    assert _timeout_for("bandcamp", {"bandcamp": 0.05}) == 0.05
+
+
 @pytest.mark.asyncio
 async def test_bandcamp_timeout_degrades_to_errored():
     """LML#1081: a Bandcamp leg that exceeds its ceiling degrades to
@@ -296,9 +333,12 @@ async def test_slow_bandcamp_does_not_block_other_services():
 
 
 @pytest.mark.asyncio
-async def test_default_ceiling_applies_to_non_bandcamp_services():
+async def test_timeout_override_generalizes_to_non_bandcamp_services():
     """LML#1081: the per-service ceiling generalizes — a stalled Spotify leg is
-    also cut off (via the default timeout override) and degrades to errored."""
+    also cut off (here via an explicit ``timeouts`` override, proving the
+    mechanism isn't Bandcamp-special) and degrades to errored. The *default*
+    (un-overridden) ceiling resolution is pinned separately in
+    ``test_timeout_for_resolves_defaults`` / ``test_timeout_for_reads_env``."""
     spotify = _SlowClient(delay=5.0)
 
     start = time.perf_counter()

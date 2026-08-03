@@ -10,6 +10,7 @@ from clients.bandcamp import BandcampClient
 from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.deezer import DeezerClient
 from clients.streaming.spotify import SpotifyClient
+from lookup.timeouts import probe_timeout_s_from_env
 from streaming.models import StreamingCheckResponse, StreamingCheckSources
 from streaming.service import CATALOG_CHECK_SERVICES
 
@@ -30,23 +31,41 @@ logger = logging.getLogger(__name__)
 # `lookup/streaming_url_postprocess._BANDCAMP_PROBE_TIMEOUT_S` pattern; on
 # timeout a service degrades to `errored_sources` (LML#376 "None = do not
 # persist / retry later"), never failing the whole request.
+#
+# The two defaults below are env-overridable at request time (no redeploy),
+# resolved via the shared `lookup.timeouts.probe_timeout_s_from_env` helper the
+# Apple probe already uses (integer-ms env var → seconds, with a WARN fallback
+# on unparseable/zero/negative). `LML_STREAMING_CHECK_TIMEOUT_MS` tunes the
+# non-Bandcamp legs; `LML_STREAMING_CHECK_BANDCAMP_TIMEOUT_MS` tunes Bandcamp —
+# the knob most likely to need widening under a real 429 storm.
 _DEFAULT_STREAMING_CHECK_TIMEOUT_S = 10.0
 _BANDCAMP_STREAMING_CHECK_TIMEOUT_S = 15.0
-_STREAMING_CHECK_TIMEOUTS: dict[str, float] = {
-    "bandcamp": _BANDCAMP_STREAMING_CHECK_TIMEOUT_S,
+_STREAMING_CHECK_TIMEOUT_ENV_VAR = "LML_STREAMING_CHECK_TIMEOUT_MS"
+_BANDCAMP_STREAMING_CHECK_TIMEOUT_ENV_VAR = "LML_STREAMING_CHECK_BANDCAMP_TIMEOUT_MS"
+# service -> (env var that overrides its ceiling, default seconds). A service
+# absent from the map uses the shared default env var + `_DEFAULT_..._S`.
+_STREAMING_CHECK_TIMEOUTS: dict[str, tuple[str, float]] = {
+    "bandcamp": (_BANDCAMP_STREAMING_CHECK_TIMEOUT_ENV_VAR, _BANDCAMP_STREAMING_CHECK_TIMEOUT_S),
 }
 
 
 def _timeout_for(service: str, overrides: Mapping[str, float] | None) -> float:
-    """Resolve the wall-clock ceiling for one `/streaming-check` service leg.
+    """Resolve the wall-clock ceiling (seconds) for one `/streaming-check` leg.
 
-    ``overrides`` (a caller-supplied per-service map, used by tests and any
-    future settings-threaded tuning) wins; otherwise the per-service default
-    from ``_STREAMING_CHECK_TIMEOUTS``, else ``_DEFAULT_STREAMING_CHECK_TIMEOUT_S``.
+    Resolution order: an explicit ``overrides`` entry (a caller-supplied
+    per-service map, used by tests and any future settings-threaded tuning)
+    wins; otherwise the per-service env var + default from
+    ``_STREAMING_CHECK_TIMEOUTS`` (Bandcamp), else the shared
+    ``_STREAMING_CHECK_TIMEOUT_ENV_VAR`` + ``_DEFAULT_STREAMING_CHECK_TIMEOUT_S``.
+    The env leg is read at call time via ``probe_timeout_s_from_env`` so the
+    ceiling is tunable without a redeploy.
     """
     if overrides is not None and service in overrides:
         return overrides[service]
-    return _STREAMING_CHECK_TIMEOUTS.get(service, _DEFAULT_STREAMING_CHECK_TIMEOUT_S)
+    env_var, default_s = _STREAMING_CHECK_TIMEOUTS.get(
+        service, (_STREAMING_CHECK_TIMEOUT_ENV_VAR, _DEFAULT_STREAMING_CHECK_TIMEOUT_S)
+    )
+    return probe_timeout_s_from_env(env_var, default_s)
 
 
 # Fail loudly at import time if the orchestrator's per-service kwargs ever
@@ -129,6 +148,12 @@ async def check_streaming_availability(
             strict=True,
         )
     )
+    # LML#1081: resolve each leg's wall-clock ceiling once, up front, so the
+    # task-creation timeout and the timeout-log message below can't drift (and
+    # the env read happens once per request, not per await).
+    ceilings: dict[str, float] = {
+        name: _timeout_for(name, timeouts) for name, client in clients.items() if client is not None
+    }
     # LML#1081: each leg is wrapped in `asyncio.wait_for` so a slow/429-stormed
     # service (Bandcamp especially) can't stall the whole request. wait_for
     # cancels the underlying coroutine on timeout, releasing its rate-limiter /
@@ -140,7 +165,7 @@ async def check_streaming_availability(
         name: asyncio.create_task(
             asyncio.wait_for(
                 client.find_album_match(artist, title),
-                timeout=_timeout_for(name, timeouts),
+                timeout=ceilings[name],
             )
         )
         for name, client in clients.items()
@@ -171,7 +196,7 @@ async def check_streaming_availability(
                 service,
                 artist,
                 title,
-                _timeout_for(service, timeouts),
+                ceilings[service],
             )
         except Exception:
             errored.add(service)
