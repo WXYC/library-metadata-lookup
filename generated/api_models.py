@@ -1969,6 +1969,17 @@ class AlbumMetadataResponse(BaseModel):
     youtubeMusicUrl: str | None = Field(None, description="YouTube Music search URL")
     bandcampUrl: str | None = Field(None, description="Bandcamp search URL")
     soundcloudUrl: str | None = Field(None, description="SoundCloud search URL")
+    discogsUnavailable: bool | None = Field(
+        None,
+        description="True when a music director has marked this release as not on Discogs; downstream render surfaces should suppress Discogs-derived artwork/links/tracklist. Mirrors the `Album` schema's MD-set marker (WXYC/wiki plans/rotation-discogs-unavailable.md).",
+    )
+    discogsUnavailableNote: constr(max_length=500) | None = Field(
+        None, description="Optional free-text reason for `discogsUnavailable`."
+    )
+    lastDiscogsRecheckAt: AwareDatetime | None = Field(
+        None,
+        description="Stamped on every recheck attempt by the\n`library-discogs-unavailable-recheck` cron. Read-only from the\nclient side.\n",
+    )
 
 
 class ArtistMetadataResponse(BaseModel):
@@ -2294,6 +2305,13 @@ class FlowsheetEntryResponse(FlowsheetEntryBase):
     artwork_url: str | None = None
     discogs_url: str | None = None
     release_year: int | None = None
+    discogsUnavailable: bool | None = Field(
+        None,
+        description='Rides the same MD-set "not on Discogs" flag as the Album surfaces (see `Album.discogsUnavailable`), non-nullable to match them. Deliberately camelCase — unlike its snake_case siblings in this block — to match Backend\'s `withDiscogsUnavailableCamelCase` serializer. Contract-first: the V2 flowsheet album embed will carry this field once the BS-emit piece (WXYC/Backend-Service#1908) lands; it is not emitted there yet.',
+    )
+    discogsUnavailableNote: constr(max_length=500) | None = Field(
+        None, description="Optional free-text reason for `discogsUnavailable`."
+    )
     spotify_url: str | None = None
     apple_music_url: str | None = None
     youtube_music_url: str | None = None
@@ -2457,6 +2475,17 @@ class AlbumSearchResult(BaseModel):
     artwork_url: str | None = Field(
         None,
         description="Album cover artwork URL from Discogs. Null if artwork has not been fetched yet or is unavailable.",
+    )
+    discogsUnavailable: bool | None = Field(
+        None,
+        description="MD-set marker indicating this release is intentionally not on\nDiscogs (embargoed promo, audience-segment release, etc.). When\ntrue, the LML runtime-lookup chokepoint does not attempt Discogs\nresolution for this release. See WXYC/wiki plans/rotation-discogs-unavailable.md.\n",
+    )
+    discogsUnavailableNote: constr(max_length=500) | None = Field(
+        None, description="Optional free-text reason for `discogsUnavailable`."
+    )
+    lastDiscogsRecheckAt: AwareDatetime | None = Field(
+        None,
+        description="Stamped on every recheck attempt by the\n`library-discogs-unavailable-recheck` cron. Read-only from the\nclient side.\n",
     )
     matched_via: list[TrackMatchHint] | None = Field(
         None,
