@@ -428,10 +428,29 @@ class UpdateAlbumRequest(BaseModel):
 
 
 class CatalogExportRow(BaseModel):
-    id: int
+    id: int = Field(
+        ...,
+        description="BS serial library.id — the existing on-device clone key for the iOS Spotlight consumer. NOT the library.db id: the library.db producer uses legacy_release_id instead (see below), so BS serials never leak into the tubafrenzy id space.\n",
+    )
+    legacy_release_id: int | None = Field(
+        None,
+        description="The library row's surrogate key (BS#1963), total in the database since the mint + NULL-legacy backfill. The Backend-sourced library.db producer (discogs-etl#351) emits this AS library.db's library.id.\nServer-side totality does NOT make it a required wire key: it is optional + nullable here so a client regenerated from this spec before BS#1965 ships still decodes the current 15-field body (see the schema description). The producer may treat a null/absent value as \"this Backend does not implement BS#1965 yet\" and fail loudly rather than emitting a library.db row with a null id.\n",
+    )
     artist_name: str = Field(
         ...,
         description="Authoritative artist name. The server COALESCEs the denormalized library.artist_name to artists.artist_name (NOT NULL), so this never ships as null even before the denormalization backfill completes.\n",
+    )
+    alternate_artist_name: str | None = Field(
+        None,
+        description="Secondary artist name curated by the librarians (library.alternate_artist_name); null when unset. Maps to library.db's alternate_artist_name column.\n",
+    )
+    album_artist: str | None = Field(
+        None,
+        description="Album-level artist (library.album_artist), distinct from the shelf-filing artist_name; null when unset. Maps to library.db's album_artist column. (Previously omitted from this export; re-added for the library.db producer.)\n",
+    )
+    cross_reference_names: list[str] | None = Field(
+        None,
+        description='Names of the artists cataloger-cross-referenced to this row\'s artist, in either FK direction, via artist_crossreference (discogs-etl#334) — e.g. a band filed under its name carries a member\'s personal name. Empty array when the artist has no cross-references.\nAn ARRAY, not the pipe-joined string library.db stores: the producer does the `" | "` join when it writes the SQLite column. The wire must not carry the delimiter, because nothing constrains artists.artist_name from containing "|" or " | " — a joined string would silently split into phantom aliases on the consumer side (library-metadata-lookup splits this field on the pipe) with no escaping rule to recover from, and the legacy MySQL source has the same latent bug plus GROUP_CONCAT\'s silent group_concat_max_len truncation. Array-on-the-wire retires both.\nDerivation (pinned, because the legacy query it replaces is load-bearing for the producer — LIBRARY_CODE_CROSS_REFERENCE in discogs-etl/scripts/sync-library.sh):\n  * BOTH FK directions — an artist_crossreference row matching on\n    either source_artist_id or target_artist_id contributes its\n    OTHER side.\n  * EXCLUDES the row\'s own artist (the legacy query\'s\n    `AND xlc.ID != lc.ID`). A self-referencing crossreference row\n    must not produce a self-alias — LML would match the artist\n    against itself.\n  * Deduplicated.\n  * Ordered by Unicode code point (Postgres `COLLATE "C"`), NOT the\n    database\'s default collation. en_US.UTF-8 ignores punctuation\n    and case at the primary level, so it orders the diacritic- and\n    punctuation-bearing names most likely to carry aliases (Nilüfer\n    Yanya, Csillagrablók, Hermanos Gutiérrez, "C. Spencer Yeh")\n    unstably across locales. The legacy GROUP_CONCAT has no ORDER BY\n    at all, so there is no legacy order to match — pick the\n    deterministic one.\n\nFRESHNESS CAVEAT — BS#1965 MUST land a trigger for this. This endpoint\'s conditional GET rides library_watermark, and artist_crossreference has NO touch_library_watermark trigger as of migration 0105 (which covers library, artists, genres, format, genre_artist_crossreference, rotation — not this table). Without a new trigger, adding a cross-reference does not advance the watermark, the per-watermark gzip cache is never rebuilt, and the producer 304s against a body that will never contain the new alias. Silent and unbounded, not a lag.\n',
     )
     album_title: str
     code_letters: str = Field(..., description='Shelf call-number letters (e.g. "AU").')
@@ -439,7 +458,10 @@ class CatalogExportRow(BaseModel):
     code_artist_number: int = Field(
         ..., description="Shelf call-number artist number (genre-scoped)."
     )
-    label: str | None = None
+    label: str | None = Field(
+        None,
+        description="Record label (library.label), projected as its real value — null only when the row genuinely has none. The library.db producer ignores it (the legacy MySQL export it must match has no label column), but every other consumer of this export should treat it as live data.\n",
+    )
     genre_name: str
     format_name: str
     on_streaming: bool | None = Field(
@@ -464,6 +486,20 @@ class CatalogExportRow(BaseModel):
     rotation_kill_date: date_aliased | None = Field(
         None,
         description="Date (YYYY-MM-DD; server ::text cast) the current rotation record expires, or null if it has none. Used with rotation_bin to evaluate live rotation client-side. Absent from AlbumSearchResult — a client that reuses AlbumSearchResult for this endpoint silently loses it.\n",
+    )
+
+
+class CatalogCompilationTrackRow(BaseModel):
+    legacy_release_id: int = Field(
+        ...,
+        description="The owning library row's legacy_release_id (BS#1963). Becomes library.db's compilation_track_artist.library_release_id, which joins to library.db's library.id.\n",
+    )
+    artist_name: constr(min_length=1, max_length=255) = Field(
+        ...,
+        description="Per-track performing artist (CTA.artist_name). Bounds mirror CompilationTrackInput and the underlying varchar(255) NOT NULL — the read and write shapes over the same physical column must not disagree about their own constraints, and the producer needs the width to size its SQLite column.\n",
+    )
+    track_title: constr(max_length=255) | None = Field(
+        None, description="Track title; nullable varchar(255), matching the CTA column."
     )
 
 
