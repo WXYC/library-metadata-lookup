@@ -31,6 +31,7 @@ from entity.sources import PgSource
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment import enrich_artwork_results
 from lookup.spine_deadline import SpineDeadline
+from lookup.streaming_url_postprocess import set_suppress_streaming_warm
 from streaming.models import SourceMatch
 from tests.factories import make_discogs_result, make_library_item
 
@@ -90,7 +91,22 @@ def _inputs(*, match_url: str | None = _BC_URL):
     return item, artwork, bandcamp
 
 
-async def _run(bandcamp, pg, item, artwork, *, album: str | None = _ALBUM, spine_deadline=None):
+async def _run(
+    bandcamp,
+    pg,
+    item,
+    artwork,
+    *,
+    album: str | None = _ALBUM,
+    spine_deadline=None,
+    suppress: bool = True,
+    entity_store=None,
+):
+    # The probe is BULK-path-only, gated on the warm-suppression ContextVar the
+    # bulk handler sets. Tests default to the bulk context (suppress=True); pass
+    # suppress=False to model the interactive /lookup path. conftest's autouse
+    # fixture resets the ContextVar between tests.
+    set_suppress_streaming_warm(suppress)
     return await enrich_artwork_results(
         [(item, artwork)],
         _discogs_service(),
@@ -98,12 +114,13 @@ async def _run(bandcamp, pg, item, artwork, *, album: str | None = _ALBUM, spine
         album=album,
         artist=_ARTIST,
         # apple_music=None isolates the Bandcamp leg from the Apple probe;
-        # entity_store=None keeps the streaming post-process inert so the only
-        # Bandcamp resolution is this ticket's inline probe.
+        # entity_store=None keeps the streaming post-process inert (returns {})
+        # so the only Bandcamp resolution is this ticket's inline probe — except
+        # the withhold-seam test, which passes a non-None store to exercise it.
         apple_music=None,
         bandcamp=bandcamp,
         discogs_cache_pg=pg,
-        entity_store=None,
+        entity_store=entity_store,
         spine_deadline=spine_deadline,
     )
 
@@ -306,3 +323,52 @@ class TestBandcampLiveProbe:
 
         assert 0.123 in captured_timeouts
         clamp.assert_called()
+
+    async def test_interactive_path_is_not_probed(self):
+        """The probe is BULK-path-only. On the interactive /lookup path (warm
+        NOT suppressed) it never runs — even with the flag on, the client
+        injected, and a cold album — so the synchronous probe stays off the hot
+        path (the #573/#651 regression guard). Without the suppression gate this
+        would call ``find_album_match`` synchronously on every interactive add.
+        """
+        item, artwork, bandcamp = _inputs()
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+
+        with patch("lookup.enrichment.item.get_settings", return_value=_flags()):
+            results = await _run(bandcamp, pg, item, artwork, suppress=False)
+
+        _, enriched = results[0]
+        bandcamp.find_album_match.assert_not_awaited()
+        assert enriched.bandcamp_url.startswith(_SEARCH_PREFIX)
+
+    async def test_withholds_bandcamp_client_from_postprocess_when_probe_runs(self):
+        """When the probe runs, ``enrich_one`` passes ``bandcamp=None`` to the
+        streaming post-process so the service isn't double-handled (redundant
+        warm) and its verdict isn't clobbered by ``postprocess_status``. With
+        the flag off, the client flows through unchanged. Uses a non-None
+        ``entity_store`` so the post-process is not the early-return no-op."""
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        spy = AsyncMock(return_value={})
+        entity_store = MagicMock()
+
+        # Probe on: the client is withheld (None) from the post-process.
+        item, artwork, bandcamp = _inputs()
+        with (
+            patch("lookup.enrichment.item.get_settings", return_value=_flags()),
+            patch("lookup.enrichment.item.apply_streaming_url_postprocess", spy),
+        ):
+            await _run(bandcamp, pg, item, artwork, entity_store=entity_store)
+        assert spy.await_args.kwargs["clients"]["bandcamp"] is None
+
+        # Probe off: the client flows through to the post-process unchanged.
+        spy.reset_mock()
+        item2, artwork2, bandcamp2 = _inputs()
+        with (
+            patch("lookup.enrichment.item.get_settings", return_value=_flags(live_probe=False)),
+            patch("lookup.enrichment.item.apply_streaming_url_postprocess", spy),
+        ):
+            await _run(bandcamp2, pg, item2, artwork2, entity_store=entity_store)
+        assert spy.await_args.kwargs["clients"]["bandcamp"] is bandcamp2

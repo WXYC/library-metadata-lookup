@@ -31,6 +31,7 @@ from config.settings import Settings
 from entity.streaming_url_cache import resolve_streaming_url_with_cache
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment.context import EnrichmentContext
+from lookup.streaming_url_postprocess import should_suppress_streaming_warm
 from lookup.timeouts import bandcamp_probe_timeout_s
 from streaming.service import ALBUM_CACHE_KEYS, StreamingService
 
@@ -74,12 +75,17 @@ async def run_bandcamp_live_probe(
     """Resolve a DIRECT Bandcamp album URL inline — bounded, cache-first.
 
     Runs only when every precondition holds:
+      * **the bulk enrichment path** — ``should_suppress_streaming_warm()`` is
+        set ``True`` only by the bulk handler (``router.py``), so it is the
+        reliable "am I on ``/lookup/bulk``" signal. The interactive ``/lookup``
+        path injects the same Bandcamp client and reads the same flag, so
+        without this gate a globally-set flag would run this synchronous probe
+        on the interactive hot path — the exact LML#573/#651 regression;
       * ``lml_bandcamp_live_probe`` on, AND-gated with the two persist
         kill-switches (``lml_persist_streaming_urls`` +
         ``lml_persist_streaming_url_bandcamp``) so an incident flip restores
         exactly today's behavior;
-      * a Bandcamp client and a PG source are wired (the bulk path injects the
-        client at ``router.py`` when the flag is on);
+      * a Bandcamp client and a PG source are wired;
       * the request carries an album (Bandcamp deep-links are album-level);
       * no verified URL already won the slot (a librarian override or the
         LML#505 sibling-invalidation left it empty) — we never overwrite a
@@ -95,10 +101,15 @@ async def run_bandcamp_live_probe(
     (LML#1094).
     """
     if not (
-        # ``getattr`` default mirrors ``apply_streaming_url_postprocess``'s
-        # flag reads: a partial Settings stub (or an incident that removes the
-        # field) reads as OFF, never an AttributeError on the enrichment path.
-        getattr(settings, "lml_bandcamp_live_probe", False)
+        # BULK-path-only gate FIRST (short-circuits the interactive path before
+        # any flag read): the interactive /lookup injects the same client and
+        # reads the same flag, so this ContextVar — set True only by the bulk
+        # handler — is what keeps the synchronous probe off the hot path.
+        should_suppress_streaming_warm()
+        # ``getattr`` default: the new field may be absent on a partial Settings
+        # stub (the two persist flags below are guaranteed on every stub that
+        # reaches enrichment), so read it defensively — never an AttributeError.
+        and getattr(settings, "lml_bandcamp_live_probe", False)
         and settings.lml_persist_streaming_urls
         and settings.lml_persist_streaming_url_bandcamp
         and ctx.bandcamp is not None
