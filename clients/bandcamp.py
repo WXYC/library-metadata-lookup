@@ -113,6 +113,34 @@ class BandcampRateLimitedError(Exception):
     """
 
 
+class BandcampTransportError(Exception):
+    """Raised by ``search_artist`` / ``fetch_artist_catalog`` / ``search_albums``
+    under ``fail_fast=True`` when the underlying ``_request_with_retry`` call
+    fails at the transport layer (network error, connect timeout) or returns
+    a non-200/non-429 response (5xx, Cloudflare 403/1015, etc.).
+
+    Distinct from both :class:`BandcampRateLimitedError` (a 429, a genuine
+    rate-limit shed) and a clean 200 response with no match: this is
+    "couldn't tell", not "asked, got nothing." Left unraised -- degrading to
+    ``None``/``[]`` the way the default (retrying) mode does -- it would be
+    indistinguishable from a real no-match, which under ``fail_fast`` would
+    let :meth:`clients.bandcamp_breaker.BandcampProbeBreaker.record_success`
+    declare a HALF_OPEN trial recovered while Bandcamp is still down, and
+    would let ``entity.streaming_url_cache.resolve_streaming_url_with_cache``
+    UPSERT a 7-day false-negative row (LML#1106 review, FIX 2).
+
+    Propagates through ``find_album_match``'s fail-fast wrapper, which
+    records it via ``record_aborted`` rather than ``record_success`` -- see
+    ``clients/bandcamp_breaker.py``'s module docstring for why a transport
+    failure shares that outcome with an unexpected raise instead of getting
+    its own breaker method (unlike ``discogs/breaker.py``'s
+    ``record_server_error``).
+
+    Only meaningful under ``fail_fast``: the default mode keeps its
+    pre-#1106 degrade-to-``None``/``[]`` behavior unchanged.
+    """
+
+
 class BandcampSearchUnavailableError(Exception):
     """Raised by ``find_album_match_via_search`` when the album-autocomplete
     request failed after retries (network error, non-200, or exhausted 429
@@ -331,9 +359,25 @@ class BandcampClient(BaseStreamingClient):
         (``BandcampBreakerOpenError``) before touching the network at all. A
         429 that does reach the network raises ``BandcampRateLimitedError``
         (propagated, not swallowed to ``None``) so the caller can't confuse a
-        shed with a genuine no-match. The breaker records the outcome of the
-        WHOLE call (shed / success / aborted), matching the guardrail that a
-        fail-fast caller issues effectively one live attempt per item.
+        shed with a genuine no-match. A non-429 transport failure (5xx,
+        Cloudflare 403/1015, connect timeout, non-200 -- raised by
+        ``search_artist`` / ``fetch_artist_catalog`` / ``search_albums`` as
+        :class:`BandcampTransportError`) is likewise propagated rather than
+        degrading to a clean ``None``: it is recorded as an aborted call, not
+        a success, so it can neither declare a HALF_OPEN trial recovered nor
+        let ``resolve_streaming_url_with_cache`` UPSERT a false-negative row
+        for it (LML#1106 review, FIX 2 -- see ``clients/bandcamp_breaker.py``'s
+        module docstring for why this shares ``record_aborted`` with an
+        unexpected raise).
+
+        Every exit from the fail-fast call -- success, a shed, a transport
+        error, an unexpected raise, or a cancellation (``asyncio.
+        CancelledError``, a ``BaseException`` and the designed timeout
+        mechanism for this mode, #1098) -- records exactly one terminal
+        breaker outcome via a ``try/finally`` guard, so none of them can
+        strand a HALF_OPEN trial the way a bare ``except Exception`` (which
+        ``CancelledError`` does not match) used to (LML#1106 review, FIX 1;
+        mirrors ``discogs.admission.admit_or_shed``'s LML#787 ``finally``).
         """
         if not fail_fast:
             return await self._find_album_match_impl(artist, title, fail_fast=False)
@@ -341,17 +385,32 @@ class BandcampClient(BaseStreamingClient):
         breaker = get_bandcamp_probe_breaker()
         epoch = breaker.allow_request()
         if epoch is None:
-            raise BandcampBreakerOpenError()
+            raise BandcampBreakerOpenError(f"Bandcamp fail-fast breaker open: {artist} - {title}")
+
+        recorded = False
         try:
             result = await self._find_album_match_impl(artist, title, fail_fast=True)
         except BandcampRateLimitedError:
             breaker.record_shed(epoch=epoch)
+            recorded = True
             raise
-        except Exception:
+        except BandcampTransportError:
             breaker.record_aborted(epoch=epoch)
+            recorded = True
             raise
-        breaker.record_success(epoch=epoch)
-        return result
+        else:
+            breaker.record_success(epoch=epoch)
+            recorded = True
+            return result
+        finally:
+            # LML#1106 review FIX 1: any exit neither branch above named --
+            # an unexpected raise, or a cancellation escaping both `except`
+            # clauses (``CancelledError`` is a ``BaseException``) -- still
+            # records a terminal outcome exactly once, so it can't strand a
+            # HALF_OPEN trial or silently skip resetting the CLOSED-state
+            # failure run the way an unrecorded exit used to.
+            if not recorded:
+                breaker.record_aborted(epoch=epoch)
 
     async def _find_album_match_impl(
         self, artist: str, title: str, *, fail_fast: bool
@@ -368,8 +427,13 @@ class BandcampClient(BaseStreamingClient):
                 best_artist = result
                 best_artist_score = s
         if best_artist is not None:
-            # A fetch failure (None) is treated as "no catalog" for the live
-            # match path -- there is no retry loop here, so it degrades to no match.
+            # Default mode: a fetch failure (None) is treated as "no catalog"
+            # for the live match path -- there is no retry loop here, so it
+            # degrades to no match. Under fail_fast, ``fetch_artist_catalog``
+            # instead raises ``BandcampTransportError`` on a transport
+            # failure (LML#1106 review, FIX 2) -- that propagates straight
+            # out of this method, uncaught here, to ``find_album_match``'s
+            # breaker wrapper.
             catalog = (
                 await self.fetch_artist_catalog(best_artist["slug"], fail_fast=fail_fast) or []
             )
@@ -398,6 +462,12 @@ class BandcampClient(BaseStreamingClient):
 
         Returns list of dicts with keys: name, url, slug.
         Only returns band results (type "b").
+
+        ``fail_fast=True`` (LML#1106, FIX 2): a non-200 response or a
+        network-layer failure raises :class:`BandcampTransportError` instead
+        of degrading to ``[]`` -- an empty list must mean "asked, no artists
+        matched", not "couldn't ask". The default mode's degrade-to-``[]``
+        behavior is unchanged.
         """
         resp = await self._request_with_retry(
             "GET",
@@ -407,6 +477,8 @@ class BandcampClient(BaseStreamingClient):
             fail_fast=fail_fast,
         )
         if resp is None or resp.status_code != 200:
+            if fail_fast:
+                raise BandcampTransportError(AUTOCOMPLETE_URL)
             return []
 
         data = resp.json()
@@ -433,17 +505,23 @@ class BandcampClient(BaseStreamingClient):
 
         Returns a list of dicts with keys ``url``, ``title`` (deduplicated by
         URL) on a successful fetch -- possibly empty if the page has no album
-        links. Returns ``None`` on a fetch failure (network error, timeout,
-        non-200, or 429 after retries), which callers must NOT treat as a
-        definitively-empty catalog: an empty list means "the artist has no
-        releases" while ``None`` means "we couldn't tell" and should be retried
-        rather than recorded as a final result (#661).
+        links. In the default mode, returns ``None`` on a fetch failure
+        (network error, timeout, non-200, or 429 after retries), which
+        callers must NOT treat as a definitively-empty catalog: an empty list
+        means "the artist has no releases" while ``None`` means "we couldn't
+        tell" and should be retried rather than recorded as a final result
+        (#661). Under ``fail_fast=True`` (LML#1106, FIX 2), that same
+        transport failure instead raises :class:`BandcampTransportError` --
+        see ``search_artist`` for why a raise, not ``None``, is required
+        there.
         """
         url = f"https://{slug}.bandcamp.com/music"
         resp = await self._request_with_retry(
             "GET", url, timeout=15.0, follow_redirects=True, fail_fast=fail_fast
         )
         if resp is None or resp.status_code != 200:
+            if fail_fast:
+                raise BandcampTransportError(url)
             return None
 
         # Bandcamp serves UTF-8 but its Content-Type often omits `charset=`;
@@ -495,8 +573,10 @@ class BandcampClient(BaseStreamingClient):
         durably recording a blip as ``not_found``.
 
         Returns a list of dicts with keys ``artist``, ``title``, ``url``
-        (de-doubled via ``fix_autocomplete_url``) on success, or ``None`` on
-        fetch failure.
+        (de-doubled via ``fix_autocomplete_url``) on success, or (default
+        mode) ``None`` on fetch failure. Under ``fail_fast=True`` (LML#1106,
+        FIX 2), that same failure instead raises
+        :class:`BandcampTransportError` -- see ``search_artist`` for why.
         """
         resp = await self._request_with_retry(
             "GET",
@@ -506,6 +586,8 @@ class BandcampClient(BaseStreamingClient):
             fail_fast=fail_fast,
         )
         if resp is None or resp.status_code != 200:
+            if fail_fast:
+                raise BandcampTransportError(AUTOCOMPLETE_URL)
             return None
 
         data = resp.json()
@@ -541,12 +623,18 @@ class BandcampClient(BaseStreamingClient):
         ``normalize_bc_title`` for the near-miss corpus this recovers).
 
         Raises:
-            BandcampSearchUnavailableError: the autocomplete request failed
-                after retries (see ``search_albums``). Offline callers
-                should catch this to avoid a durable not_found write on a
-                transient blip; the live runtime path (PR2) is expected to
-                catch it and degrade to "no match" like any other adapter
-                failure.
+            BandcampSearchUnavailableError: default mode only -- the
+                autocomplete request failed after retries (see
+                ``search_albums``). Offline callers should catch this to
+                avoid a durable not_found write on a transient blip; the live
+                runtime path (PR2) is expected to catch it and degrade to
+                "no match" like any other adapter failure.
+            BandcampTransportError: ``fail_fast=True`` only (LML#1106, FIX
+                2) -- ``search_albums`` raises this directly on the same
+                underlying failure instead of returning ``None``, so it
+                propagates from here uncaught (``results`` is never ``None``
+                under ``fail_fast``, so the ``BandcampSearchUnavailableError``
+                branch below is unreachable in that mode).
         """
         query = f"{artist} {clean_title_for_query(title)}".strip()
         results = await self.search_albums(query, fail_fast=fail_fast)

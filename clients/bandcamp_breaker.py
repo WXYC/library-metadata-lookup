@@ -14,7 +14,7 @@ plumbing with no production caller yet: the synchronous enrichment-path live
 probe that will consume them is a separate piece of work (LML#1098). Nothing
 here is reachable in production until that probe exists and is wired up.
 
-Two shapes are trimmed relative to the Discogs breaker, because Bandcamp's
+Three shapes are trimmed relative to the Discogs breaker, because Bandcamp's
 signal is simpler:
 
 - No proactive "remaining" floor -- Bandcamp 429 responses carry no
@@ -24,14 +24,45 @@ signal is simpler:
   attempt per underlying HTTP call), so "failed request" and "failed
   attempt" are the same thing here, unlike the Discogs breaker's
   request-vs-attempt distinction.
+- No separate server-error outcome -- the Discogs reference resolves a 5xx
+  trial through its own neutral ``record_server_error`` (does not reset the
+  consecutive run, does not close a HALF_OPEN trial, re-OPENs on an epoch
+  match), kept distinct from ``record_aborted``'s "unexpected raise" case.
+  Bandcamp draws no such distinction: ``clients/bandcamp.py``'s fail-fast
+  wrapper routes ``BandcampTransportError`` (raised by ``search_artist`` /
+  ``fetch_artist_catalog`` / ``search_albums`` under ``fail_fast`` for a
+  non-200/non-429 response or a network-layer failure) through the SAME
+  :meth:`BandcampProbeBreaker.record_aborted` call an unexpected raise uses
+  -- with no proactive floor to differ on, the two outcomes are already
+  behaviorally identical here (LML#1106 review).
 
 The HALF_OPEN watchdog exists for the same reason LML#787 added one to the
 Discogs breaker: a trial that dies without recording a terminal outcome must
-not latch HALF_OPEN forever (shedding every subsequent call). Its floor is
-lower than the Discogs breaker's 60s (``_WATCHDOG_FLOOR_SECONDS`` there)
-because a fail-fast trial makes exactly one attempt with no inline retry
-backoff, so it resolves (or is definitively lost) far sooner than a Discogs
-request's worst-case retry-and-backoff sequence.
+not latch HALF_OPEN forever (shedding every subsequent call). Its floor
+(``_WATCHDOG_FLOOR_SECONDS``, 30s) is lower than the Discogs breaker's 60s
+because a fail-fast trial makes exactly one attempt per underlying HTTP call
+with no inline retry backoff, so it resolves (or is definitively lost) far
+sooner than a Discogs request's worst-case retry-and-backoff sequence -- but
+the floor only binds the window at production's cool-down when the
+multiplier is small enough to let it through (``floor / cooldown`` -- at the
+shipped 20s cool-down and 2.5 multiplier, that means a cool-down below 1.5s);
+size the multiplier against the worst-case TRIAL, not the floor, for the
+window that actually governs production (LML#1106 review, FIX 6 -- a stale
+multiplier of 10.0, inherited from the Discogs reference's own default
+without re-deriving it for Bandcamp's much shorter trial, produced a 200s
+window here against a ~35-40s worst case, a ~5x overshoot).
+
+Worst case for one fail-fast trial: ``_find_album_match_impl`` makes up to
+three sequential HTTP calls, each a single attempt bounded by its own httpx
+timeout -- ``search_artist`` (10s), ``fetch_artist_catalog`` (15s, only when
+an artist matched), and the ``find_album_match_via_search`` fallback's
+``search_albums`` (10s) -- for a ~35s ceiling before scoring/parsing
+overhead, budgeted up to ~40s. At the shipped cool-down (20s) and
+``_DEFAULT_TRIAL_WATCHDOG_MULTIPLIER`` (2.5), the watchdog window is
+``max(20 * 2.5, 30) = 50s``: comfortably above the ~35-40s worst case (a
+margin proportionate to the one the Discogs breaker keeps over ITS own
+worst-case trial -- see that module's docstring) without the ~5x overshoot
+the inherited multiplier of 10 produced here.
 
 Concurrency / scope: like the Discogs breaker, state transitions are
 synchronous and cheap, so a plain object with no lock is safe under asyncio's
@@ -56,7 +87,11 @@ _WATCHDOG_FLOOR_SECONDS = 30.0
 
 _DEFAULT_FAILURE_THRESHOLD = 3
 _DEFAULT_COOLDOWN_SECONDS = 20.0
-_DEFAULT_TRIAL_WATCHDOG_MULTIPLIER = 10.0
+# LML#1106 review FIX 6: retuned from the Discogs-inherited 10.0 (a 200s
+# window against a ~35-40s worst-case trial, a ~5x overshoot) down to 2.5 --
+# see the module docstring's watchdog section for the worst-case-trial
+# derivation this tracks (``max(20 * 2.5, 30) = 50s``).
+_DEFAULT_TRIAL_WATCHDOG_MULTIPLIER = 2.5
 
 
 class BandcampBreakerState(StrEnum):
@@ -230,6 +265,7 @@ def _build_breaker() -> BandcampProbeBreaker:
     return BandcampProbeBreaker(
         failure_threshold=_DEFAULT_FAILURE_THRESHOLD,
         cooldown_seconds=_DEFAULT_COOLDOWN_SECONDS,
+        trial_watchdog_multiplier=_DEFAULT_TRIAL_WATCHDOG_MULTIPLIER,
     )
 
 

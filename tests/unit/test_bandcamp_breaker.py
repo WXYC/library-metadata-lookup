@@ -18,7 +18,12 @@ shared with ``test_discogs_breaker.py`` via ``tests/unit/conftest.py``.
 
 from __future__ import annotations
 
-from clients.bandcamp_breaker import BandcampBreakerState, BandcampProbeBreaker
+from clients.bandcamp_breaker import (
+    _DEFAULT_COOLDOWN_SECONDS,
+    _DEFAULT_TRIAL_WATCHDOG_MULTIPLIER,
+    BandcampBreakerState,
+    BandcampProbeBreaker,
+)
 
 
 def _breaker(clock, **kwargs) -> BandcampProbeBreaker:
@@ -115,12 +120,67 @@ class TestHalfOpenResolution:
         breaker.record_success(epoch=epoch - 1)
         assert breaker.state is BandcampBreakerState.HALF_OPEN
 
+    def test_stale_epoch_shed_is_ignored(self, clock):
+        # LML#1106 review FIX 5: record_shed carries the identical
+        # epoch-match guard as record_success (bandcamp_breaker.py:181-184),
+        # but nothing previously pinned it -- inverting or deleting that
+        # guard left the whole file green.
+        breaker, epoch = _to_half_open(clock, failure_threshold=1)
+        # A shed from a superseded trial must not decide the current one.
+        breaker.record_shed(epoch=epoch - 1)
+        assert breaker.state is BandcampBreakerState.HALF_OPEN
+
+    def test_stale_epoch_aborted_is_ignored(self, clock):
+        # LML#1106 review FIX 5: same shape as the shed guard above, for
+        # record_aborted's epoch-match guard (bandcamp_breaker.py:199-204).
+        breaker, epoch = _to_half_open(clock, failure_threshold=1)
+        # An abort from a superseded trial must not decide the current one.
+        breaker.record_aborted(epoch=epoch - 1)
+        assert breaker.state is BandcampBreakerState.HALF_OPEN
+
 
 class TestHalfOpenWatchdog:
     def test_stranded_trial_reopens_after_watchdog_window(self, clock):
         breaker, _epoch = _to_half_open(clock, failure_threshold=1, cooldown_seconds=1.0)
         # cooldown=1.0 -> watchdog floor of 30s dominates the multiplier.
         clock.advance(30.0)
+        assert breaker.allow_request() is None
+        assert breaker.state is BandcampBreakerState.OPEN
+
+
+class TestHalfOpenWatchdogProductionConfig:
+    """LML#1106 review FIX 6: the only pre-existing watchdog test (above)
+    drives an artificially tiny cool-down (1.0s) that exercises the 30s
+    FLOOR branch exclusively -- a branch ``_build_breaker()``'s real 20s
+    cool-down can never take (``20 * 2.5 = 50 > 30``). These construct the
+    breaker from the SAME module constants ``_build_breaker()`` uses (not
+    hand-copied literals), and pin the window those constants are expected
+    to produce (50s) -- so either a regression to the constants' VALUES
+    (e.g. back to the Discogs-inherited multiplier of 10.0, a 200s window
+    against a ~35-40s worst-case trial) or a change to the watchdog FORMULA
+    itself is caught."""
+
+    def test_trial_survives_within_the_production_watchdog_window(self, clock):
+        assert _DEFAULT_COOLDOWN_SECONDS * _DEFAULT_TRIAL_WATCHDOG_MULTIPLIER == 50.0
+        breaker, _epoch = _to_half_open(
+            clock,
+            failure_threshold=1,
+            cooldown_seconds=_DEFAULT_COOLDOWN_SECONDS,
+            trial_watchdog_multiplier=_DEFAULT_TRIAL_WATCHDOG_MULTIPLIER,
+        )
+        clock.advance(49.0)  # window = 20 * 2.5 = 50s
+        assert breaker.allow_request() is None
+        assert breaker.state is BandcampBreakerState.HALF_OPEN
+
+    def test_stranded_trial_reopens_after_the_production_watchdog_window(self, clock):
+        assert _DEFAULT_COOLDOWN_SECONDS * _DEFAULT_TRIAL_WATCHDOG_MULTIPLIER == 50.0
+        breaker, _epoch = _to_half_open(
+            clock,
+            failure_threshold=1,
+            cooldown_seconds=_DEFAULT_COOLDOWN_SECONDS,
+            trial_watchdog_multiplier=_DEFAULT_TRIAL_WATCHDOG_MULTIPLIER,
+        )
+        clock.advance(51.0)
         assert breaker.allow_request() is None
         assert breaker.state is BandcampBreakerState.OPEN
 

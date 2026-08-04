@@ -21,11 +21,14 @@ PG and the streaming client are mocked. Integration tests cover the SQL.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
+from clients.bandcamp import BandcampClient
+from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.base import BaseStreamingClient
+from clients.streaming.spotify import SpotifyClient
 from entity.sources import PgSource
 from entity.streaming_url_cache import ResolveOutcome, resolve_streaming_url_with_cache
 from streaming.models import SourceMatch
@@ -285,3 +288,77 @@ class TestResolveStreamingURLWithCacheFailFast:
 
         assert outcome == ResolveOutcome(url=None, source="live_miss")
         pg.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+class TestResolveStreamingURLWithCacheFailFastClientShape:
+    """LML#1106 review finding 4: ``fail_fast`` is accepted ONLY by
+    ``BandcampClient`` -- ``clients/streaming/base.py``'s ``find_album_match``
+    and every other concrete client (Apple Music, Spotify, YouTube Music,
+    Deezer) take no ``**kwargs``. The ``AsyncMock(spec=BaseStreamingClient)``
+    doubles ``TestResolveStreamingURLWithCacheFailFast`` uses above restrict
+    attribute NAMES only -- child mocks accept any call signature -- so
+    ``test_live_call_forwards_fail_fast_kwarg`` there certifies green
+    precisely the two combinations (apple_music_album, spotify_album) that
+    raise ``TypeError`` in production, while Bandcamp itself is never
+    exercised. These use signature-checked doubles (``create_autospec``) to
+    close that gap: one pin that the ONE real combination that works keeps
+    working, and one pin that the others fail loudly with no cache write
+    (the current, verified behavior) instead of only "passing" a call shape
+    that was never real.
+    """
+
+    async def test_live_call_forwards_fail_fast_kwarg_to_bandcamp_client(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        client = create_autospec(BandcampClient, instance=True)
+        client.find_album_match.return_value = _match("https://x.bandcamp.com/album/y")
+
+        outcome = await resolve_streaming_url_with_cache(
+            pg,
+            client,
+            service="bandcamp",
+            artist="Autechre",
+            album="Confield",
+            fail_fast=True,
+        )
+
+        assert outcome.source == "live_resolved"
+        assert outcome.url == "https://x.bandcamp.com/album/y"
+        client.find_album_match.assert_awaited_once_with("Autechre", "Confield", fail_fast=True)
+        pg.execute.assert_awaited_once()
+        assert pg.execute.await_args.args[1] == "bandcamp"
+
+    @pytest.mark.parametrize(
+        ("service", "client_class"),
+        [
+            ("apple_music_album", AppleMusicClient),
+            ("spotify_album", SpotifyClient),
+        ],
+    )
+    async def test_fail_fast_with_a_non_bandcamp_client_fails_loudly_no_cache_write(
+        self, service, client_class
+    ):
+        # create_autospec validates the call signature against the REAL
+        # class -- none of these clients' find_album_match accepts
+        # fail_fast, so the call itself raises TypeError before anything is
+        # awaited. resolve_streaming_url_with_cache's fail_fast branch
+        # re-raises (rather than swallowing to live_error), so this
+        # surfaces loudly, with no cache write either way.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock()
+        client = create_autospec(client_class, instance=True)
+
+        with pytest.raises(TypeError, match="fail_fast"):
+            await resolve_streaming_url_with_cache(
+                pg,
+                client,
+                service=service,
+                artist="Autechre",
+                album="Confield",
+                fail_fast=True,
+            )
+
+        pg.execute.assert_not_called()
