@@ -3,12 +3,66 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar, Token
 
 import httpx
 from aiolimiter import AsyncLimiter
 from wxyc_fastapi.http import async_singleton
 
 from streaming.models import SourceMatch
+
+# LML#1108: an absolute ``time.monotonic()`` deadline for the CURRENT
+# background streaming-URL warm probe, set by
+# ``lookup.streaming_url_postprocess._warm_streaming_url_cache`` right before
+# its ``asyncio.wait_for`` call and reset in a ``finally`` immediately after.
+# Any streaming client's own retry/backoff loop MAY read it (via
+# :func:`get_probe_deadline`) to bound an inter-attempt sleep against the
+# caller's actual remaining budget instead of a fixed attempt-count ceiling
+# blind to it -- mirroring ``discogs.service._retry_budget_deadline_var`` /
+# ``discogs.admission.retry_429``'s ``budget_deadline`` parameter, LML#758.
+#
+# ``SpotifyClient`` is the first (and, as of #1108, only) reader: its 429
+# handler's ``Retry-After`` sleep has a floor around 5s while the warm
+# probe's wall-clock ceiling defaults to 4s, so every warm-path 429 sleep was
+# guaranteed to be cancelled mid-flight by the enclosing ``wait_for``
+# (LIBRARY-METADATA-LOOKUP-1B: 33k+ occurrences) -- wasting the full ceiling
+# on a sleep that could never complete, and holding the warm-concurrency
+# semaphore permit for that whole span. Reading this deadline lets the sleep
+# give up immediately instead. ``None`` outside a warm probe (interactive
+# `/lookup`, offline scripts, any client that never opts in) -- retry loops
+# must treat ``None`` as "no deadline, fall back to the pre-existing
+# attempt-count-only bound," the same contract ``retry_429`` documents.
+#
+# Living here (not in ``clients/streaming/spotify.py``) rather than a
+# Spotify-only module lets any streaming client opt in the same way, without
+# ``lookup/streaming_url_postprocess.py`` needing to import a client-specific
+# setter for a module that otherwise treats every service uniformly through
+# the shared ``BaseStreamingClient`` contract.
+_probe_deadline_var: ContextVar[float | None] = ContextVar(
+    "lml_streaming_probe_deadline", default=None
+)
+
+
+def set_probe_deadline(deadline: float | None) -> Token:
+    """Set the active background-warm-probe deadline; returns a reset token.
+
+    ``deadline`` is an absolute ``time.monotonic()`` value, not a duration.
+    Callers must ``reset_probe_deadline(token)`` in a ``finally`` so the
+    deadline doesn't leak into whatever runs next in the same task, mirroring
+    ``discogs.service.set_retry_budget_deadline``.
+    """
+    return _probe_deadline_var.set(deadline)
+
+
+def reset_probe_deadline(token: Token) -> None:
+    """Undo :func:`set_probe_deadline`; see its docstring."""
+    _probe_deadline_var.reset(token)
+
+
+def get_probe_deadline() -> float | None:
+    """The active background-warm-probe deadline (an absolute
+    ``time.monotonic()`` value), or ``None`` when no probe deadline is active."""
+    return _probe_deadline_var.get()
 
 
 class BaseStreamingClient:

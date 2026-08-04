@@ -49,6 +49,14 @@ whose client is present in ``clients``, this:
   explicit lesson of the Bandcamp hot-path regression. The per-service
   wall-clock ceiling (``_effective_probe_timeout_s``, env-overridable for Apple)
   still wraps the probe inside the task.
+* **Depth-bounded + deadline-aware** (LML#1108, see
+  ``lookup.streaming_warm_admission``) — the semaphore bounds *concurrency*,
+  not pending depth: an enqueue past a small multiple of it is SHED (still
+  ``unresolved``, but a distinct Sentry outcome + cache-stats counter). The
+  warm also arms ``clients.streaming.base.set_probe_deadline`` with the SAME
+  deadline ``wait_for`` enforces, so a client's own retry loop
+  (``SpotifyClient``'s 429 handler) can give up a doomed sleep instead of
+  being cancelled mid-sleep.
 * **No Sentry tag** — the request scope has closed by the time a warm finishes,
   so a tag on the active scope would mis-attribute to the next request (the same
   reason ``lookup.enrichment.background._warm_bio_cache`` sets none). The warm logs its
@@ -57,10 +65,10 @@ whose client is present in ``clients``, this:
 Sentry on the hot path projects, per active service:
 
 * ``streaming_url.persistent_lookup.fired.<service>`` — "post-process ran".
-* ``streaming_url.persistent_lookup.<outcome>.<service>`` where ``<outcome>`` is
-  one of ``cache_hit`` / ``cache_miss_recent`` / ``cache_miss_enqueued`` /
-  ``cache_miss_unwarmed`` — the hot-path disposition (filled, known-miss,
-  warm-scheduled, or warm-suppressed-on-bulk).
+* ``streaming_url.persistent_lookup.<outcome>.<service>`` — one of
+  ``cache_hit`` / ``cache_miss_recent`` / ``cache_miss_enqueued`` /
+  ``cache_miss_unwarmed`` / ``cache_miss_shed`` (filled, known-miss,
+  warm-scheduled, warm-suppressed-on-bulk, or warm-shed-at-depth-bound).
 
 Side effects degrade gracefully: PG errors swallow inside the cache layer; mint
 failures log and continue; Sentry projection errors log and continue; the
@@ -73,6 +81,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -82,7 +91,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import sentry_sdk
 from wxyc_etl.text import to_match_form
 
-from clients.streaming.base import BaseStreamingClient
+from clients.streaming.base import BaseStreamingClient, reset_probe_deadline, set_probe_deadline
 from core.search import resolve_positive_int_env
 from entity.sources import PgSource
 from entity.store import EntityStore
@@ -93,6 +102,7 @@ from entity.streaming_url_cache import (
 )
 from generated.api_models import StreamingResolutionStatus
 from identity.release_validation import validate_and_canonicalize_external_id
+from lookup import streaming_warm_admission
 from lookup.timeouts import APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, probe_timeout_s_from_env
 from release.apple_music_url_parser import apple_album_id_from_url
 from release.bandcamp_url_parser import bandcamp_album_id_from_url
@@ -119,11 +129,20 @@ _streaming_warm_semaphore: asyncio.Semaphore | None = None
 the env at construction time lets ``resolve_positive_int_env`` honor a runtime
 override without an import-time read."""
 
+_streaming_warm_concurrency: int = _STREAMING_WARM_CONCURRENCY_DEFAULT
+"""Mirrors the semaphore's resolved size (LML#1108); the semaphore's own
+``_value`` decreases as permits are acquired so can't recover the ORIGINAL
+size. Feeds ``streaming_warm_admission.queue_depth_bound``."""
+
+# Re-exported for this module's callers/tests; see streaming_warm_admission.
+STREAMING_WARM_DEPTH_SHED_STAT_KEY = streaming_warm_admission.DEPTH_SHED_STAT_KEY
+
 _streaming_warm_in_flight: set[tuple[str, str, str]] = set()
 """Process-global dedup set, keyed ``(service, to_match_form(artist),
 to_match_form(album))``. A key present here means an identical warm is already
 scheduled or running, so a second miss skips enqueueing. NOT request-scoped —
-two cold lookups on different request tasks dedup to one probe."""
+two cold lookups on different request tasks dedup to one probe. Its size IS
+the pending-plus-running warm count the LML#1108 depth bound reads directly."""
 
 _background_tasks: set[asyncio.Task] = set()
 """Strong refs to fire-and-forget warm tasks. ``asyncio.create_task`` returns a
@@ -469,10 +488,12 @@ async def apply_streaming_url_postprocess(
             # mint to a bounded, deduplicated background task. The response
             # returns without this service's URL; the warm fills the cache for
             # next time — so this request's verdict is transient, not terminal.
-            _enqueue_streaming_warm(
+            enqueued = _enqueue_streaming_warm(
                 storage_key, cfg, client, pg, entity_store, request_artist, request_album
             )
-            _project_sentry(storage_key, "cache_miss_enqueued")
+            _project_sentry(storage_key, "cache_miss_enqueued" if enqueued else "cache_miss_shed")
+            # A shed (LML#1108) is transient, not terminal, so it gets the
+            # same "couldn't confirm" verdict as a healthy enqueue.
             statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
 
     return statuses
@@ -493,17 +514,28 @@ def _get_streaming_warm_semaphore() -> asyncio.Semaphore:
     """Lazily build the process-global warm semaphore on the running loop.
 
     Sized from ``LML_STREAMING_WARM_CONCURRENCY`` (read once, at first
-    construction). Mirrors ``lookup.enrichment.background._warm_cache_semaphore``'s lazy build
-    but reads the env so the bound is a no-redeploy Railway lever.
+    construction). Mirrors ``lookup.enrichment.background._warm_cache_semaphore``'s
+    lazy build but reads the env so the bound is a no-redeploy Railway lever.
+    Also resolves ``_streaming_warm_concurrency`` (LML#1108) in the same
+    breath, so the two never disagree.
     """
-    global _streaming_warm_semaphore
+    global _streaming_warm_semaphore, _streaming_warm_concurrency
     if _streaming_warm_semaphore is None:
-        _streaming_warm_semaphore = asyncio.Semaphore(
-            resolve_positive_int_env(
-                _STREAMING_WARM_CONCURRENCY_ENV_VAR, _STREAMING_WARM_CONCURRENCY_DEFAULT
-            )
+        _streaming_warm_concurrency = resolve_positive_int_env(
+            _STREAMING_WARM_CONCURRENCY_ENV_VAR, _STREAMING_WARM_CONCURRENCY_DEFAULT
         )
+        _streaming_warm_semaphore = asyncio.Semaphore(_streaming_warm_concurrency)
     return _streaming_warm_semaphore
+
+
+def _streaming_warm_queue_depth_bound() -> int:
+    """The pending-plus-running warm depth bound (LML#1108); see
+    ``lookup.streaming_warm_admission.queue_depth_bound`` for the policy.
+    Forces semaphore resolution first so an unwarmed caller still sees the
+    REAL configured concurrency, not the module-level default.
+    """
+    _get_streaming_warm_semaphore()
+    return streaming_warm_admission.queue_depth_bound(_streaming_warm_concurrency)
 
 
 def _enqueue_streaming_warm(
@@ -514,16 +546,37 @@ def _enqueue_streaming_warm(
     entity_store: EntityStore,
     request_artist: str,
     request_album: str,
-) -> None:
+) -> bool:
     """Schedule one deduplicated background warm for a cache miss.
 
     Dedup is synchronous (no await between the membership check and the
     ``add``), so two identical misses interleaved on the event loop enqueue a
     single probe. The key + the task are cleaned up in the task's done-callbacks.
+
+    Returns ``True`` when the warm is in flight (deduped or freshly admitted),
+    ``False`` when a fresh warm is SHED at the LML#1108 pending-depth bound
+    instead — the caller still reports ``unresolved`` either way (a shed is
+    transient) but should project a distinguishable outcome + count the shed.
     """
     key = (service_key, to_match_form(request_artist), to_match_form(request_album))
     if key in _streaming_warm_in_flight:
-        return
+        return True
+
+    # ``_streaming_warm_in_flight``'s size IS the pending-plus-running count
+    # (populated below, cleared in the done-callback) -- no separate counter.
+    depth_bound = _streaming_warm_queue_depth_bound()
+    if len(_streaming_warm_in_flight) >= depth_bound:
+        logger.warning(
+            "Streaming warm shed for %s / %s / %s: pending depth %d >= bound %d",
+            service_key,
+            request_artist,
+            request_album,
+            len(_streaming_warm_in_flight),
+            depth_bound,
+        )
+        streaming_warm_admission.record_depth_shed()
+        return False
+
     # Create the task BEFORE registering the dedup key, so a create_task failure
     # (e.g. no running loop) can't leak a key that would suppress the warm for
     # this (service, artist, album) for the rest of the process's life. There is
@@ -538,6 +591,7 @@ def _enqueue_streaming_warm(
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     task.add_done_callback(lambda _t: _streaming_warm_in_flight.discard(key))
+    return True
 
 
 async def _warm_streaming_url_cache(
@@ -558,27 +612,46 @@ async def _warm_streaming_url_cache(
     fire-and-forget task must never propagate to the event loop. No Sentry tag
     is set: the request scope has long since closed (mirrors
     ``lookup.enrichment.background._warm_bio_cache``).
+
+    LML#1108: the wait to ACQUIRE ``semaphore`` isn't deadline-bound itself
+    (the depth bound in ``_enqueue_streaming_warm`` caps queue depth instead);
+    this makes that wait *observable*, timed and folded into the outcome log
+    line. Also arms ``clients.streaming.base.set_probe_deadline`` with the
+    SAME deadline ``wait_for`` enforces, so a client's own retry loop
+    (``SpotifyClient``'s 429 handler) can give up a doomed sleep instead of
+    being cancelled mid-sleep.
     """
     semaphore = _get_streaming_warm_semaphore()
+    semaphore_wait_started = time.monotonic()
     try:
         async with semaphore:
-            outcome = await asyncio.wait_for(
-                resolve_streaming_url_with_cache(
-                    pg,
-                    client,
-                    service=service_key,
-                    artist=request_artist,
-                    album=request_album,
-                    miss_ttl=cfg.miss_ttl,
-                ),
-                timeout=_effective_probe_timeout_s(cfg),
-            )
+            semaphore_wait_s = time.monotonic() - semaphore_wait_started
+            probe_timeout_s = _effective_probe_timeout_s(cfg)
+            deadline_token = set_probe_deadline(time.monotonic() + probe_timeout_s)
+            try:
+                outcome = await asyncio.wait_for(
+                    resolve_streaming_url_with_cache(
+                        pg,
+                        client,
+                        service=service_key,
+                        artist=request_artist,
+                        album=request_album,
+                        miss_ttl=cfg.miss_ttl,
+                    ),
+                    timeout=probe_timeout_s,
+                )
+            finally:
+                reset_probe_deadline(deadline_token)
     except Exception:
+        # Recompute (not ``semaphore_wait_s``, unset if still queued) so this
+        # logs a meaningful figure even on a failure before the permit.
         logger.exception(
-            "Background streaming-URL warm probe failed for %s (%s / %s)",
+            "Background streaming-URL warm probe failed for %s (%s / %s) "
+            "after %.3fs waiting for the warm semaphore",
             service_key,
             request_artist,
             request_album,
+            time.monotonic() - semaphore_wait_started,
         )
         return
 
@@ -589,7 +662,8 @@ async def _warm_streaming_url_cache(
         await _mint_identity(service_key, cfg, outcome.url, entity_store)
 
     logger.info(
-        "Background streaming-URL warm: %s for %s / %s -> %s",
+        "Background streaming-URL warm (waited %.3fs for semaphore): %s for %s / %s -> %s",
+        semaphore_wait_s,
         service_key,
         request_artist,
         request_album,
@@ -633,22 +707,26 @@ async def _mint_identity(
         )
 
 
-def _project_sentry(
-    service_key: str,
-    outcome: Literal[
-        "cache_hit", "cache_miss_recent", "cache_miss_enqueued", "cache_miss_unwarmed"
-    ],
-) -> None:
+_SentryOutcome = Literal[
+    "cache_hit",
+    "cache_miss_recent",
+    "cache_miss_enqueued",
+    "cache_miss_unwarmed",
+    "cache_miss_shed",
+]
+
+
+def _project_sentry(service_key: str, outcome: _SentryOutcome) -> None:
     """Project per-service Sentry data-attributes for the post-process hot path.
 
     Two booleans land on the active transaction per service:
 
     * ``streaming_url.persistent_lookup.fired.<service>`` — ran-for-service.
     * ``streaming_url.persistent_lookup.<outcome>.<service>`` — the hot-path
-      disposition: ``cache_hit`` (filled synchronously), ``cache_miss_recent``
-      (known miss within TTL, no warm), ``cache_miss_enqueued`` (genuine miss,
-      warm scheduled), or ``cache_miss_unwarmed`` (genuine miss, warm suppressed
-      on the bulk path).
+      disposition: filled (``cache_hit``), known miss within TTL
+      (``cache_miss_recent``), warm scheduled (``cache_miss_enqueued``), warm
+      suppressed on the bulk path (``cache_miss_unwarmed``), or warm shed at
+      the LML#1108 pending-depth bound (``cache_miss_shed``).
 
     Hot-path only (and therefore always in-request — correct attribution): the
     background warm's ``live_*`` outcome is logged, never tagged here, because

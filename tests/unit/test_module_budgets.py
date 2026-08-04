@@ -121,6 +121,12 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/strategies/track_release_matching.py": 550,
     "lookup/strategies/va_rescue.py": 300,
     "lookup/streaming_url_postprocess.py": 750,
+    # LML#1108: pending-warm depth-bound policy, extracted out of
+    # streaming_url_postprocess.py to stay under its own ceiling above — a
+    # small, self-contained concern (constant + two pure/best-effort
+    # functions). 1.3x its ~51-line measured size -> smallest multiple of 50
+    # at or above that, 100.
+    "lookup/streaming_warm_admission.py": 100,
     "lookup/tail_deadline.py": 150,
     "lookup/timeouts.py": 100,
     # Recalibrated 2026-07-29 (LML#750): the step-3b validation cascade

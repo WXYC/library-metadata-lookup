@@ -56,6 +56,7 @@ def reset_streaming_warm_state() -> None:
     carried diverging per-file copies of this reset.
     """
     _streaming_mod._streaming_warm_semaphore = None
+    _streaming_mod._streaming_warm_concurrency = _streaming_mod._STREAMING_WARM_CONCURRENCY_DEFAULT
     _streaming_mod._streaming_warm_in_flight.clear()
     _streaming_mod._background_tasks.clear()
     set_suppress_streaming_warm(False)

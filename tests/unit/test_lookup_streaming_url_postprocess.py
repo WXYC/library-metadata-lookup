@@ -44,6 +44,7 @@ cache-layer behavior itself is covered in
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -57,6 +58,7 @@ from identity.release_validation import (
     RELEASE_SOURCE_CONFIG,
 )
 from lookup import streaming_url_postprocess as mod
+from lookup import streaming_warm_admission
 from lookup.streaming_url_postprocess import (
     STREAMING_URL_CACHE_CONFIG,
     apply_streaming_url_postprocess,
@@ -1098,6 +1100,168 @@ class TestWarmConcurrencyBound:
         sem = mod._get_streaming_warm_semaphore()
         assert sem._value == mod._STREAMING_WARM_CONCURRENCY_DEFAULT
         mod._streaming_warm_semaphore = None
+
+
+# ---------------------------------------------------------------------------
+# LML#1108: pending-warm depth bound. The semaphore above bounds *concurrency*;
+# nothing previously bounded how many warms could be QUEUED behind it --
+# LIBRARY-METADATA-LOOKUP-1B saw a 232-deep backlog under a Spotify 429 storm.
+# ---------------------------------------------------------------------------
+
+
+class TestWarmQueueDepthBoundResolution:
+    def test_depth_bound_is_a_small_multiple_of_concurrency(self, monkeypatch):
+        monkeypatch.setenv(mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, "1")
+        mod._streaming_warm_semaphore = None
+        mod._get_streaming_warm_semaphore()
+        assert mod._streaming_warm_concurrency == 1
+        assert (
+            mod._streaming_warm_queue_depth_bound()
+            == 1 * streaming_warm_admission.QUEUE_DEPTH_MULTIPLIER
+        )
+        mod._streaming_warm_semaphore = None
+
+
+@pytest.mark.asyncio
+class TestWarmQueueDepthBound:
+    async def test_enqueue_succeeds_one_below_the_bound(self):
+        bound = mod._streaming_warm_queue_depth_bound()
+        for i in range(bound - 1):
+            mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
+
+        service = "apple_music_album"
+        update = _blank_update()
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver(return_value=ResolveOutcome(url=None, source="live_error")),
+        ):
+            statuses = await _run(update, settings=_settings(service))
+            assert len(mod._background_tasks) == 1
+            await _drain_background_tasks()
+
+        assert statuses["apple_music"] == StreamingResolutionStatus.unresolved
+
+    async def test_enqueue_sheds_at_the_bound_instead_of_queueing(self):
+        bound = mod._streaming_warm_queue_depth_bound()
+        for i in range(bound):
+            mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
+
+        service = "apple_music_album"
+        update = _blank_update()
+        with _patch_cache_peek(None), _patch_resolver() as resolve:
+            statuses = await _run(update, settings=_settings(service))
+
+        # Shed, not queued: no new task, the probe never scheduled.
+        assert not mod._background_tasks
+        resolve.assert_not_awaited()
+        # The response contract is unaffected by shedding (LML#1108 constraint):
+        # still "unresolved", exactly like a healthy enqueue would report.
+        assert statuses["apple_music"] == StreamingResolutionStatus.unresolved
+
+    async def test_shed_projects_distinct_sentry_outcome_and_counts_via_cache_stats(self):
+        bound = mod._streaming_warm_queue_depth_bound()
+        for i in range(bound):
+            mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
+
+        service = "apple_music_album"
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+        recorder = Mock()
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver(),
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+            patch.object(
+                streaming_warm_admission, "get_cache_stats_recorder", return_value=recorder
+            ),
+        ):
+            await _run(update, settings=_settings(service))
+
+        keys = {c.args[0] for c in transaction.set_data.call_args_list}
+        assert f"streaming_url.persistent_lookup.cache_miss_shed.{service}" in keys
+        assert f"streaming_url.persistent_lookup.cache_miss_enqueued.{service}" not in keys
+        recorder.record.assert_called_once_with(mod.STREAMING_WARM_DEPTH_SHED_STAT_KEY)
+
+    async def test_dedup_hit_is_not_shed_by_the_depth_bound(self):
+        # A duplicate of an ALREADY-in-flight (service, artist, album) is a
+        # no-op regardless of depth -- it adds no new load, so the depth bound
+        # must not treat it as a shed.
+        service = "apple_music_album"
+        from wxyc_etl.text import to_match_form
+
+        key = (service, to_match_form(_ARTIST), to_match_form(_ALBUM))
+        bound = mod._streaming_warm_queue_depth_bound()
+        for i in range(bound):
+            mod._streaming_warm_in_flight.add((f"dummy{i}", f"artist{i}", f"album{i}"))
+        mod._streaming_warm_in_flight.add(key)
+
+        update = _blank_update()
+        with _patch_cache_peek(None), _patch_resolver() as resolve:
+            await _run(update, settings=_settings(service))
+
+        # No task created (dedup short-circuits before the depth check), and
+        # no shed telemetry -- this path returns True (enqueued/deduped) from
+        # ``_enqueue_streaming_warm``, never reaching the shed branch.
+        assert not mod._background_tasks
+        resolve.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# LML#1108: the background warm arms a probe deadline (clients.streaming.base)
+# around its live-probe call so a client's own retry/backoff loop can bound
+# itself against the SAME wall-clock ceiling `asyncio.wait_for` will enforce.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestProbeDeadlinePropagation:
+    async def test_probe_deadline_is_armed_around_the_live_probe_and_reset_after(self):
+        from clients.streaming.base import get_probe_deadline
+
+        service = "apple_music_album"
+        case = _CASES[service]
+        update = _blank_update()
+        observed: list[float | None] = []
+
+        async def observing_resolve(pg, client, *, service, artist, album, **kwargs):
+            observed.append(get_probe_deadline())
+            return ResolveOutcome(url=case["resolved_url"], source="live_resolved")
+
+        assert get_probe_deadline() is None
+        with (
+            _patch_cache_peek(None),
+            patch.object(
+                mod,
+                "resolve_streaming_url_with_cache",
+                new=AsyncMock(side_effect=observing_resolve),
+            ),
+        ):
+            await _run(update, settings=_settings(service))
+            await _drain_background_tasks()
+
+        assert len(observed) == 1
+        # A deadline WAS active during the probe, and it's a plausible
+        # near-future monotonic value (roughly now + the 4.0s Apple ceiling).
+        assert observed[0] is not None
+        assert observed[0] > time.monotonic()
+        # The deadline does not leak past the warm task's own scope.
+        assert get_probe_deadline() is None
+
+    async def test_probe_deadline_is_reset_even_when_the_probe_raises(self):
+        from clients.streaming.base import get_probe_deadline
+
+        service = "apple_music_album"
+        update = _blank_update()
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver(side_effect=RuntimeError("boom")),
+        ):
+            await _run(update, settings=_settings(service))
+            await _drain_background_tasks()
+
+        assert get_probe_deadline() is None
 
 
 # ---------------------------------------------------------------------------
