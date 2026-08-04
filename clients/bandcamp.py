@@ -435,14 +435,21 @@ class BandcampClient(BaseStreamingClient):
         if best_artist is not None:
             # Default mode: a fetch failure (None) is treated as "no catalog"
             # for the live match path -- there is no retry loop here, so it
-            # degrades to no match. Under fail_fast, ``fetch_artist_catalog``
+            # degrades to no match and falls through to the album-first
+            # fallback below. Under fail_fast, ``fetch_artist_catalog``
             # instead raises ``BandcampTransportError`` on a transport
-            # failure (LML#1106 review, FIX 2) -- that propagates straight
-            # out of this method, uncaught here, to ``find_album_match``'s
-            # breaker wrapper.
-            catalog = (
-                await self.fetch_artist_catalog(best_artist["slug"], fail_fast=fail_fast) or []
-            )
+            # failure; LML#1106 review FIX 5 (this round) catches it here so
+            # it degrades the SAME way -- an empty catalog that falls
+            # through to the fallback -- rather than pre-empting it. Only a
+            # transport failure on the fallback's OWN leg (below) still
+            # raises: a genuine couldn't-ask must never resolve to a
+            # cachable ``None``.
+            try:
+                catalog = (
+                    await self.fetch_artist_catalog(best_artist["slug"], fail_fast=fail_fast) or []
+                )
+            except BandcampTransportError:
+                catalog = []
             matched_artist_name = best_artist["name"]
             match = find_best_source_match(
                 catalog,
@@ -473,7 +480,13 @@ class BandcampClient(BaseStreamingClient):
         network-layer failure raises :class:`BandcampTransportError` instead
         of degrading to ``[]`` -- an empty list must mean "asked, no artists
         matched", not "couldn't ask". The default mode's degrade-to-``[]``
-        behavior is unchanged.
+        behavior is unchanged. LML#1106 review FIX 6 (this round): a 200
+        whose body isn't valid JSON (a Cloudflare HTML interstitial, a
+        truncated response) is the SAME "couldn't ask" shape -- under
+        ``fail_fast`` it also raises :class:`BandcampTransportError` rather
+        than letting the raw ``json.JSONDecodeError`` escape the fail-fast
+        taxonomy entirely. Default mode is unchanged: an unparseable body
+        still propagates exactly as it does today.
         """
         resp = await self._request_with_retry(
             "GET",
@@ -487,7 +500,13 @@ class BandcampClient(BaseStreamingClient):
                 raise BandcampTransportError(AUTOCOMPLETE_URL)
             return []
 
-        data = resp.json()
+        if fail_fast:
+            try:
+                data = resp.json()
+            except ValueError as e:
+                raise BandcampTransportError(AUTOCOMPLETE_URL) from e
+        else:
+            data = resp.json()
         results = []
         for item in data.get("results", []):
             if item.get("type") != "b":
@@ -582,7 +601,8 @@ class BandcampClient(BaseStreamingClient):
         (de-doubled via ``fix_autocomplete_url``) on success, or (default
         mode) ``None`` on fetch failure. Under ``fail_fast=True`` (LML#1106,
         FIX 2), that same failure instead raises
-        :class:`BandcampTransportError` -- see ``search_artist`` for why.
+        :class:`BandcampTransportError` -- see ``search_artist`` for why
+        (including the FIX 6 unparseable-body case).
         """
         resp = await self._request_with_retry(
             "GET",
@@ -596,7 +616,13 @@ class BandcampClient(BaseStreamingClient):
                 raise BandcampTransportError(AUTOCOMPLETE_URL)
             return None
 
-        data = resp.json()
+        if fail_fast:
+            try:
+                data = resp.json()
+            except ValueError as e:
+                raise BandcampTransportError(AUTOCOMPLETE_URL) from e
+        else:
+            data = resp.json()
         results = []
         for item in data.get("results", []):
             if item.get("type") != "a":
