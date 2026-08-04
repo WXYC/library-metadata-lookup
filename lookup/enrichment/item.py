@@ -46,6 +46,7 @@ from lookup.artist_resolution import (
     _mb_rescue_song_match_required,
     _project_mb_rescue_attrs,
 )
+from lookup.enrichment.bandcamp_probe import run_bandcamp_live_probe
 from lookup.enrichment.context import EnrichmentContext
 from lookup.enrichment.streaming_status import resolve_streaming_status
 from lookup.rowless import (
@@ -466,6 +467,10 @@ async def enrich_one(
         bandcamp_url = None
         soundcloud_url = None
 
+    # LML#1098: inline Bandcamp live probe (bounded, cache-first; bandcamp_probe.py).
+    bandcamp_url, bandcamp_status = await run_bandcamp_live_probe(
+        ctx, settings=settings, current_bandcamp_url=bandcamp_url
+    )
     # Album-derived fields are positionally gated: only on top-1, and
     # only when top-1 actually carries an *acceptable* library row.
     # LML#487 fall-through: when the row is not acceptable, the probe
@@ -629,7 +634,8 @@ async def enrich_one(
         clients={
             "apple_music": ctx.apple_music,
             "spotify": ctx.spotify,
-            "bandcamp": ctx.bandcamp,
+            # LML#1098: withhold the client when the inline probe owns Bandcamp.
+            "bandcamp": None if bandcamp_status is not None else ctx.bandcamp,
         },
         pg=ctx.discogs_cache_pg,
         entity_store=ctx.entity_store,
@@ -656,6 +662,7 @@ async def enrich_one(
         apple_probe_status=apple_status,
         spotify_url=spotify_url,
         bandcamp_url=bandcamp_url,
+        bandcamp_probe_status=bandcamp_status,
         postprocess_status=postprocess_status,
     )
 

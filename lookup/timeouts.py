@@ -57,3 +57,26 @@ def apple_music_lookup_timeout_s() -> float:
     return probe_timeout_s_from_env(
         APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, _APPLE_MUSIC_LOOKUP_TIMEOUT_DEFAULT_S
     )
+
+
+_BANDCAMP_LIVE_PROBE_TIMEOUT_DEFAULT_S = 8.0
+"""Default wall-clock ceiling for a single inline Bandcamp live probe (LML#1098).
+
+Bandcamp's fail-fast resolve is a SINGLE attempt across up to two sequential
+autocomplete/catalog requests (~1.4s typical when unthrottled); 8s leaves
+headroom for the slower catalog fetch without letting one item pin the
+enrichment tail. Tunable via ``LML_BANDCAMP_LIVE_PROBE_TIMEOUT_MS``; the
+per-item value is further clamped to the caller budget (LML#930)."""
+
+BANDCAMP_LIVE_PROBE_TIMEOUT_ENV_VAR = "LML_BANDCAMP_LIVE_PROBE_TIMEOUT_MS"
+
+
+def bandcamp_probe_timeout_s() -> float:
+    """Per-call wall-clock ceiling for a single inline Bandcamp live probe.
+
+    Thin wrapper over ``probe_timeout_s_from_env`` for the LML#1098 enrichment-
+    path probe. Default 8s; tuned via ``LML_BANDCAMP_LIVE_PROBE_TIMEOUT_MS``.
+    """
+    return probe_timeout_s_from_env(
+        BANDCAMP_LIVE_PROBE_TIMEOUT_ENV_VAR, _BANDCAMP_LIVE_PROBE_TIMEOUT_DEFAULT_S
+    )

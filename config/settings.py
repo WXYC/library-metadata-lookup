@@ -629,6 +629,25 @@ class Settings(BaseSettings):
             "supplies True. New in PR-3. See WXYC/library-metadata-lookup#573."
         ),
     )
+    lml_bandcamp_live_probe: bool = Field(
+        default=False,
+        description=(
+            "Enable the synchronous, bounded, cache-first Bandcamp live probe on "
+            "the /lookup/bulk enrichment path (LML#1098). When True (AND-gated with "
+            "LML_PERSIST_STREAMING_URLS and LML_PERSIST_STREAMING_URL_BANDCAMP), "
+            "enrich_one resolves a DIRECT Bandcamp album URL inline for a cold "
+            "(artist, album) — via BandcampClient.find_album_match(fail_fast=True), "
+            "breaker-gated, wrapped in a wall-clock ceiling clamped to the caller "
+            "budget — and returns it in the same response, so a flowsheet row gets "
+            "a real Bandcamp link first-time instead of a bandcamp.com/search?q= "
+            "fallback. A cache hit short-circuits; a 429/breaker shed or timeout "
+            "degrades to no link (unresolved) without failing the item. Default "
+            "False; do not enable in prod until the BS#642 backfill drain "
+            "completes. Distinct from LML_BULK_BANDCAMP_STREAMING_WARM (off-path "
+            "next-time fill); this is first-time fill. See "
+            "WXYC/library-metadata-lookup#1098."
+        ),
+    )
     lml_bulk_bandcamp_streaming_warm: bool = Field(
         default=False,
         description=(
