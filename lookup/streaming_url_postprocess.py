@@ -586,7 +586,7 @@ async def _warm_streaming_url_cache(
     # persisted their state. Outside the probe-concurrency semaphore: the mint
     # is a fast local PG write, not upstream API load.
     if outcome.source == "live_resolved" and outcome.url is not None:
-        await mint_streaming_identity(service_key, cfg, outcome.url, entity_store)
+        await _mint_identity(service_key, cfg, outcome.url, entity_store)
 
     logger.info(
         "Background streaming-URL warm: %s for %s / %s -> %s",
@@ -597,7 +597,7 @@ async def _warm_streaming_url_cache(
     )
 
 
-async def mint_streaming_identity(
+async def _mint_identity(
     source: str,
     cfg: StreamingUrlCacheConfig,
     url: str,
@@ -613,11 +613,15 @@ async def mint_streaming_identity(
     validation rejection, PG outage) is logged and swallowed — the user-visible
     URL has already been surfaced.
 
-    Public (not module-private) because ``lookup/enrichment/bandcamp_probe.py``
-    calls this too (LML#1106 review, FIX 4): the inline Bandcamp live probe
-    reaches its own ``live_resolved`` outside this module's
-    ``_warm_streaming_url_cache``, and needs the identical mint-and-swallow
-    behavior rather than a second, drifting copy.
+    Also imported by name into ``lookup/enrichment/bandcamp_probe.py``
+    (LML#1106 review, FIX 4): the inline Bandcamp live probe reaches its own
+    ``live_resolved`` outside this module's ``_warm_streaming_url_cache``, and
+    needs the identical mint-and-swallow behavior rather than a second,
+    drifting copy. Kept module-private (the leading underscore) rather than
+    renamed public: this repo has no convention requiring a public name for a
+    cross-module import, ``ruff``'s selected rule set has no private-access
+    check (no ``SLF001``) to violate, and an explicit ``from ... import
+    _mint_identity`` is unambiguous at the call site either way.
     """
     external_id = cfg.url_to_external_id(url)
     if external_id is None:
