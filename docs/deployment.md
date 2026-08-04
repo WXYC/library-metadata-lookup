@@ -38,10 +38,25 @@ The `--detach` is load-bearing. Plain `railway up` attaches to the build-log str
 
 Consequences of splitting deploy from wait:
 
-- **The gate got stronger, not weaker.** `railway up` returned when the *build* finished; `SUCCESS` from the deployment API means Railway's healthcheck passed and the revision is actually serving. `Smoke Test (Staging)` no longer races the rollout.
-- **Build logs no longer stream into the Actions log.** The deploy step prints the deployment's `logsUrl`; open that for build output. The wait script repeats it on failure and on timeout.
-- **A superseded deploy does not fail the run.** If a newer push supersedes this deployment (`SKIPPED`/`REMOVED`), the script exits 0 — that newer run gates its own deploy, and failing here would just be a different false red.
-- Tunables, all with defaults that suit CI: `RAILWAY_DEPLOY_TIMEOUT_SECONDS` (900), `RAILWAY_DEPLOY_POLL_INTERVAL_SECONDS` (10), `RAILWAY_DEPLOY_MAX_POLL_ERRORS` (10, consecutive polling errors tolerated before giving up — a single Railway API blip must not fail a good deploy).
+- **The gate is at least as strong as before, and usually stronger.** The old `railway up` raced a build-log stream against a deploy-status subscription and normally returned once the *build* finished; `SUCCESS` from the deployment API means Railway's healthcheck passed and the revision is actually serving. (That last clause depends on `railway.toml` setting `healthcheckPath` — it currently does. Remove that and `SUCCESS` weakens to "container started".) `Smoke Test (Staging)` no longer races the rollout.
+- **Build logs no longer stream into the Actions log.** The deploy step prints the deployment's `logsUrl`, and on `FAILED`/`CRASHED` the wait script dumps the last `RAILWAY_DEPLOY_BUILD_LOG_LINES` of build log inline so a broken build is still diagnosable from the run alone.
+
+How the wait script maps deployment status to an outcome:
+
+| Status | Outcome |
+|---|---|
+| `SUCCESS`, `SLEEPING` | pass — the revision deployed |
+| `FAILED`, `CRASHED` | fail, with the tail of the build log |
+| `NEEDS_APPROVAL` | fail fast — terminal until a human acts, so waiting out the budget only delays the signal |
+| `SKIPPED`, `REMOVED`, `REMOVING` | pass **only if** a newer deployment exists to supersede this one; otherwise fail (see below) |
+| `BUILDING`, `DEPLOYING`, `INITIALIZING`, `QUEUED`, `WAITING` | keep polling |
+| anything else | keep polling, with a warning naming the value |
+
+That last row matters: the CLI `Debug`-formats the status enum, so a status Railway adds after our pinned CLI version arrives as `Other("NEW_STATUS")`. It is logged rather than silently treated as a hang.
+
+**Supersession is verified, not assumed.** A newer push supersedes an in-flight deployment, and failing that run would be exactly the false red this script removes — so `SKIPPED`/`REMOVED`/`REMOVING` passes. But the script first checks the payload for a deployment with a later `createdAt`. If there is none, the deployment was rolled back or removed by hand rather than replaced, and the script fails instead of reporting success for a revision that never went live.
+
+Tunables, all with defaults that suit CI: `RAILWAY_DEPLOY_TIMEOUT_SECONDS` (900), `RAILWAY_DEPLOY_POLL_INTERVAL_SECONDS` (10), `RAILWAY_DEPLOY_MAX_POLL_ERRORS` (10), `RAILWAY_DEPLOY_BUILD_LOG_LINES` (100). The error tolerance is the point of the exercise: a single Railway API blip — including a zero-exit response that fails to parse — must not fail a good deploy, so it counts toward the tolerance instead of aborting.
 
 ## CI pin maintenance
 
