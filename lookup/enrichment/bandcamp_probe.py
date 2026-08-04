@@ -104,7 +104,11 @@ async def run_bandcamp_live_probe(
         # BULK-path-only gate FIRST (short-circuits the interactive path before
         # any flag read): the interactive /lookup injects the same client and
         # reads the same flag, so this ContextVar — set True only by the bulk
-        # handler — is what keeps the synchronous probe off the hot path.
+        # handler — is what keeps the synchronous probe off the hot path. This
+        # reuses the same bulk-only signal #1087's bulk-warm exemption keys off
+        # (a shared, existing assumption, not a new one); if a future change
+        # ever sets suppression True on a non-bulk path, gate this on a
+        # dedicated is_bulk context flag instead.
         should_suppress_streaming_warm()
         # ``getattr`` default: the new field may be absent on a partial Settings
         # stub (the two persist flags below are guaranteed on every stub that

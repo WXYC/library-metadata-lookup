@@ -30,6 +30,7 @@ from discogs.models import ReleaseMetadataResponse
 from entity.sources import PgSource
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment import enrich_artwork_results
+from lookup.rowless import ROWLESS_LIBRARY_ID
 from lookup.spine_deadline import SpineDeadline
 from lookup.streaming_url_postprocess import set_suppress_streaming_warm
 from streaming.models import SourceMatch
@@ -51,6 +52,7 @@ def _flags(
     master: bool = True,
     bandcamp: bool = True,
     telemetry: bool = True,
+    bulk_warm: bool = False,
 ) -> SimpleNamespace:
     """A Settings-like stub carrying only the flags the probe + post-process read."""
     return SimpleNamespace(
@@ -59,6 +61,7 @@ def _flags(
         lml_persist_streaming_url_spotify=False,
         lml_persist_streaming_url_bandcamp=bandcamp,
         lml_bandcamp_live_probe=live_probe,
+        lml_bulk_bandcamp_streaming_warm=bulk_warm,
         enable_telemetry=telemetry,
         environment="test",
     )
@@ -372,3 +375,51 @@ class TestBandcampLiveProbe:
         ):
             await _run(bandcamp2, pg, item2, artwork2, entity_store=entity_store)
         assert spy.await_args.kwargs["clients"]["bandcamp"] is bandcamp2
+
+    async def test_absent_verdict_survives_a_live_postprocess(self):
+        """End-to-end clobber guard: with a live post-process (non-None
+        entity_store), the probe's ``absent`` verdict reaches the response —
+        because the withhold keeps Bandcamp out of the post-process's consulted
+        set, so ``postprocess_status`` can't override it to something else."""
+        item, artwork, bandcamp = _inputs(match_url=None)  # clean no-match -> absent
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+
+        with patch("lookup.enrichment.item.get_settings", return_value=_flags()):
+            results = await _run(bandcamp, pg, item, artwork, entity_store=MagicMock())
+
+        _, enriched = results[0]
+        bandcamp.find_album_match.assert_awaited_once()
+        assert enriched.streaming_status.bandcamp == StreamingResolutionStatus.absent
+
+    async def test_both_flags_on_probe_owns_leg_and_withholds_the_1087_warm(self):
+        """#1087 (bulk warm) + #1098 (probe) both on, rowless bulk item: the
+        inline probe owns Bandcamp and the client is withheld from the
+        post-process, so the #1087 off-path warm cannot ALSO fire ('pick one' —
+        the probe wins by construction). Tested on the ABSENT case, where the
+        withhold is load-bearing (a resolved URL would exclude Bandcamp from the
+        post-process anyway)."""
+        item = make_library_item(id=ROWLESS_LIBRARY_ID, artist=_ARTIST, title=_ALBUM)
+        artwork = make_discogs_result(
+            release_id=1,
+            artist=_ARTIST,
+            album=_ALBUM,
+            artwork_url="https://example.com/painless.jpg",
+        )
+        bandcamp = AsyncMock(spec=BandcampClient)
+        bandcamp.find_album_match = AsyncMock(return_value=None)  # miss -> absent, url stays None
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        spy = AsyncMock(return_value={})
+
+        with (
+            patch("lookup.enrichment.item.get_settings", return_value=_flags(bulk_warm=True)),
+            patch("lookup.enrichment.item.apply_streaming_url_postprocess", spy),
+        ):
+            await _run(bandcamp, pg, item, artwork, entity_store=MagicMock())
+
+        bandcamp.find_album_match.assert_awaited_once()  # the probe made its single call
+        # withheld -> the #1087 rowless warm has no client to probe with.
+        assert spy.await_args.kwargs["clients"]["bandcamp"] is None
