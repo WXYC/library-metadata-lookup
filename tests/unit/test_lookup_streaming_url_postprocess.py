@@ -48,8 +48,10 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import httpx
 import pytest
 
+from clients.bandcamp import BandcampClient
 from entity.sources import PgSource
 from entity.store import EntityStore
 from entity.streaming_url_cache import ResolveOutcome
@@ -122,6 +124,20 @@ _URL_FIELDS = [case["url_field"] for case in _CASES.values()]
 
 _ARTIST = "Hyd"
 _ALBUM = "Hold Onto Me Infinity"
+
+_BANDCAMP_AUTOCOMPLETE_URL = "https://bandcamp.com/api/fuzzysearch/2/app_autocomplete"
+
+
+class _InstantLimiter:
+    """A rate limiter stand-in with a no-op ``acquire`` -- see the identical
+    fixture in ``test_bandcamp_fail_fast_probe.py`` and
+    ``test_streaming_resolve_with_cache.py``. Duplicated per this repo's
+    convention for private test helpers; without it a real
+    ``BandcampClient()``'s ``AsyncLimiter(1, 1)`` would pace real HTTP calls.
+    """
+
+    async def acquire(self) -> None:
+        return None
 
 
 @pytest.fixture(autouse=True)
@@ -605,6 +621,46 @@ class TestCacheMissEnqueuesBackgroundWarm:
             await _drain_background_tasks()
 
         assert update["apple_music_url"] is None
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+
+    async def test_background_warm_bandcamp_transport_failure_no_mint_no_cache_write(self):
+        # LML#1115: end-to-end through the REAL BandcampClient (mocked only
+        # at the HTTP transport) and the REAL resolve_streaming_url_with_cache
+        # -- not _patch_resolver's stand-in, which would agree with whatever
+        # the client's contract used to be. A default-mode Bandcamp transport
+        # failure (5xx here) must not crash this fire-and-forget task, must
+        # not mint, and -- the headline #1115 fix -- must not UPSERT a 7-day
+        # known-miss row for an outage.
+        service = "bandcamp"
+        update = _blank_update()
+        entity_store = _entity_store()
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock()
+
+        bandcamp = BandcampClient()
+        bandcamp._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
+        bandcamp._http = AsyncMock(spec=httpx.AsyncClient)
+        bandcamp._http.request = AsyncMock(
+            return_value=httpx.Response(
+                503, request=httpx.Request("GET", _BANDCAMP_AUTOCOMPLETE_URL)
+            )
+        )
+
+        with _patch_cache_peek(None):
+            await _run(
+                update,
+                settings=_settings(service),
+                clients=_clients(bandcamp=bandcamp),
+                entity_store=entity_store,
+                pg=pg,
+            )
+            await _drain_background_tasks()
+
+        assert update["bandcamp_url"] is None
+        entity_store.mint_or_get_release_identity.assert_not_called()
+        pg.execute.assert_not_called()
         assert not mod._background_tasks
         assert not mod._streaming_warm_in_flight
 

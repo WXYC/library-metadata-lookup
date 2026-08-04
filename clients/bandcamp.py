@@ -115,19 +115,24 @@ class BandcampRateLimitedError(Exception):
 
 class BandcampTransportError(Exception):
     """Raised by ``search_artist`` / ``fetch_artist_catalog`` / ``search_albums``
-    under ``fail_fast=True`` when the underlying ``_request_with_retry`` call
-    fails at the transport layer (network error, connect timeout) or returns
-    a non-200/non-429 response (5xx, Cloudflare 403/1015, etc.).
+    when the underlying ``_request_with_retry`` call fails at the transport
+    layer (network error, connect timeout) or returns a non-200/non-429
+    response (5xx, Cloudflare 403/1015, etc.) -- in BOTH ``fail_fast=True``
+    and the default retrying mode (LML#1115 extended the LML#1106
+    fail_fast-only raise to the default path too; see the default-mode note
+    below).
 
     Distinct from both :class:`BandcampRateLimitedError` (a 429, a genuine
     rate-limit shed) and a clean 200 response with no match: this is
     "couldn't tell", not "asked, got nothing." Left unraised -- degrading to
-    ``None``/``[]`` the way the default (retrying) mode does -- it would be
+    ``None``/``[]`` the way the default mode did pre-LML#1115 -- it is
     indistinguishable from a real no-match, which under ``fail_fast`` would
     let :meth:`clients.bandcamp_breaker.BandcampProbeBreaker.record_success`
     declare a HALF_OPEN trial recovered while Bandcamp is still down, and
-    would let ``entity.streaming_url_cache.resolve_streaming_url_with_cache``
-    UPSERT a 7-day false-negative row (LML#1106 review, FIX 2).
+    which on EITHER path would let
+    ``entity.streaming_url_cache.resolve_streaming_url_with_cache`` UPSERT a
+    7-day false-negative row (LML#1106 review, FIX 2; LML#1115 for the
+    default path).
 
     Propagates through ``find_album_match``'s fail-fast wrapper, which
     records it via :meth:`clients.bandcamp_breaker.BandcampProbeBreaker.
@@ -147,23 +152,44 @@ class BandcampTransportError(Exception):
     round 2, FIX A; see ``_find_album_match_impl`` for the full conditional
     table).
 
-    Only meaningful under ``fail_fast``: the default mode keeps its
-    pre-#1106 degrade-to-``None``/``[]`` behavior unchanged.
+    In the default mode (LML#1115), propagates out of ``_find_album_match_impl``
+    to ``find_album_match``'s non-fail_fast branch uncaught -- there is no
+    breaker wrapper on that branch (breaker COVERAGE of default-mode traffic
+    is LML#1116, a separate change) -- so it reaches whichever caller invoked
+    ``find_album_match`` directly: ``streaming/orchestrator.py`` (folded into
+    ``errored_sources``, a degraded response rather than a hard failure) or
+    ``entity.streaming_url_cache.resolve_streaming_url_with_cache`` (caught by
+    its existing generic ``except Exception`` -- ``live_error``, no cache
+    write). ``scripts/bandcamp_pipeline.py`` calls ``search_artist`` /
+    ``fetch_artist_catalog`` directly (not through ``find_album_match``) and
+    catches this at each call site to preserve its pre-existing
+    leave-``pending``-for-a-retry posture (#661).
     """
 
 
 class BandcampSearchUnavailableError(Exception):
-    """Raised by ``find_album_match_via_search`` when the album-autocomplete
-    request failed after retries (network error, non-200, or exhausted 429
-    backoff) -- as opposed to a request that succeeded but found no
-    floor-clearing match.
+    """Raised by ``find_album_match_via_search`` (default mode only) when the
+    album-autocomplete request failed after retries (network error, non-200,
+    or exhausted 429 backoff) -- as opposed to a request that succeeded but
+    found no floor-clearing match. A translation of ``search_albums``'s
+    :class:`BandcampTransportError` (see that class -- ``search_albums`` now
+    raises it in both modes, LML#1115); ``find_album_match_via_search``
+    re-raises it as this type only when ``not fail_fast``, preserving the
+    external contract below. Under ``fail_fast`` the raw
+    ``BandcampTransportError`` propagates instead (see that class).
 
     The distinction matters to the offline album-search drain
     (scripts/bandcamp_pipeline.py): a transient blip must not be durably
     recorded as ``not_found`` (#661), so the drain catches this and leaves
-    the row ``pending``/re-runnable rather than writing. The PR2 runtime
-    probe fallback has no such persistence concern and is expected to catch
-    this and degrade to "no match" like any other adapter failure.
+    the row ``pending``/re-runnable rather than writing.
+
+    LML#1115: the live runtime path (``_find_album_match_impl``, reached via
+    ``find_album_match``) no longer catches this to degrade to "no match" --
+    that swallow is exactly the bug #1115 fixed (a couldn't-ask outcome was
+    indistinguishable from a genuine no-match, so
+    ``resolve_streaming_url_with_cache`` would UPSERT a false 7-day
+    known-miss row). It now propagates like any other exception, letting that
+    resolver's existing exception handling skip the cache write.
     """
 
 
@@ -394,6 +420,19 @@ class BandcampClient(BaseStreamingClient):
         costs one extra rate-limited autocomplete request; both phases'
         response shapes stay encapsulated here.
 
+        Default mode (``fail_fast=False``, LML#1115): a transport failure at
+        any phase (artist search, catalog fetch, or the album-search
+        fallback) now propagates as :class:`BandcampTransportError` or
+        :class:`BandcampSearchUnavailableError` rather than degrading to a
+        clean ``None`` -- a request that couldn't reach a verdict must stay
+        distinguishable from one that reached "no match", so
+        ``entity.streaming_url_cache.resolve_streaming_url_with_cache`` (its
+        existing generic exception handling, unchanged by this PR) and
+        ``streaming/orchestrator.py`` (its per-service ``errored_sources``
+        handling, likewise unchanged) never write/report a false negative for
+        an outage. There is no breaker on this branch -- coverage of
+        default-mode traffic by the breaker is LML#1116, a separate change.
+
         ``fail_fast=True`` (LML#1106) is a single-attempt mode for the
         response-path caller (LML#1098, merged into this branch): every underlying HTTP call makes a
         single attempt (no retry-on-429 backoff), and the whole call is gated
@@ -467,7 +506,19 @@ class BandcampClient(BaseStreamingClient):
         self, artist: str, title: str, *, fail_fast: bool
     ) -> SourceMatch | None:
         """The artist-first + album-first fallback body, unwrapped from the
-        breaker (see ``find_album_match``, which is the public entry point)."""
+        breaker (see ``find_album_match``, which is the public entry point).
+
+        LML#1115: ``search_artist`` / ``fetch_artist_catalog`` /
+        ``find_album_match_via_search`` now raise on a transport failure in
+        BOTH modes (previously fail_fast-only), and nothing in this method
+        catches them -- a couldn't-ask outcome at any phase propagates
+        straight out, uncaught, to ``find_album_match``. This is a
+        deliberate parity with the pre-existing fail_fast short-circuit
+        behavior: a failure on the artist-first phase does not spend a
+        second rate-limited request on the album-search fallback in either
+        mode. A genuine no-match (every phase completes with an empty
+        result) still returns ``None`` normally.
+        """
         artist_results = await self.search_artist(artist, fail_fast=fail_fast)
         match: SourceMatch | None = None
         best_artist: dict | None = None
@@ -477,9 +528,11 @@ class BandcampClient(BaseStreamingClient):
             if s >= 80.0 and s > best_artist_score:
                 best_artist = result
                 best_artist_score = s
-        # Only set True under fail_fast (default mode never raises
-        # BandcampTransportError from fetch_artist_catalog) -- see the
-        # post-fallback check below for why this can't be decided here.
+        # Set in BOTH modes since LML#1115: ``fetch_artist_catalog`` now raises
+        # ``BandcampTransportError`` on a transport failure regardless of
+        # ``fail_fast``, so the LML#1106 FIX A conditional table below governs the
+        # default (warm / streaming-check / drain) path too -- see the post-fallback
+        # check for why this can't be decided here.
         catalog_leg_failed = False
         if best_artist is not None:
             # Default mode: a fetch failure (None) is treated as "no catalog"
@@ -519,14 +572,14 @@ class BandcampClient(BaseStreamingClient):
         if match is not None:
             return match
 
-        try:
-            fallback_match = await self.find_album_match_via_search(
-                artist, title, fail_fast=fail_fast
-            )
-        except BandcampSearchUnavailableError:
-            # No retry channel on the live path (same posture as the
-            # catalog-fetch-failure case above) -- degrade to no match.
-            return None
+        # LML#1115: no swallow in either mode. A search-leg failure used to be
+        # caught here and degraded to a clean ``None`` -- indistinguishable from a
+        # genuine no-match, so the cache-backed resolver would UPSERT a false 7-day
+        # known-miss row for a transient autocomplete blip. It now propagates, and
+        # a CLEAN miss still falls through to the FIX A check below.
+        fallback_match = await self.find_album_match_via_search(
+            artist, title, fail_fast=fail_fast
+        )
 
         if fallback_match is not None:
             # We got an answer -- safe to treat as a genuine resolution even
@@ -568,6 +621,9 @@ class BandcampClient(BaseStreamingClient):
         the same way (see ``_reject_malshaped_fail_fast_body``). Default
         mode is unchanged: an unparseable or mal-shaped body still
         propagates exactly as it does today.
+        LML#1115 extends the raise to the default (retrying) mode too, since a
+        default-mode failure was otherwise indistinguishable from a genuine
+        no-results response and could be cached as a false negative.
         """
         resp = await self._request_with_retry(
             "GET",
@@ -577,9 +633,7 @@ class BandcampClient(BaseStreamingClient):
             fail_fast=fail_fast,
         )
         if resp is None or resp.status_code != 200:
-            if fail_fast:
-                raise BandcampTransportError(AUTOCOMPLETE_URL)
-            return []
+            raise BandcampTransportError(AUTOCOMPLETE_URL)
 
         if fail_fast:
             try:
@@ -605,31 +659,30 @@ class BandcampClient(BaseStreamingClient):
                 )
         return results
 
-    async def fetch_artist_catalog(
-        self, slug: str, *, fail_fast: bool = False
-    ) -> list[dict] | None:
+    async def fetch_artist_catalog(self, slug: str, *, fail_fast: bool = False) -> list[dict]:
         """Fetch album list from {slug}.bandcamp.com/music.
 
         Returns a list of dicts with keys ``url``, ``title`` (deduplicated by
         URL) on a successful fetch -- possibly empty if the page has no album
-        links. In the default mode, returns ``None`` on a fetch failure
-        (network error, timeout, non-200, or 429 after retries), which
-        callers must NOT treat as a definitively-empty catalog: an empty list
-        means "the artist has no releases" while ``None`` means "we couldn't
-        tell" and should be retried rather than recorded as a final result
-        (#661). Under ``fail_fast=True`` (LML#1106, FIX 2), that same
-        transport failure instead raises :class:`BandcampTransportError` --
-        see ``search_artist`` for why a raise, not ``None``, is required
-        there.
+        links (a genuinely empty catalog). Raises :class:`BandcampTransportError`
+        on a fetch failure (network error, timeout, non-200, or 429 after
+        retries) -- callers must NOT treat that as a definitively-empty
+        catalog: an empty list means "the artist has no releases" while a
+        raise means "we couldn't tell" and should be retried rather than
+        recorded as a final result (#661). Originally ``fail_fast=True``-only
+        (LML#1106, FIX 2); LML#1115 extends the raise to the default
+        (retrying) mode too -- a default-mode fetch failure used to return
+        ``None``, which the live match path's ``or []`` then silently
+        coalesced into "no catalog" and could reach
+        ``entity.streaming_url_cache.resolve_streaming_url_with_cache`` as a
+        false negative.
         """
         url = f"https://{slug}.bandcamp.com/music"
         resp = await self._request_with_retry(
             "GET", url, timeout=15.0, follow_redirects=True, fail_fast=fail_fast
         )
         if resp is None or resp.status_code != 200:
-            if fail_fast:
-                raise BandcampTransportError(url)
-            return None
+            raise BandcampTransportError(url)
 
         # Bandcamp serves UTF-8 but its Content-Type often omits `charset=`;
         # force UTF-8 so diacritic-bearing album titles don't mojibake. See
@@ -668,16 +721,17 @@ class BandcampClient(BaseStreamingClient):
 
         return albums
 
-    async def search_albums(self, query: str, *, fail_fast: bool = False) -> list[dict] | None:
+    async def search_albums(self, query: str, *, fail_fast: bool = False) -> list[dict]:
         """Search Bandcamp autocomplete for album-type results (LML#1069).
 
-        Unlike ``search_artist`` (which collapses any fetch failure to
-        ``[]``, fine for its no-persistence live-only caller), this
-        distinguishes a transient fetch failure (``None`` -- network error,
-        non-200, or exhausted 429 backoff) from a genuine empty result set
-        (``[]``), mirroring ``fetch_artist_catalog``'s None/[] split (#661).
-        The offline album-search drain needs that distinction to avoid
-        durably recording a blip as ``not_found``.
+        Raises :class:`BandcampTransportError` on a transient fetch failure
+        (network error, non-200, or exhausted 429 backoff), distinguishing it
+        from a genuine empty result set (``[]``) -- mirroring
+        ``fetch_artist_catalog``'s raise/empty-list split (#661). The offline
+        album-search drain needs that distinction to avoid durably recording
+        a blip as ``not_found``; ``find_album_match_via_search`` (below)
+        translates it to :class:`BandcampSearchUnavailableError` for that
+        caller's default-mode contract.
 
         Returns a list of dicts with keys ``artist``, ``title``, ``url``
         (de-doubled via ``fix_autocomplete_url``) on success, or (default
@@ -686,6 +740,9 @@ class BandcampClient(BaseStreamingClient):
         :class:`BandcampTransportError` -- see ``search_artist`` for why
         (including the FIX 6 unparseable-body case and the FIX B round-2
         mal-shaped-body case).
+        LML#1115 extends the raise to the default (retrying) mode too, since a
+        default-mode failure was otherwise indistinguishable from a genuine
+        no-results response and could be cached as a false negative.
         """
         resp = await self._request_with_retry(
             "GET",
@@ -695,9 +752,7 @@ class BandcampClient(BaseStreamingClient):
             fail_fast=fail_fast,
         )
         if resp is None or resp.status_code != 200:
-            if fail_fast:
-                raise BandcampTransportError(AUTOCOMPLETE_URL)
-            return None
+            raise BandcampTransportError(AUTOCOMPLETE_URL)
 
         if fail_fast:
             try:
@@ -740,22 +795,30 @@ class BandcampClient(BaseStreamingClient):
 
         Raises:
             BandcampSearchUnavailableError: default mode only -- the
-                autocomplete request failed after retries (see
-                ``search_albums``). Offline callers should catch this to
-                avoid a durable not_found write on a transient blip; the live
-                runtime path (PR2) is expected to catch it and degrade to
-                "no match" like any other adapter failure.
-            BandcampTransportError: ``fail_fast=True`` only (LML#1106, FIX
-                2) -- ``search_albums`` raises this directly on the same
-                underlying failure instead of returning ``None``, so it
-                propagates from here uncaught (``results`` is never ``None``
-                under ``fail_fast``, so the ``BandcampSearchUnavailableError``
-                branch below is unreachable in that mode).
+                autocomplete request failed after retries. ``search_albums``
+                raises :class:`BandcampTransportError` on that failure in
+                BOTH modes (LML#1115); this method translates it to this
+                type when ``not fail_fast``, preserving the pre-existing
+                external contract the offline drain
+                (``scripts/bandcamp_pipeline.py``) depends on to leave a row
+                ``pending``/re-runnable rather than durably writing
+                ``not_found`` on a transient blip. LML#1115: the live runtime
+                path (``_find_album_match_impl``, via ``find_album_match``)
+                no longer catches this to degrade to "no match" -- that
+                swallow is the bug #1115 fixed. It now propagates like any
+                other exception.
+            BandcampTransportError: ``fail_fast=True`` only -- ``search_albums``'s
+                raise propagates unchanged (not translated), so
+                ``find_album_match``'s breaker wrapper (LML#1106) still sees
+                the type it already records as an aborted call.
         """
         query = f"{artist} {clean_title_for_query(title)}".strip()
-        results = await self.search_albums(query, fail_fast=fail_fast)
-        if results is None:
-            raise BandcampSearchUnavailableError(query)
+        try:
+            results = await self.search_albums(query, fail_fast=fail_fast)
+        except BandcampTransportError:
+            if fail_fast:
+                raise
+            raise BandcampSearchUnavailableError(query) from None
         if not results:
             return None
 

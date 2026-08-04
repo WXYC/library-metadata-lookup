@@ -39,7 +39,12 @@ from collections import defaultdict
 
 from rapidfuzz import fuzz
 
-from clients.bandcamp import BandcampClient, BandcampSearchUnavailableError, extract_slug
+from clients.bandcamp import (
+    BandcampClient,
+    BandcampSearchUnavailableError,
+    BandcampTransportError,
+    extract_slug,
+)
 from clients.streaming.matching import score_match
 from scripts.streaming_availability.results_db import ResultsDB
 from streaming.models import SourceMatch
@@ -173,6 +178,14 @@ async def phase_search(
 
     for result in batch_results:
         if isinstance(result, Exception):
+            # LML#1115: search_artist now raises BandcampTransportError on a
+            # transport failure instead of returning [] (which search_one
+            # above would previously read as "genuinely no artist found" and
+            # write bandcamp_slug='' below -- permanently dropping the
+            # artist on a network blip). process_batched's
+            # return_exceptions=True already routes any exception here; the
+            # row is left untouched (bandcamp_slug stays NULL), so a re-run
+            # retries it.
             log.warning(f"Search error: {result}")
             continue
 
@@ -253,15 +266,22 @@ async def phase_lookup(
     fetch_failed = 0
 
     for slug in slugs_to_process:
-        catalog = await client.fetch_artist_catalog(slug)
+        try:
+            catalog: list[dict] | None = await client.fetch_artist_catalog(slug)
+        except BandcampTransportError:
+            # LML#1115: fetch_artist_catalog now raises rather than
+            # returning None on a fetch failure (network error / timeout /
+            # non-200 / 429 after retries), in both modes -- caught here and
+            # folded back to the pre-existing None sentinel so the rest of
+            # this loop is unchanged: leave the slug's albums 'pending' so a
+            # re-run retries them. Marking not_found here would permanently
+            # drop the slug on a network blip during the multi-hour drain
+            # (#661).
+            catalog = None
         albums = slug_albums[slug]
         processed += 1
 
         if catalog is None:
-            # Transient fetch failure (network error / timeout / non-200 / 429
-            # after retries): leave the slug's albums 'pending' so a re-run
-            # retries them. Marking not_found here would permanently drop the
-            # slug on a network blip during the multi-hour drain (#661).
             fetch_failed += 1
         elif catalog:
             for album_row in albums:

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from clients.bandcamp import BandcampTransportError
 from streaming.models import SourceMatch, StreamingCheckSources
 from streaming.orchestrator import (
     _BANDCAMP_STREAMING_CHECK_TIMEOUT_ENV_VAR,
@@ -104,6 +105,26 @@ async def test_found_on_bandcamp():
     assert result.on_streaming is True
     assert result.sources.bandcamp is not None
     assert "bandcamp.com" in result.sources.bandcamp.url
+
+
+@pytest.mark.asyncio
+async def test_bandcamp_transport_failure_degrades_to_errored_not_a_hard_failure():
+    """LML#1115: a Bandcamp default-mode transport failure (5xx, connect
+    timeout) now raises ``BandcampTransportError`` out of ``find_album_match``
+    instead of degrading to a clean ``None``. This orchestrator's existing
+    generic ``except Exception`` (unchanged by #1115) already folds ANY
+    client exception into ``errored_sources`` -- a degraded response, not a
+    500 and not a false "not on Bandcamp" -- so this pins that the new
+    exception type integrates with that pre-existing posture rather than
+    escaping the gather loop or being misread as a confirmed absence.
+    """
+    bandcamp = _mock_client(BandcampTransportError("boom"))
+
+    result = await check_streaming_availability("Sessa", "Estrela Acesa", bandcamp=bandcamp)
+
+    assert result.on_streaming is None
+    assert result.errored_sources == ["bandcamp"]
+    assert result.sources.bandcamp is None
 
 
 @pytest.mark.asyncio
