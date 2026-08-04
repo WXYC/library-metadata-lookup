@@ -26,6 +26,7 @@ def resolve_streaming_status(
     spotify_url: str | None,
     bandcamp_url: str | None,
     postprocess_status: dict[str, StreamingResolutionStatus] | None,
+    bandcamp_probe_status: StreamingResolutionStatus | None = None,
 ) -> StreamingResolution | None:
     """Build the final ``StreamingResolution`` (or ``None``) for one item.
 
@@ -34,9 +35,14 @@ def resolve_streaming_status(
     override always wins the URL slot, so it always wins "verified" too,
     regardless of what the Apple probe concluded (or whether it ran at all —
     ``enrich_one`` short-circuits the probe precisely when an override is
-    already going to win). Spotify/Bandcamp have no in-``enrich_one`` probe
-    leg — only the librarian override — so a present URL there is always
-    ``verified``; otherwise their verdict is left to ``postprocess_status``.
+    already going to win). Bandcamp mirrors Apple since LML#1098: a present URL
+    (librarian override or a resolved live probe) is ``verified``; otherwise
+    the live probe's own verdict (``bandcamp_probe_status`` — ``absent`` on a
+    sourced no-match, ``unresolved`` on a shed/timeout, ``None`` when it never
+    ran) stands unless ``postprocess_status`` separately resolves it. Spotify
+    has no in-``enrich_one`` probe leg — only the librarian override — so a
+    present URL there is always ``verified``; otherwise its verdict is left to
+    ``postprocess_status``.
 
     ``postprocess_status`` (the ``apply_streaming_url_postprocess`` return
     value) is authoritative for any service it actually consulted: only keys
@@ -54,7 +60,7 @@ def resolve_streaming_status(
         StreamingResolutionStatus.verified if apple_music_override else apple_probe_status
     )
     spotify_status = StreamingResolutionStatus.verified if spotify_url else None
-    bandcamp_status = StreamingResolutionStatus.verified if bandcamp_url else None
+    bandcamp_status = StreamingResolutionStatus.verified if bandcamp_url else bandcamp_probe_status
 
     status_map: dict[str, StreamingResolutionStatus] = {
         service: status

@@ -1,0 +1,180 @@
+"""LML#1098: the inline Bandcamp live probe for the enrichment path.
+
+Extracted from ``enrich_one`` (``lookup/enrichment/item.py``) to keep that file
+under its module-size budget (``tests/unit/test_module_budgets.py``) — the same
+extraction posture ``streaming_status.py`` took for LML#1053. The probe is a
+self-contained concern: given the enrichment context + the current Bandcamp URL
+slot, it either resolves a DIRECT Bandcamp album URL synchronously (bounded,
+cache-first, single fail-fast call) or leaves the slot to the deferred
+search-URL fallback, returning the per-service resolution verdict either way.
+
+Why synchronous, and why only here: the enrichment (``/lookup/bulk``) path is
+the CDC worker call a DJ's flowsheet entry rides. Apple Music is the only
+service with a live probe there today; this gives Bandcamp the same
+first-time-fill treatment, modeled on that probe but with Bandcamp's
+rate-limit guardrails (LML#1106's fail-fast mode + saturation breaker). It is
+NOT added to the interactive ``/lookup`` hot path — that is exactly the
+unbounded-inline shape LML#573/#651 rolled back.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import NamedTuple
+
+from wxyc_fastapi.observability import get_posthog_client
+
+from clients.bandcamp import BandcampRateLimitedError
+from clients.bandcamp_breaker import BandcampBreakerOpenError
+from config.settings import Settings
+from entity.streaming_url_cache import resolve_streaming_url_with_cache
+from generated.api_models import StreamingResolutionStatus
+from lookup.enrichment.context import EnrichmentContext
+from lookup.timeouts import bandcamp_probe_timeout_s
+from streaming.service import ALBUM_CACHE_KEYS, StreamingService
+
+logger = logging.getLogger(__name__)
+
+# The album-cache storage key for Bandcamp ("bandcamp") — derived from the
+# shared enum (not a free-floating literal) so the live probe reads and writes
+# the SAME ``lml_cache.album_streaming_url_cache`` rows as the streaming
+# post-process and the LML#1069 offline drain.
+_BANDCAMP_ALBUM_SERVICE = ALBUM_CACHE_KEYS[StreamingService.BANDCAMP]
+
+_SHED_EVENT = "bandcamp_live_probe_shed"
+_SHED_POSTHOG_EVENT_PREFIX = "bandcamp_live_probe"
+_SHED_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
+
+
+class BandcampProbeResult(NamedTuple):
+    """The probe's effect on the Bandcamp slot.
+
+    ``bandcamp_url`` — the (possibly unchanged) URL slot: the resolved direct
+    album URL on a hit, else the ``current_bandcamp_url`` passed in.
+
+    ``status`` — the LML#1053 per-service verdict: ``verified`` (resolved),
+    ``absent`` (sourced no-match, terminal), ``unresolved`` (shed/timeout,
+    transient), or ``None`` when the probe did not run at all (never-consulted).
+    ``status is not None`` therefore doubles as "the probe ran and owns the
+    Bandcamp leg this request" — the caller uses it to withhold the client from
+    the streaming post-process so the service isn't double-handled.
+    """
+
+    bandcamp_url: str | None
+    status: StreamingResolutionStatus | None
+
+
+async def run_bandcamp_live_probe(
+    ctx: EnrichmentContext,
+    *,
+    settings: Settings,
+    current_bandcamp_url: str | None,
+) -> BandcampProbeResult:
+    """Resolve a DIRECT Bandcamp album URL inline — bounded, cache-first.
+
+    Runs only when every precondition holds:
+      * ``lml_bandcamp_live_probe`` on, AND-gated with the two persist
+        kill-switches (``lml_persist_streaming_urls`` +
+        ``lml_persist_streaming_url_bandcamp``) so an incident flip restores
+        exactly today's behavior;
+      * a Bandcamp client and a PG source are wired (the bulk path injects the
+        client at ``router.py`` when the flag is on);
+      * the request carries an album (Bandcamp deep-links are album-level);
+      * no verified URL already won the slot (a librarian override or the
+        LML#505 sibling-invalidation left it empty) — we never overwrite a
+        verified value.
+
+    On a run it delegates to LML#1106's ``resolve_streaming_url_with_cache(
+    fail_fast=True)`` under an ``asyncio.wait_for`` ceiling clamped to the
+    caller budget (LML#930 parity): a cache hit / live resolve -> ``verified``
+    with the URL; a clean live/known miss -> ``absent`` (the resolver already
+    negative-cached a fresh ``live_miss``); a breaker shed / 429 / timeout ->
+    ``unresolved`` with NO cache write (``fail_fast`` re-raises before the
+    UPSERT). Exactly one ``find_album_match`` — no title-variant fan-out
+    (LML#1094).
+    """
+    if not (
+        # ``getattr`` default mirrors ``apply_streaming_url_postprocess``'s
+        # flag reads: a partial Settings stub (or an incident that removes the
+        # field) reads as OFF, never an AttributeError on the enrichment path.
+        getattr(settings, "lml_bandcamp_live_probe", False)
+        and settings.lml_persist_streaming_urls
+        and settings.lml_persist_streaming_url_bandcamp
+        and ctx.bandcamp is not None
+        and ctx.discogs_cache_pg is not None
+        and ctx.artist
+        and ctx.album
+        and not current_bandcamp_url
+    ):
+        return BandcampProbeResult(current_bandcamp_url, None)
+
+    base_timeout_s = bandcamp_probe_timeout_s()
+    probe_timeout_s = (
+        ctx.spine_deadline.clamp_probe_timeout_s(base_timeout_s)
+        if ctx.spine_deadline is not None
+        else base_timeout_s
+    )
+    try:
+        outcome = await asyncio.wait_for(
+            resolve_streaming_url_with_cache(
+                ctx.discogs_cache_pg,
+                ctx.bandcamp,
+                service=_BANDCAMP_ALBUM_SERVICE,
+                artist=ctx.artist,
+                album=ctx.album,
+                fail_fast=True,
+            ),
+            timeout=probe_timeout_s,
+        )
+    except (BandcampBreakerOpenError, BandcampRateLimitedError) as exc:
+        # A 429-driven shed (breaker OPEN, or a 429 on the single fail-fast
+        # attempt): transient, no sourced verdict, no cache write. Emit the
+        # unsampled shed counter so sustained Bandcamp saturation stays
+        # queryable without a per-event Sentry flood (LML#879/#1049 pattern).
+        _capture_shed(type(exc).__name__, settings=settings)
+        return BandcampProbeResult(current_bandcamp_url, StreamingResolutionStatus.unresolved)
+    except TimeoutError:
+        # The wall-clock ceiling tripped (genuine Bandcamp slowness or a
+        # near-zero deadline clamp) — transient, but NOT a breaker shed, so no
+        # shed counter. No cache write (wait_for cancelled before the UPSERT).
+        logger.debug("Bandcamp live probe timed out for %s - %s", ctx.artist, ctx.album)
+        return BandcampProbeResult(current_bandcamp_url, StreamingResolutionStatus.unresolved)
+    except Exception:
+        # Defensive degrade (LML#444 posture): a Bandcamp fault must never fail
+        # the item — attempted-but-inconclusive maps to ``unresolved``.
+        logger.exception("Bandcamp live probe raised for %s - %s", ctx.artist, ctx.album)
+        return BandcampProbeResult(current_bandcamp_url, StreamingResolutionStatus.unresolved)
+
+    if outcome.url is not None:
+        return BandcampProbeResult(outcome.url, StreamingResolutionStatus.verified)
+    # live_miss / cache_miss_recent: a sourced, terminal no-match. Leave the URL
+    # to the deferred search fallback; the verdict says "checked, absent", not
+    # "couldn't check".
+    return BandcampProbeResult(current_bandcamp_url, StreamingResolutionStatus.absent)
+
+
+def _capture_shed(reason: str, *, settings: Settings) -> None:
+    """Emit the unsampled PostHog counter for one Bandcamp live-probe shed.
+
+    Mirrors ``discogs.service._capture_artist_breaker_shed`` (LML#1049):
+    best-effort, gated by ``enable_telemetry``, wired through the shared
+    ``get_posthog_client`` accessor. Every branch is wrapped so a telemetry
+    failure can never turn a shed into a lookup failure.
+    """
+    try:
+        if not getattr(settings, "enable_telemetry", False):
+            return
+        client = get_posthog_client(event_prefix=_SHED_POSTHOG_EVENT_PREFIX)
+        if client is None:
+            return
+        client.capture(
+            distinct_id=_SHED_POSTHOG_DISTINCT_ID,
+            event=_SHED_EVENT,
+            properties={
+                "reason": reason,
+                "environment": getattr(settings, "environment", None),
+            },
+        )
+    except Exception:
+        logger.warning("Failed to emit %s counter", _SHED_EVENT, exc_info=True)
