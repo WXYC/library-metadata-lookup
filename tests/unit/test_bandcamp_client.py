@@ -8,7 +8,12 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from clients.bandcamp import BandcampClient, BandcampSearchUnavailableError, extract_slug
+from clients.bandcamp import (
+    BandcampClient,
+    BandcampSearchUnavailableError,
+    BandcampTransportError,
+    extract_slug,
+)
 from streaming.models import SourceMatch
 
 
@@ -117,7 +122,12 @@ class TestSearchArtist:
         assert results == []
 
     @pytest.mark.asyncio
-    async def test_returns_empty_on_http_error(self):
+    async def test_raises_transport_error_on_http_error(self):
+        # LML#1115: a non-200 raises BandcampTransportError in the default
+        # mode too (previously degraded to [] here, indistinguishable from a
+        # genuine "asked, no artists matched") -- extends the fail_fast-only
+        # raise (LML#1106) so a caller can tell "couldn't ask" apart from a
+        # real no-match and skip writing a negative-cache row.
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.request = AsyncMock(
@@ -127,8 +137,8 @@ class TestSearchArtist:
         )
         client._http = mock_http
 
-        results = await client.search_artist("Nobody")
-        assert results == []
+        with pytest.raises(BandcampTransportError):
+            await client.search_artist("Nobody")
 
     @pytest.mark.asyncio
     async def test_returns_empty_on_no_results(self):
@@ -155,14 +165,15 @@ class TestSearchArtist:
         assert results[0]["slug"] == "flyinglotus"
 
     @pytest.mark.asyncio
-    async def test_returns_empty_on_network_error(self):
+    async def test_raises_transport_error_on_network_error(self):
+        # LML#1115: extends the fail_fast-only raise to the default mode.
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.request = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
         client._http = mock_http
 
-        results = await client.search_artist("Unreachable")
-        assert results == []
+        with pytest.raises(BandcampTransportError):
+            await client.search_artist("Unreachable")
 
     @pytest.mark.asyncio
     async def test_retries_on_429(self):
@@ -230,9 +241,13 @@ class TestFetchArtistCatalog:
         assert albums[0]["title"] == "confield"
 
     @pytest.mark.asyncio
-    async def test_returns_none_on_http_error(self):
-        # A non-200 is a fetch failure, distinct from a 200 page with no albums:
-        # callers must not treat it as "definitively no catalog" (#661).
+    async def test_raises_transport_error_on_http_error(self):
+        # A non-200 is a fetch failure, distinct from a 200 page with no
+        # albums: callers must not treat it as "definitively no catalog"
+        # (#661). LML#1115: raises BandcampTransportError in the default
+        # mode too (previously returned None here, which the live match
+        # path then coalesced to "no catalog" via `or []` -- silently
+        # turning a couldn't-ask into a no-match verdict).
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.request = AsyncMock(
@@ -240,18 +255,19 @@ class TestFetchArtistCatalog:
         )
         client._http = mock_http
 
-        albums = await client.fetch_artist_catalog("nonexistent99")
-        assert albums is None
+        with pytest.raises(BandcampTransportError):
+            await client.fetch_artist_catalog("nonexistent99")
 
     @pytest.mark.asyncio
-    async def test_returns_none_on_network_error(self):
+    async def test_raises_transport_error_on_network_error(self):
+        # LML#1115: extends the fail_fast-only raise to the default mode.
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.request = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
         client._http = mock_http
 
-        albums = await client.fetch_artist_catalog("broken")
-        assert albums is None
+        with pytest.raises(BandcampTransportError):
+            await client.fetch_artist_catalog("broken")
 
     @pytest.mark.asyncio
     async def test_returns_empty_list_on_successful_empty_catalog(self):
@@ -402,21 +418,42 @@ class TestFindAlbumMatch:
         assert match is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_catalog_fetch_fails_and_fallback_finds_nothing(self):
-        # fetch_artist_catalog now returns None on a fetch failure; the live
-        # match path must coalesce that to no-match, never pass None into the
-        # matcher (which iterates the catalog and would TypeError on None).
+    async def test_catalog_fetch_failure_propagates_without_trying_fallback(self):
+        # LML#1115: fetch_artist_catalog now raises BandcampTransportError in
+        # the default mode too (previously coalesced a fetch failure to "no
+        # catalog" via `or []`, silently downgrading a couldn't-ask into a
+        # no-match verdict that resolve_streaming_url_with_cache would then
+        # durably cache). Mirrors the existing fail_fast posture: a transport
+        # failure on the artist-first phase propagates immediately, without
+        # spending a second rate-limited request on the album-search fallback.
         client = BandcampClient()
         client.search_artist = AsyncMock(
             return_value=[
                 {"name": "Stereolab", "url": "https://stereolab.bandcamp.com", "slug": "stereolab"}
             ]
         )
-        client.fetch_artist_catalog = AsyncMock(return_value=None)
-        client.find_album_match_via_search = AsyncMock(return_value=None)
+        client.fetch_artist_catalog = AsyncMock(side_effect=BandcampTransportError("boom"))
+        client.find_album_match_via_search = AsyncMock()
 
-        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
-        assert match is None
+        with pytest.raises(BandcampTransportError):
+            await client.find_album_match("Stereolab", "Aluminum Tunes")
+
+        client.find_album_match_via_search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_artist_search_failure_propagates_without_trying_fallback(self):
+        # Same short-circuit one phase earlier: a transport failure on the
+        # artist autocomplete call itself propagates immediately rather than
+        # falling through to search_artist's historical "[]" degrade
+        # (LML#1115).
+        client = BandcampClient()
+        client.search_artist = AsyncMock(side_effect=BandcampTransportError("boom"))
+        client.find_album_match_via_search = AsyncMock()
+
+        with pytest.raises(BandcampTransportError):
+            await client.find_album_match("Unknown", "Whatever")
+
+        client.find_album_match_via_search.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_none_when_album_title_doesnt_match_and_fallback_finds_nothing(self):
@@ -489,15 +526,19 @@ class TestFindAlbumMatchAlbumSearchFallback:
         assert match is fallback_match
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_search_unavailable(self):
-        # The live path has no retry channel (see the catalog-fetch-failure
-        # comment above) -- a transient autocomplete failure degrades to no
-        # match, same as any other adapter failure, rather than propagating.
+    async def test_search_unavailable_propagates_instead_of_degrading(self):
+        # LML#1115: the live path used to swallow BandcampSearchUnavailableError
+        # to a clean None here -- indistinguishable from a genuine no-match, so
+        # resolve_streaming_url_with_cache would UPSERT a false 7-day
+        # known-miss row for a transient autocomplete blip. It now propagates,
+        # same as any other "couldn't ask" outcome, so the cache-backed
+        # resolver's existing exception handling (no write on any raise) can
+        # do its job.
         client = BandcampClient()
         client.search_artist = AsyncMock(return_value=[])
         client.find_album_match_via_search = AsyncMock(
             side_effect=BandcampSearchUnavailableError("boom")
         )
 
-        match = await client.find_album_match("Unknown", "Whatever")
-        assert match is None
+        with pytest.raises(BandcampSearchUnavailableError):
+            await client.find_album_match("Unknown", "Whatever")

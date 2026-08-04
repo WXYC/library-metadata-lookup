@@ -9,9 +9,17 @@ a genuine miss and never poison a negative cache), and the whole call is
 gated by ``BandcampProbeBreaker`` so a sustained 429 run sheds immediately
 without ever touching the network.
 
-The default (``fail_fast=False``) path is untouched -- pinned here so a
+The default (``fail_fast=False``) path's 429-retry-loop mechanics
+(``_request_with_retry``'s ``discogs.admission.retry_429`` backoff) are
+untouched -- pinned here (``test_default_mode_unaffected`` below) so a
 future edit can't silently change the retrying background-warm/offline-drain
-behavior other callers depend on.
+behavior other callers depend on. LML#1115 separately extends the
+NON-429-transport-failure raise (``BandcampTransportError`` /
+``BandcampSearchUnavailableError``) to that same default path one layer up
+(``search_artist`` / ``fetch_artist_catalog`` / ``search_albums`` /
+``find_album_match_via_search`` / ``_find_album_match_impl`` in
+``clients/bandcamp.py``) -- see ``tests/unit/test_bandcamp_client.py`` and
+``tests/unit/test_bandcamp_album_search.py`` for that coverage.
 """
 
 from __future__ import annotations

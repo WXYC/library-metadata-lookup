@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, create_autospec
 
+import httpx
 import pytest
 
 from clients.bandcamp import BandcampClient
@@ -38,9 +39,32 @@ _SERVICE_CASES = [
     ("spotify_album", "https://open.spotify.com/album/1A2GTWGt0LBTGQAyA3OKAf"),
 ]
 
+_AUTOCOMPLETE_URL = "https://bandcamp.com/api/fuzzysearch/2/app_autocomplete"
+
 
 def _match(url: str) -> SourceMatch:
     return SourceMatch(url=url, confidence=95.0)
+
+
+class _InstantLimiter:
+    """A rate limiter stand-in with a no-op ``acquire`` -- see the identical
+    fixture in ``test_bandcamp_fail_fast_probe.py``. Duplicated rather than
+    imported per this repo's convention for private test helpers (that file's
+    own docstring explains why); without it a real ``BandcampClient()``'s
+    ``AsyncLimiter(1, 1)`` would pace the two sequential HTTP calls below
+    (artist search, then the album-search fallback) ~1s apart for real.
+    """
+
+    async def acquire(self) -> None:
+        return None
+
+
+def _autocomplete_response(results: list[dict], status_code: int = 200) -> httpx.Response:
+    return httpx.Response(
+        status_code,
+        json={"results": results} if status_code == 200 else None,
+        request=httpx.Request("GET", _AUTOCOMPLETE_URL),
+    )
 
 
 @pytest.mark.asyncio
@@ -362,3 +386,57 @@ class TestResolveStreamingURLWithCacheFailFastClientShape:
             )
 
         pg.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestResolveStreamingURLWithCacheBandcampDefaultPath:
+    """LML#1115: on the default (non-``fail_fast``) path, ``BandcampClient``
+    used to swallow a transport failure (5xx, Cloudflare 403/1015, connect
+    timeout) to a clean ``None`` well before it ever reached this resolver --
+    indistinguishable from a genuine no-match, so the ``if match is None:``
+    branch below would UPSERT a 7-day known-miss row for an outage. LML#1115
+    fixed that at the client layer (``clients/bandcamp.py``); these tests
+    exercise the REAL ``BandcampClient`` (mocked only at the HTTP transport)
+    through this resolver end-to-end, rather than a stand-in that always
+    agreed with whatever the client layer's contract used to be.
+    """
+
+    async def test_transport_failure_returns_live_error_without_cache_write(self):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock()
+        client = BandcampClient()
+        client._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.request = AsyncMock(return_value=_autocomplete_response([], status_code=503))
+
+        outcome = await resolve_streaming_url_with_cache(
+            pg, client, service="bandcamp", artist="Sessa", album="Estrela Acesa"
+        )
+
+        assert outcome == ResolveOutcome(url=None, source="live_error")
+        pg.execute.assert_not_called()
+
+    async def test_genuine_no_match_still_writes_known_miss(self):
+        # The ticket's "keep this" requirement: a real 200-with-no-match must
+        # still write the negative-cache row with the existing TTL -- LML#1115
+        # must not weaken this deliberate negative caching.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        client = BandcampClient()
+        client._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.request = AsyncMock(return_value=_autocomplete_response([]))
+
+        outcome = await resolve_streaming_url_with_cache(
+            pg,
+            client,
+            service="bandcamp",
+            artist="Nonexistent Artist",
+            album="Nonexistent Album",
+        )
+
+        assert outcome == ResolveOutcome(url=None, source="live_miss")
+        pg.execute.assert_awaited_once()
+        assert pg.execute.await_args.args[4] is None

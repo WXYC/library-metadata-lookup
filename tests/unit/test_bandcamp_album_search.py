@@ -18,6 +18,7 @@ import pytest
 from clients.bandcamp import (
     BandcampClient,
     BandcampSearchUnavailableError,
+    BandcampTransportError,
     clean_title_for_query,
     fix_autocomplete_url,
     normalize_bc_title,
@@ -270,10 +271,13 @@ class TestSearchAlbums:
         assert results[0]["url"] == "https://stereolab.bandcamp.com/album/aluminum-tunes"
 
     @pytest.mark.asyncio
-    async def test_returns_none_on_http_error(self):
+    async def test_raises_transport_error_on_http_error(self):
         # Mirrors fetch_artist_catalog's None/[] split (#661): a transient
         # fetch failure must be distinguishable from a genuine empty result
-        # set so the offline drain doesn't durably mark it not_found.
+        # set so the offline drain doesn't durably mark it not_found. LML#1115:
+        # raises BandcampTransportError in the default mode too (previously
+        # returned None here) so the live match path can tell "couldn't ask"
+        # apart from a real no-match instead of degrading silently.
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.request = AsyncMock(
@@ -283,18 +287,19 @@ class TestSearchAlbums:
         )
         client._http = mock_http
 
-        results = await client.search_albums("Nobody")
-        assert results is None
+        with pytest.raises(BandcampTransportError):
+            await client.search_albums("Nobody")
 
     @pytest.mark.asyncio
-    async def test_returns_none_on_network_error(self):
+    async def test_raises_transport_error_on_network_error(self):
+        # LML#1115: extends the fail_fast-only raise to the default mode.
         client = BandcampClient()
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.request = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
         client._http = mock_http
 
-        results = await client.search_albums("Unreachable")
-        assert results is None
+        with pytest.raises(BandcampTransportError):
+            await client.search_albums("Unreachable")
 
     @pytest.mark.asyncio
     async def test_returns_empty_list_on_genuinely_no_results(self):
@@ -534,14 +539,30 @@ class TestFindAlbumMatchViaSearch:
 
     @pytest.mark.asyncio
     async def test_raises_on_search_unavailable(self):
-        # search_albums returning None means the autocomplete request failed
-        # after retries -- distinct from a genuine no-match so the offline
-        # drain can avoid durably marking a transient blip not_found (#661).
+        # search_albums raising BandcampTransportError (LML#1115: it no
+        # longer returns None in either mode) means the autocomplete request
+        # failed after retries -- distinct from a genuine no-match so the
+        # offline drain can avoid durably marking a transient blip not_found
+        # (#661). In the default mode this method translates it to
+        # BandcampSearchUnavailableError, preserving the existing offline-
+        # drain contract (scripts/bandcamp_pipeline.py's phase_album_search).
         client = BandcampClient()
-        client.search_albums = AsyncMock(return_value=None)
+        client.search_albums = AsyncMock(side_effect=BandcampTransportError("boom"))
 
         with pytest.raises(BandcampSearchUnavailableError):
             await client.find_album_match_via_search("Nobody", "Nothing")
+
+    @pytest.mark.asyncio
+    async def test_fail_fast_propagates_transport_error_unchanged(self):
+        # Under fail_fast, search_albums's BandcampTransportError propagates
+        # raw -- NOT translated to BandcampSearchUnavailableError, so
+        # find_album_match's breaker wrapper (LML#1106) still sees the type
+        # it already knows how to record as an aborted call.
+        client = BandcampClient()
+        client.search_albums = AsyncMock(side_effect=BandcampTransportError("boom"))
+
+        with pytest.raises(BandcampTransportError):
+            await client.find_album_match_via_search("Nobody", "Nothing", fail_fast=True)
 
     @pytest.mark.asyncio
     async def test_pine_hill_haints_recovers_via_normalized_pass(self):

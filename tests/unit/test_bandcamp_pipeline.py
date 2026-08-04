@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from clients.bandcamp import BandcampTransportError
 from scripts.streaming_availability.dedup import DeduplicatedAlbum
 from scripts.streaming_availability.results_db import ResultsDB
 
@@ -371,10 +372,12 @@ class TestPhaseLookup:
         await db.update_bandcamp_slug(rows[0]["id"], "stereolab")
 
         mock_client = AsyncMock()
-        # None signals a transient fetch failure (timeout / 5xx / rate-limit
-        # exhausted), NOT a definitively-empty catalog. Marking it not_found
-        # would permanently drop the slug on a network blip during the drain.
-        mock_client.fetch_artist_catalog = AsyncMock(return_value=None)
+        # BandcampTransportError (LML#1115: fetch_artist_catalog now raises
+        # rather than returning None, in both modes) signals a transient
+        # fetch failure (timeout / 5xx / rate-limit exhausted), NOT a
+        # definitively-empty catalog. Marking it not_found would permanently
+        # drop the slug on a network blip during the drain.
+        mock_client.fetch_artist_catalog = AsyncMock(side_effect=BandcampTransportError("boom"))
 
         await phase_lookup(mock_client, db)
 
