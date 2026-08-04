@@ -31,7 +31,11 @@ from config.settings import Settings
 from entity.streaming_url_cache import resolve_streaming_url_with_cache
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment.context import EnrichmentContext
-from lookup.streaming_url_postprocess import should_suppress_streaming_warm
+from lookup.streaming_url_postprocess import (
+    STREAMING_URL_CACHE_CONFIG,
+    mint_streaming_identity,
+    should_suppress_streaming_warm,
+)
 from lookup.timeouts import bandcamp_probe_timeout_s
 from streaming.service import ALBUM_CACHE_KEYS, StreamingService
 
@@ -42,6 +46,10 @@ logger = logging.getLogger(__name__)
 # the SAME ``lml_cache.album_streaming_url_cache`` rows as the streaming
 # post-process and the LML#1069 offline drain.
 _BANDCAMP_ALBUM_SERVICE = ALBUM_CACHE_KEYS[StreamingService.BANDCAMP]
+
+# The Bandcamp cache/mint registry entry -- reused by the FIX 4 mint call
+# below instead of a re-indexed literal at each call site.
+_BANDCAMP_CACHE_CONFIG = STREAMING_URL_CACHE_CONFIG[StreamingService.BANDCAMP]
 
 _SHED_EVENT = "bandcamp_live_probe_shed"
 _SHED_POSTHOG_EVENT_PREFIX = "bandcamp_live_probe"
@@ -56,14 +64,37 @@ class BandcampProbeResult(NamedTuple):
 
     ``status`` — the LML#1053 per-service verdict: ``verified`` (resolved),
     ``absent`` (sourced no-match, terminal), ``unresolved`` (shed/timeout,
-    transient), or ``None`` when the probe did not run at all (never-consulted).
-    ``status is not None`` therefore doubles as "the probe ran and owns the
-    Bandcamp leg this request" — the caller uses it to withhold the client from
-    the streaming post-process so the service isn't double-handled.
+    transient — the probe answered NOTHING and wrote NOTHING), or ``None``
+    when the probe did not run at all (never-consulted). See
+    :func:`probe_owns_bandcamp_leg` (LML#1106 review, FIX 3) for which of
+    these should withhold the client from the streaming post-process —
+    ``status is not None`` is NOT the right predicate for that: it also
+    matches ``unresolved``, which has no fill and no cache write to protect.
     """
 
     bandcamp_url: str | None
     status: StreamingResolutionStatus | None
+
+
+def probe_owns_bandcamp_leg(status: StreamingResolutionStatus | None) -> bool:
+    """Whether ``status`` (a :class:`BandcampProbeResult`'s ``status``) is a
+    SOURCED verdict that should withhold the client from the streaming
+    post-process (``lookup/enrichment/item.py``'s ``apply_streaming_url_
+    postprocess`` call).
+
+    Only ``verified`` and ``absent`` qualify (LML#1106 review, FIX 3): the
+    probe actually produced -- and for ``absent``, cache-wrote -- a verdict,
+    so handing the same service to the post-process too would be redundant
+    (or, worse, let ``postprocess_status`` clobber it). ``unresolved`` (a
+    breaker shed, 429, transport failure, or timeout) and ``None``
+    (never-consulted) are NOT sourced: ``unresolved`` in particular answered
+    nothing and wrote nothing to the cache, so withholding the client anyway
+    would leave the item with no fill AND no #1087 background warm — the
+    next lookup of the same album is equally cold and sheds again, strictly
+    WORSE than leaving the probe off entirely (where #1087 alone would have
+    queued a retrying off-path warm).
+    """
+    return status in (StreamingResolutionStatus.verified, StreamingResolutionStatus.absent)
 
 
 async def run_bandcamp_live_probe(
@@ -71,10 +102,24 @@ async def run_bandcamp_live_probe(
     *,
     settings: Settings,
     current_bandcamp_url: str | None,
+    is_top1: bool,
 ) -> BandcampProbeResult:
     """Resolve a DIRECT Bandcamp album URL inline — bounded, cache-first.
 
     Runs only when every precondition holds:
+      * ``is_top1`` — the probe keys on the REQUEST-level ``(ctx.artist,
+        ctx.album)``, identical across every item ``enrich_one`` is called
+        for. Without this gate, a response with N results (up to
+        ``MAX_SEARCH_RESULTS``) fires N identical concurrent resolves — up to
+        3 HTTP calls each, no dedup (the warm path this displaced had
+        ``_streaming_warm_in_flight``; the probe has none) — and a later
+        probe can exceed the shared breaker's ceiling, so one response could
+        carry a direct URL on one row and a search URL on its siblings
+        (LML#1106 review, FIX 2). Matches ``enrich_artwork_results``'s own
+        documented top-1-only convention ("BS/iOS only consume the top-1
+        result, so paying N round-trips was waste"). A non-top-1 item is
+        simply unprobed — its slot falls through to the deferred search-URL
+        fallback in ``enrich_one``, never a wrong/stale verdict;
       * **the bulk enrichment path** — ``should_suppress_streaming_warm()`` is
         set ``True`` only by the bulk handler (``router.py``), so it is the
         reliable "am I on ``/lookup/bulk``" signal. The interactive ``/lookup``
@@ -94,14 +139,21 @@ async def run_bandcamp_live_probe(
     On a run it delegates to LML#1106's ``resolve_streaming_url_with_cache(
     fail_fast=True)`` under an ``asyncio.wait_for`` ceiling clamped to the
     caller budget (LML#930 parity): a cache hit / live resolve -> ``verified``
-    with the URL; a clean live/known miss -> ``absent`` (the resolver already
-    negative-cached a fresh ``live_miss``); a breaker shed / 429 / non-429
-    transport failure / timeout -> ``unresolved`` with NO cache write
-    (``fail_fast`` re-raises before the UPSERT). Exactly one
-    ``find_album_match`` — no title-variant fan-out (LML#1094).
+    with the URL (``live_resolved`` also mints the external_id into
+    ``entity.release_identity`` -- FIX 4, since the withheld client means
+    ``_warm_streaming_url_cache`` never runs to mint it instead); a clean
+    live/known miss -> ``absent`` (a fresh ``live_miss`` negative-cache);
+    a breaker shed / 429 / non-429 transport failure / timeout ->
+    ``unresolved`` with NO cache write (``fail_fast`` re-raises before the
+    UPSERT). Exactly one ``find_album_match`` — no title-variant fan-out
+    (LML#1094).
     """
     if not (
-        # BULK-path-only gate FIRST (short-circuits the interactive path before
+        # is_top1 FIRST (cheapest check, no attribute/ContextVar read): a
+        # non-top-1 item never runs the probe (LML#1106 review, FIX 2) — see
+        # the docstring's is_top1 bullet.
+        is_top1
+        # BULK-path-only gate NEXT (short-circuits the interactive path before
         # any flag read): the interactive /lookup injects the same client and
         # reads the same flag, so this ContextVar — set True only by the bulk
         # handler — is what keeps the synchronous probe off the hot path. This
@@ -109,7 +161,7 @@ async def run_bandcamp_live_probe(
         # (a shared, existing assumption, not a new one); if a future change
         # ever sets suppression True on a non-bulk path, gate this on a
         # dedicated is_bulk context flag instead.
-        should_suppress_streaming_warm()
+        and should_suppress_streaming_warm()
         # ``getattr`` default: the new field may be absent on a partial Settings
         # stub (the two persist flags below are guaranteed on every stub that
         # reaches enrichment), so read it defensively — never an AttributeError.
@@ -173,6 +225,13 @@ async def run_bandcamp_live_probe(
         return BandcampProbeResult(current_bandcamp_url, StreamingResolutionStatus.unresolved)
 
     if outcome.url is not None:
+        # FIX 4 (LML#1106 review): mint only a brand-new live_resolved -- a
+        # cache_hit already minted; mint_streaming_identity swallows its own
+        # failures (never fails the lookup).
+        if outcome.source == "live_resolved" and ctx.entity_store is not None:
+            await mint_streaming_identity(
+                _BANDCAMP_ALBUM_SERVICE, _BANDCAMP_CACHE_CONFIG, outcome.url, ctx.entity_store
+            )
         return BandcampProbeResult(outcome.url, StreamingResolutionStatus.verified)
     # live_miss / cache_miss_recent: a sourced, terminal no-match. Leave the URL
     # to the deferred search fallback; the verdict says "checked, absent", not

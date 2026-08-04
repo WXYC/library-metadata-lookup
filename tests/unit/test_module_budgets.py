@@ -55,9 +55,12 @@ MODULE_BUDGETS: dict[str, int] = {
     # LML#1098: the inline Bandcamp live probe, extracted out of item.py to keep
     # that file under its ceiling (same posture streaming_status.py took for
     # LML#1053) — a self-contained concern with no dependency on enrich_one's
-    # control flow. Smallest multiple of 50 at or above 1.3x its ~177-line
+    # control flow. Recalibrated 2026-08 (LML#1106 review, FIXes 2-4: the
+    # is_top1 gate, the probe_owns_bandcamp_leg predicate, and the
+    # live_resolved mint all landed here rather than in the already-at-ceiling
+    # item.py) — smallest multiple of 50 at or above 1.3x its new ~266-line
     # measured size.
-    "lookup/enrichment/bandcamp_probe.py": 250,
+    "lookup/enrichment/bandcamp_probe.py": 350,
     "lookup/enrichment/context.py": 150,
     "lookup/enrichment/item.py": 850,
     # LML#1053: the per-service streaming-status merge, extracted out of

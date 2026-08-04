@@ -149,6 +149,64 @@ class TestBandcampLiveProbe:
         # Write-back UPSERT ran (resolved URL persisted for the next play).
         assert pg.execute.await_count >= 1
 
+    async def test_live_resolved_mints_the_release_identity(self):
+        """LML#1106 review FIX 4: a fresh ``live_resolved`` must mint the
+        parsed external_id into ``entity.release_identity``, mirroring
+        ``_warm_streaming_url_cache``'s ``live_resolved`` mint. Without this,
+        the probe's own UPSERT populates the cache row, so every LATER lookup
+        takes ``cache_hit`` -- which deliberately skips minting -- leaving a
+        PERMANENTLY missing Bandcamp row for exactly the rotation/rowless
+        population this feature targets. The probe also withholds the client
+        from the post-process on a ``verified`` result, so the post-process's
+        OWN mint (``_warm_streaming_url_cache``) can never run either --
+        minting is entirely this probe's responsibility on this path."""
+        item, artwork, bandcamp = _inputs()
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)  # cache miss -> live_resolved
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        entity_store = MagicMock()
+        entity_store.mint_or_get_release_identity = AsyncMock(return_value=(1, True))
+
+        with patch("lookup.enrichment.item.get_settings", return_value=_flags()):
+            await _run(bandcamp, pg, item, artwork, entity_store=entity_store)
+
+        entity_store.mint_or_get_release_identity.assert_awaited_once_with(
+            source="bandcamp", external_id=_BC_URL
+        )
+
+    async def test_mint_failure_is_swallowed_not_raised(self):
+        """LML#1106 review FIX 4: mirrors ``_mint_identity``'s failure
+        posture -- a mint failure (PG outage, validation rejection) logs and
+        continues, it must never fail the lookup. The URL still surfaces."""
+        item, artwork, bandcamp = _inputs()
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        entity_store = MagicMock()
+        entity_store.mint_or_get_release_identity = AsyncMock(side_effect=RuntimeError("pg down"))
+
+        with patch("lookup.enrichment.item.get_settings", return_value=_flags()):
+            results = await _run(bandcamp, pg, item, artwork, entity_store=entity_store)
+
+        _, enriched = results[0]
+        assert enriched.bandcamp_url == _BC_URL
+        assert enriched.streaming_status.bandcamp == StreamingResolutionStatus.verified
+
+    async def test_cache_hit_does_not_mint(self):
+        """A cache HIT already minted on its original resolution -- the probe
+        must not re-mint on a warm read (matches
+        ``_warm_streaming_url_cache``'s ``live_resolved``-only mint gate)."""
+        item, artwork, bandcamp = _inputs()
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value={"url": _BC_URL})  # cache hit
+        entity_store = MagicMock()
+        entity_store.mint_or_get_release_identity = AsyncMock(return_value=(1, True))
+
+        with patch("lookup.enrichment.item.get_settings", return_value=_flags()):
+            await _run(bandcamp, pg, item, artwork, entity_store=entity_store)
+
+        entity_store.mint_or_get_release_identity.assert_not_awaited()
+
     async def test_cache_hit_returns_cached_url_without_calling(self):
         """A warm cache entry short-circuits: no live call, cached URL returned."""
         item, artwork, bandcamp = _inputs()
@@ -211,6 +269,59 @@ class TestBandcampLiveProbe:
 
         _, _enriched = results[0]
         bandcamp.find_album_match.assert_not_awaited()
+
+    async def test_only_top1_item_runs_the_probe(self):
+        """LML#1106 review FIX 2: the probe keys on the request-level
+        ``(ctx.artist, ctx.album)``, identical across every item in the
+        result list. Without an ``is_top1`` gate, a response with N results
+        (up to ``MAX_SEARCH_RESULTS``) fires N identical concurrent resolves
+        -- up to 3 HTTP calls each, no dedup -- and a later probe can exceed
+        the shared breaker's ceiling so one response carries a direct URL on
+        one row and a search URL on its siblings. Gating on ``is_top1``
+        (which ``enrich_one`` already receives) matches
+        ``enrich_artwork_results``'s own documented top-1-only convention.
+        Non-top-1 items must still reach a correct end state -- unprobed
+        (search-URL fallback, no verdict), not wrong."""
+        item1, artwork1, bandcamp = _inputs()
+        item2 = make_library_item(id=43, artist=_ARTIST, title=_ALBUM)
+        artwork2 = make_discogs_result(
+            release_id=2,
+            artist=_ARTIST,
+            album=_ALBUM,
+            artwork_url="https://example.com/painless-sibling.jpg",
+        )
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+
+        set_suppress_streaming_warm(True)
+        with patch("lookup.enrichment.item.get_settings", return_value=_flags()):
+            results = await enrich_artwork_results(
+                [(item1, artwork1), (item2, artwork2)],
+                _discogs_service(),
+                song=_SONG,
+                album=_ALBUM,
+                artist=_ARTIST,
+                apple_music=None,
+                bandcamp=bandcamp,
+                discogs_cache_pg=pg,
+                entity_store=None,
+            )
+
+        # Exactly one find_album_match + one UPSERT -- not one per item.
+        bandcamp.find_album_match.assert_awaited_once()
+        assert pg.execute.await_count == 1
+
+        _, top1_result = results[0]
+        _, other_result = results[1]
+        assert top1_result.bandcamp_url == _BC_URL
+        assert top1_result.streaming_status.bandcamp == StreamingResolutionStatus.verified
+        # Non-top-1: unprobed, not wrong -- the deferred search-URL fallback,
+        # never a verdict this item's own call never earned.
+        assert other_result.bandcamp_url.startswith(_SEARCH_PREFIX)
+        assert (
+            other_result.streaming_status is None or other_result.streaming_status.bandcamp is None
+        )
 
     async def test_breaker_shed_yields_unresolved_and_emits_shed_counter(self):
         """A saturation-breaker shed (``BandcampBreakerOpenError``) is transient:
@@ -376,11 +487,14 @@ class TestBandcampLiveProbe:
         assert enriched.bandcamp_url.startswith(_SEARCH_PREFIX)
 
     async def test_withholds_bandcamp_client_from_postprocess_when_probe_runs(self):
-        """When the probe runs, ``enrich_one`` passes ``bandcamp=None`` to the
-        streaming post-process so the service isn't double-handled (redundant
-        warm) and its verdict isn't clobbered by ``postprocess_status``. With
-        the flag off, the client flows through unchanged. Uses a non-None
-        ``entity_store`` so the post-process is not the early-return no-op."""
+        """When the probe runs and reaches a SOURCED verdict (``verified`` /
+        ``absent``), ``enrich_one`` passes ``bandcamp=None`` to the streaming
+        post-process so the service isn't double-handled (redundant warm) and
+        its verdict isn't clobbered by ``postprocess_status``. With the flag
+        off, the client flows through unchanged. Uses a non-None
+        ``entity_store`` so the post-process is not the early-return no-op.
+        See ``test_does_not_withhold_client_when_probe_is_unresolved`` for the
+        THIRD verdict (``unresolved``), which must NOT withhold."""
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
         pg.execute = AsyncMock(return_value="INSERT 0 1")
@@ -405,6 +519,32 @@ class TestBandcampLiveProbe:
         ):
             await _run(bandcamp2, pg, item2, artwork2, entity_store=entity_store)
         assert spy.await_args.kwargs["clients"]["bandcamp"] is bandcamp2
+
+    async def test_does_not_withhold_client_when_probe_is_unresolved(self):
+        """LML#1106 review FIX 3: an ``unresolved`` verdict (a breaker shed,
+        429, transport failure, or timeout) means the probe answered NOTHING
+        and wrote NOTHING to the cache -- withholding the client anyway would
+        leave this item with no fill AND no #1087 off-path warm, so the next
+        lookup of the same album is equally cold and sheds again (strictly
+        WORSE than leaving the probe off, where #1087 alone would have queued
+        a retrying warm). Only a SOURCED verdict (``verified`` / ``absent``)
+        should withhold -- see
+        ``test_withholds_bandcamp_client_from_postprocess_when_probe_runs``."""
+        item, artwork, bandcamp = _inputs()
+        bandcamp.find_album_match = AsyncMock(side_effect=BandcampBreakerOpenError())
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        spy = AsyncMock(return_value={})
+        entity_store = MagicMock()
+
+        with (
+            patch("lookup.enrichment.item.get_settings", return_value=_flags()),
+            patch("lookup.enrichment.item.apply_streaming_url_postprocess", spy),
+        ):
+            await _run(bandcamp, pg, item, artwork, entity_store=entity_store)
+
+        assert spy.await_args.kwargs["clients"]["bandcamp"] is bandcamp
 
     async def test_absent_verdict_survives_a_live_postprocess(self):
         """End-to-end clobber guard: with a live post-process (non-None

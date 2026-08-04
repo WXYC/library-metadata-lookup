@@ -46,7 +46,7 @@ from lookup.artist_resolution import (
     _mb_rescue_song_match_required,
     _project_mb_rescue_attrs,
 )
-from lookup.enrichment.bandcamp_probe import run_bandcamp_live_probe
+from lookup.enrichment.bandcamp_probe import probe_owns_bandcamp_leg, run_bandcamp_live_probe
 from lookup.enrichment.context import EnrichmentContext
 from lookup.enrichment.streaming_status import resolve_streaming_status
 from lookup.rowless import (
@@ -469,7 +469,7 @@ async def enrich_one(
 
     # LML#1098: inline Bandcamp live probe (bounded, cache-first; bandcamp_probe.py).
     bandcamp_url, bandcamp_status = await run_bandcamp_live_probe(
-        ctx, settings=settings, current_bandcamp_url=bandcamp_url
+        ctx, settings=settings, current_bandcamp_url=bandcamp_url, is_top1=is_top1
     )
     # Album-derived fields are positionally gated: only on top-1, and
     # only when top-1 actually carries an *acceptable* library row.
@@ -634,8 +634,8 @@ async def enrich_one(
         clients={
             "apple_music": ctx.apple_music,
             "spotify": ctx.spotify,
-            # LML#1098: withhold the client when the inline probe owns Bandcamp.
-            "bandcamp": None if bandcamp_status is not None else ctx.bandcamp,
+            # LML#1098: withhold only on a SOURCED verdict (FIX 3, LML#1106 review).
+            "bandcamp": None if probe_owns_bandcamp_leg(bandcamp_status) else ctx.bandcamp,
         },
         pg=ctx.discogs_cache_pg,
         entity_store=ctx.entity_store,
