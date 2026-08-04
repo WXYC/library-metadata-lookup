@@ -194,6 +194,42 @@ class TestBandcampLiveProbe:
         assert enriched.bandcamp_url == _BC_URL
         assert enriched.streaming_status.bandcamp == StreamingResolutionStatus.verified
 
+    async def test_mint_await_is_bounded_and_does_not_block_the_response(self):
+        """LML#1106 review round 2, FIX C: the ``_mint_identity`` await sits
+        OUTSIDE the probe's own ``asyncio.wait_for`` (that ceiling has
+        already returned by the time this call happens) and nothing else
+        bounds it -- ``enrich_metadata`` is invoked as a bare ``await
+        run_step()``, ``should_shed_tail`` only checks BETWEEN steps, and
+        ``PgSource.acquire`` passes no ``timeout=`` to ``pool.acquire()``.
+        An exhausted asyncpg pool (lock contention on
+        ``entity.release_identity`` during a ``live_resolved``) would
+        therefore pin this ``/lookup/bulk`` item indefinitely, past the
+        caller's own budget. Simulates that with a mint call that never
+        returns; the fix must bound it so the response still completes well
+        inside a generous outer ceiling."""
+        item, artwork, bandcamp = _inputs()
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        entity_store = MagicMock()
+
+        async def _hang(*args, **kwargs):
+            await asyncio.sleep(3600)  # simulate stuck PG lock contention
+
+        entity_store.mint_or_get_release_identity = AsyncMock(side_effect=_hang)
+
+        with patch("lookup.enrichment.item.get_settings", return_value=_flags()):
+            start = time.monotonic()
+            results = await asyncio.wait_for(
+                _run(bandcamp, pg, item, artwork, entity_store=entity_store), timeout=5.0
+            )
+            elapsed = time.monotonic() - start
+
+        _, enriched = results[0]
+        assert enriched.bandcamp_url == _BC_URL
+        assert enriched.streaming_status.bandcamp == StreamingResolutionStatus.verified
+        assert elapsed < 5.0
+
     async def test_cache_hit_does_not_mint(self):
         """A cache HIT already minted on its original resolution -- the probe
         must not re-mint on a warm read (matches

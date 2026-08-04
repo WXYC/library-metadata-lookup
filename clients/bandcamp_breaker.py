@@ -39,6 +39,11 @@ Divergences from the Discogs reference, because Bandcamp's signal is simpler:
   and threshold: a transport failure IS a saturation signal here, since
   nothing else is watching for one (LML#1106 review, FIX 1 -- before this,
   a sustained Cloudflare block or tarpit never tripped the breaker at all).
+  ``fetch_artist_catalog``'s own failure only reaches here when the
+  album-first fallback that runs in its place ALSO comes back clean --
+  a fallback HIT is a genuine answer and is recorded as a success instead
+  (LML#1106 review round 2, FIX A; see ``clients/bandcamp.py``'s
+  ``_find_album_match_impl`` for the full conditional table).
   :meth:`record_aborted` stays reserved for the narrower case of a trial
   that dies with NO terminal outcome (an unexpected raise, or a
   cancellation -- the caller's own budget running out, not an upstream
@@ -61,9 +66,12 @@ FIX 8 -- a prior draft of this paragraph conflated the two axes and stated
 the floor binds "below a 1.5s cool-down," which is neither variable this
 module actually has). Size the multiplier against the worst-case TRIAL, not
 the floor, for the window that actually governs production (LML#1106 review,
-FIX 6 -- a stale multiplier of 10.0, inherited from the Discogs reference's
-own default without re-deriving it for Bandcamp's much shorter trial,
-produced a 200s window here against a ~35-40s worst case, a ~5x overshoot).
+FIX 6 -- a stale multiplier of 10.0 (not itself a Discogs default -- the
+Discogs reference's own default is 20.0, see ``discogs/breaker.py``'s
+``trial_watchdog_multiplier`` and ``config/settings.py``'s
+``discogs_breaker_trial_watchdog_multiplier``; 10.0 was simply never
+re-derived for Bandcamp's much shorter trial) produced a 200s window here
+against a ~35-40s worst case, a ~5x overshoot).
 
 Worst case for one fail-fast trial: ``_find_album_match_impl`` makes up to
 three sequential HTTP calls, each a single attempt bounded by its own httpx
@@ -100,10 +108,11 @@ _WATCHDOG_FLOOR_SECONDS = 30.0
 
 _DEFAULT_FAILURE_THRESHOLD = 3
 _DEFAULT_COOLDOWN_SECONDS = 20.0
-# LML#1106 review FIX 6: retuned from the Discogs-inherited 10.0 (a 200s
-# window against a ~35-40s worst-case trial, a ~5x overshoot) down to 2.5 --
-# see the module docstring's watchdog section for the worst-case-trial
-# derivation this tracks (``max(20 * 2.5, 30) = 50s``).
+# LML#1106 review FIX 6: retuned from the previous 10.0 (not itself a
+# Discogs default -- see the module docstring's watchdog section -- and a
+# 200s window against a ~35-40s worst-case trial, a ~5x overshoot) down to
+# 2.5 -- see that section for the worst-case-trial derivation this tracks
+# (``max(20 * 2.5, 30) = 50s``).
 _DEFAULT_TRIAL_WATCHDOG_MULTIPLIER = 2.5
 
 

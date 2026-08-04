@@ -208,9 +208,9 @@ class TestHalfOpenWatchdogProductionConfig:
     breaker from the SAME module constants ``_build_breaker()`` uses (not
     hand-copied literals), and pin the window those constants are expected
     to produce (50s) -- so either a regression to the constants' VALUES
-    (e.g. back to the Discogs-inherited multiplier of 10.0, a 200s window
-    against a ~35-40s worst-case trial) or a change to the watchdog FORMULA
-    itself is caught."""
+    (e.g. back to the previous multiplier of 10.0 -- not itself a Discogs
+    default, whose own default is 20.0 -- a 200s window against a ~35-40s
+    worst-case trial) or a change to the watchdog FORMULA itself is caught."""
 
     def test_trial_survives_within_the_production_watchdog_window(self, clock):
         assert _DEFAULT_COOLDOWN_SECONDS * _DEFAULT_TRIAL_WATCHDOG_MULTIPLIER == 50.0

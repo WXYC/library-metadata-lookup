@@ -123,13 +123,23 @@ class TestFailFastCatalogFailureFallsThroughToAlbumSearch:
     fallback that recovers label/imprint-hosted releases). Under
     ``fail_fast`` the same response instead RAISES
     ``BandcampTransportError``, which previously escaped uncaught -- the
-    fallback never ran. These pin the fix: the catalog leg's transport
-    failure is caught inside ``_find_album_match_impl`` and the album-first
-    search still runs; a transport failure on THAT leg too still raises
-    (never a cachable ``None``)."""
+    fallback never ran. FIX 5 caught that leg's failure inside
+    ``_find_album_match_impl`` so the album-first search still runs -- but
+    FIX 5 also unconditionally recorded whatever the fallback returned as
+    the OVERALL outcome, including a clean miss, which conflates "the
+    lower-recall fallback found nothing" with "asked, got nothing": the
+    album-autocomplete index has strictly lower recall than the catalog
+    scrape (that is why #1069 added it as a fallback, not a replacement), so
+    it finding nothing after the catalog leg couldn't even be consulted is
+    NOT evidence of absence (LML#1106 review round 2, FIX A). These pin the
+    corrected 3x2 table: a catalog-leg failure whose fallback HITS still
+    resolves the match (we got an answer); a catalog-leg failure whose
+    fallback comes back CLEAN now raises ``BandcampTransportError`` instead
+    of resolving to a cachable ``None``; a catalog-leg failure whose
+    fallback ALSO fails transport-wise still raises (unchanged)."""
 
     @pytest.mark.asyncio
-    async def test_catalog_failure_falls_through_to_a_clean_album_search_miss(self, client):
+    async def test_catalog_failure_with_clean_fallback_miss_raises_transport_error(self, client):
         # 1: search_artist (autocomplete) -> 200, a matching artist.
         # 2: fetch_artist_catalog (/music) -> 500 (BandcampTransportError).
         # 3: search_albums (album-first fallback) -> 200, no results.
@@ -160,23 +170,27 @@ class TestFailFastCatalogFailureFallsThroughToAlbumSearch:
                 breaker, "record_transport_failure", wraps=breaker.record_transport_failure
             ) as record_transport_failure,
         ):
-            result = await client.find_album_match("Autechre", "Confield", fail_fast=True)
+            with pytest.raises(BandcampTransportError):
+                await client.find_album_match("Autechre", "Confield", fail_fast=True)
 
-        assert result is None
         # All three legs fired -- the catalog failure did not pre-empt the
         # album-first fallback.
         assert client._http.request.await_count == 3
-        # The OVERALL call still resolved cleanly (a genuine no-match, not a
-        # couldn't-ask) -- the mid-flight catalog hiccup must not itself
-        # trip the breaker when the call as a whole succeeded.
-        record_success.assert_called_once_with(epoch=0)
-        record_transport_failure.assert_not_called()
+        # The catalog leg genuinely couldn't ask, and the lower-recall
+        # fallback's clean miss is not evidence of absence -- this is a
+        # couldn't-ask, not a genuine no-match, so it must be recorded as a
+        # transport failure (counts toward opening the breaker), never a
+        # success.
+        record_transport_failure.assert_called_once_with(epoch=0)
+        record_success.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_catalog_failure_falls_through_to_an_album_search_match(self, client):
         # Same shape, but the album-first fallback actually resolves a
         # match -- the label/imprint-hosted-release recovery #1069 exists
         # for, now reachable even when the artist's own catalog page 500s.
+        # We got an answer, so this must still succeed and be recorded as a
+        # genuine success, not a transport failure.
         client._http.request = AsyncMock(
             side_effect=[
                 httpx.Response(
@@ -209,12 +223,21 @@ class TestFailFastCatalogFailureFallsThroughToAlbumSearch:
                 ),
             ]
         )
+        breaker = get_bandcamp_probe_breaker()
 
-        result = await client.find_album_match("Autechre", "Confield", fail_fast=True)
+        with (
+            patch.object(breaker, "record_success", wraps=breaker.record_success) as record_success,
+            patch.object(
+                breaker, "record_transport_failure", wraps=breaker.record_transport_failure
+            ) as record_transport_failure,
+        ):
+            result = await client.find_album_match("Autechre", "Confield", fail_fast=True)
 
         assert result is not None
         assert result.url == "https://autechre.bandcamp.com/album/confield"
         assert client._http.request.await_count == 3
+        record_success.assert_called_once_with(epoch=0)
+        record_transport_failure.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_catalog_failure_then_album_search_failure_still_raises(self, client):
@@ -378,6 +401,106 @@ class TestFailFastUnparseableJsonBody:
         # otherwise a sustained Cloudflare-interstitial run would never trip
         # the breaker, same bug class as FIX 1.
         client._http.request = AsyncMock(return_value=self._malformed_json_response())
+        breaker = get_bandcamp_probe_breaker()
+
+        with (
+            patch.object(
+                breaker, "record_transport_failure", wraps=breaker.record_transport_failure
+            ) as record_transport_failure,
+            patch.object(breaker, "record_aborted", wraps=breaker.record_aborted) as record_aborted,
+        ):
+            with pytest.raises(BandcampTransportError):
+                await client.find_album_match("Autechre", "Confield", fail_fast=True)
+
+        record_transport_failure.assert_called_once_with(epoch=0)
+        record_aborted.assert_not_called()
+
+
+class TestFailFastMalshapedJsonBody:
+    """LML#1106 review round 2, FIX B: ``search_artist`` / ``search_albums``
+    guard ``resp.json()``'s PARSEABILITY (FIX 6, above) but not its SHAPE.
+    A 200 whose body is valid JSON but not an object -- a bare list, a bare
+    string -- or whose ``results`` field isn't a list still escapes: the
+    ``for item in data.get("results", [])`` loop raises ``AttributeError``
+    (``'list' object has no attribute 'get'`` / ``'str' object has no
+    attribute 'get'``) or iterates over something that isn't item-shaped.
+    That ``AttributeError`` escapes the fail-fast taxonomy entirely and
+    lands in ``lookup/enrichment/bandcamp_probe.py``'s ``except Exception``
+    catch-all -- a loud ``logger.exception`` per item (the #755 flood shape)
+    routed through the no-op-in-CLOSED ``record_aborted`` instead of the
+    counted ``record_transport_failure`` shed path, so the flood runs for
+    the whole outage instead of tripping the breaker. Under ``fail_fast``,
+    a mal-shaped-but-parseable body must raise :class:`BandcampTransportError`
+    exactly like an unparseable one. Default mode is untouched -- these
+    shapes still raise their raw ``AttributeError`` there, byte-identical to
+    today (pinned by the two existing ``test_search_*_default_mode_still_
+    raises_value_error`` tests above, which this class does not touch)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param([], id="bare_list"),
+            pytest.param("a string", id="bare_string"),
+            pytest.param({"results": "not-a-list"}, id="results_not_a_list"),
+        ],
+    )
+    async def test_search_artist_raises_transport_error_on_malshaped_body(self, client, body):
+        client._http.request = AsyncMock(
+            return_value=httpx.Response(200, json=body, request=httpx.Request("GET", _URL))
+        )
+
+        with pytest.raises(BandcampTransportError):
+            await client.search_artist("Autechre", fail_fast=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param([], id="bare_list"),
+            pytest.param("a string", id="bare_string"),
+            pytest.param({"results": "not-a-list"}, id="results_not_a_list"),
+        ],
+    )
+    async def test_search_albums_raises_transport_error_on_malshaped_body(self, client, body):
+        client._http.request = AsyncMock(
+            return_value=httpx.Response(200, json=body, request=httpx.Request("GET", _URL))
+        )
+
+        with pytest.raises(BandcampTransportError):
+            await client.search_albums("Autechre Confield", fail_fast=True)
+
+    @pytest.mark.asyncio
+    async def test_search_artist_default_mode_still_raises_attribute_error_on_bare_list(
+        self, client
+    ):
+        # Default mode is untouched -- no new shape guard is added there;
+        # a bare-list body still crashes with its raw AttributeError.
+        client._http.request = AsyncMock(
+            return_value=httpx.Response(200, json=[], request=httpx.Request("GET", _URL))
+        )
+
+        with pytest.raises(AttributeError):
+            await client.search_artist("Autechre", fail_fast=False)
+
+    @pytest.mark.asyncio
+    async def test_search_albums_default_mode_still_raises_attribute_error_on_bare_list(
+        self, client
+    ):
+        client._http.request = AsyncMock(
+            return_value=httpx.Response(200, json=[], request=httpx.Request("GET", _URL))
+        )
+
+        with pytest.raises(AttributeError):
+            await client.search_albums("Autechre Confield", fail_fast=False)
+
+    @pytest.mark.asyncio
+    async def test_malshaped_body_records_transport_failure_not_aborted(self, client):
+        # End-to-end through find_album_match's breaker wrapper, mirroring
+        # the unparseable-body pin above -- same taxonomy, same reason.
+        client._http.request = AsyncMock(
+            return_value=httpx.Response(200, json=[], request=httpx.Request("GET", _URL))
+        )
         breaker = get_bandcamp_probe_breaker()
 
         with (

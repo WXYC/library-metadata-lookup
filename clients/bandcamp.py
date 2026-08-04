@@ -136,6 +136,17 @@ class BandcampTransportError(Exception):
     gets its own breaker method that counts toward opening, unlike
     ``discogs/breaker.py``'s neutral ``record_server_error``.
 
+    ``search_artist`` and ``search_albums`` raise it directly, and it always
+    propagates unmodified from those two -- neither has anywhere else in
+    ``_find_album_match_impl`` to be caught. ``fetch_artist_catalog`` is the
+    one leg where a raise here does NOT always propagate: LML#1106 review
+    FIX 5 catches it inside ``_find_album_match_impl`` so the album-first
+    fallback still runs, and a fresh :class:`BandcampTransportError` is only
+    re-raised from there if that fallback ALSO fails to produce a match --
+    a hit means "we got an answer" and resolves normally (LML#1106 review
+    round 2, FIX A; see ``_find_album_match_impl`` for the full conditional
+    table).
+
     Only meaningful under ``fail_fast``: the default mode keeps its
     pre-#1106 degrade-to-``None``/``[]`` behavior unchanged.
     """
@@ -235,6 +246,31 @@ def extract_slug(url: str | None) -> str | None:
         return None
     match = _SLUG_RE.match(url)
     return match.group(1) if match else None
+
+
+def _reject_malshaped_fail_fast_body(data: object, url: str) -> dict:
+    """Guard a fail-fast-parsed autocomplete body's SHAPE, not just its
+    parseability (LML#1106 review round 2, FIX B).
+
+    ``resp.json()`` succeeding only guarantees valid JSON -- a valid-JSON
+    non-object body (a bare list, a bare string) or a ``results`` field
+    that isn't a list still crashes the ``for item in data.get("results",
+    [])`` loop downstream with an ``AttributeError``, which escapes the
+    fail-fast taxonomy entirely and lands in
+    ``lookup/enrichment/bandcamp_probe.py``'s ``except Exception`` catch-all
+    -- a loud ``logger.exception`` per item (the #755 flood shape) routed
+    through the no-op-in-CLOSED ``record_aborted`` instead of the counted
+    ``record_transport_failure`` shed path, so a sustained mal-shaped-body
+    run would never trip the breaker. Treat it exactly like an unparseable
+    body: raise :class:`BandcampTransportError`.
+
+    Only called from ``fail_fast`` call sites -- default mode never guards
+    shape and still propagates a raw ``AttributeError`` on these bodies,
+    unchanged.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
+        raise BandcampTransportError(url)
+    return data
 
 
 MAX_RETRIES = 3
@@ -365,7 +401,10 @@ class BandcampClient(BaseStreamingClient):
         Cloudflare 403/1015, connect timeout, non-200 -- raised by
         ``search_artist`` / ``fetch_artist_catalog`` / ``search_albums`` as
         :class:`BandcampTransportError`) is likewise propagated rather than
-        degrading to a clean ``None``: it is recorded via
+        degrading to a clean ``None`` -- EXCEPT that a ``fetch_artist_catalog``
+        failure whose album-first fallback then HITS resolves normally (we
+        got an answer; LML#1106 review round 2, FIX A) rather than raising.
+        Whenever it does propagate, it is recorded via
         ``record_transport_failure``, not ``record_success``, so it can
         neither declare a HALF_OPEN trial recovered nor let
         ``resolve_streaming_url_with_cache`` UPSERT a false-negative row for
@@ -434,24 +473,35 @@ class BandcampClient(BaseStreamingClient):
             if s >= 80.0 and s > best_artist_score:
                 best_artist = result
                 best_artist_score = s
+        # Only set True under fail_fast (default mode never raises
+        # BandcampTransportError from fetch_artist_catalog) -- see the
+        # post-fallback check below for why this can't be decided here.
+        catalog_leg_failed = False
         if best_artist is not None:
             # Default mode: a fetch failure (None) is treated as "no catalog"
             # for the live match path -- there is no retry loop here, so it
             # degrades to no match and falls through to the album-first
             # fallback below. Under fail_fast, ``fetch_artist_catalog``
             # instead raises ``BandcampTransportError`` on a transport
-            # failure; LML#1106 review FIX 5 (this round) catches it here so
-            # it degrades the SAME way -- an empty catalog that falls
-            # through to the fallback -- rather than pre-empting it. Only a
-            # transport failure on the fallback's OWN leg (below) still
-            # raises: a genuine couldn't-ask must never resolve to a
-            # cachable ``None``.
+            # failure; LML#1106 review FIX 5 catches it here so it degrades
+            # the SAME way -- an empty catalog that falls through to the
+            # fallback -- rather than pre-empting it. The fallback's own
+            # transport failure (below) still raises unconditionally. A
+            # CLEAN MISS from the fallback is a separate case (LML#1106
+            # review round 2, FIX A): the album-autocomplete index has
+            # strictly lower recall than the catalog scrape (that is why
+            # #1069 added it as a fallback, not a replacement), so "the
+            # fallback found nothing" after this leg genuinely couldn't ask
+            # is NOT evidence of absence -- ``catalog_leg_failed`` records
+            # that so the post-fallback check below can still raise instead
+            # of resolving to a cachable ``None``.
             try:
                 catalog = (
                     await self.fetch_artist_catalog(best_artist["slug"], fail_fast=fail_fast) or []
                 )
             except BandcampTransportError:
                 catalog = []
+                catalog_leg_failed = True
             matched_artist_name = best_artist["name"]
             match = find_best_source_match(
                 catalog,
@@ -466,11 +516,32 @@ class BandcampClient(BaseStreamingClient):
             return match
 
         try:
-            return await self.find_album_match_via_search(artist, title, fail_fast=fail_fast)
+            fallback_match = await self.find_album_match_via_search(
+                artist, title, fail_fast=fail_fast
+            )
         except BandcampSearchUnavailableError:
             # No retry channel on the live path (same posture as the
             # catalog-fetch-failure case above) -- degrade to no match.
             return None
+
+        if fallback_match is not None:
+            # We got an answer -- safe to treat as a genuine resolution even
+            # though the catalog leg itself couldn't ask.
+            return fallback_match
+
+        if catalog_leg_failed:
+            # The catalog leg genuinely couldn't ask, and the strictly-
+            # lower-recall fallback came back clean: that combination is a
+            # couldn't-ask, not a confirmed no-match, so it must never
+            # resolve to a cachable ``None`` (LML#1106 review round 2, FIX
+            # A). Raising here lets ``find_album_match``'s wrapper record it
+            # via ``record_transport_failure`` (counts toward opening the
+            # breaker) instead of ``record_success``.
+            raise BandcampTransportError(
+                f"catalog leg failed for {artist!r}; album-first fallback clean-missed"
+            )
+
+        return None
 
     async def search_artist(self, artist_name: str, *, fail_fast: bool = False) -> list[dict]:
         """Search Bandcamp autocomplete for artist pages.
@@ -482,13 +553,17 @@ class BandcampClient(BaseStreamingClient):
         network-layer failure raises :class:`BandcampTransportError` instead
         of degrading to ``[]`` -- an empty list must mean "asked, no artists
         matched", not "couldn't ask". The default mode's degrade-to-``[]``
-        behavior is unchanged. LML#1106 review FIX 6 (this round): a 200
-        whose body isn't valid JSON (a Cloudflare HTML interstitial, a
-        truncated response) is the SAME "couldn't ask" shape -- under
-        ``fail_fast`` it also raises :class:`BandcampTransportError` rather
-        than letting the raw ``json.JSONDecodeError`` escape the fail-fast
-        taxonomy entirely. Default mode is unchanged: an unparseable body
-        still propagates exactly as it does today.
+        behavior is unchanged. LML#1106 review FIX 6: a 200 whose body isn't
+        valid JSON (a Cloudflare HTML interstitial, a truncated response) is
+        the SAME "couldn't ask" shape -- under ``fail_fast`` it also raises
+        :class:`BandcampTransportError` rather than letting the raw
+        ``json.JSONDecodeError`` escape the fail-fast taxonomy entirely.
+        LML#1106 review round 2, FIX B: a 200 whose body IS valid JSON but
+        not object-shaped (a bare list, a bare string) or whose ``results``
+        field isn't a list is the same "couldn't ask" shape and is guarded
+        the same way (see ``_reject_malshaped_fail_fast_body``). Default
+        mode is unchanged: an unparseable or mal-shaped body still
+        propagates exactly as it does today.
         """
         resp = await self._request_with_retry(
             "GET",
@@ -507,6 +582,7 @@ class BandcampClient(BaseStreamingClient):
                 data = resp.json()
             except ValueError as e:
                 raise BandcampTransportError(AUTOCOMPLETE_URL) from e
+            data = _reject_malshaped_fail_fast_body(data, AUTOCOMPLETE_URL)
         else:
             data = resp.json()
         results = []
@@ -604,7 +680,8 @@ class BandcampClient(BaseStreamingClient):
         mode) ``None`` on fetch failure. Under ``fail_fast=True`` (LML#1106,
         FIX 2), that same failure instead raises
         :class:`BandcampTransportError` -- see ``search_artist`` for why
-        (including the FIX 6 unparseable-body case).
+        (including the FIX 6 unparseable-body case and the FIX B round-2
+        mal-shaped-body case).
         """
         resp = await self._request_with_retry(
             "GET",
@@ -623,6 +700,7 @@ class BandcampClient(BaseStreamingClient):
                 data = resp.json()
             except ValueError as e:
                 raise BandcampTransportError(AUTOCOMPLETE_URL) from e
+            data = _reject_malshaped_fail_fast_body(data, AUTOCOMPLETE_URL)
         else:
             data = resp.json()
         results = []
