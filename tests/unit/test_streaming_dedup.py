@@ -1,7 +1,9 @@
 """Unit tests for scripts/streaming_availability/dedup.py."""
 
+import logging
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -150,6 +152,109 @@ class TestDeduplicateLibrary:
         result = await deduplicate_library(db_path)
         assert result[0].genre == "Electronic"
         assert result[0].label == "Warp"
+
+    @pytest.mark.asyncio
+    async def test_diverging_genre_logs_warning_but_still_merges(self, tmp_path, caplog):
+        """LML#1095: two distinct library_ids that collapse to the same
+        normalized (artist, title) key with materially different genre are a
+        silent collision today -- the second row's genre is dropped with no
+        signal. Detect and log it (so operators can audit real frequency)
+        without changing the merge itself: measured against the real WXYC
+        catalog, this pattern is at least as often a data-quality artifact
+        (the same physical item re-catalogued with an inconsistent genre tag)
+        as it is two genuinely distinct items, so auto-splitting on this
+        signal alone isn't warranted."""
+        db_path = _create_test_db(
+            tmp_path,
+            [
+                (1, "Orion", "Orion", "O", 1, 1, "Electronic", "cd", None, None),
+                (2, "Orion", "Orion", "O", 1, 2, "Rock", "vinyl - LP", None, None),
+            ],
+        )
+        with caplog.at_level(logging.WARNING):
+            result = await deduplicate_library(db_path)
+        assert len(result) == 1
+        assert sorted(result[0].library_ids) == [1, 2]
+        assert result[0].genre == "Electronic"  # first-row-wins, unchanged
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "1" in warnings[0].getMessage() and "2" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_diverging_label_logs_warning(self, tmp_path, caplog):
+        db_path = _create_test_db(
+            tmp_path,
+            [
+                (1, "Black Book", "Greg Osby", "G", 1, 1, "Jazz", "cd", None, "Blue Note"),
+                (2, "Black Book", "Greg Osby", "G", 1, 2, "Jazz", "vinyl - LP", None, "JMT"),
+            ],
+        )
+        with caplog.at_level(logging.WARNING):
+            await deduplicate_library(db_path)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_one_sided_null_genre_does_not_warn(self, tmp_path, caplog):
+        """Incomplete metadata on one row (a common real shape -- one catalog
+        entry never got a genre) is not treated as a divergence signal."""
+        db_path = _create_test_db(
+            tmp_path,
+            [
+                (1, "Aluminum Tunes", "Stereolab", "S", 1, 1, None, "cd", None, "Duophonic"),
+                (
+                    2,
+                    "Aluminum Tunes",
+                    "Stereolab",
+                    "S",
+                    1,
+                    2,
+                    "Rock",
+                    "vinyl - LP",
+                    None,
+                    "Duophonic",
+                ),
+            ],
+        )
+        with caplog.at_level(logging.WARNING):
+            await deduplicate_library(db_path)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_matching_genre_label_does_not_warn(self, tmp_path, caplog):
+        """Sanity check: the existing identical-metadata multi-format case
+        (test_genre_and_label_from_first_row) must not spuriously warn."""
+        db_path = _create_test_db(
+            tmp_path,
+            [
+                (1, "Confield", "Autechre", "A", 1, 1, "Electronic", "cd", None, "Warp"),
+                (2, "Confield", "Autechre", "A", 1, 2, "Electronic", "vinyl - LP", None, "Warp"),
+            ],
+        )
+        with caplog.at_level(logging.WARNING):
+            await deduplicate_library(db_path)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_diverging_is_compilation_logs_warning(self, tmp_path, caplog):
+        """is_compilation is derived per-row from is_compilation_artist(artist)
+        -- a collision where that verdict flips is exactly as much a signal
+        as a genre/label conflict."""
+        db_path = _create_test_db(
+            tmp_path,
+            [
+                (1, "Rarities", "Overlap Artist", "O", 1, 1, "Rock", "cd", None, None),
+                (2, "Rarities", "Overlap Artist", "O", 1, 2, "Rock", "vinyl - LP", None, None),
+            ],
+        )
+        with patch(
+            "scripts.streaming_availability.dedup.is_compilation_artist",
+            side_effect=[False, True],
+        ):
+            with caplog.at_level(logging.WARNING):
+                await deduplicate_library(db_path)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
 
     @pytest.mark.asyncio
     async def test_empty_database(self, tmp_path):
