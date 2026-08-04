@@ -130,11 +130,11 @@ class BandcampTransportError(Exception):
     UPSERT a 7-day false-negative row (LML#1106 review, FIX 2).
 
     Propagates through ``find_album_match``'s fail-fast wrapper, which
-    records it via ``record_aborted`` rather than ``record_success`` -- see
-    ``clients/bandcamp_breaker.py``'s module docstring for why a transport
-    failure shares that outcome with an unexpected raise instead of getting
-    its own breaker method (unlike ``discogs/breaker.py``'s
-    ``record_server_error``).
+    records it via :meth:`clients.bandcamp_breaker.BandcampProbeBreaker.
+    record_transport_failure` rather than ``record_success`` -- see that
+    method's docstring (LML#1106 review, FIX 1) for why a transport failure
+    gets its own breaker method that counts toward opening, unlike
+    ``discogs/breaker.py``'s neutral ``record_server_error``.
 
     Only meaningful under ``fail_fast``: the default mode keeps its
     pre-#1106 degrade-to-``None``/``[]`` behavior unchanged.
@@ -363,12 +363,14 @@ class BandcampClient(BaseStreamingClient):
         Cloudflare 403/1015, connect timeout, non-200 -- raised by
         ``search_artist`` / ``fetch_artist_catalog`` / ``search_albums`` as
         :class:`BandcampTransportError`) is likewise propagated rather than
-        degrading to a clean ``None``: it is recorded as an aborted call, not
-        a success, so it can neither declare a HALF_OPEN trial recovered nor
-        let ``resolve_streaming_url_with_cache`` UPSERT a false-negative row
-        for it (LML#1106 review, FIX 2 -- see ``clients/bandcamp_breaker.py``'s
-        module docstring for why this shares ``record_aborted`` with an
-        unexpected raise).
+        degrading to a clean ``None``: it is recorded via
+        ``record_transport_failure``, not ``record_success``, so it can
+        neither declare a HALF_OPEN trial recovered nor let
+        ``resolve_streaming_url_with_cache`` UPSERT a false-negative row for
+        it -- and, unlike an unexpected raise, it counts toward opening the
+        breaker on its own (LML#1106 review, FIX 1 -- see
+        ``clients/bandcamp_breaker.py``'s module docstring for why this
+        differs from ``record_aborted``).
 
         Every exit from the fail-fast call -- success, a shed, a transport
         error, an unexpected raise, or a cancellation (``asyncio.
@@ -395,7 +397,7 @@ class BandcampClient(BaseStreamingClient):
             recorded = True
             raise
         except BandcampTransportError:
-            breaker.record_aborted(epoch=epoch)
+            breaker.record_transport_failure(epoch=epoch)
             recorded = True
             raise
         else:
@@ -406,9 +408,13 @@ class BandcampClient(BaseStreamingClient):
             # LML#1106 review FIX 1: any exit neither branch above named --
             # an unexpected raise, or a cancellation escaping both `except`
             # clauses (``CancelledError`` is a ``BaseException``) -- still
-            # records a terminal outcome exactly once, so it can't strand a
-            # HALF_OPEN trial or silently skip resetting the CLOSED-state
-            # failure run the way an unrecorded exit used to.
+            # records a terminal outcome exactly once via ``record_aborted``,
+            # so it can't strand a HALF_OPEN trial forever (LML#787 shape).
+            # ``record_aborted`` is a no-op in CLOSED for any state --
+            # neither branch above uses it, and it never touches
+            # ``_consecutive_failures`` in any state, so this fallback is
+            # NOT "resetting the CLOSED-state failure run"; it exists purely
+            # to resolve a stranded HALF_OPEN trial.
             if not recorded:
                 breaker.record_aborted(epoch=epoch)
 

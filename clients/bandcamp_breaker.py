@@ -5,17 +5,19 @@ the LML#787 aborted-trial/watchdog fix): a three-state (CLOSED / OPEN /
 HALF_OPEN) breaker with a monotonic epoch guard so a stale response can't
 decide a superseded trial. ``BandcampClient.find_album_match(...,
 fail_fast=True)`` (``clients/bandcamp.py``) gates every fail-fast call through
-this breaker, so a sustained Bandcamp 429 run sheds before touching the
-network at all -- protection against Bandcamp's ~1 req/s rate limit and
-429-proneness.
+this breaker, so a sustained run of either a Bandcamp 429 (:meth:`record_shed`)
+or a non-429 transport failure (:meth:`record_transport_failure` -- a
+Cloudflare 403/1015, a 5xx, or a bare tarpit; LML#1106 review FIX 1) sheds
+before touching the network at all -- protection against Bandcamp's ~1 req/s
+rate limit, its 429-proneness, and non-rate-limit saturation shapes alike.
 
-This module and the ``fail_fast`` mode it backs are client-and-cache-layer
-plumbing with no production caller yet: the synchronous enrichment-path live
-probe that will consume them is a separate piece of work (LML#1098). Nothing
-here is reachable in production until that probe exists and is wired up.
+This module's ``fail_fast`` mode is consumed by the synchronous
+enrichment-path live probe (LML#1098, ``lookup/enrichment/bandcamp_probe.py``),
+merged into this branch alongside it -- it is reachable in production behind
+that probe's own preconditions (the ``lml_bandcamp_live_probe`` flag, the
+bulk-path gate, the persist kill-switches), not still-inert plumbing.
 
-Three shapes are trimmed relative to the Discogs breaker, because Bandcamp's
-signal is simpler:
+Divergences from the Discogs reference, because Bandcamp's signal is simpler:
 
 - No proactive "remaining" floor -- Bandcamp 429 responses carry no
   ``X-*-Ratelimit-Remaining`` equivalent, so only the reactive
@@ -24,17 +26,23 @@ signal is simpler:
   attempt per underlying HTTP call), so "failed request" and "failed
   attempt" are the same thing here, unlike the Discogs breaker's
   request-vs-attempt distinction.
-- No separate server-error outcome -- the Discogs reference resolves a 5xx
-  trial through its own neutral ``record_server_error`` (does not reset the
-  consecutive run, does not close a HALF_OPEN trial, re-OPENs on an epoch
-  match), kept distinct from ``record_aborted``'s "unexpected raise" case.
-  Bandcamp draws no such distinction: ``clients/bandcamp.py``'s fail-fast
-  wrapper routes ``BandcampTransportError`` (raised by ``search_artist`` /
-  ``fetch_artist_catalog`` / ``search_albums`` under ``fail_fast`` for a
-  non-200/non-429 response or a network-layer failure) through the SAME
-  :meth:`BandcampProbeBreaker.record_aborted` call an unexpected raise uses
-  -- with no proactive floor to differ on, the two outcomes are already
-  behaviorally identical here (LML#1106 review).
+- A non-429 transport failure counts toward opening, unlike the Discogs
+  reference's 5xx handling. Discogs resolves a 5xx trial through its own
+  NEUTRAL ``record_server_error`` (does not add to the consecutive run) --
+  safe there only because Discogs has the proactive ``remaining`` floor
+  above as an alternate trip lever for that saturation shape. Bandcamp has
+  no such floor, so :meth:`BandcampProbeBreaker.record_transport_failure`
+  (fed by ``clients/bandcamp.py``'s fail-fast wrapper on
+  ``BandcampTransportError`` -- a non-200/non-429 response or a
+  network-layer failure from ``search_artist`` / ``fetch_artist_catalog`` /
+  ``search_albums``) instead shares :meth:`record_shed`'s consecutive run
+  and threshold: a transport failure IS a saturation signal here, since
+  nothing else is watching for one (LML#1106 review, FIX 1 -- before this,
+  a sustained Cloudflare block or tarpit never tripped the breaker at all).
+  :meth:`record_aborted` stays reserved for the narrower case of a trial
+  that dies with NO terminal outcome (an unexpected raise, or a
+  cancellation -- the caller's own budget running out, not an upstream
+  signal) and, like Discogs's ``record_aborted``, is a no-op in CLOSED.
 
 The HALF_OPEN watchdog exists for the same reason LML#787 added one to the
 Discogs breaker: a trial that dies without recording a terminal outcome must
@@ -42,15 +50,20 @@ not latch HALF_OPEN forever (shedding every subsequent call). Its floor
 (``_WATCHDOG_FLOOR_SECONDS``, 30s) is lower than the Discogs breaker's 60s
 because a fail-fast trial makes exactly one attempt per underlying HTTP call
 with no inline retry backoff, so it resolves (or is definitively lost) far
-sooner than a Discogs request's worst-case retry-and-backoff sequence -- but
-the floor only binds the window at production's cool-down when the
-multiplier is small enough to let it through (``floor / cooldown`` -- at the
-shipped 20s cool-down and 2.5 multiplier, that means a cool-down below 1.5s);
-size the multiplier against the worst-case TRIAL, not the floor, for the
-window that actually governs production (LML#1106 review, FIX 6 -- a stale
-multiplier of 10.0, inherited from the Discogs reference's own default
-without re-deriving it for Bandcamp's much shorter trial, produced a 200s
-window here against a ~35-40s worst case, a ~5x overshoot).
+sooner than a Discogs request's worst-case retry-and-backoff sequence.
+``floor / cooldown`` (30 / 20 = 1.5 at the shipped 20s cool-down) is a bound
+on the MULTIPLIER, not the cool-down: the floor only binds -- i.e. the
+watchdog window is ``_WATCHDOG_FLOOR_SECONDS`` rather than
+``cooldown * multiplier`` -- when ``multiplier < floor / cooldown``. At the
+shipped multiplier of 2.5 that means the floor binds only if the cool-down
+itself drops below ``floor / multiplier = 30 / 2.5 = 12s`` (LML#1106 review,
+FIX 8 -- a prior draft of this paragraph conflated the two axes and stated
+the floor binds "below a 1.5s cool-down," which is neither variable this
+module actually has). Size the multiplier against the worst-case TRIAL, not
+the floor, for the window that actually governs production (LML#1106 review,
+FIX 6 -- a stale multiplier of 10.0, inherited from the Discogs reference's
+own default without re-deriving it for Bandcamp's much shorter trial,
+produced a 200s window here against a ~35-40s worst case, a ~5x overshoot).
 
 Worst case for one fail-fast trial: ``_find_album_match_impl`` makes up to
 three sequential HTTP calls, each a single attempt bounded by its own httpx
@@ -116,9 +129,10 @@ class BandcampProbeBreaker:
 
     Fed by ``BandcampClient.find_album_match`` via :meth:`record_success` (the
     call completed, resolved or not), :meth:`record_shed` (a 429 on the
-    fail-fast attempt), and :meth:`record_aborted` (the call exited without
-    either outcome -- an unexpected raise). Consulted via :meth:`allow_request`
-    before any live HTTP call is made.
+    fail-fast attempt), :meth:`record_transport_failure` (a non-429 transport
+    failure -- LML#1106 review FIX 1), and :meth:`record_aborted` (the call
+    exited without any of the above -- an unexpected raise or a cancellation).
+    Consulted via :meth:`allow_request` before any live HTTP call is made.
     """
 
     def __init__(
@@ -211,8 +225,42 @@ class BandcampProbeBreaker:
 
         In HALF_OPEN, a shed whose ``epoch`` matches the current trial
         re-OPENS for another cool-down. In CLOSED, ``failure_threshold``
-        consecutive sheds trip it.
+        consecutive sheds trip it. Shares its consecutive-failure run with
+        :meth:`record_transport_failure` (LML#1106 review FIX 1) -- see that
+        method's docstring for why the two are counted together.
         """
+        self._record_failure(epoch=epoch)
+
+    def record_transport_failure(self, *, epoch: int | None) -> None:
+        """Record a non-429 transport failure on the fail-fast attempt (5xx,
+        Cloudflare 403/1015, connect timeout, non-200 --
+        :class:`clients.bandcamp.BandcampTransportError`; LML#1106 review
+        FIX 1).
+
+        Shares the SAME consecutive-failure run and ``failure_threshold`` as
+        :meth:`record_shed`: a fail-fast trial that can't complete -- whether
+        because it was rate-limited or because the transport itself failed --
+        is the same "the live Bandcamp path is unhealthy" signal, so both
+        count toward one run. This is a deliberate divergence from the
+        Discogs reference's ``record_server_error``, which does NOT count
+        toward opening: Discogs has a proactive ``remaining`` floor as an
+        alternate trip lever for a 5xx-adjacent saturation shape, so treating
+        its 5xx as neutral doesn't leave saturation undetected. Bandcamp has
+        no such floor (see the module docstring), so a transport failure that
+        stayed neutral here would never trip the breaker at all -- exactly
+        the LML#1106 review bug this method fixes (Bandcamp/Cloudflare 403 +
+        error 1015, or a bare tarpit, made every fail-fast call keep hitting
+        the network up to the full ceiling).
+
+        In HALF_OPEN, a transport failure whose ``epoch`` matches the current
+        trial re-OPENS for another cool-down, identical to :meth:`record_shed`.
+        """
+        self._record_failure(epoch=epoch)
+
+    def _record_failure(self, *, epoch: int | None) -> None:
+        """Shared body for :meth:`record_shed` and
+        :meth:`record_transport_failure` -- both outcomes mean "the fail-fast
+        attempt could not complete" and count toward the same consecutive run."""
         if self._state is BandcampBreakerState.HALF_OPEN:
             if epoch == self._epoch:
                 self._open()
@@ -223,13 +271,25 @@ class BandcampProbeBreaker:
             self._open()
 
     def record_aborted(self, *, epoch: int | None) -> None:
-        """Record a call that exited without a terminal outcome -- an
-        unexpected raise other than the 429 shed (LML#787 shape).
+        """Record a call that exited without ANY terminal outcome -- an
+        unexpected raise, or a cancellation (the designed timeout mechanism
+        for this mode, #1098) -- narrower than it once was (LML#1106 review
+        FIX 1): a non-429 transport failure is now a KNOWN, terminal outcome
+        with its own method (:meth:`record_transport_failure`), so it no
+        longer reaches here. What's left is genuinely inconclusive: the
+        caller gave up (cancellation) or something outside the modeled
+        outcomes raised, neither of which is itself an upstream-saturation
+        signal.
 
         If the aborter was the current HALF_OPEN trial (epoch match), the
         trial is inconclusive -- re-OPEN for another cool-down so a fresh
         trial is promoted rather than latching HALF_OPEN forever. Every other
-        case is a no-op: an aborted request is not a saturation signal.
+        case is a no-op -- in particular, a CLOSED-state abort does NOT count
+        toward the consecutive-failure run: unlike a shed or a transport
+        failure, an abort carries no information about whether Bandcamp
+        itself is unhealthy (a cancellation is the caller's own budget
+        running out), so counting it here would trip the breaker on caller
+        behavior rather than on Bandcamp's.
         """
         if self._state is BandcampBreakerState.HALF_OPEN and epoch == self._epoch:
             logger.warning(
