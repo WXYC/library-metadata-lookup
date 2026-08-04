@@ -248,6 +248,75 @@ class TestFailFastCatalogFailureFallsThroughToAlbumSearch:
         assert client._http.request.await_count == 3
 
 
+class TestFailFastTransportErrorRaiseSitesIndividually:
+    """LML#1106 review FIX 7: ``search_artist`` / ``fetch_artist_catalog`` /
+    ``search_albums`` each raise ``BandcampTransportError`` under
+    ``fail_fast`` on their own non-200 response. Every existing
+    ``find_album_match`` integration test drives a UNIFORM failing response
+    (e.g. ``return_value=_response(500)`` for every call), so deleting any
+    ONE of the three raise sites still leaves the OTHER TWO firing somewhere
+    downstream -- the mutation survives undetected. These use MIXED
+    per-leg responses (or call the method directly) to isolate each site."""
+
+    @pytest.mark.asyncio
+    async def test_search_artist_failure_is_not_masked_by_the_album_search_fallback(self, client):
+        # search_artist's OWN response is a transport failure; the album-
+        # search fallback response (were it ever reached) is a clean empty
+        # result. If search_artist's raise were deleted (degrading to []
+        # instead), best_artist would resolve to None and the call would
+        # silently fall through to the fallback -- masking a genuine
+        # Bandcamp outage on the very first leg as "no artist found".
+        client._http.request = AsyncMock(
+            side_effect=[
+                _response(500),  # search_artist
+                httpx.Response(200, json={"results": []}, request=httpx.Request("GET", _URL)),
+            ]
+        )
+
+        with pytest.raises(BandcampTransportError):
+            await client.find_album_match("Autechre", "Confield", fail_fast=True)
+
+        # Exactly one call: the fallback must never run when the very first
+        # leg genuinely couldn't ask.
+        assert client._http.request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_fetch_artist_catalog_raises_individually(self, client):
+        # Direct call, bypassing find_album_match entirely: since FIX 5
+        # (above) now catches this leg's BandcampTransportError and falls
+        # through to the album-first search regardless of whether it was
+        # raised or not, the raise is no longer independently observable
+        # THROUGH find_album_match when the fallback resolves cleanly --
+        # both branches converge on an empty catalog. Calling the method
+        # directly is the only way left to pin this specific raise site.
+        client._http.request = AsyncMock(return_value=_response(500))
+
+        with pytest.raises(BandcampTransportError):
+            await client.fetch_artist_catalog("autechre", fail_fast=True)
+
+    @pytest.mark.asyncio
+    async def test_search_albums_failure_propagates_not_swallowed_as_unavailable(self, client):
+        # search_artist finds no match (a clean 200, empty) -> falls
+        # through to the album-first fallback, whose OWN leg is a transport
+        # failure. If search_albums's raise were deleted (degrading to
+        # ``None`` instead), ``find_album_match_via_search`` would see
+        # ``results is None`` and raise ``BandcampSearchUnavailableError``
+        # instead -- which ``_find_album_match_impl`` explicitly catches
+        # and converts to a clean ``None`` (the default-mode posture),
+        # silently swallowing what should have been a couldn't-ask.
+        client._http.request = AsyncMock(
+            side_effect=[
+                httpx.Response(200, json={"results": []}, request=httpx.Request("GET", _URL)),
+                _response(500),  # search_albums (album-first fallback)
+            ]
+        )
+
+        with pytest.raises(BandcampTransportError):
+            await client.find_album_match("Obscure Artist", "Obscure Album", fail_fast=True)
+
+        assert client._http.request.await_count == 2
+
+
 class TestFailFastUnparseableJsonBody:
     """LML#1106 review FIX 6: ``search_artist`` / ``search_albums`` call
     ``resp.json()`` unguarded after the non-200 check. A 200 with a

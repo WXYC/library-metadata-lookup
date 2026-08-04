@@ -30,6 +30,8 @@ from discogs.models import ReleaseMetadataResponse
 from entity.sources import PgSource
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment import enrich_artwork_results
+from lookup.enrichment.bandcamp_probe import run_bandcamp_live_probe
+from lookup.enrichment.context import EnrichmentContext
 from lookup.rowless import ROWLESS_LIBRARY_ID
 from lookup.spine_deadline import SpineDeadline
 from lookup.streaming_url_postprocess import set_suppress_streaming_warm
@@ -593,3 +595,95 @@ class TestBandcampLiveProbe:
         bandcamp.find_album_match.assert_awaited_once()  # the probe made its single call
         # withheld -> the #1087 rowless warm has no client to probe with.
         assert spy.await_args.kwargs["clients"]["bandcamp"] is None
+
+    async def test_unexpected_exception_yields_unresolved_not_absent(self):
+        """LML#1106 review FIX 7: the catch-all ``except Exception`` branch --
+        an unmodeled Bandcamp fault, not one of the three named couldn't-ask
+        exceptions -- must map to ``unresolved``. If it ever mapped to
+        ``absent``, a transient fault would publish a confirmed "not on
+        Bandcamp" verdict, which BS then freezes permanently (BS#1747)."""
+        item, artwork, bandcamp = _inputs()
+        bandcamp.find_album_match = AsyncMock(side_effect=RuntimeError("boom"))
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+
+        with patch("lookup.enrichment.item.get_settings", return_value=_flags()):
+            results = await _run(bandcamp, pg, item, artwork)
+
+        _, enriched = results[0]
+        assert enriched.streaming_status.bandcamp == StreamingResolutionStatus.unresolved
+        pg.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestRunBandcampLiveProbeGatesDirect:
+    """LML#1106 review FIX 7: direct-call gate tests for
+    ``run_bandcamp_live_probe``, isolating preconditions the ``enrich_one``
+    harness above never exercises independently -- both incident
+    kill-switches (``lml_persist_streaming_urls``,
+    ``lml_persist_streaming_url_bandcamp``; only ``lml_bandcamp_live_probe``
+    was previously verified) and the never-overwrite-a-resolved-URL guard
+    (``not current_bandcamp_url``). Calls the function directly (bypassing
+    ``enrich_one``) so each gate is isolated from the others."""
+
+    def _ctx(self, **overrides) -> EnrichmentContext:
+        defaults: dict = {
+            "discogs_service": MagicMock(),
+            "mb_pg": None,
+            "apple_music": None,
+            "spotify": None,
+            "bandcamp": AsyncMock(spec=BandcampClient),
+            "entity_store": None,
+            "discogs_cache_pg": AsyncMock(spec=PgSource),
+            "library_db": None,
+            "song": _SONG,
+            "album": _ALBUM,
+            "artist": _ARTIST,
+            "request_artist_stripped": _ARTIST,
+            "artist_identity_split_enabled": False,
+            "extended": False,
+            "found_on_compilation": False,
+            "spine_deadline": None,
+        }
+        defaults.update(overrides)
+        return EnrichmentContext(**defaults)
+
+    async def test_master_persist_flag_off_skips_the_probe(self):
+        set_suppress_streaming_warm(True)
+        ctx = self._ctx()
+
+        result = await run_bandcamp_live_probe(
+            ctx, settings=_flags(master=False), current_bandcamp_url=None, is_top1=True
+        )
+
+        ctx.bandcamp.find_album_match.assert_not_awaited()
+        assert result.status is None
+        assert result.bandcamp_url is None
+
+    async def test_bandcamp_persist_flag_off_skips_the_probe(self):
+        set_suppress_streaming_warm(True)
+        ctx = self._ctx()
+
+        result = await run_bandcamp_live_probe(
+            ctx, settings=_flags(bandcamp=False), current_bandcamp_url=None, is_top1=True
+        )
+
+        ctx.bandcamp.find_album_match.assert_not_awaited()
+        assert result.status is None
+
+    async def test_existing_bandcamp_url_is_never_overwritten(self):
+        # A librarian override (or an LML#505 sibling-invalidation leaving a
+        # verified value) already won the slot -- the probe must never run,
+        # regardless of every other flag being on.
+        set_suppress_streaming_warm(True)
+        ctx = self._ctx()
+        existing = "https://librarian-curated.bandcamp.com/album/pick"
+
+        result = await run_bandcamp_live_probe(
+            ctx, settings=_flags(), current_bandcamp_url=existing, is_top1=True
+        )
+
+        ctx.bandcamp.find_album_match.assert_not_awaited()
+        assert result.bandcamp_url == existing
+        assert result.status is None
