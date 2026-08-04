@@ -71,14 +71,22 @@ async def test_anadol_and_marie_klock_resolves_either_pressing(service):
 @pytest.mark.asyncio
 async def test_matmos_self_titled_placeholder_resolves(service):
     """Category 4: the query-side "S/T" swap searches the artist name instead
-    of the literal placeholder (which scores 22.2 and can never pass)."""
+    of the literal placeholder (which scores 22.2 and can never pass).
+
+    63794 and 20466 both score 100/100/100 -- a genuine exact tie Discogs
+    itself doesn't order consistently. LML#1097 makes ``find_best_typed_match``
+    break such ties deterministically by ascending ``release_id`` rather than
+    by whichever the API happened to return first, so 20466 (not 63794) is
+    the now-guaranteed pick -- both remain acceptable per this test's contract
+    (mirrors ``test_anadol_and_marie_klock_resolves_either_pressing`` above).
+    """
     result = await _library_miss_discogs_search(
         _parsed("Matmos", "S/T"),
         discogs_service=service,
     )
-    assert result is not None, "expected release 63794; got no floor-clearing candidate"
+    assert result is not None, "expected release 63794 or 20466; got no floor-clearing candidate"
     _, best = result
-    assert best.release_id == 63794, f"resolved wrong release {best.release_id}"
+    assert best.release_id in {63794, 20466}, f"resolved wrong release {best.release_id}"
     assert (best.album or "").strip().upper() != "S/T", (
         "a candidate literally titled 'S/T' must never clear via the placeholder"
     )
