@@ -1041,7 +1041,18 @@ async def handle_bulk_lookup(
                         # exempts Bandcamp from the bulk suppression), resolving
                         # the DIRECT album URL into the cache for subsequent
                         # lookups. Enable only after the BS#642 drain completes.
-                        bandcamp=bandcamp if settings.lml_bulk_bandcamp_streaming_warm else None,
+                        # LML#1098 adds the live-probe flag as a second reason to
+                        # inject the client: the inline probe (enrich_one) resolves a
+                        # DIRECT album URL in-response, distinct from the #1087 warm's
+                        # off-path next-time fill. Either flag wires the client through.
+                        bandcamp=(
+                            bandcamp
+                            if (
+                                settings.lml_bulk_bandcamp_streaming_warm
+                                or settings.lml_bandcamp_live_probe
+                            )
+                            else None
+                        ),
                         discogs_cache_pg=discogs_cache_pg,
                         caller_budget_ms=x_caller_budget_ms,
                         # Caller-controlled since LML#920 (default False, the
