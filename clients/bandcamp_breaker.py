@@ -100,6 +100,8 @@ import time
 from collections.abc import Callable
 from enum import StrEnum
 
+from core.exceptions import BreakerOpenError
+
 logger = logging.getLogger(__name__)
 
 # Floor for the HALF_OPEN watchdog window -- see the module docstring for why
@@ -124,13 +126,17 @@ class BandcampBreakerState(StrEnum):
     HALF_OPEN = "half-open"
 
 
-class BandcampBreakerOpenError(Exception):
+class BandcampBreakerOpenError(BreakerOpenError):
     """Raised by ``BandcampClient.find_album_match(..., fail_fast=True)`` when
     the breaker sheds a call (OPEN at entry, or opened mid-flight).
 
     Like ``discogs.breaker.DiscogsBreakerOpenError``, this means "couldn't
     ask, try later" -- never a confirmed no-match. Callers must not treat it
-    as a genuine miss (no negative-cache write, no ``absent`` status)."""
+    as a genuine miss (no negative-cache write, no ``absent`` status).
+
+    Inherits ``core.exceptions.BreakerOpenError`` (LML#1118) so a
+    breaker-generic catch also covers this type; kept as its own concrete
+    class because it carries useful specificity in logs."""
 
 
 class BandcampProbeBreaker:

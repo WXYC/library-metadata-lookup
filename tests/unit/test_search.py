@@ -1351,6 +1351,43 @@ class TestBreakerShedInRunner:
         assert [i.id for i in state.results] == [7]
         assert SearchStrategyType.SONG_AS_ARTIST in state.strategies_tried
 
+    @pytest.mark.asyncio
+    async def test_a_new_breaker_subclass_is_caught_by_the_existing_leg(self, monkeypatch):
+        """LML#1118 regression pin: the runner's per-strategy catch is typed on
+        ``BreakerOpenError``, not ``DiscogsBreakerOpenError`` specifically, so a
+        breaker introduced after this test is written -- YouTube Music, Spotify,
+        whatever #1100's registry adds next -- is degraded the same way with NO
+        further change to this "ONE catch boundary" leg. Without this, each new
+        breaker would repeat the #755 flood's one-miss-at-a-time discovery
+        pattern the 19 hand-patched ``except DiscogsBreakerOpenError`` legs
+        already went through.
+        """
+        from core.exceptions import BreakerOpenError
+
+        class _FutureStreamingBreakerOpenError(BreakerOpenError):
+            """Stand-in for a breaker that does not exist yet."""
+
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "60000")
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
+
+        async def shed_attempt(parsed, state, raw_message):  # noqa: ARG001
+            raise _FutureStreamingBreakerOpenError("future breaker open")
+
+        strategies = [
+            _StubStrategy(
+                name=SearchStrategyType.TRACK_ON_COMPILATION,
+                condition=lambda *_a: True,
+                attempt_func=shed_attempt,
+            )
+        ]
+        parsed = ParsedRequest(artist="Sessa", song="Retrato Sonoro", raw_message="x")
+
+        # Must NOT raise -- caught by the same base-typed leg as a Discogs shed.
+        state = await execute_search_pipeline(parsed, "x", strategies, song_not_found=True)
+
+        assert state.results == []
+        assert SearchStrategyType.TRACK_ON_COMPILATION in state.strategies_tried
+
 
 class TestHardCapSoftBudgetIndependence:
     """The hard cap (LML#370) and soft budget (LML#340) are layered knobs.

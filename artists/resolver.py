@@ -585,6 +585,9 @@ class BareNameArtistResolver:
                 try:
                     page = await service.search_artists(group.probe)
                 except DiscogsBreakerOpenError:
+                    # LML#1118: kept narrow — this tier only ever calls
+                    # ``self._discogs_service``; no other breaker type can
+                    # reach here.
                     logger.warning(
                         "artist-resolve breaker shed at '%s'; short-circuiting remaining batch",
                         group.probe,

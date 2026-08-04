@@ -138,6 +138,9 @@ async def _fallback_via_discogs_api(
             artist_name, limit=max_releases
         )
     except DiscogsBreakerOpenError:
+        # LML#1118: kept narrow — this fallback (module docstring: "Discogs
+        # genre/style aggregation") only ever calls DiscogsService; no other
+        # breaker type can reach here.
         return Counter(), Counter(), "unavailable"
 
     if release_ids is None:
@@ -159,6 +162,7 @@ async def _fallback_via_discogs_api(
             # requirement — and inherits the Discogs rate-limit + breaker gates.
             release = await discogs_service.get_release(release_id)
         except DiscogsBreakerOpenError:
+            # LML#1118: kept narrow — same reason as the leg above.
             # Budget exhausted mid-fan-out. Stop; keep whatever we aggregated.
             breaker_shed = True
             break

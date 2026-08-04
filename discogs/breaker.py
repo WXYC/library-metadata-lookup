@@ -126,6 +126,8 @@ import time
 from collections.abc import Callable
 from enum import StrEnum
 
+from core.exceptions import BreakerOpenError
+
 logger = logging.getLogger(__name__)
 
 # LML#787: minimum HALF_OPEN watchdog threshold. ``cooldown ×
@@ -144,7 +146,7 @@ class BreakerState(StrEnum):
     HALF_OPEN = "half-open"
 
 
-class DiscogsBreakerOpenError(Exception):
+class DiscogsBreakerOpenError(BreakerOpenError):
     """Raised by ``_request_with_retry`` when the saturation breaker sheds a
     live Discogs call (OPEN at entry, or opened mid-flight).
 
@@ -153,6 +155,11 @@ class DiscogsBreakerOpenError(Exception):
     callers must treat it as *unknown* — never persist a negative-cache row, a
     ``None`` release-id pin, an empty memoized list, or a definitive
     "not-on-release" verdict from it.
+
+    Inherits ``core.exceptions.BreakerOpenError`` (LML#1118) so a
+    breaker-generic catch (``except BreakerOpenError``) also covers this
+    type; kept as its own concrete class because most call sites deliberately
+    want Discogs-only handling (see their per-site comments).
     """
 
 

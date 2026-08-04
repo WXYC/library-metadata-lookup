@@ -58,6 +58,9 @@ async def fetch_top1_release_details(
         try:
             details = await discogs_service.get_artist_details(artist_id, lean=True)
         except DiscogsBreakerOpenError:
+            # LML#1118: kept narrow — this module's dependency surface is
+            # Discogs-only by design (module docstring: "one service handle");
+            # no other breaker type can reach here.
             # LML#1049: a breaker shed on the artist-bio step is "couldn't
             # enrich the bio this time," not a reason to discard the
             # release-level enrichment (``year`` / ``release``) already

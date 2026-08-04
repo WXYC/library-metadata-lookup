@@ -29,12 +29,12 @@ from clients.streaming.apple_music import AppleMusicClient
 from clients.streaming.spotify import SpotifyClient
 from config.settings import get_settings
 from core.event_loop_lag import get_event_loop_lag_ms
+from core.exceptions import BreakerOpenError
 from core.search import (
     SEARCH_TYPE_NONE,
     execute_search_pipeline,
     get_search_type_from_state,
 )
-from discogs.breaker import DiscogsBreakerOpenError
 from discogs.cache_service import DiscogsCacheService
 from discogs.lookup import lookup_releases_by_track
 from discogs.models import (
@@ -1205,13 +1205,22 @@ async def perform_lookup(
         )
 
     # LML#755 R2-2 backstop. The runner (`core/search.py`) already catches a
-    # Discogs saturation-breaker shed *inside* the search pipeline and degrades
-    # to cache-only. This try is defense in depth for the remaining tail steps
-    # (library-miss probe, track validation, artwork, enrichment, identity
-    # resolution) — a shed raised from any of them must degrade to whatever the
-    # library + already-cached legs produced, NOT 500. A shed is "couldn't ask",
-    # never a fatal error. We keep the library results found so far and skip the
-    # live-Discogs-dependent enrichment tail.
+    # saturation-breaker shed *inside* the search pipeline and degrades to
+    # cache-only. This try is defense in depth for the remaining tail steps
+    # (library-miss probe, track validation, streaming status, artwork,
+    # enrichment, identity resolution) — a shed raised from any of them must
+    # degrade to whatever the library + already-cached legs produced, NOT 500.
+    # A shed is "couldn't ask", never a fatal error. We keep the library
+    # results found so far and skip the live-dependent enrichment tail.
+    #
+    # LML#1118 widened this from `DiscogsBreakerOpenError` to the shared
+    # `BreakerOpenError` base: this boundary's own contract — "a shed from ANY
+    # tail step degrades the same way" — was never Discogs-specific, just
+    # typed that way because Discogs was the only breaker that existed yet.
+    # `enrich_metadata` already threads a Bandcamp client through this tail
+    # (`item.py`), which today self-catches its own shed before reaching
+    # here (`lookup/enrichment/bandcamp_probe.py`); the widening is defense
+    # in depth against that changing, per #1118's #755-flood rationale.
     #
     # LML#930 layers a second, orthogonal shed onto the same tail: the caller
     # *deadline*. Between each tail step we check the spine deadline; if the
@@ -1239,10 +1248,10 @@ async def perform_lookup(
                     state, parsed, degraded_reason=reason, location_union_task=location_union_task
                 )
             await run_step()
-    except DiscogsBreakerOpenError:
+    except BreakerOpenError as exc:
         logger.info(
-            "Discogs saturation breaker shed the enrichment tail; "
-            "returning cache-only lookup for %r",
+            "%s shed the enrichment tail; returning cache-only lookup for %r",
+            type(exc).__name__,
             request.raw_message,
         )
         return await _build_degraded_response(
@@ -1270,10 +1279,14 @@ async def perform_lookup(
         )
     try:
         identities_by_artist = await _step_resolve_result_identities(state, services)
-    except DiscogsBreakerOpenError:
+    # LML#1118: widened alongside the tail-steps catch above, same reason
+    # (`_resolve_identities` swallows per-name exceptions via
+    # `asyncio.gather(..., return_exceptions=True)`, so this leg is defense
+    # in depth, not a normally-reachable path).
+    except BreakerOpenError as exc:
         logger.info(
-            "Discogs saturation breaker shed identity resolution; "
-            "returning cache-only lookup for %r",
+            "%s shed identity resolution; returning cache-only lookup for %r",
+            type(exc).__name__,
             request.raw_message,
         )
         return await _build_degraded_response(

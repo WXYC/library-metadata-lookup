@@ -114,6 +114,8 @@ async def filter_results_by_track_validation(
                     )
                     return item, False
         except DiscogsBreakerOpenError:
+            # LML#1118: kept narrow — this validation only ever calls
+            # ``discogs_service``; no other breaker type can reach here.
             # LML#755 R2-4: the Discogs saturation breaker shed a live probe
             # (search or validate). A shed is "couldn't ask", NOT "confirmed not
             # on the album" — dropping the row here would launder the shed into
