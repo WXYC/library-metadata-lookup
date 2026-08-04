@@ -18,6 +18,7 @@ from __future__ import annotations
 # so it still takes effect there; removing this import would only break the
 # patch-target resolution, not any real behavior. Keep it.
 import asyncio  # noqa: F401
+import html
 import logging
 import re
 
@@ -155,11 +156,18 @@ def parse_og_title(og_title: str) -> tuple[str, str] | None:
     """Split a Bandcamp album page's ``og:title`` content ("Title, by Artist")
     into ``(title, artist)``. Returns ``None`` if the content doesn't match
     that shape.
+
+    The HTML attribute value is entity-escaped (``&#39;``, ``&amp;``, etc.)
+    by Bandcamp's page rendering, so both halves are unescaped before being
+    returned -- otherwise a genuinely correct match with an apostrophe or
+    ampersand in its title/artist scores tens of points below the acceptance
+    floor against the un-escaped library string (LML#1069 album-search
+    backlog).
     """
     match = _OG_TITLE_SPLIT_RE.match(og_title)
     if not match:
         return None
-    return match.group(1), match.group(2)
+    return html.unescape(match.group(1)), html.unescape(match.group(2))
 
 
 def extract_slug(url: str | None) -> str | None:

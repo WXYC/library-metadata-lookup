@@ -290,6 +290,23 @@ class TestParseOgTitle:
     def test_no_match_returns_none(self):
         assert parse_og_title("Not the expected shape") is None
 
+    def test_decodes_html_entities(self):
+        """Bandcamp HTML-escapes og:title content -- an apostrophe in a real
+        artist/title renders as ``&#39;`` in the page source. Without
+        decoding, score_match compares the literal escaped text and a
+        genuinely correct match can drop 40+ points below the acceptance
+        floor (LML#1069 album-search backlog: The UMC's, id 2674)."""
+        assert parse_og_title("Fruits Of Nature, by The UMC&#39;s") == (
+            "Fruits Of Nature",
+            "The UMC's",
+        )
+
+    def test_decodes_ampersand_entity(self):
+        assert parse_og_title("Bombscare EP, by Low &amp; Spring Heel Jack") == (
+            "Bombscare EP",
+            "Low & Spring Heel Jack",
+        )
+
 
 class TestVerifyAlbumPage:
     @pytest.mark.asyncio
@@ -361,6 +378,34 @@ class TestVerifyAlbumPage:
             "https://someone.bandcamp.com/album/whatever", "Stereolab", "Aluminum Tunes"
         )
         assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_accepts_match_with_html_escaped_apostrophe(self):
+        """Regression for LML#1069's album-search backlog: a real Bandcamp
+        og:title HTML-escapes apostrophes, e.g. ``The UMC&#39;s``. Comparing
+        the un-decoded text against the library's "The UMC's" scores 57.1
+        (apostrophe-only diff), well below the 80 floor, even though the
+        page is the correct match."""
+        html = '<meta property="og:title" content="Fruits Of Nature, by The UMC&#39;s">'
+        client = BandcampClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(
+            return_value=httpx.Response(
+                200,
+                text=html,
+                request=httpx.Request(
+                    "GET", "https://wildpitchrecords.bandcamp.com/album/fruits-of-nature"
+                ),
+            )
+        )
+        client._http = mock_http
+
+        ok = await client.verify_album_page(
+            "https://wildpitchrecords.bandcamp.com/album/fruits-of-nature",
+            "The UMC's",
+            "Fruits of Nature",
+        )
+        assert ok is True
 
 
 class TestFindAlbumMatchViaSearch:
