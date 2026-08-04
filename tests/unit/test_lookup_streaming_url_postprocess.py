@@ -1110,15 +1110,34 @@ class TestWarmConcurrencyBound:
 
 
 class TestWarmQueueDepthBoundResolution:
-    def test_depth_bound_is_a_small_multiple_of_concurrency(self, monkeypatch):
+    def test_depth_bound_is_concurrency_times_the_default_multiplier(self, monkeypatch):
+        monkeypatch.delenv(streaming_warm_admission.QUEUE_DEPTH_MULTIPLIER_ENV_VAR, raising=False)
         monkeypatch.setenv(mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, "1")
         mod._streaming_warm_semaphore = None
         mod._get_streaming_warm_semaphore()
         assert mod._streaming_warm_concurrency == 1
         assert (
             mod._streaming_warm_queue_depth_bound()
-            == 1 * streaming_warm_admission.QUEUE_DEPTH_MULTIPLIER
+            == 1 * streaming_warm_admission.QUEUE_DEPTH_MULTIPLIER_DEFAULT
         )
+        mod._streaming_warm_semaphore = None
+
+    def test_depth_bound_honors_the_multiplier_env_override(self, monkeypatch):
+        """LML#1108 review finding 6: with #1094 forbidding a runtime bump to
+        ``LML_STREAMING_WARM_CONCURRENCY``, this multiplier is now the only
+        no-redeploy lever available for the depth bound -- confirm it's
+        actually live-tunable, read fresh (not cached at semaphore-build
+        time like the concurrency itself)."""
+        monkeypatch.setenv(mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, "1")
+        mod._streaming_warm_semaphore = None
+        mod._get_streaming_warm_semaphore()
+
+        monkeypatch.setenv(streaming_warm_admission.QUEUE_DEPTH_MULTIPLIER_ENV_VAR, "32")
+        assert mod._streaming_warm_queue_depth_bound() == 32
+
+        monkeypatch.setenv(streaming_warm_admission.QUEUE_DEPTH_MULTIPLIER_ENV_VAR, "8")
+        assert mod._streaming_warm_queue_depth_bound() == 8
+
         mod._streaming_warm_semaphore = None
 
 
@@ -1216,16 +1235,31 @@ class TestWarmQueueDepthBound:
 
 @pytest.mark.asyncio
 class TestProbeDeadlinePropagation:
-    async def test_probe_deadline_is_armed_around_the_live_probe_and_reset_after(self):
+    """LML#1108 review finding 3: ``_warm_streaming_url_cache`` runs in a task
+    from ``asyncio.create_task``, which COPIES the calling context -- a
+    mutation the child task makes to a ``ContextVar`` (arming, then resetting,
+    the probe deadline) is invisible from the PARENT context these tests
+    otherwise run in. Asserting ``get_probe_deadline() is None`` from the test
+    function itself after the task completes is trivially true regardless of
+    whether ``reset_probe_deadline`` actually ran -- proven by mutation: it
+    passes even with the ``finally: reset_probe_deadline(...)`` deleted.
+
+    Both tests below instead observe from A POINT STILL INSIDE THE SAME WARM
+    TASK, after the reset has (or hasn't) happened: ``_mint_identity`` on the
+    happy path (called after the probe's ``finally`` exits, still in the same
+    coroutine), and ``logger.exception`` on the raise path (same reasoning).
+    """
+
+    async def test_probe_deadline_is_armed_during_the_probe(self):
         from clients.streaming.base import get_probe_deadline
 
         service = "apple_music_album"
         case = _CASES[service]
         update = _blank_update()
-        observed: list[float | None] = []
+        observed_during_probe: list[float | None] = []
 
         async def observing_resolve(pg, client, *, service, artist, album, **kwargs):
-            observed.append(get_probe_deadline())
+            observed_during_probe.append(get_probe_deadline())
             return ResolveOutcome(url=case["resolved_url"], source="live_resolved")
 
         assert get_probe_deadline() is None
@@ -1236,31 +1270,75 @@ class TestProbeDeadlinePropagation:
                 "resolve_streaming_url_with_cache",
                 new=AsyncMock(side_effect=observing_resolve),
             ),
+            patch.object(mod, "_mint_identity", new=AsyncMock()),
         ):
             await _run(update, settings=_settings(service))
             await _drain_background_tasks()
 
-        assert len(observed) == 1
+        assert len(observed_during_probe) == 1
         # A deadline WAS active during the probe, and it's a plausible
         # near-future monotonic value (roughly now + the 4.0s Apple ceiling).
-        assert observed[0] is not None
-        assert observed[0] > time.monotonic()
-        # The deadline does not leak past the warm task's own scope.
+        assert observed_during_probe[0] is not None
+        assert observed_during_probe[0] > time.monotonic()
+        # No leak into the TEST's own (parent) context either -- this alone
+        # would pass even without a working reset (see class docstring), so
+        # it is a supplementary check, not the load-bearing one below.
         assert get_probe_deadline() is None
+
+    async def test_probe_deadline_is_reset_after_the_probe_within_the_same_task(self):
+        from clients.streaming.base import get_probe_deadline
+
+        service = "apple_music_album"
+        case = _CASES[service]
+        update = _blank_update()
+        observed_after_reset: list[float | None] = []
+
+        async def observing_mint(*args, **kwargs):
+            # Runs AFTER `_warm_streaming_url_cache`'s `finally:
+            # reset_probe_deadline(...)` exits, but still inside the SAME
+            # warm task -- the one in-task observation point after the reset
+            # on the happy path.
+            observed_after_reset.append(get_probe_deadline())
+
+        with (
+            _patch_cache_peek(None),
+            _patch_resolver(
+                return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
+            ),
+            patch.object(mod, "_mint_identity", new=AsyncMock(side_effect=observing_mint)),
+        ):
+            await _run(update, settings=_settings(service))
+            await _drain_background_tasks()
+
+        # The load-bearing assertion: deleting the `finally:
+        # reset_probe_deadline(...)` line makes this observe the still-armed
+        # deadline instead of `None`.
+        assert observed_after_reset == [None]
 
     async def test_probe_deadline_is_reset_even_when_the_probe_raises(self):
         from clients.streaming.base import get_probe_deadline
 
         service = "apple_music_album"
         update = _blank_update()
+        observed_in_except_handler: list[float | None] = []
+
+        def observing_log_exception(*args, **kwargs):
+            # `_warm_streaming_url_cache`'s `except Exception:` handler runs
+            # AFTER the inner `finally: reset_probe_deadline(...)` has
+            # already unwound, still inside the SAME warm task.
+            observed_in_except_handler.append(get_probe_deadline())
 
         with (
             _patch_cache_peek(None),
             _patch_resolver(side_effect=RuntimeError("boom")),
+            patch.object(mod.logger, "exception", side_effect=observing_log_exception),
         ):
             await _run(update, settings=_settings(service))
             await _drain_background_tasks()
 
+        # The load-bearing assertion: deleting the reset would leave this
+        # observing the still-armed deadline instead of `None`.
+        assert observed_in_except_handler == [None]
         assert get_probe_deadline() is None
 
 

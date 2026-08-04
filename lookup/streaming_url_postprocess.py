@@ -388,9 +388,10 @@ async def apply_streaming_url_postprocess(
         ``StreamingResolution`` object uses). A cache hit maps to ``verified``;
         a known recent miss (a fresh "not found" already on record) maps to
         ``absent`` — a real, sourced negative, not a couldn't-check; a genuine
-        miss — whether it enqueues a background warm or is suppressed on the
-        bulk path — maps to ``unresolved``, since neither leaves this request
-        with a confirmed verdict; a swallowed cache-peek error maps to
+        miss — whether it enqueues a background warm, is suppressed on the
+        bulk path, or is SHED at the LML#1108 pending-depth bound — maps to
+        ``unresolved``, since none of those leave this request with a
+        confirmed verdict; a swallowed cache-peek error maps to
         ``unresolved`` too (attempted, inconclusive). A service this call never
         even considered (master/per-service flag off, no client, or the URL
         field was already non-null entering this function) is simply absent
@@ -616,44 +617,64 @@ async def _warm_streaming_url_cache(
     LML#1108: the wait to ACQUIRE ``semaphore`` isn't deadline-bound itself
     (the depth bound in ``_enqueue_streaming_warm`` caps queue depth instead);
     this makes that wait *observable*, timed and folded into the outcome log
-    line. Also arms ``clients.streaming.base.set_probe_deadline`` with the
-    SAME deadline ``wait_for`` enforces, so a client's own retry loop
-    (``SpotifyClient``'s 429 handler) can give up a doomed sleep instead of
-    being cancelled mid-sleep.
+    line. Also arms ``clients.streaming.base.set_probe_deadline`` with (at or
+    just before) the deadline ``wait_for`` enforces, so a client's own retry
+    loop (``SpotifyClient``'s 429/5xx handler) can RAISE and give up a doomed
+    sleep rather than being cancelled mid-sleep or returning a false ``[]``
+    "no match" that would poison the streaming-URL cache.
+
+    Acquiring the permit and running the probe are timed/exception-handled
+    SEPARATELY (not one ``async with`` + one ``except``): a probe failure --
+    the common case, e.g. a ``wait_for`` timeout -- must never be
+    misattributed as a semaphore-wait failure in the log (a probe that
+    acquired instantly and then timed out must not read as "failed after 4s
+    waiting for the semaphore").
     """
     semaphore = _get_streaming_warm_semaphore()
     semaphore_wait_started = time.monotonic()
     try:
-        async with semaphore:
-            semaphore_wait_s = time.monotonic() - semaphore_wait_started
-            probe_timeout_s = _effective_probe_timeout_s(cfg)
-            deadline_token = set_probe_deadline(time.monotonic() + probe_timeout_s)
-            try:
-                outcome = await asyncio.wait_for(
-                    resolve_streaming_url_with_cache(
-                        pg,
-                        client,
-                        service=service_key,
-                        artist=request_artist,
-                        album=request_album,
-                        miss_ttl=cfg.miss_ttl,
-                    ),
-                    timeout=probe_timeout_s,
-                )
-            finally:
-                reset_probe_deadline(deadline_token)
+        await semaphore.acquire()
     except Exception:
-        # Recompute (not ``semaphore_wait_s``, unset if still queued) so this
-        # logs a meaningful figure even on a failure before the permit.
         logger.exception(
-            "Background streaming-URL warm probe failed for %s (%s / %s) "
-            "after %.3fs waiting for the warm semaphore",
+            "Background streaming-URL warm probe aborted for %s (%s / %s) "
+            "while waiting for the warm semaphore (%.3fs elapsed)",
             service_key,
             request_artist,
             request_album,
             time.monotonic() - semaphore_wait_started,
         )
         return
+
+    semaphore_wait_s = time.monotonic() - semaphore_wait_started
+    try:
+        probe_timeout_s = _effective_probe_timeout_s(cfg)
+        deadline_token = set_probe_deadline(time.monotonic() + probe_timeout_s)
+        try:
+            outcome = await asyncio.wait_for(
+                resolve_streaming_url_with_cache(
+                    pg,
+                    client,
+                    service=service_key,
+                    artist=request_artist,
+                    album=request_album,
+                    miss_ttl=cfg.miss_ttl,
+                ),
+                timeout=probe_timeout_s,
+            )
+        finally:
+            reset_probe_deadline(deadline_token)
+    except Exception:
+        logger.exception(
+            "Background streaming-URL warm probe failed for %s (%s / %s) "
+            "(waited %.3fs for the warm semaphore)",
+            service_key,
+            request_artist,
+            request_album,
+            semaphore_wait_s,
+        )
+        return
+    finally:
+        semaphore.release()
 
     # Mint only a brand-new live resolution — cache hits/misses already
     # persisted their state. Outside the probe-concurrency semaphore: the mint

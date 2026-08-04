@@ -679,6 +679,28 @@ class TestHandleLookup:
         projected = {c.args[0]: c.args[1] for c in mock_transaction.set_data.call_args_list}
         assert projected["lml.cache.memory_cache_inflight_join"] == 2
 
+    def test_streaming_warm_depth_shed_key_is_seeded(self):
+        """LML#1108 review finding 4: ``streaming_warm_depth_shed`` (LML#1108's
+        warm-queue-depth shed counter) must be seeded here like every other
+        ``*_STAT_KEY`` in this tuple, or the shed rate has a numerator with no
+        denominator (a nonzero count is indistinguishable from "never
+        sampled") and the payload shape is unstable across requests. Exercises
+        the REAL seeding path (mirrors
+        ``test_extra_keys_seeded_and_projected_onto_transaction`` above) so a
+        future drop of this key from ``_LML_CACHE_STATS_EXTRA_KEYS`` fails
+        here, not just via an assertion against a mock.
+        """
+        from wxyc_fastapi.observability import get_cache_stats, init_cache_stats
+
+        from lookup.router import _LML_CACHE_STATS_EXTRA_KEYS
+        from lookup.streaming_warm_admission import DEPTH_SHED_STAT_KEY
+
+        assert DEPTH_SHED_STAT_KEY in _LML_CACHE_STATS_EXTRA_KEYS
+
+        init_cache_stats(extra_keys=_LML_CACHE_STATS_EXTRA_KEYS)
+        stats = get_cache_stats()
+        assert stats[DEPTH_SHED_STAT_KEY] == 0
+
     @pytest.mark.asyncio
     async def test_server_timing_header_present_by_default(self, app_client):
         """BS#881 (Epic G) observability: /lookup surfaces the RequestTelemetry stage
