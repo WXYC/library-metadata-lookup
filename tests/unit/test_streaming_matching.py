@@ -639,6 +639,51 @@ class TestFindBestMatch:
         assert best is not None
         assert best["id"] == "abc123"
 
+    def test_ties_break_deterministically_by_url_not_input_order(self):
+        """LML#1097: an exact-combined-score tie must resolve the same way
+        regardless of which candidate the caller's API happened to list
+        first -- by ascending url_fn(item), not first-in-list-wins."""
+        from clients.streaming.matching import find_best_match
+
+        candidate_a = {"artist": "Stereolab", "album": "Aluminum Tunes", "url": "http://z"}
+        candidate_b = {"artist": "Stereolab", "album": "Aluminum Tunes", "url": "http://a"}
+
+        for results in ([candidate_a, candidate_b], [candidate_b, candidate_a]):
+            best = find_best_match(
+                results,
+                "Stereolab",
+                "Aluminum Tunes",
+                artist_fn=lambda r: r["artist"],
+                title_fn=lambda r: r["album"],
+                url_fn=lambda r: r["url"],
+            )
+            assert best is not None
+            assert best["url"] == "http://a"
+
+    def test_ties_from_crossed_axis_scores_break_deterministically(self):
+        """A tie doesn't require identical strings: two candidates with
+        different, non-identical (artist_score, title_score) pairs can
+        average to the same combined score (e.g. (100, 80) vs (80, 100)).
+        Must still resolve deterministically by url, not input order."""
+        from clients.streaming.matching import find_best_match
+
+        scores = {"ArtistHigh": 100, "ArtistLow": 80, "TitleHigh": 100, "TitleLow": 80}
+        candidate_a = {"artist": "ArtistHigh", "album": "TitleLow", "url": "http://z"}
+        candidate_b = {"artist": "ArtistLow", "album": "TitleHigh", "url": "http://a"}
+
+        with patch("clients.streaming.matching.score_match", side_effect=lambda _q, r: scores[r]):
+            for results in ([candidate_a, candidate_b], [candidate_b, candidate_a]):
+                best = find_best_match(
+                    results,
+                    "query artist",
+                    "query title",
+                    artist_fn=lambda r: r["artist"],
+                    title_fn=lambda r: r["album"],
+                    url_fn=lambda r: r["url"],
+                )
+                assert best is not None
+                assert best["url"] == "http://a"
+
     def test_no_id_key_when_id_fn_omitted(self):
         from clients.streaming.matching import find_best_match
 
@@ -1472,9 +1517,10 @@ class TestFindBestTypedMatch:
         )
         assert best is good
 
-    def test_first_result_wins_on_tie(self):
-        """Ties resolve to the first candidate reaching the score — mirrors
-        find_best_match's order-preserving behavior."""
+    def test_first_result_wins_on_tie_when_no_key_fn_given(self):
+        """Without a key_fn, a caller that can't offer a deterministic
+        secondary key falls back to preserving input order on an exact
+        tie -- documented, not guaranteed-deterministic, behavior."""
         from clients.streaming.matching import find_best_typed_match
         from tests.factories import make_discogs_result
 
@@ -1488,6 +1534,50 @@ class TestFindBestTypedMatch:
             title_fn=lambda r: r.album,
         )
         assert best is first
+
+    def test_ties_break_deterministically_by_key_fn(self):
+        """LML#1097: when the caller supplies key_fn, an exact tie resolves
+        the same way regardless of input order -- by ascending key_fn(item),
+        mirroring release_resolution.py's (-score, release_id) sort key."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        low_id = make_discogs_result(release_id=1, album="Aluminum Tunes", artist="Stereolab")
+        high_id = make_discogs_result(release_id=2, album="Aluminum Tunes", artist="Stereolab")
+
+        for candidates in ([low_id, high_id], [high_id, low_id]):
+            best = find_best_typed_match(
+                candidates,
+                query_artist="Stereolab",
+                query_title="Aluminum Tunes",
+                artist_fn=lambda r: r.artist,
+                title_fn=lambda r: r.album,
+                key_fn=lambda r: r.release_id,
+            )
+            assert best is low_id
+
+    def test_ties_from_crossed_axis_scores_break_by_key_fn(self):
+        """A tie doesn't require identical strings -- different, non-identical
+        (artist_score, title_score) pairs can average to the same combined
+        score. Must still resolve deterministically via key_fn, not order."""
+        from clients.streaming.matching import find_best_typed_match
+        from tests.factories import make_discogs_result
+
+        scores = {"ArtistHigh": 100, "ArtistLow": 80, "TitleHigh": 100, "TitleLow": 80}
+        low_id = make_discogs_result(release_id=1, album="TitleLow", artist="ArtistHigh")
+        high_id = make_discogs_result(release_id=2, album="TitleHigh", artist="ArtistLow")
+
+        with patch("clients.streaming.matching.score_match", side_effect=lambda _q, r: scores[r]):
+            for candidates in ([low_id, high_id], [high_id, low_id]):
+                best = find_best_typed_match(
+                    candidates,
+                    query_artist="query artist",
+                    query_title="query title",
+                    artist_fn=lambda r: r.artist,
+                    title_fn=lambda r: r.album,
+                    key_fn=lambda r: r.release_id,
+                )
+                assert best is low_id
 
     def test_query_artist_accepts_variant_list_and_takes_max(self):
         """When the search-query form ('Various') differs from the canonical
