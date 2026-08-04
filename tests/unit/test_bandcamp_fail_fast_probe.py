@@ -443,6 +443,9 @@ class TestFailFastMalshapedJsonBody:
             pytest.param([], id="bare_list"),
             pytest.param("a string", id="bare_string"),
             pytest.param({"results": "not-a-list"}, id="results_not_a_list"),
+            pytest.param({"results": ["cloudflare"]}, id="results_items_are_strings"),
+            pytest.param({"results": [None]}, id="results_items_are_null"),
+            pytest.param({"results": [{"name": "ok"}, 123]}, id="results_items_mixed"),
         ],
     )
     async def test_search_artist_raises_transport_error_on_malshaped_body(self, client, body):
@@ -460,6 +463,9 @@ class TestFailFastMalshapedJsonBody:
             pytest.param([], id="bare_list"),
             pytest.param("a string", id="bare_string"),
             pytest.param({"results": "not-a-list"}, id="results_not_a_list"),
+            pytest.param({"results": ["cloudflare"]}, id="results_items_are_strings"),
+            pytest.param({"results": [None]}, id="results_items_are_null"),
+            pytest.param({"results": [{"name": "ok"}, 123]}, id="results_items_mixed"),
         ],
     )
     async def test_search_albums_raises_transport_error_on_malshaped_body(self, client, body):

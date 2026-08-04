@@ -253,8 +253,9 @@ def _reject_malshaped_fail_fast_body(data: object, url: str) -> dict:
     parseability (LML#1106 review round 2, FIX B).
 
     ``resp.json()`` succeeding only guarantees valid JSON -- a valid-JSON
-    non-object body (a bare list, a bare string) or a ``results`` field
-    that isn't a list still crashes the ``for item in data.get("results",
+    non-object body (a bare list, a bare string), a ``results`` field that
+    isn't a list, or a ``results`` list whose ITEMS aren't objects still
+    crashes the ``for item in data.get("results",
     [])`` loop downstream with an ``AttributeError``, which escapes the
     fail-fast taxonomy entirely and lands in
     ``lookup/enrichment/bandcamp_probe.py``'s ``except Exception`` catch-all
@@ -268,7 +269,10 @@ def _reject_malshaped_fail_fast_body(data: object, url: str) -> dict:
     shape and still propagates a raw ``AttributeError`` on these bodies,
     unchanged.
     """
-    if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
+    if not isinstance(data, dict):
+        raise BandcampTransportError(url)
+    results = data.get("results", [])
+    if not isinstance(results, list) or not all(isinstance(item, dict) for item in results):
         raise BandcampTransportError(url)
     return data
 
