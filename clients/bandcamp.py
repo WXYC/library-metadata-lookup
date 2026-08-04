@@ -494,6 +494,16 @@ class BandcampClient(BaseStreamingClient):
         link (worse than no link at all, per the LML#1069 plan's house rule)
         before a write. Conservative: any fetch or parse failure returns
         ``False`` -- an unverifiable hit is not written.
+
+        Runs the SAME raw-then-normalized acceptance pass as
+        ``find_album_match_via_search``: raw fields first, then
+        ``normalize_bc_title`` on both sides' titles if that misses. Without
+        the second pass, a match ``find_album_match_via_search`` only found
+        via its own normalized pass (e.g. a library title carrying a
+        cataloger annotation the real release title never had -- "Dreamy
+        [full-length]" vs the page's "Dreamy") gets re-scored here against
+        the raw un-normalized title and wrongly rejected -- the LML#1069
+        85-row verify_failed floor.
         """
         resp = await self._request_with_retry("GET", url, timeout=15.0, follow_redirects=True)
         if resp is None or resp.status_code != 200:
@@ -506,4 +516,10 @@ class BandcampClient(BaseStreamingClient):
         if parsed is None:
             return False
         page_title, page_artist = parsed
-        return is_acceptable_match(score_match(artist, page_artist), score_match(title, page_title))
+        artist_score = score_match(artist, page_artist)
+        if is_acceptable_match(artist_score, score_match(title, page_title)):
+            return True
+        return is_acceptable_match(
+            artist_score,
+            score_match(normalize_bc_title(title), normalize_bc_title(page_title)),
+        )

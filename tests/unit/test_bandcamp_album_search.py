@@ -380,6 +380,59 @@ class TestVerifyAlbumPage:
         assert ok is False
 
     @pytest.mark.asyncio
+    async def test_accepts_when_only_normalized_titles_match(self):
+        """LML#1069 85-row verify_failed floor: find_album_match_via_search
+        accepts a hit via its second (normalize_bc_title) pass -- e.g. a
+        library title carrying a cataloger annotation the real release
+        title never had ("Dreamy [full-length]" vs the page's "Dreamy") --
+        but verify_album_page re-scored the RAW un-normalized title against
+        the page title and rejected an otherwise-correct match. verify_album_page
+        must fall back to the same normalize_bc_title comparison the search
+        step used to accept the match.
+        """
+        html = '<meta property="og:title" content="Dreamy, by Beat Happening">'
+        client = BandcampClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(
+            return_value=httpx.Response(
+                200,
+                text=html,
+                request=httpx.Request("GET", "https://beathappening.bandcamp.com/album/dreamy"),
+            )
+        )
+        client._http = mock_http
+
+        ok = await client.verify_album_page(
+            "https://beathappening.bandcamp.com/album/dreamy",
+            "Beat Happening",
+            "Dreamy [full-length]",
+        )
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_still_rejects_when_normalized_titles_also_mismatch(self):
+        """The normalize_bc_title fallback must not widen the floor itself --
+        a genuinely wrong page still fails both passes."""
+        html = '<meta property="og:title" content="Totally Different Album, by Someone Else">'
+        client = BandcampClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.request = AsyncMock(
+            return_value=httpx.Response(
+                200,
+                text=html,
+                request=httpx.Request("GET", "https://someone.bandcamp.com/album/whatever"),
+            )
+        )
+        client._http = mock_http
+
+        ok = await client.verify_album_page(
+            "https://someone.bandcamp.com/album/whatever",
+            "Stereolab",
+            "Aluminum Tunes [full-length]",
+        )
+        assert ok is False
+
+    @pytest.mark.asyncio
     async def test_accepts_match_with_html_escaped_apostrophe(self):
         """Regression for LML#1069's album-search backlog: a real Bandcamp
         og:title HTML-escapes apostrophes, e.g. ``The UMC&#39;s``. Comparing
