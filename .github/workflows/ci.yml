@@ -207,15 +207,21 @@ jobs:
         run: |
           railway up --detach --json --service library-metadata-lookup > "$RUNNER_TEMP/deploy.json"
           jq -e . "$RUNNER_TEMP/deploy.json"
+          # Assign on their own lines: `echo "$(jq -er ...)"` would discard jq's exit status
+          # (the substitution's failure is invisible to `set -e` once `echo` succeeds) and write
+          # the literal string "null", which the wait step would then poll for until it timed out.
+          deployment_id="$(jq -er .deploymentId "$RUNNER_TEMP/deploy.json")"
+          logs_url="$(jq -er .logsUrl "$RUNNER_TEMP/deploy.json")"
           {
-            echo "deployment_id=$(jq -er .deploymentId "$RUNNER_TEMP/deploy.json")"
-            echo "logs_url=$(jq -er .logsUrl "$RUNNER_TEMP/deploy.json")"
+            echo "deployment_id=$deployment_id"
+            echo "logs_url=$logs_url"
           } >> "$GITHUB_OUTPUT"
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_STAGING }}
-      # Polls the deployment API for the real terminal status. Stronger than the old gate:
-      # `railway up` returned when the *build* finished, SUCCESS here means Railway's healthcheck
-      # passed and the revision is serving.
+      # Polls the deployment API for the real terminal status. At least as strong as the old
+      # gate and usually stronger: `railway up` raced a build-log stream against a deploy-status
+      # subscription and normally returned once the *build* finished, whereas SUCCESS here means
+      # Railway's healthcheck passed (railway.toml sets healthcheckPath) and the revision serves.
       - name: Wait for deployment to go live
         run: ./scripts/wait_for_railway_deployment.sh library-metadata-lookup "$DEPLOYMENT_ID" "$LOGS_URL"
         env:
@@ -277,9 +283,14 @@ jobs:
         run: |
           railway up --detach --json --service library-metadata-lookup > "$RUNNER_TEMP/deploy.json"
           jq -e . "$RUNNER_TEMP/deploy.json"
+          # Assign on their own lines: `echo "$(jq -er ...)"` would discard jq's exit status
+          # (the substitution's failure is invisible to `set -e` once `echo` succeeds) and write
+          # the literal string "null", which the wait step would then poll for until it timed out.
+          deployment_id="$(jq -er .deploymentId "$RUNNER_TEMP/deploy.json")"
+          logs_url="$(jq -er .logsUrl "$RUNNER_TEMP/deploy.json")"
           {
-            echo "deployment_id=$(jq -er .deploymentId "$RUNNER_TEMP/deploy.json")"
-            echo "logs_url=$(jq -er .logsUrl "$RUNNER_TEMP/deploy.json")"
+            echo "deployment_id=$deployment_id"
+            echo "logs_url=$logs_url"
           } >> "$GITHUB_OUTPUT"
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
