@@ -17,6 +17,8 @@ import aiosqlite
 import asyncpg
 from rapidfuzz import fuzz
 
+from clients.streaming.matching import _FORMAT_SUFFIX_RE
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -27,14 +29,19 @@ log = logging.getLogger(__name__)
 DISCOGS_URL = "postgresql://jake@localhost/discogs"
 SQLITE_PATH = "streaming_availability.db"
 
-# Strip annotations: [techno comp], (14 cds), etc.
+# Strip annotations: [techno comp], (14 cds), etc. Deliberately unconditional
+# (LML#1096 audit), unlike clients/streaming/matching.py's conservative
+# canonical bracket/parenthetical regexes: a compilation title's bracket/paren
+# content is cataloger noise ("[techno comp]", "(14 cds)") a real compilation
+# title never legitimately carries, unlike an album title where similar
+# content (e.g. "[Live]"/"[Disc One]") can be meaningful -- so this domain
+# intentionally strips more aggressively. See
+# tests/unit/test_match_compilations_normalize.py for the pinned behavior.
 _BRACKET_RE = re.compile(r"\s*\[[^\]]*\]\s*$")
 _PAREN_ANNOTATION_RE = re.compile(r"\s*\([^)]*\)\s*$")
-# Strip trailing format suffixes
-_FORMAT_SUFFIX_RE = re.compile(
-    r"""\s+(?:\d{1,2}[""]|LP|EP|CD|x\s*\d+)$""",
-    re.IGNORECASE,
-)
+# _FORMAT_SUFFIX_RE above is imported from the canonical implementation
+# (LML#1096) -- this one pattern was a byte-for-byte duplicate with no
+# domain-specific divergence, unlike the bracket/paren patterns above.
 # Strip leading label/annotation prefixes like "tribute: " or "FA 05-90 - "
 _LABEL_PREFIX_RE = re.compile(r"^[A-Z]{2,}\s*[-:]?\s*(?:\d{2,}-\d{2,}\s*[-:]\s*)?", re.IGNORECASE)
 

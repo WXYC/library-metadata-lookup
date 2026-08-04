@@ -61,6 +61,15 @@ _HTTPS_PREFIX = "https://"
 # query-only -- scoring still sees the raw title (clients/bandcamp.py's
 # ``find_album_match_via_search``), so over-stripping here costs recall, not
 # precision.
+#
+# LML#1096 audit: deliberately kept independent of (and more aggressive
+# than) ``clients/streaming/matching.py``'s canonical, scoring-side
+# ``strip_format_suffix``/``_CATALOG_NUMBER_BRACKET_RE`` -- that regex
+# conservatively preserves multi-word brackets ("[Disc One]") and
+# pure-numeric brackets ("[2019]") since they can be real title content on
+# the SCORING axis; a search QUERY has no such precision cost from
+# over-stripping. See ``test_strips_content_the_canonical_regex_preserves``
+# in ``tests/unit/test_bandcamp_album_search.py`` for the pinned divergence.
 _QUERY_BRACKET_TAG_RE = re.compile(r"\s*\[[^\]]*\]\s*$")
 _QUERY_STUDIO_SUFFIX_RE = re.compile(r"\s*\(studio\)\s*$", re.IGNORECASE)
 _QUERY_VINYL_SIZE_RE = re.compile(r"\s+\d{1,2}[\"”]\s*$")

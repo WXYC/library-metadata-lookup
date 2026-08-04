@@ -16,6 +16,18 @@ import re
 from clients.streaming.matching import strip_format_suffix
 
 # Bracket tags: [single], [ep], [split 7-inch], [missing], [45 rpm EP], etc.
+#
+# LML#1096 audit: intentionally unconditional and applied BEFORE
+# strip_format_suffix below (which itself has conservative, letter+digit- or
+# format-word-gated bracket handling) -- by the time strip_format_suffix
+# runs, this has already removed any bracket content, so its own bracket
+# regexes never get a chance to fire here. That's fine: a TRACK title never
+# legitimately carries bracket content the way an ALBUM title occasionally
+# does (a real "[Disc One]"/"[Live]" marker), so this domain's noise is
+# always safe to strip unconditionally. See
+# test_disc_marker_bracket_stripped_unlike_canonical_strip_format_suffix and
+# test_missing_bracket in tests/unit/test_title_parser.py for the pinned
+# divergence from the canonical (album-scoring) behavior.
 _BRACKET_RE = re.compile(r"\s*\[[^\]]*\]\s*$")
 
 # b/w (backed with): A-side b/w B-side

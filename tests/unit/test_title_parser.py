@@ -132,6 +132,17 @@ class TestBracketAndFormatStripping:
         result = parse_single_title("Kidding on the Square // If You Hurt Me [missing]")
         assert result == ["Kidding on the Square", "If You Hurt Me"]
 
+    def test_disc_marker_bracket_stripped_unlike_canonical_strip_format_suffix(self):
+        """LML#1096: pins the intentional divergence from clients/streaming/
+        matching.py's conservative strip_format_suffix, which deliberately
+        PRESERVES a multi-word bracket like "[Disc One]" (real content on an
+        album title). A track title never legitimately carries that kind of
+        marker, so this module's own unconditional _BRACKET_RE -- which runs
+        BEFORE strip_format_suffix and so is solely responsible for bracket
+        handling here -- strips it anyway."""
+        result = parse_single_title("Confield [Disc One]")
+        assert result == ["Confield"]
+
 
 class TestNoDelimiter:
     """Titles with no delimiter produce a single track."""

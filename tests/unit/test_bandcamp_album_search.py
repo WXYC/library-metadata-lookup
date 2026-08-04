@@ -103,6 +103,33 @@ class TestCleanTitleForQuery:
     def test_empty_string(self):
         assert clean_title_for_query("") == ""
 
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            # A multi-word bracket like "[Disc One]" carries real content on
+            # an album title -- clients/streaming/matching.py's canonical
+            # strip_format_suffix deliberately preserves it (LML#1084).
+            # clean_title_for_query strips it anyway: it feeds a SEARCH
+            # QUERY, not the scoring axis (score_match still sees the raw
+            # title in find_album_match_via_search), so over-stripping here
+            # only costs recall, never precision.
+            ("Confield [Disc One]", "Confield"),
+            # A pure-numeric bracket ("[2019]") is ambiguous between a
+            # reissue year and real title content, so the canonical regex
+            # leaves it alone; the query-only strip doesn't need to hedge.
+            ("Confield [2019]", "Confield"),
+        ],
+    )
+    def test_strips_content_the_canonical_regex_preserves(self, raw, expected):
+        """LML#1096 audit: pins the intentional query-side/scoring-side
+        divergence from clients/streaming/matching.py's conservative
+        strip_format_suffix -- see the module comment on
+        _QUERY_BRACKET_TAG_RE for the recall-vs-precision rationale."""
+        from clients.streaming.matching import strip_format_suffix
+
+        assert clean_title_for_query(raw) == expected
+        assert strip_format_suffix(raw) == raw  # canonical regex leaves it untouched
+
 
 class TestNormalizeBcTitle:
     """Parameterized against the LML#1069 measurement's near-miss corpus.
