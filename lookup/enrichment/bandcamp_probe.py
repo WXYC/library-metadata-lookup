@@ -25,7 +25,7 @@ from typing import NamedTuple
 
 from wxyc_fastapi.observability import get_posthog_client
 
-from clients.bandcamp import BandcampRateLimitedError
+from clients.bandcamp import BandcampRateLimitedError, BandcampTransportError
 from clients.bandcamp_breaker import BandcampBreakerOpenError
 from config.settings import Settings
 from entity.streaming_url_cache import resolve_streaming_url_with_cache
@@ -95,10 +95,10 @@ async def run_bandcamp_live_probe(
     fail_fast=True)`` under an ``asyncio.wait_for`` ceiling clamped to the
     caller budget (LML#930 parity): a cache hit / live resolve -> ``verified``
     with the URL; a clean live/known miss -> ``absent`` (the resolver already
-    negative-cached a fresh ``live_miss``); a breaker shed / 429 / timeout ->
-    ``unresolved`` with NO cache write (``fail_fast`` re-raises before the
-    UPSERT). Exactly one ``find_album_match`` — no title-variant fan-out
-    (LML#1094).
+    negative-cached a fresh ``live_miss``); a breaker shed / 429 / non-429
+    transport failure / timeout -> ``unresolved`` with NO cache write
+    (``fail_fast`` re-raises before the UPSERT). Exactly one
+    ``find_album_match`` — no title-variant fan-out (LML#1094).
     """
     if not (
         # BULK-path-only gate FIRST (short-circuits the interactive path before
@@ -142,11 +142,22 @@ async def run_bandcamp_live_probe(
             ),
             timeout=probe_timeout_s,
         )
-    except (BandcampBreakerOpenError, BandcampRateLimitedError) as exc:
+    except (
+        BandcampBreakerOpenError,
+        BandcampRateLimitedError,
+        BandcampTransportError,
+    ) as exc:
         # A 429-driven shed (breaker OPEN, or a 429 on the single fail-fast
-        # attempt): transient, no sourced verdict, no cache write. Emit the
-        # unsampled shed counter so sustained Bandcamp saturation stays
-        # queryable without a per-event Sentry flood (LML#879/#1049 pattern).
+        # attempt) or a non-429 transport failure (5xx, Cloudflare 403/1015,
+        # connect timeout, non-200 -- clients/bandcamp.py's
+        # BandcampTransportError, LML#1106 review FIX 2): all three are a
+        # "couldn't ask", not an unexpected raise -- transient, no sourced
+        # verdict, no cache write. Emit the unsampled shed counter so
+        # sustained Bandcamp saturation (rate-limit OR transport) stays
+        # queryable without a per-event Sentry flood (LML#879/#1049 pattern)
+        # -- routing a transport failure through the ``logger.exception``
+        # catch-all below instead would reproduce the exact #755 33k-event
+        # flood shape for an outcome that is expected under load.
         _capture_shed(type(exc).__name__, settings=settings)
         return BandcampProbeResult(current_bandcamp_url, StreamingResolutionStatus.unresolved)
     except TimeoutError:

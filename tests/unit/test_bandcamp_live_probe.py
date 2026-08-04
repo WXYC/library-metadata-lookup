@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from clients.bandcamp import BandcampClient, BandcampRateLimitedError
+from clients.bandcamp import BandcampClient, BandcampRateLimitedError, BandcampTransportError
 from clients.bandcamp_breaker import BandcampBreakerOpenError
 from discogs.models import ReleaseMetadataResponse
 from entity.sources import PgSource
@@ -259,6 +259,36 @@ class TestBandcampLiveProbe:
         pg.execute.assert_not_awaited()
         events = [c.kwargs.get("event") for c in posthog.capture.call_args_list]
         assert "bandcamp_live_probe_shed" in events
+
+    async def test_transport_error_yields_unresolved_and_emits_counter_not_exception_log(self):
+        """A non-429 transport failure (``BandcampTransportError`` -- 5xx,
+        Cloudflare 403/1015, connect timeout, non-200) is a "couldn't ask",
+        not an unexpected raise: ``unresolved``, NO cache write, and the
+        shed counter fires (same bucket as a breaker shed / 429). LML#1106
+        review integration fix: it must NOT fall through to the loud
+        ``logger.exception`` catch-all below -- that would reproduce the
+        #755 Sentry-flood shape for an outcome that's expected under
+        sustained Bandcamp load."""
+        item, artwork, bandcamp = _inputs()
+        bandcamp.find_album_match = AsyncMock(side_effect=BandcampTransportError("500"))
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        posthog = MagicMock()
+
+        with (
+            patch("lookup.enrichment.item.get_settings", return_value=_flags()),
+            patch("lookup.enrichment.bandcamp_probe.get_posthog_client", return_value=posthog),
+            patch("lookup.enrichment.bandcamp_probe.logger") as logger_mock,
+        ):
+            results = await _run(bandcamp, pg, item, artwork)
+
+        _, enriched = results[0]
+        assert enriched.streaming_status.bandcamp == StreamingResolutionStatus.unresolved
+        pg.execute.assert_not_awaited()
+        events = [c.kwargs.get("event") for c in posthog.capture.call_args_list]
+        assert "bandcamp_live_probe_shed" in events
+        logger_mock.exception.assert_not_called()
 
     async def test_timeout_yields_unresolved_without_shed_counter(self):
         """A ``wait_for`` timeout is transient (``unresolved``) but is NOT a
