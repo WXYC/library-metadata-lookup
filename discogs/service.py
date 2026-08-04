@@ -1,4 +1,15 @@
-"""Discogs API service with caching and rate limiting."""
+"""Discogs API service with caching and rate limiting.
+
+LML#1118: every ``except DiscogsBreakerOpenError`` in this module is kept
+narrow on purpose rather than widened to the shared ``core.exceptions.
+BreakerOpenError`` base. This module IS the Discogs client -- every call
+inside these ``try`` blocks only ever talks to Discogs, so no other breaker
+type can reach these catches, today or in the future. Keeping the concrete
+name also keeps a reader's context tight to "this call only ever talks to
+Discogs" at each site, several of which exist specifically to re-raise a
+shed before the generic ``except Exception`` below can swallow it into a
+false-negative ``None``.
+"""
 
 from __future__ import annotations
 
@@ -1013,6 +1024,7 @@ class DiscogsService:
                 )
 
             except DiscogsBreakerOpenError:
+                # LML#1118: kept narrow — see module docstring.
                 # LML#805: a saturation-breaker shed is expected degrade
                 # ("couldn't ask, try later"), NOT a search failure — log it at
                 # DEBUG so a sustained OPEN episode doesn't flood Sentry with a
@@ -1549,6 +1561,7 @@ class DiscogsService:
                 )
 
             except DiscogsBreakerOpenError:
+                # LML#1118: kept narrow — see module docstring.
                 # LML#755 FIX 1: a breaker shed is "couldn't ask" — propagate it
                 # so ``validate_track_on_release`` doesn't turn a missing release
                 # into a definitive ``False`` (dropping a valid candidate). A
@@ -1714,6 +1727,7 @@ class DiscogsService:
                 )
 
             except DiscogsBreakerOpenError:
+                # LML#1118: kept narrow — see module docstring.
                 # LML#1049 FIX 1 (mirrors ``get_release``'s LML#755 FIX 1 above): a
                 # breaker shed is "couldn't ask," not "asked, Discogs confirms no
                 # such artist" — re-raise BEFORE any tombstone/write-back so the
@@ -1805,6 +1819,7 @@ class DiscogsService:
         try:
             details = await self.get_artist_details(artist_id)
         except DiscogsBreakerOpenError:
+            # LML#1118: kept narrow — see module docstring.
             return None
         return details.image_url if details else None
 
@@ -2046,6 +2061,7 @@ class DiscogsService:
                 )
 
             except DiscogsBreakerOpenError:
+                # LML#1118: kept narrow — see module docstring.
                 # LML#805: a saturation-breaker shed is expected degrade, not a
                 # search failure — DEBUG, not ERROR, so a sustained OPEN episode
                 # doesn't flood Sentry with per-request error events (#755). The

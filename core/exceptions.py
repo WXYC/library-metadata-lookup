@@ -32,3 +32,31 @@ class ConfigurationError(LookupServiceError):
     """Raised when there's a configuration error."""
 
     pass
+
+
+class BreakerOpenError(Exception):
+    """Shared base for every saturation-breaker shed (LML#1118).
+
+    ``DiscogsBreakerOpenError`` (``discogs/breaker.py``, LML#755) and
+    ``BandcampBreakerOpenError`` (``clients/bandcamp_breaker.py``, LML#1106)
+    both mean the identical thing: **"couldn't ask, try later -- never a
+    confirmed miss."** Callers must not treat either as a genuine negative
+    result -- no negative-cache write, no ``None`` release-id pin, no
+    definitive "not on this release" verdict.
+
+    Lives here rather than in ``discogs/`` or ``clients/`` so neither module
+    has to import the other's package to share the type: this module has no
+    dependents in either direction, so importing it from both is cycle-free.
+
+    Deliberately a plain ``Exception`` subclass rather than a
+    ``LookupServiceError`` one -- see ``BreakerOpenError``'s own subclasses
+    for why: ``LookupServiceError`` requires a ``message`` argument, and both
+    concrete breaker errors are raised bare at some call sites.
+
+    A single ``except BreakerOpenError`` leg covers every present and future
+    breaker, so adding a new one (YouTube Music, Spotify) costs no new
+    call-site audit at genuinely breaker-generic boundaries. Most of today's
+    call sites intentionally keep catching a concrete subclass instead --
+    see the per-site comments at each ``except DiscogsBreakerOpenError`` for
+    why that specificity is worth keeping there.
+    """

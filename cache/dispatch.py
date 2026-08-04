@@ -136,6 +136,13 @@ async def _refresh_discogs_release(
     except asyncio.CancelledError:
         raise
     except DiscogsBreakerOpenError:
+        # LML#1118: kept narrow — this leg only ever calls DiscogsService, and
+        # the ``message="DiscogsBreakerOpenError"`` tag below is a
+        # dashboard-facing per-source label (cache/models.py); widening to the
+        # shared ``BreakerOpenError`` base would let a hypothetical
+        # non-Discogs shed reach here mislabeled with a Discogs-specific tag.
+        # A future non-Discogs release leg would be its own function with its
+        # own tag, not a widened version of this one.
         # LML#814: ``get_release`` re-raises a saturation-breaker shed (the
         # LML#755 FIX-1 guard, so ``validate_track_on_release`` can't turn
         # "couldn't ask" into a definitive False). Here in the cache-warmer that
@@ -187,6 +194,9 @@ async def _refresh_discogs_artist(
         except asyncio.CancelledError:
             raise
         except DiscogsBreakerOpenError:
+            # LML#1118: kept narrow — same reason as the release leg above
+            # (``_refresh_discogs_release``): a Discogs-only function tagging
+            # a dashboard-facing ``message="DiscogsBreakerOpenError"`` label.
             # LML#1049: ``get_artist_details`` now re-raises a saturation-breaker
             # shed (mirroring ``get_release``'s LML#755 FIX-1, propagated to this
             # walk-to-artist leg the same way ``_refresh_discogs_release`` above

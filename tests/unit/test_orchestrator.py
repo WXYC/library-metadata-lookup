@@ -204,6 +204,46 @@ class TestPerformLookupBasic:
         assert response.degraded_reason == DegradedReason.upstream_unavailable
 
     @pytest.mark.asyncio
+    async def test_a_new_breaker_subclass_in_the_tail_also_degrades_to_cache_only(
+        self, mock_library_db, mock_discogs_service, telemetry, stereolab_item
+    ):
+        """LML#1118 regression pin: the tail's catch is typed on
+        ``BreakerOpenError``, not ``DiscogsBreakerOpenError`` specifically, so a
+        breaker that does not exist yet degrades through this same "defense in
+        depth" leg with no further change -- the risk #1118 exists to close
+        before a Bandcamp/YTM/Spotify shed reaches this boundary uncaught and
+        falls into the generic ``except Exception`` -> ``logger.exception`` ->
+        ERROR path, reproducing the #755 flood shape.
+        """
+        from core.exceptions import BreakerOpenError
+
+        class _FutureStreamingBreakerOpenError(BreakerOpenError):
+            """Stand-in for a breaker that does not exist yet."""
+
+        mock_library_db.search.return_value = [stereolab_item]
+
+        request = LookupRequest(
+            artist="Stereolab",
+            album="Emperor Tomato Ketchup",
+            raw_message="Play Emperor Tomato Ketchup by Stereolab",
+        )
+
+        async def _shed(*_a, **_k):
+            raise _FutureStreamingBreakerOpenError("future breaker open mid-enrichment")
+
+        with patch("lookup.orchestrator._step_fetch_artwork", side_effect=_shed):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        # 200-shaped degrade, exactly like the DiscogsBreakerOpenError case above.
+        assert isinstance(response, LookupResponse)
+        assert len(response.results) == 1
+        assert response.results[0].library_item.artist == "Stereolab"
+        assert response.degraded is True
+        assert response.degraded_reason == DegradedReason.upstream_unavailable
+
+    @pytest.mark.asyncio
     async def test_tail_shed_on_caller_deadline_degrades_deadline_exceeded(
         self, mock_library_db, mock_discogs_service, telemetry, queen_item
     ):

@@ -1,4 +1,11 @@
-"""FastAPI router for Discogs API endpoints."""
+"""FastAPI router for Discogs API endpoints.
+
+LML#1118: every ``except DiscogsBreakerOpenError`` here is kept narrow on
+purpose. This router's routes only ever call ``DiscogsService`` methods
+(``get_release`` / ``get_artist_details`` / ``get_master``), so no other
+breaker type can reach these catches, and the 503 detail string they build
+("Discogs temporarily shed...") is itself Discogs-specific.
+"""
 
 import logging
 from collections.abc import Callable
@@ -116,6 +123,7 @@ async def get_release(
     try:
         result = await svc.get_release(release_id)
     except DiscogsBreakerOpenError as e:
+        # LML#1118: kept narrow — see module docstring.
         # LML#755 R2-3: the Discogs saturation breaker shed this live probe. 503
         # (transient / retryable), not a raw 500 — the caller should back off and
         # retry rather than treat this as a hard failure.
@@ -154,6 +162,7 @@ async def get_artist(
     try:
         result = await svc.get_artist_details(artist_id)
     except DiscogsBreakerOpenError as e:
+        # LML#1118: kept narrow — see module docstring.
         # LML#1031 originally added this wrap defensively — get_artist_details's
         # own _api_fetch used to CATCH DiscogsBreakerOpenError internally and
         # return None (LML#805), so a real shed surfaced as the 404 branch
@@ -239,6 +248,7 @@ async def resolve_entity(
                 raise HTTPException(status_code=404, detail=f"Master {entity_id} not found")
             return EntityResolveResponse(name=master.title, type=entity_type, id=entity_id)
     except DiscogsBreakerOpenError as e:
+        # LML#1118: kept narrow — see module docstring.
         # LML#755 R2-3: a saturation-breaker shed on this diagnostic route → 503
         # (transient), not a raw 500. Both the release branch's ``get_release``
         # (LML#755 FIX 1) and the artist branch's ``get_artist_details``

@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import sentry_sdk
 
+from core.exceptions import BreakerOpenError
 from core.observability import observability_guard, project_transaction
-from discogs.breaker import DiscogsBreakerOpenError
 from discogs.service import reset_retry_budget_deadline, set_retry_budget_deadline
 from generated.api_models import TrackMatchHint
 from library.models import LibraryItem
@@ -950,17 +950,24 @@ async def _run_strategy_pipeline(
                     hard_cap_ms=hard_cap_ms,
                 )
                 break
-            except DiscogsBreakerOpenError:
-                # LML#755 R2-2: the Discogs saturation breaker shed a live probe
-                # inside this strategy. A shed means "couldn't ask" — degrade to the
-                # same empty (cache-only) outcome a strategy miss produces, so the
-                # lookup returns library + already-cached results instead of 500ing.
-                # This is the ONE catch boundary for the shed on the search path: all
-                # strategies that fan out to Discogs are covered here, so no strategy
-                # needs its own catch. We ``continue`` (not ``break``) so a later
-                # strategy — which may hit only the cache — still runs.
+            except BreakerOpenError as exc:
+                # LML#755 R2-2: a saturation breaker shed a live probe inside this
+                # strategy. A shed means "couldn't ask" — degrade to the same empty
+                # (cache-only) outcome a strategy miss produces, so the lookup
+                # returns library + already-cached results instead of 500ing.
+                # This is the ONE catch boundary for the shed on the search path:
+                # every strategy that fans out to a breaker-guarded live probe is
+                # covered here, so no strategy needs its own catch. LML#1118 widened
+                # this from ``DiscogsBreakerOpenError`` to the shared
+                # ``BreakerOpenError`` base — today only Discogs strategies fan out
+                # from here, but the whole point of the base class is that a future
+                # breaker-guarded strategy (e.g. a Bandcamp search strategy) is
+                # covered for free, with no new catch to add. We ``continue`` (not
+                # ``break``) so a later strategy — which may hit only the cache —
+                # still runs.
                 logger.info(
-                    "Discogs saturation breaker shed strategy %s; degrading to cache-only",
+                    "%s shed strategy %s; degrading to cache-only",
+                    type(exc).__name__,
                     strategy.name,
                 )
                 outcome = Outcome.empty()

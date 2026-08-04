@@ -406,6 +406,9 @@ async def run_drain(
                 try:
                     outcome = await drain_master(service, master_id)
                 except DiscogsBreakerOpenError:
+                    # LML#1118: kept narrow — this drain script (module
+                    # docstring) only ever calls the Discogs API; no other
+                    # breaker type can reach here.
                     # get_release shed the live probe — unambiguous saturation.
                     shed = True
                 except Exception as exc:  # noqa: BLE001 — retryable: do not checkpoint
