@@ -437,6 +437,75 @@ class TestBulkLookupEndpoint:
         assert mock_lookup.await_args.kwargs.get("bandcamp") is sentinel
 
     @pytest.mark.asyncio
+    async def test_bulk_omits_bandcamp_client_when_live_probe_flag_off(self, app_client):
+        """Mirrors ``test_bulk_omits_bandcamp_client_when_flag_off`` for the
+        OTHER disjunct in the handler's ``bandcamp=(... if (lml_bulk_bandcamp_
+        streaming_warm or lml_bandcamp_live_probe) else None)`` gate
+        (LML#1106 review round 2, FIX D): with both flags off (the default),
+        the bulk drain must not forward the Bandcamp client."""
+        with patch(
+            "lookup.router.perform_lookup",
+            new_callable=AsyncMock,
+            return_value=_no_match_response(),
+        ) as mock_lookup:
+            async with AsyncClient(
+                transport=ASGITransport(app=app_client), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={"items": [{"artist": "Juana Molina", "album": "DOGA"}]},
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_count == 1
+        assert mock_lookup.await_args.kwargs.get("bandcamp") is None
+
+    @pytest.mark.asyncio
+    async def test_bulk_forwards_bandcamp_client_when_live_probe_flag_on(
+        self, mock_db, mock_discogs, mock_settings
+    ):
+        """LML#1106 review round 2, FIX D: with ``lml_bandcamp_live_probe`` on
+        (and ``lml_bulk_bandcamp_streaming_warm`` left at its default off, to
+        isolate this disjunct), the Bandcamp client must still flow into
+        ``perform_lookup`` -- LML#1098's inline live probe (``lookup/
+        enrichment/bandcamp_probe.py``) needs ``ctx.bandcamp`` wired to
+        resolve a DIRECT album URL on the enrichment path. Without this
+        disjunct, enabling ``LML_BANDCAMP_LIVE_PROBE`` in Railway would leave
+        ``ctx.bandcamp`` ``None``, failing the probe's own precondition
+        silently -- the feature would be a no-op in production with nothing
+        catching it (the whole suite stays green without this disjunct)."""
+        from streaming.dependencies import get_bandcamp_client
+
+        sentinel = object()
+        flag_on_settings = mock_settings.model_copy(update={"lml_bandcamp_live_probe": True})
+        with (
+            override_deps(
+                app,
+                {
+                    get_library_db: mock_db,
+                    get_discogs_service: mock_discogs,
+                    get_posthog_client: None,
+                    get_settings: flag_on_settings,
+                    get_bandcamp_client: sentinel,
+                },
+            ),
+            patch(
+                "lookup.router.perform_lookup",
+                new_callable=AsyncMock,
+                return_value=_no_match_response(),
+            ) as mock_lookup,
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/api/v1/lookup/bulk",
+                    json={"items": [{"artist": "Juana Molina", "album": "DOGA"}]},
+                )
+
+        assert resp.status_code == 200
+        assert mock_lookup.await_count == 1
+        assert mock_lookup.await_args.kwargs.get("bandcamp") is sentinel
+
+    @pytest.mark.asyncio
     async def test_results_preserve_input_order(self, app_client):
         """Even with mixed match/no_match/error, response[i] corresponds to request[i]."""
 

@@ -55,6 +55,19 @@ _SHED_EVENT = "bandcamp_live_probe_shed"
 _SHED_POSTHOG_EVENT_PREFIX = "bandcamp_live_probe"
 _SHED_POSTHOG_DISTINCT_ID = "library-metadata-lookup-service"
 
+# LML#1106 review round 2, FIX C: unlike the resolve-with-cache call above
+# (bounded by its own asyncio.wait_for, clamped to the caller budget), this
+# mint's PG write has nothing else bounding it -- enrich_metadata runs as a
+# bare ``await run_step()`` (not run_within_spine_deadline), should_shed_tail
+# only checks BETWEEN steps, and PgSource.acquire passes no ``timeout=`` to
+# pool.acquire(). An exhausted pool (lock contention on
+# entity.release_identity) would otherwise pin this response-path item
+# indefinitely. A fixed, local ceiling (not env-tunable -- this is a
+# best-effort local PG write, not a knob operators need to retune) is enough:
+# see run_bandcamp_live_probe's mint call site for the failure posture (log
+# and continue, never fail the lookup).
+_MINT_TIMEOUT_S = 3.0
+
 
 class BandcampProbeResult(NamedTuple):
     """The probe's effect on the Bandcamp slot.
@@ -227,11 +240,32 @@ async def run_bandcamp_live_probe(
     if outcome.url is not None:
         # FIX 4 (LML#1106 review): mint only a brand-new live_resolved -- a
         # cache_hit already minted; _mint_identity swallows its own failures
-        # (never fails the lookup).
+        # (never fails the lookup). FIX C (LML#1106 review round 2): this
+        # await sits AFTER the probe's own asyncio.wait_for has already
+        # returned, so nothing else bounds it -- wrap it in its own ceiling
+        # so a stuck PG mint (pool exhaustion / lock contention on
+        # entity.release_identity) can't pin this response-path item past
+        # the caller's budget. A timeout here is the SAME best-effort
+        # posture as a mint failure inside _mint_identity itself: log and
+        # continue, the URL still surfaces either way.
         if outcome.source == "live_resolved" and ctx.entity_store is not None:
-            await _mint_identity(
-                _BANDCAMP_ALBUM_SERVICE, _BANDCAMP_CACHE_CONFIG, outcome.url, ctx.entity_store
-            )
+            try:
+                await asyncio.wait_for(
+                    _mint_identity(
+                        _BANDCAMP_ALBUM_SERVICE,
+                        _BANDCAMP_CACHE_CONFIG,
+                        outcome.url,
+                        ctx.entity_store,
+                    ),
+                    timeout=_MINT_TIMEOUT_S,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Bandcamp release-identity mint timed out for %s - %s (url=%s)",
+                    ctx.artist,
+                    ctx.album,
+                    outcome.url,
+                )
         return BandcampProbeResult(outcome.url, StreamingResolutionStatus.verified)
     # live_miss / cache_miss_recent: a sourced, terminal no-match. Leave the URL
     # to the deferred search fallback; the verdict says "checked, absent", not
