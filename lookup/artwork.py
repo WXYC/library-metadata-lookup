@@ -332,6 +332,9 @@ async def fetch_artwork_for_items(
                 query_title=album_variants,
                 artist_fn=lambda r: r.artist_variants(),
                 title_fn=lambda r: r.album,
+                # LML#1097: deterministic tie-break by release_id, mirroring
+                # release_resolution.py's (-score, release_id) sort key.
+                key_fn=lambda r: r.release_id,
             )
             if result is None:
                 # A found-on-compilation in-library row that carries a validated

@@ -92,6 +92,9 @@ async def _library_miss_discogs_search(
             query_title=album,
             artist_fn=lambda r: r.artist_variants(),
             title_fn=lambda r: r.album,
+            # LML#1097: deterministic tie-break by release_id, mirroring
+            # release_resolution.py's (-score, release_id) sort key.
+            key_fn=lambda r: r.release_id,
         )
 
     try:

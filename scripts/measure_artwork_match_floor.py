@@ -177,6 +177,9 @@ def classify(
         query_title=query.title_variants,
         artist_fn=lambda r: r.artist,
         title_fn=lambda r: r.album,
+        # LML#1097: deterministic tie-break by release_id, matching the
+        # production callers in lookup/artwork.py and lookup/strategies/library_miss.py.
+        key_fn=lambda r: r.release_id,
     )
 
     best_combined = 0.0

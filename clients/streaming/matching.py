@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Iterable
+from typing import Any
 
 import sentry_sdk
 from rapidfuzz import fuzz
@@ -686,9 +687,16 @@ def find_best_match(
         break (upstream shape change or broken extractor), surfaced so the
         caller can treat the source as errored and retry (LML#376) rather than
         record a definitive no-match. A sparse minority never raises.
+
+    LML#1097: an exact-tie combined score resolves deterministically by
+    ascending ``result_url`` (the ``url_fn`` extraction is required of every
+    caller, so this needs no new parameter) rather than by whichever
+    candidate the caller's API happened to list first -- upstream ordering
+    isn't guaranteed stable across repeated identical queries.
     """
     best: dict | None = None
     best_score = 0.0
+    best_url = ""
     total = 0
     extraction_failures = 0
     last_error: Exception | None = None
@@ -714,8 +722,9 @@ def find_best_match(
         if not is_acceptable_match(artist_score, title_score):
             continue
         combined = (artist_score + title_score) / 2
-        if combined > best_score:
+        if combined > best_score or (combined == best_score and result_url < best_url):
             best_score = combined
+            best_url = result_url
             match: dict = {
                 "url": result_url,
                 "confidence": combined,
@@ -745,6 +754,7 @@ def find_best_typed_match[T](
     query_title: str | Iterable[str],
     artist_fn: Callable[[T], str | None | Iterable[str | None]],
     title_fn: Callable[[T], str | None],
+    key_fn: Callable[[T], Any] | None = None,
 ) -> T | None:
     """Return the highest-scoring result that clears the 80/80 floor, or None.
 
@@ -780,14 +790,19 @@ def find_best_typed_match[T](
     or whitespace-only is dropped from the scoring set; if no usable variant
     survives on either side, the result is rejected.
 
-    None-valued extractors score as 0 against any non-empty query. Ties
-    resolve to the first candidate reaching the score, preserving input
-    order. An extractor that *raises* (vs. returns None) is treated as a
-    malformed candidate: the row is skipped and logged rather than scored
-    (LML#640). The real callers pass attribute extractors (``lambda r:
-    r.artist``), whose failure mode is ``AttributeError``, so
-    ``_EXTRACTION_ERRORS`` includes it — a ``None``/wrong-type candidate is
-    skipped, not fatal.
+    None-valued extractors score as 0 against any non-empty query. When
+    ``key_fn`` is given, an exact tie resolves deterministically by ascending
+    ``key_fn(item)`` (LML#1097) — mirroring ``release_resolution.py``'s
+    ``(-score, release_id)`` sort key, e.g. ``key_fn=lambda r: r.release_id``.
+    Without ``key_fn`` (no natural deterministic key exists for every
+    possible ``T``), ties fall back to the first candidate reaching the
+    score, preserving input order — the pre-#1097 behavior, kept only for
+    callers that can't offer a meaningful secondary key. An extractor that
+    *raises* (vs. returns None) is treated as a malformed candidate: the row
+    is skipped and logged rather than scored (LML#640). The real callers pass
+    attribute extractors (``lambda r: r.artist``), whose failure mode is
+    ``AttributeError``, so ``_EXTRACTION_ERRORS`` includes it — a
+    ``None``/wrong-type candidate is skipped, not fatal.
 
     Unlike ``find_best_match``, this does NOT re-raise on total extraction
     failure. Its callers are the lookup pipeline (``lookup/orchestrator.py``),
@@ -808,6 +823,7 @@ def find_best_typed_match[T](
 
     best: T | None = None
     best_score = 0.0
+    best_key: Any = None
     for item in results:
         # Per-item guard, as in ``find_best_match``: a malformed candidate is
         # skipped, not fatal (LML#640). No total-failure re-raise here — the
@@ -831,8 +847,16 @@ def find_best_typed_match[T](
         if not is_acceptable_match(artist_score, title_score):
             continue
         combined = (artist_score + title_score) / 2
-        if combined > best_score:
+        item_key = key_fn(item) if key_fn is not None else None
+        is_better = combined > best_score or (
+            combined == best_score
+            and key_fn is not None
+            and best is not None
+            and item_key < best_key
+        )
+        if is_better:
             best_score = combined
+            best_key = item_key
             best = item
     return best
 
