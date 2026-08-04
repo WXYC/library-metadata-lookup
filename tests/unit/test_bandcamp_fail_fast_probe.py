@@ -214,12 +214,20 @@ class TestFindAlbumMatchFailFastBreakerIntegration:
         with (
             patch.object(breaker, "record_success", wraps=breaker.record_success) as record_success,
             patch.object(breaker, "record_aborted", wraps=breaker.record_aborted) as record_aborted,
+            patch.object(
+                breaker, "record_transport_failure", wraps=breaker.record_transport_failure
+            ) as record_transport_failure,
         ):
             with pytest.raises(BandcampTransportError):
                 await client.find_album_match("Obscure Artist", "Obscure Album", fail_fast=True)
 
         record_success.assert_not_called()
-        record_aborted.assert_called_once_with(epoch=0)
+        # LML#1106 review FIX 1: a transport failure is its own terminal
+        # outcome now -- it must NOT fall through to record_aborted (which
+        # is a no-op in CLOSED and would leave a sustained transport-failure
+        # run undetected forever).
+        record_aborted.assert_not_called()
+        record_transport_failure.assert_called_once_with(epoch=0)
         assert breaker.state is BandcampBreakerState.CLOSED
 
     @pytest.mark.asyncio
@@ -236,6 +244,22 @@ class TestFindAlbumMatchFailFastBreakerIntegration:
                 await client.find_album_match("Obscure Artist", "Obscure Album", fail_fast=True)
 
         record_success.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sustained_transport_failures_trip_the_breaker_open(self, client):
+        # LML#1106 review FIX 1: repeated non-429 transport failures (a
+        # sustained Cloudflare 403/1015 block, or a tarpit) must open the
+        # breaker on their own -- before this fix nothing counted them, and
+        # every fail-fast call kept hitting the network up to the full
+        # 3-request ceiling forever.
+        client._http.request = AsyncMock(return_value=_response(500))
+        breaker = get_bandcamp_probe_breaker()
+
+        for _ in range(3):
+            with pytest.raises(BandcampTransportError):
+                await client.find_album_match("Obscure Artist", "Obscure Album", fail_fast=True)
+
+        assert breaker.state is BandcampBreakerState.OPEN
 
     @pytest.mark.asyncio
     async def test_unexpected_exception_records_aborted(self, client):

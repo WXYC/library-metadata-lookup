@@ -76,6 +76,58 @@ class TestClosedToOpen:
         assert breaker.state is BandcampBreakerState.CLOSED
 
 
+class TestTransportFailureTripsBreaker:
+    """LML#1106 review FIX 1: a non-429 transport failure (5xx, Cloudflare
+    403/1015, connect timeout) must have its own path to opening the
+    breaker -- ``record_shed`` only fires on a literal 429, and
+    ``record_aborted`` is a no-op in CLOSED (reserved for a trial that dies
+    with no terminal outcome at all: an unexpected raise or a
+    cancellation). Without this, a sustained non-429 saturation run never
+    trips the breaker and every fail-fast call keeps hitting the network."""
+
+    def test_consecutive_transport_failures_open_the_breaker(self, clock):
+        breaker = _breaker(clock, failure_threshold=3)
+        breaker.record_transport_failure(epoch=breaker.allow_request())
+        breaker.record_transport_failure(epoch=breaker.allow_request())
+        assert breaker.state is BandcampBreakerState.CLOSED
+        breaker.record_transport_failure(epoch=breaker.allow_request())
+        assert breaker.state is BandcampBreakerState.OPEN
+        assert breaker.allow_request() is None
+
+    def test_success_resets_the_transport_failure_count(self, clock):
+        breaker = _breaker(clock, failure_threshold=3)
+        breaker.record_transport_failure(epoch=breaker.allow_request())
+        breaker.record_transport_failure(epoch=breaker.allow_request())
+        breaker.record_success(epoch=breaker.allow_request())
+        breaker.record_transport_failure(epoch=breaker.allow_request())
+        breaker.record_transport_failure(epoch=breaker.allow_request())
+        # Two more failures after the reset -- still below threshold.
+        assert breaker.state is BandcampBreakerState.CLOSED
+
+    def test_mixed_sheds_and_transport_failures_share_one_run(self, clock):
+        # A 429 shed and a non-429 transport failure are the same
+        # "couldn't complete the call" signal, so they share ONE
+        # consecutive-failure run against the SAME threshold.
+        breaker = _breaker(clock, failure_threshold=3)
+        breaker.record_shed(epoch=breaker.allow_request())
+        breaker.record_transport_failure(epoch=breaker.allow_request())
+        assert breaker.state is BandcampBreakerState.CLOSED
+        breaker.record_shed(epoch=breaker.allow_request())
+        assert breaker.state is BandcampBreakerState.OPEN
+
+    def test_half_open_transport_failure_with_matching_epoch_reopens(self, clock):
+        breaker, epoch = _to_half_open(clock, failure_threshold=1)
+        breaker.record_transport_failure(epoch=epoch)
+        assert breaker.state is BandcampBreakerState.OPEN
+
+    def test_half_open_stale_epoch_transport_failure_is_ignored(self, clock):
+        breaker, epoch = _to_half_open(clock, failure_threshold=1)
+        # A transport failure from a superseded trial must not decide the
+        # current one.
+        breaker.record_transport_failure(epoch=epoch - 1)
+        assert breaker.state is BandcampBreakerState.HALF_OPEN
+
+
 class TestOpenSheds:
     def test_open_sheds_every_request_before_cooldown(self, clock):
         breaker = _breaker(clock, failure_threshold=1, cooldown_seconds=20.0)
