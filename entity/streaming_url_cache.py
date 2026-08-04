@@ -317,6 +317,7 @@ async def resolve_streaming_url_with_cache(
     album: str,
     miss_ttl: timedelta = DEFAULT_MISS_TTL,
     now: datetime | None = None,
+    fail_fast: bool = False,
 ) -> ResolveOutcome:
     """Read-through cache around ``client.find_album_match``.
 
@@ -329,8 +330,10 @@ async def resolve_streaming_url_with_cache(
        - returns a match → ``live_resolved`` and UPSERT the URL.
        - returns ``None`` → ``live_miss`` and UPSERT a null entry so
          subsequent requests inside the TTL short-circuit.
-       - raises → ``live_error`` with NO cache write so a transient flake
-         doesn't lock in a spurious null.
+       - raises → ``live_error`` with NO cache write (default mode), so a
+         transient flake doesn't lock in a spurious null. Under
+         ``fail_fast=True`` the exception is RE-RAISED instead (still with no
+         cache write) -- see the ``fail_fast`` note below.
 
     Uses ``find_album_match`` (album-level), not a track probe, because the
     cache key is the album: a per-track deep-link would cache wrong-track URLs
@@ -339,6 +342,18 @@ async def resolve_streaming_url_with_cache(
     No ``probe_timeout_s`` parameter — the per-call wall-clock ceiling is
     applied externally at the post-process gather level (LML#573). An external
     timeout cancels this coroutine before its UPSERT.
+
+    ``fail_fast`` (LML#1106, default ``False``) is forwarded to
+    ``client.find_album_match`` ONLY when set -- the default call keeps its
+    pre-#1106 exact shape (``find_album_match(artist, album)``, no kwarg) so
+    a client whose ``find_album_match`` doesn't accept ``fail_fast`` (every
+    non-Bandcamp ``BaseStreamingClient`` subclass today) is unaffected.
+    Setting it changes exactly one other thing here: a live-call exception is
+    RE-RAISED rather than swallowed to ``live_error``, so a caller that wants
+    sharp failure semantics (e.g. a future breaker-aware live probe, LML#1098,
+    that must tell a rate-limit shed apart from a generic upstream flake) can
+    see it. Either way there is NO cache write on the exception path -- the
+    "don't poison the cache" invariant holds regardless of ``fail_fast``.
     """
     cached = await _fetch_cached_row(
         pg, service=service, artist=artist, album=album, miss_ttl=miss_ttl, now=now
@@ -355,8 +370,26 @@ async def resolve_streaming_url_with_cache(
     # cancellation here is a BaseException and propagates past ``except
     # Exception`` without an UPSERT.
     try:
-        match = await client.find_album_match(artist, album)
+        if fail_fast:
+            # ``fail_fast`` is a Bandcamp-specific extension (LML#1106,
+            # ``clients/bandcamp.py``), not part of the shared
+            # ``BaseStreamingClient.find_album_match`` interface every other
+            # service client implements -- so this is a static type error
+            # against the parameter's declared ``BaseStreamingClient`` type.
+            # It is the CALLER's responsibility to only request
+            # ``fail_fast=True`` for a client that supports it; no production
+            # caller does yet (this whole mode is inert until LML#1098 wires
+            # one up against ``BandcampClient`` specifically).
+            match = await client.find_album_match(artist, album, fail_fast=True)  # type: ignore[call-arg]
+        else:
+            match = await client.find_album_match(artist, album)
     except Exception:
+        if fail_fast:
+            # The caller wants sharp failure semantics (e.g. to distinguish a
+            # breaker shed from a generic flake) -- propagate. No cache write
+            # either way, so re-raising costs nothing the default branch
+            # below doesn't already forgo.
+            raise
         # Transient upstream failure: do not poison the cache with a
         # permanent "not found" sentinel — leave the row alone and let the
         # next request retry.

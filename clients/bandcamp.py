@@ -24,6 +24,7 @@ import re
 
 import httpx
 
+from clients.bandcamp_breaker import BandcampBreakerOpenError, get_bandcamp_probe_breaker
 from clients.streaming.base import BaseStreamingClient
 from clients.streaming.matching import (
     find_best_source_match,
@@ -95,6 +96,21 @@ _NORMALIZE_SLASH_SPACING_RE = re.compile(r"\s*/\s*")
 # Bandcamp album-page ``og:title`` meta content: "Title, by Artist".
 _OG_TITLE_RE = re.compile(r'<meta property="og:title" content="([^"]+)"')
 _OG_TITLE_SPLIT_RE = re.compile(r"^(.*), by (.+)$")
+
+
+class BandcampRateLimitedError(Exception):
+    """Raised by ``_request_with_retry(..., fail_fast=True)`` when a single
+    fail-fast attempt gets a 429.
+
+    Distinct from a plain ``None`` return (which the non-fail-fast retry loop
+    still returns after exhausting its backoff): a 429 under ``fail_fast`` is
+    a *shed* the caller must not treat as "asked, got nothing" -- propagating
+    it as an exception rather than returning ``None`` lets
+    ``entity.streaming_url_cache.resolve_streaming_url_with_cache`` (also
+    supporting ``fail_fast=True``) tell a rate-limit shed apart from a
+    genuine no-match, so it never records a negative-cache row for a shed.
+    See ``clients/bandcamp_breaker.py``.
+    """
 
 
 class BandcampSearchUnavailableError(Exception):
@@ -235,7 +251,9 @@ class BandcampClient(BaseStreamingClient):
     def __init__(self) -> None:
         super().__init__(rate_limit=(1, 1), semaphore_limit=2)
 
-    async def _request_with_retry(self, method: str, url: str, **kwargs) -> httpx.Response | None:
+    async def _request_with_retry(
+        self, method: str, url: str, *, fail_fast: bool = False, **kwargs
+    ) -> httpx.Response | None:
         """Make an HTTP request with retry on 429.
 
         Returns the response, or None on failure after retries. LML#1040:
@@ -244,6 +262,16 @@ class BandcampClient(BaseStreamingClient):
         Bandcamp's own permit acquisition, delay policy, and log wording
         (byte-identical to the pre-#1040 inline loop -- see
         ``tests/unit/test_bandcamp_retry_characterization.py``).
+
+        ``fail_fast=True`` (LML#1106) is a single-attempt mode with no
+        ``retry_429`` backoff loop -- for a future response-path caller
+        (LML#1098) where inline request latency must not stack a 3s+ retry
+        sleep on top of that caller's own wall-clock ceiling. A 429 on that
+        single attempt raises :class:`BandcampRateLimitedError` instead of
+        degrading to ``None``, so the caller can tell a shed apart from a
+        genuine no-match (and never record a negative-cache row for it). A
+        request-layer failure (network error) still degrades to ``None``
+        either way -- that is not a rate-limit signal.
         """
         client = await self._get_client()
 
@@ -254,6 +282,15 @@ class BandcampClient(BaseStreamingClient):
                     return await client.request(method, url, **kwargs)
                 except Exception as e:
                     raise _BandcampRequestFailedError() from e
+
+        if fail_fast:
+            try:
+                response = await _attempt(0)
+            except _BandcampRequestFailedError:
+                return None
+            if response.status_code == 429:
+                raise BandcampRateLimitedError(url)
+            return response
 
         try:
             response = await retry_429(
@@ -272,7 +309,9 @@ class BandcampClient(BaseStreamingClient):
 
         return None if response.status_code == 429 else response
 
-    async def find_album_match(self, artist: str, title: str) -> SourceMatch | None:
+    async def find_album_match(
+        self, artist: str, title: str, *, fail_fast: bool = False
+    ) -> SourceMatch | None:
         """Search Bandcamp for ``(artist, title)`` and return the best match.
 
         See ``BaseStreamingClient.find_album_match`` for the contract.
@@ -284,8 +323,42 @@ class BandcampClient(BaseStreamingClient):
         without the fallback this method can never see it. Worst case this
         costs one extra rate-limited autocomplete request; both phases'
         response shapes stay encapsulated here.
+
+        ``fail_fast=True`` (LML#1106) is a single-attempt mode for a future
+        response-path caller (LML#1098): every underlying HTTP call makes a
+        single attempt (no retry-on-429 backoff), and the whole call is gated
+        by ``BandcampProbeBreaker`` so a sustained 429 run sheds
+        (``BandcampBreakerOpenError``) before touching the network at all. A
+        429 that does reach the network raises ``BandcampRateLimitedError``
+        (propagated, not swallowed to ``None``) so the caller can't confuse a
+        shed with a genuine no-match. The breaker records the outcome of the
+        WHOLE call (shed / success / aborted), matching the guardrail that a
+        fail-fast caller issues effectively one live attempt per item.
         """
-        artist_results = await self.search_artist(artist)
+        if not fail_fast:
+            return await self._find_album_match_impl(artist, title, fail_fast=False)
+
+        breaker = get_bandcamp_probe_breaker()
+        epoch = breaker.allow_request()
+        if epoch is None:
+            raise BandcampBreakerOpenError()
+        try:
+            result = await self._find_album_match_impl(artist, title, fail_fast=True)
+        except BandcampRateLimitedError:
+            breaker.record_shed(epoch=epoch)
+            raise
+        except Exception:
+            breaker.record_aborted(epoch=epoch)
+            raise
+        breaker.record_success(epoch=epoch)
+        return result
+
+    async def _find_album_match_impl(
+        self, artist: str, title: str, *, fail_fast: bool
+    ) -> SourceMatch | None:
+        """The artist-first + album-first fallback body, unwrapped from the
+        breaker (see ``find_album_match``, which is the public entry point)."""
+        artist_results = await self.search_artist(artist, fail_fast=fail_fast)
         match: SourceMatch | None = None
         best_artist: dict | None = None
         best_artist_score = 0.0
@@ -297,7 +370,9 @@ class BandcampClient(BaseStreamingClient):
         if best_artist is not None:
             # A fetch failure (None) is treated as "no catalog" for the live
             # match path -- there is no retry loop here, so it degrades to no match.
-            catalog = await self.fetch_artist_catalog(best_artist["slug"]) or []
+            catalog = (
+                await self.fetch_artist_catalog(best_artist["slug"], fail_fast=fail_fast) or []
+            )
             matched_artist_name = best_artist["name"]
             match = find_best_source_match(
                 catalog,
@@ -312,13 +387,13 @@ class BandcampClient(BaseStreamingClient):
             return match
 
         try:
-            return await self.find_album_match_via_search(artist, title)
+            return await self.find_album_match_via_search(artist, title, fail_fast=fail_fast)
         except BandcampSearchUnavailableError:
             # No retry channel on the live path (same posture as the
             # catalog-fetch-failure case above) -- degrade to no match.
             return None
 
-    async def search_artist(self, artist_name: str) -> list[dict]:
+    async def search_artist(self, artist_name: str, *, fail_fast: bool = False) -> list[dict]:
         """Search Bandcamp autocomplete for artist pages.
 
         Returns list of dicts with keys: name, url, slug.
@@ -329,6 +404,7 @@ class BandcampClient(BaseStreamingClient):
             AUTOCOMPLETE_URL,
             params={"q": artist_name, "param": "b"},
             timeout=10.0,
+            fail_fast=fail_fast,
         )
         if resp is None or resp.status_code != 200:
             return []
@@ -350,7 +426,9 @@ class BandcampClient(BaseStreamingClient):
                 )
         return results
 
-    async def fetch_artist_catalog(self, slug: str) -> list[dict] | None:
+    async def fetch_artist_catalog(
+        self, slug: str, *, fail_fast: bool = False
+    ) -> list[dict] | None:
         """Fetch album list from {slug}.bandcamp.com/music.
 
         Returns a list of dicts with keys ``url``, ``title`` (deduplicated by
@@ -362,7 +440,9 @@ class BandcampClient(BaseStreamingClient):
         rather than recorded as a final result (#661).
         """
         url = f"https://{slug}.bandcamp.com/music"
-        resp = await self._request_with_retry("GET", url, timeout=15.0, follow_redirects=True)
+        resp = await self._request_with_retry(
+            "GET", url, timeout=15.0, follow_redirects=True, fail_fast=fail_fast
+        )
         if resp is None or resp.status_code != 200:
             return None
 
@@ -403,7 +483,7 @@ class BandcampClient(BaseStreamingClient):
 
         return albums
 
-    async def search_albums(self, query: str) -> list[dict] | None:
+    async def search_albums(self, query: str, *, fail_fast: bool = False) -> list[dict] | None:
         """Search Bandcamp autocomplete for album-type results (LML#1069).
 
         Unlike ``search_artist`` (which collapses any fetch failure to
@@ -423,6 +503,7 @@ class BandcampClient(BaseStreamingClient):
             AUTOCOMPLETE_URL,
             params={"q": query, "param": "a"},
             timeout=10.0,
+            fail_fast=fail_fast,
         )
         if resp is None or resp.status_code != 200:
             return None
@@ -441,7 +522,9 @@ class BandcampClient(BaseStreamingClient):
             )
         return results
 
-    async def find_album_match_via_search(self, artist: str, title: str) -> SourceMatch | None:
+    async def find_album_match_via_search(
+        self, artist: str, title: str, *, fail_fast: bool = False
+    ) -> SourceMatch | None:
         """Album-first Bandcamp discovery (LML#1069): search the general
         Bandcamp index for ``artist title`` and bind by the returned
         ``band_name``, rather than requiring the artist's own catalog page
@@ -466,7 +549,7 @@ class BandcampClient(BaseStreamingClient):
                 failure.
         """
         query = f"{artist} {clean_title_for_query(title)}".strip()
-        results = await self.search_albums(query)
+        results = await self.search_albums(query, fail_fast=fail_fast)
         if results is None:
             raise BandcampSearchUnavailableError(query)
         if not results:

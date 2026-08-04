@@ -188,3 +188,100 @@ class TestResolveStreamingURLWithCache:
 
         # No cache write — the probe was cancelled before reaching any UPSERT.
         pg.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("service", "sample_url"), _SERVICE_CASES)
+class TestResolveStreamingURLWithCacheFailFast:
+    """LML#1106: ``fail_fast=True`` is the mode a future synchronous Bandcamp
+    live probe (LML#1098) is expected to use. It changes exactly two things
+    relative to the default mode: the ``fail_fast`` kwarg is forwarded to
+    ``client.find_album_match``, and a live-probe exception is RE-RAISED
+    instead of being swallowed to ``live_error`` -- so a caller that wants
+    sharp failure semantics (to tell a breaker-tripping shed apart from a
+    generic upstream flake) can see it. Cache-hit and cache-miss-recent
+    short-circuit identically either way -- ``fail_fast`` only ever changes
+    what happens once a live call is needed.
+    """
+
+    async def test_cache_hit_still_short_circuits_without_touching_client(
+        self, service, sample_url
+    ):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value={"url": sample_url})
+        client = AsyncMock(spec=BaseStreamingClient)
+
+        outcome = await resolve_streaming_url_with_cache(
+            pg,
+            client,
+            service=service,
+            artist="Hyd",
+            album="Hold Onto Me Infinity",
+            fail_fast=True,
+        )
+
+        assert outcome == ResolveOutcome(url=sample_url, source="cache_hit")
+        client.find_album_match.assert_not_called()
+
+    async def test_live_call_forwards_fail_fast_kwarg(self, service, sample_url):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        client = AsyncMock(spec=BaseStreamingClient)
+        client.find_album_match = AsyncMock(return_value=_match(sample_url))
+
+        outcome = await resolve_streaming_url_with_cache(
+            pg,
+            client,
+            service=service,
+            artist="Hyd",
+            album="Hold Onto Me Infinity",
+            fail_fast=True,
+        )
+
+        assert outcome.source == "live_resolved"
+        client.find_album_match.assert_awaited_once_with(
+            "Hyd", "Hold Onto Me Infinity", fail_fast=True
+        )
+
+    async def test_live_call_exception_propagates_without_cache_write(self, service, sample_url):
+        # Unlike the default mode (test_client_exception_returns_live_error_
+        # without_cache_write above), fail_fast re-raises so the caller (a
+        # breaker-aware live probe) can distinguish a shed from a generic
+        # error. Either way, no cache write on the exception path.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock()
+        client = AsyncMock(spec=BaseStreamingClient)
+        client.find_album_match = AsyncMock(side_effect=RuntimeError("shed"))
+
+        with pytest.raises(RuntimeError, match="shed"):
+            await resolve_streaming_url_with_cache(
+                pg,
+                client,
+                service=service,
+                artist="Hyd",
+                album="Hold Onto Me Infinity",
+                fail_fast=True,
+            )
+
+        pg.execute.assert_not_called()
+
+    async def test_live_miss_still_records_null(self, service, sample_url):
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        client = AsyncMock(spec=BaseStreamingClient)
+        client.find_album_match = AsyncMock(return_value=None)
+
+        outcome = await resolve_streaming_url_with_cache(
+            pg,
+            client,
+            service=service,
+            artist="ObscureArtist",
+            album="ObscureAlbum",
+            fail_fast=True,
+        )
+
+        assert outcome == ResolveOutcome(url=None, source="live_miss")
+        pg.execute.assert_awaited_once()

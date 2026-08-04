@@ -354,7 +354,9 @@ class TestFindAlbumMatch:
         match = await client.find_album_match("Unknown", "Whatever")
 
         assert match is None
-        client.find_album_match_via_search.assert_awaited_once_with("Unknown", "Whatever")
+        client.find_album_match_via_search.assert_awaited_once_with(
+            "Unknown", "Whatever", fail_fast=False
+        )
 
     @pytest.mark.asyncio
     async def test_returns_none_when_artist_match_below_floor_and_fallback_finds_nothing(self):
@@ -381,7 +383,9 @@ class TestFindAlbumMatch:
 
         assert match is None
         client.fetch_artist_catalog.assert_not_awaited()
-        client.find_album_match_via_search.assert_awaited_once_with("Stereolab", "Aluminum Tunes")
+        client.find_album_match_via_search.assert_awaited_once_with(
+            "Stereolab", "Aluminum Tunes", fail_fast=False
+        )
 
     @pytest.mark.asyncio
     async def test_returns_none_when_catalog_empty_and_fallback_finds_nothing(self):
@@ -455,7 +459,7 @@ class TestFindAlbumMatchAlbumSearchFallback:
 
         assert match is fallback_match
         client.find_album_match_via_search.assert_awaited_once_with(
-            "George Theodorakis", "The Rules of the Game"
+            "George Theodorakis", "The Rules of the Game", fail_fast=False
         )
 
     @pytest.mark.asyncio
