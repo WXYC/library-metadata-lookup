@@ -30,6 +30,19 @@
 
 See [`testing.md`](testing.md#pytest-markers-architecture-a) for what each test job runs.
 
+### How the deploy jobs gate
+
+`deploy-staging` / `deploy-production` run `railway up --detach --json`, capture the returned `deploymentId`, and then block on [`scripts/wait_for_railway_deployment.sh`](../scripts/wait_for_railway_deployment.sh) until the Railway deployment API reports a terminal status.
+
+The `--detach` is load-bearing. Plain `railway up` attaches to the build-log stream and calls `std::process::exit(1)` when that stream drops — but only in the CLI's "CI mode", which `$CI` auto-enables on every GitHub Actions runner (railwayapp/cli v4.58.0, `src/commands/up.rs:240` and `:275-279`). A transient `Failed to stream build logs: Failed to retrieve build log` therefore turned a perfectly healthy deploy into a red **Deploy to Staging**, and took down the smoke test that would have shown the deploy was fine.
+
+Consequences of splitting deploy from wait:
+
+- **The gate got stronger, not weaker.** `railway up` returned when the *build* finished; `SUCCESS` from the deployment API means Railway's healthcheck passed and the revision is actually serving. `Smoke Test (Staging)` no longer races the rollout.
+- **Build logs no longer stream into the Actions log.** The deploy step prints the deployment's `logsUrl`; open that for build output. The wait script repeats it on failure and on timeout.
+- **A superseded deploy does not fail the run.** If a newer push supersedes this deployment (`SKIPPED`/`REMOVED`), the script exits 0 — that newer run gates its own deploy, and failing here would just be a different false red.
+- Tunables, all with defaults that suit CI: `RAILWAY_DEPLOY_TIMEOUT_SECONDS` (900), `RAILWAY_DEPLOY_POLL_INTERVAL_SECONDS` (10), `RAILWAY_DEPLOY_MAX_POLL_ERRORS` (10, consecutive polling errors tolerated before giving up — a single Railway API blip must not fail a good deploy).
+
 ## CI pin maintenance
 
 Four classes of pin in `.github/workflows/*.yml` exist for supply-chain reasons (mirrors WXYC/request-o-matic#124's free-tier hardening; see WXYC/wiki#67 for the org-wide rollout). They will bit-rot and need occasional bumps:
