@@ -62,11 +62,16 @@ def apple_music_lookup_timeout_s() -> float:
 _BANDCAMP_LIVE_PROBE_TIMEOUT_DEFAULT_S = 8.0
 """Default wall-clock ceiling for a single inline Bandcamp live probe (LML#1098).
 
-Bandcamp's fail-fast resolve is a SINGLE attempt across up to two sequential
-autocomplete/catalog requests (~1.4s typical when unthrottled); 8s leaves
-headroom for the slower catalog fetch without letting one item pin the
-enrichment tail. Tunable via ``LML_BANDCAMP_LIVE_PROBE_TIMEOUT_MS``; the
-per-item value is further clamped to the caller budget (LML#930)."""
+Bandcamp's fail-fast resolve is a SINGLE attempt across up to THREE sequential
+requests -- ``search_artist`` + ``fetch_artist_catalog`` + the
+``find_album_match_via_search`` fallback's ``search_albums`` (corrected
+LML#1106 review, FIX 8 -- a prior draft of this docstring undercounted at
+"two"; ``clients/bandcamp_breaker.py``'s module docstring already had this
+right) -- (~1.4s typical when unthrottled); 8s leaves headroom for the
+slower catalog fetch without letting one item pin the enrichment tail. The
+8s default is unchanged by this correction -- retuning it is a separate
+decision. Tunable via ``LML_BANDCAMP_LIVE_PROBE_TIMEOUT_MS``; the per-item
+value is further clamped to the caller budget (LML#930)."""
 
 BANDCAMP_LIVE_PROBE_TIMEOUT_ENV_VAR = "LML_BANDCAMP_LIVE_PROBE_TIMEOUT_MS"
 

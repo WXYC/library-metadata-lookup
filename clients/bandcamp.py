@@ -292,9 +292,11 @@ class BandcampClient(BaseStreamingClient):
         ``tests/unit/test_bandcamp_retry_characterization.py``).
 
         ``fail_fast=True`` (LML#1106) is a single-attempt mode with no
-        ``retry_429`` backoff loop -- for a future response-path caller
-        (LML#1098) where inline request latency must not stack a 3s+ retry
-        sleep on top of that caller's own wall-clock ceiling. A 429 on that
+        ``retry_429`` backoff loop -- for the response-path caller
+        (LML#1098, ``lookup/enrichment/bandcamp_probe.py``, merged into this
+        branch alongside it) where inline request latency must not stack a
+        3s+ retry sleep on top of that caller's own wall-clock ceiling. A
+        429 on that
         single attempt raises :class:`BandcampRateLimitedError` instead of
         degrading to ``None``, so the caller can tell a shed apart from a
         genuine no-match (and never record a negative-cache row for it). A
@@ -352,8 +354,8 @@ class BandcampClient(BaseStreamingClient):
         costs one extra rate-limited autocomplete request; both phases'
         response shapes stay encapsulated here.
 
-        ``fail_fast=True`` (LML#1106) is a single-attempt mode for a future
-        response-path caller (LML#1098): every underlying HTTP call makes a
+        ``fail_fast=True`` (LML#1106) is a single-attempt mode for the
+        response-path caller (LML#1098, merged into this branch): every underlying HTTP call makes a
         single attempt (no retry-on-429 backoff), and the whole call is gated
         by ``BandcampProbeBreaker`` so a sustained 429 run sheds
         (``BandcampBreakerOpenError``) before touching the network at all. A

@@ -350,10 +350,11 @@ async def resolve_streaming_url_with_cache(
     non-Bandcamp ``BaseStreamingClient`` subclass today) is unaffected.
     Setting it changes exactly one other thing here: a live-call exception is
     RE-RAISED rather than swallowed to ``live_error``, so a caller that wants
-    sharp failure semantics (e.g. a future breaker-aware live probe, LML#1098,
-    that must tell a rate-limit shed apart from a generic upstream flake) can
-    see it. Either way there is NO cache write on the exception path -- the
-    "don't poison the cache" invariant holds regardless of ``fail_fast``.
+    sharp failure semantics (the LML#1098 breaker-aware live probe,
+    ``lookup/enrichment/bandcamp_probe.py``, which must tell a rate-limit shed
+    apart from a generic upstream flake) can see it. Either way there is NO
+    cache write on the exception path -- the "don't poison the cache"
+    invariant holds regardless of ``fail_fast``.
     """
     cached = await _fetch_cached_row(
         pg, service=service, artist=artist, album=album, miss_ttl=miss_ttl, now=now
@@ -377,9 +378,11 @@ async def resolve_streaming_url_with_cache(
             # service client implements -- so this is a static type error
             # against the parameter's declared ``BaseStreamingClient`` type.
             # It is the CALLER's responsibility to only request
-            # ``fail_fast=True`` for a client that supports it; no production
-            # caller does yet (this whole mode is inert until LML#1098 wires
-            # one up against ``BandcampClient`` specifically).
+            # ``fail_fast=True`` for a client that supports it -- the LML#1098
+            # inline Bandcamp live probe (``lookup/enrichment/
+            # bandcamp_probe.py``, merged into this branch) is that caller in
+            # production today, behind its own preconditions (bulk-path-only,
+            # the ``lml_bandcamp_live_probe`` flag, the persist kill-switches).
             match = await client.find_album_match(artist, album, fail_fast=True)  # type: ignore[call-arg]
         else:
             match = await client.find_album_match(artist, album)
