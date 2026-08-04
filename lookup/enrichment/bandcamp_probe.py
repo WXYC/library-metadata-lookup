@@ -33,7 +33,7 @@ from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment.context import EnrichmentContext
 from lookup.streaming_url_postprocess import (
     STREAMING_URL_CACHE_CONFIG,
-    mint_streaming_identity,
+    _mint_identity,
     should_suppress_streaming_warm,
 )
 from lookup.timeouts import bandcamp_probe_timeout_s
@@ -226,10 +226,10 @@ async def run_bandcamp_live_probe(
 
     if outcome.url is not None:
         # FIX 4 (LML#1106 review): mint only a brand-new live_resolved -- a
-        # cache_hit already minted; mint_streaming_identity swallows its own
-        # failures (never fails the lookup).
+        # cache_hit already minted; _mint_identity swallows its own failures
+        # (never fails the lookup).
         if outcome.source == "live_resolved" and ctx.entity_store is not None:
-            await mint_streaming_identity(
+            await _mint_identity(
                 _BANDCAMP_ALBUM_SERVICE, _BANDCAMP_CACHE_CONFIG, outcome.url, ctx.entity_store
             )
         return BandcampProbeResult(outcome.url, StreamingResolutionStatus.verified)
