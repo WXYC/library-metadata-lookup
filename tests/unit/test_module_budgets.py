@@ -120,7 +120,16 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/strategies/track_on_compilation.py": 1150,
     "lookup/strategies/track_release_matching.py": 550,
     "lookup/strategies/va_rescue.py": 300,
-    "lookup/streaming_url_postprocess.py": 750,
+    # Recalibrated 2026-08-04 (LML#1108 review): the review mandated splitting
+    # the semaphore-acquire and probe exception handling into separately
+    # timed/logged try blocks (a probe failure was misattributed as a
+    # semaphore-wait failure) plus the depth-bound + deadline-arming
+    # docstring/comment additions the same review required for correctness
+    # legibility -- not organic growth. Smallest multiple of 50 at or above
+    # the new ~771-line measured size, not a re-derived 1.3x (which would
+    # reopen hundreds of lines of headroom), matching this table's own
+    # recalibration convention (see e.g. track_on_compilation.py above).
+    "lookup/streaming_url_postprocess.py": 800,
     # LML#1108: pending-warm depth-bound policy, extracted out of
     # streaming_url_postprocess.py to stay under its own ceiling above — a
     # small, self-contained concern (constant + two pure/best-effort

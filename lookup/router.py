@@ -88,6 +88,9 @@ from lookup.orchestrator import perform_lookup
 from lookup.rowless import NONLIBRARY_RELEASE_SURFACED_STAT_KEY
 from lookup.server_timing_legs import EVENT_LOOP_LAG_STAT_KEY, event_loop_lag_extra_leg
 from lookup.streaming_url_postprocess import set_suppress_streaming_warm
+from lookup.streaming_warm_admission import (
+    DEPTH_SHED_STAT_KEY as STREAMING_WARM_DEPTH_SHED_STAT_KEY,
+)
 from streaming.dependencies import (
     get_apple_music_client,
     get_bandcamp_client,
@@ -274,6 +277,11 @@ _LML_CACHE_STATS_EXTRA_KEYS: tuple[str, ...] = (
     LOCATION_UNION_INDEX_HIT_STAT_KEY,
     LOCATION_UNION_INDEX_MISS_STAT_KEY,
     LOCATION_UNION_INDEX_DEGRADED_STAT_KEY,
+    # LML#1108: background streaming-URL warm-queue depth-bound shed counter,
+    # seeded to 0 so the shed rate is an alertable baseline series on the
+    # #683 surface (mirrors BREAKER_OPEN_STAT_KEY / ADMISSION_WOULD_SHED_STAT_KEY
+    # above) rather than a numerator with no denominator.
+    STREAMING_WARM_DEPTH_SHED_STAT_KEY,
 )
 """LML-specific keys seeded into every request's cache_stats dict so PostHog
 and Sentry payload shapes stay stable. Used at BOTH ``handle_lookup`` and
