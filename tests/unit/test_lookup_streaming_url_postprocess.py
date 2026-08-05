@@ -8,22 +8,27 @@ the ``update`` dict came out null, and whose client is present.
 
 **Hot path vs. background warm (LML#706).** The response path is
 **cache-read-only**: it calls ``peek_cached_streaming_url`` (a pure SELECT) per
-service and makes the same three-way choice the resolver makes, without probing:
+service and makes the same four-way choice the resolver makes, without probing:
 
 * cache **hit** → fill ``update[cfg.url_field]`` synchronously, no mint (cache
   hits already minted);
-* known **recent miss** (no url, fresh "not found" within TTL) → do nothing (a
-  warm would just re-derive the same verdict);
-* genuine **miss** (absent/stale) → leave the field null and enqueue **one**
-  bounded, deduplicated background task that runs the live probe
-  (``resolve_streaming_url_with_cache``) → cache UPSERT → mint-on-``live_resolved``.
+* known **recent GENUINE miss** (no url, fresh "not found" within ``miss_ttl``)
+  → do nothing (a warm would just re-derive the same verdict);
+* fresh **ERROR row** (LML#1115: no url, ``is_error`` true, within the shorter
+  ``error_ttl``) → UNLIKE a genuine miss, this DOES enqueue a warm — re-asking
+  after a transient outage is the point — via the same bounded path below;
+* genuine **miss** (absent/stale) — or a fresh error row per the point above —
+  → leave the field null and enqueue **one** bounded, deduplicated background
+  task that runs the live probe (``resolve_streaming_url_with_cache``) → cache
+  UPSERT → mint-on-``live_resolved``.
 
 Streaming URLs are therefore *eventually consistent*: the first lookup of an
 uncached album returns without that service's URL; the background warm fills the
 cache so the next lookup is warm. The response path does **zero** synchronous
 external HTTP — the cure for the cold-tail latency in #706. The warm is
 suppressed for the whole context on the ``/lookup/bulk`` path
-(``should_suppress_streaming_warm()``), which then does cache read-fill only.
+(``should_suppress_streaming_warm()``), which then does cache read-fill only —
+uniformly for a genuine miss or a fresh error row.
 
 Dedup is process-global, keyed ``(service, to_match_form(artist),
 to_match_form(album))``. Background concurrency is bounded by
@@ -31,9 +36,12 @@ to_match_form(album))``. Background concurrency is bounded by
 
 Sentry (hot-path only): ``streaming_url.persistent_lookup.fired.<service>`` plus
 ``streaming_url.persistent_lookup.<outcome>.<service>`` where ``<outcome>`` is
-``cache_hit`` / ``cache_miss_recent`` / ``cache_miss_enqueued`` /
-``cache_miss_unwarmed``. The background task never writes to the active scope
-(the request scope has closed by then) — it logs its ``live_*`` outcome.
+``cache_hit`` / ``cache_miss_recent`` / ``cache_error_recent`` /
+``cache_miss_enqueued`` / ``cache_miss_unwarmed``. ``cache_error_recent``
+(LML#1115) covers a fresh error row's enqueue/suppress/shed sub-cases
+uniformly — the couldn't-ask signal itself is what matters. The background
+task never writes to the active scope (the request scope has closed by then)
+— it logs its ``live_*`` outcome.
 
 PG, the streaming clients, the entity store, and the cache layer are mocked. The
 cache-layer behavior itself is covered in
@@ -204,16 +212,20 @@ def _sentry_scope():
     return scope, transaction
 
 
-def _patch_cache_peek(url, has_fresh_decision=None):
-    """Patch the hot-path cache peek, returning ``(url, has_fresh_decision)``.
+def _patch_cache_peek(url, has_fresh_decision=None, is_error=False):
+    """Patch the hot-path cache peek, returning ``(url, has_fresh_decision, is_error)``.
 
     ``has_fresh_decision`` defaults to ``url is not None`` — a hit always has a
     fresh row. For a url-less peek, pass ``True`` for a known-recent-miss (the
     cache holds a fresh "not found") or leave it ``None`` (→ ``False``) for a
-    genuine absent/stale miss.
+    genuine absent/stale miss. ``is_error`` (LML#1115) marks a known-recent-miss
+    as a fresh LML#1121 transport-failure row rather than a genuine confirmed
+    absence — only meaningful alongside ``has_fresh_decision=True``.
     """
     fresh = has_fresh_decision if has_fresh_decision is not None else (url is not None)
-    return patch.object(mod, "peek_cached_streaming_url", new=AsyncMock(return_value=(url, fresh)))
+    return patch.object(
+        mod, "peek_cached_streaming_url", new=AsyncMock(return_value=(url, fresh, is_error))
+    )
 
 
 def _patch_resolver(**kwargs):
@@ -354,7 +366,7 @@ class TestPerServiceGating:
 
         async def fake_peek(pg, *, service, artist, album, **kwargs):
             read_services.append(service)
-            return other_url, True
+            return other_url, True, False
 
         with (
             patch.object(mod, "peek_cached_streaming_url", new=AsyncMock(side_effect=fake_peek)),
@@ -423,6 +435,91 @@ class TestKnownRecentMiss:
         assert not mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.cache_miss_recent.{service}") is True
+
+
+# ---------------------------------------------------------------------------
+# LML#1115: a fresh LML#1121 ERROR row (couldn't ask) must not be treated like
+# a genuine known miss above -- it DOES enqueue a bounded, deduplicated warm
+# (re-asking after a transient outage is the point), gated by the SAME bulk
+# suppression a genuine miss uses, and always reports the single
+# ``cache_error_recent`` Sentry outcome regardless of which of
+# enqueued/suppressed/shed it lands in.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("service", list(_CASES))
+class TestFreshErrorRowMiss:
+    async def test_fresh_error_row_enqueues_a_warm_unlike_a_genuine_recent_miss(self, service):
+        case = _CASES[service]
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+
+        with (
+            _patch_cache_peek(None, has_fresh_decision=True, is_error=True),
+            _patch_resolver(return_value=ResolveOutcome(url=None, source="live_error")),
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            result = await _run(update, settings=_settings(service))
+            # Unlike a genuine recent miss, a fresh error row DOES schedule a
+            # warm -- exactly one, same as a genuine absent/stale miss would.
+            assert len(mod._background_tasks) == 1
+            await _drain_background_tasks()
+
+        assert update[case["url_field"]] is None
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
+        # Not tagged as any of the genuine-miss outcomes.
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_recent.{service}") is None
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_enqueued.{service}") is None
+        assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
+
+    async def test_fresh_error_row_stays_unwarmed_when_bulk_suppressed(self, service):
+        case = _CASES[service]
+        update = _blank_update()
+        scope, transaction = _sentry_scope()
+        set_suppress_streaming_warm(True)
+
+        with (
+            _patch_cache_peek(None, has_fresh_decision=True, is_error=True),
+            _patch_resolver() as resolve,
+            patch.object(mod.sentry_sdk, "get_current_scope", return_value=scope),
+        ):
+            result = await _run(update, settings=_settings(service))
+
+        # Bulk suppression gates a fresh error row exactly like a genuine
+        # miss -- an outage during a bulk drain must not spawn request-time
+        # warms either.
+        resolve.assert_not_called()
+        assert not mod._background_tasks
+        assert not mod._streaming_warm_in_flight
+        calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
+        assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
+        assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is None
+        assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
+
+    async def test_fresh_error_row_is_still_subject_to_the_depth_bound(self, service):
+        # LML#1108's depth bound must apply to this branch too -- the whole
+        # point of reusing ``_enqueue_streaming_warm`` (rather than a bespoke
+        # unbounded enqueue) instead of writing a parallel warm path for error
+        # rows. Fill the in-flight set to the bound first so a healthy enqueue
+        # would shed; an error-row peek must shed here too, not bypass it.
+        bound = mod._streaming_warm_queue_depth_bound()
+        for i in range(bound):
+            mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
+
+        update = _blank_update()
+        with (
+            _patch_cache_peek(None, has_fresh_decision=True, is_error=True),
+            _patch_resolver() as resolve,
+        ):
+            result = await _run(update, settings=_settings(service))
+
+        assert not mod._background_tasks
+        resolve.assert_not_awaited()
+        assert result == {_CASES[service]["client_attr"]: StreamingResolutionStatus.unresolved}
 
 
 # ---------------------------------------------------------------------------
@@ -709,7 +806,7 @@ class TestCachePeekError:
         async def flaky_peek(pg, *, service, artist, album, **kwargs):
             if service == "apple_music_album":
                 raise RuntimeError("boom")
-            return _CASES["spotify_album"]["resolved_url"], True
+            return _CASES["spotify_album"]["resolved_url"], True, False
 
         with (
             patch.object(mod, "peek_cached_streaming_url", new=AsyncMock(side_effect=flaky_peek)),
@@ -928,6 +1025,22 @@ class TestStreamingStatusReturnValue:
         assert result == {case["client_attr"]: StreamingResolutionStatus.absent}
 
     @pytest.mark.parametrize("service", list(_CASES))
+    async def test_fresh_error_row_returns_unresolved_not_absent(self, service):
+        # LML#1115: the core bug this fix closes -- a fresh LML#1121 error row
+        # (couldn't ask) must NOT report the confirmed-negative ``absent``
+        # verdict a genuine known miss reports just above. It reports
+        # ``unresolved``, same as any other "didn't reach a verdict" case.
+        case = _CASES[service]
+        update = _blank_update()
+        with (
+            _patch_cache_peek(None, has_fresh_decision=True, is_error=True),
+            _patch_resolver(return_value=ResolveOutcome(url=None, source="live_error")),
+        ):
+            result = await _run(update, settings=_settings(service))
+            assert result == {case["client_attr"]: StreamingResolutionStatus.unresolved}
+            await _drain_background_tasks()
+
+    @pytest.mark.parametrize("service", list(_CASES))
     async def test_genuine_miss_enqueued_returns_unresolved(self, service):
         case = _CASES[service]
         update = _blank_update()
@@ -1012,8 +1125,8 @@ class TestStreamingStatusReturnValue:
 
         async def fake_peek(pg, *, service, artist, album, **kwargs):
             if service == "apple_music_album":
-                return _CASES["apple_music_album"]["resolved_url"], True
-            return None, False
+                return _CASES["apple_music_album"]["resolved_url"], True, False
+            return None, False, False
 
         with (
             patch.object(mod, "peek_cached_streaming_url", new=AsyncMock(side_effect=fake_peek)),

@@ -192,31 +192,56 @@ class TestGetCachedStreamingURL:
 class TestPeekCachedStreamingURL:
     """``peek_cached_streaming_url`` exposes the ``was_present`` bit so the
     /lookup post-process can tell a fresh known-miss (skip the warm) from an
-    absent/stale row (warm) — without paying the live probe (LML#706)."""
+    absent/stale row (warm) — without paying the live probe (LML#706).
+
+    LML#1115: it also exposes the row's ``is_error`` bit as a third tuple
+    element, so a fresh LML#1121 transport-failure row (couldn't ask) is
+    distinguishable from a fresh genuine known miss (asked, confirmed absent)
+    without the caller re-querying to find out.
+    """
 
     async def test_hit_returns_url_and_fresh_decision(self, service, sample_url):
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value={"url": sample_url})
 
-        url, has_fresh_decision = await peek_cached_streaming_url(
+        url, has_fresh_decision, is_error = await peek_cached_streaming_url(
             pg, service=service, artist="Stereolab", album="Aluminum Tunes"
         )
 
         assert url == sample_url
         assert has_fresh_decision is True
+        assert is_error is False
 
     async def test_fresh_known_miss_returns_none_with_fresh_decision(self, service, sample_url):
         # Row present, url NULL, inside the TTL (the SQL filter returned it):
         # the cache already knows "not found" — the caller must NOT warm.
         pg = AsyncMock(spec=PgSource)
-        pg.fetchone = AsyncMock(return_value={"url": None})
+        pg.fetchone = AsyncMock(return_value={"url": None, "is_error": False})
 
-        url, has_fresh_decision = await peek_cached_streaming_url(
+        url, has_fresh_decision, is_error = await peek_cached_streaming_url(
             pg, service=service, artist="Sessa", album="Estrela Acesa"
         )
 
         assert url is None
         assert has_fresh_decision is True
+        assert is_error is False
+
+    async def test_fresh_error_row_returns_none_with_fresh_decision_and_is_error(
+        self, service, sample_url
+    ):
+        # LML#1115: a fresh ERROR row (is_error=true, still inside the short
+        # error_ttl) is a "couldn't ask", not a confirmed absence -- the
+        # third tuple element must say so, distinctly from a genuine miss.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value={"url": None, "is_error": True})
+
+        url, has_fresh_decision, is_error = await peek_cached_streaming_url(
+            pg, service=service, artist="Sessa", album="Estrela Acesa"
+        )
+
+        assert url is None
+        assert has_fresh_decision is True
+        assert is_error is True
 
     async def test_absent_or_stale_returns_none_without_fresh_decision(self, service, sample_url):
         # No row (absent, or a stale miss the SQL WHERE filtered out): the
@@ -224,12 +249,13 @@ class TestPeekCachedStreamingURL:
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
 
-        url, has_fresh_decision = await peek_cached_streaming_url(
+        url, has_fresh_decision, is_error = await peek_cached_streaming_url(
             pg, service=service, artist="Hyd", album="Hold Onto Me Infinity"
         )
 
         assert url is None
         assert has_fresh_decision is False
+        assert is_error is False
 
     async def test_pg_error_degrades_to_probe(self, service, sample_url):
         # A failed read must look like "absent" so the caller falls through to
@@ -237,12 +263,13 @@ class TestPeekCachedStreamingURL:
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(side_effect=RuntimeError("PG unreachable"))
 
-        url, has_fresh_decision = await peek_cached_streaming_url(
+        url, has_fresh_decision, is_error = await peek_cached_streaming_url(
             pg, service=service, artist="Hyd", album="Hold Onto Me Infinity"
         )
 
         assert url is None
         assert has_fresh_decision is False
+        assert is_error is False
 
 
 @pytest.mark.asyncio

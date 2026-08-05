@@ -435,7 +435,9 @@ class TestErrorTTL:
     ):
         # The LML#1121 backpressure guarantee: once an error row is written,
         # a subsequent resolve for the same key inside error_ttl must NOT
-        # call the client again.
+        # call the client again. LML#1115: the reported source must also say
+        # WHICH miss flavor short-circuited it -- a fresh error row is
+        # ``cache_error_recent``, distinct from a genuine ``cache_miss_recent``.
         client = AsyncMock(spec=BaseStreamingClient)
         client.find_album_match = AsyncMock(side_effect=RuntimeError("upstream flake"))
 
@@ -449,8 +451,32 @@ class TestErrorTTL:
             pg_source, client, service=service, artist="Sessa", album="Estrela Acesa"
         )
 
-        assert second.source == "cache_miss_recent"
+        assert second.source == "cache_error_recent"
         client.find_album_match.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_peek_reports_is_error_true_for_a_fresh_error_row(
+        self, pg_source, pg_pool, service, sample_url
+    ):
+        # LML#1115: the /lookup post-process reads via ``peek_cached_streaming_url``,
+        # not ``resolve_streaming_url_with_cache`` -- it must see the same
+        # distinction against a REAL row, not just the mocked unit-level SQL bind.
+        await set_cached_streaming_url(
+            pg_source,
+            service=service,
+            artist="Sessa",
+            album="Estrela Acesa",
+            url=None,
+            is_error=True,
+        )
+
+        url, has_fresh_decision, is_error = await peek_cached_streaming_url(
+            pg_source, service=service, artist="Sessa", album="Estrela Acesa"
+        )
+
+        assert url is None
+        assert has_fresh_decision is True
+        assert is_error is True
 
     @pytest.mark.asyncio
     async def test_error_row_past_error_ttl_falls_through_to_live_probe(
@@ -488,7 +514,7 @@ class TestErrorTTL:
 
         assert result is None
         # Distinguish "stale, fell through" from "still a fresh decision":
-        _, has_fresh_decision = await peek_cached_streaming_url(
+        _, has_fresh_decision, _ = await peek_cached_streaming_url(
             pg_source,
             service=service,
             artist="Sessa",
@@ -520,7 +546,7 @@ class TestErrorTTL:
                 service,
             )
 
-        _, has_fresh_decision = await peek_cached_streaming_url(
+        _, has_fresh_decision, is_error = await peek_cached_streaming_url(
             pg_source,
             service=service,
             artist="Sessa",
@@ -530,6 +556,9 @@ class TestErrorTTL:
         )
 
         assert has_fresh_decision is True
+        # A GENUINE miss, not an error row -- LML#1115's third tuple element
+        # must not misreport it.
+        assert is_error is False
 
     @pytest.mark.asyncio
     async def test_genuine_resolve_after_error_clears_is_error(

@@ -57,6 +57,16 @@ genuine resolve or genuine miss on the same key always writes
 ``is_error=False`` via the UPSERT, clearing any stale error marker rather
 than leaving it latched.
 
+LML#1115 closes the read-side half of the same gap: writing the ``is_error``
+column is only half the fix if nothing downstream of the SELECT can tell the
+two miss flavors apart. ``_fetch_cached_row`` now carries the row's
+``is_error`` bit alongside ``value``/``was_present``, ``peek_cached_streaming_url``
+surfaces it as a third tuple element, and ``resolve_streaming_url_with_cache``
+reports a fresh error row as the distinct ``ResolveSource`` value
+``cache_error_recent`` rather than folding it into ``cache_miss_recent``. See
+``lookup/streaming_url_postprocess.py`` for how the ``/lookup`` hot path uses
+this to avoid reporting a couldn't-ask as a confirmed ``absent`` verdict.
+
 PG failures degrade to a no-op: ``get`` returns ``None``, ``set`` swallows
 the exception. The caller (``lookup/streaming_url_postprocess.py``) then falls
 through to the live probe as if no cache were configured. Schema bootstrap
@@ -90,7 +100,7 @@ from wxyc_etl.text import to_match_form
 
 from clients.streaming.base import BaseStreamingClient
 from core.search import resolve_positive_int_env
-from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute, swallowing_fetch
+from entity.cache_toolkit import DEFAULT_MISS_TTL, swallowing_execute, swallowing_fetch
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.ddl import bootstrap_lml_cache_table, widen_service_check
 from entity.sources import PgSource
@@ -208,8 +218,13 @@ _WIDEN_CHECK_CONSTRAINT = "album_streaming_url_cache_service_valid"
 # versa) even if one TTL happens to be looser than the other. A miss stale
 # under its own branch is filtered out and the caller sees the same "no row"
 # shape as an absent entry.
+#
+# ``is_error`` is also SELECTed (LML#1115), not just filtered on: a caller
+# needs to know not just THAT a fresh row satisfied the query but WHICH flavor
+# it is, so ``_fetch_cached_row`` can report it onward instead of the read
+# path having to issue a second query to find out.
 _SELECT_SQL = """\
-SELECT url
+SELECT url, is_error
 FROM lml_cache.album_streaming_url_cache
 WHERE service = $1 AND artist_normalized = $2 AND album_normalized = $3
   AND (url IS NOT NULL
@@ -333,26 +348,32 @@ async def peek_cached_streaming_url(
     miss_ttl: timedelta = DEFAULT_MISS_TTL,
     error_ttl: timedelta | None = None,
     now: datetime | None = None,
-) -> tuple[str | None, bool]:
+) -> tuple[str | None, bool, bool]:
     """Read the cache decision for ``(service, artist, album)`` WITHOUT probing.
 
-    Returns ``(url, has_fresh_decision)``:
+    Returns ``(url, has_fresh_decision, is_error)``:
 
     * ``url`` — the cached URL, or ``None`` for a miss (known or absent).
     * ``has_fresh_decision`` — ``True`` when the cache already holds a fresh row
       (a hit, OR a known-miss still inside ``miss_ttl`` / ``error_ttl``): no
       live probe is warranted. ``False`` for an absent or stale row, where a
       probe/warm is.
+    * ``is_error`` (LML#1115) — ``True`` only when ``has_fresh_decision`` is
+      ``True`` AND the row that satisfied the query is an LML#1121
+      transport-failure row ("couldn't ask") rather than a genuine confirmed
+      absence. Always ``False`` for a hit or an absent/stale row. Lets the
+      caller avoid a second query to tell the two known-miss flavors apart.
 
     ``error_ttl`` — see :func:`get_cached_streaming_url`; ``None`` resolves
     the live env-tunable default.
 
-    Lets the ``/lookup`` post-process make the same three-way decision
-    ``resolve_streaming_url_with_cache`` makes (hit / recent-miss / probe)
-    without paying the live probe on the response path (LML#706) — so it can
-    skip scheduling a no-op background warm for a row the cache already knows
-    is a recent miss. Same PG-error posture as ``get_cached_streaming_url``:
-    failures surface as ``(None, False)`` (treated as "absent → probe").
+    Lets the ``/lookup`` post-process make the same four-way decision
+    ``resolve_streaming_url_with_cache`` makes (hit / genuine recent-miss /
+    fresh error-miss / probe) without paying the live probe on the response
+    path (LML#706) — so it can skip scheduling a no-op background warm for a
+    row the cache already knows is a genuine recent miss. Same PG-error
+    posture as ``get_cached_streaming_url``: failures surface as
+    ``(None, False, False)`` (treated as "absent → probe").
     """
     result = await _fetch_cached_row(
         pg,
@@ -363,7 +384,34 @@ async def peek_cached_streaming_url(
         error_ttl=error_ttl,
         now=now,
     )
-    return result.value, result.was_present
+    return result.value, result.was_present, result.is_error
+
+
+@dataclass(frozen=True)
+class _CachedRow:
+    """Outcome of ``_fetch_cached_row``: hit / fresh-genuine-miss /
+    fresh-error-miss / absent-or-stale, extended with the LML#1115
+    ``is_error`` bit alongside the ``entity.cache_toolkit.CachedValue`` shape.
+
+    Kept local rather than adding ``is_error`` to the shared ``CachedValue``:
+    no sibling cache (``release_resolution_cache``, ``compilation_track_location``)
+    has this dimension yet, and several modules construct ``CachedValue``
+    directly with its existing two-field shape.
+
+    * ``was_present=False`` — absent or stale row of either flavor; ``is_error``
+      is always ``False`` (meaningless in this state).
+    * ``was_present=True``, ``value is not None`` — a durable hit; ``is_error``
+      is always ``False`` (a resolved URL is never simultaneously an error
+      row — see ``set_cached_streaming_url``'s coercion).
+    * ``was_present=True``, ``value is None`` — a fresh known miss;
+      ``is_error`` distinguishes a genuine confirmed absence (``False``) from
+      an LML#1121 transport-failure miss still inside its short ``error_ttl``
+      (``True``).
+    """
+
+    value: str | None
+    was_present: bool
+    is_error: bool
 
 
 async def _fetch_cached_row(
@@ -375,12 +423,14 @@ async def _fetch_cached_row(
     miss_ttl: timedelta,
     error_ttl: timedelta | None,
     now: datetime | None,
-) -> CachedValue[str]:
+) -> _CachedRow:
     """Read the cache row keyed by ``(service, artist, album)`` honoring the TTL.
 
-    Module-private helper powering both ``get_cached_streaming_url`` (URL only)
-    and ``resolve_streaming_url_with_cache`` (needs ``was_present`` to tell a
-    fresh known miss from a stale/absent row before deciding whether to probe).
+    Module-private helper powering ``get_cached_streaming_url`` (URL only),
+    ``peek_cached_streaming_url`` (also needs ``is_error``), and
+    ``resolve_streaming_url_with_cache`` (needs ``was_present``/``is_error`` to
+    tell a fresh genuine miss from a fresh error miss from a stale/absent row
+    before deciding whether to probe).
 
     ``error_ttl=None`` resolves :func:`resolve_streaming_error_ttl` here, at
     call time -- the single point every public wrapper funnels through, so
@@ -412,14 +462,20 @@ async def _fetch_cached_row(
         # Either a PG failure, no row at all, or a stale known-miss (genuine
         # or error) filtered out by the SQL WHERE. All render the same way;
         # the resolver treats any of them as "call the API."
-        return CachedValue(value=None, was_present=False)
+        return _CachedRow(value=None, was_present=False, is_error=False)
 
-    return CachedValue(value=row["url"], was_present=True)
+    # ``.get`` (not ``row["is_error"]``): a real PG row always carries the
+    # column (it's in ``_SELECT_SQL``'s column list), but this degrades
+    # gracefully for any caller/double supplying a bare ``{"url": ...}``
+    # mapping without it -- treated as the correct default for a hit (where
+    # ``is_error`` is always coerced ``False`` on write anyway).
+    return _CachedRow(value=row["url"], was_present=True, is_error=bool(row.get("is_error", False)))
 
 
 ResolveSource = Literal[
     "cache_hit",
     "cache_miss_recent",
+    "cache_error_recent",
     "live_resolved",
     "live_miss",
     "live_error",
@@ -432,9 +488,10 @@ class ResolveOutcome:
 
     Carries both the URL and the path taken so callers can tag Sentry without
     reproducing the resolution's branch logic. ``url is None`` whenever
-    ``source`` is ``cache_miss_recent``, ``live_miss``, or ``live_error`` —
-    but ``live_error`` is a distinct signal so dashboards can tell a genuine
-    catalog miss from an upstream outage.
+    ``source`` is ``cache_miss_recent``, ``cache_error_recent``, ``live_miss``,
+    or ``live_error`` — but ``live_error`` and ``cache_error_recent`` are
+    distinct signals so dashboards can tell a genuine catalog miss from an
+    upstream outage (live, or a still-fresh cached record of one — LML#1115).
     """
 
     url: str | None
@@ -458,8 +515,11 @@ async def resolve_streaming_url_with_cache(
     Branch order:
 
     1. Cache row exists with a non-null URL → ``cache_hit`` (no API).
-    2. Cache row exists with a NULL URL inside ``miss_ttl`` / ``error_ttl`` →
-       ``cache_miss_recent`` (no API).
+    2. Cache row exists with a NULL URL inside ``miss_ttl`` → ``cache_miss_recent``
+       (a genuine confirmed absence, no API). Inside the shorter ``error_ttl``
+       instead (LML#1121's ``is_error=True`` row) → the distinct
+       ``cache_error_recent`` (LML#1115) — a couldn't-ask, not a confirmed
+       absence, so a caller must not treat the two as interchangeable.
     3. Otherwise call ``client.find_album_match(artist, album)``:
        - returns a match → ``live_resolved`` and UPSERT the URL
          (``is_error=False``, clearing any stale error marker).
@@ -510,8 +570,10 @@ async def resolve_streaming_url_with_cache(
     if cached.was_present:
         # SQL filter already excluded stale misses; a present row with NULL
         # URL is necessarily an in-TTL known miss (genuine or error) — skip
-        # the API.
-        return ResolveOutcome(url=None, source="cache_miss_recent")
+        # the API. LML#1115: report which flavor via a distinct source so a
+        # caller can't mistake a couldn't-ask for a confirmed absence.
+        source: ResolveSource = "cache_error_recent" if cached.is_error else "cache_miss_recent"
+        return ResolveOutcome(url=None, source=source)
 
     # Cache empty or stale — call the service with REQUEST values. The
     # external ``wait_for`` (post-process gather) bounds wall-clock; a
