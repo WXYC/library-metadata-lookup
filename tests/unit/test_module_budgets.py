@@ -99,7 +99,22 @@ MODULE_BUDGETS: dict[str, int] = {
     # documented extraction blocker (the reconciliation needs
     # build_context_message, orchestrator-only) is the debt to pay down
     # before the next one.
-    "lookup/orchestrator.py": 1650,
+    #
+    # Recalibrated 2026-08-05 (LML#1126): the 1650 ceiling above was set to the
+    # file's exact measured size, leaving zero headroom, and this ticket's
+    # change landed on top of it via a rebase — CI was green on both PRs
+    # independently and only the merge order produced the overflow. The growth
+    # is irreducible and not a new concern: one `LookupState.upstream_shed`
+    # field (that dataclass lives here) plus its two call sites — the copy in
+    # `_step_search_pipeline` and the `degraded`/`degraded_reason` pair in
+    # `perform_lookup`'s response build. There is no module to extract; the
+    # shed-detection logic itself lives in `core/search.py`. Same shape as
+    # LML#944's `router.py` recalibration ("an import plus the two irreducible
+    # call sites") and the same tight-on-purpose formula: smallest multiple of
+    # 50 at or above the new measured 1664, not a re-derived 1.3x. This is the
+    # FOURTH consecutive recalibration — the extraction debt named directly
+    # above is now overdue and tracked at LML#1142.
+    "lookup/orchestrator.py": 1700,
     "lookup/release_resolution.py": 550,
     # Recalibrated 2026-07-27 (LML#944): unrelated changes since the 2026-07-06
     # calibration had already carried this file to exactly its old 950-line
