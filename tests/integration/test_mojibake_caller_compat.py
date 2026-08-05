@@ -175,7 +175,7 @@ async def test_lookup_finds_v012_corrected_row(
 # `ascii-nilufer` is xfail: the row's leading char is Greek capital nu (Ν,
 # U+039D) which has no NFKD decomposition, so after `normalize_for_comparison`
 # the artist still starts with `ν` and the prefix match against `nilufer`
-# fails. Documented in audit/lml_capability_matrix.md as a real limitation.
+# fails. Documented in docs/audits/lml_capability_matrix.md as a real limitation.
 # ---------------------------------------------------------------------------
 
 
@@ -260,7 +260,7 @@ async def test_library_search_q_finds_v012_row(mojibake_client, query, expected_
 
 # ---------------------------------------------------------------------------
 # Pin the known asymmetry: /library/search?artist= is byte-strict and does NOT
-# strip diacritics. Documented in audit/lml_capability_matrix.md. If this
+# strip diacritics. Documented in docs/audits/lml_capability_matrix.md. If this
 # behaviour ever changes, this test should fail and the matrix must be updated.
 # ---------------------------------------------------------------------------
 
@@ -276,6 +276,6 @@ async def test_library_search_artist_filter_is_byte_strict(mojibake_client):
     payload = response.json()
     assert payload["total"] == 0, (
         "artist= filter unexpectedly matched across codepoints. "
-        "If LML now NFKC-normalizes this path, update lml_capability_matrix.md "
-        "and remove the M0.4 caller warning."
+        "If LML now NFKC-normalizes this path, update "
+        "docs/audits/lml_capability_matrix.md and remove the M0.4 caller warning."
     )
