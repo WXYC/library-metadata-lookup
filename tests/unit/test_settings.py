@@ -5,7 +5,19 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from config import settings as settings_module
 from config.settings import Settings, get_settings
+
+
+@pytest.fixture
+def reset_empty_path_warning(monkeypatch):
+    """Clear the once-per-process guard on the empty-path fallback WARNING.
+
+    The guard is module state, so without this the test that asserts the
+    warning fires would depend on which test in the session reached the
+    fallback branch first.
+    """
+    monkeypatch.setattr(settings_module, "_empty_library_db_path_warned", False)
 
 
 class TestResolvedLibraryDbPath:
@@ -21,7 +33,7 @@ class TestResolvedLibraryDbPath:
         s = Settings(library_db_path=Path("/data/my_library.db"))
         assert s.resolved_library_db_path == Path("/data/my_library.db")
 
-    def test_empty_value_fallback_logs_warning(self, caplog):
+    def test_empty_value_fallback_logs_warning(self, caplog, reset_empty_path_warning):
         """LML#1132: the set-but-empty-env-var fallback (`.` after pydantic's
         Path coercion) must warn loudly rather than silently serve a
         different catalog than the one an operator thinks they configured."""
@@ -32,6 +44,24 @@ class TestResolvedLibraryDbPath:
         warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
         assert any("library_db_path" in m.lower() or "library.db" in m for m in warnings), (
             f"expected a WARNING naming the fallback path, got: {warnings}"
+        )
+
+    def test_empty_value_fallback_warns_once_per_process(self, caplog, reset_empty_path_warning):
+        """The fallback branch is reached from ``get_library_db``, which is a
+        per-request FastAPI dependency (``core/dependencies.py``), plus the
+        boot-fetch (``main.py``) and ``get_object_store``. An unguarded
+        ``logger.warning`` there emits one identical line **per request** for
+        the whole life of a misconfigured deploy -- burying the signal it
+        exists to raise. Measured against the built image before this guard:
+        6 lines for 5 ``GET /health`` calls. Warn once per process instead."""
+        s = Settings(library_db_path=Path("."))
+        with caplog.at_level("WARNING", logger="config.settings"):
+            for _ in range(5):
+                assert s.resolved_library_db_path == Path("library.db")
+        warnings = [r for r in caplog.records if r.name == "config.settings"]
+        assert len(warnings) == 1, (
+            f"expected exactly one WARNING across 5 property reads, got {len(warnings)}: "
+            f"{[r.getMessage() for r in warnings]}"
         )
 
     def test_valid_custom_path_does_not_warn(self, caplog):

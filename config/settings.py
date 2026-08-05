@@ -11,6 +11,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
+# Once-per-process guard for the ``resolved_library_db_path`` empty-value
+# WARNING. The property is read on the request path (``get_library_db`` and
+# ``get_object_store`` in ``core/dependencies.py`` are FastAPI dependencies), so
+# an unguarded ``logger.warning`` would emit one identical line per request for
+# the entire life of a misconfigured deploy. Reset in tests via monkeypatch.
+_empty_library_db_path_warned = False
+
 # Postgres memory-value grammar (digits + optional unit) for ``work_mem`` (LML#804).
 # ``discogs_search_work_mem`` is interpolated into a ``SET LOCAL`` string (Postgres
 # ``SET`` takes no bind params), so it is validated against this at BOTH ends: the
@@ -70,10 +77,15 @@ class Settings(BaseSettings):
             # deploy would otherwise silently serve library.db from whatever
             # the process's CWD happens to be -- a stale or wrong catalog
             # with no signal in the logs. See WXYC/library-metadata-lookup#1132.
-            logger.warning(
-                "library_db_path was set but empty; falling back to "
-                "library.db in the current working directory"
-            )
+            # Warned once per process: this property is read per request, and a
+            # per-request repeat would bury the signal it exists to raise.
+            global _empty_library_db_path_warned
+            if not _empty_library_db_path_warned:
+                _empty_library_db_path_warned = True
+                logger.warning(
+                    "library_db_path was set but empty; falling back to "
+                    "library.db in the current working directory"
+                )
             return Path("library.db")
         return self.library_db_path
 
