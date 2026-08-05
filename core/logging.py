@@ -67,12 +67,14 @@ def setup_logging(
     # Create handlers
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
 
+    worker_file: Path | None = None
     if log_file:
         # Ensure log directory exists
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        worker_file = worker_log_path(log_file)
         handlers.append(
             logging.handlers.RotatingFileHandler(
-                worker_log_path(log_file),
+                worker_file,
                 maxBytes=max_bytes,
                 backupCount=backup_count,
             )
@@ -88,8 +90,11 @@ def setup_logging(
 
     logger = logging.getLogger(__name__)
     logger.info(f"Logging configured at {level} level")
-    if log_file:
-        logger.info(f"Logging to file: {log_file}")
+    if worker_file:
+        # Name the file this process actually opened, not the caller's bare
+        # argument -- under the per-worker scheme that argument is a path
+        # nothing ever writes to, and every worker would claim the same one.
+        logger.info(f"Logging to file: {worker_file}")
 
 
 def get_logger(name: str) -> logging.Logger:

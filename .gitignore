@@ -69,5 +69,10 @@ cta_inserts.sql
 # output here starting in Phase 2 of the root-cleanup effort)
 artifacts/
 
+# Ad hoc audit tool output. Distinct from the tracked audit write-ups, which
+# LML#1124 Phase 4 moved from the top-level audit/ to docs/audits/ precisely so
+# the two stop reading as the same word.
+.audit/
+
 # Claude Code local config
 .claude/

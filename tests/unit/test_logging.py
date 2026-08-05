@@ -105,6 +105,22 @@ class TestLogRotation:
         backup_file = worker_file.with_name(worker_file.name + ".1")
         assert backup_file.exists()
 
+    def test_startup_confirmation_names_the_file_actually_opened(self, tmp_path):
+        """The single startup line telling an operator where logs go must name
+        the per-worker file that exists on disk. Echoing the caller's bare
+        `log_file` argument instead would point every operator at a path the
+        per-worker scheme guarantees is never written to -- and with N workers
+        each line would claim the same file while N different ones accumulate.
+        """
+        log_file = tmp_path / "library-metadata-lookup.log"
+
+        setup_logging(log_file=log_file)
+
+        worker_file = worker_log_path(log_file)
+        contents = worker_file.read_text()
+        assert f"Logging to file: {worker_file}" in contents
+        assert f"Logging to file: {log_file}" not in contents
+
 
 class TestGetLogger:
     def test_returns_logger_with_name(self):
