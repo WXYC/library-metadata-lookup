@@ -577,9 +577,7 @@ class BandcampClient(BaseStreamingClient):
         # genuine no-match, so the cache-backed resolver would UPSERT a false 7-day
         # known-miss row for a transient autocomplete blip. It now propagates, and
         # a CLEAN miss still falls through to the FIX A check below.
-        fallback_match = await self.find_album_match_via_search(
-            artist, title, fail_fast=fail_fast
-        )
+        fallback_match = await self.find_album_match_via_search(artist, title, fail_fast=fail_fast)
 
         if fallback_match is not None:
             # We got an answer -- safe to treat as a genuine resolution even

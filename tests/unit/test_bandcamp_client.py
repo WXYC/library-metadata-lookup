@@ -418,14 +418,14 @@ class TestFindAlbumMatch:
         assert match is None
 
     @pytest.mark.asyncio
-    async def test_catalog_fetch_failure_propagates_without_trying_fallback(self):
-        # LML#1115: fetch_artist_catalog now raises BandcampTransportError in
-        # the default mode too (previously coalesced a fetch failure to "no
-        # catalog" via `or []`, silently downgrading a couldn't-ask into a
-        # no-match verdict that resolve_streaming_url_with_cache would then
-        # durably cache). Mirrors the existing fail_fast posture: a transport
-        # failure on the artist-first phase propagates immediately, without
-        # spending a second rate-limited request on the album-search fallback.
+    async def test_catalog_fetch_failure_still_tries_the_album_first_fallback(self):
+        # LML#1115 makes fetch_artist_catalog raise BandcampTransportError in the
+        # DEFAULT mode too, but the LML#1106 FIX A conditional table still governs
+        # what that means: the catalog leg and the album-first fallback hit
+        # DIFFERENT hosts ({slug}.bandcamp.com vs bandcamp.com/api/fuzzysearch), so
+        # a per-subdomain failure must not pre-empt a sibling call that would very
+        # likely have succeeded -- that fallback is the LML#1069 label/imprint
+        # recovery path. A fallback HIT is a real answer and resolves normally.
         client = BandcampClient()
         client.search_artist = AsyncMock(
             return_value=[
@@ -433,12 +433,38 @@ class TestFindAlbumMatch:
             ]
         )
         client.fetch_artist_catalog = AsyncMock(side_effect=BandcampTransportError("boom"))
-        client.find_album_match_via_search = AsyncMock()
+        hit = SourceMatch(
+            url="https://duophonic.bandcamp.com/album/aluminum-tunes", confidence=95.0
+        )
+        client.find_album_match_via_search = AsyncMock(return_value=hit)
+
+        match = await client.find_album_match("Stereolab", "Aluminum Tunes")
+
+        assert match is hit
+        client.find_album_match_via_search.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_catalog_fetch_failure_plus_clean_fallback_miss_raises(self):
+        # The other half of FIX A: the album-autocomplete index has strictly lower
+        # recall than the catalog scrape (that is why LML#1069 added it as a
+        # fallback, not a replacement), so "the fallback found nothing" AFTER the
+        # catalog leg genuinely couldn't ask is NOT evidence of absence. It must
+        # raise rather than resolve to a cachable None -- otherwise
+        # resolve_streaming_url_with_cache UPSERTs a 7-day false negative, which is
+        # exactly the bug LML#1115 exists to close.
+        client = BandcampClient()
+        client.search_artist = AsyncMock(
+            return_value=[
+                {"name": "Stereolab", "url": "https://stereolab.bandcamp.com", "slug": "stereolab"}
+            ]
+        )
+        client.fetch_artist_catalog = AsyncMock(side_effect=BandcampTransportError("boom"))
+        client.find_album_match_via_search = AsyncMock(return_value=None)
 
         with pytest.raises(BandcampTransportError):
             await client.find_album_match("Stereolab", "Aluminum Tunes")
 
-        client.find_album_match_via_search.assert_not_awaited()
+        client.find_album_match_via_search.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_artist_search_failure_propagates_without_trying_fallback(self):
