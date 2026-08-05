@@ -1,0 +1,37 @@
+name: Cross-repo critical path
+
+# Adds an issue or PR to org Project #33 (Cross-repo critical path)
+# when the `cross-repo:active` label is applied. Removing the label does
+# NOT auto-remove from the project — the project's Status field auto-drifts
+# to Done when the issue closes; manual project removal is the path for
+# "no longer active but still open."
+#
+# Setup requirement: WXYC_PROJECTS_TOKEN org secret, a fine-grained PAT
+# with `read:project, project` scope on the WXYC org.
+# Without that secret this workflow no-ops silently.
+
+on:
+  issues:
+    types: [labeled]
+  pull_request_target:
+    types: [labeled]
+
+jobs:
+  add-to-project:
+    if: github.event.label.name == 'cross-repo:active'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # `secrets` isn't a permitted context inside an `if:` (job- or step-level);
+    # mirror it into `env` first, which is permitted. This is what actually
+    # makes the "no-ops silently" claim above true: a repo/org where
+    # WXYC_PROJECTS_TOKEN hasn't been provisioned yet skips the step below
+    # instead of failing the add-to-project call with an empty github-token.
+    env:
+      PROJECTS_TOKEN: ${{ secrets.WXYC_PROJECTS_TOKEN }}
+    steps:
+      - if: ${{ env.PROJECTS_TOKEN != '' }}
+        uses: actions/add-to-project@v1.0.2
+        with:
+          project-url: https://github.com/orgs/WXYC/projects/33
+          github-token: ${{ env.PROJECTS_TOKEN }}
