@@ -609,6 +609,9 @@ def _select_best_track_candidate(
     best_with_artwork: dict | None = None
     best_with_artwork_score = 0.0
     best_with_artwork_axes: tuple[float, float] = (0.0, 0.0)
+    # Highest combined score among candidates the LML#1139 V/A guard struck.
+    # Feeds the no-promotion rule after the loop.
+    struck_best_score = 0.0
 
     for item in results:
         attrs = item.get("attributes") or {}
@@ -665,6 +668,15 @@ def _select_best_track_candidate(
         # on its own merits, which matters because the artist axis keeps
         # token_set_ratio deliberately for leader->ensemble subsets.
         #
+        # A bare `continue` is NOT sufficient, though: removing the top-ranked
+        # candidate would hand the win to whatever scored next, so the guard
+        # could SUBSTITUTE a wrong link rather than withhold one. That is not
+        # theoretical here — against a V/A query the only realistic surviving
+        # candidate is the trailing-credit class (`CAGAYANO VARIOUS ARTISTS`,
+        # 81.08), which the tests document as a measured false positive. So the
+        # struck score is remembered and re-checked after the loop; see the
+        # no-promotion rule below.
+        #
         # Recall cost (accepted, LML#719 idiom): an album-less V/A query that
         # was genuinely right now returns None — e.g. the real pair
         # ("Various Artists - Asia", "Jombang Jet") -> ("Various Artists & Pan
@@ -672,6 +684,7 @@ def _select_best_track_candidate(
         # failure mode is a MISSING Apple link, never a wrong one, and a wrong
         # track deep-link persists downstream (BS#2000).
         if norm_album is None and va_artist_axis_is_uninformative(norm_artist, cand_artist_norm):
+            struck_best_score = max(struck_best_score, (artist_score + track_score) / 2)
             continue
         if norm_album is not None:
             album_score = fuzz.token_set_ratio(
@@ -700,6 +713,22 @@ def _select_best_track_candidate(
             best_with_artwork_score = combined
             best_with_artwork = item
             best_with_artwork_axes = (artist_score, track_score)
+
+    # LML#1139 no-promotion rule. A strike is allowed to REMOVE a candidate,
+    # never to promote one that could not have won without it. If the best
+    # struck candidate matched or beat the best surviving one, the guard
+    # changed who tops the ranking, so the honest answer is "no adjudicable
+    # match" rather than the runner-up's deep link.
+    #
+    # Compared against `best_overall_score` — the true ceiling of the surviving
+    # candidates — rather than the returned record's score, so this stays
+    # independent of the orthogonal artwork preference below. Ties suppress
+    # (`>=`): the loop breaks exact ties by response order, so a tie-scoring
+    # survivor "winning" would be an artifact of Apple's ordering, and this
+    # file's standing trade is that dropping enrichment beats shipping a wrong
+    # link.
+    if struck_best_score >= best_overall_score:
+        return None, (0.0, 0.0)
 
     best = best_with_artwork or best_overall
     axes = best_with_artwork_axes if best is best_with_artwork else best_overall_axes

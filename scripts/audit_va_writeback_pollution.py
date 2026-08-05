@@ -28,7 +28,13 @@ from wxyc_etl.text import is_compilation_artist
 if TYPE_CHECKING:
     import psycopg
 
-SUPERSET_REGEX = r"(various|soundtrack|compilation|v/a|v\.a\.)"
+# LML#1139: `v\.a\.` required a trailing dot, so the dotless family (`v.a`,
+# `v.a - jazz`, `v.a 1998`) was arbiter-True and net-False — i.e. this was NOT
+# the superset the module docstring claims, and `--apply` silently left those
+# rows classified as clean, under-reporting confirmed V/A pollution. Widening
+# the coarse net can only surface MORE rows to `is_compilation_artist`, which
+# remains the sole arbiter of what is deleted.
+SUPERSET_REGEX = r"(various|soundtrack|compilation|v[./]\s*a\.?)"
 
 OUT_DIR = Path("/tmp")
 DELETE_CSV = OUT_DIR / "audit-lml-379-delete.csv"

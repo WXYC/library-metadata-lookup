@@ -1302,16 +1302,71 @@ class TestFindTrackMetadataVaArtistAxis:
         assert match.url == "https://music.apple.com/us/song/sleigh-ride/444"
 
     @pytest.mark.asyncio
-    async def test_guard_is_per_candidate_not_a_winner_veto(self, es256_keypair):
-        """The guard strikes individual CANDIDATES, not the query. A response
-        holding both a struck V/A<->V/A candidate (``Various Artists - Sergent
-        Major``, the real 82.93 pair from the 30d sample) and a non-V/A one that
-        clears on its own merits returns the latter — it must not suppress the
-        whole album-less pass, which is why the rule is a per-candidate
-        ``continue`` rather than a winner veto or fallback suppression."""
+    async def test_strike_never_promotes_a_lower_scoring_candidate(self, es256_keypair):
+        """A strike must REMOVE a link, never SUBSTITUTE a worse one.
+
+        This is the shape a plain per-candidate ``continue`` gets wrong, and it
+        is not hypothetical — it is built from the two artist strings this suite
+        already pins. Against ``Various Artists - Xmas``:
+
+        * the struck V/A candidate ``Various Artists - Sergent Major`` scores
+          87.18 on the artist axis, so at title 100 it tops the ranking at 93.59;
+        * the surviving ``CAGAYANO VARIOUS ARTISTS`` scores 81.08, i.e. 90.54 —
+          and ``test_one_sided_va_credit_still_resolves`` documents it as a
+          *genuine measured false positive*.
+
+        So striking the leader would hand the win to a known-bad candidate that
+        could not have won on its own: wrong-URL-A becomes wrong-URL-B, and the
+        deep-link is persisted downstream (BS#2000) either way. The guard's
+        stated contract — "the failure mode is a MISSING Apple link, never a
+        wrong one" — only holds if a strike that displaces the top of the
+        ranking suppresses the pass entirely.
+        """
         client = _client(es256_keypair)
         va_spam = _make_song_data(
             name="Duke of Earl",
+            artist_name="Various Artists - Sergent Major",
+            album_name="Oldies Party",
+            url="https://music.apple.com/us/song/duke-of-earl/111",
+        )
+        trailing_credit = _make_song_data(
+            name="Duke of Earl",
+            artist_name="CAGAYANO VARIOUS ARTISTS",
+            album_name="Doo Wop Classics",
+            url="https://music.apple.com/us/song/duke-of-earl/222",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([va_spam, trailing_credit]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Various Artists - Xmas", "Duke of Earl", album=None
+        )
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_guard_is_per_candidate_not_a_winner_veto(self, es256_keypair):
+        """The complement, and why the rule is not a blanket winner veto.
+
+        A strike suppresses the pass only when it displaces the TOP of the
+        ranking. A candidate that already outscored every struck one wins
+        normally — the guard removes candidates, it does not veto the query.
+
+        The margin here is deliberate and thin, so the test would fail if the
+        rule silently became "any strike suppresses". Same two artists as the
+        sibling test above, but the struck candidate's title is a real variant
+        rather than an exact hit:
+
+        * struck ``Various Artists - Sergent Major`` / ``Dukes of Earle`` —
+          artist 87.18, title 92.31, combined **89.74**;
+        * surviving ``CAGAYANO VARIOUS ARTISTS`` / ``Duke of Earl`` —
+          artist 81.08, title 100, combined **90.54**.
+
+        The survivor tops the ranking on its own merits, so it is returned.
+        """
+        client = _client(es256_keypair)
+        va_spam = _make_song_data(
+            name="Dukes of Earle",
             artist_name="Various Artists - Sergent Major",
             album_name="Oldies Party",
             url="https://music.apple.com/us/song/duke-of-earl/111",

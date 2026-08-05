@@ -58,6 +58,7 @@ _LML_CACHE_FIXTURE_FILES = (
     "test_release_resolution_cache.py",
     "test_streaming_url_persistent_lookup.py",
     "test_track_streaming_url_cache_pg.py",
+    "test_purge_va_apple_track_cache_pg.py",
     "test_streaming_catalog.py",
     "test_streaming_catalog_dao.py",
     "test_library_release_override.py",

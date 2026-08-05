@@ -52,10 +52,20 @@ next play — it re-probes and mostly re-nulls until it wins the throttle. Run
 this AFTER rolling ``LML_APPLE_MUSIC_RATE_PER_MIN`` up (60 -> 300 -> 600), and
 run it in WAVES via ``--limit`` so the re-probe load arrives gradually.
 
-Every purged row is written to a CSV **before** the DELETE, on the dry-run path
-and the execute path alike, so a knowingly-over-deleting irreversible operation
-on expensive-to-replace API-derived data stays recoverable. Copy each wave's
-file somewhere durable before running the next one.
+Every purged row is written to a recovery CSV, so a knowingly-over-deleting
+irreversible operation on expensive-to-replace API-derived data stays
+recoverable. Two properties make that guarantee actually hold:
+
+* **The rows come from the DELETE itself.** The execute path is a single
+  ``DELETE ... RETURNING`` inside one transaction, and the CSV is written
+  before that transaction commits. A preceding SELECT plus a separate DELETE
+  would be two autocommit statements on two different pooled connections, and
+  this guard does NOT block album-CONSTRAINED V/A cache writes — so live
+  ``/lookup`` traffic could insert a row for a purge key in the gap and have it
+  deleted with no CSV entry. (The dry-run path has no such gap; it only reads.)
+* **Waves cannot clobber each other.** ``--out`` defaults to a timestamped
+  per-invocation path, and an existing path is refused rather than truncated.
+  Copy each wave's file somewhere durable anyway.
 
 Flag naming note: the donor uses ``--apply``; this script uses ``--execute`` to
 match ``seed_library_release_overrides.py`` and the downstream BS#2000 job. The
@@ -79,6 +89,7 @@ import argparse
 import asyncio
 import csv
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -114,9 +125,10 @@ WHERE service = $1 AND artist_normalized = ANY($2)
 ORDER BY artist_normalized, album_normalized, song_normalized\
 """
 
-_DELETE_SQL = """\
+_DELETE_RETURNING_SQL = """\
 DELETE FROM lml_cache.track_streaming_url_cache
-WHERE service = $1 AND artist_normalized = ANY($2)\
+WHERE service = $1 AND artist_normalized = ANY($2)
+RETURNING service, artist_normalized, album_normalized, song_normalized, url\
 """
 
 _CSV_COLUMNS = ("service", "artist_normalized", "album_normalized", "song_normalized", "url")
@@ -138,13 +150,27 @@ def classify(keys: list[str]) -> tuple[list[str], list[str]]:
 
 
 def write_recovery_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    """Write the rows about to be deleted, so the over-deletion is reversible.
+    """Write the deleted rows, so the knowing over-deletion stays reversible.
 
-    Called BEFORE the DELETE on both the dry-run and execute paths — a crash
-    mid-DELETE must still leave the artifact behind.
+    On the execute path this is called INSIDE the DELETE's transaction and
+    before it commits, so rows can never be gone without being recorded: a
+    crash here rolls the DELETE back rather than losing the URLs.
+
+    Opened with mode ``"x"``, not ``"w"``. This file is the only record of an
+    irreversible operation on expensive-to-replace API-derived data, so a path
+    collision with an earlier wave must abort the run rather than truncate it
+    (each invocation's default path is already timestamped; an explicit
+    ``--out`` reused across waves is the case this catches).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
+    try:
+        handle = path.open("x", newline="", encoding="utf-8")
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"recovery CSV {path} already exists — refusing to overwrite an earlier wave's "
+            "only record of what it deleted. Pass a different --out."
+        ) from exc
+    with handle as f:
         writer = csv.DictWriter(f, fieldnames=list(_CSV_COLUMNS))
         writer.writeheader()
         for row in rows:
@@ -191,10 +217,9 @@ async def purge(
         log.info("no V/A keys in this wave; next --after %r", next_after)
         return 0
 
-    rows = await pg.fetchall(_SELECT_ROWS_SQL, service, purge_keys)
-    write_recovery_csv(out, rows)
-
     if not execute:
+        rows = await pg.fetchall(_SELECT_ROWS_SQL, service, purge_keys)
+        write_recovery_csv(out, rows)
         log.info(
             "[dry-run] would delete %d rows across %d keys. Pass --execute to write. "
             "Next wave: --after %r",
@@ -204,12 +229,36 @@ async def purge(
         )
         return 0
 
-    status = await pg.execute(_DELETE_SQL, service, purge_keys)
+    # One transaction, one statement. A preceding SELECT plus a separate DELETE
+    # would be two autocommit round-trips on two different pooled connections,
+    # and the guard does NOT block album-constrained V/A cache writes — so live
+    # /lookup traffic could insert a row for one of `purge_keys` in the gap and
+    # have it deleted with no entry in the recovery CSV. RETURNING closes the
+    # gap and, as a bonus, makes the reported count the DELETE's own count
+    # rather than a pre-DELETE estimate that `docs/scripts.md` asks the
+    # operator to record on the PR.
+    #
+    # The CSV is written inside the transaction, so the rows are only really
+    # gone once they are on disk: a crash before commit rolls the DELETE back.
+    async with pg.acquire() as conn:
+        async with conn.transaction():
+            deleted_records = await conn.fetch(_DELETE_RETURNING_SQL, service, purge_keys)
+            # RETURNING has no ORDER BY; sort so the artifact is diffable and
+            # matches the dry-run CSV's ordering.
+            rows = sorted(
+                (dict(r) for r in deleted_records),
+                key=lambda r: (
+                    r["artist_normalized"] or "",
+                    r["album_normalized"] or "",
+                    r["song_normalized"] or "",
+                ),
+            )
+            write_recovery_csv(out, rows)
+
     log.info(
-        "deleted %d rows across %d keys (%s). Next wave: --after %r",
+        "deleted %d rows across %d keys. Next wave: --after %r",
         len(rows),
         len(purge_keys),
-        status,
         next_after,
     )
     return len(rows)
@@ -238,6 +287,30 @@ async def main(args: argparse.Namespace) -> None:
         await pg.close()
 
 
+def _non_negative_int(raw: str) -> int:
+    """``argparse`` type for ``--limit``.
+
+    A negative value is truthy, so it would reach ``LIMIT $4`` and make asyncpg
+    raise ``LIMIT must not be negative`` partway through a prod wave. Reject it
+    before any connection is opened.
+    """
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"--limit must be >= 0 (0 means all), got {value}")
+    return value
+
+
+def _default_out_path() -> str:
+    """Timestamped, so consecutive waves cannot collide.
+
+    A fixed default would have wave 2 truncate wave 1's recovery CSV — and a
+    plain re-check dry-run writes the CSV too, so the collision does not even
+    need a second DELETE to destroy the first wave's record. Local time: this
+    names a file an operator correlates with their own run log.
+    """
+    return f"/tmp/lml-1139-purged-{datetime.now().strftime('%Y%m%dT%H%M%S%f')}.csv"
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -247,7 +320,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--limit",
-        type=int,
+        type=_non_negative_int,
         default=0,
         help="Distinct artist keys to examine in this wave (0 = all). Bounds re-probe load.",
     )
@@ -258,9 +331,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--out",
-        default="/tmp/lml-1139-purged.csv",
-        help="Recovery CSV path, written before the DELETE. Use a distinct path per wave "
-        "and copy it somewhere durable (default: /tmp/lml-1139-purged.csv)",
+        default=_default_out_path(),
+        help="Recovery CSV path, written from DELETE ... RETURNING inside the transaction. "
+        "Defaults to a per-invocation timestamped path under /tmp so waves cannot clobber "
+        "each other; an existing path is refused rather than overwritten. Copy each wave's "
+        "file somewhere durable.",
     )
     return parser
 
