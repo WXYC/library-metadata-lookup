@@ -47,9 +47,13 @@ miss was to skip the write entirely (LML#1115) — which also removed the
 only backpressure on the default warm path: with no row, every subsequent
 ``/lookup`` for the same album re-enqueues a fresh background warm for as
 long as the outage lasts (compounding LML#1094's warm-slot contention). The
-column lets both keep a row (backpressure preserved) while aging on
-different clocks: ``is_error=True`` rows self-heal within the short
-``error_ttl``, everything else ages on the 7-day ``miss_ttl``. The column is
+column exists so a *reader* can tell a couldn't-ask apart from a confirmed
+absence — it is not backpressure on the default ``/lookup`` warm path, which
+deliberately bypasses a fresh error row so a retry actually reaches the
+network (see the canonical rationale in
+``lookup/streaming_url_postprocess.py``). Both flavors age on different
+clocks: ``is_error=True`` rows self-heal within the short ``error_ttl``,
+everything else ages on the 7-day ``miss_ttl``. The column is
 ``NOT NULL DEFAULT FALSE``, so every pre-existing row (collected before this
 column existed) reads as a genuine miss — correct, since that is what it is;
 no backfill or reclassification of historical rows is attempted. A later
@@ -624,10 +628,11 @@ async def resolve_streaming_url_with_cache(
        - raises → ``live_error``. In default mode this now (LML#1121) also
          UPSERTs a null entry marked ``is_error=True``, so it ages on the
          much-shorter ``error_ttl`` instead of ``miss_ttl`` -- a couldn't-ask
-         outcome self-heals fast, but still backpressures the default warm
-         path for the outage's duration (see the module docstring). Under
-         ``fail_fast=True`` the exception is RE-RAISED instead, with NO cache
-         write either way -- see the ``fail_fast`` note below.
+         outcome self-heals fast. This does NOT backpressure the default
+         ``/lookup`` warm path, which deliberately bypasses a fresh error row
+         (see the canonical rationale in ``lookup/streaming_url_postprocess.py``).
+         Under ``fail_fast=True`` the exception is RE-RAISED instead, with NO
+         cache write either way -- see the ``fail_fast`` note below.
 
     Uses ``find_album_match`` (album-level), not a track probe, because the
     cache key is the album: a per-track deep-link would cache wrong-track URLs
@@ -704,7 +709,7 @@ async def resolve_streaming_url_with_cache(
         # (service, artist, album) re-enqueued a fresh background warm for as
         # long as the outage lasted, since the warm task's dedup key is
         # discarded once the task completes (see
-        # ``lookup/streaming_url_postprocess.py``'s ``_streaming_warm_in_flight``)
+        # ``lookup/streaming_warm.py``'s ``_streaming_warm_in_flight``)
         # -- unbounded background-task growth that starves sibling services on
         # the shared warm semaphore (LML#1094). The error row self-heals
         # within ``error_ttl`` (default 5 minutes) instead of a week.
