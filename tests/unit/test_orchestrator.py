@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from core.exceptions import BreakerOpenError
+from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import DiscogsSearchResponse
 from entity.compilation_track_location import CompilationTrackLocationRow
 from generated.api_models import (
@@ -31,6 +33,11 @@ from lookup.orchestrator import LookupState, perform_lookup
 from lookup.spine_deadline import LIMIT_CALLER_BUDGET, SpineDeadline
 from tests.conftest import make_lml_telemetry
 from tests.factories import make_discogs_result, make_library_item
+
+
+class _FutureStreamingBreakerOpenError(BreakerOpenError):
+    """Stand-in for a breaker that does not exist yet (LML#1118 regression pin)."""
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -168,58 +175,29 @@ class TestPerformLookupBasic:
         assert response.song_not_found is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "breaker_cls",
+        [DiscogsBreakerOpenError, _FutureStreamingBreakerOpenError],
+        ids=["discogs-breaker", "future-breaker-subclass"],
+    )
     async def test_breaker_shed_in_tail_degrades_to_cache_only_not_500(
-        self, mock_library_db, mock_discogs_service, telemetry, queen_item
+        self, mock_library_db, mock_discogs_service, telemetry, stereolab_item, breaker_cls
     ):
-        """R2-2 backstop: a ``DiscogsBreakerOpenError`` raised from a post-search
-        step (here artwork fetch) must be caught in ``perform_lookup`` and
-        degraded to a cache-only/partial response — the library results already
-        found are returned, artwork/enrichment pending — NOT propagated to a 500.
-        Defense in depth beyond the runner catch."""
-        from discogs.breaker import DiscogsBreakerOpenError
+        """R2-2 backstop: a breaker-open shed raised from a post-search step
+        (here artwork fetch) must be caught in ``perform_lookup`` and degraded
+        to a cache-only/partial response — the library results already found
+        are returned, artwork/enrichment pending — NOT propagated to a 500.
+        Defense in depth beyond the runner catch.
 
-        mock_library_db.search.return_value = [queen_item]
-
-        request = LookupRequest(
-            artist="Queen",
-            album="A Night at the Opera",
-            raw_message="Play A Night at the Opera by Queen",
-        )
-
-        async def _shed(*_a, **_k):
-            raise DiscogsBreakerOpenError("shed mid-enrichment")
-
-        with patch("lookup.orchestrator._step_fetch_artwork", side_effect=_shed):
-            response = await perform_lookup(
-                request, mock_library_db, mock_discogs_service, telemetry
-            )
-
-        # 200-shaped degrade: the library match survives, no exception.
-        assert isinstance(response, LookupResponse)
-        assert len(response.results) == 1
-        assert response.results[0].library_item.artist == "Queen"
-        # LML#930: a saturation-breaker shed is now marked degraded on the wire
-        # with the upstream_unavailable reason (distinct from a deadline shed).
-        assert response.degraded is True
-        assert response.degraded_reason == DegradedReason.upstream_unavailable
-
-    @pytest.mark.asyncio
-    async def test_a_new_breaker_subclass_in_the_tail_also_degrades_to_cache_only(
-        self, mock_library_db, mock_discogs_service, telemetry, stereolab_item
-    ):
-        """LML#1118 regression pin: the tail's catch is typed on
-        ``BreakerOpenError``, not ``DiscogsBreakerOpenError`` specifically, so a
-        breaker that does not exist yet degrades through this same "defense in
-        depth" leg with no further change -- the risk #1118 exists to close
-        before a Bandcamp/YTM/Spotify shed reaches this boundary uncaught and
-        falls into the generic ``except Exception`` -> ``logger.exception`` ->
-        ERROR path, reproducing the #755 flood shape.
+        Parametrized over ``DiscogsBreakerOpenError`` and a throwaway
+        ``BreakerOpenError`` subclass standing in for a breaker that does not
+        exist yet (LML#1118 regression pin): the tail's catch is typed on the
+        shared base, not the concrete Discogs type, so a not-yet-existing
+        breaker (Bandcamp/YTM/Spotify) degrades through this same
+        defense-in-depth leg with no further change -- instead of falling into
+        the generic ``except Exception`` -> ``logger.exception`` -> ERROR path
+        and reproducing the #755 flood shape.
         """
-        from core.exceptions import BreakerOpenError
-
-        class _FutureStreamingBreakerOpenError(BreakerOpenError):
-            """Stand-in for a breaker that does not exist yet."""
-
         mock_library_db.search.return_value = [stereolab_item]
 
         request = LookupRequest(
@@ -229,17 +207,19 @@ class TestPerformLookupBasic:
         )
 
         async def _shed(*_a, **_k):
-            raise _FutureStreamingBreakerOpenError("future breaker open mid-enrichment")
+            raise breaker_cls("shed mid-enrichment")
 
         with patch("lookup.orchestrator._step_fetch_artwork", side_effect=_shed):
             response = await perform_lookup(
                 request, mock_library_db, mock_discogs_service, telemetry
             )
 
-        # 200-shaped degrade, exactly like the DiscogsBreakerOpenError case above.
+        # 200-shaped degrade: the library match survives, no exception.
         assert isinstance(response, LookupResponse)
         assert len(response.results) == 1
         assert response.results[0].library_item.artist == "Stereolab"
+        # LML#930: a saturation-breaker shed is now marked degraded on the wire
+        # with the upstream_unavailable reason (distinct from a deadline shed).
         assert response.degraded is True
         assert response.degraded_reason == DegradedReason.upstream_unavailable
 
