@@ -13,7 +13,7 @@ from streaming.models import SourceMatch
 
 # LML#1108: an absolute ``time.monotonic()`` deadline for the CURRENT
 # background streaming-URL warm probe, set by
-# ``lookup.streaming_url_postprocess._warm_streaming_url_cache`` right before
+# ``lookup.streaming_warm._warm_streaming_url_cache`` right before
 # its ``asyncio.wait_for`` call and reset in a ``finally`` immediately after.
 # Any streaming client's own retry/backoff loop MAY read it (via
 # :func:`get_probe_deadline`) to bound an inter-attempt sleep against the

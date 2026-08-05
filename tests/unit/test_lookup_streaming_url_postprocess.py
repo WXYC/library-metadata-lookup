@@ -70,6 +70,7 @@ from identity.release_validation import (
     RELEASE_SOURCE_CONFIG,
 )
 from lookup import streaming_url_postprocess as mod
+from lookup import streaming_warm as warm_mod
 from lookup import streaming_warm_admission
 from lookup.streaming_url_postprocess import (
     STREAMING_URL_CACHE_CONFIG,
@@ -233,7 +234,7 @@ def _patch_cache_peek(url, has_fresh_decision=None, is_error=False):
 
 def _patch_resolver(**kwargs):
     """Patch the background-warm probe (``resolve_streaming_url_with_cache``)."""
-    return patch.object(mod, "resolve_streaming_url_with_cache", new=AsyncMock(**kwargs))
+    return patch.object(warm_mod, "resolve_streaming_url_with_cache", new=AsyncMock(**kwargs))
 
 
 # Bounded drain shared with the endpoint-level suite (single source of truth
@@ -278,7 +279,7 @@ class TestSkipConditions:
         peek.assert_not_called()
         resolve.assert_not_called()
         assert update == _blank_update()
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
     async def test_master_on_but_all_per_service_off_does_nothing(self):
         update = _blank_update()
@@ -286,7 +287,7 @@ class TestSkipConditions:
             await _run(update, settings=_settings(master=True))
         peek.assert_not_called()
         resolve.assert_not_called()
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
     @pytest.mark.parametrize("missing", ["pg", "entity_store", "artist", "album"])
     async def test_skips_when_precondition_missing(self, missing):
@@ -311,7 +312,7 @@ class TestSkipConditions:
             await apply_streaming_url_postprocess(update, **kwargs)
         peek.assert_not_called()
         resolve.assert_not_called()
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +331,7 @@ class TestPerServiceGating:
             await _run(update, settings=_settings(service))
         peek.assert_not_called()
         assert update[case["url_field"]] == "https://existing.test/x"
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
     async def test_empty_string_sentinel_is_respected(self, service):
         # "" means "explicitly checked, nothing to surface" — must NOT trigger a
@@ -342,7 +343,7 @@ class TestPerServiceGating:
             await _run(update, settings=_settings(service))
         peek.assert_not_called()
         assert update[case["url_field"]] == ""
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
     async def test_skips_service_when_client_is_none(self, service):
         case = _CASES[service]
@@ -355,7 +356,7 @@ class TestPerServiceGating:
             )
         peek.assert_not_called()
         assert update[case["url_field"]] is None
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
     async def test_per_service_flag_off_reads_only_the_enabled_service(self, service):
         # Enable the OTHER service only; the parametrized service stays off. The
@@ -379,7 +380,7 @@ class TestPerServiceGating:
         assert read_services == [other]
         assert update[case["url_field"]] is None
         assert update[_CASES[other]["url_field"]] == other_url
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +407,7 @@ class TestCacheHit:
         assert update[case["url_field"]] == case["resolved_url"]
         resolve.assert_not_called()
         entity_store.mint_or_get_release_identity.assert_not_called()
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.fired.{service}") is True
         assert calls.get(f"streaming_url.persistent_lookup.cache_hit.{service}") is True
@@ -434,8 +435,8 @@ class TestKnownRecentMiss:
 
         assert update[case["url_field"]] is None
         resolve.assert_not_called()
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.cache_miss_recent.{service}") is True
 
@@ -504,7 +505,7 @@ class TestFreshErrorRowMiss:
             )
             # Unlike a genuine recent miss, a fresh error row DOES schedule a
             # warm -- exactly one, same as a genuine absent/stale miss would.
-            assert len(mod._background_tasks) == 1
+            assert len(warm_mod._background_tasks) == 1
             await _drain_background_tasks()
 
         # The live call actually happened -- not a guaranteed short-circuit
@@ -514,8 +515,8 @@ class TestFreshErrorRowMiss:
             source=service, external_id=case["external_id"]
         )
         assert update[case["url_field"]] is None
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
         # LML#1121 FIX 7: the enqueue sub-outcome is tagged ALONGSIDE
@@ -541,8 +542,8 @@ class TestFreshErrorRowMiss:
         # miss -- an outage during a bulk drain must not spawn request-time
         # warms either.
         resolve.assert_not_called()
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
         # LML#1121 FIX 7: cache_miss_unwarmed is the depth-shed/suppression
@@ -558,9 +559,9 @@ class TestFreshErrorRowMiss:
         # rows. Fill the in-flight set to the bound first so a healthy enqueue
         # would shed; an error-row peek must shed here too, not bypass it.
         case = _CASES[service]
-        bound = mod._streaming_warm_queue_depth_bound()
+        bound = warm_mod._streaming_warm_queue_depth_bound()
         for i in range(bound):
-            mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
+            warm_mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
 
         update = _blank_update()
         scope, transaction = _sentry_scope()
@@ -571,7 +572,7 @@ class TestFreshErrorRowMiss:
         ):
             result = await _run(update, settings=_settings(service))
 
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
         resolve.assert_not_awaited()
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.cache_error_recent.{service}") is True
@@ -610,14 +611,16 @@ class TestCacheMissEnqueuesBackgroundWarm:
         with (
             _patch_cache_peek(None),
             patch.object(
-                mod, "resolve_streaming_url_with_cache", new=AsyncMock(side_effect=gated_resolve)
+                warm_mod,
+                "resolve_streaming_url_with_cache",
+                new=AsyncMock(side_effect=gated_resolve),
             ),
         ):
             await _run(update, settings=_settings(service))
             # Response path completed: field still null, exactly one warm queued,
             # and the probe has NOT returned a URL onto the response.
             assert update[case["url_field"]] is None
-            assert len(mod._background_tasks) == 1
+            assert len(warm_mod._background_tasks) == 1
 
             # Let the gated warm finish; it writes the cache (mocked) but must
             # NOT backfill the already-returned response dict.
@@ -626,8 +629,8 @@ class TestCacheMissEnqueuesBackgroundWarm:
 
         assert probed == [service]
         assert update[case["url_field"]] is None
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
 
     async def test_response_path_records_zero_probe_awaits_even_when_probe_raises(self):
         # PR2 of #706 hardens the Event-gated ordering test above into a
@@ -651,7 +654,7 @@ class TestCacheMissEnqueuesBackgroundWarm:
         with (
             _patch_cache_peek(None),
             patch.object(
-                mod,
+                warm_mod,
                 "resolve_streaming_url_with_cache",
                 new=AsyncMock(side_effect=raise_if_awaited),
             ),
@@ -666,15 +669,15 @@ class TestCacheMissEnqueuesBackgroundWarm:
             # such an await, update this assertion knowingly (the Event-gated
             # test above still carries the pure does-not-WAIT invariant).
             assert probe_awaits == []
-            assert len(mod._background_tasks) == 1
+            assert len(warm_mod._background_tasks) == 1
 
             await _drain_background_tasks()
 
         # The warm DID run the probe off-path and swallowed its failure.
         assert probe_awaits == [service]
         assert update["apple_music_url"] is None
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
 
     @pytest.mark.parametrize("service", list(_CASES))
     async def test_background_warm_runs_probe_and_mints_on_live_resolved(self, service):
@@ -762,8 +765,8 @@ class TestCacheMissEnqueuesBackgroundWarm:
 
         # Reached the mint, swallowed the error, left the task set clean.
         entity_store.mint_or_get_release_identity.assert_awaited_once()
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
 
     async def test_background_warm_probe_exception_is_swallowed(self):
         # resolve_streaming_url_with_cache swallows its own client errors, but a
@@ -779,8 +782,8 @@ class TestCacheMissEnqueuesBackgroundWarm:
             await _drain_background_tasks()
 
         assert update["apple_music_url"] is None
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
 
     async def test_background_warm_bandcamp_transport_failure_no_mint_writes_short_ttl_error_row(
         self,
@@ -831,8 +834,8 @@ class TestCacheMissEnqueuesBackgroundWarm:
         call = pg.execute.await_args
         assert call.args[4] is None
         assert call.args[5] is True
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
 
     async def test_background_warm_slow_bandcamp_response_still_writes_an_error_row(self):
         # LML#1121 FIX 4: the dominant Cloudflare-under-load failure mode --
@@ -890,8 +893,8 @@ class TestCacheMissEnqueuesBackgroundWarm:
         call = pg.execute.await_args
         assert call.args[4] is None
         assert call.args[5] is True
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +920,7 @@ class TestCachePeekError:
 
         assert update["apple_music_url"] is None
         resolve.assert_not_called()
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
     async def test_one_service_peek_error_does_not_block_the_other(self):
         # Apple peek raises; Spotify hits. The healthy service must still fill.
@@ -936,7 +939,7 @@ class TestCachePeekError:
 
         assert update["apple_music_url"] is None
         assert update["spotify_url"] == _CASES["spotify_album"]["resolved_url"]
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -961,8 +964,8 @@ class TestBulkSuppression:
 
         assert update["apple_music_url"] is None
         resolve.assert_not_called()
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
 
@@ -977,7 +980,7 @@ class TestBulkSuppression:
             await _run(update, settings=_settings(service))
 
         assert update[case["url_field"]] == case["resolved_url"]
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -1014,11 +1017,11 @@ class TestBulkBandcampWarmExemption:
             result = await _run(
                 update, settings=_settings("bandcamp", bulk_bandcamp_warm=True), is_rowless=True
             )
-            assert len(mod._background_tasks) == 1
+            assert len(warm_mod._background_tasks) == 1
             await _drain_background_tasks()
 
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get("streaming_url.persistent_lookup.cache_miss_enqueued.bandcamp") is True
         assert calls.get("streaming_url.persistent_lookup.cache_miss_unwarmed.bandcamp") is None
@@ -1045,8 +1048,8 @@ class TestBulkBandcampWarmExemption:
             )
 
         resolve.assert_not_called()
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get("streaming_url.persistent_lookup.cache_miss_unwarmed.bandcamp") is True
 
@@ -1069,8 +1072,8 @@ class TestBulkBandcampWarmExemption:
             )
 
         resolve.assert_not_called()
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get("streaming_url.persistent_lookup.cache_miss_unwarmed.bandcamp") is True
 
@@ -1090,8 +1093,8 @@ class TestBulkBandcampWarmExemption:
             await _run(update, settings=_settings(service, bulk_bandcamp_warm=True))
 
         resolve.assert_not_called()
-        assert not mod._background_tasks
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._background_tasks
+        assert not warm_mod._streaming_warm_in_flight
         # Sentry keys use the storage key (``spotify_album``), not the catalog key.
         calls = {c.args[0]: c.args[1] for c in transaction.set_data.call_args_list}
         assert calls.get(f"streaming_url.persistent_lookup.cache_miss_unwarmed.{service}") is True
@@ -1106,9 +1109,9 @@ class TestBulkBandcampWarmExemption:
             _patch_resolver(return_value=ResolveOutcome(url=None, source="live_miss")),
         ):
             await _run(update, settings=_settings("bandcamp", bulk_bandcamp_warm=False))
-            assert len(mod._background_tasks) == 1
+            assert len(warm_mod._background_tasks) == 1
             await _drain_background_tasks()
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -1281,7 +1284,9 @@ class TestDedup:
         with (
             _patch_cache_peek(None),
             patch.object(
-                mod, "resolve_streaming_url_with_cache", new=AsyncMock(side_effect=gated_resolve)
+                warm_mod,
+                "resolve_streaming_url_with_cache",
+                new=AsyncMock(side_effect=gated_resolve),
             ),
         ):
             # Fire two concurrent lookups for the SAME (artist, album); the
@@ -1290,13 +1295,13 @@ class TestDedup:
                 _run(_blank_update(), settings=_settings(service)),
                 _run(_blank_update(), settings=_settings(service)),
             )
-            assert len(mod._background_tasks) == 1
+            assert len(warm_mod._background_tasks) == 1
 
             release.set()
             await _drain_background_tasks()
 
         assert probed == [service]
-        assert not mod._streaming_warm_in_flight
+        assert not warm_mod._streaming_warm_in_flight
 
     async def test_dedup_key_clears_after_warm_completes(self):
         # A second lookup AFTER the first warm drained must enqueue afresh
@@ -1311,7 +1316,7 @@ class TestDedup:
         ):
             await _run(_blank_update(), settings=_settings(service))
             await _drain_background_tasks()
-            assert not mod._streaming_warm_in_flight
+            assert not warm_mod._streaming_warm_in_flight
 
             await _run(_blank_update(), settings=_settings(service))
             await _drain_background_tasks()
@@ -1385,22 +1390,22 @@ class TestSentryProjection:
 
 class TestWarmConcurrencyBound:
     def test_env_var_name_and_default(self):
-        assert mod._STREAMING_WARM_CONCURRENCY_ENV_VAR == "LML_STREAMING_WARM_CONCURRENCY"
-        assert mod._STREAMING_WARM_CONCURRENCY_DEFAULT == 4
+        assert warm_mod._STREAMING_WARM_CONCURRENCY_ENV_VAR == "LML_STREAMING_WARM_CONCURRENCY"
+        assert warm_mod._STREAMING_WARM_CONCURRENCY_DEFAULT == 4
 
     def test_semaphore_uses_env_override(self, monkeypatch):
-        monkeypatch.setenv(mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, "2")
-        mod._streaming_warm_semaphore = None
-        sem = mod._get_streaming_warm_semaphore()
+        monkeypatch.setenv(warm_mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, "2")
+        warm_mod._streaming_warm_semaphore = None
+        sem = warm_mod._get_streaming_warm_semaphore()
         assert sem._value == 2
-        mod._streaming_warm_semaphore = None
+        warm_mod._streaming_warm_semaphore = None
 
     def test_semaphore_falls_back_to_default_when_unset(self, monkeypatch):
-        monkeypatch.delenv(mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, raising=False)
-        mod._streaming_warm_semaphore = None
-        sem = mod._get_streaming_warm_semaphore()
-        assert sem._value == mod._STREAMING_WARM_CONCURRENCY_DEFAULT
-        mod._streaming_warm_semaphore = None
+        monkeypatch.delenv(warm_mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, raising=False)
+        warm_mod._streaming_warm_semaphore = None
+        sem = warm_mod._get_streaming_warm_semaphore()
+        assert sem._value == warm_mod._STREAMING_WARM_CONCURRENCY_DEFAULT
+        warm_mod._streaming_warm_semaphore = None
 
 
 # ---------------------------------------------------------------------------
@@ -1413,15 +1418,15 @@ class TestWarmConcurrencyBound:
 class TestWarmQueueDepthBoundResolution:
     def test_depth_bound_is_concurrency_times_the_default_multiplier(self, monkeypatch):
         monkeypatch.delenv(streaming_warm_admission.QUEUE_DEPTH_MULTIPLIER_ENV_VAR, raising=False)
-        monkeypatch.setenv(mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, "1")
-        mod._streaming_warm_semaphore = None
-        mod._get_streaming_warm_semaphore()
-        assert mod._streaming_warm_concurrency == 1
+        monkeypatch.setenv(warm_mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, "1")
+        warm_mod._streaming_warm_semaphore = None
+        warm_mod._get_streaming_warm_semaphore()
+        assert warm_mod._streaming_warm_concurrency == 1
         assert (
-            mod._streaming_warm_queue_depth_bound()
+            warm_mod._streaming_warm_queue_depth_bound()
             == 1 * streaming_warm_admission.QUEUE_DEPTH_MULTIPLIER_DEFAULT
         )
-        mod._streaming_warm_semaphore = None
+        warm_mod._streaming_warm_semaphore = None
 
     def test_depth_bound_honors_the_multiplier_env_override(self, monkeypatch):
         """LML#1108 review finding 6: with #1094 forbidding a runtime bump to
@@ -1429,25 +1434,25 @@ class TestWarmQueueDepthBoundResolution:
         no-redeploy lever available for the depth bound -- confirm it's
         actually live-tunable, read fresh (not cached at semaphore-build
         time like the concurrency itself)."""
-        monkeypatch.setenv(mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, "1")
-        mod._streaming_warm_semaphore = None
-        mod._get_streaming_warm_semaphore()
+        monkeypatch.setenv(warm_mod._STREAMING_WARM_CONCURRENCY_ENV_VAR, "1")
+        warm_mod._streaming_warm_semaphore = None
+        warm_mod._get_streaming_warm_semaphore()
 
         monkeypatch.setenv(streaming_warm_admission.QUEUE_DEPTH_MULTIPLIER_ENV_VAR, "32")
-        assert mod._streaming_warm_queue_depth_bound() == 32
+        assert warm_mod._streaming_warm_queue_depth_bound() == 32
 
         monkeypatch.setenv(streaming_warm_admission.QUEUE_DEPTH_MULTIPLIER_ENV_VAR, "8")
-        assert mod._streaming_warm_queue_depth_bound() == 8
+        assert warm_mod._streaming_warm_queue_depth_bound() == 8
 
-        mod._streaming_warm_semaphore = None
+        warm_mod._streaming_warm_semaphore = None
 
 
 @pytest.mark.asyncio
 class TestWarmQueueDepthBound:
     async def test_enqueue_succeeds_one_below_the_bound(self):
-        bound = mod._streaming_warm_queue_depth_bound()
+        bound = warm_mod._streaming_warm_queue_depth_bound()
         for i in range(bound - 1):
-            mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
+            warm_mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
 
         service = "apple_music_album"
         update = _blank_update()
@@ -1456,15 +1461,15 @@ class TestWarmQueueDepthBound:
             _patch_resolver(return_value=ResolveOutcome(url=None, source="live_error")),
         ):
             statuses = await _run(update, settings=_settings(service))
-            assert len(mod._background_tasks) == 1
+            assert len(warm_mod._background_tasks) == 1
             await _drain_background_tasks()
 
         assert statuses["apple_music"] == StreamingResolutionStatus.unresolved
 
     async def test_enqueue_sheds_at_the_bound_instead_of_queueing(self):
-        bound = mod._streaming_warm_queue_depth_bound()
+        bound = warm_mod._streaming_warm_queue_depth_bound()
         for i in range(bound):
-            mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
+            warm_mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
 
         service = "apple_music_album"
         update = _blank_update()
@@ -1472,16 +1477,16 @@ class TestWarmQueueDepthBound:
             statuses = await _run(update, settings=_settings(service))
 
         # Shed, not queued: no new task, the probe never scheduled.
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
         resolve.assert_not_awaited()
         # The response contract is unaffected by shedding (LML#1108 constraint):
         # still "unresolved", exactly like a healthy enqueue would report.
         assert statuses["apple_music"] == StreamingResolutionStatus.unresolved
 
     async def test_shed_projects_distinct_sentry_outcome_and_counts_via_cache_stats(self):
-        bound = mod._streaming_warm_queue_depth_bound()
+        bound = warm_mod._streaming_warm_queue_depth_bound()
         for i in range(bound):
-            mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
+            warm_mod._streaming_warm_in_flight.add(("dummy", f"artist{i}", f"album{i}"))
 
         service = "apple_music_album"
         update = _blank_update()
@@ -1511,10 +1516,10 @@ class TestWarmQueueDepthBound:
         from wxyc_etl.text import to_match_form
 
         key = (service, to_match_form(_ARTIST), to_match_form(_ALBUM))
-        bound = mod._streaming_warm_queue_depth_bound()
+        bound = warm_mod._streaming_warm_queue_depth_bound()
         for i in range(bound):
-            mod._streaming_warm_in_flight.add((f"dummy{i}", f"artist{i}", f"album{i}"))
-        mod._streaming_warm_in_flight.add(key)
+            warm_mod._streaming_warm_in_flight.add((f"dummy{i}", f"artist{i}", f"album{i}"))
+        warm_mod._streaming_warm_in_flight.add(key)
 
         update = _blank_update()
         with _patch_cache_peek(None), _patch_resolver() as resolve:
@@ -1523,7 +1528,7 @@ class TestWarmQueueDepthBound:
         # No task created (dedup short-circuits before the depth check), and
         # no shed telemetry -- this path returns True (enqueued/deduped) from
         # ``_enqueue_streaming_warm``, never reaching the shed branch.
-        assert not mod._background_tasks
+        assert not warm_mod._background_tasks
         resolve.assert_not_awaited()
 
 
@@ -1567,11 +1572,11 @@ class TestProbeDeadlinePropagation:
         with (
             _patch_cache_peek(None),
             patch.object(
-                mod,
+                warm_mod,
                 "resolve_streaming_url_with_cache",
                 new=AsyncMock(side_effect=observing_resolve),
             ),
-            patch.object(mod, "_mint_identity", new=AsyncMock()),
+            patch.object(warm_mod, "_mint_identity", new=AsyncMock()),
         ):
             await _run(update, settings=_settings(service))
             await _drain_background_tasks()
@@ -1606,7 +1611,7 @@ class TestProbeDeadlinePropagation:
             _patch_resolver(
                 return_value=ResolveOutcome(url=case["resolved_url"], source="live_resolved")
             ),
-            patch.object(mod, "_mint_identity", new=AsyncMock(side_effect=observing_mint)),
+            patch.object(warm_mod, "_mint_identity", new=AsyncMock(side_effect=observing_mint)),
         ):
             await _run(update, settings=_settings(service))
             await _drain_background_tasks()
@@ -1632,7 +1637,7 @@ class TestProbeDeadlinePropagation:
         with (
             _patch_cache_peek(None),
             _patch_resolver(side_effect=RuntimeError("boom")),
-            patch.object(mod.logger, "exception", side_effect=observing_log_exception),
+            patch.object(warm_mod.logger, "exception", side_effect=observing_log_exception),
         ):
             await _run(update, settings=_settings(service))
             await _drain_background_tasks()
@@ -1725,7 +1730,9 @@ class TestPerServiceTimeoutResolution:
 
         monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
         assert (
-            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG[StreamingService.BANDCAMP])
+            warm_mod._effective_probe_timeout_s(
+                STREAMING_URL_CACHE_CONFIG[StreamingService.BANDCAMP]
+            )
             == 9.0
         )
 
@@ -1734,7 +1741,9 @@ class TestPerServiceTimeoutResolution:
 
         monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
         assert (
-            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG[StreamingService.APPLE_MUSIC])
+            warm_mod._effective_probe_timeout_s(
+                STREAMING_URL_CACHE_CONFIG[StreamingService.APPLE_MUSIC]
+            )
             == 1.5
         )
 
@@ -1743,7 +1752,9 @@ class TestPerServiceTimeoutResolution:
 
         monkeypatch.delenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, raising=False)
         assert (
-            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG[StreamingService.APPLE_MUSIC])
+            warm_mod._effective_probe_timeout_s(
+                STREAMING_URL_CACHE_CONFIG[StreamingService.APPLE_MUSIC]
+            )
             == 4.0
         )
 
@@ -1752,6 +1763,8 @@ class TestPerServiceTimeoutResolution:
 
         monkeypatch.setenv(APPLE_MUSIC_LOOKUP_TIMEOUT_ENV_VAR, "1500")
         assert (
-            mod._effective_probe_timeout_s(STREAMING_URL_CACHE_CONFIG[StreamingService.SPOTIFY])
+            warm_mod._effective_probe_timeout_s(
+                STREAMING_URL_CACHE_CONFIG[StreamingService.SPOTIFY]
+            )
             == 4.0
         )

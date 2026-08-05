@@ -35,6 +35,7 @@ from entity.sources import PgSource
 from entity.store import EntityStore
 from entity.streaming_url_cache import ResolveOutcome
 from lookup import streaming_url_postprocess as streaming_mod
+from lookup import streaming_warm as warm_mod
 from tests.conftest import drain_streaming_warm_tasks, reset_streaming_warm_state
 from tests.factories import make_discogs_result
 
@@ -135,9 +136,10 @@ async def offpath_harness(library_db, test_settings, monkeypatch):
 
     Guarded seams — stated precisely, because each has a boundary:
 
-    * ``resolve_streaming_url_with_cache`` / ``peek_cached_streaming_url`` are
-      patched **on the post-process module's bindings**
-      (``lookup.streaming_url_postprocess``). A regression that re-inlines the
+    * ``peek_cached_streaming_url`` is patched on the post-process module's
+      binding (``lookup.streaming_url_postprocess``); ``resolve_streaming_url_with_cache``
+      is patched on the warm-executor module's binding (``lookup.streaming_warm``,
+      LML#1121 review Table 6 extraction). A regression that re-inlines the
       probe through those bindings deadlocks the response against the closed
       gate and trips the outer ``wait_for``. A future call site that imports
       the resolver directly from ``entity.streaming_url_cache`` would NOT be
@@ -305,7 +307,7 @@ async def offpath_harness(library_db, test_settings, monkeypatch):
                 new=AsyncMock(return_value=(None, False, False)),
             ),
             patch.object(
-                streaming_mod,
+                warm_mod,
                 "resolve_streaming_url_with_cache",
                 new=AsyncMock(side_effect=gated_resolve),
             ),
@@ -326,7 +328,7 @@ async def offpath_harness(library_db, test_settings, monkeypatch):
         # the loop closes cleanly (no destroyed-pending-task noise burying the
         # real assertion failure).
         gate.set()
-        pending = list(streaming_mod._background_tasks)
+        pending = list(warm_mod._background_tasks)
         for task in pending:
             task.cancel()
         if pending:
@@ -366,7 +368,7 @@ class TestApiLookupStreamingProbeOffPath:
         # neither the gated probe's URL nor anything else Apple-shaped.
         assert "music.apple.com" not in resp.text
         # Exactly one warm was scheduled for the (apple, artist, album) miss.
-        assert len(streaming_mod._background_tasks) == 1
+        assert len(warm_mod._background_tasks) == 1
 
         # Release the gate: the warm must run the probe + mint to completion.
         h.gate.set()
@@ -376,7 +378,7 @@ class TestApiLookupStreamingProbeOffPath:
         h.entity_store.mint_or_get_release_identity.assert_awaited_once_with(
             source="apple_music_album", external_id="1234567890"
         )
-        assert not streaming_mod._streaming_warm_in_flight
+        assert not warm_mod._streaming_warm_in_flight
         # The album-level client probe was never bypass-called directly.
         h.apple.find_album_match.assert_not_awaited()
 
@@ -413,13 +415,13 @@ class TestApiLookupStreamingProbeOffPath:
 
         assert resp.status_code == 200
         assert "music.apple.com" not in resp.text
-        assert len(streaming_mod._background_tasks) == 1
+        assert len(warm_mod._background_tasks) == 1
 
         h.gate.set()
         await _drain_background_tasks()
 
         assert h.probed == [("apple_music_album", "Stereolab", "Emperor Tomato Ketchup")]
-        assert not streaming_mod._streaming_warm_in_flight
+        assert not warm_mod._streaming_warm_in_flight
         # The happy-path track probe is the ALLOWED synchronous Apple call
         # (URL-only; artwork on this branch comes from the Discogs row) — it
         # must have run in-request, unlike the album-level probe.
@@ -466,7 +468,7 @@ class TestApiLookupStreamingProbeOffPath:
         assert [r.status_code for r in responses] == [200] * 5
         # One warm per distinct (service, artist, album) — request-internal
         # duplicate misses (multi-row results) dedup to a single task.
-        assert len(streaming_mod._background_tasks) == 5
+        assert len(warm_mod._background_tasks) == 5
 
         h.gate.set()
         await _drain_background_tasks()
@@ -474,4 +476,4 @@ class TestApiLookupStreamingProbeOffPath:
         assert sorted(h.probed) == sorted(
             ("apple_music_album", artist, album) for artist, album in requests
         )
-        assert not streaming_mod._streaming_warm_in_flight
+        assert not warm_mod._streaming_warm_in_flight

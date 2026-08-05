@@ -33,9 +33,9 @@ from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment.context import EnrichmentContext
 from lookup.streaming_url_postprocess import (
     STREAMING_URL_CACHE_CONFIG,
-    _mint_identity,
     should_suppress_streaming_warm,
 )
+from lookup.streaming_warm import _mint_identity
 from lookup.timeouts import bandcamp_probe_timeout_s
 from streaming.service import ALBUM_CACHE_KEYS, StreamingService
 

@@ -8,7 +8,7 @@ from wxyc_fastapi.observability import RequestTelemetry
 
 from config.settings import get_settings
 from discogs.service import DiscogsApiCheckResult
-from lookup import streaming_url_postprocess as _streaming_mod
+from lookup import streaming_warm as _streaming_warm_mod
 from lookup.streaming_url_postprocess import set_suppress_streaming_warm
 from services.parser import MessageType, ParsedRequest
 from tests.factories import make_library_item
@@ -55,10 +55,12 @@ def reset_streaming_warm_state() -> None:
     Single source of truth — the unit and integration suites previously
     carried diverging per-file copies of this reset.
     """
-    _streaming_mod._streaming_warm_semaphore = None
-    _streaming_mod._streaming_warm_concurrency = _streaming_mod._STREAMING_WARM_CONCURRENCY_DEFAULT
-    _streaming_mod._streaming_warm_in_flight.clear()
-    _streaming_mod._background_tasks.clear()
+    _streaming_warm_mod._streaming_warm_semaphore = None
+    _streaming_warm_mod._streaming_warm_concurrency = (
+        _streaming_warm_mod._STREAMING_WARM_CONCURRENCY_DEFAULT
+    )
+    _streaming_warm_mod._streaming_warm_in_flight.clear()
+    _streaming_warm_mod._background_tasks.clear()
     set_suppress_streaming_warm(False)
 
 
@@ -76,16 +78,16 @@ async def drain_streaming_warm_tasks(timeout_s: float = 5.0) -> None:
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
-    while _streaming_mod._background_tasks:
+    while _streaming_warm_mod._background_tasks:
         remaining = deadline - loop.time()
         if remaining <= 0:
             pytest.fail(
                 f"streaming-warm drain exceeded {timeout_s}s; "
-                f"{len(_streaming_mod._background_tasks)} task(s) still tracked, "
-                f"in-flight keys: {_streaming_mod._streaming_warm_in_flight}"
+                f"{len(_streaming_warm_mod._background_tasks)} task(s) still tracked, "
+                f"in-flight keys: {_streaming_warm_mod._streaming_warm_in_flight}"
             )
         await asyncio.wait_for(
-            asyncio.gather(*list(_streaming_mod._background_tasks), return_exceptions=True),
+            asyncio.gather(*list(_streaming_warm_mod._background_tasks), return_exceptions=True),
             timeout=remaining,
         )
 

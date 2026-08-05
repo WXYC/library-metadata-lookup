@@ -153,17 +153,18 @@ MODULE_BUDGETS: dict[str, int] = {
     # the new ~771-line measured size, not a re-derived 1.3x (which would
     # reopen hundreds of lines of headroom), matching this table's own
     # recalibration convention (see e.g. track_on_compilation.py above).
-    # Recalibrated 2026-08-05 (LML#1121 review, FIXes 2 + 7): the
-    # error-row-triggered warm now bypasses that same row on its own read
-    # (``bypass_error_row``/``error_ttl=timedelta(0)``) instead of
-    # guaranteed-no-op short-circuiting on it, and the Sentry projection now
-    # tags the specific enqueued/unwarmed/shed sub-outcome ALONGSIDE
-    # cache_error_recent instead of being masked by it -- both genuine new
-    # concerns (a correctness fix and an observability fix), not organic
-    # growth. Smallest multiple of 50 at or above the new ~888-line measured
-    # size, not a re-derived 1.3x (matching this table's own recalibration
-    # convention -- see e.g. track_on_compilation.py above).
-    "lookup/streaming_url_postprocess.py": 900,
+    "lookup/streaming_url_postprocess.py": 800,
+    # LML#1121 review: the warm *executor* — the concurrency semaphore, the
+    # in-flight dedup set, the background-task registry, the enqueue, the warm
+    # coroutine itself and its release-identity mint — extracted out of
+    # streaming_url_postprocess.py, which keeps *deciding whether to warm*.
+    # The review's F1/F3 pass left that file at 870 against its 800 ceiling
+    # with only +23 executable lines, so 800 was arithmetically unreachable
+    # (it measured 781 on main); extracting rather than raising follows this
+    # table's convention and the streaming_warm_admission.py precedent
+    # directly below. 1.3x its ~334-line measured size -> smallest multiple of
+    # 50 at or above that, 450.
+    "lookup/streaming_warm.py": 450,
     # LML#1108: pending-warm depth-bound policy, extracted out of
     # streaming_url_postprocess.py to stay under its own ceiling above — a
     # small, self-contained concern (constant + two pure/best-effort
