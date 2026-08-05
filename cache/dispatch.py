@@ -40,7 +40,7 @@ from cache.models import (
     CacheRefreshResultItem,
     SourceRefreshOutcome,
 )
-from discogs.breaker import DiscogsBreakerOpenError
+from core.exceptions import BreakerOpenError
 from discogs.models import ReleaseMetadataResponse
 
 if TYPE_CHECKING:
@@ -135,14 +135,21 @@ async def _refresh_discogs_release(
         release = await discogs_service.get_release(release_id)
     except asyncio.CancelledError:
         raise
-    except DiscogsBreakerOpenError:
-        # LML#1118: kept narrow — this leg only ever calls DiscogsService, and
-        # the ``message="DiscogsBreakerOpenError"`` tag below is a
-        # dashboard-facing per-source label (cache/models.py); widening to the
-        # shared ``BreakerOpenError`` base would let a hypothetical
-        # non-Discogs shed reach here mislabeled with a Discogs-specific tag.
-        # A future non-Discogs release leg would be its own function with its
-        # own tag, not a widened version of this one.
+    except BreakerOpenError as exc:
+        # LML#1118 FIX 2: widened from ``DiscogsBreakerOpenError`` to the
+        # shared ``BreakerOpenError`` base. The prior "kept narrow" rationale
+        # here -- that widening would mislabel a hypothetical non-Discogs shed
+        # with the Discogs-specific ``message="DiscogsBreakerOpenError"`` tag
+        # below -- was refuted by this same file: the generic ``except
+        # Exception`` a few lines down already tags ``message=type(exc)
+        # .__name__``, so ``except BreakerOpenError as exc`` plus that same
+        # ``type(exc).__name__`` tag produces byte-identical output for a
+        # Discogs shed (see the mirroring test in test_cache_dispatch.py) and
+        # closes the gap for every other shed reachable today or later --
+        # including a wired-up ``bandcamp`` leg (LML#548 already lists it in
+        # ``_NOT_IMPLEMENTED_SOURCES`` below and plumbs ``bandcamp_client``
+        # through ``_dispatch_source``/``refresh_identity``), which would
+        # otherwise flood the backfill-cron path LML#814 exists to protect.
         # LML#814: ``get_release`` re-raises a saturation-breaker shed (the
         # LML#755 FIX-1 guard, so ``validate_track_on_release`` can't turn
         # "couldn't ask" into a definitive False). Here in the cache-warmer that
@@ -168,9 +175,7 @@ async def _refresh_discogs_release(
             "external_id=%r; recording retriable error (cache-only)",
             external_id,
         )
-        return None, SourceRefreshOutcome(
-            release_outcome="error", message="DiscogsBreakerOpenError"
-        )
+        return None, SourceRefreshOutcome(release_outcome="error", message=type(exc).__name__)
     except Exception as exc:
         logger.exception("cache refresh: discogs release leg failed external_id=%r", external_id)
         return None, SourceRefreshOutcome(release_outcome="error", message=type(exc).__name__)
@@ -193,10 +198,14 @@ async def _refresh_discogs_artist(
             await discogs_service.get_artist_details(artist_id)
         except asyncio.CancelledError:
             raise
-        except DiscogsBreakerOpenError:
-            # LML#1118: kept narrow — same reason as the release leg above
-            # (``_refresh_discogs_release``): a Discogs-only function tagging
-            # a dashboard-facing ``message="DiscogsBreakerOpenError"`` label.
+        except BreakerOpenError as exc:
+            # LML#1118 FIX 2: widened from ``DiscogsBreakerOpenError`` to the
+            # shared ``BreakerOpenError`` base -- same reason as the release
+            # leg above (``_refresh_discogs_release``): the generic ``except
+            # Exception`` below already tags ``message=type(exc).__name__``,
+            # so this arm's own ``type(exc).__name__`` tag produces
+            # byte-identical output for a Discogs shed while closing the gap
+            # for every other shed reachable today or later.
             # LML#1049: ``get_artist_details`` now re-raises a saturation-breaker
             # shed (mirroring ``get_release``'s LML#755 FIX-1, propagated to this
             # walk-to-artist leg the same way ``_refresh_discogs_release`` above
@@ -207,7 +216,7 @@ async def _refresh_discogs_artist(
             # record to a discrete event) on this cron-driven fan-out.
             #
             # A shed is expected degrade: log at DEBUG and record the retriable
-            # ``error`` outcome, tagged ``message="DiscogsBreakerOpenError"`` so a
+            # ``error`` outcome, tagged with the breaker exception name so a
             # dashboard can tell it apart from a hard leg failure — same shape as
             # the release leg. Nothing negative is persisted: ``get_artist_details``
             # re-raised before any tombstone/write-back (LML#1049 FIX 1), and this
@@ -221,7 +230,7 @@ async def _refresh_discogs_artist(
             return ArtistRefreshOutcome(
                 external_id=str(artist_id),
                 outcome="error",
-                message="DiscogsBreakerOpenError",
+                message=type(exc).__name__,
             )
         except Exception as exc:
             logger.exception("cache refresh: discogs artist leg failed artist_id=%d", artist_id)
