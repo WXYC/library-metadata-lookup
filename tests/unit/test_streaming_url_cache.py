@@ -31,9 +31,12 @@ import pytest
 
 from entity.sources import PgSource
 from entity.streaming_url_cache import (
+    _ERROR_TTL_ENV_VAR,
+    DEFAULT_ERROR_TTL,
     DEFAULT_MISS_TTL,
     get_cached_streaming_url,
     peek_cached_streaming_url,
+    resolve_streaming_error_ttl,
     set_cached_streaming_url,
 )
 
@@ -109,12 +112,55 @@ class TestGetCachedStreamingURL:
         assert "FROM lml_cache.album_streaming_url_cache" in sql
         assert "WHERE service = $1" in sql
         assert "artist_normalized = $2 AND album_normalized = $3" in sql
-        # The TTL filter must be DB-side, not Python-side, and gated on ``$4``.
-        assert "last_checked_at > $4" in sql
-        assert "url IS NOT NULL OR" in sql
-        # Bind order: service, artist, album, cutoff.
+        # The TTL filter must be DB-side, not Python-side, and gated on ``$4``
+        # for a genuine miss (LML#1121: `$5` is the sibling error-row cutoff,
+        # pinned separately in ``test_sql_binds_error_cutoff_as_fifth_param``).
+        assert "NOT is_error AND last_checked_at > $4" in sql
+        assert "url IS NOT NULL" in sql
+        # Bind order: service, artist, album, genuine-miss cutoff.
         assert call.args[1] == service
         assert call.args[4] == now - miss_ttl
+
+    async def test_sql_binds_error_cutoff_as_fifth_param(self, service, sample_url):
+        # LML#1121: a short-TTL error row is distinguished from a genuine
+        # known-miss row via the ``is_error`` column; its own cutoff is bind
+        # ``$5``, resolved from ``error_ttl`` the same way ``miss_ttl``
+        # resolves ``$4``.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
+        error_ttl = timedelta(minutes=5)
+
+        await get_cached_streaming_url(
+            pg,
+            service=service,
+            artist="Hyd",
+            album="Hold Onto Me Infinity",
+            now=now,
+            error_ttl=error_ttl,
+        )
+
+        call = pg.fetchone.await_args
+        sql = call.args[0]
+        assert "is_error" in sql
+        assert "last_checked_at > $5" in sql
+        assert call.args[5] == now - error_ttl
+
+    async def test_error_ttl_defaults_to_env_resolution_when_omitted(self, service, sample_url):
+        # Production callers (the /lookup post-process, the fail-fast probe)
+        # never pass ``error_ttl`` explicitly -- omitting it must still resolve
+        # a live value via ``resolve_streaming_error_ttl`` (env-tunable, no
+        # redeploy), not silently skip the bind.
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
+
+        await get_cached_streaming_url(
+            pg, service=service, artist="Hyd", album="Hold Onto Me Infinity", now=now
+        )
+
+        call = pg.fetchone.await_args
+        assert call.args[5] == now - DEFAULT_ERROR_TTL
 
     async def test_normalizes_artist_and_album_via_to_match_form(self, service, sample_url):
         pg = AsyncMock(spec=PgSource)
@@ -217,11 +263,13 @@ class TestSetCachedStreamingURL:
         sql = call.args[0]
         assert "INSERT INTO lml_cache.album_streaming_url_cache" in sql
         assert "ON CONFLICT (service, artist_normalized, album_normalized)" in sql
-        # Bind: service, artist_normalized, album_normalized, url.
+        # Bind: service, artist_normalized, album_normalized, url, is_error.
         assert call.args[1] == service
         assert call.args[2] == "hyd"
         assert call.args[3] == "hold onto me infinity"
         assert call.args[4] == sample_url
+        # LML#1121: a genuine resolve clears any stale error marker.
+        assert call.args[5] is False
 
     async def test_inserts_known_miss(self, service, sample_url):
         pg = AsyncMock(spec=PgSource)
@@ -237,6 +285,41 @@ class TestSetCachedStreamingURL:
         assert call.args[3] == "estrela acesa"
         # url bound as NULL
         assert call.args[4] is None
+        # LML#1121: a genuine (non-error) miss keeps writing is_error=False.
+        assert call.args[5] is False
+
+    async def test_inserts_error_row(self, service, sample_url):
+        # LML#1121: a transport-failure write marks the row as an error miss
+        # (short TTL) rather than a genuine known-miss (7-day TTL) -- both
+        # share the same NULL url, so the SQL text and the ``is_error`` bind
+        # are the only distinguishing signal.
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+
+        await set_cached_streaming_url(
+            pg, service=service, artist="Sessa", album="Estrela Acesa", url=None, is_error=True
+        )
+
+        call = pg.execute.await_args
+        sql = call.args[0]
+        assert "is_error" in sql
+        assert call.args[4] is None
+        assert call.args[5] is True
+
+    async def test_is_error_coerced_false_when_url_present(self, service, sample_url):
+        # Defensive guard (mirrors LML#824's ``crowd_out`` coercion): a resolved
+        # URL is never simultaneously an error row, regardless of what a
+        # careless caller passes.
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+
+        await set_cached_streaming_url(
+            pg, service=service, artist="Hyd", album="Angel", url=sample_url, is_error=True
+        )
+
+        call = pg.execute.await_args
+        assert call.args[4] == sample_url
+        assert call.args[5] is False
 
     async def test_swallows_pg_error(self, service, sample_url):
         pg = AsyncMock(spec=PgSource)
@@ -252,3 +335,40 @@ def test_default_miss_ttl_is_seven_days():
     # Pin the published default so a careless change to the constant gets
     # caught by review.
     assert DEFAULT_MISS_TTL == timedelta(days=7)
+
+
+def test_default_error_ttl_is_five_minutes():
+    # LML#1121: short enough that a real Bandcamp outage self-heals fast, long
+    # enough to backpressure a hot /lookup loop's re-enqueue during the outage.
+    assert DEFAULT_ERROR_TTL == timedelta(minutes=5)
+
+
+class TestResolveStreamingErrorTTL:
+    """``resolve_streaming_error_ttl`` -- the LML#1121 no-redeploy lever for the
+    short error-row TTL, mirroring ``core.search.resolve_positive_int_env``'s
+    WARN-on-junk contract (unparseable / zero / negative all fall back)."""
+
+    def test_returns_default_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv(_ERROR_TTL_ENV_VAR, raising=False)
+
+        assert resolve_streaming_error_ttl() == DEFAULT_ERROR_TTL
+
+    def test_reads_env_override(self, monkeypatch):
+        monkeypatch.setenv(_ERROR_TTL_ENV_VAR, "10")
+
+        assert resolve_streaming_error_ttl() == timedelta(minutes=10)
+
+    def test_falls_back_on_unparseable_value(self, monkeypatch):
+        monkeypatch.setenv(_ERROR_TTL_ENV_VAR, "not-a-number")
+
+        assert resolve_streaming_error_ttl() == DEFAULT_ERROR_TTL
+
+    def test_falls_back_on_zero(self, monkeypatch):
+        monkeypatch.setenv(_ERROR_TTL_ENV_VAR, "0")
+
+        assert resolve_streaming_error_ttl() == DEFAULT_ERROR_TTL
+
+    def test_falls_back_on_negative(self, monkeypatch):
+        monkeypatch.setenv(_ERROR_TTL_ENV_VAR, "-5")
+
+        assert resolve_streaming_error_ttl() == DEFAULT_ERROR_TTL

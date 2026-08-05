@@ -387,9 +387,17 @@ class TestBudgetGiveupDoesNotPoisonCache:
     chain is caught here -- not just at the isolated-unit level above. Before
     the fix, this scenario UPSERTed a ``url=None`` row with a 7-day
     ``miss_ttl``, durably reporting an album that was merely rate-limited as
-    a sourced "not on Spotify" (``StreamingResolutionStatus.absent``)."""
+    a sourced "not on Spotify" (``StreamingResolutionStatus.absent``).
 
-    async def test_budget_giveup_writes_no_cache_row_and_degrades_to_live_error(self):
+    LML#1121 changed the assertion shape (not the underlying guarantee): the
+    resolver now DOES write a row on a default-mode raise, but marks it
+    ``is_error=True`` so it ages on the short ``error_ttl`` (default 5
+    minutes) rather than the 7-day ``miss_ttl`` this class exists to guard
+    against. "Poisoning the cache" means the durable 7-day negative, not a
+    row at all -- the row itself is the deliberate backpressure fix for
+    LML#1094/#1115's warm-storm review finding."""
+
+    async def test_budget_giveup_writes_short_ttl_error_row_and_degrades_to_live_error(self):
         from entity.sources import PgSource
         from entity.streaming_url_cache import ResolveOutcome, resolve_streaming_url_with_cache
 
@@ -398,6 +406,7 @@ class TestBudgetGiveupDoesNotPoisonCache:
 
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)  # no cache row -> live probe
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
 
         with (
             patch("clients.streaming.spotify.asyncio.sleep", new=AsyncMock()),
@@ -417,7 +426,11 @@ class TestBudgetGiveupDoesNotPoisonCache:
                 reset_probe_deadline(token)
 
         assert outcome == ResolveOutcome(url=None, source="live_error")
-        # The load-bearing assertion: zero PG writes. A pre-fix regression
-        # (returning `[]` instead of raising) would UPSERT a durable
-        # `url=None` negative here.
-        pg.execute.assert_not_called()
+        # The load-bearing assertion: a SHORT-TTL error row, not the durable
+        # 7-day negative. A pre-#1115 regression (returning `[]` instead of
+        # raising) would UPSERT a genuine (`is_error=False`) `url=None` row
+        # here instead.
+        pg.execute.assert_awaited_once()
+        call = pg.execute.await_args
+        assert call.args[4] is None
+        assert call.args[5] is True

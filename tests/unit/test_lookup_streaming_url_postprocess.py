@@ -624,20 +624,29 @@ class TestCacheMissEnqueuesBackgroundWarm:
         assert not mod._background_tasks
         assert not mod._streaming_warm_in_flight
 
-    async def test_background_warm_bandcamp_transport_failure_no_mint_no_cache_write(self):
-        # LML#1115: end-to-end through the REAL BandcampClient (mocked only
-        # at the HTTP transport) and the REAL resolve_streaming_url_with_cache
-        # -- not _patch_resolver's stand-in, which would agree with whatever
-        # the client's contract used to be. A default-mode Bandcamp transport
-        # failure (5xx here) must not crash this fire-and-forget task, must
-        # not mint, and -- the headline #1115 fix -- must not UPSERT a 7-day
-        # known-miss row for an outage.
+    async def test_background_warm_bandcamp_transport_failure_no_mint_writes_short_ttl_error_row(
+        self,
+    ):
+        # LML#1115 + LML#1121: end-to-end through the REAL BandcampClient
+        # (mocked only at the HTTP transport) and the REAL
+        # resolve_streaming_url_with_cache -- not _patch_resolver's stand-in,
+        # which would agree with whatever the client's contract used to be. A
+        # default-mode Bandcamp transport failure (5xx here) must not crash
+        # this fire-and-forget task and must not mint. #1115's headline fix
+        # (must not UPSERT a 7-day known-miss row for an outage) still holds,
+        # but #1121 review found that dropping the write ENTIRELY also
+        # dropped the only backpressure on this warm path -- the dedup key in
+        # `_streaming_warm_in_flight` is discarded once this task finishes, so
+        # every subsequent /lookup for the same album would re-enqueue a
+        # fresh warm for as long as the outage lasted. The fix: still write a
+        # row, marked `is_error=True` so it ages on the short `error_ttl`
+        # (default 5 minutes) instead of the 7-day `miss_ttl`.
         service = "bandcamp"
         update = _blank_update()
         entity_store = _entity_store()
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
-        pg.execute = AsyncMock()
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
 
         bandcamp = BandcampClient()
         bandcamp._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
@@ -660,7 +669,10 @@ class TestCacheMissEnqueuesBackgroundWarm:
 
         assert update["bandcamp_url"] is None
         entity_store.mint_or_get_release_identity.assert_not_called()
-        pg.execute.assert_not_called()
+        pg.execute.assert_awaited_once()
+        call = pg.execute.await_args
+        assert call.args[4] is None
+        assert call.args[5] is True
         assert not mod._background_tasks
         assert not mod._streaming_warm_in_flight
 
