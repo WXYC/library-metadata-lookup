@@ -8,7 +8,41 @@ test exercises both the skip set (V/A bucket filings) and the keep set
 
 from __future__ import annotations
 
-from scripts.audit_va_writeback_pollution import classify
+import re
+
+import pytest
+
+from scripts.audit_va_writeback_pollution import SUPERSET_REGEX, classify
+
+_NET = re.compile(SUPERSET_REGEX)
+
+
+@pytest.mark.parametrize(
+    "library_name",
+    [
+        "various artists - blues",
+        "v/a",
+        "v/a - soundtracks",
+        "v.a.",
+        # LML#1139: the dotless family. The original `v\.a\.` alternative
+        # required a trailing dot, so these were arbiter-True and net-False —
+        # `--apply` left them classified as clean and never deleted them.
+        "v.a",
+        "v.a - jazz",
+        "v.a 1998",
+        "soundtrack",
+        "compilation",
+    ],
+)
+def test_regex_is_a_true_superset_of_the_arbiter(library_name: str):
+    """The module docstring calls the regex a SUPERSET of the arbiter. Since the
+    SQL net is what bounds the scan, any arbiter-positive name the net misses is
+    pollution the audit can never see — so the claim has to be enforced, not
+    just asserted in prose."""
+    assert classify([(1, library_name)])[0], f"{library_name!r} should be arbiter-positive"
+    assert _NET.search(library_name) is not None, (
+        f"{library_name!r} is confirmed V/A pollution but the coarse net misses it"
+    )
 
 
 def test_classify_splits_v_a_filings_from_real_artists():

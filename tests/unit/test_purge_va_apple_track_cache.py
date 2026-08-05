@@ -2,8 +2,10 @@
 
 The arbiter (``classify``) and the recovery-CSV writer are pure, so the logic
 that actually decides what gets deleted is tested here without a database. The
-live DB path — wave cursoring, the ``ANY($2)`` array bind, DELETE shape — is
-exercised by the ``@pytest.mark.pg`` suite (mirrors the split documented in
+live DB path — wave cursoring, the ``ANY($2)`` array bind, the
+``DELETE … RETURNING`` shape and its transaction — is exercised against a real
+PostgreSQL in ``tests/integration/test_purge_va_apple_track_cache_pg.py``
+(mirrors the split documented in
 ``tests/unit/test_seed_library_release_overrides.py``).
 """
 
@@ -11,11 +13,13 @@ from __future__ import annotations
 
 import csv
 import re
+from contextlib import asynccontextmanager
 
 import pytest
 
 from scripts.purge_va_apple_track_cache import (
     SUPERSET_REGEX,
+    _build_arg_parser,
     classify,
     purge,
     write_recovery_csv,
@@ -112,6 +116,74 @@ class TestWriteRecoveryCsv:
             }
         ]
 
+    def test_refuses_to_overwrite_an_existing_file(self, tmp_path):
+        """The recovery CSV is the ONLY record of a knowingly-over-deleting,
+        irreversible DELETE. Truncating one wave's file with the next wave's
+        rows destroys the earlier wave's recoverability, so a collision must
+        abort loudly rather than silently clobber."""
+        out = tmp_path / "purged.csv"
+        out.write_text("wave 1 rows we must not lose\n", encoding="utf-8")
+
+        with pytest.raises(FileExistsError, match="already exists"):
+            write_recovery_csv(out, [_ROW])
+
+        assert out.read_text(encoding="utf-8") == "wave 1 rows we must not lose\n"
+
+
+class TestArgParser:
+    def test_out_default_is_unique_per_invocation(self):
+        """A fixed default path would have later waves clobber earlier ones.
+        Two parses must not agree on a filename."""
+        first = _build_arg_parser().parse_args([]).out
+        second = _build_arg_parser().parse_args([]).out
+        assert first != second
+        assert first.endswith(".csv")
+
+    @pytest.mark.parametrize("bad", ["-5", "-1"])
+    def test_negative_limit_is_rejected_at_parse_time(self, bad: str):
+        """``LIMIT $4`` with a negative bind makes asyncpg raise partway through
+        a prod run; reject it before any connection is opened."""
+        with pytest.raises(SystemExit):
+            _build_arg_parser().parse_args(["--limit", bad])
+
+    def test_zero_limit_still_means_all(self):
+        assert _build_arg_parser().parse_args(["--limit", "0"]).limit == 0
+
+
+class _FakeConn:
+    """Minimal asyncpg-connection stand-in with transaction + fetch."""
+
+    def __init__(self, parent: _FakePg):
+        self._parent = parent
+
+    def transaction(self):
+        return _FakeTransaction(self._parent)
+
+    async def fetch(self, query: str, *args):
+        self._parent.executed.append((query, args))
+        return list(self._parent._rows)
+
+
+class _FakeTransaction:
+    def __init__(self, parent: _FakePg):
+        self._parent = parent
+
+    async def __aenter__(self):
+        self._parent.transaction_depth += 1
+        self._parent.max_transaction_depth = max(
+            self._parent.max_transaction_depth, self._parent.transaction_depth
+        )
+        return self
+
+    async def __aexit__(self, *exc):
+        self._parent.transaction_depth -= 1
+        self._parent.committed = exc[0] is None
+        # Ordering proof: the recovery artifact must already be on disk when
+        # the DELETE commits, so a crash can never lose rows it did not record.
+        if self._parent.out_path is not None:
+            self._parent.csv_existed_at_commit = self._parent.out_path.exists()
+        return False
+
 
 class _FakePg:
     """Records the SQL/args it is handed so the purge's shape can be asserted."""
@@ -121,6 +193,14 @@ class _FakePg:
         self._rows = rows if rows is not None else []
         self.calls: list[tuple[str, tuple]] = []
         self.executed: list[tuple[str, tuple]] = []
+        self.transaction_depth = 0
+        self.max_transaction_depth = 0
+        self.committed = False
+        # Set by tests that want the ordering proof in `_FakeTransaction`.
+        self.out_path = None
+        # Snapshot of whether the CSV existed at the moment the transaction
+        # closed — proves ordering rather than merely final state.
+        self.csv_existed_at_commit: bool | None = None
 
     async def fetchall(self, query: str, *args):
         self.calls.append((query, args))
@@ -128,9 +208,9 @@ class _FakePg:
             return [{"artist_normalized": k} for k in self._keys]
         return self._rows
 
-    async def execute(self, query: str, *args):
-        self.executed.append((query, args))
-        return f"DELETE {len(self._rows)}"
+    @asynccontextmanager
+    async def acquire(self):
+        yield _FakeConn(self)
 
 
 _ROW = {
@@ -178,6 +258,41 @@ class TestPurgeWave:
         # `the various` matched the coarse net but the arbiter rejected it, so
         # it must not appear in the DELETE's key array.
         assert args[1] == ["various artists - blues"]
+
+    @pytest.mark.asyncio
+    async def test_execute_recovers_from_the_delete_itself_in_one_transaction(self, tmp_path):
+        """The recovery CSV must be built from ``DELETE … RETURNING`` inside a
+        single transaction, not from a preceding autocommit SELECT.
+
+        With two independent statements on two pooled connections, live
+        ``/lookup`` traffic can insert a row for one of ``purge_keys`` in the
+        gap — the guard does not block album-CONSTRAINED V/A cache writes — and
+        that row is then deleted with no CSV entry. That is exactly the
+        unrecoverable loss the CSV exists to prevent.
+        """
+        out = tmp_path / "w1.csv"
+        pg = _FakePg(["various artists - blues"], [_ROW])
+        pg.out_path = out
+
+        deleted = await purge(
+            pg, service="apple_music_track", out=out, limit=0, after="", execute=True
+        )
+
+        # Exactly one mutating statement, and it returns the rows it removed.
+        assert len(pg.executed) == 1
+        sql, _ = pg.executed[0]
+        assert "RETURNING" in sql
+        # No separate pre-DELETE row SELECT on the execute path — the key scan
+        # is the only `fetchall`, so there is no gap to race.
+        assert len(pg.calls) == 1
+        assert "SELECT DISTINCT artist_normalized" in pg.calls[0][0]
+        # Wrapped in a transaction, with the CSV already durable at commit.
+        assert pg.max_transaction_depth == 1
+        assert pg.committed is True
+        assert pg.csv_existed_at_commit is True
+        # The count reported is the DELETE's own row count.
+        assert deleted == 1
+        assert len(list(csv.DictReader(out.open(encoding="utf-8")))) == 1
 
     @pytest.mark.asyncio
     async def test_all_rejected_wave_still_advances_and_deletes_nothing(self, tmp_path):
