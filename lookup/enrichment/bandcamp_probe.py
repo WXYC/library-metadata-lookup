@@ -31,6 +31,7 @@ from core.exceptions import BreakerOpenError
 from entity.streaming_url_cache import resolve_streaming_url_with_cache
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment.context import EnrichmentContext
+from lookup.spine_deadline import clamp_probe_timeout_for
 from lookup.streaming_url_postprocess import (
     STREAMING_URL_CACHE_CONFIG,
     should_suppress_streaming_warm,
@@ -193,11 +194,7 @@ async def run_bandcamp_live_probe(
         return BandcampProbeResult(current_bandcamp_url, None)
 
     base_timeout_s = bandcamp_probe_timeout_s()
-    probe_timeout_s = (
-        ctx.spine_deadline.clamp_probe_timeout_s(base_timeout_s)
-        if ctx.spine_deadline is not None
-        else base_timeout_s
-    )
+    probe_timeout_s = clamp_probe_timeout_for(ctx.spine_deadline, base_timeout_s)
     try:
         outcome = await asyncio.wait_for(
             resolve_streaming_url_with_cache(

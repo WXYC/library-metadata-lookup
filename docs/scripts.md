@@ -231,7 +231,7 @@ LML_API_KEY=... LML_BASE_URL=https://<prod-lml> \
 
 ## Track-Cache V/A Purge (`scripts/purge_va_apple_track_cache.py`)
 
-Clears pre-LML#1139 Various-Artists rows from `lml_cache.track_streaming_url_cache` (the LML#893 L1 track-URL cache). **This runs in the same deploy as the LML#1139 guard, not after it.** The table is hit-only and TTL-less and is peeked in `lookup/enrichment/item.py` *before* the live Apple probe, so a wrong V/A deep-link cached before the guard shipped would serve forever — on exactly the repeat-play traffic that recurs most — and the guard would never get a chance to re-adjudicate it. Ship the guard without the purge and the bug stays fully live from cache.
+Clears pre-LML#1139 Various-Artists rows from `lml_cache.track_streaming_url_cache` (the LML#893 L1 track-URL cache). **This runs in the same deploy as the LML#1139 guard, not after it.** The table is hit-only and TTL-less and is peeked in `lookup/enrichment/apple_probe.py` *before* the live Apple probe, so a wrong V/A deep-link cached before the guard shipped would serve forever — on exactly the repeat-play traffic that recurs most — and the guard would never get a chance to re-adjudicate it. Ship the guard without the purge and the bug stays fully live from cache.
 
 Selection is coarse-net-plus-pure-arbiter (donor: `scripts/audit_va_writeback_pollution.py`): an intentionally unanchored superset regex bounds the SQL scan, then `wxyc_etl.text.is_compilation_artist` — the exact predicate the guard uses, on the exact string the guard sees — decides. Real artists like `various production` and `the various` do match the regex and are rejected by the arbiter. The service is imported as `APPLE_MUSIC_TRACK_SERVICE` (`"apple_music_track"`), never spelled as a literal.
 

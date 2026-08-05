@@ -19,13 +19,15 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from clients.streaming.apple_music import AppleMusicTrackMatch
+from entity.sources import PgSource
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment.apple_probe import AppleProbeResult, run_apple_music_probe
+from lookup.enrichment.context import EnrichmentContext
 
 VERIFIED = StreamingResolutionStatus.verified
 ABSENT = StreamingResolutionStatus.absent
@@ -44,12 +46,33 @@ def _settings(**overrides):
     return SimpleNamespace(**base)
 
 
-def _ctx(*, apple_music=None, album="Aluminum Tunes", song=None, pg=None, spine_deadline=None):
-    return SimpleNamespace(
+def _ctx(
+    *, apple_music=None, album="Aluminum Tunes", song=None, pg=None, spine_deadline=None
+) -> EnrichmentContext:
+    """A REAL ``EnrichmentContext``, not a duck-type (LML#1101 review).
+
+    A ``SimpleNamespace`` stub would keep this whole file green after a field
+    is renamed or removed from the frozen dataclass, while the live /lookup
+    path raised ``AttributeError`` — which is exactly the class of regression a
+    direct unit surface exists to catch. Mirrors
+    ``tests/unit/test_bandcamp_live_probe.py``'s ``_ctx``.
+    """
+    return EnrichmentContext(
+        discogs_service=MagicMock(),
+        mb_pg=None,
         apple_music=apple_music,
-        album=album,
-        song=song,
+        spotify=None,
+        bandcamp=None,
+        entity_store=None,
         discogs_cache_pg=pg,
+        library_db=None,
+        song=song,
+        album=album,
+        artist="Stereolab",
+        request_artist_stripped="Stereolab",
+        artist_identity_split_enabled=False,
+        extended=False,
+        found_on_compilation=False,
         spine_deadline=spine_deadline,
     )
 
@@ -69,7 +92,9 @@ async def _run(
         row_artist=row_artist,
         search_term=search_term,
         library_row_acceptable=library_row_acceptable,
-        apple_music_override=apple_music_override,
+        # enrich_one's own precedence rule, reproduced at this test seam so the
+        # cases below still read as "an override is present".
+        skip_happy_probe=bool(library_row_acceptable and apple_music_override),
     )
 
 
@@ -207,7 +232,7 @@ class TestL1TrackCache:
             "lookup.enrichment.apple_probe.get_cached_track_streaming_url",
             AsyncMock(return_value=APPLE_URL),
         )
-        result = await _run(_ctx(apple_music=client, song="Pop Quiz", pg=object()))
+        result = await _run(_ctx(apple_music=client, song="Pop Quiz", pg=AsyncMock(spec=PgSource)))
         assert result == AppleProbeResult(APPLE_URL, VERIFIED, None, None, None)
         client.find_track_url.assert_not_awaited()
 
@@ -220,7 +245,7 @@ class TestL1TrackCache:
         )
         monkeypatch.setattr("lookup.enrichment.apple_probe.set_cached_track_streaming_url", setter)
         client = SimpleNamespace(find_track_url=AsyncMock(return_value=APPLE_URL))
-        result = await _run(_ctx(apple_music=client, song="Pop Quiz", pg=object()))
+        result = await _run(_ctx(apple_music=client, song="Pop Quiz", pg=AsyncMock(spec=PgSource)))
         assert result.status == VERIFIED
         setter.assert_awaited_once()
         assert setter.await_args.kwargs["url"] == APPLE_URL
@@ -235,7 +260,7 @@ class TestL1TrackCache:
         )
         monkeypatch.setattr("lookup.enrichment.apple_probe.set_cached_track_streaming_url", setter)
         client = SimpleNamespace(find_track_url=AsyncMock(return_value=None))
-        result = await _run(_ctx(apple_music=client, song="Pop Quiz", pg=object()))
+        result = await _run(_ctx(apple_music=client, song="Pop Quiz", pg=AsyncMock(spec=PgSource)))
         assert result.status == ABSENT
         setter.assert_not_awaited()
 
@@ -245,7 +270,7 @@ class TestL1TrackCache:
         monkeypatch.setattr("lookup.enrichment.apple_probe.get_cached_track_streaming_url", getter)
         client = SimpleNamespace(find_track_url=AsyncMock(return_value=None))
         result = await _run(
-            _ctx(apple_music=client, song="Pop Quiz", pg=object()),
+            _ctx(apple_music=client, song="Pop Quiz", pg=AsyncMock(spec=PgSource)),
             settings=_settings(lml_persist_streaming_url_apple_music=False),
         )
         getter.assert_not_awaited()

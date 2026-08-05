@@ -1,7 +1,7 @@
 """Purge pre-LML#1139 Various-Artists rows from the L1 track-URL cache.
 
 ``lml_cache.track_streaming_url_cache`` (LML#893) is **hit-only and TTL-less**,
-and ``lookup/enrichment/item.py`` peeks it *before* running the live Apple
+and ``lookup/enrichment/apple_probe.py`` peeks it *before* running the live Apple
 probe. So a wrong V/A deep-link cached before the LML#1139 artist-axis guard
 shipped would serve forever, on exactly the repeat-play traffic that recurs
 most, and the guard would never get a chance to re-adjudicate it. Deploying the

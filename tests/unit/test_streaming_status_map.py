@@ -139,7 +139,7 @@ class TestPostprocessOverrides:
         result = resolve_streaming_status(
             verified_urls={StreamingService.APPLE_MUSIC: None},
             probe_status={StreamingService.APPLE_MUSIC: VERIFIED},
-            postprocess_status=object(),  # type: ignore[arg-type]
+            postprocess_status=object(),
         )
         assert result == StreamingResolution(apple_music=VERIFIED)
 
@@ -179,7 +179,7 @@ class TestKeyTypesInterop:
 
     def test_bare_string_keys_are_accepted(self):
         result = resolve_streaming_status(
-            verified_urls={"apple_music": "https://music.apple.com/album/1"},  # type: ignore[dict-item]
+            verified_urls={"apple_music": "https://music.apple.com/album/1"},
             probe_status={},
             postprocess_status=None,
         )
@@ -194,3 +194,50 @@ class TestKeyTypesInterop:
             postprocess_status={"bandcamp": ABSENT},
         )
         assert result == StreamingResolution(bandcamp=ABSENT)
+
+
+class TestResolutionProvingSlotsExcludeSearchUrlServices:
+    """LML#1101 review: the "just add a key" recipe is a trap for YTM/SoundCloud.
+
+    ``enrich_one`` fills ``youtube_music_url`` / ``soundcloud_url`` with
+    templated ``_build_streaming_search_url`` fallbacks BEFORE it calls
+    ``resolve_streaming_status`` — they have no album-cache tier, so unlike
+    Bandcamp (whose fallback LML#573 PR-3 defers past the call) their slots are
+    already populated with a generic search page. Keying them into
+    ``verified_urls`` would report that search page as ``verified``, and BS/iOS
+    would render an available-badge for a link that resolves nothing.
+
+    This is the tripwire. If it fails because someone added YouTube Music, the
+    fix is NOT to update the expected set: defer the YTM search-URL fallback
+    past the ``resolve_streaming_status`` call first (write
+    ``update["youtube_music_url"]`` afterwards, the way Bandcamp already
+    does), and only then add the key.
+    """
+
+    def test_only_slots_that_cannot_hold_a_search_url_are_resolution_proving(self):
+        from lookup.enrichment.item import _RESOLUTION_PROVING_URL_SERVICES
+
+        assert set(_RESOLUTION_PROVING_URL_SERVICES) == {
+            StreamingService.APPLE_MUSIC,
+            StreamingService.SPOTIFY,
+            StreamingService.BANDCAMP,
+        }
+
+    def test_search_url_services_are_excluded(self):
+        from lookup.enrichment.item import _RESOLUTION_PROVING_URL_SERVICES
+
+        for service in (StreamingService.YOUTUBE_MUSIC, StreamingService.SOUNDCLOUD):
+            assert service not in _RESOLUTION_PROVING_URL_SERVICES, (
+                f"{service} holds a templated search URL by the time "
+                "resolve_streaming_status is called — see the constant's docstring"
+            )
+
+    def test_a_search_url_would_be_reported_verified_if_keyed(self):
+        # Demonstrates the failure mode the exclusion prevents, using a service
+        # StreamingResolution does model so the assertion is not vacuous.
+        result = resolve_streaming_status(
+            verified_urls={StreamingService.SPOTIFY: "https://open.spotify.com/search?q=x"},
+            probe_status={},
+            postprocess_status=None,
+        )
+        assert result == StreamingResolution(spotify=VERIFIED)

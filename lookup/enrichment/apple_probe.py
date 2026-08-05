@@ -57,6 +57,7 @@ from entity.track_streaming_url_cache import (
 )
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment.context import EnrichmentContext
+from lookup.spine_deadline import clamp_probe_timeout_for
 from lookup.timeouts import apple_music_lookup_timeout_s
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,14 @@ async def run_apple_music_probe(
     row_artist: str,
     search_term: str,
     library_row_acceptable: bool,
-    apple_music_override: str | None,
+    # A pre-computed gate, NOT the override URL (LML#1101 review). The probe
+    # has no business knowing that a librarian override exists, that it wins
+    # the Apple slot, or that the synthesis path is exempt — that precedence
+    # rule is ``enrich_one``'s, and it is already encoded there and in
+    # ``resolve_streaming_status``. Handing the probe the URL would make three
+    # modules co-own one rule with no single owner; handing it a bool leaves
+    # it a pure did-we-run gate.
+    skip_happy_probe: bool,
 ) -> AppleProbeResult:
     """Resolve an Apple Music deep-link for one item — bounded, L1-cache-first.
 
@@ -130,7 +138,6 @@ async def run_apple_music_probe(
     # ran. Finalized (override precedence) by ``resolve_streaming_status``.
     apple_status: StreamingResolutionStatus | None = None
     probe_method = "find_track_metadata" if not library_row_acceptable else "find_track_url"
-    skip_happy_probe = library_row_acceptable and apple_music_override
 
     # L1 (LML#893): cache-first Apple track probe on the happy path. When the
     # lookup carries a played track (``ctx.song``), peek a track-scoped cache
@@ -186,11 +193,7 @@ async def run_apple_music_probe(
         # ``enrich_artwork_results`` caller) or no caller-budget header, this
         # returns the unbounded ceiling unchanged.
         base_apple_timeout_s = apple_music_lookup_timeout_s()
-        apple_probe_timeout_s = (
-            ctx.spine_deadline.clamp_probe_timeout_s(base_apple_timeout_s)
-            if ctx.spine_deadline is not None
-            else base_apple_timeout_s
-        )
+        apple_probe_timeout_s = clamp_probe_timeout_for(ctx.spine_deadline, base_apple_timeout_s)
         try:
             if library_row_acceptable:
                 apple_music_url = await asyncio.wait_for(
