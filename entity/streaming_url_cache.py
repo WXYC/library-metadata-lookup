@@ -297,19 +297,35 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
     886001, retired) serialized nothing an outer caller wasn't already
     serializing.
 
-    The third step, ``_DDL_ADD_ERROR_COLUMN`` (LML#1121), upgrades a table
+    The second step, ``_DDL_ADD_ERROR_COLUMN`` (LML#1121), upgrades a table
     created before the ``is_error`` column existed: ``CREATE TABLE IF NOT
     EXISTS`` cannot add a column to an already-present table, so prod needs
     the idempotent ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` to gain the
     marker. It's a no-op once the column exists (mirrors LML#824's
-    ``crowd_out`` upgrade in ``entity/release_resolution_cache.py``).
+    ``crowd_out`` upgrade in ``entity/release_resolution_cache.py``) --
+    EXCEPT that PG16 confirmed ``ADD COLUMN IF NOT EXISTS`` still acquires an
+    ``AccessExclusiveLock`` even on that no-op path, so it can queue behind
+    live ``/lookup`` traffic on a hot table (LML#1121 FIX 5). It therefore
+    runs in its OWN ``bootstrap_lml_cache_table`` call -- its own transaction
+    -- rather than bundled with schema/table creation: a lock_timeout here
+    must not roll back the (already-succeeded) schema/table step too, and
+    must leave the table in a state where the NEXT boot can simply retry the
+    ALTER. A failure here is caught and logged, then followed by
+    :func:`_verify_error_column_present` -- which independently confirms
+    (and, on failure, logs LOUDLY at ERROR) whether the column actually
+    exists, so a lock-timed-out ALTER is never silent: every downstream
+    SELECT/UPSERT would otherwise raise ``UndefinedColumnError`` and be
+    swallowed by ``swallowing_fetch``/``swallowing_execute``, disabling the
+    cache for the rest of the process's life with no clear signal why.
 
     The final step widens the named CHECK constraint to the current
     ``_SERVICES`` set, merging rather than narrowing (see
     ``entity.ddl.build_widen_service_check_sql``). ``CREATE TABLE IF NOT
     EXISTS`` cannot add a value to an already-created table's constraint, so
     without it a prod table frozen at an older service set would reject
-    UPSERTs for a newly-added service.
+    UPSERTs for a newly-added service. Also run as its OWN transaction (LML#1121
+    FIX 5): its rare rewrite path (DROP + ADD CONSTRAINT) takes the same
+    class of lock as the ``is_error`` ALTER, so it gets the same isolation.
     """
 
     async def _widen(conn: Any) -> None:
@@ -320,7 +336,62 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
             services=_SERVICES,
         )
 
-    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE, _DDL_ADD_ERROR_COLUMN, _widen)
+    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE)
+    try:
+        await bootstrap_lml_cache_table(pg, _DDL_ADD_ERROR_COLUMN)
+    except Exception:
+        logger.exception(
+            "album_streaming_url_cache is_error column ALTER failed -- verifying "
+            "column presence next (see the following log line for the operational impact)"
+        )
+    await _verify_error_column_present(pg)
+    await bootstrap_lml_cache_table(pg, _widen)
+
+
+_VERIFY_ERROR_COLUMN_SQL = (
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_schema = 'lml_cache' AND table_name = 'album_streaming_url_cache' "
+    "AND column_name = 'is_error'"
+)
+
+
+async def _verify_error_column_present(pg: PgSource) -> None:
+    """LML#1121 FIX 5: confirm the ``is_error`` column actually survived
+    bootstrap, and log LOUDLY at ERROR (not WARNING) if it didn't.
+
+    A lock-timed-out ``ADD COLUMN`` ALTER (see ``set_up_streaming_url_cache_schema``)
+    leaves the column missing while every OTHER bootstrap step still
+    succeeds -- from the app's perspective this looked healthy until the
+    FIRST cache read/write, which raises ``UndefinedColumnError`` and is
+    swallowed by ``swallowing_fetch``/``swallowing_execute`` (this module's
+    documented "PG failures degrade to a no-op" posture). Left unverified,
+    that means the streaming-URL cache silently runs disabled for the rest
+    of the process's life, visible only as one easy-to-miss startup
+    exception (or none at all, if the ALTER failed for a reason that didn't
+    raise). This check is independent of whether the ALTER itself raised --
+    it is the loud, unambiguous signal a silently-disabled cache must never
+    lack.
+
+    Best-effort: a failure of the verification QUERY itself (connectivity,
+    permissions) is a different problem and is logged separately, at
+    ``exception`` level, rather than misreported as a missing column.
+    """
+    try:
+        row = await pg.fetchone(_VERIFY_ERROR_COLUMN_SQL)
+    except Exception:
+        logger.exception(
+            "album_streaming_url_cache is_error column verification query failed -- "
+            "could not confirm whether the streaming-URL cache is healthy"
+        )
+        return
+    if row is None:
+        logger.error(
+            "album_streaming_url_cache is missing its is_error column after bootstrap -- "
+            "the streaming-URL cache is silently degraded to a no-op for the rest of this "
+            "process (every SELECT/UPSERT will raise UndefinedColumnError and be swallowed). "
+            "Likely cause: the ADD COLUMN ALTER lock-timed-out against live traffic; it will "
+            "retry on the next boot."
+        )
 
 
 async def get_cached_streaming_url(

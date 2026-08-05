@@ -1,4 +1,5 @@
-"""Unit tests for the streaming-URL cache schema bootstrap (LML#573, LML#1038).
+"""Unit tests for the streaming-URL cache schema bootstrap (LML#573, LML#1038,
+LML#1121 FIX 5).
 
 Two surfaces:
 
@@ -7,13 +8,21 @@ Two surfaces:
   ``lml_cache.album_streaming_url_cache`` table with the named CHECK
   constraint and composite PK, so a reviewer / operator has the DDL inline.
 * ``set_up_streaming_url_cache_schema`` — the lifespan bootstrap helper. It
-  must issue ``CREATE SCHEMA`` then ``CREATE TABLE`` (named CHECK), then the
-  widen-only DO block (``entity.ddl.widen_service_check`` — LML#1038
-  generalized this table onto the same LML#890 generation
-  ``entity/streaming_catalog.py`` pioneered, retiring this module's own
-  ~33-line LML#886 port), all inside one transaction on one connection behind
-  a ``lock_timeout`` + advisory-lock preamble. No row mutation (the
-  LML#571→#573 apple-table backfill was removed in #573's PR-2).
+  issues ``CREATE SCHEMA`` then ``CREATE TABLE`` (named CHECK) as one
+  transaction, then the LML#1121 additive ``is_error`` column ALTER as its
+  OWN separate transaction, then the widen-only DO block
+  (``entity.ddl.widen_service_check`` — LML#1038 generalized this table onto
+  the same LML#890 generation ``entity/streaming_catalog.py`` pioneered,
+  retiring this module's own ~33-line LML#886 port) as a third separate
+  transaction. Each transaction is on its own connection behind its own
+  ``lock_timeout`` preamble (no advisory-lock preamble — see the module
+  docstring). The ALTER and widen steps are isolated into their own
+  transactions (LML#1121 FIX 5) so a lock_timeout on either -- PG16 confirmed
+  ``ADD COLUMN IF NOT EXISTS`` still takes an AccessExclusiveLock even when
+  the column already exists -- can't roll back the (already-succeeded)
+  schema/table step too, and leaves the table retryable on the next boot. No
+  row mutation (the LML#571→#573 apple-table backfill was removed in #573's
+  PR-2).
 
 PG is faked with a recording double (mirrors
 ``test_streaming_catalog_schema.py``'s ``_FakePgSource``): ``AsyncMock`` can
@@ -21,17 +30,21 @@ model ``async with pg.acquire()``, but the nested ``conn.transaction()``
 bookkeeping needed to assert the wrapping-transaction shape isn't expressible
 with the conftest AsyncMock helpers. The integration layer
 (``tests/integration/test_streaming_url_persistent_lookup.py``) drives the
-real DDL — including the widen-only rewrite semantics — against PostgreSQL.
+real DDL -- including the widen-only rewrite semantics and a real
+lock-timeout race against the ALTER -- against PostgreSQL.
 """
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 
 from entity.streaming_url_cache import set_up_streaming_url_cache_schema
+
+_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '10s'"
 
 
 class _FakeTransaction:
@@ -56,22 +69,44 @@ class _FakeConnection:
         return _FakeTransaction(self._source)
 
     async def execute(self, sql: str, *args: object) -> str:
+        if self._source.fail_statements_containing is not None and (
+            self._source.fail_statements_containing in sql
+        ):
+            raise RuntimeError("simulated lock_timeout")
         self._source.executed.append((sql, self._source.in_transaction))
         return "CREATE"
 
 
 class _FakePgSource:
-    """Records every statement the bootstrap issues and whether it ran inside
-    the wrapping transaction. Deliberately defines only ``acquire`` — any
-    other attribute access (pool-level ``execute``/``fetchone``) is an
-    ``AttributeError``, which doubles as the only-one-connection assertion."""
+    """Records every statement the bootstrap issues (and whether it ran
+    inside the wrapping transaction), plus every LML#1121 FIX 5
+    ``fetchone`` verification call. Deliberately defines only ``acquire``
+    and ``fetchone`` — any other attribute access (pool-level ``execute``)
+    is an ``AttributeError``, which doubles as an only-these-two-surfaces
+    assertion.
 
-    def __init__(self) -> None:
+    ``is_error_column_present`` controls what ``fetchone`` reports for the
+    FIX 5 post-bootstrap verification query. ``fail_statements_containing``
+    (a substring) makes ``_FakeConnection.execute`` raise instead of
+    recording for any matching statement -- used to simulate a lock_timeout
+    on a specific step (e.g. the ``ALTER TABLE`` ) without a real PostgreSQL
+    connection.
+    """
+
+    def __init__(
+        self,
+        *,
+        is_error_column_present: bool = True,
+        fail_statements_containing: str | None = None,
+    ) -> None:
         self.executed: list[tuple[str, bool]] = []
         self.acquire_count = 0
         self.transaction_starts = 0
         self.transaction_ends = 0
         self.in_transaction = False
+        self.fetchone_calls: list[str] = []
+        self.is_error_column_present = is_error_column_present
+        self.fail_statements_containing = fail_statements_containing
 
     @property
     def statements(self) -> list[str]:
@@ -81,6 +116,10 @@ class _FakePgSource:
     async def acquire(self):
         self.acquire_count += 1
         yield _FakeConnection(self)
+
+    async def fetchone(self, sql: str, *args: object) -> dict[str, int] | None:
+        self.fetchone_calls.append(sql)
+        return {"?column?": 1} if self.is_error_column_present else None
 
 
 _SQL_REFERENCE = (
@@ -169,13 +208,15 @@ class TestSetUpStreamingUrlCacheSchema:
 
         await set_up_streaming_url_cache_schema(pg)
 
-        # One-statement lock_timeout preamble (LML#1038 PR-2 dropped the
-        # inner advisory lock -- see the module docstring), then schema,
-        # table, the LML#1121 additive `is_error` column ALTER, then the
-        # widen-only DO block (so a pre-existing prod table picks up new
-        # service values that CREATE TABLE IF NOT EXISTS cannot add). No
-        # backfill.
-        ddl = pg.statements[1:]
+        # Three separate lock_timeout-guarded transactions (LML#1121 FIX 5):
+        # schema+table together, the additive `is_error` column ALTER alone,
+        # then the widen-only DO block alone (so a pre-existing prod table
+        # picks up new service values that CREATE TABLE IF NOT EXISTS cannot
+        # add). No backfill. Isolating the ALTER and widen into their own
+        # transactions means a lock_timeout on either can't roll back an
+        # already-succeeded earlier step.
+        assert pg.statements.count(_LOCK_TIMEOUT_SQL) == 3
+        ddl = [s for s in pg.statements if s != _LOCK_TIMEOUT_SQL]
         assert len(ddl) == 4
         schema_sql, table_sql, error_column_sql, widen_sql = ddl
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in schema_sql
@@ -238,25 +279,44 @@ class TestSetUpStreamingUrlCacheSchema:
         assert not any("INSERT" in sql for sql in pg.statements)
         assert not any("album_apple_music_lookup_cache" in sql for sql in pg.statements)
 
-    async def test_runs_as_one_transaction_on_one_connection(self):
-        # All-or-nothing: a mid-boot failure must never leave the table
-        # standing without its service CHECK.
+    async def test_schema_table_step_is_its_own_all_or_nothing_transaction(self):
+        # Schema creation + table creation stay bundled together (LML#1038):
+        # a mid-boot failure between them must never leave a schema standing
+        # without its table.
         pg = _FakePgSource()
 
         await set_up_streaming_url_cache_schema(pg)
 
-        assert pg.acquire_count == 1
-        assert pg.transaction_starts == 1
-        assert pg.transaction_ends == 1
+        assert pg.transaction_starts == pg.transaction_ends
         assert pg.in_transaction is False
         assert all(in_txn for _, in_txn in pg.executed)
+
+    async def test_alter_and_widen_each_run_in_their_own_transaction(self):
+        # LML#1121 FIX 5: the additive `is_error` ALTER (PG16 confirmed it
+        # still takes an AccessExclusiveLock even when the column already
+        # exists) and the widen-only check-constraint maintenance each get
+        # their OWN acquire+transaction pair, separate from schema/table
+        # creation and from each other -- three transactions total, not one.
+        # A lock_timeout on either one is then independently retryable on
+        # the next boot without redoing (or losing) the other steps.
+        pg = _FakePgSource()
+
+        await set_up_streaming_url_cache_schema(pg)
+
+        assert pg.acquire_count == 3
+        assert pg.transaction_starts == 3
+        assert pg.transaction_ends == 3
 
     async def test_preamble_bounds_lock_waits(self):
         pg = _FakePgSource()
 
         await set_up_streaming_url_cache_schema(pg)
 
-        assert pg.statements[0] == "SET LOCAL lock_timeout = '10s'"
+        assert pg.statements[0] == _LOCK_TIMEOUT_SQL
+        # Each of the three separate transactions (LML#1121 FIX 5) gets its
+        # own lock_timeout preamble as the first statement of ITS OWN
+        # transaction -- not just the very first statement overall.
+        assert pg.statements.count(_LOCK_TIMEOUT_SQL) == 3
 
     async def test_no_inner_advisory_lock(self):
         # LML#1038 PR-2: every caller of this bootstrap goes through
@@ -269,3 +329,52 @@ class TestSetUpStreamingUrlCacheSchema:
         await set_up_streaming_url_cache_schema(pg)
 
         assert not any("pg_advisory" in sql for sql in pg.statements)
+
+    async def test_alter_failure_does_not_prevent_the_widen_step(self):
+        # LML#1121 FIX 5: a failure on the ALTER's own transaction (a
+        # lock_timeout, simulated here) must not abort the rest of the
+        # bootstrap -- the widen step still runs, and the caller (main.py)
+        # sees a normal return, not a propagated exception.
+        # A substring unique to the standalone ADD COLUMN statement -- the
+        # widen block's dynamic ``EXECUTE 'ALTER TABLE ...'`` text also
+        # contains the bare "ALTER TABLE" substring, so matching on that
+        # alone would (incorrectly) fail the widen step too.
+        pg = _FakePgSource(fail_statements_containing="ADD COLUMN IF NOT EXISTS is_error")
+
+        await set_up_streaming_url_cache_schema(pg)
+
+        assert any(s.startswith("DO $") for s in pg.statements)
+        assert any("CREATE TABLE IF NOT EXISTS" in s for s in pg.statements)
+        assert not any("ADD COLUMN IF NOT EXISTS is_error" in s for s in pg.statements)
+
+    async def test_verifies_the_error_column_after_bootstrap(self):
+        # LML#1121 FIX 5 part 2: after the bootstrap attempt, an independent
+        # verification query confirms the column actually exists.
+        pg = _FakePgSource()
+
+        await set_up_streaming_url_cache_schema(pg)
+
+        assert len(pg.fetchone_calls) == 1
+        assert "is_error" in pg.fetchone_calls[0]
+        assert "information_schema.columns" in pg.fetchone_calls[0]
+
+    async def test_logs_error_when_the_column_is_confirmed_missing(self, caplog):
+        # A silently-disabled cache must never look healthy: log LOUDLY at
+        # ERROR (not WARNING) when the verification finds the column absent.
+        pg = _FakePgSource(is_error_column_present=False)
+
+        with caplog.at_level(logging.ERROR, logger="entity.streaming_url_cache"):
+            await set_up_streaming_url_cache_schema(pg)
+
+        assert any(
+            "is_error" in record.message and record.levelno == logging.ERROR
+            for record in caplog.records
+        )
+
+    async def test_does_not_log_error_when_the_column_is_confirmed_present(self, caplog):
+        pg = _FakePgSource(is_error_column_present=True)
+
+        with caplog.at_level(logging.ERROR, logger="entity.streaming_url_cache"):
+            await set_up_streaming_url_cache_schema(pg)
+
+        assert not any(record.levelno == logging.ERROR for record in caplog.records)
