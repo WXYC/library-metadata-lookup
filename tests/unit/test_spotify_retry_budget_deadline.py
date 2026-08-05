@@ -394,8 +394,12 @@ class TestBudgetGiveupDoesNotPoisonCache:
     ``is_error=True`` so it ages on the short ``error_ttl`` (default 5
     minutes) rather than the 7-day ``miss_ttl`` this class exists to guard
     against. "Poisoning the cache" means the durable 7-day negative, not a
-    row at all -- the row itself is the deliberate backpressure fix for
-    LML#1094/#1115's warm-storm review finding."""
+    row at all -- the row itself lets a *reader* tell a couldn't-ask apart
+    from a confirmed absence; it does NOT throttle the default /lookup warm
+    path's re-enqueue rate that motivated LML#1094's warm-storm review
+    finding (see the canonical rationale in
+    ``lookup/streaming_url_postprocess.py``; LML#1141 tracks that follow-up).
+    """
 
     async def test_budget_giveup_writes_short_ttl_error_row_and_degrades_to_live_error(self):
         from entity.sources import PgSource

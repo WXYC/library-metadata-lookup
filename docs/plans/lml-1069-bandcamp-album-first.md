@@ -9,7 +9,7 @@ Issue: https://github.com/WXYC/library-metadata-lookup/issues/1069 (sub-issue of
 - Album-first strictly dominated artist-first in-sample (artist-first: 2% on the untouched tail, and its lone hit was a subset of album-first's), and it also heals artist-first false negatives (non-obvious slugs, custom domains).
 - Known API quirks: the `url` field comes back doubled (`https://x.bandcamp.comhttps://x.bandcamp.com/album/...`); custom domains (`music.sufjan.com`) appear in results; library titles carry format junk (`12"`, `[missing]`, `(studio)`) that pollutes queries.
 - Custom-domain URLs are safe to store: `release/bandcamp_url_parser.py::bandcamp_album_id_from_url` returns `None` for non-`*.bandcamp.com` hosts and the identity mint is skipped (no error path); the streaming-links emission chain treats `bandcamp_url` as opaque.
-- The runtime probe's live resolve (`lookup/streaming_url_postprocess.py::_warm_streaming_url_cache`) is a fire-and-forget background task off the response path, bounded by `_effective_probe_timeout_s` + a process-global semaphore — adding a fallback request there does not touch the `/lookup` hot path.
+- The runtime probe's live resolve (`lookup/streaming_warm.py::_warm_streaming_url_cache`) is a fire-and-forget background task off the response path, bounded by `_effective_probe_timeout_s` + a process-global semaphore — adding a fallback request there does not touch the `/lookup` hot path.
 
 ## Deliverables
 

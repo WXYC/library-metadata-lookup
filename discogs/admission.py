@@ -231,7 +231,10 @@ async def retry_429(
             # LML#758: don't sleep past the caller's remaining budget. A
             # deadline is only active when supplied by the caller (Discogs
             # arms it from ``core.search._run_strategy_pipeline``'s
-            # caller-budget contextvar; Bandcamp never sets one).
+            # caller-budget contextvar; Bandcamp arms it from
+            # ``clients.streaming.base.get_probe_deadline`` -- LML#1121 FIX 4
+            # -- which is itself a no-op outside a background warm, so a
+            # Bandcamp call off that path still passes ``None`` here).
             if budget_deadline is not None:
                 remaining_budget = budget_deadline - time.monotonic()
                 if delay > remaining_budget:

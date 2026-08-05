@@ -129,26 +129,27 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/strategies/track_on_compilation.py": 1150,
     "lookup/strategies/track_release_matching.py": 550,
     "lookup/strategies/va_rescue.py": 300,
-    # Recalibrated 2026-08-04 (LML#1108 review): the review mandated splitting
-    # the semaphore-acquire and probe exception handling into separately
-    # timed/logged try blocks (a probe failure was misattributed as a
-    # semaphore-wait failure) plus the depth-bound + deadline-arming
-    # docstring/comment additions the same review required for correctness
-    # legibility -- not organic growth. Smallest multiple of 50 at or above
-    # the new ~771-line measured size, not a re-derived 1.3x (which would
-    # reopen hundreds of lines of headroom), matching this table's own
-    # recalibration convention (see e.g. track_on_compilation.py above).
-    "lookup/streaming_url_postprocess.py": 800,
+    # Recalibrated 2026-08-05 (LML#1121 review): the warm-executor extraction
+    # documented immediately below (`lookup/streaming_warm.py`) pulled the
+    # concurrency semaphore, the in-flight dedup set, the background-task
+    # registry, the enqueue, the warm coroutine itself, and its
+    # release-identity mint out of this file, which now only *decides whether
+    # to warm*. That took the file from the prior 2026-08-04 recalibration's
+    # ~771 measured lines down to 573. Smallest multiple of 50 at or above the
+    # new measured size, not a re-derived 1.3x (which would reopen hundreds of
+    # lines of headroom), matching this table's own recalibration convention
+    # (see e.g. track_on_compilation.py above): 600.
+    "lookup/streaming_url_postprocess.py": 600,
     # LML#1121 review: the warm *executor* — the concurrency semaphore, the
     # in-flight dedup set, the background-task registry, the enqueue, the warm
     # coroutine itself and its release-identity mint — extracted out of
     # streaming_url_postprocess.py, which keeps *deciding whether to warm*.
-    # The review's F1/F3 pass left that file at 870 against its 800 ceiling
-    # with only +23 executable lines, so 800 was arithmetically unreachable
-    # (it measured 781 on main); extracting rather than raising follows this
-    # table's convention and the streaming_warm_admission.py precedent
-    # directly below. 1.3x its ~334-line measured size -> smallest multiple of
-    # 50 at or above that, 450.
+    # The review's F1/F3 pass left that file at 888 against its 800 ceiling
+    # (a later prose dedupe brought it to 870) with only +23 executable lines,
+    # so 800 was arithmetically unreachable (it measured 781 on main);
+    # extracting rather than raising follows this table's convention and the
+    # streaming_warm_admission.py precedent directly below. 1.3x its
+    # ~334-line measured size -> smallest multiple of 50 at or above that, 450.
     "lookup/streaming_warm.py": 450,
     # LML#1108: pending-warm depth-bound policy, extracted out of
     # streaming_url_postprocess.py to stay under its own ceiling above — a

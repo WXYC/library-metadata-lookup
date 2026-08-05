@@ -43,17 +43,22 @@ Hit/miss semantics (LML#576: staleness is a SQL-side filter, mirroring
 5xx, Cloudflare block, connect timeout — "couldn't ask") and a genuine
 200-with-no-match ("asked, confirmed absent") were indistinguishable at read
 time, so the only way to stop a failure from freezing as a week-long known
-miss was to skip the write entirely (LML#1115) — which also removed the
-only backpressure on the default warm path: with no row, every subsequent
-``/lookup`` for the same album re-enqueues a fresh background warm for as
-long as the outage lasts (compounding LML#1094's warm-slot contention). The
-column exists so a *reader* can tell a couldn't-ask apart from a confirmed
-absence — it is not backpressure on the default ``/lookup`` warm path, which
-deliberately bypasses a fresh error row so a retry actually reaches the
-network (see the canonical rationale in
-``lookup/streaming_url_postprocess.py``). Both flavors age on different
-clocks: ``is_error=True`` rows self-heal within the short ``error_ttl``,
-everything else ages on the 7-day ``miss_ttl``. The column is
+miss was to skip the write entirely (LML#1115). That left no row at all
+during an outage, so a *reader* had no way to tell a couldn't-ask apart from
+a confirmed absence — and, separately, every subsequent ``/lookup`` for the
+same album kept re-enqueuing a fresh background warm for as long as the
+outage lasted (compounding LML#1094's warm-slot contention). This column
+closes the first gap, not the second: it lets a *reader* tell the two miss
+flavors apart, which the fail-fast probe path
+(``lookup/enrichment/bandcamp_probe.py``) consumes to skip a doomed re-ask
+against a fresh error row. It is NOT backpressure on the default
+``/lookup`` warm path, which deliberately bypasses a fresh error row so a
+retry still reaches the network (see the canonical rationale in
+``lookup/streaming_url_postprocess.py``) — the re-enqueue-every-lookup
+behavior above is unchanged from the #1115-only posture; restoring
+backpressure there is LML#1141. Both flavors age on different clocks:
+``is_error=True`` rows self-heal within the short ``error_ttl``, everything
+else ages on the 7-day ``miss_ttl``. The column is
 ``NOT NULL DEFAULT FALSE``, so every pre-existing row (collected before this
 column existed) reads as a genuine miss — correct, since that is what it is;
 no backfill or reclassification of historical rows is attempted. A later
@@ -121,8 +126,8 @@ logger = logging.getLogger(__name__)
 # LML#1121: how long an ERROR row (``is_error=True`` -- a transport failure,
 # not a confirmed absence) stays authoritative before a caller re-probes.
 # Deliberately much shorter than ``DEFAULT_MISS_TTL``: a couldn't-ask outcome
-# must self-heal fast once the outage clears, while still backpressuring the
-# default warm path for the outage's duration (see the module docstring).
+# must self-heal fast once the outage clears (see the module docstring for
+# what this column does, and does not, backpressure).
 # Kept local to this module (unlike ``DEFAULT_MISS_TTL``) since no sibling
 # cache shares this concept yet; move it to ``entity.cache_toolkit`` if one
 # ever does.

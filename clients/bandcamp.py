@@ -120,11 +120,14 @@ class BandcampRateLimitedError(Exception):
 class BandcampTransportError(Exception):
     """Raised by ``search_artist`` / ``fetch_artist_catalog`` / ``search_albums``
     when the underlying ``_request_with_retry`` call fails at the transport
-    layer (network error, connect timeout) or returns a non-200/non-429
+    layer (network error, connect timeout) or returns an unexpected non-200
     response (5xx, Cloudflare 403/1015, etc.) -- in BOTH ``fail_fast=True``
     and the default retrying mode (LML#1115 extended the LML#1106
     fail_fast-only raise to the default path too; see the default-mode note
-    below).
+    below). Excludes a 429 (:class:`BandcampRateLimitedError` instead) and,
+    for ``fetch_artist_catalog`` only, a 404/410 -- a clean "no artist page
+    at this slug" absence, not a transport failure (LML#1121 review F2; see
+    that method's docstring).
 
     Distinct from both :class:`BandcampRateLimitedError` (a 429, a genuine
     rate-limit shed) and a clean 200 response with no match: this is
@@ -528,12 +531,15 @@ class BandcampClient(BaseStreamingClient):
         429 that does reach the network raises ``BandcampRateLimitedError``
         (propagated, not swallowed to ``None``) so the caller can't confuse a
         shed with a genuine no-match. A non-429 transport failure (5xx,
-        Cloudflare 403/1015, connect timeout, non-200 -- raised by
-        ``search_artist`` / ``fetch_artist_catalog`` / ``search_albums`` as
-        :class:`BandcampTransportError`) is likewise propagated rather than
-        degrading to a clean ``None`` -- EXCEPT that a ``fetch_artist_catalog``
-        failure whose album-first fallback then HITS resolves normally (we
-        got an answer; LML#1106 review round 2, FIX A) rather than raising.
+        Cloudflare 403/1015, connect timeout, or any other unexpected
+        non-200 -- raised by ``search_artist`` / ``fetch_artist_catalog`` /
+        ``search_albums`` as :class:`BandcampTransportError`) is likewise
+        propagated rather than degrading to a clean ``None`` -- EXCEPT that a
+        ``fetch_artist_catalog`` failure whose album-first fallback then HITS
+        resolves normally (we got an answer; LML#1106 review round 2, FIX A)
+        rather than raising. A 404/410 from ``fetch_artist_catalog`` is a
+        clean absence (``None``), not a transport failure, in this mode too
+        (LML#1121 review F2) -- it never reaches this raise path.
         Whenever it does propagate, it is recorded via
         ``record_transport_failure``, not ``record_success``, so it can
         neither declare a HALF_OPEN trial recovered nor let
@@ -622,15 +628,16 @@ class BandcampClient(BaseStreamingClient):
         # check for why this can't be decided here.
         catalog_leg_failed = False
         if best_artist is not None:
-            # Default mode: a fetch failure (None) is treated as "no catalog"
-            # for the live match path -- there is no retry loop here, so it
-            # degrades to no match and falls through to the album-first
-            # fallback below. Under fail_fast, ``fetch_artist_catalog``
-            # instead raises ``BandcampTransportError`` on a transport
-            # failure; LML#1106 review FIX 5 catches it here so it degrades
-            # the SAME way -- an empty catalog that falls through to the
-            # fallback -- rather than pre-empting it. The fallback's own
-            # transport failure (below) still raises unconditionally. A
+            # ``fetch_artist_catalog`` returns ``None`` only for a clean
+            # 404/410 absence -- in BOTH modes (LML#1121 review F2); ``or []``
+            # coalesces that into an empty catalog so the album-first
+            # fallback below still gets its shot. Every other failure (5xx,
+            # 403, timeout, ...) raises ``BandcampTransportError`` in BOTH
+            # modes too (see the comment above this block); LML#1106 review
+            # FIX 5 catches it here so it degrades the SAME way -- an empty
+            # catalog that falls through to the fallback -- rather than
+            # pre-empting it. The fallback's own transport failure (below)
+            # still raises unconditionally. A
             # CLEAN MISS from the fallback is a separate case (LML#1106
             # review round 2, FIX A): the album-autocomplete index has
             # strictly lower recall than the catalog scrape (that is why
@@ -827,10 +834,13 @@ class BandcampClient(BaseStreamingClient):
 
         Raises :class:`BandcampTransportError` on a transient fetch failure
         (network error, non-200, or exhausted 429 backoff), distinguishing it
-        from a genuine empty result set (``[]``) -- mirroring
-        ``fetch_artist_catalog``'s raise/empty-list split (#661). The offline
-        album-search drain needs that distinction to avoid durably recording
-        a blip as ``not_found``; ``find_album_match_via_search`` (below)
+        from a genuine empty result set (``[]``) -- the same raise-vs-genuine-
+        empty-result distinction ``fetch_artist_catalog`` draws (#661), though
+        that method is now a three-way split (raise / a clean 404-410 absence
+        as ``None`` / a found-or-empty list, LML#1121 review F2) while
+        ``search_albums`` itself stays a plain two-way raise/``[]`` split. The
+        offline album-search drain needs that distinction to avoid durably
+        recording a blip as ``not_found``; ``find_album_match_via_search`` (below)
         translates it to :class:`BandcampSearchUnavailableError` for that
         caller's default-mode contract.
 

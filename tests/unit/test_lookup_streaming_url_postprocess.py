@@ -794,14 +794,17 @@ class TestCacheMissEnqueuesBackgroundWarm:
         # which would agree with whatever the client's contract used to be. A
         # default-mode Bandcamp transport failure (5xx here) must not crash
         # this fire-and-forget task and must not mint. #1115's headline fix
-        # (must not UPSERT a 7-day known-miss row for an outage) still holds,
-        # but #1121 review found that dropping the write ENTIRELY also
-        # dropped the only backpressure on this warm path -- the dedup key in
-        # `_streaming_warm_in_flight` is discarded once this task finishes, so
-        # every subsequent /lookup for the same album would re-enqueue a
-        # fresh warm for as long as the outage lasted. The fix: still write a
-        # row, marked `is_error=True` so it ages on the short `error_ttl`
-        # (default 5 minutes) instead of the 7-day `miss_ttl`.
+        # (must not UPSERT a 7-day known-miss row for an outage) still holds.
+        # #1121 review found that dropping the write ENTIRELY also left no
+        # row for a *reader* to consult -- the dedup key in
+        # `_streaming_warm_in_flight` is discarded once this task finishes,
+        # so every subsequent /lookup for the same album still re-enqueues a
+        # fresh warm for as long as the outage lasts, unchanged by this fix
+        # (see the canonical rationale in lookup/streaming_url_postprocess.py;
+        # LML#1141 tracks throttling that). What #1121 fixes: it still writes
+        # a row, marked `is_error=True` so it ages on the short `error_ttl`
+        # (default 5 minutes) instead of the 7-day `miss_ttl`, letting a
+        # reader tell a couldn't-ask apart from a confirmed absence.
         service = "bandcamp"
         update = _blank_update()
         entity_store = _entity_store()
