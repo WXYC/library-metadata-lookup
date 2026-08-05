@@ -51,6 +51,34 @@ from streaming.service import StreamingService
 
 logger = logging.getLogger(__name__)
 
+#: Services whose URL slot, at the point ``resolve_streaming_status`` is called,
+#: PROVES the item resolved on that service — so a present value there may be
+#: reported ``verified`` (LML#1101).
+#:
+#: The membership rule is not "every service with a URL field". It is "every
+#: service whose slot cannot contain a templated
+#: ``_build_streaming_search_url`` fallback yet". Apple and Spotify qualify
+#: because their slots hold only a librarian ``streaming_links`` override at
+#: that point; Bandcamp qualifies because LML#573 PR-3 deliberately DEFERS its
+#: search-URL fallback until after the status call.
+#:
+#: **YouTube Music and SoundCloud are excluded, and adding them here without
+#: more work would be a bug.** They have no album-cache tier, so their
+#: search-URL fallbacks are applied INLINE, before this call — by the time the
+#: status map is built, both slots are already populated with
+#: ``https://music.youtube.com/search?q=...`` / ``https://soundcloud.com/
+#: search?q=...``. Reporting those ``verified`` would tell BS and iOS that a
+#: generic search page is a confirmed streaming match, and render an
+#: available-badge for a link that resolves nothing. LML#1103 must first defer
+#: the YouTube Music fallback past this call the way Bandcamp's already is
+#: (write ``update["youtube_music_url"]`` afterwards), and only then add the
+#: key. ``tests/unit/test_streaming_status_map.py`` pins this exclusion.
+_RESOLUTION_PROVING_URL_SERVICES: tuple[StreamingService, ...] = (
+    StreamingService.APPLE_MUSIC,
+    StreamingService.SPOTIFY,
+    StreamingService.BANDCAMP,
+)
+
 
 def _build_streaming_search_url(base: str, artist: str, term: str) -> str:
     """Build a streaming service search URL from artist + song/album."""
@@ -219,20 +247,26 @@ async def enrich_one(
     # See apple_probe.py's module docstring for why the two probes are sibling
     # modules rather than rows in a config-driven engine.
     settings = get_settings()
-    (
-        apple_music_url,
-        apple_status,
-        probe_match,
-        probe_artwork_url,
-        probe_release_year,
-    ) = await run_apple_music_probe(
+    apple = await run_apple_music_probe(
         ctx,
         settings=settings,
         row_artist=row_artist,
         search_term=search_term,
         library_row_acceptable=library_row_acceptable,
-        apple_music_override=apple_music_override,
+        # The librarian-override precedence stays here, not in the probe: the
+        # happy-path probe is pointless when the override would win the slot
+        # anyway, but the synthesis path still needs artwork + year, which an
+        # override cannot supply.
+        skip_happy_probe=bool(library_row_acceptable and apple_music_override),
     )
+    # Bound by NAME, not by positional unpack (LML#1101 review): four of the
+    # five fields are ``... | None`` and two are plain URLs, so a positional
+    # bind would silently transpose on any future reordering.
+    apple_music_url = apple.apple_music_url
+    apple_status = apple.status
+    probe_match = apple.probe_match
+    probe_artwork_url = apple.artwork_url
+    probe_release_year = apple.release_year
 
     # LML#505: post-hoc invalidation of sibling-row override URLs on
     # the synthesis branch. The LML#477 title gate
@@ -479,12 +513,20 @@ async def enrich_one(
     # through ``apple_status``), for Spotify the override alone (no probe leg),
     # for Bandcamp the post-probe slot (LML#1098's probe writes its resolved
     # URL back there and reports ``verified`` alongside it). A new probing
-    # service is a new key here and no signature change in streaming_status.py.
+    # service is a new key here and no signature change in streaming_status.py
+    # — but read ``_RESOLUTION_PROVING_URL_SERVICES`` before adding one: a slot
+    # already carrying a templated search-URL fallback (YouTube Music,
+    # SoundCloud) must NOT be keyed here.
+    _slot_urls = {
+        StreamingService.APPLE_MUSIC: apple_music_override,
+        StreamingService.SPOTIFY: spotify_url,
+        StreamingService.BANDCAMP: bandcamp_url,
+        StreamingService.YOUTUBE_MUSIC: youtube_music_url,
+        StreamingService.SOUNDCLOUD: soundcloud_url,
+    }
     update["streaming_status"] = resolve_streaming_status(
         verified_urls={
-            StreamingService.APPLE_MUSIC: apple_music_override,
-            StreamingService.SPOTIFY: spotify_url,
-            StreamingService.BANDCAMP: bandcamp_url,
+            service: _slot_urls[service] for service in _RESOLUTION_PROVING_URL_SERVICES
         },
         probe_status={
             StreamingService.APPLE_MUSIC: apple_status,

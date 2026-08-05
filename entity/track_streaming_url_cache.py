@@ -27,7 +27,7 @@ enforced at the schema level, not just by the caller). A SELECT returns the
 durable hit or nothing.
 
 PG failures degrade to a no-op: ``get`` returns ``None``, ``set`` swallows the
-exception. The caller (``lookup/enrichment/item.py``) then falls through to the
+exception. The caller (``lookup/enrichment/apple_probe.py``) then falls through to the
 live probe as if no cache were configured. Schema bootstrap
 (``set_up_track_streaming_url_cache_schema``) is called from ``main.py``
 lifespan; the DDL is ``IF NOT EXISTS`` so re-running on every boot is safe.

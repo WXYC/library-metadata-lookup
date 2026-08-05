@@ -64,22 +64,23 @@ MODULE_BUDGETS: dict[str, int] = {
     "lookup/enrichment/context.py": 150,
     # LML#1101: the inline Apple Music probe, extracted out of item.py to keep
     # that file under its ceiling — the same posture bandcamp_probe.py took for
-    # LML#1098 and streaming_status.py for LML#1053. 1.3x its ~305-line
-    # measured size -> 400.
-    "lookup/enrichment/apple_probe.py": 400,
-    # LML#1101 recalibration: 850 -> 700 after the Apple probe left for
-    # apple_probe.py (862 -> 677). Smallest multiple of 50 at or above the
+    # LML#1098 and streaming_status.py for LML#1053. 1.3x its 312-line measured
+    # size (405.6) -> 450.
+    "lookup/enrichment/apple_probe.py": 450,
+    # LML#1101 recalibration: 850 -> 750 after the Apple probe left for
+    # apple_probe.py (862 -> 719). Smallest multiple of 50 at or above the
     # measured size, NOT a re-derived 1.3x — an extraction hands its headroom
     # back rather than banking it for the next concern to grow into.
-    "lookup/enrichment/item.py": 700,
+    "lookup/enrichment/item.py": 750,
     # LML#1053: the per-service streaming-status merge, extracted out of
     # item.py to stay under its own ceiling above — a pure function with no
     # dependency on enrich_one's control flow. 1.3x its ~70-line measured
     # size -> 100.
-    # LML#1101: 76 -> 100 lines converting the per-service parameters into
-    # per-service maps. 1.3x -> 150; at the old 100 the file sat exactly on its
-    # ceiling with no maintenance headroom at all.
-    "lookup/enrichment/streaming_status.py": 150,
+    # LML#1101: 76 -> 135 lines converting the per-service parameters into
+    # per-service maps and adding the unmodelled-service drop log. 1.3x (175.5)
+    # -> 200; at the old 100 the file sat exactly on its ceiling with no
+    # maintenance headroom at all.
+    "lookup/enrichment/streaming_status.py": 200,
     "lookup/enrichment/top1.py": 100,
     "lookup/external_search.py": 350,
     # Recalibrated 2026-08-01 (LML#1026, supersedes the 2026-07-31

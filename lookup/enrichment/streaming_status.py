@@ -23,9 +23,12 @@ change here at all.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 
 from generated.api_models import StreamingResolution, StreamingResolutionStatus
+
+logger = logging.getLogger(__name__)
 
 #: Services ``StreamingResolution`` actually models, as generated from
 #: wxyc-shared's ``api.yaml``. Read off the model rather than hardcoded so a
@@ -68,16 +71,33 @@ def resolve_streaming_status(
     separately resolves it. Accepts a non-Mapping (e.g. a loosely-configured
     test double) as "nothing to merge" rather than raising.
 
+    Only URLs that PROVE resolution belong in ``verified_urls``. A templated
+    search-URL fallback is not a resolution — see
+    ``lookup/enrichment/item.py``'s ``_RESOLUTION_PROVING_URL_SERVICES`` for
+    which slots qualify at the call site and why YouTube Music / SoundCloud do
+    not.
+
     A service absent from ``StreamingResolution`` is DROPPED from all three
-    inputs rather than raised on: the model is generated from wxyc-shared's
-    ``api.yaml``, so ``StreamingService`` can carry a member whose wire field
-    has not shipped yet (LML#1103's ``youtube_music`` today). A not-yet-
-    modelled verdict must degrade to an omitted key, never a 500 on the lookup
-    path — the LML#444 posture the rest of ``enrich_one`` holds.
+    inputs (at DEBUG) rather than raised on: the model is generated from
+    wxyc-shared's ``api.yaml``, so ``StreamingService`` can carry a member
+    whose wire field has not shipped yet (LML#1103's ``youtube_music`` today).
+    A not-yet-modelled verdict must degrade to an omitted key, never a 500 on
+    the lookup path — the LML#444 posture the rest of ``enrich_one`` holds. The
+    log line is what makes that degrade diagnosable: without it, a probe leg
+    that ships ahead of its wire field burns quota every request and its
+    verdict vanishes indistinguishably from "never consulted".
 
     Returns ``None`` (not an empty object) when nothing was consulted at
     all — the never-consulted state is represented by key/field absence, per
-    the wire contract, all the way up.
+    the wire contract, all the way up. Note this now also covers the case where
+    the ONLY signals were for unmodelled services: pre-LML#1101 an unmodelled
+    ``postprocess_status`` key left ``status_map`` non-empty and produced an
+    all-null ``StreamingResolution()`` (pydantic's ``extra='ignore'`` swallowed
+    the kwarg), which serializes as ``streaming_status: {}`` rather than an
+    omitted key. Unreachable today — ``apply_streaming_url_postprocess`` only
+    emits the three ``STREAMING_URL_CACHE_CONFIG`` catalog keys — but the
+    omitted-key shape is the correct one for a field whose contract is
+    "absence means never-consulted".
     """
     status_map: dict[str, StreamingResolutionStatus] = {}
     for service in _MODELLED_SERVICES:
@@ -96,5 +116,20 @@ def resolve_streaming_status(
                 for service, status in postprocess_status.items()
                 if service in _MODELLED_SERVICES
             }
+        )
+
+    dropped = sorted(
+        (
+            {s for s, u in verified_urls.items() if u}
+            | {s for s, v in probe_status.items() if v is not None}
+            | (set(postprocess_status) if isinstance(postprocess_status, Mapping) else set())
+        )
+        - _MODELLED_SERVICES
+    )
+    if dropped:
+        logger.debug(
+            "Dropping streaming_status verdicts for services StreamingResolution "
+            "does not model: %s — the wxyc-shared api.yaml field has not shipped yet",
+            ", ".join(dropped),
         )
     return StreamingResolution(**status_map) if status_map else None

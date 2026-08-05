@@ -162,7 +162,7 @@ class SpineDeadline:
     def clamp_probe_timeout_s(self, base_timeout_s: float) -> float:
         """Clamp a fixed per-probe wall-clock ceiling to the remaining spine budget.
 
-        The per-item Apple Music probe (``lookup/enrichment/item.py``) uses a
+        The per-item Apple Music probe (``lookup/enrichment/apple_probe.py``) uses a
         fixed 4s ``wait_for`` regardless of how much caller budget is left — the
         single biggest tail-overrun source (LML#930). Passing the probe
         ``min(base, remaining)`` keeps a caller with 300ms left from waiting 4s
@@ -174,6 +174,29 @@ class SpineDeadline:
         """
         remaining_ms, _ = self.remaining()
         return max(_STEP_TIMEOUT_FLOOR_S, min(base_timeout_s, remaining_ms / 1000.0))
+
+
+def clamp_probe_timeout_for(deadline: SpineDeadline | None, base_timeout_s: float) -> float:
+    """:meth:`SpineDeadline.clamp_probe_timeout_s`, tolerating a ``None`` deadline.
+
+    Every inline probe needs the same four lines — read its per-service base
+    ceiling, then clamp it only if a deadline exists — because a direct
+    ``enrich_artwork_results`` caller (and any request with no caller-budget
+    header) has ``ctx.spine_deadline is None`` and must get the unbounded
+    ceiling back unchanged. That ``is not None`` guard is the load-bearing
+    part: omitting it raises ``AttributeError`` on exactly the no-deadline
+    path, which is the one an inline probe's tests are least likely to cover.
+
+    Extracted at LML#1101 with the second copy (``apple_probe.py`` +
+    ``bandcamp_probe.py``); LML#1103's YouTube Music leg would have made a
+    third. This is the whole of the "roughly twenty genuinely common lines"
+    those two probes share — the rest of them diverge, which is why they are
+    sibling modules rather than rows in one config-driven engine (see
+    ``apple_probe.py``'s module docstring).
+    """
+    return (
+        deadline.clamp_probe_timeout_s(base_timeout_s) if deadline is not None else base_timeout_s
+    )
 
 
 async def run_within_spine_deadline[T](

@@ -31,6 +31,7 @@ module's own test file, not duplicated here:
 
 from __future__ import annotations
 
+from generated.api_models import StreamingResolution
 from streaming.service import (
     ALBUM_CACHE_KEYS,
     ALBUM_CACHED_SERVICES,
@@ -189,3 +190,40 @@ class TestCanonicalOrderingTuples:
 
     def test_track_cached_services_matches_the_track_cache_keys_dict(self):
         assert set(TRACK_CACHED_SERVICES) == set(TRACK_CACHE_KEYS)
+
+
+class TestStreamingResolutionWireFieldsTrackTheEnum:
+    """LML#1101: ``resolve_streaming_status`` derives its service vocabulary from
+    ``StreamingResolution.model_fields`` — the generated wire model — rather than
+    from a hand-maintained tuple, deliberately: the question it asks is "what does
+    the wire actually carry?", and a second list here would be exactly the
+    free-floating duplication LML#1037 retired.
+
+    The cost of deriving from a generated model is that a wxyc-shared rename is
+    silent. ``StreamingResolution`` inherits pydantic's default ``extra='ignore'``,
+    so a field renamed ``apple_music`` -> ``appleMusic`` upstream would make
+    ``resolve_streaming_status`` stop emitting every Apple verdict with a fully
+    green suite. These pin the intersection so that regen is loud instead.
+    """
+
+    def test_every_wire_field_is_a_streaming_service_catalog_key(self):
+        catalog_keys = {s.catalog_key for s in StreamingService}
+        assert set(StreamingResolution.model_fields) <= catalog_keys, (
+            "StreamingResolution grew a field that is not a StreamingService catalog "
+            "key — either the enum needs the member or wxyc-shared renamed a field"
+        )
+
+    def test_the_modelled_service_set_is_exactly_what_lml_expects(self):
+        # Update this ONLY alongside a wxyc-shared api.yaml change that
+        # deliberately adds or removes a StreamingResolution field. LML#1103
+        # adds youtube_music here.
+        assert set(StreamingResolution.model_fields) == {
+            StreamingService.SPOTIFY,
+            StreamingService.APPLE_MUSIC,
+            StreamingService.BANDCAMP,
+        }
+
+    def test_resolve_streaming_status_derives_from_the_same_set(self):
+        from lookup.enrichment.streaming_status import _MODELLED_SERVICES
+
+        assert _MODELLED_SERVICES == frozenset(StreamingResolution.model_fields)
