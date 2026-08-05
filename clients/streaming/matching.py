@@ -9,7 +9,7 @@ from typing import Any
 
 import sentry_sdk
 from rapidfuzz import fuzz
-from wxyc_etl.text import strip_discogs_disambiguation
+from wxyc_etl.text import is_compilation_artist, strip_discogs_disambiguation
 from wxyc_etl.text import to_match_form as normalize_for_comparison  # noqa: F401
 
 from streaming.models import SourceMatch
@@ -517,6 +517,57 @@ def album_subset_is_degenerate(query_album: str, candidate_album: str) -> bool:
     return score_match(query_album, candidate_album) < SCORE_MATCH_ACCEPTANCE_FLOOR
 
 
+def va_artist_axis_is_uninformative(query_artist: str, candidate_artist: str) -> bool:
+    """True when BOTH sides are V/A credits, so the artist score is carried
+    entirely by the shared "Various Artists" prefix and identifies nothing (LML#1139).
+
+    WXYC files Various-Artists compilations under a *shelf-genre* convention
+    rather than an artist name -- ``Various Artists - Blues``, ``Various
+    Artists - Latin``. Because ``Various Artists - `` is a constant ~19-char
+    prefix, ``token_set_ratio`` scores any two such credits at ~85 against each
+    other regardless of content, comfortably clearing the 80 floor while
+    carrying zero identifying information.
+
+    This cannot be fixed by moving the floor. The LML#592 marginal sample was
+    hand-labeled in full: false positives span artist scores 83.87-85.71 and
+    true positives span 80.0-89.55 -- the FP band is *entirely contained*
+    inside the TP band (``Hank Williams, Sr.`` and ``Hank Williams, Jr.`` both
+    score 83.87096774193549 against ``Hank Williams``, to 14 significant
+    figures, with opposite correctness). LML#638 closed no-change on the floor
+    for exactly this reason; that decision stands and this guard is structural
+    instead.
+
+    Both sides are tested with ``wxyc_etl.text.is_compilation_artist`` -- the
+    org's canonical V/A detector -- whose leading-anchored rule is what lets
+    ``Various Artists - Blues`` and ``Various Artists & Pan Ron`` hit while
+    real artists like ``Various Production`` and ``The Various`` don't.
+
+    NORMALIZATION CONTRACT: callers pass ``to_match_form`` output (i.e.
+    ``normalize_for_comparison``) on BOTH sides, not raw strings. This differs
+    from the issue's original instruction, deliberately:
+
+    * ``to_match_form`` does NOT strip punctuation, so the ``v/a`` and ``v.a``
+      prefixes survive it intact -- every positive and every negative in the
+      labeled matrix is preserved under normalization.
+    * It additionally catches variants the raw form misses: leading/doubled
+      whitespace (``"  Various Artists"``) and diacritics
+      (``"Vàrious Artists"``), both of which are ``False`` raw and ``True``
+      normalized.
+    * Decisively, the normalized query artist is *literally the L1 cache key*
+      (``lml_cache.track_streaming_url_cache`` keys on ``to_match_form(artist)``),
+      so keying this guard on the same string makes "the purged key set == the
+      guarded key set" a property rather than an aspiration. Keying on raw
+      would leave purged-but-unguarded rows that immediately re-cache the same
+      wrong URL.
+
+    ``or ""`` on both sides because ``is_compilation_artist`` requires ``str``
+    and raises on ``None``.
+    """
+    return is_compilation_artist(query_artist or "") and is_compilation_artist(
+        candidate_artist or ""
+    )
+
+
 # LML#592 telemetry bands. The 80/80 floor admits organic short-name artist
 # collisions on a shared album title ("Wand" vs "Wanda" scores 88.89 against
 # an identical title at 100). These bands classify the *signature* of such a
@@ -567,8 +618,12 @@ def record_match_telemetry(
         artist_score: Fuzzy score of the request artist vs the matched artist.
         title_score: Fuzzy score of the request title vs the matched title.
         service: Streaming service that produced the match ("apple_music", ...).
-        surface: Match surface — "album", "track", or "track_album_fallback"
-            (a track winner selected by the LML#782 album-less re-score).
+        surface: Match surface — "album", "track", "track_album_less", or
+            "track_album_fallback". "track" means the album-CONSTRAINED pass
+            supplied the winner; "track_album_less" that the request carried no
+            scoreable album at all (LML#1139 — previously conflated with
+            "track", which made the album-less population unmeasurable);
+            "track_album_fallback" that the LML#782 album-less re-score did.
         query_artist: Request artist string (labeling; marginal clears only).
         matched_artist: Matched-candidate artist string (labeling).
         query_title: Request title string (labeling).

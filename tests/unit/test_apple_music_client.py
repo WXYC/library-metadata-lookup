@@ -1156,6 +1156,227 @@ class TestFindTrackMetadataTitleSubsetInflation:
         assert match.url == "https://music.apple.com/us/song/little-fury-things/321"
 
 
+class TestFindTrackMetadataVaArtistAxis:
+    """LML#1139: on the Apple track path, a V/A<->V/A pair is acceptable only
+    when the album-CONSTRAINED pass supplied the winner.
+
+    WXYC files V/A compilations under a shelf-genre convention (``Various
+    Artists - Blues``), so the constant ~19-char prefix scores ~85 between any
+    two such credits — over the 80 floor, carrying zero information. The
+    measured false positives are generic blues/latin standards whose titles
+    genuinely agree at 95-100, so no title rule and no floor move separates
+    them (the FP artist band 83.87-85.71 sits entirely inside the TP band
+    80.0-89.55; LML#638 settled the floor). The album axis is the only real
+    evidence, so the LML#782 album-dropped fallback and album-less queries
+    reject these candidates.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rejects_va_fallback_winner_blues_document_records(self, es256_keypair):
+        """AC1, the highest-volume real pair (14 occurrences / 30d): query
+        ``Various Artists - Blues`` / ``I'm On My Way`` with a catalog album
+        that matches NO candidate's album, so the album-constrained pass clears
+        nobody and the LML#782 fallback would previously re-admit a ``Various
+        Artists - Document Records`` winner on artist 85 + title 100."""
+        client = _client(es256_keypair)
+        document_records = _make_song_data(
+            name="I'm On My Way",
+            artist_name="Various Artists - Document Records",
+            album_name="Field Recordings Vol. 7",
+            url="https://music.apple.com/us/song/im-on-my-way/777",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([document_records]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Various Artists - Blues", "I'm On My Way", album="Blues Classics 1927-1940"
+        )
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_rejects_va_fallback_winner_latin_azzurra(self, es256_keypair):
+        """AC2: ``Various Artists - Latin`` / ``Aguas de Março`` against
+        ``Various Artists - Azzurra Music`` — same shape, second pair class."""
+        client = _client(es256_keypair)
+        azzurra = _make_song_data(
+            name="Aguas de Março",
+            artist_name="Various Artists - Azzurra Music",
+            album_name="Bossa Nova Collection",
+            url="https://music.apple.com/us/song/aguas-de-marco/888",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([azzurra]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Various Artists - Latin", "Aguas De Marco", album="Latin Jazz Sampler"
+        )
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_retains_va_pair_whose_album_clears(self, es256_keypair):
+        """AC3 — the guard's whole point. A V/A<->V/A candidate whose ALBUM
+        genuinely agrees still resolves, still carries its URL, and is still
+        album_verified: the album-constrained pass is the lane V/A matching
+        survives through."""
+        client = _client(es256_keypair)
+        real_comp = _make_song_data(
+            name="I'm On My Way",
+            artist_name="Various Artists - Document Records",
+            album_name="Blues Classics 1927-1940",
+            url="https://music.apple.com/us/song/im-on-my-way/999",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([real_comp]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Various Artists - Blues", "I'm On My Way", album="Blues Classics 1927-1940"
+        )
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/im-on-my-way/999"
+        assert match.album_verified is True
+
+    @pytest.mark.asyncio
+    async def test_rejects_album_less_va_query(self, es256_keypair):
+        """AC4 — a DELIBERATE KILL, pinned with its accepted recall cost (the
+        LML#719 idiom). The real pair (``Various Artists - Asia``, ``Jombang
+        Jet``) -> (``Various Artists & Pan Ron``) scores title 100 and is
+        plausibly CORRECT, but with no album to check, nothing distinguishes it
+        from the blues/latin false positives: the artist axis is vacuous and
+        the title is the only signal. We accept losing this match — a missing
+        Apple link beats a wrong one that BS then persists (BS#2000)."""
+        client = _client(es256_keypair)
+        pan_ron = _make_song_data(
+            name="Jombang Jet",
+            artist_name="Various Artists & Pan Ron",
+            album_name="Cambodian Rocks",
+            url="https://music.apple.com/us/song/jombang-jet/555",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([pan_ron]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Various Artists - Asia", "Jombang Jet", album=None
+        )
+        assert match is None
+
+    @pytest.mark.asyncio
+    async def test_one_sided_va_credit_still_resolves(self, es256_keypair):
+        """The real boundary case, and the documented out-of-scope residual.
+
+        ``is_compilation_artist`` is LEADING-anchored, so a candidate carrying a
+        TRAILING V/A credit — ``CAGAYANO VARIOUS ARTISTS`` — is not a
+        compilation artist by the org's canonical rule. The predicate is an AND
+        over both sides, so this pair is NOT struck and still resolves on an
+        album-less probe.
+
+        This is a genuine measured false positive (``Various Artists - Xmas``,
+        artist score 81.08, n=1) that the issue deliberately leaves out of
+        scope: catching it needs a different, one-sided predicate. Pinning it
+        here documents the boundary precisely — and this assertion is what fails
+        if the AND is ever loosened to an OR, which would silently widen the
+        guard's blast radius well past the evidence.
+
+        Note this is also the ONLY realistic non-V/A candidate that clears the
+        artist floor against a V/A query at all: a real artist name scores
+        17-24 against ``Various Artists - …`` and never reaches the guard.
+        """
+        client = _client(es256_keypair)
+        trailing_credit = _make_song_data(
+            name="Sleigh Ride",
+            artist_name="CAGAYANO VARIOUS ARTISTS",
+            album_name="Holiday Party",
+            url="https://music.apple.com/us/song/sleigh-ride/444",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([trailing_credit]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Various Artists - Xmas", "Sleigh Ride", album=None
+        )
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/sleigh-ride/444"
+
+    @pytest.mark.asyncio
+    async def test_guard_is_per_candidate_not_a_winner_veto(self, es256_keypair):
+        """The guard strikes individual CANDIDATES, not the query. A response
+        holding both a struck V/A<->V/A candidate (``Various Artists - Sergent
+        Major``, the real 82.93 pair from the 30d sample) and a non-V/A one that
+        clears on its own merits returns the latter — it must not suppress the
+        whole album-less pass, which is why the rule is a per-candidate
+        ``continue`` rather than a winner veto or fallback suppression."""
+        client = _client(es256_keypair)
+        va_spam = _make_song_data(
+            name="Duke of Earl",
+            artist_name="Various Artists - Sergent Major",
+            album_name="Oldies Party",
+            url="https://music.apple.com/us/song/duke-of-earl/111",
+        )
+        trailing_credit = _make_song_data(
+            name="Duke of Earl",
+            artist_name="CAGAYANO VARIOUS ARTISTS",
+            album_name="Doo Wop Classics",
+            url="https://music.apple.com/us/song/duke-of-earl/222",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([va_spam, trailing_credit]))
+        client._http = mock_http
+
+        match = await client.find_track_metadata(
+            "Various Artists - Xmas", "Duke of Earl", album=None
+        )
+        assert match is not None
+        assert match.url == "https://music.apple.com/us/song/duke-of-earl/222"
+
+    @pytest.mark.asyncio
+    async def test_album_less_va_win_emits_track_album_less_surface(self, es256_keypair):
+        """LML#1139 telemetry split: an album-less request that WINS records
+        ``track_album_less``, not ``track``. Before the split the two were
+        conflated, which is why the album-less V/A population could not be sized
+        in the 30d sample that motivated this guard."""
+        client = _client(es256_keypair)
+        real_artist = _make_song_data(
+            name="la paradoja",
+            artist_name="Juana Molina",
+            album_name="DOGA",
+            url="https://music.apple.com/us/song/la-paradoja/321",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([real_artist]))
+        client._http = mock_http
+
+        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
+            match = await client.find_track_metadata("Juana Molina", "la paradoja", album=None)
+
+        assert match is not None
+        assert rec.call_args.kwargs["surface"] == "track_album_less"
+
+    @pytest.mark.asyncio
+    async def test_album_constrained_win_still_emits_plain_track_surface(self, es256_keypair):
+        """The complement: a constrained win keeps ``track``, which now means
+        strictly "the album-constrained pass supplied the winner"."""
+        client = _client(es256_keypair)
+        real_artist = _make_song_data(
+            name="la paradoja",
+            artist_name="Juana Molina",
+            album_name="DOGA",
+            url="https://music.apple.com/us/song/la-paradoja/321",
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(return_value=_songs_response([real_artist]))
+        client._http = mock_http
+
+        with patch("clients.streaming.apple_music.record_match_telemetry") as rec:
+            match = await client.find_track_metadata("Juana Molina", "la paradoja", album="DOGA")
+
+        assert match is not None
+        assert rec.call_args.kwargs["surface"] == "track"
+
+
 class TestFindTrackMetadataAlbumSubsetInflation:
     """LML#721: the album axis inside ``find_track_metadata`` shares the same
     ``token_set_ratio`` subset-inflation weakness #719 fixed on the title axis.
@@ -1300,13 +1521,20 @@ class TestFindTrackMetadataEmits:
         assert kwargs["matched_title"] == "la paradoja"
 
     @pytest.mark.asyncio
-    async def test_whitespace_album_emits_plain_track_surface(self, es256_keypair):
+    async def test_whitespace_album_emits_album_less_track_surface(self, es256_keypair):
         """A whitespace-only album normalizes to ``""`` — no scoreable
         constraint. It must take the album-less path directly (one scoring
-        pass, ``surface="track"``), not run a guaranteed-miss constrained
-        pass and mislabel the winner ``"track_album_fallback"`` — that
-        would inflate the LML#592 fallback-rate dashboard with requests
-        that were never album-constrained to begin with."""
+        pass), not run a guaranteed-miss constrained pass and mislabel the
+        winner ``"track_album_fallback"`` — that would inflate the LML#592
+        fallback-rate dashboard with requests that were never album-constrained
+        to begin with.
+
+        LML#1139 sharpened the label this asserts: album-less wins now record
+        ``"track_album_less"`` rather than sharing ``"track"`` with genuine
+        album-constrained wins. That serves this test's original intent more
+        precisely — the point was always that a never-constrained request must
+        not be filed under a constrained surface, and ``"track"`` was itself
+        doing exactly that until the third value existed."""
         client = _client(es256_keypair)
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(return_value=_songs_response([_make_song_data_full()]))
@@ -1322,7 +1550,7 @@ class TestFindTrackMetadataEmits:
         assert match.release_year is None
         assert match.album_verified is False
         rec.assert_called_once()
-        assert rec.call_args.kwargs["surface"] == "track"
+        assert rec.call_args.kwargs["surface"] == "track_album_less"
 
     @pytest.mark.asyncio
     async def test_emits_scores_of_chosen_winner_not_top_fuzz(self, es256_keypair):
