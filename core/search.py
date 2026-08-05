@@ -385,6 +385,26 @@ class SearchState:
     time" (``results`` may be empty, ``timed_out: True``).
     """
 
+    upstream_shed: bool = False
+    """True when a saturation-breaker shed (any ``BreakerOpenError``) was
+    caught inside the strategy loop and degraded to a cache-only outcome
+    (LML#755 R2-2, LML#1126). Breaker-agnostic since LML#1118 widened the
+    catch to the shared base — today only Discogs strategies fan out from
+    there, but a future breaker-guarded strategy sets this for free.
+
+    Distinct from ``timed_out``: a shed means "couldn't ask upstream" (the
+    breaker is open), not "ran out of time to ask". Projected onto
+    ``LookupState.upstream_shed`` and surfaced as
+    ``LookupResponse.degraded=True`` / ``degraded_reason=upstream_unavailable``
+    so a shed response is distinguishable on the wire from a genuine no-match
+    — before LML#1126, a search-leg shed produced the byte-identical
+    ``results: [], timeout: false, degraded: false`` shape a real miss does.
+    Set even when a later strategy still recovers results (the shed strategy's
+    own contribution is missing/unconfirmed regardless), matching the tail
+    shed arms (``_build_degraded_response``), which mark ``degraded=True``
+    while keeping whatever the library + cached legs already produced.
+    """
+
 
 # Type aliases for strategy functions
 ConditionFunc = Callable[[ParsedRequest, SearchState, str], bool]
@@ -965,11 +985,21 @@ async def _run_strategy_pipeline(
                 # covered for free, with no new catch to add. We ``continue`` (not
                 # ``break``) so a later strategy — which may hit only the cache —
                 # still runs.
+                #
+                # LML#1126: record the shed on ``state.upstream_shed`` so the
+                # response can be marked degraded instead of laundering into a
+                # byte-identical genuine no-match. This is a marker only — no
+                # per-shed WARNING/ERROR (LML#805/#798 already fixed that noise
+                # posture; the existing INFO line below is unchanged). The marker
+                # is breaker-agnostic for the same reason the catch is: any
+                # breaker-guarded strategy's shed is an "upstream unavailable,"
+                # not a no-match.
                 logger.info(
                     "%s shed strategy %s; degrading to cache-only",
                     type(exc).__name__,
                     strategy.name,
                 )
+                state.upstream_shed = True
                 outcome = Outcome.empty()
 
             # The one write site: every per-strategy ``SearchState`` mutation

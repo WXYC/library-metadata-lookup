@@ -1319,6 +1319,10 @@ class TestBreakerShedInRunner:
 
         assert state.results == []
         assert SearchStrategyType.TRACK_ON_COMPILATION in state.strategies_tried
+        # LML#1126: the shed must be recorded on SearchState so the orchestrator
+        # can mark the wire response degraded instead of a byte-identical
+        # genuine no-match.
+        assert state.upstream_shed is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1370,9 +1374,39 @@ class TestBreakerShedInRunner:
 
         state = await execute_search_pipeline(parsed, "x", strategies, song_not_found=True)
 
-        # The later strategy still ran and surfaced its match despite the shed.
+        # The later strategy still ran and surfaced its match despite the shed —
+        # ``continue`` semantics are preserved.
         assert [i.id for i in state.results] == [7]
         assert SearchStrategyType.SONG_AS_ARTIST in state.strategies_tried
+        # LML#1126: a shed that still produced results (via a later cache-only
+        # strategy) is still marked — the response is trustworthy but
+        # incomplete, not a clean hit.
+        assert state.upstream_shed is True
+
+    @pytest.mark.asyncio
+    async def test_no_shed_leaves_upstream_shed_false(self, monkeypatch):
+        """Regression pin (LML#1126): a genuine miss with no breaker involvement
+        must NOT set ``upstream_shed`` — this is what keeps a real no-match
+        distinguishable from a shed on the wire."""
+        monkeypatch.setenv("LML_SEARCH_HARD_TIMEOUT_MS", "60000")
+        monkeypatch.setenv("LML_SEARCH_BUDGET_MS", "60000")
+
+        async def miss_attempt(parsed, state, raw_message):  # noqa: ARG001
+            return Outcome.empty()
+
+        strategies = [
+            _StubStrategy(
+                name=SearchStrategyType.TRACK_ON_COMPILATION,
+                condition=lambda *_a: True,
+                attempt_func=miss_attempt,
+            )
+        ]
+        parsed = ParsedRequest(artist="Juana Molina", song="La Verdad", raw_message="x")
+
+        state = await execute_search_pipeline(parsed, "x", strategies, song_not_found=True)
+
+        assert state.results == []
+        assert state.upstream_shed is False
 
 
 class TestHardCapSoftBudgetIndependence:

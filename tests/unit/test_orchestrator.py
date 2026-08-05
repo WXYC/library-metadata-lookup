@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from core.exceptions import BreakerOpenError
+from core.search import SearchState
 from discogs.breaker import DiscogsBreakerOpenError
 from discogs.models import DiscogsSearchResponse
 from entity.compilation_track_location import CompilationTrackLocationRow
@@ -304,6 +305,96 @@ class TestPerformLookupBasic:
 
         assert isinstance(response, LookupResponse)
         assert len(response.results) == 0
+        # LML#1126 regression pin: a genuine no-match (no breaker shed anywhere
+        # in the pipeline) must stay byte-identical to the pre-#1126 contract —
+        # this is the exact shape a search-leg shed used to falsify.
+        assert response.degraded is False
+        assert response.degraded_reason is None
+        assert response.timeout is False
+
+    @pytest.mark.asyncio
+    async def test_search_leg_shed_marks_response_degraded(
+        self, mock_library_db, mock_discogs_service, telemetry
+    ):
+        """LML#1126: a Discogs saturation-breaker shed caught inside the search
+        pipeline (core/search.py's one catch boundary, R2-2) degrades to an
+        empty/cache-only ``SearchState`` with ``upstream_shed=True`` set. That
+        flag must ride onto ``LookupState`` and surface on the wire as
+        ``degraded: true, degraded_reason: upstream_unavailable`` — before this
+        fix the response was byte-identical to a genuine no-match.
+
+        ``execute_search_pipeline`` is patched directly (rather than driving a
+        real strategy through ``DiscogsBreakerOpenError``, which is already
+        pinned at the runner level in ``tests/unit/test_search.py``) to isolate
+        the orchestrator-side copy-through + response-build wiring this ticket
+        adds. No album on the request so the library-miss probe (3a) — gated on
+        empty ``library_results`` plus a present ``album`` — does not fire and
+        need its own Discogs mock.
+        """
+        request = LookupRequest(
+            artist="Jessica Pratt",
+            song="Back, Baby",
+            raw_message="Jessica Pratt - Back, Baby",
+        )
+
+        shed_state = SearchState(results=[], upstream_shed=True)
+
+        with patch(
+            "lookup.orchestrator.execute_search_pipeline",
+            AsyncMock(return_value=shed_state),
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert isinstance(response, LookupResponse)
+        assert response.results == []
+        assert response.degraded is True
+        assert response.degraded_reason == DegradedReason.upstream_unavailable
+        # Control flow unchanged: no 500, timeout stays independent of the shed.
+        assert response.timeout is False
+
+    @pytest.mark.asyncio
+    async def test_search_leg_shed_with_results_still_marks_degraded(
+        self, mock_library_db, mock_discogs_service, telemetry, stereolab_item
+    ):
+        """Decision (LML#1126): a shed that still produced library results is
+        ALSO marked degraded=True. ``degraded`` means "trustworthy but
+        incomplete" — a lookup that found library rows but could not reach
+        Discogs to confirm/enrich them is exactly that, matching the tail-shed
+        arms (``_build_degraded_response``), which keep whatever the library +
+        cached legs produced while still returning ``degraded=True``."""
+        mock_discogs_service.search.return_value = DiscogsSearchResponse(
+            results=[
+                make_discogs_result(
+                    release_id=555,
+                    album="Emperor Tomato Ketchup",
+                    artist="Stereolab",
+                )
+            ]
+        )
+
+        request = LookupRequest(
+            artist="Stereolab",
+            album="Emperor Tomato Ketchup",
+            raw_message="Stereolab - Emperor Tomato Ketchup",
+        )
+
+        shed_state = SearchState(results=[stereolab_item], upstream_shed=True)
+
+        with patch(
+            "lookup.orchestrator.execute_search_pipeline",
+            AsyncMock(return_value=shed_state),
+        ):
+            response = await perform_lookup(
+                request, mock_library_db, mock_discogs_service, telemetry
+            )
+
+        assert isinstance(response, LookupResponse)
+        assert len(response.results) == 1
+        assert response.results[0].library_item.artist == "Stereolab"
+        assert response.degraded is True
+        assert response.degraded_reason == DegradedReason.upstream_unavailable
 
     @pytest.mark.asyncio
     async def test_no_discogs_service_still_works(self, mock_library_db, telemetry, queen_item):

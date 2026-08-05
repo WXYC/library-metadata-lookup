@@ -330,6 +330,15 @@ class LookupState:
     abandoned. Written by the search pipeline (step 3); read by the response
     build (``LookupResponse.timeout``) and the degraded-response build."""
 
+    upstream_shed: bool = False
+    """True when the search pipeline (step 3) caught a Discogs saturation-
+    breaker shed in its one catch boundary and degraded to a cache-only
+    outcome (LML#755 R2-2). Copied from ``SearchState.upstream_shed``; read by
+    the normal response build, which emits ``degraded=True`` (mirroring the
+    tail legs' ``_build_degraded_response``) instead of the pre-LML#1126
+    hardcoded ``degraded=False`` — even when ``library_results`` ended up
+    non-empty, since the shed strategy's own contribution is still missing."""
+
     @property
     def result_count(self) -> int:
         """Row count for the response; ``items_with_artwork`` takes precedence when non-empty."""
@@ -613,6 +622,7 @@ async def _step_search_pipeline(
         state.artist_fallback_results = search_state.artist_fallback_results
         state.matched_via_by_id = search_state.matched_via_by_id
         state.timed_out = search_state.timed_out
+        state.upstream_shed = search_state.upstream_shed
         # LML#808: preserve the full, pre-truncation candidate set so track
         # validation (3b) can widen past the ``limit_results`` cut instead of
         # only ever seeing the top ``MAX_SEARCH_RESULTS`` rows by rowid.
@@ -1327,6 +1337,9 @@ async def perform_lookup(
     )
     _project_post_fold_trace_attrs(result_items, search_type)
 
+    # LML#1126: a search-leg breaker shed must not read as a genuine no-match
+    # -- see ``LookupState.upstream_shed``'s docstring.
+    degraded = state.upstream_shed
     return LookupResponse(
         results=result_items,
         search_type=search_type,
@@ -1336,7 +1349,8 @@ async def perform_lookup(
         corrected_artist=state.corrected_artist,
         external_source=external_source,
         timeout=state.timed_out,
-        degraded=False,
+        degraded=degraded,
+        degraded_reason=DegradedReason.upstream_unavailable if degraded else None,
     )
 
 
