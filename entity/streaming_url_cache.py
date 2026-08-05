@@ -239,13 +239,37 @@ WHERE service = $1 AND artist_normalized = $2 AND album_normalized = $3
 # EXCLUDED.is_error`` is load-bearing: a later genuine resolve or genuine
 # miss on the same key must clear a stale ``True`` rather than leave it
 # latched, so the row doesn't keep aging on the short error TTL forever.
+#
+# ``url``/``is_error`` are CASE-guarded, not unconditional overwrites (LML#1121
+# FIX 3): an ERROR write (``EXCLUDED.url IS NULL AND EXCLUDED.is_error``)
+# against a row that already carries a non-null URL keeps the EXISTING
+# url/is_error instead of clobbering them. Without this guard, two resolves
+# for the same key racing across uvicorn workers (or a warm racing the
+# ``/streaming-check`` leg) could both read the row absent, then A resolves a
+# real URL and UPSERTs it while B's leg fails and UPSERTs
+# ``url=NULL, is_error=true`` -- destroying A's URL. Pre-LML#1121 the
+# exception path wrote nothing at all, so this interleaving was impossible;
+# the ``is_error`` column is what creates it. A GENUINE miss write
+# (``is_error=false``) is NOT guarded -- it still overwrites a stale URL
+# unconditionally, unchanged, out of this fix's scope. An existing NULL url
+# is likewise never guarded -- there is nothing to protect.
 _UPSERT_SQL = """\
 INSERT INTO lml_cache.album_streaming_url_cache
     (service, artist_normalized, album_normalized, url, is_error, last_checked_at)
 VALUES ($1, $2, $3, $4, $5, now())
 ON CONFLICT (service, artist_normalized, album_normalized) DO UPDATE
-SET url = EXCLUDED.url,
-    is_error = EXCLUDED.is_error,
+SET url = CASE
+        WHEN EXCLUDED.url IS NULL AND EXCLUDED.is_error
+             AND album_streaming_url_cache.url IS NOT NULL
+        THEN album_streaming_url_cache.url
+        ELSE EXCLUDED.url
+    END,
+    is_error = CASE
+        WHEN EXCLUDED.url IS NULL AND EXCLUDED.is_error
+             AND album_streaming_url_cache.url IS NOT NULL
+        THEN album_streaming_url_cache.is_error
+        ELSE EXCLUDED.is_error
+    END,
     last_checked_at = EXCLUDED.last_checked_at\
 """
 

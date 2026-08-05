@@ -617,3 +617,69 @@ class TestErrorTTL:
             )
         assert row["url"] is None
         assert row["is_error"] is False
+
+
+@pytest.mark.pg
+@pytest.mark.parametrize(("service", "sample_url"), _SERVICE_CASES)
+class TestErrorWriteDoesNotClobberAUrl:
+    """LML#1121 FIX 3: two interleaved resolves for the same key -- A resolves
+    a real URL and UPSERTs it, B's leg then fails and UPSERTs
+    ``url=NULL, is_error=true`` -- must not let B destroy A's URL. Pre-#1121
+    the exception path wrote nothing at all, so this interleaving was
+    impossible; the ``is_error`` column is what creates it. Real ``ON
+    CONFLICT`` evaluation is the point here -- the unit-level mock
+    (``tests/unit/test_streaming_url_cache.py``) can only pin the SQL TEXT,
+    not that PostgreSQL actually honors the CASE guard."""
+
+    @pytest.mark.asyncio
+    async def test_error_write_keeps_the_existing_url(
+        self, pg_source, pg_pool, service, sample_url
+    ):
+        await set_cached_streaming_url(
+            pg_source, service=service, artist="Sessa", album="Estrela Acesa", url=sample_url
+        )
+
+        await set_cached_streaming_url(
+            pg_source,
+            service=service,
+            artist="Sessa",
+            album="Estrela Acesa",
+            url=None,
+            is_error=True,
+        )
+
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT url, is_error FROM lml_cache.album_streaming_url_cache "
+                "WHERE service = $1 AND artist_normalized = 'sessa' "
+                "AND album_normalized = 'estrela acesa'",
+                service,
+            )
+        assert row["url"] == sample_url
+        assert row["is_error"] is False
+
+    @pytest.mark.asyncio
+    async def test_genuine_miss_write_still_overwrites_an_existing_url(
+        self, pg_source, pg_pool, service, sample_url
+    ):
+        # Companion pin: the guard is scoped to an ERROR write only -- a
+        # GENUINE miss (is_error=false, e.g. a librarian-curated URL going
+        # dead and a fresh probe confirming absence) must still be free to
+        # overwrite an existing URL. Out of FIX 3's scope, unchanged.
+        await set_cached_streaming_url(
+            pg_source, service=service, artist="Sessa", album="Estrela Acesa", url=sample_url
+        )
+
+        await set_cached_streaming_url(
+            pg_source, service=service, artist="Sessa", album="Estrela Acesa", url=None
+        )
+
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT url, is_error FROM lml_cache.album_streaming_url_cache "
+                "WHERE service = $1 AND artist_normalized = 'sessa' "
+                "AND album_normalized = 'estrela acesa'",
+                service,
+            )
+        assert row["url"] is None
+        assert row["is_error"] is False

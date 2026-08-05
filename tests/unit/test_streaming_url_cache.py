@@ -333,6 +333,36 @@ class TestSetCachedStreamingURL:
         assert call.args[4] is None
         assert call.args[5] is True
 
+    async def test_upsert_sql_guards_an_error_write_against_clobbering_a_url(
+        self, service, sample_url
+    ):
+        # LML#1121 FIX 3: an unconditional ``DO UPDATE SET url = EXCLUDED.url``
+        # lets two interleaved resolves for the same key race -- A resolves a
+        # real URL and UPSERTs it, B's leg then fails and UPSERTs
+        # ``url=NULL, is_error=True``, destroying A's URL. Pre-#1121 the
+        # exception path wrote nothing, so this interleaving was impossible;
+        # the ``is_error`` column creates it. This is a unit-level SQL-TEXT
+        # pin (mirrors ``tests/unit/test_cache_service.py``'s precedent for
+        # this class of guard) since the mocked PG double never runs real
+        # ``ON CONFLICT`` semantics -- only the ``pg``-marked
+        # ``tests/integration/test_streaming_url_persistent_lookup.py``
+        # exercises the actual clobber-guard behavior. Dropping
+        # ``is_error = EXCLUDED.is_error`` from the ``DO UPDATE`` survives
+        # the entire non-pg unit lane without this pin.
+        pg = AsyncMock(spec=PgSource)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+
+        await set_cached_streaming_url(
+            pg, service=service, artist="Hyd", album="Angel", url=sample_url
+        )
+
+        sql = pg.execute.await_args.args[0]
+        assert "CASE" in sql
+        assert "WHEN EXCLUDED.url IS NULL AND EXCLUDED.is_error" in sql
+        assert "album_streaming_url_cache.url IS NOT NULL" in sql
+        assert "THEN album_streaming_url_cache.url" in sql
+        assert "THEN album_streaming_url_cache.is_error" in sql
+
     async def test_is_error_coerced_false_when_url_present(self, service, sample_url):
         # Defensive guard (mirrors LML#824's ``crowd_out`` coercion): a resolved
         # URL is never simultaneously an error row, regardless of what a
