@@ -171,6 +171,45 @@ def test_guard_prevents_false_positive(tmp_path, relpath, content, seed_target):
     assert "BROKEN" not in result.stdout
 
 
+@pytest.mark.parametrize(
+    "citing_file,expect_broken",
+    [
+        pytest.param("docs/scripts.md", False, id="directly-in-docs-resolves"),
+        pytest.param("docs/adr/0001-example.md", True, id="nested-under-docs-does-not"),
+        # Built via _cite(), not a literal: see the module docstring -- a literal
+        # here would register as a citation from this very file.
+        pytest.param(_cite("sibling.md"), True, id="inside-docs-plans-does-not"),
+    ],
+)
+def test_docs_relative_citation_resolves_only_one_level_above_plans(
+    tmp_path, citing_file, expect_broken
+):
+    """Pin the exact reach of the ``tracked "$dir/$path"`` fallback.
+
+    ``docs/plans/README.md`` documents which files the one-spelling rule is
+    merely *advisory* for, and that boundary is narrower than "anything under
+    ``docs/``": the fallback prepends only the citing file's own directory, so a
+    docs-relative ``plans/<name>.md`` resolves from a file sitting *directly* in
+    ``docs/`` (``docs/`` + ``plans/…`` is the real path) and from nowhere else.
+    From ``docs/adr/`` or ``docs/plans/`` itself the same spelling is a hard CI
+    failure -- which is precisely why the LML#1124 Group B rewrites inside
+    ``docs/plans/`` were mandatory rather than cosmetic.
+    """
+    _init_repo(tmp_path)
+    _track(tmp_path, _cite("target.md"), "# Target\n")
+    docs_relative = _cite("target.md", under_docs=False)
+    _track(tmp_path, citing_file, f"see {docs_relative}\n")
+
+    result = _run_checker(tmp_path)
+
+    if expect_broken:
+        assert result.returncode == 1, result.stdout
+        assert f"BROKEN: {citing_file}:{docs_relative}" in result.stdout
+    else:
+        assert result.returncode == 0, result.stdout
+        assert "BROKEN" not in result.stdout
+
+
 def test_generated_directory_is_excluded(tmp_path):
     """``generated/`` is codegen'd upstream; hand-editing it to fix a citation
     would break the ``codegen-check`` CI job, so the checker must not scan it
