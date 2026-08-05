@@ -146,11 +146,23 @@ class TestGetCachedStreamingURL:
         assert "last_checked_at > $5" in sql
         assert call.args[5] == now - error_ttl
 
-    async def test_error_ttl_defaults_to_env_resolution_when_omitted(self, service, sample_url):
+    async def test_error_ttl_defaults_to_env_resolution_when_omitted(
+        self, service, sample_url, monkeypatch
+    ):
         # Production callers (the /lookup post-process, the fail-fast probe)
         # never pass ``error_ttl`` explicitly -- omitting it must still resolve
-        # a live value via ``resolve_streaming_error_ttl`` (env-tunable, no
-        # redeploy), not silently skip the bind.
+        # a LIVE value via ``resolve_streaming_error_ttl`` (env-tunable, no
+        # redeploy), not silently skip the bind. LML#1121 FIX 8: the previous
+        # version of this test never set or unset the env var, so it asserted
+        # against ``DEFAULT_ERROR_TTL`` regardless of whether live resolution
+        # ran at all -- it passed under a mutant that hardcoded the default,
+        # and failed for any developer with ``LML_STREAMING_ERROR_TTL_MINUTES``
+        # exported locally (a real production Railway variable). Set an
+        # explicit NON-default override so the assertion can only pass if the
+        # omitted parameter actually threads through to the live env read,
+        # and ``monkeypatch.setenv`` makes this independent of whatever the
+        # ambient environment happens to carry.
+        monkeypatch.setenv(_ERROR_TTL_ENV_VAR, "11")
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
         now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
@@ -160,7 +172,7 @@ class TestGetCachedStreamingURL:
         )
 
         call = pg.fetchone.await_args
-        assert call.args[5] == now - DEFAULT_ERROR_TTL
+        assert call.args[5] == now - timedelta(minutes=11)
 
     async def test_normalizes_artist_and_album_via_to_match_form(self, service, sample_url):
         pg = AsyncMock(spec=PgSource)
