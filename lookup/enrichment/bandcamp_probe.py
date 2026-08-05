@@ -26,8 +26,8 @@ from typing import NamedTuple
 from wxyc_fastapi.observability import get_posthog_client
 
 from clients.bandcamp import BandcampRateLimitedError, BandcampTransportError
-from clients.bandcamp_breaker import BandcampBreakerOpenError
 from config.settings import Settings
+from core.exceptions import BreakerOpenError
 from entity.streaming_url_cache import resolve_streaming_url_with_cache
 from generated.api_models import StreamingResolutionStatus
 from lookup.enrichment.context import EnrichmentContext
@@ -208,21 +208,28 @@ async def run_bandcamp_live_probe(
             timeout=probe_timeout_s,
         )
     except (
-        BandcampBreakerOpenError,
+        BreakerOpenError,
         BandcampRateLimitedError,
         BandcampTransportError,
     ) as exc:
-        # A 429-driven shed (breaker OPEN, or a 429 on the single fail-fast
-        # attempt) or a non-429 transport failure (5xx, Cloudflare 403/1015,
-        # connect timeout, non-200 -- clients/bandcamp.py's
-        # BandcampTransportError, LML#1106 review FIX 2): all three are a
-        # "couldn't ask", not an unexpected raise -- transient, no sourced
-        # verdict, no cache write. Emit the unsampled shed counter so
-        # sustained Bandcamp saturation (rate-limit OR transport) stays
-        # queryable without a per-event Sentry flood (LML#879/#1049 pattern)
-        # -- routing a transport failure through the ``logger.exception``
-        # catch-all below instead would reproduce the exact #755 33k-event
-        # flood shape for an outcome that is expected under load.
+        # LML#1118 FIX 1: widened from ``BandcampBreakerOpenError`` to the
+        # shared ``BreakerOpenError`` base. This parenthesized tuple was the
+        # 20th breaker-catch site -- an AST walk over every ``except`` handler
+        # found it; the #1118 audit's ``except DiscogsBreakerOpenError`` grep
+        # structurally could not see a handler that names the OTHER concrete
+        # type. #1103's future YouTube Music breaker reaches this same probe
+        # through the service-generic
+        # ``resolve_streaming_url_with_cache(fail_fast=True)`` seam; without
+        # this widening its shed would fall to the ``except Exception`` below
+        # and log at ERROR, reproducing the #755 flood misattributed to
+        # Bandcamp. A breaker-OPEN shed (any service), a 429-driven shed on
+        # the single fail-fast attempt, or a non-429 transport failure (5xx,
+        # Cloudflare 403/1015, connect timeout, non-200 --
+        # clients/bandcamp.py's BandcampTransportError, LML#1106 review FIX
+        # 2): all are a "couldn't ask", not an unexpected raise -- transient,
+        # no sourced verdict, no cache write. Emit the unsampled shed counter
+        # so sustained saturation (rate-limit OR transport) stays queryable
+        # without a per-event Sentry flood (LML#879/#1049 pattern).
         _capture_shed(type(exc).__name__, settings=settings)
         return BandcampProbeResult(current_bandcamp_url, StreamingResolutionStatus.unresolved)
     except TimeoutError:
@@ -231,10 +238,18 @@ async def run_bandcamp_live_probe(
         # shed counter. No cache write (wait_for cancelled before the UPSERT).
         logger.debug("Bandcamp live probe timed out for %s - %s", ctx.artist, ctx.album)
         return BandcampProbeResult(current_bandcamp_url, StreamingResolutionStatus.unresolved)
-    except Exception:
-        # Defensive degrade (LML#444 posture): a Bandcamp fault must never fail
-        # the item — attempted-but-inconclusive maps to ``unresolved``.
-        logger.exception("Bandcamp live probe raised for %s - %s", ctx.artist, ctx.album)
+    except Exception as exc:
+        # Defensive degrade (LML#444 posture): a probe fault must never fail
+        # the item — attempted-but-inconclusive maps to ``unresolved``. Names
+        # the actual exception type (LML#1118 FIX 1) rather than assuming
+        # Bandcamp -- the widened catch above no longer funnels every
+        # breaker-typed shed through here for that assumption to hold.
+        logger.exception(
+            "%s raised from the Bandcamp live probe for %s - %s",
+            type(exc).__name__,
+            ctx.artist,
+            ctx.album,
+        )
         return BandcampProbeResult(current_bandcamp_url, StreamingResolutionStatus.unresolved)
 
     if outcome.url is not None:

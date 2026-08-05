@@ -26,6 +26,7 @@ import pytest
 
 from clients.bandcamp import BandcampClient, BandcampRateLimitedError, BandcampTransportError
 from clients.bandcamp_breaker import BandcampBreakerOpenError
+from core.exceptions import BreakerOpenError
 from discogs.models import ReleaseMetadataResponse
 from entity.sources import PgSource
 from generated.api_models import StreamingResolutionStatus
@@ -420,6 +421,42 @@ class TestBandcampLiveProbe:
         sustained Bandcamp load."""
         item, artwork, bandcamp = _inputs()
         bandcamp.find_album_match = AsyncMock(side_effect=BandcampTransportError("500"))
+        pg = AsyncMock(spec=PgSource)
+        pg.fetchone = AsyncMock(return_value=None)
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
+        posthog = MagicMock()
+
+        with (
+            patch("lookup.enrichment.item.get_settings", return_value=_flags()),
+            patch("lookup.enrichment.bandcamp_probe.get_posthog_client", return_value=posthog),
+            patch("lookup.enrichment.bandcamp_probe.logger") as logger_mock,
+        ):
+            results = await _run(bandcamp, pg, item, artwork)
+
+        _, enriched = results[0]
+        assert enriched.streaming_status.bandcamp == StreamingResolutionStatus.unresolved
+        pg.execute.assert_not_awaited()
+        events = [c.kwargs.get("event") for c in posthog.capture.call_args_list]
+        assert "bandcamp_live_probe_shed" in events
+        logger_mock.exception.assert_not_called()
+
+    async def test_future_breaker_subclass_shed_yields_unresolved_and_stays_quiet(self):
+        """LML#1118 FIX 1: this handler was the 20th breaker-catch site found by
+        an AST walk over every ``except`` handler in the repo -- invisible to
+        the #1118 audit's ``except DiscogsBreakerOpenError`` grep because it
+        names ``BandcampBreakerOpenError`` inside a parenthesized tuple. Widened
+        to the shared ``BreakerOpenError`` base so a future breaker (e.g.
+        #1103's YouTube Music breaker, reached through the same service-generic
+        ``resolve_streaming_url_with_cache(fail_fast=True)`` seam) takes this
+        same quiet path instead of falling to the ``except Exception`` below --
+        which would ``logger.exception`` at ERROR, reproducing the #755 flood
+        misattributed to Bandcamp."""
+
+        class _FutureBreakerOpenError(BreakerOpenError):
+            """Stand-in for a breaker that does not exist yet."""
+
+        item, artwork, bandcamp = _inputs()
+        bandcamp.find_album_match = AsyncMock(side_effect=_FutureBreakerOpenError())
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
         pg.execute = AsyncMock(return_value="INSERT 0 1")
