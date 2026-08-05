@@ -1,0 +1,72 @@
+# Volume Eviction and Replica Readiness
+
+## Problem
+
+LML runs as a single Railway instance with a volume mounted at `/data` holding two SQLite files: `library.db` (16MB, read-only at runtime, replaced daily by discogs-etl's `sync-library.sh` via `POST /admin/upload-library-db`) and `streaming_availability.db` (53MB, volume-canonical since LML#672, round-tripped by the weekly `refresh-streaming.yml` cron and occasional manual runs via `POST /admin/upload-streaming-db` / `GET /admin/download-streaming-db`, read daily by discogs-etl).
+
+The volume imposes two costs. First, Railway will not attach one volume to two active deployments, so every deploy takes a downtime blip. Second, Railway replicas cannot be used with volumes at all, so horizontal scaling is architecturally blocked. Separately, the per-process Discogs rate limiter/semaphore/breaker (`discogs/ratelimit.py`) would overrun the shared 60/min Discogs token at N replicas × 50/min if replicas were ever enabled naively.
+
+## Target end state (decided in design review)
+
+**Replica-ready, no flip.** This plan delivers (a) both SQLite files moved off the volume into a Railway Bucket (Railway's native S3-compatible object storage — nothing leaves Railway), (b) the volume removed, making deploys zero-downtime, and (c) a horizontal-scaling runbook that documents the exact env-var arithmetic and flip criteria for enabling replicas later. Actually enabling N≥2 replicas is explicitly out of scope: it is gated on discogs-etl#313 (discogs-cache PG shared_buffers tuning — replicas would double connection load onto a memory-starved PG) and on flood control (BS#1591), and it is a later evidence-driven decision per the runbook's flip criteria.
+
+### Decisions locked during design review
+
+1. **streaming_availability.db → Railway Bucket behind the existing endpoints.** `POST /admin/upload-streaming-db` and `GET /admin/download-streaming-db` keep their exact URL contract, auth, and status codes; storage moves from `/data` to the bucket. The LML#672 coverage-regression guard stays server-side (baseline = current bucket object). Consumers — `refresh-streaming.yml`, discogs-etl's daily sync, manual scripts — change zero lines. Verified: the running app never reads this file (all `streaming_availability` references in runtime modules are the `check_streaming_availability` function name); it is purely a hosted artifact, so no boot-fetch is needed for it.
+2. **library.db → Railway Bucket, upload endpoint retained, lifespan boot-fetch.** `POST /admin/upload-library-db` keeps its contract: it now writes the file to the bucket and then performs today's local hot-swap (`close_library_db()` — which already clears the TTL caches internally via `library/db.py:174` — then atomic replace; caches repopulate lazily against the new file). At N=1 behavior is identical to today — discogs-etl's `sync-library.sh` changes nothing. At boot, the FastAPI lifespan fetches `library.db` from the bucket to local disk before serving; fetch failure is **non-fatal** — the app logs the error (with Sentry capture) and serves in today's degraded posture (missing DB → `/health` 503 via `core/dependencies.py:83-88`, non-DB endpoints still up). This preserves both safety properties: during a deploy, the 503 health check keeps Railway from cutting over to the degraded instance (the previous deployment keeps serving), and on a steady-state restart the process stays alive so `POST /admin/upload-library-db` remains available as the recovery path (a crash-loop would instead exhaust `railway.toml`'s `restartPolicyMaxRetries = 10` and strand the service with no recovery endpoint).
+3. **Cutover = snapshot, seed out-of-band, hard cutover, remove volume.** Per environment (staging first): snapshot both files locally via the existing download endpoints (safety copies, honoring the never-delete-collected-data rule), create the bucket and put both objects directly with an S3-protocol client, enable bucket mode via Railway variable references, verify (health + downloads + a live lookup), then remove the volume mount. No dual-path transition code and no organic-fill window (the #672 two-lineages anti-pattern).
+4. **Limiter/breaker workstream = runbook + follow-up issues, no code.** The #792 settings knobs are already promoted to prod (`origin/prod` = `origin/main`), and the breaker's proactive floor path is already globally informed (`X-Discogs-Ratelimit-Remaining` reflects shared-token consumption across all consumers). Static division is pure env-var arithmetic, documented in the runbook. Two follow-up issues are filed but not built: a shared PG token bucket in `lml_cache.*` (exact global enforcement; would also fix the standing staging-shares-prod-token hazard) and the streaming_availability.db → `lml_cache.*` PG canonical migration (the durable fix for the whole-file-clobber model; deferred because ~25 offline scripts do direct sqlite3 I/O against the file and the pre-#313 PG shouldn't take on new data).
+5. **Packaging = standalone LML epic** with sub-issues per PR, cross-referencing LML#747 (UVICORN_WORKERS>1 prerequisites — shares the per-process-state analysis and the `os.replace` stale-inode concern, and boot-fetch resolves several of its blockers), LML#757 (breaker state on /health, adjacent to the runbook), and discogs-etl#313 (flip criterion).
+
+## Design details
+
+### Storage layer
+
+New module `storage/object_store.py` defining an `ObjectStore` protocol (`get(key) -> bytes` or streamed-to-path, `put(key, path_or_bytes)`, `exists(key)`, `head(key)`) with two implementations:
+
+- `S3ObjectStore`: plain `boto3` client calls wrapped in `asyncio.to_thread`. Rationale: storage operations are rare (one boot fetch, one daily upload, weekly round-trips), so async-native `aioboto3` isn't worth its aiobotocore version-pinning fragility. Client configured with explicit `endpoint_url`, connect/read timeouts, and standard retries.
+- `LocalDirStore`: current filesystem behavior against a configured directory. This is the mode for local dev and for the existing endpoint test suite, selected automatically when bucket settings are absent.
+
+Selection happens once in `core/dependencies.py` (same pattern as the existing singletons): bucket mode when `LML_BUCKET_NAME` + `LML_BUCKET_ENDPOINT` (Railway variable references to the bucket's `BUCKET` and `ENDPOINT`) are set, with credentials via the standard `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars that boto3 picks up natively (Railway's variable-reference presets provision these names). Local mode otherwise. Exactly one store is active per deployment — no dual-write, no fallback chain.
+
+New settings in `config/settings.py`: `lml_bucket_name`, `lml_bucket_endpoint` (both optional, default None → local mode), documented in `docs/env-vars.md`.
+
+### Streaming endpoints on the store
+
+`POST /admin/upload-streaming-db`: read upload → SQLite validity check (unchanged) → fetch current bucket object to a temp file for the coverage baseline → `_check_streaming_regression` (unchanged) → `put`. Guard semantics preserved exactly, including the asymmetry between missing and unreadable baselines: a **missing** object (no key in the bucket) is accepted like today's first-upload case (`_streaming_coverage` on an absent file yields all-zero metrics at `routers/admin.py:78-79`, and the regression check skips zero baselines at `:151`), while an **unreadable** object (present but corrupt) fails closed with 409 + `force=true` override (`routers/admin.py:408-429`). These two cases are cleanly distinguishable against the store (S3 404 vs a fetched-but-corrupt file). The seed-first cutover means the missing-baseline path never occurs in a deployed environment anyway. S3 PUT is atomic per object, so the tmp-file + `os.replace` dance is unnecessary in bucket mode. `GET /admin/download-streaming-db`: stream the object through the service (contract and auth unchanged; 53MB/week of service egress is negligible), 404 when absent.
+
+### library.db boot-fetch and upload
+
+Lifespan (in `main.py`, alongside the existing `lml_cache` bootstrap): in bucket mode, fetch `library.db` from the store to `LIBRARY_DB_PATH` before the app starts serving, with a small bounded retry (e.g. 3 attempts with backoff); on final failure, log + Sentry-capture and continue serving degraded rather than raising (see decision 2 for why non-fatal: health-gate deploy safety is preserved via the existing 503, and the admin upload endpoint stays available as the recovery path). In local mode, no fetch — current behavior. `POST /admin/upload-library-db`: validate (unchanged) → `put` to store → existing local hot-swap sequence (close-then-replace, matching today's `routers/admin.py:312-315`; no extra cache-clear call — `LibraryDB.close()` already clears the TTL caches). The N≥2 caveat (hot-swap only refreshes the replica that received the request; others refresh at next restart) goes in the runbook, not code.
+
+### Runbook (docs/deployment.md)
+
+Rewrite the volume-centric sections to describe the bucket architecture and add two runbook sections:
+
+- **Cutover runbook**: the seed-then-hard-cutover procedure above, written to be executed per environment.
+- **Horizontal-scaling runbook**: knob inventory table — divide by N: `DISCOGS_RATE_LIMIT` (floor(50/N)), `DISCOGS_MAX_CONCURRENT`; raise: `discogs_breaker_remaining_floor` by ~N × per-replica `DISCOGS_MAX_CONCURRENT` (absorbs cluster-wide in-flight overshoot when the floor is observed); shrink pre-#313: `LML_DISCOGS_POOL_MAX_SIZE` (shared PG connection budget); unchanged: `LML_LOOKUP_MAX_CONCURRENT`, warm/bulk concurrency (per-replica compute gates). Flip criteria: (1) discogs-etl#313 landed and the #706 tail re-measured healthy, (2) BS#1591 landed or floods otherwise controlled, (3) observed CPU-bound latency under organic load or an explicit availability requirement. Known permanent N≥2 degradations: split L1 TTL caches, split single-flight dedup (LML#537 scope becomes per-replica), N half-open breaker trials, library.db freshness skew until the post-sync redeploy step. Flip procedure: set the divided env vars, bump replica count, add `railway redeploy` after the daily library sync.
+
+## PR chain (each ≤ a few hundred lines, TDD throughout: failing test → implementation → refactor)
+
+1. **PR 1 — storage layer.** `storage/object_store.py` protocol + `S3ObjectStore` + `LocalDirStore`, settings, dependency wiring (inert — nothing calls it yet). Dependencies: `boto3` goes in `[project].dependencies` (it's on the boot-fetch and upload runtime paths — the Docker image installs runtime deps only, so a dev-only boto3 would ImportError at boot); `moto` goes in the `dev` extra. Tests: moto for the S3 impl, plain tmp-path tests for the local impl. No new pytest markers needed — moto is in-process.
+2. **PR 2 — streaming endpoints on the store.** Endpoint rework + guard re-anchoring. Tests: existing endpoint suite runs against `LocalDirStore` (proving the contract is unchanged), plus moto-backed tests for bucket mode pinning today's exact guard semantics: missing-object→accepted (first upload), unreadable-object→409, coverage regression→409, and the `force=true` overrides.
+3. **PR 3 — library.db boot-fetch + upload rework.** Lifespan fetch (bucket mode only), upload endpoint bucket write + hot-swap. Tests: moto-backed lifespan tests (fetch success, fetch failure raises), upload round-trip, hot-swap cache invalidation (existing tests extended).
+4. **PR 4 — cleanup + docs.** Remove the `chown /data` line from `entrypoint.sh` (a no-op once volumes are gone, so this lands after cutover) — but **retain** the Dockerfile's `mkdir -p /data && chown -R appuser:appuser /data` (`Dockerfile:32`): with the volume gone, that line is the only thing creating the writable directory the boot-fetch writes `LIBRARY_DB_PATH` into. Rewrite `docs/deployment.md` (bucket architecture + both runbooks), update `docs/env-vars.md`, adjust the CLAUDE.md router line if the deployment doc's summary changes.
+
+Operator steps interleaved (not PRs, executed with the user): after PR 3 reaches staging — create the staging bucket, snapshot, seed, set variable references, verify, remove the staging volume; after a soak (through at least one daily library sync and ideally the weekly streaming refresh) — promote to prod, repeat the cutover there, remove the prod volume; then PR 4. Epic + sub-issues filed at implementation start per the finish-plan workflow; the two follow-up issues (PG token bucket, streaming-DB PG migration) are filed alongside the epic.
+
+## Risks and mitigations
+
+- **Bucket unavailable at boot**: the boot-fetch retries then degrades — the instance serves with `/health` 503, so new deploys fail the health gate and the old deploy keeps serving, while steady-state restarts keep the process (and the admin upload recovery path) alive. Strictly no worse than the volume's own failure modes.
+- **Seeding mistakes**: local snapshots are taken first and retained; staging proves the full sequence before prod; the coverage guard remains active for all post-seed streaming uploads.
+- **Guard semantics drift during the rewrite**: PR 2 pins today's exact behaviors as explicit tests before the storage swap — missing baseline accepted (first upload), unreadable baseline 409, regression 409, force overrides.
+- **Railway Buckets product maturity**: GA, S3-compatible, per-environment isolated instances; cost ~$0.001/month for 70MB with free API ops and egress. The GitHub `streaming-data-v1` release copy of library.db continues to exist as an independent artifact (discogs-etl publishes it; unaffected by this plan).
+- **Stale `library.db` on other replicas after a future flip**: documented degradation + redeploy-after-sync runbook step; a replica serving yesterday's catalog is degraded (missing new arrivals), not broken.
+
+## Acceptance criteria
+
+- Volume detached in staging and prod; a staging deploy observed with zero downtime (request loop through the deploy window).
+- Daily `sync-library.sh` and weekly `refresh-streaming.yml` green post-cutover with zero changes in their repos; discogs-etl's daily streaming-DB read green.
+- Coverage guard verified live: a force-less thin upload against the seeded bucket is rejected 409.
+- Both runbooks merged in `docs/deployment.md`; `docs/env-vars.md` updated; epic + sub-issues + two follow-up issues filed and cross-referenced (#747, #757, discogs-etl#313).
+- CI green on every PR; local checks pass before each push.
