@@ -100,4 +100,4 @@ This reuses **both** proven pieces (LML's Apple matching + BS's fill-only write)
 - `clients/streaming/apple_music.py::find_album_match` / `clients/streaming/matching.py::find_best_source_match` — the reused matcher.
 - `entity/streaming_url_cache.py:350` — proof the warm (the backfill's capture path) calls `find_album_match`.
 - `Backend-Service/jobs/apple-music-url-backfill/resolve.ts::applyUpdate` — the reused fill-only write.
-- `plans/bs1631-tail-cache-seed.md` (discogs-etl) — the seed effort; its live-coverage check surfaced that the tail is library albums and that resolution ≠ Apple-URL yield.
+- `https://github.com/WXYC/discogs-etl/blob/main/docs/seed-cache-from-clone-runbook.md` — the seed effort; its live-coverage check surfaced that the tail is library albums and that resolution ≠ Apple-URL yield.

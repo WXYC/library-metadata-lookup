@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # LML#907 event-loop-lag gauge. The process-global sampler (core.event_loop_lag,
 # started in main.py lifespan) measures how long the single uvicorn worker's loop
 # takes to resume past a fixed sleep — the /lookup starvation tax
-# (plans/lookup-latency-event-loop-starvation.md §3) that no track_step or
+# (docs/plans/lookup-latency-event-loop-starvation.md §3) that no track_step or
 # Server-Timing leg can see. Stamped once per cache_stats context so it rides the
 # cache.* / lml.cache.* projection to PostHog + Sentry as a per-request sample of
 # the process-global gauge.

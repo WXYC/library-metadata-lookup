@@ -574,7 +574,7 @@ class Settings(BaseSettings):
             "stamps the current value onto each request's cache_stats as "
             "event_loop_lag_ms, riding the cache.* / lml.cache.* projection to "
             "PostHog + Sentry. This surfaces the /lookup single-worker starvation "
-            "tax (plans/lookup-latency-event-loop-starvation.md §3) that "
+            "tax (docs/plans/lookup-latency-event-loop-starvation.md §3) that "
             "track_step and the Server-Timing header structurally cannot see, and "
             "is the before/after metric for Lever A' (#904) and Lever B (#747). "
             "Default True. To disable, set False and confirm a redeploy landed: "

@@ -4,7 +4,7 @@
 VA/compilation guard lives only in ``writer_credits_from_release`` and is
 exercised there. Role strings are drawn from a live discogs-cache enumeration
 (2026-06-28) so the matrix reflects the real hyphen/space, comma-compound, and
-``[bracket]`` variants. See ``plans/699-composer-credits-bmi.md``.
+``[bracket]`` variants. See ``docs/plans/699-composer-credits-bmi.md``.
 """
 
 import pytest

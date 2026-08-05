@@ -1179,7 +1179,7 @@ class DiscogsCacheService:
         The shared :meth:`get_release` is deliberately left untouched so the
         public ``/api/v1/discogs/release`` response keeps returning ``videos``
         (and every other child) on BOTH warm and cold cache paths — the
-        ``plans/lookup-latency-plan.md`` §6.3 fence: a field-drop or read-shape
+        ``docs/plans/lookup-latency-plan.md`` §6.3 fence: a field-drop or read-shape
         change must never mutate the shared cached read ``/discogs/*`` serves
         from.
         """
@@ -2113,7 +2113,7 @@ class DiscogsCacheService:
         The shared :meth:`get_artist_details` is deliberately left untouched so
         the public ``/api/v1/discogs/artist`` response keeps returning those
         children on BOTH warm and cold cache paths (the
-        ``plans/lookup-latency-plan.md`` §6.3 fence).
+        ``docs/plans/lookup-latency-plan.md`` §6.3 fence).
         """
         try:
             return await self._hydrate_artist_details_lean(artist_id)

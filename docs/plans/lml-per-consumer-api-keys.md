@@ -147,7 +147,7 @@ Add the LML key env var to `REQUIRED_VARS` in `.github/scripts/install-webapps.s
 
 ### Rollout (HITL — live secrets, one consumer at a time)
 
-Run interactively, not from an AFK agent — same posture as `plans/838-staging-cutover-runbook.md`. Per step: seed a new row for that caller → hand the plaintext to that consumer's own secret store → confirm `last_used_at` ticks on the new hash (or the caller-attribution signal from Observability, once that's landed) → the legacy shared key stays live throughout, since it isn't consumer-specific and there's nothing to revoke until every consumer is off it.
+Run interactively, not from an AFK agent — same posture as `docs/plans/838-staging-cutover-runbook.md`. Per step: seed a new row for that caller → hand the plaintext to that consumer's own secret store → confirm `last_used_at` ticks on the new hash (or the caller-attribution signal from Observability, once that's landed) → the legacy shared key stays live throughout, since it isn't consumer-specific and there's nothing to revoke until every consumer is off it.
 
 Order, safest/most-observable first:
 
@@ -196,4 +196,4 @@ Once all four consumers show zero `reason=legacy_shared_key_used` log lines for 
 
 Before any implementation (PR 1 onward): `git fetch origin && git worktree add .worktrees/lml-per-consumer-api-keys -b lml-per-consumer-api-keys origin/main`. The default tree here is currently on the `prod` branch (which lags `origin/main`) — per global CLAUDE.md, new work always starts from a fresh worktree off `origin/main`, not off whatever the ambient tree happens to be on (`project_prod_tree_lags_main`).
 
-This plan lives at `docs/plans/lml-per-consumer-api-keys.md` — the tracked convention (unlike the top-level `plans/` directory, which is untracked scratch space with no `origin/main` history). It is still uncommitted as of this writing, though, so a fresh worktree checked out from `origin/main` won't contain it until it's actually committed. Commit this file (a small, standalone commit is fine) before or as the first step inside the new worktree, so PR 1 and the GitHub issue both have it to reference.
+This plan lives at `docs/plans/lml-per-consumer-api-keys.md`, the single tracked plan home (`docs/plans/README.md`) since LML#1124's document consolidation retired the old untracked top-level `plans/` directory. It is already committed on `origin/main`, so any fresh worktree checked out from there has it available to reference from the start.

@@ -1,0 +1,37 @@
+name: Plan-link citation check
+
+# Asserts that every local docs/plans/*.md citation in tracked files
+# (code, comments, docstrings, other plan documents) resolves to a file
+# actually tracked in the git index. Runs on doc-only PRs too -- ci.yml's
+# `paths-ignore` skips those, and a broken citation is exactly the kind of
+# change a doc-only PR is likely to introduce (LML#1124).
+
+on:
+  pull_request:
+    paths:
+      - '**/*.md'
+      - '**/*.py'
+      - 'entrypoint.sh'
+      - 'scripts/check_plan_links.sh'
+      - '.github/workflows/plan-links.yml'
+  push:
+    branches: [main, prod]
+    paths:
+      - '**/*.md'
+      - '**/*.py'
+      - 'entrypoint.sh'
+      - 'scripts/check_plan_links.sh'
+      - '.github/workflows/plan-links.yml'
+
+# Workflow-level GITHUB_TOKEN scope. No job in this file pushes code,
+# comments on PRs, or creates releases. contents:read is the safe floor.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Plan-link citations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: bash scripts/check_plan_links.sh

@@ -8,8 +8,8 @@ Backed by prod Sentry (2026-07-21) + code audits of the two pinned trees below +
 
 | Repo | Local path | Pin | Notes |
 |---|---|---|---|
-| **library-metadata-lookup** | `/Users/jake/Developer/WXYC/library-metadata-lookup` | `prod @ 94eb220` | Default working tree is on `prod`; baseline new work against `origin/main` (5 ahead) or this pin. All `lookup/`, `enrichment/`, `discogs/`, `core/` anchors below resolve at `94eb220`. |
-| **Backend-Service** | `/Users/jake/Developer/WXYC/Backend-Service` | `main @ 5f67115b` (2026-07-21 19:40 PDT) | **Not** `/Users/jake/Developer/Backend-Service` — that path is an unrelated `daisyguide` repo and was the source of the review's stale-tree false alarm. The WXYC tree is current with `origin/main` and contains every BS anchor (`shared/lml-client/src/index.ts`, `apps/enrichment-worker/{handler,enrich}.ts`, `apps/backend/controllers/library.controller.ts`). |
+| **library-metadata-lookup** | the WXYC-org checkout (`WXYC/library-metadata-lookup`) | `prod @ 94eb220` | Default working tree is on `prod`; baseline new work against `origin/main` (5 ahead) or this pin. All `lookup/`, `enrichment/`, `discogs/`, `core/` anchors below resolve at `94eb220`. |
+| **Backend-Service** | the WXYC-org checkout (`WXYC/Backend-Service`) | `main @ 5f67115b` (2026-07-21 19:40 PDT) | **Not** a stray top-level `Backend-Service` clone outside the WXYC workspace — one such clone is an unrelated `daisyguide` repo and was the source of the review's stale-tree false alarm. The WXYC-org tree is current with `origin/main` and contains every BS anchor (`shared/lml-client/src/index.ts`, `apps/enrichment-worker/{handler,enrich}.ts`, `apps/backend/controllers/library.controller.ts`). |
 
 Every BS line anchor is pinned to `5f67115b`; if the tree has moved when an implementer picks this up, re-resolve the symbol (grep target named in each row) rather than trusting the line number. Cut a fresh worktree from each pin before Phase 0/1/3 work (branch/worktree names in §7).
 

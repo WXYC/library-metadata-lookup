@@ -27,7 +27,7 @@ Confirmed call path for the parent #801: `lookup/strategies/track_on_compilation
 
 ## Design — single PR, branch `802-search-by-track-artist-prefilter` off `origin/main`
 
-**Worktree first (before any code).** The default tree is on `prod` (`1ce136b`, lags `origin/main` — MEMORY `prod-tree-lags-main`) and is dirty (`plans/`, `docs/repo-graph.*`, `.worktrees/`, etc. uncommitted). Per global CLAUDE.md, create a worktree off `origin/main` in the repo's existing `.worktrees/` convention before writing code, so this fix can't collide with that uncommitted state: `git fetch origin && git worktree add .worktrees/802-search-by-track-artist-prefilter -b 802-search-by-track-artist-prefilter origin/main`. Run the fresh-worktree pytest setup from MEMORY `project-worktree-pytest-setup` (`uv sync --extra dev`, then `uv run --no-sync python -m pytest`).
+**Worktree first (before any code).** The default tree is on `prod` (`1ce136b`, lags `origin/main` — MEMORY `prod-tree-lags-main`). Per global CLAUDE.md, create a worktree off `origin/main` in the repo's existing `.worktrees/` convention before writing code, so this fix can't collide with whatever else is in flight on the ambient checkout: `git fetch origin && git worktree add .worktrees/802-search-by-track-artist-prefilter -b 802-search-by-track-artist-prefilter origin/main`. Run the fresh-worktree pytest setup from MEMORY `project-worktree-pytest-setup` (`uv sync --extra dev`, then `uv run --no-sync python -m pytest`).
 
 ### Core change: split into two query strings, gated on `artist is None`
 

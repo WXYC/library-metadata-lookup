@@ -58,6 +58,15 @@ That last row matters: the CLI `Debug`-formats the status enum, so a status Rail
 
 Tunables, all with defaults that suit CI: `RAILWAY_DEPLOY_TIMEOUT_SECONDS` (900), `RAILWAY_DEPLOY_POLL_INTERVAL_SECONDS` (10), `RAILWAY_DEPLOY_MAX_POLL_ERRORS` (10), `RAILWAY_DEPLOY_BUILD_LOG_LINES` (100). The error tolerance is the point of the exercise: a single Railway API blip — including a zero-exit response that fails to parse — must not fail a good deploy, so it counts toward the tolerance instead of aborting.
 
+## Standalone `paths:`-filtered guard workflows
+
+Two workflows outside `ci.yml` run narrow, `paths:`-filtered checks on both `pull_request` and `push: branches: [main, prod]`, each with `permissions: contents: read` and no Python setup (pure bash):
+
+- **`cross-cache-identity-flags.yml`** runs `scripts/check_cross_cache_identity_flags.sh`, asserting that the LML-owned cross-cache-identity feature flags documented in [`env-vars.md`](env-vars.md)'s "Cross-cache-identity feature flags" section match the locked §4.2 inventory.
+- **`plan-links.yml`** runs `scripts/check_plan_links.sh`, asserting that every local `docs/plans/*.md` citation in tracked files — code, comments, docstrings, other plan documents — resolves to a file actually tracked in the git index (`git ls-files --error-unmatch`, not a filesystem check, so an untracked file on a developer's disk can't mask a real break). See `docs/plans/README.md` for the citation convention it enforces.
+
+Both exist as their own workflow rather than a step in `ci.yml`'s `lint` job because `ci.yml` sets `paths-ignore: ["*.md", "docs/**", …]` on its triggers — it never runs on doc-only PRs, which is exactly when a flag-doc or plan-citation drift is introduced. Neither is a required status check, for the same reason `actionlint.yml`'s `Workflow Lint` isn't (see below): a `paths:`-filtered workflow that gets skipped never reports a status, and marking one required without an always-runs companion would block every PR that doesn't touch the watched paths.
+
 ## CI pin maintenance
 
 Four classes of pin in `.github/workflows/*.yml` exist for supply-chain reasons (mirrors WXYC/request-o-matic#124's free-tier hardening; see WXYC/wiki#67 for the org-wide rollout). They will bit-rot and need occasional bumps:

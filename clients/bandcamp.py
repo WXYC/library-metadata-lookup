@@ -205,7 +205,7 @@ def normalize_bc_title(title: str) -> str:
     Applied to both sides (query title and candidate title) as a SECOND
     acceptance pass in ``find_album_match_via_search`` -- only consulted
     when the raw-field pass misses. See the near-miss corpus in
-    ``plans/lml-1069-bandcamp-album-first.md`` for the TRUE/FALSE rows this
+    ``docs/plans/lml-1069-bandcamp-album-first.md`` for the TRUE/FALSE rows this
     is parameterized against.
     """
     if not title:

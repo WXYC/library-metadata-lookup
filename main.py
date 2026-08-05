@@ -468,7 +468,7 @@ async def lifespan(app: FastAPI):
                 logger.exception("API-key cache failed to start; continuing without it")
 
     # LML#907: start the event-loop-lag sampler — a background task that measures
-    # the single-worker starvation tax (plans/lookup-latency-event-loop-starvation.md
+    # the single-worker starvation tax (docs/plans/lookup-latency-event-loop-starvation.md
     # §3) and exposes it as a process-global gauge the lookup router stamps onto
     # cache_stats. Gated on the LML_EVENT_LOOP_LAG_GAUGE kill switch (default on).
     # Best-effort: a failure to start must never block serving.
