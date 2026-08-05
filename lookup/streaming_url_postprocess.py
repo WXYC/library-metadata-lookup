@@ -78,10 +78,15 @@ Sentry on the hot path projects, per active service:
   ``cache_hit`` / ``cache_miss_recent`` / ``cache_error_recent`` /
   ``cache_miss_enqueued`` / ``cache_miss_unwarmed`` / ``cache_miss_shed``
   (filled, genuine known-miss, fresh LML#1121 error-row miss, warm-scheduled,
-  warm-suppressed-on-bulk, or warm-shed-at-depth-bound). ``cache_error_recent``
-  covers all three of the error row's own enqueue/suppress/shed sub-outcomes —
-  the couldn't-ask signal itself is what matters operationally, not which of
-  those it landed in.
+  warm-suppressed-on-bulk, or warm-shed-at-depth-bound). For a fresh error
+  row, ``cache_error_recent`` fires ALONGSIDE the specific
+  enqueued/unwarmed/shed sub-outcome (LML#1121 FIX 7) rather than masking it
+  — the earlier posture projected ONLY ``cache_error_recent`` for all three
+  sub-cases, which meant ``cache_miss_shed`` (docs/env-vars.md's designated
+  depth-shed signal) went silent for the dominant service during exactly the
+  outage when shedding peaks. Both tags are ``True`` when both apply; a
+  dashboard that only ever queried ``cache_error_recent`` keeps working
+  unchanged.
 
 Side effects degrade gracefully: PG errors swallow inside the cache layer; mint
 failures log and continue; Sentry projection errors log and continue; the
@@ -499,9 +504,15 @@ async def apply_streaming_url_postprocess(
             # offline #1069 drain already warms them. A fresh LML#1121 error
             # row (below) is gated by this SAME bulk check — an outage during
             # a bulk drain must not spawn request-time warms either.
-            _project_sentry(
-                storage_key, "cache_error_recent" if is_error else "cache_miss_unwarmed"
-            )
+            # LML#1121 FIX 7: project cache_error_recent AND the specific
+            # sub-outcome (cache_miss_unwarmed) rather than letting the former
+            # mask the latter — docs/env-vars.md designates cache_miss_unwarmed/
+            # cache_miss_shed as their own signals, which must not go silent
+            # for the dominant service during exactly the outage when they
+            # matter most.
+            if is_error:
+                _project_sentry(storage_key, "cache_error_recent")
+            _project_sentry(storage_key, "cache_miss_unwarmed")
             statuses[service.catalog_key] = StreamingResolutionStatus.unresolved
         else:
             # Genuine miss (absent/stale), a rowless Bandcamp miss on the bulk
@@ -517,16 +528,30 @@ async def apply_streaming_url_postprocess(
             # (LML#1108's depth bound + the in-flight dedup both still apply).
             # The response returns without this service's URL either way; the
             # warm fills the cache for next time — transient, not terminal.
+            # LML#1121 FIX 2: a warm enqueued BECAUSE of a fresh error row
+            # (``bypass_error_row=is_error``) must bypass that SAME row on its
+            # OWN read inside the warm, or it re-reads the identical row a few
+            # milliseconds later and short-circuits on it -- a guaranteed
+            # no-op that still spends a warm slot and depth-bound budget
+            # without ever performing the retry the comment above promises.
             enqueued = _enqueue_streaming_warm(
-                storage_key, cfg, client, pg, entity_store, request_artist, request_album
+                storage_key,
+                cfg,
+                client,
+                pg,
+                entity_store,
+                request_artist,
+                request_album,
+                bypass_error_row=is_error,
             )
+            sub_outcome: _SentryOutcome = "cache_miss_enqueued" if enqueued else "cache_miss_shed"
+            # LML#1121 FIX 7: project both cache_error_recent AND the
+            # specific enqueued/shed sub-outcome, rather than letting the
+            # former mask the latter (see the suppress_warm branch above for
+            # the same rationale).
             if is_error:
-                outcome: _SentryOutcome = "cache_error_recent"
-            elif enqueued:
-                outcome = "cache_miss_enqueued"
-            else:
-                outcome = "cache_miss_shed"
-            _project_sentry(storage_key, outcome)
+                _project_sentry(storage_key, "cache_error_recent")
+            _project_sentry(storage_key, sub_outcome)
             # A shed (LML#1108) is transient, not terminal, so it gets the
             # same "couldn't confirm" verdict as a healthy enqueue — same for
             # a fresh error row, which never reached a verdict either.
@@ -582,12 +607,21 @@ def _enqueue_streaming_warm(
     entity_store: EntityStore,
     request_artist: str,
     request_album: str,
+    *,
+    bypass_error_row: bool = False,
 ) -> bool:
     """Schedule one deduplicated background warm for a cache miss.
 
     Dedup is synchronous (no await between the membership check and the
     ``add``), so two identical misses interleaved on the event loop enqueue a
     single probe. The key + the task are cleaned up in the task's done-callbacks.
+
+    ``bypass_error_row`` (LML#1121 FIX 2, default ``False``): set ``True``
+    only when THIS enqueue was triggered by a fresh LML#1121 error row (the
+    caller's own ``is_error`` peek result) -- see
+    :func:`_warm_streaming_url_cache` for what it does and why a warm
+    enqueued for any OTHER reason (a genuine miss, a rowless bulk-exempt
+    miss) must leave it ``False``.
 
     Returns ``True`` when the warm is in flight (deduped or freshly admitted),
     ``False`` when a fresh warm is SHED at the LML#1108 pending-depth bound
@@ -620,7 +654,14 @@ def _enqueue_streaming_warm(
     # identical misses still dedup to one task.
     task = asyncio.create_task(
         _warm_streaming_url_cache(
-            service_key, cfg, client, pg, entity_store, request_artist, request_album
+            service_key,
+            cfg,
+            client,
+            pg,
+            entity_store,
+            request_artist,
+            request_album,
+            bypass_error_row=bypass_error_row,
         )
     )
     _streaming_warm_in_flight.add(key)
@@ -638,6 +679,8 @@ async def _warm_streaming_url_cache(
     entity_store: EntityStore,
     request_artist: str,
     request_album: str,
+    *,
+    bypass_error_row: bool = False,
 ) -> None:
     """Background task: live probe → cache UPSERT → mint, off the response path.
 
@@ -648,6 +691,23 @@ async def _warm_streaming_url_cache(
     fire-and-forget task must never propagate to the event loop. No Sentry tag
     is set: the request scope has long since closed (mirrors
     ``lookup.enrichment.background._warm_bio_cache``).
+
+    ``bypass_error_row`` (LML#1121 FIX 2): when ``True``, this warm's OWN
+    ``resolve_streaming_url_with_cache`` read passes ``error_ttl=timedelta(0)``
+    so the fresh error row that TRIGGERED this very warm reads as stale for
+    that one call, instead of short-circuiting on itself. Without this, a
+    warm enqueued because the hot-path peek saw a fresh ``is_error`` row would
+    re-read that SAME row a few milliseconds later (well inside its
+    multi-minute ``error_ttl``) and immediately return ``cache_error_recent``
+    again — a guaranteed no-op that still consumes a warm-semaphore slot and
+    LML#1108 depth-bound budget, and never performs the retry the enqueueing
+    comment promises. ``error_ttl=timedelta(0)`` only affects the error-row
+    SELECT branch (``is_error AND last_checked_at > $5``); a hit (``url``
+    present) or a genuine miss still short-circuits normally regardless of
+    this flag — see ``entity/streaming_url_cache.py``'s ``_SELECT_SQL``.
+    Deliberately NOT the default for an ordinary miss-triggered warm — only
+    the error-row-triggered path (``_enqueue_streaming_warm``'s caller in
+    ``apply_streaming_url_postprocess``) ever passes ``True``.
 
     LML#1108: the wait to ACQUIRE ``semaphore`` isn't deadline-bound itself
     (the depth bound in ``_enqueue_streaming_warm`` caps queue depth instead);
@@ -693,6 +753,10 @@ async def _warm_streaming_url_cache(
                     artist=request_artist,
                     album=request_album,
                     miss_ttl=cfg.miss_ttl,
+                    # LML#1121 FIX 2: a zeroed error_ttl only ages OUT the
+                    # error-row SELECT branch for this one read -- a hit or a
+                    # genuine miss still short-circuits normally either way.
+                    error_ttl=timedelta(0) if bypass_error_row else None,
                 ),
                 timeout=probe_timeout_s,
             )
@@ -792,11 +856,15 @@ def _project_sentry(service_key: str, outcome: _SentryOutcome) -> None:
     * ``streaming_url.persistent_lookup.<outcome>.<service>`` — the hot-path
       disposition: filled (``cache_hit``), genuine known miss within
       ``miss_ttl`` (``cache_miss_recent``), fresh LML#1121 error-row miss
-      within the shorter ``error_ttl`` (``cache_error_recent``, LML#1115 —
-      covers its own enqueue/suppress/shed sub-cases uniformly), warm
-      scheduled (``cache_miss_enqueued``), warm suppressed on the bulk path
-      (``cache_miss_unwarmed``), or warm shed at the LML#1108 pending-depth
-      bound (``cache_miss_shed``).
+      within the shorter ``error_ttl`` (``cache_error_recent``, LML#1115),
+      warm scheduled (``cache_miss_enqueued``), warm suppressed on the bulk
+      path (``cache_miss_unwarmed``), or warm shed at the LML#1108
+      pending-depth bound (``cache_miss_shed``). For a fresh error row, the
+      caller calls this function TWICE (LML#1121 FIX 7) — once with
+      ``cache_error_recent``, once with the specific enqueued/unwarmed/shed
+      sub-outcome — so the sub-outcome stays queryable rather than being
+      masked by the uniform ``cache_error_recent`` tag every error sub-case
+      used to project alone.
 
     Hot-path only (and therefore always in-request — correct attribution): the
     background warm's ``live_*`` outcome is logged, never tagged here, because

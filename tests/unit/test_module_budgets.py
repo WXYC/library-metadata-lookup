@@ -138,15 +138,17 @@ MODULE_BUDGETS: dict[str, int] = {
     # the new ~771-line measured size, not a re-derived 1.3x (which would
     # reopen hundreds of lines of headroom), matching this table's own
     # recalibration convention (see e.g. track_on_compilation.py above).
-    # Recalibrated 2026-08-04 (LML#1115): the read side now distinguishes a
-    # fresh LML#1121 error row (couldn't-ask) from a genuine known miss
-    # (confirmed absent) -- a new is_error-gated branch in the hot-path loop,
-    # a new cache_error_recent Sentry outcome, and the docstring/comment
-    # explanation the warm/enqueue posture decision needed for legibility, not
-    # organic growth. Smallest multiple of 50 at or above the new ~818-line
-    # measured size, not a re-derived 1.3x (matching this table's own
-    # recalibration convention -- see e.g. track_on_compilation.py above).
-    "lookup/streaming_url_postprocess.py": 850,
+    # Recalibrated 2026-08-05 (LML#1121 review, FIXes 2 + 7): the
+    # error-row-triggered warm now bypasses that same row on its own read
+    # (``bypass_error_row``/``error_ttl=timedelta(0)``) instead of
+    # guaranteed-no-op short-circuiting on it, and the Sentry projection now
+    # tags the specific enqueued/unwarmed/shed sub-outcome ALONGSIDE
+    # cache_error_recent instead of being masked by it -- both genuine new
+    # concerns (a correctness fix and an observability fix), not organic
+    # growth. Smallest multiple of 50 at or above the new ~888-line measured
+    # size, not a re-derived 1.3x (matching this table's own recalibration
+    # convention -- see e.g. track_on_compilation.py above).
+    "lookup/streaming_url_postprocess.py": 900,
     # LML#1108: pending-warm depth-bound policy, extracted out of
     # streaming_url_postprocess.py to stay under its own ceiling above — a
     # small, self-contained concern (constant + two pure/best-effort
