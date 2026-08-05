@@ -1,5 +1,6 @@
 """Application configuration using Pydantic Settings."""
 
+import logging
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -7,6 +8,8 @@ from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 # Postgres memory-value grammar (digits + optional unit) for ``work_mem`` (LML#804).
 # ``discogs_search_work_mem`` is interpolated into a ``SET LOCAL`` string (Postgres
@@ -61,6 +64,16 @@ class Settings(BaseSettings):
     def resolved_library_db_path(self) -> Path:
         """Get the library database path, handling empty env var case."""
         if not str(self.library_db_path) or str(self.library_db_path) == ".":
+            # LIBRARY_DB_PATH was set but empty (or unset -- pydantic's Path
+            # coercion turns "" into "."). Production always sets a real
+            # value, so this branch is latent today, but a misconfigured
+            # deploy would otherwise silently serve library.db from whatever
+            # the process's CWD happens to be -- a stale or wrong catalog
+            # with no signal in the logs. See WXYC/library-metadata-lookup#1132.
+            logger.warning(
+                "library_db_path was set but empty; falling back to "
+                "library.db in the current working directory"
+            )
             return Path("library.db")
         return self.library_db_path
 

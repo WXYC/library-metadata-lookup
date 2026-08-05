@@ -21,6 +21,27 @@ class TestResolvedLibraryDbPath:
         s = Settings(library_db_path=Path("/data/my_library.db"))
         assert s.resolved_library_db_path == Path("/data/my_library.db")
 
+    def test_empty_value_fallback_logs_warning(self, caplog):
+        """LML#1132: the set-but-empty-env-var fallback (`.` after pydantic's
+        Path coercion) must warn loudly rather than silently serve a
+        different catalog than the one an operator thinks they configured."""
+        s = Settings(library_db_path=Path("."))
+        with caplog.at_level("WARNING", logger="config.settings"):
+            result = s.resolved_library_db_path
+        assert result == Path("library.db")
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("library_db_path" in m.lower() or "library.db" in m for m in warnings), (
+            f"expected a WARNING naming the fallback path, got: {warnings}"
+        )
+
+    def test_valid_custom_path_does_not_warn(self, caplog):
+        """The warning is scoped to the fallback branch only -- a real,
+        non-empty path must never trigger it."""
+        s = Settings(library_db_path=Path("/data/my_library.db"))
+        with caplog.at_level("WARNING", logger="config.settings"):
+            _ = s.resolved_library_db_path
+        assert not caplog.records
+
 
 class TestStreamingUrlPersistFlags:
     """LML#573 AND-gate: a service persists only when the master AND its
