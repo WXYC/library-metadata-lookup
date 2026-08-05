@@ -63,26 +63,30 @@ class TestBreakerOpenError:
     """LML#1118: the shared base for every saturation-breaker shed.
 
     ``BreakerOpenError`` is deliberately a plain ``Exception`` subclass, not a
-    ``LookupServiceError`` one: the two concrete breaker errors it replaces
-    (``DiscogsBreakerOpenError``, ``BandcampBreakerOpenError``) are raised both
-    bare (``BandcampBreakerOpenError()``, ``clients/bandcamp.py``) and with a
-    message (``DiscogsBreakerOpenError(f"...")``, ``discogs/admission.py``).
-    ``LookupServiceError.__init__`` requires a ``message`` positional argument,
-    so subclassing it here would turn every bare raise into a ``TypeError`` --
-    a real behavior change the LML#1118 "behavior-preserving" constraint rules
-    out.
+    ``LookupServiceError`` one -- NOT because any raise site needs a bare
+    (message-less) constructor. Every current raise site passes one
+    (``clients/bandcamp.py``, ``discogs/admission.py``, ``discogs/service.py``,
+    ``lookup/release_resolution.py``); joining ``LookupServiceError`` would
+    cost nothing there. The real reason is that ``LookupServiceError`` has no
+    consumers to inherit into: no ``except LookupServiceError`` anywhere in
+    this service, no FastAPI handler registered for it (``main.py`` only wires
+    ``StarletteHTTPException`` and ``RequestValidationError``), no Sentry hook
+    keyed on its type, and no reader of ``.message``/``.details`` outside this
+    test module. An uncaught ``BreakerOpenError`` and an uncaught
+    ``LookupServiceError`` both surface as an identical raw 500, so joining
+    the hierarchy would add constructor weight with no behavioral payoff.
     """
 
-    def test_inherits_from_exception(self):
-        assert issubclass(BreakerOpenError, Exception)
-
     def test_not_a_lookup_service_error(self):
-        # See the class docstring: LookupServiceError's required `message`
-        # argument would break the no-arg raise sites this type replaces.
+        # See the class docstring: LookupServiceError has no consumers to
+        # inherit into, so BreakerOpenError stays a plain Exception subclass.
         assert not issubclass(BreakerOpenError, LookupServiceError)
 
     def test_bare_construction(self):
-        # Mirrors `raise BandcampBreakerOpenError()` in clients/bandcamp.py.
+        # No raise site actually does this today -- every one passes a
+        # message (see test_construction_with_message) -- but BreakerOpenError
+        # is a plain Exception subclass, so a bare construction is valid and
+        # costs nothing to support.
         err = BreakerOpenError()
         assert isinstance(err, Exception)
 

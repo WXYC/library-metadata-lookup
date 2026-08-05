@@ -48,10 +48,22 @@ class BreakerOpenError(Exception):
     has to import the other's package to share the type: this module has no
     dependents in either direction, so importing it from both is cycle-free.
 
-    Deliberately a plain ``Exception`` subclass rather than a
-    ``LookupServiceError`` one -- see ``BreakerOpenError``'s own subclasses
-    for why: ``LookupServiceError`` requires a ``message`` argument, and both
-    concrete breaker errors are raised bare at some call sites.
+    A plain ``Exception`` subclass rather than a ``LookupServiceError`` one --
+    NOT because any raise site needs a bare (message-less) constructor. Every
+    current raise site passes one (``clients/bandcamp.py``,
+    ``discogs/admission.py``, ``discogs/service.py``,
+    ``lookup/release_resolution.py``); joining ``LookupServiceError`` would
+    cost nothing there. The real reason is that ``LookupServiceError`` has no
+    consumers to inherit into: nothing in this service does ``except
+    LookupServiceError``, no FastAPI handler is registered for it (``main.py``
+    only registers ``StarletteHTTPException`` and ``RequestValidationError``),
+    no Sentry ``before_send``/``ignore_errors``/fingerprint hook keys on its
+    type, and nothing outside ``tests/unit/test_exceptions.py`` reads
+    ``.message``/``.details``. An uncaught ``BreakerOpenError`` and an
+    uncaught ``LookupServiceError`` both surface as an identical raw 500
+    today, so there is no behavioral payoff to joining the hierarchy -- only
+    a heavier constructor contract this type's own subclasses would inherit
+    for nothing.
 
     A single ``except BreakerOpenError`` leg covers every present and future
     breaker, so adding a new one (YouTube Music, Spotify) costs no new
