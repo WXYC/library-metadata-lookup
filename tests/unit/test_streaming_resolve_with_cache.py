@@ -168,15 +168,19 @@ class TestResolveStreamingURLWithCache:
         client.find_album_match.assert_awaited_once()
         client.find_track_metadata.assert_not_called()
 
-    async def test_client_exception_returns_live_error_without_cache_write(
+    async def test_client_exception_returns_live_error_and_writes_short_ttl_error_row(
         self, service, sample_url
     ):
-        # A client raising during the probe must not break the request.
-        # Treated as live_error (distinct from live_miss): NO cache write so
-        # the next request retries rather than locking in a spurious null.
+        # LML#1121: a client raising during the probe must not break the
+        # request (still ``live_error``, distinct from ``live_miss``), but
+        # UNLIKE the pre-#1121 posture it now DOES write a row -- marked
+        # ``is_error=True`` so it ages on the short error TTL instead of the
+        # 7-day miss TTL. This is the deliberate backpressure fix: without a
+        # row, every subsequent /lookup for the same album re-enqueues a warm
+        # for as long as the outage lasts (LML#1094).
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
-        pg.execute = AsyncMock()
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
         client = AsyncMock(spec=BaseStreamingClient)
         client.find_album_match = AsyncMock(side_effect=RuntimeError("upstream flake"))
 
@@ -185,7 +189,10 @@ class TestResolveStreamingURLWithCache:
         )
 
         assert outcome == ResolveOutcome(url=None, source="live_error")
-        pg.execute.assert_not_called()
+        pg.execute.assert_awaited_once()
+        call = pg.execute.await_args
+        assert call.args[4] is None
+        assert call.args[5] is True
 
     async def test_external_timeout_cancels_before_upsert_no_poison(self, service, sample_url):
         # The load-bearing safety property (LML#573): the per-call ceiling lives
@@ -399,12 +406,22 @@ class TestResolveStreamingURLWithCacheBandcampDefaultPath:
     exercise the REAL ``BandcampClient`` (mocked only at the HTTP transport)
     through this resolver end-to-end, rather than a stand-in that always
     agreed with whatever the client layer's contract used to be.
+
+    LML#1121 review: dropping the write entirely also dropped the only
+    backpressure on the default warm path (the dedup key in
+    ``lookup/streaming_url_postprocess.py`` is discarded once the warm task
+    finishes, so it dedups concurrent warms only) -- for as long as an outage
+    lasts, every subsequent /lookup for the same album re-enqueues a fresh
+    warm. The fix keeps #1115's guarantee (a transport failure never freezes
+    as a 7-day known-miss) while restoring backpressure via a short,
+    env-tunable error TTL (``is_error=True``, see
+    ``TestResolveStreamingErrorTTL`` in ``test_streaming_url_cache.py``).
     """
 
-    async def test_transport_failure_returns_live_error_without_cache_write(self):
+    async def test_transport_failure_returns_live_error_and_writes_short_ttl_error_row(self):
         pg = AsyncMock(spec=PgSource)
         pg.fetchone = AsyncMock(return_value=None)
-        pg.execute = AsyncMock()
+        pg.execute = AsyncMock(return_value="INSERT 0 1")
         client = BandcampClient()
         client._rate_limiter = _InstantLimiter()  # type: ignore[assignment]
         client._http = AsyncMock(spec=httpx.AsyncClient)
@@ -415,7 +432,10 @@ class TestResolveStreamingURLWithCacheBandcampDefaultPath:
         )
 
         assert outcome == ResolveOutcome(url=None, source="live_error")
-        pg.execute.assert_not_called()
+        pg.execute.assert_awaited_once()
+        call = pg.execute.await_args
+        assert call.args[4] is None
+        assert call.args[5] is True
 
     async def test_genuine_no_match_still_writes_known_miss(self):
         # The ticket's "keep this" requirement: a real 200-with-no-match must
@@ -440,3 +460,6 @@ class TestResolveStreamingURLWithCacheBandcampDefaultPath:
         assert outcome == ResolveOutcome(url=None, source="live_miss")
         pg.execute.assert_awaited_once()
         assert pg.execute.await_args.args[4] is None
+        # LML#1121: a genuine miss is NOT an error row -- it ages on the
+        # 7-day miss TTL, not the short error TTL.
+        assert pg.execute.await_args.args[5] is False

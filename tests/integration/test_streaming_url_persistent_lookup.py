@@ -32,6 +32,7 @@ import pytest_asyncio
 from clients.streaming.base import BaseStreamingClient
 from entity.streaming_url_cache import (
     get_cached_streaming_url,
+    peek_cached_streaming_url,
     resolve_streaming_url_with_cache,
     set_cached_streaming_url,
     set_up_streaming_url_cache_schema,
@@ -154,6 +155,50 @@ class TestSchemaBootstrap:
                 "SELECT url FROM lml_cache.album_streaming_url_cache WHERE service = 'bandcamp'"
             )
         assert row["url"] == "https://x.bandcamp.com/album/y"
+
+    @pytest.mark.asyncio
+    async def test_alter_adds_error_column_on_preexisting_table(self, pg_pool, pg_source):
+        # LML#1121: the production migration path for a table created before
+        # `is_error` existed. CREATE TABLE IF NOT EXISTS is a no-op on the
+        # existing table; the idempotent ALTER is what adds the column.
+        async with pg_pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS lml_cache.album_streaming_url_cache")
+            await conn.execute("CREATE SCHEMA IF NOT EXISTS lml_cache")
+            await conn.execute(
+                "CREATE TABLE lml_cache.album_streaming_url_cache ("
+                "  service TEXT NOT NULL,"
+                "  artist_normalized TEXT NOT NULL,"
+                "  album_normalized TEXT NOT NULL,"
+                "  url TEXT,"
+                "  last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+                "  PRIMARY KEY (service, artist_normalized, album_normalized),"
+                "  CONSTRAINT album_streaming_url_cache_service_valid CHECK ("
+                "    service IN ('apple_music_album', 'spotify_album', 'bandcamp')"
+                "  )"
+                ")"
+            )
+            await conn.execute(
+                "INSERT INTO lml_cache.album_streaming_url_cache "
+                "(service, artist_normalized, album_normalized, url) "
+                "VALUES ('bandcamp', 'x', 'y', NULL)"
+            )
+
+        # Pre-ALTER: the column doesn't exist yet.
+        with pytest.raises(asyncpg.PostgresError):
+            async with pg_pool.acquire() as conn:
+                await conn.fetchval(
+                    "SELECT is_error FROM lml_cache.album_streaming_url_cache "
+                    "WHERE service = 'bandcamp'"
+                )
+
+        # Re-boot: the ALTER adds the column, backfilling existing rows false.
+        await set_up_streaming_url_cache_schema(pg_source)
+        async with pg_pool.acquire() as conn:
+            is_error = await conn.fetchval(
+                "SELECT is_error FROM lml_cache.album_streaming_url_cache "
+                "WHERE service = 'bandcamp'"
+            )
+        assert is_error is False
 
     @pytest.mark.asyncio
     async def test_second_boot_leaves_the_check_constraint_untouched(self, pg_pool, pg_source):
@@ -348,3 +393,198 @@ class TestRoundTrip:
             pg_source, service=service, artist="Nilufer Yanya", album="painless"
         )
         assert result == sample_url
+
+
+@pytest.mark.pg
+@pytest.mark.parametrize(("service", "sample_url"), _SERVICE_CASES)
+class TestErrorTTL:
+    """LML#1121: a transport failure writes a short-TTL ``is_error=True`` row
+    instead of either the pre-#1115 7-day known-miss or the #1115-#1121
+    interim no-write. Real SQL evaluation of the ``is_error``-gated WHERE
+    clause is the point of this class -- the unit-level mocks can only pin
+    the bind shape, not that PostgreSQL actually treats a fresh error row and
+    a fresh genuine miss on independent clocks."""
+
+    @pytest.mark.asyncio
+    async def test_live_error_writes_error_row_distinct_from_genuine_miss(
+        self, pg_source, pg_pool, service, sample_url
+    ):
+        client = AsyncMock(spec=BaseStreamingClient)
+        client.find_album_match = AsyncMock(side_effect=RuntimeError("upstream flake"))
+
+        outcome = await resolve_streaming_url_with_cache(
+            pg_source, client, service=service, artist="Sessa", album="Estrela Acesa"
+        )
+
+        assert outcome.url is None
+        assert outcome.source == "live_error"
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT url, is_error FROM lml_cache.album_streaming_url_cache "
+                "WHERE service = $1 AND artist_normalized = 'sessa' "
+                "AND album_normalized = 'estrela acesa'",
+                service,
+            )
+        assert row is not None
+        assert row["url"] is None
+        assert row["is_error"] is True
+
+    @pytest.mark.asyncio
+    async def test_fresh_error_row_short_circuits_without_a_second_live_call(
+        self, pg_source, pg_pool, service, sample_url
+    ):
+        # The LML#1121 backpressure guarantee: once an error row is written,
+        # a subsequent resolve for the same key inside error_ttl must NOT
+        # call the client again.
+        client = AsyncMock(spec=BaseStreamingClient)
+        client.find_album_match = AsyncMock(side_effect=RuntimeError("upstream flake"))
+
+        first = await resolve_streaming_url_with_cache(
+            pg_source, client, service=service, artist="Sessa", album="Estrela Acesa"
+        )
+        assert first.source == "live_error"
+        client.find_album_match.reset_mock()
+
+        second = await resolve_streaming_url_with_cache(
+            pg_source, client, service=service, artist="Sessa", album="Estrela Acesa"
+        )
+
+        assert second.source == "cache_miss_recent"
+        client.find_album_match.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_error_row_past_error_ttl_falls_through_to_live_probe(
+        self, pg_source, pg_pool, service, sample_url
+    ):
+        # An error row is fresh only within the much-shorter error_ttl, not
+        # the 7-day miss_ttl -- it must self-heal fast once the outage clears.
+        await set_cached_streaming_url(
+            pg_source,
+            service=service,
+            artist="Sessa",
+            album="Estrela Acesa",
+            url=None,
+            is_error=True,
+        )
+        now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
+        past_error_ttl = now - timedelta(minutes=6)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.album_streaming_url_cache SET last_checked_at = $1 "
+                "WHERE service = $2 AND artist_normalized = 'sessa' "
+                "AND album_normalized = 'estrela acesa'",
+                past_error_ttl,
+                service,
+            )
+
+        result = await get_cached_streaming_url(
+            pg_source,
+            service=service,
+            artist="Sessa",
+            album="Estrela Acesa",
+            now=now,
+            error_ttl=timedelta(minutes=5),
+        )
+
+        assert result is None
+        # Distinguish "stale, fell through" from "still a fresh decision":
+        _, has_fresh_decision = await peek_cached_streaming_url(
+            pg_source,
+            service=service,
+            artist="Sessa",
+            album="Estrela Acesa",
+            now=now,
+            error_ttl=timedelta(minutes=5),
+        )
+        assert has_fresh_decision is False
+
+    @pytest.mark.asyncio
+    async def test_error_and_miss_ttls_are_independent_clocks(
+        self, pg_source, pg_pool, service, sample_url
+    ):
+        # A GENUINE miss (is_error=False) aged past the SHORT error_ttl but
+        # still inside the 7-day miss_ttl must stay a fresh known miss -- the
+        # two TTL branches must never leak into each other regardless of
+        # which happens to be looser.
+        await set_cached_streaming_url(
+            pg_source, service=service, artist="Sessa", album="Estrela Acesa", url=None
+        )
+        now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
+        past_error_ttl_only = now - timedelta(minutes=6)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lml_cache.album_streaming_url_cache SET last_checked_at = $1 "
+                "WHERE service = $2 AND artist_normalized = 'sessa' "
+                "AND album_normalized = 'estrela acesa'",
+                past_error_ttl_only,
+                service,
+            )
+
+        _, has_fresh_decision = await peek_cached_streaming_url(
+            pg_source,
+            service=service,
+            artist="Sessa",
+            album="Estrela Acesa",
+            now=now,
+            error_ttl=timedelta(minutes=5),
+        )
+
+        assert has_fresh_decision is True
+
+    @pytest.mark.asyncio
+    async def test_genuine_resolve_after_error_clears_is_error(
+        self, pg_source, pg_pool, service, sample_url
+    ):
+        # A resolved URL must never be stuck reading as an error row.
+        await set_cached_streaming_url(
+            pg_source,
+            service=service,
+            artist="Sessa",
+            album="Estrela Acesa",
+            url=None,
+            is_error=True,
+        )
+
+        await set_cached_streaming_url(
+            pg_source, service=service, artist="Sessa", album="Estrela Acesa", url=sample_url
+        )
+
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT url, is_error FROM lml_cache.album_streaming_url_cache "
+                "WHERE service = $1 AND artist_normalized = 'sessa' "
+                "AND album_normalized = 'estrela acesa'",
+                service,
+            )
+        assert row["url"] == sample_url
+        assert row["is_error"] is False
+
+    @pytest.mark.asyncio
+    async def test_genuine_miss_after_error_clears_is_error(
+        self, pg_source, pg_pool, service, sample_url
+    ):
+        # A later CONFIRMED absence (live_miss) must also clear a stale error
+        # marker -- the row should age on the 7-day miss_ttl from here, not
+        # the short error_ttl.
+        await set_cached_streaming_url(
+            pg_source,
+            service=service,
+            artist="Sessa",
+            album="Estrela Acesa",
+            url=None,
+            is_error=True,
+        )
+
+        await set_cached_streaming_url(
+            pg_source, service=service, artist="Sessa", album="Estrela Acesa", url=None
+        )
+
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT url, is_error FROM lml_cache.album_streaming_url_cache "
+                "WHERE service = $1 AND artist_normalized = 'sessa' "
+                "AND album_normalized = 'estrela acesa'",
+                service,
+            )
+        assert row["url"] is None
+        assert row["is_error"] is False

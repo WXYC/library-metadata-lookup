@@ -130,6 +130,12 @@ class TestCanonicalDDLReference:
         ddl = _SQL_REFERENCE.read_text()
         assert "PRIMARY KEY (service, artist_normalized, album_normalized)" in ddl
 
+    def test_has_error_column_alter(self):
+        # LML#1121: the additive upgrade for a table that predates the
+        # `is_error` column, mirroring LML#824's `crowd_out` ALTER.
+        ddl = _SQL_REFERENCE.read_text()
+        assert "ADD COLUMN IF NOT EXISTS is_error BOOLEAN NOT NULL DEFAULT false" in ddl
+
 
 class TestStreamingServiceParity:
     """LML#1037 hard constraint: the enum-derived storage keys must equal
@@ -165,16 +171,22 @@ class TestSetUpStreamingUrlCacheSchema:
 
         # One-statement lock_timeout preamble (LML#1038 PR-2 dropped the
         # inner advisory lock -- see the module docstring), then schema,
-        # table, then the widen-only DO block (so a pre-existing prod table
-        # picks up new service values that CREATE TABLE IF NOT EXISTS cannot
-        # add). No backfill.
+        # table, the LML#1121 additive `is_error` column ALTER, then the
+        # widen-only DO block (so a pre-existing prod table picks up new
+        # service values that CREATE TABLE IF NOT EXISTS cannot add). No
+        # backfill.
         ddl = pg.statements[1:]
-        assert len(ddl) == 3
-        schema_sql, table_sql, widen_sql = ddl
+        assert len(ddl) == 4
+        schema_sql, table_sql, error_column_sql, widen_sql = ddl
         assert "CREATE SCHEMA IF NOT EXISTS lml_cache" in schema_sql
         assert "CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache" in table_sql
         assert "CONSTRAINT album_streaming_url_cache_service_valid CHECK" in table_sql
         assert "PRIMARY KEY (service, artist_normalized, album_normalized)" in table_sql
+        # LML#1121: upgrades a table created before `is_error` existed.
+        assert "ALTER TABLE lml_cache.album_streaming_url_cache" in error_column_sql
+        assert (
+            "ADD COLUMN IF NOT EXISTS is_error BOOLEAN NOT NULL DEFAULT false" in error_column_sql
+        )
         # LML#1038: the widen block now comes from the shared
         # entity.ddl.build_widen_service_check_sql -- same widen-only shape,
         # generic dollar-quote tag (not this table's own).

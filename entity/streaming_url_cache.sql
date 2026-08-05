@@ -42,13 +42,18 @@ CREATE SCHEMA IF NOT EXISTS lml_cache;
 -- extends `_SERVICES`, which both the CREATE-time CHECK and the widen block
 -- below read from). `url` -- NULL records a known miss, gated by
 -- `last_checked_at`'s TTL (LML#576: staleness is a SQL-side filter); a
--- non-null `url` is a durable hit that never goes stale.
+-- non-null `url` is a durable hit that never goes stale. `is_error`
+-- (LML#1121) marks a null-`url` row as a transport failure ("couldn't ask")
+-- rather than a genuine confirmed absence, so it ages on the much shorter
+-- `error_ttl` instead of `miss_ttl` -- see the footer below for tables that
+-- predate the column.
 
 CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
     service TEXT NOT NULL,
     artist_normalized TEXT NOT NULL,
     album_normalized TEXT NOT NULL,
     url TEXT,
+    is_error BOOLEAN NOT NULL DEFAULT false,
     last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (service, artist_normalized, album_normalized),
     CONSTRAINT album_streaming_url_cache_service_valid CHECK (
@@ -106,3 +111,15 @@ BEGIN
         || merged_list || '))';
 END;
 $widen_service_check$;
+
+-- LML#1121: `is_error` marks a null-`url` row as a transport failure
+-- ("couldn't ask") apart from a genuine confirmed absence, so it ages on a
+-- much shorter `error_ttl` instead of the 7-day `miss_ttl`. A fresh install
+-- already has the column from the CREATE TABLE above; the runtime bootstrap
+-- additionally issues this idempotent ALTER (not shown as a top-level
+-- statement -- it is a follow-up upgrade for a table that predates the
+-- column, a no-op once the column exists) so an existing prod table gains it
+-- in place. Mirrors `entity/release_resolution_cache.py`'s `crowd_out`
+-- upgrade (LML#824):
+--
+--   ALTER TABLE lml_cache.album_streaming_url_cache ADD COLUMN IF NOT EXISTS is_error BOOLEAN NOT NULL DEFAULT false;

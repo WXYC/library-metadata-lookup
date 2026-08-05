@@ -24,19 +24,47 @@ Hit/miss semantics (LML#576: staleness is a SQL-side filter, mirroring
 * ``url IS NOT NULL`` — durable hit. Hits never expire; the
   ``last_checked_at`` column is informational. Manual eviction is a single
   ``DELETE`` if a URL goes bad.
-* ``url IS NULL`` AND ``last_checked_at > now() - miss_ttl`` — known miss
-  inside the TTL window. The SELECT returns this row; the caller
+* ``url IS NULL`` AND ``NOT is_error`` AND ``last_checked_at > now() -
+  miss_ttl`` — genuine known miss (a real, sourced "checked and not found")
+  inside the 7-day TTL window. The SELECT returns this row; the caller
   short-circuits and skips the live probe.
-* ``url IS NULL`` AND ``last_checked_at <= now() - miss_ttl`` — stale miss.
-  The SELECT filter excludes the row, so callers see the same "no row" shape
-  as an absent entry and fall through to the live probe. The stale row stays
-  in the table and the next live probe's UPSERT refreshes it in place.
+* ``url IS NULL`` AND ``is_error`` AND ``last_checked_at > now() -
+  error_ttl`` — LML#1121 error miss: a transport failure (couldn't ask, not
+  a confirmed absence) inside the much shorter ``error_ttl`` window (default
+  5 minutes, env-tunable). Also short-circuits the caller, but self-heals
+  fast instead of freezing the outage for a week — see ``is_error`` below.
+* Neither branch's TTL holds (a stale miss of either flavor) — the SELECT
+  filter excludes the row, so callers see the same "no row" shape as an
+  absent entry and fall through to the live probe. The stale row stays in
+  the table and the next live probe's UPSERT refreshes it in place.
+
+``is_error`` (LML#1121) distinguishes the two miss flavors sharing the same
+``url IS NULL`` shape. Before this column, a transport failure (Bandcamp
+5xx, Cloudflare block, connect timeout — "couldn't ask") and a genuine
+200-with-no-match ("asked, confirmed absent") were indistinguishable at read
+time, so the only way to stop a failure from freezing as a week-long known
+miss was to skip the write entirely (LML#1115) — which also removed the
+only backpressure on the default warm path: with no row, every subsequent
+``/lookup`` for the same album re-enqueues a fresh background warm for as
+long as the outage lasts (compounding LML#1094's warm-slot contention). The
+column lets both keep a row (backpressure preserved) while aging on
+different clocks: ``is_error=True`` rows self-heal within the short
+``error_ttl``, everything else ages on the 7-day ``miss_ttl``. The column is
+``NOT NULL DEFAULT FALSE``, so every pre-existing row (collected before this
+column existed) reads as a genuine miss — correct, since that is what it is;
+no backfill or reclassification of historical rows is attempted. A later
+genuine resolve or genuine miss on the same key always writes
+``is_error=False`` via the UPSERT, clearing any stale error marker rather
+than leaving it latched.
 
 PG failures degrade to a no-op: ``get`` returns ``None``, ``set`` swallows
 the exception. The caller (``lookup/streaming_url_postprocess.py``) then falls
 through to the live probe as if no cache were configured. Schema bootstrap
 (``set_up_streaming_url_cache_schema``) is called from ``main.py`` lifespan;
-the schema/table DDL is ``IF NOT EXISTS`` and the service CHECK is maintained
+the schema/table DDL is ``IF NOT EXISTS``, the ``is_error`` column is added to
+a pre-existing table via an idempotent ``ALTER TABLE ... ADD COLUMN IF NOT
+EXISTS`` (LML#1121, mirroring LML#824's ``crowd_out`` upgrade in
+``entity/release_resolution_cache.py``), and the service CHECK is maintained
 by a widen-only DO block (LML#886), so re-running on every boot is safe.
 
 **Timeout relocation (LML#573, preempts #594).** Unlike LML#571's resolver,
@@ -61,6 +89,7 @@ from typing import Any, Literal
 from wxyc_etl.text import to_match_form
 
 from clients.streaming.base import BaseStreamingClient
+from core.search import resolve_positive_int_env
 from entity.cache_toolkit import DEFAULT_MISS_TTL, CachedValue, swallowing_execute, swallowing_fetch
 from entity.ddl import LML_CACHE_SCHEMA_DDL as _DDL_SCHEMA
 from entity.ddl import bootstrap_lml_cache_table, widen_service_check
@@ -74,6 +103,42 @@ logger = logging.getLogger(__name__)
 # before the duplication survey gave it one home. The import above keeps it
 # importable under this module's name for existing callers
 # (lookup/streaming_url_postprocess.py, tests/unit/test_streaming_url_cache.py).
+
+# LML#1121: how long an ERROR row (``is_error=True`` -- a transport failure,
+# not a confirmed absence) stays authoritative before a caller re-probes.
+# Deliberately much shorter than ``DEFAULT_MISS_TTL``: a couldn't-ask outcome
+# must self-heal fast once the outage clears, while still backpressuring the
+# default warm path for the outage's duration (see the module docstring).
+# Kept local to this module (unlike ``DEFAULT_MISS_TTL``) since no sibling
+# cache shares this concept yet; move it to ``entity.cache_toolkit`` if one
+# ever does.
+_DEFAULT_ERROR_TTL_MINUTES = 5
+DEFAULT_ERROR_TTL = timedelta(minutes=_DEFAULT_ERROR_TTL_MINUTES)
+
+# Env-tunable override for the error TTL (minutes) -- a no-redeploy lever for
+# exactly this class of knob (the Bandcamp hot-path-regression lesson: a
+# throttle/kill switch for a background-warm posture must not require a
+# deploy to adjust during an incident). Read fresh on every resolution via
+# ``core.search.resolve_positive_int_env`` (unparseable/zero/negative all
+# fall back to the default with a WARN), mirroring the LML#1081 per-service
+# streaming-check ceilings and ``LML_STREAMING_WARM_CONCURRENCY``.
+_ERROR_TTL_ENV_VAR = "LML_STREAMING_ERROR_TTL_MINUTES"
+
+
+def resolve_streaming_error_ttl() -> timedelta:
+    """Resolve the LML#1121 error-row TTL, honoring ``LML_STREAMING_ERROR_TTL_MINUTES``.
+
+    Read at CALL time (not import time) so a Railway var change takes effect
+    on the next resolution, no redeploy — the same posture
+    ``core.search.resolve_positive_int_env``'s other callers use. Production
+    callers of ``get_cached_streaming_url`` / ``peek_cached_streaming_url`` /
+    ``resolve_streaming_url_with_cache`` never pass an explicit ``error_ttl``,
+    so they always resolve the live value here; tests pass an explicit
+    ``timedelta`` to bypass the env read entirely.
+    """
+    minutes = resolve_positive_int_env(_ERROR_TTL_ENV_VAR, _DEFAULT_ERROR_TTL_MINUTES)
+    return timedelta(minutes=minutes)
+
 
 # The services the cache ships. The named CHECK constraint pins this set at
 # the DB level; a future PR adding a service (Deezer's 'deezer_album') extends
@@ -99,6 +164,7 @@ CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
     artist_normalized TEXT NOT NULL,
     album_normalized TEXT NOT NULL,
     url TEXT,
+    is_error BOOLEAN NOT NULL DEFAULT false,
     last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (service, artist_normalized, album_normalized),
     CONSTRAINT album_streaming_url_cache_service_valid CHECK (
@@ -106,6 +172,18 @@ CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
     )
 )\
 """
+
+# LML#1121 additive upgrade for a table that predates the ``is_error`` column
+# (prod, where the CREATE TABLE IF NOT EXISTS above is a no-op). ``ADD
+# COLUMN`` with a constant DEFAULT is a metadata-only, fast operation in
+# modern PostgreSQL, so it's safe to re-issue on every boot even against a
+# populated table. Existing rows backfill to ``false`` (a genuine miss,
+# which is what every pre-#1121 miss row is). Mirrors
+# ``entity/release_resolution_cache.py``'s ``_DDL_ADD_CROWD_OUT_COLUMN``.
+_DDL_ADD_ERROR_COLUMN = (
+    "ALTER TABLE lml_cache.album_streaming_url_cache "
+    "ADD COLUMN IF NOT EXISTS is_error BOOLEAN NOT NULL DEFAULT false"
+)
 
 # Bare table/constraint names for the shared widen-check builder
 # (``entity.ddl.widen_service_check``). Previously this module carried its
@@ -119,27 +197,40 @@ CREATE TABLE IF NOT EXISTS lml_cache.album_streaming_url_cache (
 _WIDEN_CHECK_TABLE = "album_streaming_url_cache"
 _WIDEN_CHECK_CONSTRAINT = "album_streaming_url_cache_service_valid"
 
-# Staleness lives in the WHERE clause (LML#576). ``$1`` is the service key,
-# ``$4`` the lower bound on ``last_checked_at`` for a "fresh" known miss
-# (typically ``now - miss_ttl``). A hit (url not null) is always returned; a
-# stale miss is filtered out and the caller sees the same "no row" shape as
-# an absent entry.
+# Staleness lives in the WHERE clause (LML#576, LML#1121). ``$1`` is the
+# service key, ``$4`` the lower bound on ``last_checked_at`` for a "fresh"
+# GENUINE known miss (``now - miss_ttl``), ``$5`` the (shorter) lower bound
+# for a "fresh" ERROR miss (``now - error_ttl``). A hit (url not null) is
+# always returned regardless of ``is_error`` (a resolve always clears the
+# flag anyway, but the hit branch doesn't depend on that). A miss row is
+# fresh under EXACTLY ONE of the two TTL branches, gated on ``is_error`` so a
+# genuine miss can never be judged fresh against the error cutoff (or vice
+# versa) even if one TTL happens to be looser than the other. A miss stale
+# under its own branch is filtered out and the caller sees the same "no row"
+# shape as an absent entry.
 _SELECT_SQL = """\
 SELECT url
 FROM lml_cache.album_streaming_url_cache
 WHERE service = $1 AND artist_normalized = $2 AND album_normalized = $3
-  AND (url IS NOT NULL OR last_checked_at > $4)\
+  AND (url IS NOT NULL
+       OR (NOT is_error AND last_checked_at > $4)
+       OR (is_error AND last_checked_at > $5))\
 """
 
 # UPSERT: keep the latest URL and refresh ``last_checked_at`` on conflict.
-# The ``url=None`` write path explicitly records "checked and not found at
-# time T" so subsequent lookups can short-circuit the API inside the TTL.
+# The ``url=None`` write path explicitly records "checked at time T" so
+# subsequent lookups can short-circuit the API inside the relevant TTL --
+# ``is_error`` says which TTL applies (LML#1121). ``SET is_error =
+# EXCLUDED.is_error`` is load-bearing: a later genuine resolve or genuine
+# miss on the same key must clear a stale ``True`` rather than leave it
+# latched, so the row doesn't keep aging on the short error TTL forever.
 _UPSERT_SQL = """\
 INSERT INTO lml_cache.album_streaming_url_cache
-    (service, artist_normalized, album_normalized, url, last_checked_at)
-VALUES ($1, $2, $3, $4, now())
+    (service, artist_normalized, album_normalized, url, is_error, last_checked_at)
+VALUES ($1, $2, $3, $4, $5, now())
 ON CONFLICT (service, artist_normalized, album_normalized) DO UPDATE
 SET url = EXCLUDED.url,
+    is_error = EXCLUDED.is_error,
     last_checked_at = EXCLUDED.last_checked_at\
 """
 
@@ -167,6 +258,13 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
     886001, retired) serialized nothing an outer caller wasn't already
     serializing.
 
+    The third step, ``_DDL_ADD_ERROR_COLUMN`` (LML#1121), upgrades a table
+    created before the ``is_error`` column existed: ``CREATE TABLE IF NOT
+    EXISTS`` cannot add a column to an already-present table, so prod needs
+    the idempotent ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` to gain the
+    marker. It's a no-op once the column exists (mirrors LML#824's
+    ``crowd_out`` upgrade in ``entity/release_resolution_cache.py``).
+
     The final step widens the named CHECK constraint to the current
     ``_SERVICES`` set, merging rather than narrowing (see
     ``entity.ddl.build_widen_service_check_sql``). ``CREATE TABLE IF NOT
@@ -183,7 +281,7 @@ async def set_up_streaming_url_cache_schema(pg: PgSource) -> None:
             services=_SERVICES,
         )
 
-    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE, _widen)
+    await bootstrap_lml_cache_table(pg, _DDL_SCHEMA, _DDL_TABLE, _DDL_ADD_ERROR_COLUMN, _widen)
 
 
 async def get_cached_streaming_url(
@@ -193,21 +291,35 @@ async def get_cached_streaming_url(
     artist: str,
     album: str,
     miss_ttl: timedelta = DEFAULT_MISS_TTL,
+    error_ttl: timedelta | None = None,
     now: datetime | None = None,
 ) -> str | None:
     """Look up a previously resolved URL for ``(service, artist, album)``.
 
     Returns the cached URL, or ``None`` for absent / stale / not-found rows.
-    The SQL ``WHERE`` clause excludes stale known-misses so callers can't tell
-    a stale miss from an absent entry — both render as ``None`` and the caller
-    falls through to a live probe.
+    The SQL ``WHERE`` clause excludes stale known-misses (of either the
+    genuine or LML#1121 error flavor) so callers can't tell a stale miss from
+    an absent entry — both render as ``None`` and the caller falls through to
+    a live probe.
+
+    ``error_ttl`` governs how long an ``is_error=True`` row (a transport
+    failure, not a confirmed absence) stays fresh; ``None`` (the default)
+    resolves ``resolve_streaming_error_ttl()`` live, honoring
+    ``LML_STREAMING_ERROR_TTL_MINUTES`` with no redeploy. Pass an explicit
+    value only to override (tests, or a future settings-threaded tuning).
 
     PG failures return ``None`` (same posture as the discogs negative-cache
     helper). ``now`` is exposed for testability; production callers leave it
     at the default.
     """
     result = await _fetch_cached_row(
-        pg, service=service, artist=artist, album=album, miss_ttl=miss_ttl, now=now
+        pg,
+        service=service,
+        artist=artist,
+        album=album,
+        miss_ttl=miss_ttl,
+        error_ttl=error_ttl,
+        now=now,
     )
     return result.value
 
@@ -219,6 +331,7 @@ async def peek_cached_streaming_url(
     artist: str,
     album: str,
     miss_ttl: timedelta = DEFAULT_MISS_TTL,
+    error_ttl: timedelta | None = None,
     now: datetime | None = None,
 ) -> tuple[str | None, bool]:
     """Read the cache decision for ``(service, artist, album)`` WITHOUT probing.
@@ -227,8 +340,12 @@ async def peek_cached_streaming_url(
 
     * ``url`` — the cached URL, or ``None`` for a miss (known or absent).
     * ``has_fresh_decision`` — ``True`` when the cache already holds a fresh row
-      (a hit, OR a known-miss still inside ``miss_ttl``): no live probe is
-      warranted. ``False`` for an absent or stale row, where a probe/warm is.
+      (a hit, OR a known-miss still inside ``miss_ttl`` / ``error_ttl``): no
+      live probe is warranted. ``False`` for an absent or stale row, where a
+      probe/warm is.
+
+    ``error_ttl`` — see :func:`get_cached_streaming_url`; ``None`` resolves
+    the live env-tunable default.
 
     Lets the ``/lookup`` post-process make the same three-way decision
     ``resolve_streaming_url_with_cache`` makes (hit / recent-miss / probe)
@@ -238,7 +355,13 @@ async def peek_cached_streaming_url(
     failures surface as ``(None, False)`` (treated as "absent → probe").
     """
     result = await _fetch_cached_row(
-        pg, service=service, artist=artist, album=album, miss_ttl=miss_ttl, now=now
+        pg,
+        service=service,
+        artist=artist,
+        album=album,
+        miss_ttl=miss_ttl,
+        error_ttl=error_ttl,
+        now=now,
     )
     return result.value, result.was_present
 
@@ -250,6 +373,7 @@ async def _fetch_cached_row(
     artist: str,
     album: str,
     miss_ttl: timedelta,
+    error_ttl: timedelta | None,
     now: datetime | None,
 ) -> CachedValue[str]:
     """Read the cache row keyed by ``(service, artist, album)`` honoring the TTL.
@@ -257,11 +381,19 @@ async def _fetch_cached_row(
     Module-private helper powering both ``get_cached_streaming_url`` (URL only)
     and ``resolve_streaming_url_with_cache`` (needs ``was_present`` to tell a
     fresh known miss from a stale/absent row before deciding whether to probe).
+
+    ``error_ttl=None`` resolves :func:`resolve_streaming_error_ttl` here, at
+    call time -- the single point every public wrapper funnels through, so
+    the env read happens exactly once per call regardless of which wrapper
+    the caller used.
     """
     artist_key = to_match_form(artist)
     album_key = to_match_form(album)
     reference_now = now or datetime.now(UTC)
     miss_cutoff = reference_now - miss_ttl
+    error_cutoff = reference_now - (
+        error_ttl if error_ttl is not None else resolve_streaming_error_ttl()
+    )
     row = await swallowing_fetch(
         pg,
         _SELECT_SQL,
@@ -269,6 +401,7 @@ async def _fetch_cached_row(
         artist_key,
         album_key,
         miss_cutoff,
+        error_cutoff,
         miss=None,
         logger=logger,
         log_label="streaming_url_cache get failed for %s / %s / %s",
@@ -276,9 +409,9 @@ async def _fetch_cached_row(
     )
 
     if row is None:
-        # Either a PG failure, no row at all, or a stale known-miss filtered
-        # out by the SQL WHERE. All render the same way; the resolver treats
-        # any of them as "call the API."
+        # Either a PG failure, no row at all, or a stale known-miss (genuine
+        # or error) filtered out by the SQL WHERE. All render the same way;
+        # the resolver treats any of them as "call the API."
         return CachedValue(value=None, was_present=False)
 
     return CachedValue(value=row["url"], was_present=True)
@@ -316,6 +449,7 @@ async def resolve_streaming_url_with_cache(
     artist: str,
     album: str,
     miss_ttl: timedelta = DEFAULT_MISS_TTL,
+    error_ttl: timedelta | None = None,
     now: datetime | None = None,
     fail_fast: bool = False,
 ) -> ResolveOutcome:
@@ -324,16 +458,21 @@ async def resolve_streaming_url_with_cache(
     Branch order:
 
     1. Cache row exists with a non-null URL → ``cache_hit`` (no API).
-    2. Cache row exists with a NULL URL inside ``miss_ttl`` →
+    2. Cache row exists with a NULL URL inside ``miss_ttl`` / ``error_ttl`` →
        ``cache_miss_recent`` (no API).
     3. Otherwise call ``client.find_album_match(artist, album)``:
-       - returns a match → ``live_resolved`` and UPSERT the URL.
-       - returns ``None`` → ``live_miss`` and UPSERT a null entry so
-         subsequent requests inside the TTL short-circuit.
-       - raises → ``live_error`` with NO cache write (default mode), so a
-         transient flake doesn't lock in a spurious null. Under
-         ``fail_fast=True`` the exception is RE-RAISED instead (still with no
-         cache write) -- see the ``fail_fast`` note below.
+       - returns a match → ``live_resolved`` and UPSERT the URL
+         (``is_error=False``, clearing any stale error marker).
+       - returns ``None`` → ``live_miss`` and UPSERT a null, genuine-miss
+         entry (``is_error=False``) so subsequent requests inside
+         ``miss_ttl`` short-circuit.
+       - raises → ``live_error``. In default mode this now (LML#1121) also
+         UPSERTs a null entry marked ``is_error=True``, so it ages on the
+         much-shorter ``error_ttl`` instead of ``miss_ttl`` -- a couldn't-ask
+         outcome self-heals fast, but still backpressures the default warm
+         path for the outage's duration (see the module docstring). Under
+         ``fail_fast=True`` the exception is RE-RAISED instead, with NO cache
+         write either way -- see the ``fail_fast`` note below.
 
     Uses ``find_album_match`` (album-level), not a track probe, because the
     cache key is the album: a per-track deep-link would cache wrong-track URLs
@@ -353,17 +492,25 @@ async def resolve_streaming_url_with_cache(
     sharp failure semantics (the LML#1098 breaker-aware live probe,
     ``lookup/enrichment/bandcamp_probe.py``, which must tell a rate-limit shed
     apart from a generic upstream flake) can see it. Either way there is NO
-    cache write on the exception path -- the "don't poison the cache"
-    invariant holds regardless of ``fail_fast``.
+    cache write on the exception path under ``fail_fast`` -- that caller has
+    its own breaker-based backpressure and does not need the error-row
+    mechanism.
     """
     cached = await _fetch_cached_row(
-        pg, service=service, artist=artist, album=album, miss_ttl=miss_ttl, now=now
+        pg,
+        service=service,
+        artist=artist,
+        album=album,
+        miss_ttl=miss_ttl,
+        error_ttl=error_ttl,
+        now=now,
     )
     if cached.value is not None:
         return ResolveOutcome(url=cached.value, source="cache_hit")
     if cached.was_present:
         # SQL filter already excluded stale misses; a present row with NULL
-        # URL is necessarily an in-TTL known miss — skip the API.
+        # URL is necessarily an in-TTL known miss (genuine or error) — skip
+        # the API.
         return ResolveOutcome(url=None, source="cache_miss_recent")
 
     # Cache empty or stale — call the service with REQUEST values. The
@@ -393,11 +540,22 @@ async def resolve_streaming_url_with_cache(
             # either way, so re-raising costs nothing the default branch
             # below doesn't already forgo.
             raise
-        # Transient upstream failure: do not poison the cache with a
-        # permanent "not found" sentinel — leave the row alone and let the
-        # next request retry.
+        # LML#1121: a transport failure is a "couldn't ask", not a confirmed
+        # absence -- do not poison the cache with the 7-day genuine-miss
+        # sentinel. But DO write a short-TTL error row: leaving no row at all
+        # (the pre-#1121 posture) meant every subsequent /lookup for this
+        # (service, artist, album) re-enqueued a fresh background warm for as
+        # long as the outage lasted, since the warm task's dedup key is
+        # discarded once the task completes (see
+        # ``lookup/streaming_url_postprocess.py``'s ``_streaming_warm_in_flight``)
+        # -- unbounded background-task growth that starves sibling services on
+        # the shared warm semaphore (LML#1094). The error row self-heals
+        # within ``error_ttl`` (default 5 minutes) instead of a week.
         logger.exception(
             "streaming_url_cache live probe raised for %s / %s / %s", service, artist, album
+        )
+        await set_cached_streaming_url(
+            pg, service=service, artist=artist, album=album, url=None, is_error=True
         )
         return ResolveOutcome(url=None, source="live_error")
 
@@ -416,17 +574,30 @@ async def set_cached_streaming_url(
     artist: str,
     album: str,
     url: str | None,
+    is_error: bool = False,
 ) -> None:
     """UPSERT a cache row for ``(service, artist, album)``.
 
-    Pass ``url`` for a hit, ``None`` to record a known miss. ``last_checked_at``
-    is set to ``now()`` server-side on both insert and conflict-update.
+    Pass ``url`` for a hit, ``None`` to record a known miss.
+    ``last_checked_at`` is set to ``now()`` server-side on both insert and
+    conflict-update.
+
+    ``is_error`` (LML#1121, miss-only) marks a null-``url`` write as a
+    transport failure ("couldn't ask") rather than a genuine confirmed
+    absence -- it ages on the much shorter ``error_ttl`` instead of
+    ``miss_ttl``. Coerced to ``False`` whenever ``url`` is non-``None`` (a
+    resolved URL is never simultaneously an error row, regardless of what a
+    caller passes) -- mirrors ``entity/release_resolution_cache.py``'s
+    ``crowd_out`` coercion. A later genuine resolve or genuine miss on the
+    same key always writes ``is_error=False`` via the UPSERT, clearing any
+    stale error marker.
 
     Write failures are logged and swallowed: cache writes are best-effort. A
     request that produced a real URL still returns it even if the write fails.
     """
     artist_key = to_match_form(artist)
     album_key = to_match_form(album)
+    is_error_flag = is_error and url is None
     await swallowing_execute(
         pg,
         _UPSERT_SQL,
@@ -434,6 +605,7 @@ async def set_cached_streaming_url(
         artist_key,
         album_key,
         url,
+        is_error_flag,
         logger=logger,
         log_label="streaming_url_cache set failed for %s / %s / %s",
         log_args=(service, artist_key, album_key),
