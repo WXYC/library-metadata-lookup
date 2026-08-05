@@ -144,9 +144,7 @@ Rejected alternative: narrowing the purge to `album_normalized = ''` (the album-
 | `docs/plans/lml-1139-va-track-guard.md` | this plan, committed (CI `scripts/check_plan_links.sh` fails on citations to untracked plans) |
 | `tests/unit/test_streaming_matching.py` | predicate unit matrix |
 | `tests/unit/test_apple_music_client.py` | + `TestFindTrackMetadataVaArtistAxis`; **+ update `test_whitespace_album_emits_plain_track_surface` (`:1302`)** — it asserts `surface == "track"` for `album="   "`, which §3b relabels `track_album_less`. Its docstring *argues for* the old label, so it needs rewriting, not just re-asserting; the new label in fact serves that test's own intent (not mislabeling a never-constrained request) more precisely. Update it **before** the §3b change lands |
-| `tests/conftest.py` | promote `es256_keypair` (from `tests/unit/conftest.py:224`) + the `_make_song_data` / `_songs_response` builders to a shared scope so the integration tier can reach them — a prerequisite for the file below, and a new pattern for that tier |
-| `tests/unit/test_purge_va_apple_track_cache.py` | new — arbiter + SQL-shape tests |
-| `tests/integration/test_va_artist_axis_guard.py` | new — Bug Fix Protocol integration tier (**mocked httpx, unmarked** — see below) |
+| `tests/unit/test_purge_va_apple_track_cache.py` | new — arbiter, superset-property, and wave-shape tests |
 
 ## Test plan (TDD — failing tests first, per `docs/testing.md`)
 
@@ -177,9 +175,12 @@ Rejected alternative: narrowing the purge to `album_normalized = ''` (the album-
 - Dry-run path performs no DELETE but **does** write the recovery CSV.
 - The recovery CSV is written before the DELETE, not after (pin the ordering — a crash mid-DELETE must still leave the artifact).
 
-`tests/integration/test_va_artist_axis_guard.py` — Bug Fix Protocol (`docs/testing.md:21-27`): a unit test **and** an integration test asserting false positives are excluded AND correct results retained.
+**Integration tier — deviation from the Bug Fix Protocol, stated rather than silently skipped.** `docs/testing.md:21-27` asks for a unit test *and* an integration test "against real APIs". No such test is added here, for two verified reasons:
 
-**Tier correction (rev 3):** this test is **mocked-`httpx` and unmarked**, not `external_api`. `docs/testing.md:50` defines `external_api` as "needs a real third-party API key (**Discogs**)", and the CI job provisions only `DISCOGS_TOKEN`. Apple Music needs an ES256 developer token assembled from `apple_music_team_id` / `apple_music_key_id` / `apple_music_private_key` (`config/settings.py:50-56`, signed at `clients/streaming/apple_music.py:201-226`), which CI does not hold — an `external_api`-marked Apple test would never run. Every Apple-touching file under `tests/integration/` already mocks the client, and that is the pattern followed here. (The rev-2 rationale "sits beside `test_va_comp_wave_b_extra_credit.py`" also doesn't transfer: that file is `pytestmark = pytest.mark.pg`, not `external_api`.) The integration tier still earns its place — it exercises the real `find_track_metadata` → `_select_best_track_candidate` → `matching.py` composition end to end, which the unit tests stub apart.
+1. **CI cannot run it.** `docs/testing.md:50` defines `external_api` as "needs a real third-party API key (**Discogs**)" and the job provisions only `DISCOGS_TOKEN`. Apple Music needs an ES256 developer token assembled from `apple_music_team_id` / `apple_music_key_id` / `apple_music_private_key` (`config/settings.py:50-56`, signed at `clients/streaming/apple_music.py:201-226`), which CI does not hold. An `external_api`-marked Apple test would never execute; every Apple-touching file under `tests/integration/` already mocks the client.
+2. **The unit tests already are the composition test.** `TestFindTrackMetadataVaArtistAxis` mocks only `httpx` — it drives the real `find_track_metadata` → `_select_best_track_candidate` → `matching.py` → real `wxyc_etl.is_compilation_artist` path end to end. A mocked-`httpx` file under `tests/integration/` would be a near-duplicate requiring a shared-fixture refactor (`es256_keypair` lives at `tests/unit/conftest.py:224`; the song builders are module-local) for zero additional coverage.
+
+What the protocol is actually protecting — "false positives excluded AND correct results retained" — is covered: the two measured FP pairs are pinned as rejections, the album-cleared V/A pair and the one-sided `CAGAYANO` pair are pinned as retained, and the labeled true-positive corpus is pinned unaffected. The purge script's live-DB behavior (wave cursoring, `ANY($2)` array bind, DELETE shape) is the part genuinely not unit-testable; it is covered by a `@pytest.mark.pg` test rather than by an Apple-hitting one.
 
 ## Verification & rollout
 

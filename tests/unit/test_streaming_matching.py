@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from wxyc_etl.text import to_match_form
 
 from clients.streaming.matching import (
     album_subset_is_degenerate,
@@ -17,6 +18,7 @@ from clients.streaming.matching import (
     strip_the_prefix,
     strip_track_suffix,
     title_subset_is_degenerate,
+    va_artist_axis_is_uninformative,
 )
 from discogs.matching import strip_discogs_suffix
 
@@ -482,6 +484,80 @@ class TestAlbumSubsetIsDegenerate:
 
     def test_identical_albums_not_degenerate(self):
         assert album_subset_is_degenerate("Aluminum Tunes", "Aluminum Tunes") is False
+
+
+class TestVaArtistAxisIsUninformative:
+    """LML#1139: both-sides V/A means the artist score is carried entirely by the
+    shared "Various Artists" prefix and identifies nothing.
+
+    Inputs are ``to_match_form`` output on BOTH sides — the documented calling
+    contract (see the predicate's docstring for why normalized, not raw).
+    """
+
+    @pytest.mark.parametrize(
+        "query, candidate",
+        [
+            # The two highest-volume marginal clears in the entire 30d band.
+            ("various artists - blues", "various artists - document records"),
+            ("various artists - latin", "various artists - azzurra music"),
+            # Album-less real pair, pinned as a deliberate kill in the client tests.
+            ("various artists - asia", "various artists & pan ron"),
+            # Abbreviated + exact-only forms from is_compilation_artist's vocabulary.
+            ("v/a", "various"),
+            ("soundtracks", "compilation"),
+            ("v.a.", "various artists - jazz"),
+            # Dotless v.a — the form LML's donor purge regex missed (see the
+            # purge script's superset test).
+            ("v.a", "v.a - jazz"),
+        ],
+    )
+    def test_both_sides_va_is_uninformative(self, query: str, candidate: str):
+        assert va_artist_axis_is_uninformative(query, candidate) is True
+
+    @pytest.mark.parametrize(
+        "query, candidate",
+        [
+            # One-sided, both orders: the artist axis still carries real signal.
+            ("various artists - blues", "jessica pratt"),
+            ("juana molina", "various artists"),
+            # Documented residual (out of scope): is_compilation_artist is
+            # leading-anchored, so a TRAILING V/A credit does not fire.
+            ("various artists - xmas", "cagayano various artists"),
+            # Real artists whose names merely contain a keyword. These are the
+            # reason the org moved off a substring scan in wxyc-etl 0.5.0.
+            ("various production", "various artists"),
+            ("various artists", "the various"),
+            ("the soundtrack of our lives", "various artists"),
+            # Neither side V/A at all.
+            ("stereolab", "cat power"),
+        ],
+    )
+    def test_one_sided_or_real_artists_are_informative(self, query: str, candidate: str):
+        assert va_artist_axis_is_uninformative(query, candidate) is False
+
+    def test_empty_side_is_informative(self):
+        assert va_artist_axis_is_uninformative("", "various") is False
+
+    def test_none_does_not_raise(self):
+        """``is_compilation_artist`` requires str and raises on None; the
+        predicate's ``or ""`` guard absorbs that for defensive callers."""
+        assert va_artist_axis_is_uninformative(None, None) is False  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "  Various Artists",  # leading whitespace
+            "Various  Artists - Blues",  # doubled inner space
+            "Vàrious Artists",  # diacritic
+        ],
+    )
+    def test_normalization_contract(self, raw: str):
+        """The reason callers MUST pass ``to_match_form`` output: each of these
+        is False raw and True normalized. Feeding raw strings would leave the
+        guard blind to exactly these variants while the L1 cache — which keys on
+        ``to_match_form(artist)`` — would still hold their (wrong) rows."""
+        assert va_artist_axis_is_uninformative(raw, "various artists") is False
+        assert va_artist_axis_is_uninformative(to_match_form(raw), "various artists") is True
 
 
 class TestStripDiscogsSuffix:

@@ -229,6 +229,30 @@ LML_API_KEY=... LML_BASE_URL=https://<prod-lml> \
 
 `--base-url` defaults to `$LML_BASE_URL` then `$PRODUCTION_URL`; `--api-key` to `$LML_API_KEY`. Other flags: `--page-size` (default/cap 25), `--max-retries` (default 2), `--cooldown` (seconds between retry rounds, default 60), `--spot-check` (sample size, default 20), `--seed` (spot-check RNG seed — the sample is reproducible from the JSONL), `--timeout` (per-request seconds, default 120; a fully-escalating page can take ~30s). The report is printed to stdout and, with `--report`, written to a markdown file for pasting into WXYC/Backend-Service#1614.
 
+## Track-Cache V/A Purge (`scripts/purge_va_apple_track_cache.py`)
+
+Clears pre-LML#1139 Various-Artists rows from `lml_cache.track_streaming_url_cache` (the LML#893 L1 track-URL cache). **This runs in the same deploy as the LML#1139 guard, not after it.** The table is hit-only and TTL-less and is peeked in `lookup/enrichment/item.py` *before* the live Apple probe, so a wrong V/A deep-link cached before the guard shipped would serve forever — on exactly the repeat-play traffic that recurs most — and the guard would never get a chance to re-adjudicate it. Ship the guard without the purge and the bug stays fully live from cache.
+
+Selection is coarse-net-plus-pure-arbiter (donor: `scripts/audit_va_writeback_pollution.py`): an intentionally unanchored superset regex bounds the SQL scan, then `wxyc_etl.text.is_compilation_artist` — the exact predicate the guard uses, on the exact string the guard sees — decides. Real artists like `various production` and `the various` do match the regex and are rejected by the arbiter. The service is imported as `APPLE_MUSIC_TRACK_SERVICE` (`"apple_music_track"`), never spelled as a literal.
+
+**Safety:** dry-run by default; `--execute` performs the DELETE. Every purged row's full tuple is written to a recovery CSV (`--out`) **before** the DELETE on both paths, because the purge knowingly over-deletes (it keys on the query artist alone, while the guard also requires a V/A candidate and an album-less pass — so correct album-cleared V/A links go too) and those URLs are expensive-to-replace API-derived data. Copy each wave's CSV somewhere durable before the next wave. Targets the shared discogs-cache PG via `DATABASE_URL_DISCOGS`. **Prod writes require explicit authorization and run staging-first.**
+
+**Run it in waves, after raising the probe ceiling.** `docs/env-vars.md` (LML#904) records that at the default `LML_APPLE_MUSIC_RATE_PER_MIN=60` roughly **56% of `find_track_url` probes time out** on LML's own self-throttle and return null — and nulls are never cached (`url NOT NULL`), so a purged key does not reliably re-fill on next play; it re-probes and mostly re-nulls until it wins the throttle. Roll the rate up (60 → 300 → 600) first, then use `--limit` so the re-probe load arrives gradually. `--after` is the resume cursor (an exclusive lower bound on `artist_normalized`); each wave logs the value to pass next. The cursor advances past every key *examined*, not just the purged ones, so a wave whose keys are all rejected by the arbiter still makes progress.
+
+```bash
+# 1. dry-run (default): report + write the recovery CSV, delete nothing
+uv run python -m scripts.purge_va_apple_track_cache
+
+# 2. first wave (staging first), 500 artist keys
+uv run python -m scripts.purge_va_apple_track_cache \
+  --limit 500 --out /tmp/lml-1139-wave1.csv --execute
+
+# 3. next wave — resume past the last key the previous wave examined
+uv run python -m scripts.purge_va_apple_track_cache \
+  --limit 500 --after 'various artists - jazz' \
+  --out /tmp/lml-1139-wave2.csv --execute
+```
+
 ## Library-Release Override Seeder (`scripts/seed_library_release_overrides.py`)
 
 Seeds `lml_cache.library_release_override` from WXYC DJ Alex L.'s hand-verified `card_catalog_id -> discogs_release_id` CSV (LML#850). Each pin makes a library-album `/lookup` return the verified Discogs release (and its correct tracklist) instead of the per-request fuzzy pick — gated behind the `LML_LIBRARY_RELEASE_OVERRIDE` flag (see [`env-vars.md`](env-vars.md)). The verified CSV lives in the workspace meta-repo (`plans/alex-discogs-import/data/phase1_release_links.csv`) and is **not** committed here — pass its path via `--input`.

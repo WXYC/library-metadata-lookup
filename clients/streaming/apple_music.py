@@ -54,6 +54,7 @@ from clients.streaming.matching import (
     find_best_source_match,
     record_match_telemetry,
     title_subset_is_degenerate,
+    va_artist_axis_is_uninformative,
 )
 from core.search import resolve_positive_int_env
 from streaming.models import SourceMatch
@@ -520,7 +521,17 @@ class AppleMusicClient(BaseStreamingClient):
             service="apple_music",
             # The fallback winner gets its own surface so LML#592 dashboards
             # can watch the fallback rate separately from ordinary track wins.
-            surface="track_album_fallback" if album_fallback else "track",
+            # LML#1139 splits a third value off "track": an album-less-FROM-
+            # THE-START request never ran a constrained pass, and previously
+            # emitted "track" exactly like a constrained win, which made the
+            # album-less population — the other surface this issue's guard
+            # strikes — impossible to size in the 30d sample. Now "track"
+            # means strictly "the album-constrained pass won".
+            surface=(
+                "track_album_fallback"
+                if album_fallback
+                else ("track" if norm_album is not None else "track_album_less")
+            ),
             # LML#592 labeling: request values vs the CHOSEN winner's strings
             # (same record the axes were stashed from), for the marginal sample.
             query_artist=artist,
@@ -604,9 +615,11 @@ def _select_best_track_candidate(
         url = attrs.get("url")
         if not url:
             continue
-        artist_score = fuzz.token_set_ratio(
-            norm_artist, normalize_for_comparison(attrs.get("artistName") or "")
-        )
+        # Hoisted so the LML#1139 V/A guard below can reuse it instead of
+        # re-normalizing — and, more importantly, so the guard is guaranteed to
+        # test the SAME string the artist axis scored.
+        cand_artist_norm = normalize_for_comparison(attrs.get("artistName") or "")
+        artist_score = fuzz.token_set_ratio(norm_artist, cand_artist_norm)
         track_score = fuzz.token_set_ratio(
             norm_song, normalize_for_comparison(attrs.get("name") or "")
         )
@@ -633,6 +646,32 @@ def _select_best_track_candidate(
         # caller; in-catalog rows source artwork from the library row, not
         # this probe). Never alters the DJ's typed artist/song text.
         if title_subset_is_degenerate(raw_song, attrs.get("name") or ""):
+            continue
+        # LML#1139: when NO album constrains the scoring, a V/A<->V/A pair has
+        # no discriminating evidence left. The artist axis is vacuous by
+        # construction (the constant "Various Artists - " prefix alone scores
+        # ~85 between any two WXYC V/A credits), and the measured false
+        # positives are generic blues/latin standards whose TITLES genuinely
+        # agree at 95-100 while pointing at a different compilation's
+        # recording. Both axes clear, and both are worthless. Strike the
+        # candidate: on this surface the album axis is the only real evidence,
+        # so a V/A<->V/A match is acceptable ONLY when the album-constrained
+        # pass supplied it.
+        #
+        # `norm_album is None` covers both album-less-from-the-start queries
+        # and the LML#782 fallback re-score (which re-enters this function with
+        # norm_album=None) — the whole rule in one clause. Per-CANDIDATE, not a
+        # winner veto: a non-V/A candidate in the same response stays eligible
+        # on its own merits, which matters because the artist axis keeps
+        # token_set_ratio deliberately for leader->ensemble subsets.
+        #
+        # Recall cost (accepted, LML#719 idiom): an album-less V/A query that
+        # was genuinely right now returns None — e.g. the real pair
+        # ("Various Artists - Asia", "Jombang Jet") -> ("Various Artists & Pan
+        # Ron") at title 100, pinned in the tests as a deliberate kill. The
+        # failure mode is a MISSING Apple link, never a wrong one, and a wrong
+        # track deep-link persists downstream (BS#2000).
+        if norm_album is None and va_artist_axis_is_uninformative(norm_artist, cand_artist_norm):
             continue
         if norm_album is not None:
             album_score = fuzz.token_set_ratio(
